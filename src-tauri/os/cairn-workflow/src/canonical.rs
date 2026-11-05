@@ -484,6 +484,7 @@ async fn freeze_execution_conn(
     }
     // A failed session keeps the reason it failed with; every other session
     // closes as superseded, so a refusal can say why.
+    // No process access here: lifecycle::sweep_process_lifetimes stops retained session processes.
     conn.execute(
         "UPDATE sessions
             SET status = 'closed',

@@ -229,6 +229,7 @@ pub async fn close_job_sessions_conn(
         closed.push(row.text(0)?);
     }
     drop(rows);
+    // No process access here: lifecycle::sweep_process_lifetimes stops retained session processes.
     for session_id in &closed {
         conn.execute(
             "UPDATE sessions

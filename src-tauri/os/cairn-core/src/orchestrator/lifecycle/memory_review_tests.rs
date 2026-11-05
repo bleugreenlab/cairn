@@ -432,7 +432,6 @@ async fn latest_memory_review_turn_state(orch: &crate::orchestrator::Orchestrato
 }
 
 fn register_warm_process(orch: &crate::orchestrator::Orchestrator) {
-    let mut processes = orch.process_state.processes.lock().unwrap();
     let child = Arc::new(Mutex::new(None));
     let stdin = Arc::new(Mutex::new(Some(
         cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
@@ -444,7 +443,9 @@ fn register_warm_process(orch: &crate::orchestrator::Orchestrator) {
         Some("j-review".to_string()),
     );
     handle.transition_to_warm();
-    processes.register("run-review".to_string(), handle);
+    orch.process_state
+        .register_process("run-review".to_string(), handle)
+        .unwrap();
 }
 
 async fn direct_message_count(orch: &crate::orchestrator::Orchestrator, like: &str) -> i64 {
@@ -627,4 +628,201 @@ async fn done_state_is_noop() {
 
     assert_eq!(review_state(&orch).await.as_deref(), Some("done"));
     assert_eq!(memory_status(&orch).await, "draft");
+}
+
+struct TrackedReviewProcess {
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::services::ChildProcess for TrackedReviewProcess {
+    fn id(&self) -> u32 {
+        // Outside the host PID range: never signal a real process.
+        i32::MAX as u32
+    }
+
+    fn take_stdout(&mut self) -> Option<Box<dyn std::io::BufRead + Send>> {
+        None
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn std::io::BufRead + Send>> {
+        None
+    }
+
+    fn take_stdin(&mut self) -> Option<Box<dyn std::io::Write + Send>> {
+        None
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        Ok(None)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn finished_review_defers_process_stop_and_finalization_to_lifetime_sweep() {
+    for issue_status in ["merged", "closed", "active"] {
+        let db = test_db().await;
+        seed_job_row(&db, Some("sent"), true).await;
+        insert_run_session_with_turns(&db, 0).await;
+        insert_review_turn(&db, "running").await;
+        db.execute_script(
+            "UPDATE sessions SET backend = 'codex' WHERE id = 's-review';
+             UPDATE turns SET run_id = 'run-review' WHERE id = 't-review';
+             UPDATE jobs SET current_turn_id = 't-review' WHERE id = 'j-review';",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE issues SET status = ?1, progress = ?1 WHERE id = 'i-review'",
+            (issue_status,),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO runtime_admission_requests
+             (request_id, workspace_key, resource_lane, launch_key, claim_json,
+              priority, enqueue_seq, state, lease_owner, lease_generation,
+              lease_expires_at, created_at, updated_at)
+             VALUES ('req-review', 'private-runtime', 'review-test', 'ordinary:run-review',
+                     '{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',
+                     0, 1, 'active', 'review-owner', 1, 9999999999, 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        orch.process_state.prepare_admission_claim(
+            "run-review".into(),
+            crate::agent_process::process::ProcessAdmissionClaim {
+                request_id: "req-review".into(),
+                workspace_key: "private-runtime".into(),
+                launch_key: "ordinary:run-review".into(),
+                owner: "review-owner".into(),
+                generation: 1,
+                team_workspace_id: None,
+            },
+        );
+        register_warm_process(&orch);
+        let child = {
+            let processes = orch.process_state.processes.lock().unwrap();
+            processes.get("run-review").unwrap().child.clone()
+        };
+        // No EOF finalizer is attached, matching an idle Codex reader's close.
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *child.lock().unwrap() = Some(Box::new(TrackedReviewProcess {
+            stopped: stopped.clone(),
+        }));
+        assert!(orch.process_state.begin_turn("run-review", "t-review"));
+        orch.process_state
+            .set_current_turn_id("run-review", Some("t-review"));
+
+        assert!(super::transition_to_warm_state(&orch, "run-review", None));
+        assert_eq!(latest_memory_review_turn_state(&orch).await, "complete");
+
+        assert_eq!(review_state(&orch).await.as_deref(), Some("done"));
+        let resolved = issue_status != "active";
+        let (status, reason, closed_at) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT status, terminal_reason, closed_at FROM sessions WHERE id = 's-review'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_i64(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, if resolved { "closed" } else { "open" });
+        assert_eq!(
+            reason.as_deref(),
+            match issue_status {
+                "merged" => Some("issue_merged"),
+                "closed" => Some("issue_closed"),
+                _ => None,
+            }
+        );
+        assert_eq!(closed_at.is_some(), resolved);
+        // Review completion may already be inside finalize_run. It closes only
+        // the session; physical teardown and run bookkeeping stay with the sweep.
+        assert_eq!(orch.process_state.has_process("run-review"), Some(true));
+        assert!(child.lock().unwrap().is_some());
+        assert!(!stopped.load(std::sync::atomic::Ordering::SeqCst));
+        let request = crate::storage::get_admission_request(&orch.db.local, "req-review")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.state, "active");
+        assert_eq!(
+            orch.db
+                .local
+                .query_one(
+                    "SELECT status FROM runs WHERE id = 'run-review'",
+                    (),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap(),
+            "live"
+        );
+
+        super::sweep_process_lifetimes(&orch);
+
+        assert_eq!(
+            orch.process_state.has_process("run-review"),
+            Some(!resolved)
+        );
+        assert_eq!(child.lock().unwrap().is_none(), resolved);
+        assert_eq!(stopped.load(std::sync::atomic::Ordering::SeqCst), resolved);
+        let request = crate::storage::get_admission_request(&orch.db.local, "req-review")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.state, if resolved { "released" } else { "active" });
+        let (status, reason) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT status, exit_reason FROM runs WHERE id = 'run-review'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, if resolved { "exited" } else { "live" });
+        assert_eq!(
+            reason.as_deref(),
+            if resolved {
+                Some("session_closed")
+            } else {
+                None
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn running_review_on_resolved_issue_keeps_process() {
+    let db = test_db().await;
+    seed_job_row(&db, Some("sent"), true).await;
+    insert_run_session_with_turns(&db, 0).await;
+    insert_review_turn(&db, "running").await;
+    db.execute(
+        "UPDATE issues SET status = 'closed', progress = 'closed' WHERE id = 'i-review'",
+        (),
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch);
+
+    finish_memory_review_if_due(&orch, "j-review", "run-review");
+    super::sweep_process_lifetimes(&orch);
+
+    assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
+    assert_eq!(orch.process_state.has_process("run-review"), Some(true));
+    assert!(!super::current_session_closed(&orch, "j-review"));
 }

@@ -158,6 +158,23 @@ pub(crate) fn release_and_stop_process(orch: &Orchestrator, run_id: &str) -> boo
     orch.process_state.stop_and_remove(run_id)
 }
 
+/// Stop processes retained by closed sessions, releasing admission before removal.
+/// This only releases and stops the provider; callers own run exit bookkeeping.
+pub(crate) fn stop_processes_for_sessions(orch: &Orchestrator, session_ids: &[String]) {
+    for session_id in session_ids {
+        let Some(run_id) = orch.process_state.find_process_by_session(session_id) else {
+            continue;
+        };
+        if release_and_stop_process(orch, &run_id) {
+            log::info!("Stopped process {run_id} for closed session {session_id}");
+        } else {
+            log::warn!(
+                "Could not stop process {run_id} for closed session {session_id}; the lifetime sweep will retry"
+            );
+        }
+    }
+}
+
 pub(crate) fn release_process_admission(orch: &Orchestrator, run_id: &str) -> bool {
     let Some(claim) = orch.process_state.admission_claim(run_id) else {
         return true;
@@ -415,6 +432,7 @@ pub(crate) fn current_session_closed(orch: &Orchestrator, job_id: &str) -> bool 
 }
 
 fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str) {
+    // May run inside finalize_run: sweep_process_lifetimes owns stop/finalize; Codex EOF does not finalize idle runs.
     let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     let _ = run_db_blocking(move || async move {

@@ -424,16 +424,7 @@ pub(crate) async fn resolve_terminal(
     .await
     .map_err(|e| ResolutionRefusal::Rejected(e.to_string()))?;
 
-    for session_id in &closed_sessions {
-        if let Some(run_id) = orch.process_state.find_process_by_session(session_id) {
-            crate::orchestrator::lifecycle::release_and_stop_process(orch, &run_id);
-            log::info!(
-                "Evicted warm process {} for closed session {}",
-                &run_id[..run_id.len().min(8)],
-                &session_id[..session_id.len().min(8)]
-            );
-        }
-    }
+    crate::orchestrator::lifecycle::stop_processes_for_sessions(orch, &closed_sessions);
 
     // The issue is resolved — quit any in-flight turn-end review suite so it does
     // not keep running against a merged/closed issue (CAIRN-2648).

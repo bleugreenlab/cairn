@@ -1480,6 +1480,32 @@ pub async fn pending_launch_run_ids(db: &LocalDb) -> DbResult<HashSet<String>> {
     Ok(pending)
 }
 
+/// A launch waiting on this session prevents rotation even after its in-memory
+/// preparation claim has been handed off to admission. Replicas have no local
+/// admission ledger; their callers also check the runner-local ledger.
+pub async fn awaiting_launch_run_for_session(
+    db: &LocalDb,
+    session_id: &str,
+) -> DbResult<Option<String>> {
+    let session_id = session_id.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            if !has_admission_table(conn).await? {
+                return Ok(None);
+            }
+            let mut rows = conn.query(
+                format!(
+                    "SELECT p.run_id FROM prepared_ordinary_launches p JOIN runtime_admission_requests r ON r.request_id=p.request_id WHERE p.session_id=?1 AND {AWAITING_LAUNCH}
+                     UNION ALL
+                     SELECT c.run_id FROM prepared_runtime_calls c JOIN runtime_admission_requests r ON r.request_id=c.request_id WHERE json_extract(c.prepared_json,'$.session_id')=?1 AND r.state IN ('queued','leased','starting') LIMIT 1"
+                ),
+                [session_id],
+            ).await?;
+            rows.next().await?.map(|row| row.text(0)).transpose()
+        })
+    }).await
+}
+
 /// A team replica carries no admission table (the rows are runner-local), so a
 /// settle write against one has nothing to withdraw.
 async fn has_admission_table(conn: &crate::turso::Connection) -> DbResult<bool> {
@@ -3304,6 +3330,105 @@ mod tests {
             .await
             .unwrap()
             .contains("call-queued"));
+    }
+
+    #[tokio::test]
+    async fn session_launch_fence_covers_ordinary_and_call_phases_but_not_registered_processes() {
+        let db = crate::storage::migrated_test_db("admission-session-fence.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO executions(id,recipe_id,project_id,status,started_at) VALUES('x','recipe','p','running',1);
+             INSERT INTO jobs(id,project_id,execution_id,status,created_at,updated_at) VALUES('j','p','x','running',1,1);
+             INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('s','j','claude','open',1,1);
+             INSERT INTO runs(id,project_id,job_id,session_id,status,created_at,updated_at) VALUES('run','p','j','s','starting',1,1);
+             INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_generation,created_at,updated_at)
+               VALUES('req','private-runtime','lane','ordinary:run','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,1,'queued',0,1,1);
+             INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
+               VALUES('req','j','run','s','turn','x','p','resume','{}','','null','{}',1);",
+        ).await.unwrap();
+        for call in [false, true] {
+            if call {
+                db.execute_script(
+                    "DELETE FROM prepared_ordinary_launches WHERE request_id='req';
+                     INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at) VALUES('req','run','{\"session_id\":\"s\"}',1);",
+                ).await.unwrap();
+            }
+            for state in [
+                "queued",
+                "leased",
+                "starting",
+                "active",
+                "released",
+                "cancelled",
+                "failed",
+            ] {
+                db.execute(
+                    "UPDATE runtime_admission_requests SET state=?1 WHERE request_id='req'",
+                    [state],
+                )
+                .await
+                .unwrap();
+                let expected = matches!(state, "queued" | "leased" | "starting").then_some("run");
+                assert_eq!(
+                    awaiting_launch_run_for_session(&db, "s")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    expected,
+                    "call={call}, phase={state}"
+                );
+                assert_eq!(
+                    awaiting_launch_run_for_session(&db, "other-session")
+                        .await
+                        .unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_launch_fence_reads_team_call_packets_without_local_run_rows() {
+        let db = crate::storage::migrated_test_db("admission-team-call-session.db").await;
+        db.execute_script(
+            "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_generation,created_at,updated_at)
+               VALUES('call-request','local-runtime','lane','call:team-run','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,1,'queued',0,1,1);
+             INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at)
+               VALUES('call-request','team-run','{\"session_id\":\"team-session\"}',1);",
+        ).await.unwrap();
+        assert_eq!(
+            awaiting_launch_run_for_session(&db, "team-session")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("team-run")
+        );
+        assert_eq!(
+            awaiting_launch_run_for_session(&db, "other-session")
+                .await
+                .unwrap(),
+            None
+        );
+        db.execute("UPDATE prepared_runtime_calls SET prepared_json='invalid' WHERE request_id='call-request'", ()).await.unwrap();
+        assert!(
+            awaiting_launch_run_for_session(&db, "team-session")
+                .await
+                .is_err(),
+            "corrupt launch facts must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_launch_fence_is_absent_on_a_replica_without_admission_tables() {
+        let root = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(root.path().join("replica.db")).await.unwrap();
+        assert_eq!(
+            awaiting_launch_run_for_session(&db, "session")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

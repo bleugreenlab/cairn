@@ -1,7 +1,6 @@
 pub mod outcome;
 pub mod projection;
 pub mod run;
-pub mod session;
 pub mod status;
 pub mod turn;
 /// Error type for invalid state transitions.

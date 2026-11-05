@@ -34,12 +34,10 @@
 pub mod outcome;
 pub mod projection;
 mod run;
-mod session;
 mod status;
 pub mod turn;
 
 pub use run::{set_exit_reason, transition_run};
-pub use session::transition_session;
 pub use status::{
     recompute_execution_status, recompute_issue_status, transition_job_readiness, unresolve_issue,
     ExecutionStatus, Resolution,

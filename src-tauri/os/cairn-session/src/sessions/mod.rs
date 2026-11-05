@@ -1,7 +1,7 @@
 //! Durable backend conversation identity and account binding.
 use cairn_db::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
-use cairn_domain::{Session, SessionStatus};
+use cairn_domain::Session;
 
 pub async fn create_with_id(
     db: &LocalDb,
@@ -68,42 +68,6 @@ pub async fn get(db: &LocalDb, session_id: &str) -> Result<Session, String> {
     .await
     .map_err(|e| format!("Session lookup failed ({session_id}): {e}"))?
     .ok_or_else(|| format!("Session not found: {session_id}"))
-}
-
-pub async fn update_status(
-    db: &LocalDb,
-    session_id: &str,
-    status: SessionStatus,
-    reason: Option<&str>,
-) -> Result<(), String> {
-    let session_id = session_id.to_string();
-    let status = status.to_string();
-    let reason = reason.map(str::to_string);
-    db.write(|conn| {
-        let session_id = session_id.clone();
-        let status = status.clone();
-        let reason = reason.clone();
-        Box::pin(async move {
-            let now = chrono::Utc::now().timestamp();
-            let closed_at = if status == "open" { None } else { Some(now) };
-            conn.execute(
-                "UPDATE sessions
-                 SET status = ?1, terminal_reason = ?2, closed_at = ?3, updated_at = ?4
-                 WHERE id = ?5",
-                params![
-                    status.as_str(),
-                    reason.as_deref(),
-                    closed_at,
-                    now,
-                    session_id.as_str()
-                ],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to update session status: {e}"))
 }
 
 pub async fn create_with_id_and_lineage_conn(

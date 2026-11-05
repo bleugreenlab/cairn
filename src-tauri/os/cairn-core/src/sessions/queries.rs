@@ -335,6 +335,7 @@ async fn rotate_session(
 /// write: mint the successor on `backend`, hand the job to it, and close the
 /// predecessor. The caller owns the emit [`rotate_session`] makes after its
 /// write commits.
+// Callers own teardown: lifecycle rotations stop first; provider changes stop after commit.
 pub(crate) async fn rotate_session_conn(
     conn: &cairn_db::turso::Connection,
     source: &Session,

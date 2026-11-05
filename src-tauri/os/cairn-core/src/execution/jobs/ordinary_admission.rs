@@ -108,6 +108,53 @@ enum OrdinaryLease {
     },
 }
 
+struct OrdinaryLaunchState {
+    run_status: String,
+    turn_awaits_launch: bool,
+    project_id: String,
+    session_status: String,
+    current_session_id: Option<String>,
+}
+
+impl OrdinaryLaunchState {
+    fn refusal_reason(&self, session_id: &str) -> Option<&'static str> {
+        if self.session_status != "open" || self.current_session_id.as_deref() != Some(session_id) {
+            Some("session closed before launch")
+        } else if self.run_status != "starting" || !self.turn_awaits_launch {
+            Some("run or turn is no longer launchable")
+        } else {
+            None
+        }
+    }
+}
+
+fn load_ordinary_launch_state(
+    db: Arc<crate::storage::LocalDb>,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<Option<OrdinaryLaunchState>, String> {
+    let run = run_id.to_string();
+    let turn = turn_id.to_string();
+    run_db(async move {
+        db.query_opt(
+            format!(
+                "SELECT r.status,{},j.project_id,s.status,j.current_session_id FROM runs r JOIN jobs j ON j.id=r.job_id JOIN sessions s ON s.id=r.session_id JOIN turns t ON t.id=?2 WHERE r.id=?1",
+                super::TURN_AWAITS_LAUNCH_SQL
+            ),
+            (run, turn),
+            |row| Ok(OrdinaryLaunchState {
+                run_status: row.text(0)?,
+                turn_awaits_launch: row.i64(1)? != 0,
+                project_id: row.text(2)?,
+                session_status: row.text(3)?,
+                current_session_id: row.opt_text(4)?,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
 fn resume_warm_race(
     orch: &Orchestrator,
     lease: &OrdinaryLease,
@@ -124,33 +171,12 @@ fn resume_warm_race(
                 .map_err(|e| e.to_string())
         }
     })?;
-    let (run_status, turn_awaits_launch, project_id) = run_db({
-        let db = owning.clone();
-        let run = snapshot.run_id.clone();
-        let turn = snapshot.turn_id.clone();
-        async move {
-            db.query_opt(
-                format!(
-                    "SELECT r.status,{},j.project_id FROM runs r JOIN jobs j ON j.id=r.job_id JOIN turns t ON t.id=?2 WHERE r.id=?1",
-                    super::TURN_AWAITS_LAUNCH_SQL
-                ),
-                (run, turn),
-                |row| Ok((row.text(0)?, row.i64(1)? != 0, row.text(2)?)),
-            )
-            .await
-            .map_err(|e| e.to_string())
-        }
-    })?
-    .ok_or_else(|| "prepared ordinary warm continuation is no longer durable".to_string())?;
-    if run_status != "starting" || !turn_awaits_launch {
-        return withdraw_unlaunched(
-            orch,
-            lease,
-            snapshot,
-            launch_guard,
-            "run or turn is no longer launchable",
-        );
+    let state = load_ordinary_launch_state(owning.clone(), &snapshot.run_id, &snapshot.turn_id)?
+        .ok_or_else(|| "prepared ordinary warm continuation is no longer durable".to_string())?;
+    if let Some(reason) = state.refusal_reason(&snapshot.session_id) {
+        return withdraw_unlaunched(orch, lease, snapshot, launch_guard, reason);
     }
+    let project_id = state.project_id;
 
     // The process that won the race already owns capacity. Release this unused
     // generation before delivery and never install it as a pending process claim.
@@ -468,8 +494,7 @@ pub(super) fn enqueue_or_start(
             defer_stateless_start(orch, prepared, identity_override);
             return Ok(false);
         }
-        start_stateless_now(orch, prepared, identity_override)?;
-        return Ok(true);
+        return start_stateless_now(orch, prepared, identity_override);
     }
 
     let team_id = match cairn_common::ids::parse_route_scope(&prepared.project_id)
@@ -669,14 +694,81 @@ pub(super) fn enqueue_or_start(
 
 fn start_stateless_now(
     orch: &Orchestrator,
-    prepared: &PreparedJob,
+    prepared: &mut PreparedJob,
     identity_override: Option<crate::identity::UserIdentity>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    // Cold continuation drops its launch guard before this handoff; initial
+    // starts and child tasks carry no guard. Deferred starts enter here only
+    // after readiness, so this lock fences every stateless provider handoff.
+    let launch_lock = orch.job_launch_lock(&prepared.job_id);
+    let launch_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if prepared.launch_claim.is_none() {
+        prepared.launch_claim = Some(orch.claim_job_launch(&prepared.job_id, &prepared.run_id));
+    }
+    let owning = run_db({
+        let dbs = orch.db.clone();
+        let run_id = prepared.run_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    // Stateless launches have no enqueue write to bind an initial pending turn.
+    // Bind it before settlement, while the in-memory claim still covers the run.
+    run_db({
+        let db = owning.clone();
+        let run_id = prepared.run_id.clone();
+        let turn_id = prepared.turn_id.clone();
+        async move {
+            db.execute(
+                "UPDATE turns SET run_id=?1 WHERE id=?2 AND state='pending' AND run_id IS NULL",
+                (run_id, turn_id),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        }
+    })?;
+    let launch_state = load_ordinary_launch_state(owning, &prepared.run_id, &prepared.turn_id)?;
+    let refusal = launch_state
+        .as_ref()
+        .map(|state| state.refusal_reason(&prepared.session_id))
+        .unwrap_or(Some("run or turn is no longer launchable"));
+    if let Some(reason) = refusal {
+        return_undelivered_attention(
+            orch,
+            &prepared.run_id,
+            &prepared.turn_id,
+            TurnDelivery::Unknown,
+        );
+        let settled = settle_unlaunched_run(orch, &prepared.run_id, &prepared.turn_id)?;
+        // Recomputing may launch a successor: neither the old launch claim nor
+        // this non-reentrant mutex may survive into it.
+        drop(prepared.launch_claim.take());
+        drop(launch_guard);
+        if settled {
+            log::info!(
+                "withdrew stateless launch of run {}: {reason}",
+                prepared.run_id
+            );
+            if let Err(error) = crate::execution::advancement::recompute_job(orch, &prepared.job_id)
+            {
+                log::warn!(
+                    "could not re-derive job {} after withdrawing its stateless launch: {error}",
+                    prepared.job_id
+                );
+            }
+        }
+        return Ok(false);
+    }
     super::start_ordinary_session_now(orch, prepared, identity_override)?;
     super::start_prepared_turn(orch, &prepared.turn_id, &prepared.run_id, &prepared.run_id)?;
     orch.process_state
         .set_current_turn_id(&prepared.run_id, Some(&prepared.turn_id));
-    Ok(())
+    Ok(true)
 }
 
 /// Start a stateless launch once startup recovery is ready.
@@ -696,7 +788,7 @@ fn defer_stateless_start(
         .launch_claim
         .take()
         .unwrap_or_else(|| orch.claim_job_launch(&prepared.job_id, &prepared.run_id));
-    let deferred = PreparedJob {
+    let mut deferred = PreparedJob {
         job_id: prepared.job_id.clone(),
         project_id: prepared.project_id.clone(),
         run_id: prepared.run_id.clone(),
@@ -718,13 +810,9 @@ fn defer_stateless_start(
         orch.startup_readiness.wait_ready_blocking();
         let run_id = deferred.run_id.clone();
         let turn_id = deferred.turn_id.clone();
-        // An unreadable owning database proves nothing, so only a positive
-        // answer stands the start down.
-        if super::private_lane::run_settled(&orch, &run_id) == Some(true) {
-            return_undelivered_attention(&orch, &run_id, &turn_id, TurnDelivery::Unknown);
-            return;
-        }
-        if let Err(error) = start_stateless_now(&orch, &deferred, identity_override) {
+        // The locked handoff revalidates durable session, run and turn facts;
+        // missing or unreadable facts never permit a provider prompt.
+        if let Err(error) = start_stateless_now(&orch, &mut deferred, identity_override) {
             log::warn!("deferred stateless launch of run {run_id} failed to start: {error}");
             terminalize_failed_start(
                 &orch,
@@ -1172,37 +1260,18 @@ fn start_leased_inner(
                 .map_err(|e| e.to_string())
         }
     })?;
-    let launch_state = run_db({
-        let db = owning.clone();
-        let run = snapshot.run_id.clone();
-        let turn = snapshot.turn_id.clone();
-        async move {
-            db.query_opt(
-                format!(
-                    "SELECT r.status,{},j.project_id FROM runs r JOIN jobs j ON j.id=r.job_id JOIN turns t ON t.id=?2 WHERE r.id=?1",
-                    super::TURN_AWAITS_LAUNCH_SQL
-                ),
-                (run, turn),
-                |row| Ok((row.text(0)?, row.i64(1)? != 0, row.text(2)?)),
-            )
-            .await
-            .map_err(|e| e.to_string())
-        }
-    })?;
-    let launchable = launch_state
+    let launch_state =
+        load_ordinary_launch_state(owning.clone(), &snapshot.run_id, &snapshot.turn_id)?;
+    let refusal = launch_state
         .as_ref()
-        .is_some_and(|(run_status, turn_awaits_launch, _)| {
-            run_status == "starting" && *turn_awaits_launch
-        });
-    let Some((_, _, project_id)) = launch_state.filter(|_| launchable) else {
-        return withdraw_unlaunched(
-            orch,
-            lease,
-            &snapshot,
-            launch_guard,
-            "run or turn is no longer launchable",
-        );
-    };
+        .map(|state| state.refusal_reason(&snapshot.session_id))
+        .unwrap_or(Some("run or turn is no longer launchable"));
+    if let Some(reason) = refusal {
+        return withdraw_unlaunched(orch, lease, &snapshot, launch_guard, reason);
+    }
+    let project_id = launch_state
+        .expect("launchable state was checked")
+        .project_id;
     transition(orch, lease, "leased", "starting")?;
     let prompt = snapshot.prompt.clone();
     let session_start = match snapshot.session_start {
@@ -3564,6 +3633,103 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_fence_withdraws_closed_and_noncurrent_cold_and_warm_launches() {
+        for warm in [false, true] {
+            for closed in [false, true] {
+                let (orch, request, snapshot) =
+                    lifecycle_fixture(&format!("ordinary-session-fence-{warm}-{closed}.db")).await;
+                brief(&orch, "cold", "t", "j").await;
+                let bytes = Arc::new(Mutex::new(Vec::new()));
+                if warm {
+                    orch.db.local.execute(
+                        "INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,created_at,updated_at) VALUES('warm','p','i','j','s','live',1,1)", (),
+                    ).await.unwrap();
+                    let handle = crate::agent_process::process::RunHandle::new(
+                        Arc::new(Mutex::new(None)),
+                        Arc::new(Mutex::new(Some(
+                            cairn_models::session::claude::ClaudeControl::boxed(Box::new(
+                                CapturingWriter(bytes.clone()),
+                            )),
+                        ))),
+                        Some("s".into()),
+                        Some("j".into()),
+                    );
+                    orch.process_state
+                        .register_process("warm".into(), handle)
+                        .unwrap();
+                    orch.process_state.transition_to_warm("warm");
+                }
+                if closed {
+                    orch.db
+                        .local
+                        .execute(
+                            "UPDATE sessions SET status='closed',closed_at=2 WHERE id='s'",
+                            (),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    // Even an open predecessor cannot receive work after the job
+                    // moves to a successor.
+                    orch.db.local.execute_script(
+                        "INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('successor','j','claude','open',2,2,2);
+                         UPDATE jobs SET current_session_id='successor' WHERE id='j';",
+                    ).await.unwrap();
+                }
+                let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let counted = starts.clone();
+                let _backend =
+                    crate::orchestrator::session::install_orchestrator_test_session_backend(
+                        &orch,
+                        move || Box::new(CountingBackend(counted.clone())),
+                    );
+                assert!(!super::start_leased(
+                    &orch,
+                    super::OrdinaryLease::Private(request),
+                    snapshot,
+                )
+                .unwrap());
+                assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(
+                    bytes.lock().unwrap().is_empty(),
+                    "closed or stale warm process received input"
+                );
+                assert!(!orch.process_state.has_process("cold").unwrap_or(false));
+                assert_eq!(
+                    request_state(&orch, "req").await,
+                    (
+                        "cancelled".into(),
+                        Some("session closed before launch".into())
+                    )
+                );
+                assert_eq!(
+                    text(
+                        &orch,
+                        "SELECT status || ':' || exit_reason FROM runs WHERE id='cold'"
+                    )
+                    .await,
+                    "exited:launch_superseded"
+                );
+                assert_eq!(
+                    text(
+                        &orch,
+                        "SELECT state || ':' || end_reason FROM turns WHERE id='t'"
+                    )
+                    .await,
+                    "cancelled:launch_refused"
+                );
+                assert!(delivery_returned(&orch, "j", "t").await);
+                if warm {
+                    assert!(
+                        orch.process_state.is_warm("warm"),
+                        "fence must not consume the existing process"
+                    );
+                }
+            }
+        }
+    }
+
     /// A promoted launch whose session's process is busy is withdrawn in favour
     /// of that process, which serves the returned wake at its next turn
     /// boundary. The launch's run must end with the withdrawal: left `starting`
@@ -3883,11 +4049,8 @@ mod tests {
         (orch, starts, backend)
     }
 
-    /// Defer an OpenRouter launch of the fixture's run `cold` before readiness,
-    /// asserting that it holds its launch claim, that the stale-run reaper
-    /// spares it, and that nothing has started.
-    async fn defer_stateless_launch(orch: &Orchestrator, starts: &std::sync::atomic::AtomicUsize) {
-        let mut prepared = super::PreparedJob {
+    fn stateless_prepared(orch: &Orchestrator) -> super::PreparedJob {
+        super::PreparedJob {
             job_id: "j".into(),
             project_id: "p".into(),
             run_id: "cold".into(),
@@ -3906,7 +4069,14 @@ mod tests {
             start_reason: crate::models::TurnStartReason::FollowUp,
             origin: crate::storage::LaunchOrigin::Background,
             launch_claim: Some(orch.claim_job_launch("j", "cold")),
-        };
+        }
+    }
+
+    /// Defer an OpenRouter launch of the fixture's run `cold` before readiness,
+    /// asserting that it holds its launch claim, that the stale-run reaper
+    /// spares it, and that nothing has started.
+    async fn defer_stateless_launch(orch: &Orchestrator, starts: &std::sync::atomic::AtomicUsize) {
+        let mut prepared = stateless_prepared(orch);
         assert!(
             !super::enqueue_or_start(orch, &mut prepared, None).unwrap(),
             "a deferred launch reports that no process holds its prompt yet"
@@ -3938,8 +4108,8 @@ mod tests {
         assert_eq!(started(starts), 0, "nothing starts before readiness");
     }
 
-    /// Open readiness and wait for the deferred launch to act, which it
-    /// signals by releasing its claim last.
+    /// Open readiness and wait until the deferred launch registers a process
+    /// or settles the withdrawn run and turn, then releases its claim.
     async fn open_readiness_and_await_release(orch: &Orchestrator) {
         orch.mark_startup_recovery_ready();
         for _ in 0..3000 {
@@ -3949,6 +4119,179 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the deferral never released its claim after readiness");
+    }
+
+    async fn invalidate_stateless_session(orch: &Orchestrator, noncurrent: bool) {
+        let sql = if noncurrent {
+            "INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at)
+               VALUES('successor','j','openrouter','open',2,2,2);
+             UPDATE jobs SET current_session_id='successor' WHERE id='j';"
+        } else {
+            "UPDATE sessions SET status='closed', terminal_reason='rotated_cache_expiry',
+               closed_at=2 WHERE id='s';"
+        };
+        orch.db.local.execute_script(sql).await.unwrap();
+    }
+
+    async fn assert_stateless_withdrawn(
+        orch: &Orchestrator,
+        starts: &std::sync::atomic::AtomicUsize,
+    ) {
+        assert_eq!(started(starts), 0, "no provider received the prompt");
+        assert_eq!(orch.process_state.has_process("cold"), Some(false));
+        assert_eq!(
+            text(orch, "SELECT status FROM runs WHERE id='cold'").await,
+            "exited"
+        );
+        assert_eq!(
+            text(orch, "SELECT exit_reason FROM runs WHERE id='cold'").await,
+            super::LAUNCH_SUPERSEDED_EXIT_REASON
+        );
+        assert_eq!(
+            text(orch, "SELECT state FROM turns WHERE id='t'").await,
+            "cancelled"
+        );
+        assert_eq!(
+            text(orch, "SELECT end_reason FROM turns WHERE id='t'").await,
+            crate::models::TurnEndReason::LaunchRefused.to_string()
+        );
+        assert!(delivery_returned(orch, "j", "t").await);
+        assert_eq!(
+            text(
+                orch,
+                "SELECT CAST(COUNT(*) AS TEXT) FROM runtime_admission_requests"
+            )
+            .await,
+            "0",
+            "stateless withdrawal never creates an admission row"
+        );
+        assert!(orch.claimed_launch_run("j").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_stateless_session_fence_withdraws_closed_and_noncurrent_launches() {
+        for noncurrent in [false, true] {
+            for claimed in [false, true] {
+                let (orch, starts, _backend) = held_launch_fixture(
+                    &format!("direct-stateless-fence-{noncurrent}-{claimed}.db"),
+                    "openrouter",
+                )
+                .await;
+                // Initial starts can reach this seam with an unbound pending
+                // turn; withdrawal must still cancel that turn, not strand it.
+                orch.db
+                    .local
+                    .execute("UPDATE turns SET run_id=NULL WHERE id='t'", ())
+                    .await
+                    .unwrap();
+                invalidate_stateless_session(&orch, noncurrent).await;
+                orch.mark_startup_recovery_ready();
+                let mut prepared = stateless_prepared(&orch);
+                if !claimed {
+                    drop(prepared.launch_claim.take());
+                }
+                assert!(!super::enqueue_or_start(&orch, &mut prepared, None).unwrap());
+                assert!(
+                    prepared.launch_claim.is_none(),
+                    "withdrawal relinquishes its own claim before recomputing, even while preparation lives"
+                );
+                assert_stateless_withdrawn(&orch, &starts).await;
+                assert_eq!(
+                    text(&orch, "SELECT run_id FROM turns WHERE id='t'").await,
+                    "cold"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_stateless_session_fence_rechecks_closed_and_noncurrent_after_readiness() {
+        for noncurrent in [false, true] {
+            let (orch, starts, _backend) = held_launch_fixture(
+                &format!("deferred-stateless-fence-{noncurrent}.db"),
+                "openrouter",
+            )
+            .await;
+            defer_stateless_launch(&orch, &starts).await;
+            invalidate_stateless_session(&orch, noncurrent).await;
+
+            open_readiness_and_await_release(&orch).await;
+            assert_stateless_withdrawn(&orch, &starts).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stateless_session_fence_fails_closed_when_durable_session_facts_are_missing() {
+        for deferred in [false, true] {
+            let (orch, starts, _backend) = held_launch_fixture(
+                &format!("stateless-missing-session-facts-{deferred}.db"),
+                "openrouter",
+            )
+            .await;
+            if deferred {
+                defer_stateless_launch(&orch, &starts).await;
+            }
+            orch.db
+                .local
+                .execute("UPDATE runs SET session_id=NULL WHERE id='cold'", ())
+                .await
+                .unwrap();
+
+            if deferred {
+                open_readiness_and_await_release(&orch).await;
+            } else {
+                orch.mark_startup_recovery_ready();
+                let mut prepared = stateless_prepared(&orch);
+                assert!(!super::enqueue_or_start(&orch, &mut prepared, None).unwrap());
+            }
+            assert_stateless_withdrawn(&orch, &starts).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stateless_session_fence_refuses_a_settled_run_or_turn() {
+        for deferred in [false, true] {
+            for settled_run in [false, true] {
+                let (orch, starts, _backend) = held_launch_fixture(
+                    &format!("stateless-settled-fence-{deferred}-{settled_run}.db"),
+                    "openrouter",
+                )
+                .await;
+                if deferred {
+                    defer_stateless_launch(&orch, &starts).await;
+                }
+                let sql = if settled_run {
+                    "UPDATE runs SET status='exited' WHERE id='cold'"
+                } else {
+                    "UPDATE turns SET state='cancelled',end_reason='launch_refused' WHERE id='t'"
+                };
+                orch.db.local.execute(sql, ()).await.unwrap();
+
+                if deferred {
+                    open_readiness_and_await_release(&orch).await;
+                } else {
+                    orch.mark_startup_recovery_ready();
+                    let mut prepared = stateless_prepared(&orch);
+                    assert!(!super::enqueue_or_start(&orch, &mut prepared, None).unwrap());
+                    assert!(prepared.launch_claim.is_none());
+                }
+                assert_eq!(started(&starts), 0);
+                assert_eq!(orch.process_state.has_process("cold"), Some(false));
+                assert!(delivery_returned(&orch, "j", "t").await);
+                assert_eq!(
+                    text(&orch, "SELECT status FROM runs WHERE id='cold'").await,
+                    "exited"
+                );
+                assert_eq!(
+                    text(
+                        &orch,
+                        "SELECT CAST(COUNT(*) AS TEXT) FROM runtime_admission_requests"
+                    )
+                    .await,
+                    "0"
+                );
+            }
+        }
     }
 
     /// cairn/4758: a stateless launch has no durable admission row, so before

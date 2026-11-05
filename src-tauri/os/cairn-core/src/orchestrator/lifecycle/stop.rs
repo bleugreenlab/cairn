@@ -1319,11 +1319,20 @@ pub(crate) const WATCHDOG_ARM_FAILED_EXIT_REASON: &str = "watchdog_arm_failed";
 /// continuation to the Compact.
 pub(crate) const OPERATOR_COMPACT_EXIT_REASON: &str = "operator_compact";
 
-/// Kill a session with a specific exit reason.
-pub fn kill_session_with_reason(
+/// Whether ending a provider process also ends the job's tool processes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalPolicy {
+    Finalize,
+    Keep,
+}
+
+/// Release admission and stop the registered child without finalizing its run.
+/// The caller owns exit bookkeeping, which can resume the job and must happen
+/// outside the job launch lock.
+pub(super) fn teardown_process(
     orch: &Orchestrator,
     run_id: &str,
-    exit_reason: &str,
+    terminals: TerminalPolicy,
 ) -> Result<(), String> {
     // Removal below destroys the handle carrying the release generation. Do not
     // proceed unless the terminal obligation has been durably recorded; the
@@ -1347,9 +1356,10 @@ pub fn kill_session_with_reason(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Clean up all tool processes — both foreground and background
-    cleanup_inline_commands(orch, run_id);
-    cleanup_job_terminals(orch, run_id);
+    if terminals == TerminalPolicy::Finalize {
+        cleanup_inline_commands(orch, run_id);
+        cleanup_job_terminals(orch, run_id);
+    }
 
     // Remove the handle under the registry lock, but stop its child only after
     // releasing it: `graceful_stop` can wait seconds on a child that ignores
@@ -1389,6 +1399,17 @@ pub fn kill_session_with_reason(
             }
         }
     }
+
+    Ok(())
+}
+
+/// Kill a session with a specific exit reason.
+pub fn kill_session_with_reason(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+) -> Result<(), String> {
+    teardown_process(orch, run_id, TerminalPolicy::Finalize)?;
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
     let final_status = if matches!(

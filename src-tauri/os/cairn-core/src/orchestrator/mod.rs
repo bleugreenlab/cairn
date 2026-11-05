@@ -3934,9 +3934,13 @@ impl Orchestrator {
     }
 
     /// The periodic process sweep: reconcile durable run rows against the
-    /// processes this host actually holds, then trim the warm pool to its memory
-    /// budget. Two jobs on one tick because both are decided from the same
-    /// evidence — which runs have a live process handle right now.
+    /// processes this host actually holds, enforce idle provider-process
+    /// lifetimes, then trim the warm pool to its memory budget. Three jobs on one
+    /// tick, all decided from the registered process handles.
+    ///
+    /// Lifetime enforcement is ungated: closed sessions, cancelled jobs, and
+    /// expired idle prefixes lose their provider process, but keep job terminals.
+    /// It runs before warm trimming and lane promotion measure the room freed.
     ///
     /// Reaping runs unconditionally (`crate::runs::reap`). Nothing else inside a
     /// live session settles a run whose process vanished without finalizing it,
@@ -4033,6 +4037,7 @@ impl Orchestrator {
                     // trim and promotion measure the lanes.
                     crate::execution::jobs::heal_settled_call_admissions(&orch, None);
                     crate::orchestrator::lifecycle::sweep_stranded_watchdog_jobs(&orch);
+                    crate::orchestrator::lifecycle::sweep_process_lifetimes(&orch);
                     orch.collect_warm(crate::agent_process::gc::SpawnRoom::None);
                     // After the warm trim, so a queue head measures the memory
                     // that trim freed; and on every tick, so memory freed by

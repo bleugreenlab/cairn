@@ -2875,10 +2875,9 @@ fn continue_job_launch_locked(
                     // radius than this decision earns. It also means the freshness
                     // query runs only where it can change something.
                     //
-                    // That leaves a real gap — a warm process idle past the
-                    // horizon still pays cache creation on its full prefix on the
-                    // next turn — which needs a warm-process teardown story
-                    // before it can be closed safely (CAIRN-4757).
+                    // The process-lifetime sweep stops idle processes past the
+                    // cache horizon. Their next delivery takes this cold path
+                    // and can rebuild instead of paying full-prefix creation.
                     //
                     // A warm process on a different account than this launch will
                     // authenticate as is no exception: it is restarted on the new
@@ -4975,6 +4974,49 @@ fn rotate_job_onto_successor(
     rotation: Rotation<'_>,
     seed_bytes: usize,
 ) -> Result<String, String> {
+    // The caller holds the job launch lock through rotation. Admission owns a
+    // prepared launch after its in-memory claim drops, until registration.
+    if let Some(run_id) = orch.claimed_launch_run(&job.id) {
+        let on_session = run_db({
+            let db = owning_db.clone();
+            let session_id = session.id.clone();
+            async move {
+                db.query_opt(
+                    "SELECT session_id=?2 FROM runs WHERE id=?1",
+                    (run_id, session_id),
+                    |row| Ok(row.i64(0)? != 0),
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        })?;
+        if on_session != Some(false) {
+            return Err("Cannot rotate session while its launch is claimed".into());
+        }
+    }
+    let awaiting = run_db({
+        let db = owning_db.clone();
+        let local = orch.db.local.clone();
+        let session_id = session.id.clone();
+        async move {
+            let awaiting = crate::storage::awaiting_launch_run_for_session(&db, &session_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if awaiting.is_some() || Arc::ptr_eq(&db, &local) {
+                return Ok::<_, String>(awaiting);
+            }
+            // Team runs live in their replica, but prepared launch packets and
+            // the admission ledger are runner-local.
+            crate::storage::awaiting_launch_run_for_session(&local, &session_id)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })?;
+    if let Some(run_id) = awaiting {
+        return Err(format!(
+            "Cannot rotate session while run {run_id} awaits launch"
+        ));
+    }
     let Rotation {
         reason,
         target_backend,
@@ -4994,7 +5036,11 @@ fn rotate_job_onto_successor(
         // Rotation ends the old physical process even though the logical job
         // continues. Release its provider-runtime claim before dropping the
         // retained handle, then let the successor acquire its own generation.
-        crate::orchestrator::lifecycle::release_and_stop_process(orch, &old_run);
+        if !crate::orchestrator::lifecycle::release_and_stop_process(orch, &old_run) {
+            return Err(format!(
+                "Cannot rotate session: failed to release process {old_run}"
+            ));
+        }
     }
 
     let new_session = run_db({
@@ -5594,6 +5640,7 @@ mod tests {
     use crate::db::DbState;
     use crate::orchestrator::Orchestrator;
     use crate::services::testing::TestServicesBuilder;
+    use crate::sessions::queries::RotationReason;
     use crate::storage::migrated_test_db;
     use crate::storage::SearchIndex;
     use cairn_db::turso::params;
@@ -7235,6 +7282,25 @@ mod tests {
         (orch, db)
     }
 
+    async fn node_with_a_rebuildable_prefix(
+        name: &str,
+    ) -> (Orchestrator, Arc<crate::storage::LocalDb>) {
+        let (orch, db) = node_with_a_provider_request(name).await;
+        let body = "tool output line that a resumed conversation would re-send\n".repeat(400);
+        let data = serde_json::json!({ "toolResult": body, "toolName": "run" }).to_string();
+        for index in 0..8i64 {
+            db.execute(
+                "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                                    parent_tool_use_id, created_at)
+                 VALUES(?1, 'r1', 's1', ?2, 0, 'tool_result', ?3, NULL, 0)",
+                params![format!("e-tool-{index}"), index + 10, data.clone()],
+            )
+            .await
+            .unwrap();
+        }
+        (orch, db)
+    }
+
     /// The prefix cache state this node's session is in at `now`, read the way
     /// the continuation path reads it — through the freshness query, not a value
     /// the test made up.
@@ -8438,6 +8504,464 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotation_refuses_a_claimed_launch_before_changing_the_session() {
+        let (orch, db) = node_with_a_provider_request("rotation-claimed-launch").await;
+        let job = super::load_job(db.clone(), "j".into(), "rotation claim test")
+            .await
+            .unwrap();
+        let session = crate::sessions::queries::get(&db, "s1").await.unwrap();
+        let launch_lock = orch.job_launch_lock("j");
+        let claim = orch.claim_job_launch("j", "r1");
+        let error = {
+            let _guard = launch_lock.lock().unwrap();
+            super::rotate_job_onto_successor(
+                &orch,
+                &db,
+                &job,
+                &session,
+                super::Rotation {
+                    reason: RotationReason::CacheExpiry,
+                    target_backend: None,
+                    boundary: None,
+                },
+                0,
+            )
+            .unwrap_err()
+        };
+        assert!(error.contains("launch is claimed"), "{error}");
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM sessions WHERE job_id='j'", ())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            crate::sessions::queries::get(&db, "s1")
+                .await
+                .unwrap()
+                .status,
+            crate::models::SessionStatus::Open
+        );
+        drop(claim);
+        let rotation = {
+            let _guard = launch_lock.lock().unwrap();
+            super::rotate_job_onto_successor(
+                &orch,
+                &db,
+                &job,
+                &session,
+                super::Rotation {
+                    reason: RotationReason::CacheExpiry,
+                    target_backend: None,
+                    boundary: None,
+                },
+                0,
+            )
+        };
+        assert!(
+            rotation.is_ok(),
+            "rotation can proceed after the preparation claim ends"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotation_refuses_a_durable_queued_launch_and_promotion_uses_the_open_session() {
+        let (orch, db) = node_with_a_rebuildable_prefix("rotation-queued-launch").await;
+        db.execute_script(
+            "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e','recipe','i','p','running',1,1);
+             UPDATE jobs SET execution_id='e',issue_id='i',recipe_node_id='builder' WHERE id='j';
+             UPDATE runs SET status='exited',exited_at=2 WHERE id='r1';
+             INSERT INTO runs(id,job_id,project_id,issue_id,session_id,status,start_mode,created_at,updated_at)
+               VALUES('queued','j','p','i','s1','starting','resume',3,3);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at)
+               VALUES('pending-turn','s1','queued','j',1,'pending','resume',3,3);
+             INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_generation,created_at,updated_at)
+               VALUES('req-queued','private-runtime','lane','ordinary:queued','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,1,'queued',0,3,3);",
+        ).await.unwrap();
+        crate::storage::persist_prepared_ordinary_launch(&db, crate::storage::PreparedOrdinaryLaunch {
+            request_id: "req-queued".into(), job_id: "j".into(), run_id: "queued".into(),
+            session_id: "s1".into(), turn_id: "pending-turn".into(), execution_id: "e".into(),
+            prompt: "queued delivery".into(), reason: crate::models::TurnStartReason::FollowUp,
+            session_start: crate::storage::PreparedSessionStart::Resume {
+                session_id: "s1".into(), backend_id: "native-thread-1".into(),
+            },
+            model: String::new(), agent_config: serde_json::Value::Null, output_schema: None,
+            runtime_capability: serde_json::from_value(serde_json::json!({
+                "class":"dedicated_process","lane":"lane",
+                "host_requirement":{"requirement":"resident_on","host_kind":"runner"},
+                "claim":{"resident_process_units":1,"server_instance_key":null,"logical_stream_units":1,"estimated_memory_bytes":null},
+                "supports_warm_reuse":true
+            })).unwrap(),
+            provider_account_id: None, identity_override: None,
+            origin: crate::storage::LaunchOrigin::Background, created_at: 3,
+        }).await.unwrap();
+        assert!(
+            orch.claimed_launch_run("j").is_none(),
+            "admission alone must cover the launch"
+        );
+        let job = super::load_job(db.clone(), "j".into(), "queued rotation test")
+            .await
+            .unwrap();
+        let session = crate::sessions::queries::get(&db, "s1").await.unwrap();
+        let now = 7200;
+        let prefix = cache_state_at(&db, now).await;
+        assert_eq!(prefix, PrefixCacheState::Cold);
+        assert!(!orch.process_state.is_warm("r1"));
+        assert_eq!(
+            decide_continue_action(
+                "claude",
+                Some("native-thread-1"),
+                Some("claude"),
+                prefix,
+                false
+            ),
+            ContinueAction::MaybeReseed
+        );
+        {
+            let launch_lock = orch.job_launch_lock("j");
+            let _guard = launch_lock.lock().unwrap();
+            assert!(matches!(
+                super::attempt_session_reseed(
+                    &orch,
+                    &db,
+                    &job,
+                    &session,
+                    now,
+                    Some("claude"),
+                    prefix,
+                ),
+                ReseedDecision::NativeResume(None)
+            ));
+        }
+        assert_eq!(
+            crate::sessions::queries::get(&db, "s1")
+                .await
+                .unwrap()
+                .status,
+            crate::models::SessionStatus::Open
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM sessions WHERE job_id='j'", ())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT current_session_id FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s1")
+        );
+
+        let _backend =
+            crate::orchestrator::session::install_orchestrator_test_session_backend(&orch, || {
+                Box::new(RegisteringBackend)
+            });
+        super::super::ordinary_admission::promote_private_lane_blocking(&orch, "lane").unwrap();
+        let admission = crate::storage::get_admission_request(&db, "req-queued")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                admission.state.as_str(),
+                admission.failure_detail.as_deref()
+            ),
+            ("active", None),
+            "the queued launch must reach the backend, not fail during session preparation"
+        );
+        assert_eq!(
+            orch.process_state.find_process_by_session("s1").as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT state FROM turns WHERE id='pending-turn'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            crate::sessions::queries::get(&db, "s1")
+                .await
+                .unwrap()
+                .status,
+            crate::models::SessionStatus::Open
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotation_refuses_a_team_launch_from_the_runner_local_ledger() {
+        let (_replica_orch, replica) = node_with_a_provider_request("rotation-team-replica").await;
+        replica
+            .exclusive(|conn| {
+                Box::pin(async move {
+                    conn.execute("DROP TABLE runtime_admission_requests", ())
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let orch = test_orchestrator(migrated_test_db("rotation-team-runner-local").await);
+        orch.db.local.execute_script(
+            "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_generation,created_at,updated_at)
+               VALUES('team-request','team:team','lane','ordinary:team-run','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,1,'queued',0,1,1);
+             INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
+               VALUES('team-request','j','team-run','s1','turn','e','prompt','resume','{}','','null','{}',1);",
+        ).await.unwrap();
+        assert!(orch
+            .db
+            .local
+            .query_opt_text("SELECT id FROM runs WHERE id='team-run'", ())
+            .await
+            .unwrap()
+            .is_none());
+        let job = super::load_job(replica.clone(), "j".into(), "team rotation test")
+            .await
+            .unwrap();
+        let session = crate::sessions::queries::get(&replica, "s1").await.unwrap();
+        let launch_lock = orch.job_launch_lock("j");
+        let error = {
+            let _guard = launch_lock.lock().unwrap();
+            super::rotate_job_onto_successor(
+                &orch,
+                &replica,
+                &job,
+                &session,
+                super::Rotation {
+                    reason: RotationReason::CacheExpiry,
+                    target_backend: None,
+                    boundary: None,
+                },
+                0,
+            )
+            .unwrap_err()
+        };
+        assert!(error.contains("team-run awaits launch"), "{error}");
+        assert_eq!(
+            crate::sessions::queries::get(&replica, "s1")
+                .await
+                .unwrap()
+                .status,
+            crate::models::SessionStatus::Open
+        );
+        assert_eq!(
+            replica
+                .query_opt_i64("SELECT COUNT(*) FROM sessions WHERE job_id='j'", ())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            replica
+                .query_opt_text("SELECT current_session_id FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s1")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rotation_release_failure_keeps_the_process_session_and_successor_unchanged() {
+        let (orch, db) = standing_node("rotation-release-failure").await;
+        db.execute_script(
+            "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,created_at,updated_at)
+               VALUES('req','private-runtime','lane','ordinary:r1','{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,1,'active','owner',1,1,1);",
+        ).await.unwrap();
+        let handle = orch
+            .process_state
+            .processes
+            .lock()
+            .unwrap()
+            .remove("r1")
+            .unwrap();
+        orch.process_state.prepare_admission_claim(
+            "r1".into(),
+            crate::agent_process::process::ProcessAdmissionClaim {
+                request_id: "req".into(),
+                workspace_key: "private-runtime".into(),
+                launch_key: "ordinary:r1".into(),
+                owner: "owner".into(),
+                generation: 1,
+                team_workspace_id: None,
+            },
+        );
+        orch.process_state
+            .register_process("r1".into(), handle)
+            .unwrap();
+        db.exclusive(|conn| Box::pin(async move {
+            conn.execute(
+                "CREATE TRIGGER fail_rotation_release BEFORE UPDATE OF state ON runtime_admission_requests
+                 WHEN NEW.state='released' BEGIN SELECT RAISE(ABORT, 'injected release failure'); END;", (),
+            ).await?;
+            Ok(())
+        })).await.unwrap();
+        let job = super::load_job(db.clone(), "j".into(), "release failure test")
+            .await
+            .unwrap();
+        let session = crate::sessions::queries::get(&db, "s1").await.unwrap();
+        let launch_lock = orch.job_launch_lock("j");
+        let error = {
+            let _guard = launch_lock.lock().unwrap();
+            super::rotate_job_onto_successor(
+                &orch,
+                &db,
+                &job,
+                &session,
+                super::Rotation {
+                    reason: RotationReason::CacheExpiry,
+                    target_backend: None,
+                    boundary: None,
+                },
+                0,
+            )
+            .unwrap_err()
+        };
+        assert!(error.contains("failed to release process"), "{error}");
+        assert!(orch.process_state.is_warm("r1"));
+        assert!(orch.process_state.admission_claim("r1").is_some());
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT state FROM runtime_admission_requests WHERE request_id='req'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            crate::sessions::queries::get(&db, "s1")
+                .await
+                .unwrap()
+                .status,
+            crate::models::SessionStatus::Open
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM sessions WHERE job_id='j'", ())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT current_session_id FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("s1")
+        );
+
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("DROP TRIGGER fail_rotation_release", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let successor = {
+            let _guard = launch_lock.lock().unwrap();
+            super::rotate_job_onto_successor(
+                &orch,
+                &db,
+                &job,
+                &session,
+                super::Rotation {
+                    reason: RotationReason::CacheExpiry,
+                    target_backend: None,
+                    boundary: None,
+                },
+                0,
+            )
+            .unwrap()
+        };
+        assert_ne!(successor, "s1");
+        assert!(!orch.process_state.has_process("r1").unwrap_or(false));
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT state FROM runtime_admission_requests WHERE request_id='req'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("released")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_delivery_after_the_lifetime_sweep_takes_the_cold_reseed_path() {
+        let (orch, db) = node_with_a_rebuildable_prefix("cold-after-lifetime-sweep").await;
+        // The injected fixture clock is zero; the provider last saw this prefix
+        // two hours earlier, independent of wall-clock execution time.
+        db.execute(
+            "UPDATE events SET created_at=-7200 WHERE id='e-request'",
+            (),
+        )
+        .await
+        .unwrap();
+        orch.process_state
+            .register_process("r1".into(), RunHandle::test_handle(Some("s1"), Some("j")))
+            .unwrap();
+        orch.process_state.transition_to_warm("r1");
+        assert!(orch.process_state.is_warm("r1"));
+        crate::orchestrator::lifecycle::sweep_process_lifetimes(&orch);
+        assert!(!orch.process_state.has_process("r1").unwrap_or(false));
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT status || ':' || exit_reason FROM runs WHERE id='r1'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("exited:cache_horizon_idle")
+        );
+
+        let session = crate::sessions::queries::get(&db, "s1").await.unwrap();
+        let job = super::load_job(db.clone(), "j".into(), "after lifetime sweep")
+            .await
+            .unwrap();
+        assert!(orch.process_state.find_warm_by_session("s1").is_none());
+        let now = orch.services.clock.now();
+        let prefix = cache_state_at(&db, now).await;
+        assert_eq!(prefix, PrefixCacheState::Cold);
+        assert_eq!(
+            decide_continue_action(
+                "claude",
+                Some("native-thread-1"),
+                Some("claude"),
+                prefix,
+                false
+            ),
+            ContinueAction::MaybeReseed
+        );
+        let launch_lock = orch.job_launch_lock("j");
+        let reseed = {
+            let _guard = launch_lock.lock().unwrap();
+            super::attempt_session_reseed(&orch, &db, &job, &session, now, Some("claude"), prefix)
+        };
+        let ReseedDecision::Rebuilt(outcome, Some(decision)) = reseed else {
+            panic!("the next delivery must rebuild a cold prefix when the seed pays");
+        };
+        assert_ne!(outcome.new_session_id, "s1");
+        assert_eq!(decision.cache_state, "cold");
+        assert_eq!(
+            crate::sessions::queries::get(&db, "s1")
+                .await
+                .unwrap()
+                .terminal_reason
+                .as_deref(),
+            Some("rotated_cache_expiry")
+        );
+    }
+
     /// Acceptance 2, and the other side of the guard. A transcript whose bulk is
     /// tool output is exactly where the bounded digest wins: native resume makes
     /// the provider recreate every result body, while the digest carries one row
@@ -8446,19 +8970,7 @@ mod tests {
     async fn a_cold_prefix_rebuilds_when_the_seed_pays_for_itself() {
         use crate::sessions::queries::get as get_session;
 
-        let (orch, db) = node_with_a_provider_request("cold-prefix-rebuilds").await;
-        let body = "tool output line that a resumed conversation would re-send\n".repeat(400);
-        let data = serde_json::json!({ "toolResult": body, "toolName": "run" }).to_string();
-        for index in 0..8i64 {
-            db.execute(
-                "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
-                                    parent_tool_use_id, created_at)
-                 VALUES(?1, 'r1', 's1', ?2, 0, 'tool_result', ?3, NULL, 0)",
-                params![format!("e-tool-{index}"), index + 10, data.clone()],
-            )
-            .await
-            .unwrap();
-        }
+        let (orch, db) = node_with_a_rebuildable_prefix("cold-prefix-rebuilds").await;
 
         // The measurement the decision turns on, taken here so this test fails
         // loudly if the digest ever stops eliding what it elides today.
