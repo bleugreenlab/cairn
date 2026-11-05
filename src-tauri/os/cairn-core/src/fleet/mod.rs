@@ -732,6 +732,11 @@ struct PendingPolicyResult {
     waiter: oneshot::Sender<Result<cairn_common::executor_protocol::ExecutorRuntimePolicy, String>>,
 }
 
+struct PendingMemoryDiagnosticResult {
+    generation: u64,
+    waiter: oneshot::Sender<Result<(), String>>,
+}
+
 struct PendingDrainResult {
     executor_id: String,
     generation: u64,
@@ -1487,6 +1492,7 @@ pub struct Fleet {
     pending_residency: Arc<Mutex<PendingResidencyResults>>,
     pending_materialization_reads: Arc<Mutex<PendingMaterializationReads>>,
     pending_policy: Arc<Mutex<HashMap<String, PendingPolicyResult>>>,
+    pending_memory_diagnostic: Arc<Mutex<HashMap<String, PendingMemoryDiagnosticResult>>>,
     desired_runtime_policies:
         Arc<Mutex<HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>>>,
     pending_drain: Arc<Mutex<HashMap<String, PendingDrainResult>>>,
@@ -6233,6 +6239,20 @@ impl Fleet {
                 }
                 false
             }
+            ExecutorMessage::MemoryDiagnosticResponse {
+                correlation_id,
+                result,
+            } => {
+                let mut pending = self.pending_memory_diagnostic.lock().unwrap();
+                if pending.get(&correlation_id).is_some_and(|request| {
+                    executor_id == COLOCATED_EXECUTOR_ID && request.generation == generation
+                }) {
+                    if let Some(request) = pending.remove(&correlation_id) {
+                        let _ = request.waiter.send(result);
+                    }
+                }
+                false
+            }
             ExecutorMessage::RuntimePolicyResponse {
                 correlation_id,
                 result,
@@ -8117,6 +8137,73 @@ impl Fleet {
         self.lock_connections()
             .get(executor_id)
             .map(executor_public_name)
+    }
+
+    /// Cached diagnostic from exactly the local connection the caller inspected.
+    /// This does not ask the executor for a sample, nor retire an expired watch.
+    pub(crate) fn memory_diagnostic(
+        &self,
+        expected_generation: u64,
+        now_unix_ms: u64,
+    ) -> Option<cairn_common::executor_protocol::MemoryDiagnosticEvidence> {
+        self.lock_connections()
+            .get(COLOCATED_EXECUTOR_ID)
+            .filter(|entry| entry.colocated && entry.generation == expected_generation)
+            .and_then(|entry| entry.health.memory_diagnostic.as_ref())
+            .filter(|evidence| evidence.expires_at_unix_ms > now_unix_ms)
+            .cloned()
+    }
+
+    pub(crate) async fn set_memory_diagnostic(
+        &self,
+        expected_generation: u64,
+        attach: Option<cairn_common::executor_protocol::MemoryDiagnosticAttach>,
+    ) -> Result<(), String> {
+        if !cfg!(debug_assertions) {
+            return Err("memory diagnostics are development-only".into());
+        }
+        if let Some(attach) = &attach {
+            attach.validate()?;
+        }
+        let sender = self
+            .lock_connections()
+            .get(COLOCATED_EXECUTOR_ID)
+            .filter(|entry| entry.colocated && entry.generation == expected_generation)
+            .map(|entry| entry.sender.clone())
+            .ok_or_else(|| "local executor connection generation is stale".to_string())?;
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.pending_memory_diagnostic.lock().unwrap().insert(
+            correlation_id.clone(),
+            PendingMemoryDiagnosticResult {
+                generation: expected_generation,
+                waiter: tx,
+            },
+        );
+        if sender
+            .send(ExecutorMessage::MemoryDiagnosticRequest {
+                correlation_id: correlation_id.clone(),
+                expected_generation,
+                attach,
+            })
+            .is_err()
+        {
+            self.pending_memory_diagnostic
+                .lock()
+                .unwrap()
+                .remove(&correlation_id);
+            return Err("local executor disconnected while changing memory diagnostic".into());
+        }
+        let result = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("local executor dropped the memory diagnostic response".into()),
+            Err(_) => Err("memory diagnostic response timed out; an accepted watch still expires within 60 seconds".into()),
+        };
+        self.pending_memory_diagnostic
+            .lock()
+            .unwrap()
+            .remove(&correlation_id);
+        result
     }
 
     pub async fn set_executor_runtime_policy(
@@ -25200,6 +25287,99 @@ mod tests {
         });
         assert_eq!(calls, IDLE_RETENTION_CEILING_PER_PROJECT);
         assert_eq!(result["first"].files, 1);
+    }
+
+    #[test]
+    fn memory_diagnostic_cache_is_generation_fenced_and_expiry_is_read_only() {
+        use cairn_common::executor_protocol::MemoryDiagnosticEvidence;
+        let pool = Fleet::default();
+        let (id, mut entry) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        let evidence = MemoryDiagnosticEvidence {
+            run_id: "registered".into(),
+            anchor: cairn_common::process_identity::ProcessAnchor {
+                pid: 42,
+                start_token: "1".into(),
+            },
+            expires_at_unix_ms: NOW + 60_000,
+            cached: None,
+        };
+        Arc::make_mut(&mut entry.health).memory_diagnostic = Some(evidence.clone());
+        pool.lock_connections().insert(id, entry);
+        assert_eq!(pool.memory_diagnostic(1, NOW), Some(evidence));
+        assert!(pool.memory_diagnostic(2, NOW).is_none());
+        assert!(pool.memory_diagnostic(1, NOW + 60_000).is_none());
+        assert!(
+            pool.lock_connections()[COLOCATED_EXECUTOR_ID]
+                .health
+                .memory_diagnostic
+                .is_some(),
+            "reads must not clean up or mutate the watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_diagnostic_rpc_is_local_and_correlates_generation() {
+        let pool = Fleet::default();
+        let (id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        let (sender, mut received) = mpsc::unbounded_channel();
+        local.sender = sender;
+        pool.lock_connections().insert(id, local);
+        let (remote_id, remote) = fleet_entry("remote", "linux", 0, &[]);
+        pool.lock_connections().insert(remote_id, remote);
+
+        assert!(pool.set_memory_diagnostic(2, None).await.is_err());
+        assert!(received.try_recv().is_err());
+        if cfg!(debug_assertions) {
+            let request = pool.set_memory_diagnostic(1, None);
+            let reply = async {
+                let ExecutorMessage::MemoryDiagnosticRequest {
+                    correlation_id,
+                    expected_generation,
+                    attach,
+                } = received.recv().await.unwrap()
+                else {
+                    panic!("expected diagnostic control");
+                };
+                assert_eq!(expected_generation, 1);
+                assert!(attach.is_none());
+                for (source, generation) in [("remote", 1), (COLOCATED_EXECUTOR_ID, 2)] {
+                    pool.handle_executor_message(
+                        source,
+                        generation,
+                        ExecutorMessage::MemoryDiagnosticResponse {
+                            correlation_id: correlation_id.clone(),
+                            result: Ok(()),
+                        },
+                    );
+                    assert!(pool
+                        .pending_memory_diagnostic
+                        .lock()
+                        .unwrap()
+                        .contains_key(&correlation_id));
+                }
+                pool.handle_executor_message(
+                    COLOCATED_EXECUTOR_ID,
+                    1,
+                    ExecutorMessage::MemoryDiagnosticResponse {
+                        correlation_id,
+                        result: Ok(()),
+                    },
+                );
+            };
+            let (result, ()) = tokio::join!(request, reply);
+            assert!(result.is_ok());
+            assert!(pool.pending_memory_diagnostic.lock().unwrap().is_empty());
+        } else {
+            assert!(pool.set_memory_diagnostic(1, None).await.is_err());
+            assert!(received.try_recv().is_err());
+        }
+
+        pool.lock_connections()
+            .get_mut(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .colocated = false;
+        assert!(pool.set_memory_diagnostic(1, None).await.is_err());
+        assert!(received.try_recv().is_err());
     }
 
     fn fleet_entry(

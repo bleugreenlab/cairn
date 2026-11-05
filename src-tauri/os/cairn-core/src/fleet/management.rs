@@ -1881,6 +1881,51 @@ impl RoleOutcome {
     }
 }
 
+/// A diagnostic selects a registered runner run, never caller-supplied kernel identity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MemoryDiagnosticSelection {
+    pub run_id: String,
+    pub duration_ms: u64,
+}
+
+pub(crate) fn resolve_memory_diagnostic(
+    orch: &Orchestrator,
+    name: &str,
+    expected_generation: u64,
+    selection: Option<&MemoryDiagnosticSelection>,
+) -> Result<Option<cairn_common::executor_protocol::MemoryDiagnosticAttach>, String> {
+    if !cfg!(debug_assertions) {
+        return Err("memory diagnostics are development-only".into());
+    }
+    let executor_id = resolve_executor_reference(orch, name)?;
+    if executor_id != super::COLOCATED_EXECUTOR_ID {
+        return Err("memory diagnostics are available only on cairn://executors/local".into());
+    }
+    ensure_current_generation(orch, &executor_id, expected_generation)?;
+    selection.map(|selection| {
+        let (anchor, _) = orch.process_state.memory_diagnostic(&selection.run_id)
+            .ok_or_else(|| "memory diagnostic runId is not a currently registered runner process with a captured leader".to_string())?;
+        let attach = cairn_common::executor_protocol::MemoryDiagnosticAttach {
+            run_id: selection.run_id.clone(), anchor, duration_ms: selection.duration_ms,
+        };
+        attach.validate()?;
+        Ok(attach)
+    }).transpose()
+}
+
+pub(crate) async fn set_memory_diagnostic(
+    orch: &Orchestrator,
+    name: &str,
+    expected_generation: u64,
+    selection: Option<&MemoryDiagnosticSelection>,
+) -> Result<(), String> {
+    let attach = resolve_memory_diagnostic(orch, name, expected_generation, selection)?;
+    orch.fleet
+        .set_memory_diagnostic(expected_generation, attach)
+        .await
+}
+
 /// Refuse a fenced control whose generation is not the one that is live.
 pub fn ensure_current_generation(
     orch: &Orchestrator,
@@ -1919,6 +1964,29 @@ mod tests {
             config_dir.to_path_buf(),
         )
         .build()
+    }
+
+    #[tokio::test]
+    async fn memory_diagnostic_resolves_only_registered_run_and_local_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(sender);
+        let selection = MemoryDiagnosticSelection {
+            run_id: "not-registered".into(),
+            duration_ms: 60_000,
+        };
+        assert!(resolve_memory_diagnostic(&orch, "local", generation, Some(&selection)).is_err());
+        assert!(resolve_memory_diagnostic(&orch, "local", generation + 1, None).is_err());
+        if cfg!(debug_assertions) {
+            assert!(resolve_memory_diagnostic(&orch, "local", generation, None)
+                .unwrap()
+                .is_none());
+        } else {
+            assert!(resolve_memory_diagnostic(&orch, "local", generation, None).is_err());
+        }
+        orch.fleet.seed_host_for_test("remote", Default::default());
+        assert!(resolve_memory_diagnostic(&orch, "remote", 1, None).is_err());
     }
 
     #[tokio::test]

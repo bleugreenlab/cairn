@@ -7,44 +7,15 @@
 //! spawn checks that pair immediately before the signal, and treats a changed
 //! start time as "the process I meant is gone", never as a target.
 
-/// The kernel's start time for `pid`, rendered as an opaque token, or `None`
-/// when no such process exists or this platform cannot say.
-#[cfg(target_os = "linux")]
+/// The kernel's start time for `pid`, including an exited, unreaped child.
+/// A token identifies a lifetime, not liveness; use [`process_presence`] when
+/// deciding whether a recorded process is still present.
 pub fn process_start_token(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The comm field may contain spaces and parentheses. Fields after its final
-    // ')' begin at proc field 3; starttime is field 22, index 19 from there.
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)
-        .map(str::to_owned)
+    cairn_procmem::platform::read_start_token(pid)
 }
 
-#[cfg(target_os = "macos")]
-pub fn process_start_token(pid: u32) -> Option<String> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    (read == size).then(|| format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn process_start_token(_pid: u32) -> Option<String> {
-    None
-}
-
-/// Whether [`process_start_token`] can answer on this platform at all. Where it
-/// cannot, `None` means "unknown", not "gone".
-pub const START_TOKENS_SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+/// Whether start tokens are available from this platform's kernel.
+pub const START_TOKENS_SUPPORTED: bool = cairn_procmem::platform::MEMORY_SUPPORTED;
 
 /// Whether `pid` names a live process, of any identity.
 #[cfg(unix)]
@@ -99,12 +70,44 @@ impl ProcessPresence {
 }
 
 pub fn process_presence(pid: u32, expected_start_token: &str) -> ProcessPresence {
-    match process_start_token(pid) {
-        Some(actual) if actual == expected_start_token => ProcessPresence::Present,
-        Some(_) => ProcessPresence::Reused,
-        None if START_TOKENS_SUPPORTED => ProcessPresence::Gone,
-        None if process_is_alive(pid) => ProcessPresence::Unverifiable,
-        None => ProcessPresence::Gone,
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        // Capture identity survives exit for Darwin zombies and held Windows
+        // process objects. Only the live-state reader distinguishes those from
+        // running processes and preserves unreadable identity as uncertainty.
+        presence_from_kernel_read(
+            cairn_procmem::platform::read_kernel_state(pid),
+            expected_start_token,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        // Linux can retain a zombie thread-group leader while other threads
+        // still hold resources, so presence keeps its token-based contract.
+        match process_start_token(pid) {
+            Some(actual) if actual == expected_start_token => ProcessPresence::Present,
+            Some(_) => ProcessPresence::Reused,
+            None if START_TOKENS_SUPPORTED => ProcessPresence::Gone,
+            None if process_is_alive(pid) => ProcessPresence::Unverifiable,
+            None => ProcessPresence::Gone,
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn presence_from_kernel_read(
+    reading: cairn_procmem::KernelRead,
+    expected_start_token: &str,
+) -> ProcessPresence {
+    match reading {
+        cairn_procmem::KernelRead::Live(process)
+            if process.start.token() == expected_start_token =>
+        {
+            ProcessPresence::Present
+        }
+        cairn_procmem::KernelRead::Live(_) => ProcessPresence::Reused,
+        cairn_procmem::KernelRead::Gone => ProcessPresence::Gone,
+        cairn_procmem::KernelRead::Unreadable => ProcessPresence::Unverifiable,
     }
 }
 
@@ -515,6 +518,64 @@ pub fn signal_anchored_group(
     Ok(Some(anchor.pid))
 }
 
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod kernel_presence_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_identity_is_not_proof_of_exit() {
+        let presence = presence_from_kernel_read(cairn_procmem::KernelRead::Unreadable, "123");
+        assert_eq!(presence, ProcessPresence::Unverifiable);
+        assert!(!presence.is_gone());
+        assert_eq!(
+            presence_from_kernel_read(cairn_procmem::KernelRead::Gone, "123"),
+            ProcessPresence::Gone
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_presence_tests {
+    use super::*;
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_retained_exited_child_keeps_its_token_but_is_not_present() {
+        let mut child = Child(
+            std::process::Command::new("bun")
+                .args(["-e", "setInterval(() => {}, 1000)"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a long-lived child"),
+        );
+        let pid = child.0.id();
+        let token = process_start_token(pid).expect("live child token");
+        assert_eq!(process_presence(pid, &token), ProcessPresence::Present);
+        assert_eq!(
+            process_presence(pid, "not-the-token"),
+            ProcessPresence::Reused
+        );
+        child.0.kill().expect("terminate the child");
+        child.0.wait().expect("wait for child exit");
+        assert!(!process_is_alive(pid));
+        assert_eq!(
+            process_start_token(pid),
+            Some(token.clone()),
+            "the retained process handle must preserve capture identity"
+        );
+        assert_eq!(process_presence(pid, &token), ProcessPresence::Gone);
+    }
+}
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
@@ -529,6 +590,48 @@ mod tests {
             ProcessPresence::Reused
         );
         assert!(process_is_alive(pid));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreaped_child_keeps_its_token_but_is_not_present() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let token = process_start_token(pid).expect("live child token");
+        child.0.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(
+            cairn_procmem::platform::read_kernel_state(pid),
+            cairn_procmem::KernelRead::Gone
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not finish exiting"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            process_start_token(pid),
+            Some(token.clone()),
+            "capture must include unreaped children"
+        );
+        assert_eq!(process_presence(pid, &token), ProcessPresence::Gone);
+        assert_eq!(
+            signal_verified(pid, &token, None, libc::SIGKILL).unwrap(),
+            SignalOutcome::Gone
+        );
     }
 
     #[test]

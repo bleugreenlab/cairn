@@ -11281,3 +11281,111 @@ mod runner_scratch_tests {
         );
     }
 }
+
+/// Both sides are cached independently; their sample times need not coincide.
+pub(crate) fn render_memory_diagnostic(
+    evidence: &cairn_common::executor_protocol::MemoryDiagnosticEvidence,
+    runner: Option<&(
+        cairn_common::process_identity::ProcessAnchor,
+        Option<cairn_common::executor_protocol::MemoryDiagnosticReading>,
+    )>,
+    captured_at_unix_ms: u64,
+) -> String {
+    let mut out = format!(
+        "\n## Development memory diagnostic (not accounting)\n\n- Runner run: {}\n- Captured leader: pid {} start {}\n- Expires in: {} ms\n\nThis watch grants no process ownership and contributes no OOM, reservation, live-accounting or stall evidence. Reads use caches only. Independently timed RSS readings need not be equal.\n",
+        evidence.run_id, evidence.anchor.pid, evidence.anchor.start_token,
+        evidence.expires_at_unix_ms.saturating_sub(captured_at_unix_ms),
+    );
+    diagnostic_reading(
+        &mut out,
+        "Executor cache",
+        evidence.cached.as_ref(),
+        captured_at_unix_ms,
+    );
+    match runner {
+        Some((anchor, cached)) if anchor == &evidence.anchor => {
+            diagnostic_reading(&mut out, "Runner cache", cached.as_ref(), captured_at_unix_ms);
+        }
+        Some(_) => out.push_str("\n### Runner cache\n\nRegistered anchor changed; not comparable to this diagnostic. Detach and select the current run again.\n"),
+        None => out.push_str("\n### Runner cache\n\nRun is no longer registered with a captured leader.\n"),
+    }
+    out
+}
+
+fn diagnostic_reading(
+    out: &mut String,
+    label: &str,
+    reading: Option<&cairn_common::executor_protocol::MemoryDiagnosticReading>,
+    captured_at_unix_ms: u64,
+) {
+    out.push_str(&format!("\n### {label}\n\n"));
+    let Some(reading) = reading else {
+        out.push_str("No successful cached tick yet; this is not a measured zero.\n");
+        return;
+    };
+    out.push_str(&format!(
+        "- Tick: {} unix ms (age {} ms)\n- Resident bytes: {}{}\n- RSS members read/known: {}/{}\n- Complete: {}\n- Verified member identities:\n",
+        reading.tick_unix_ms, captured_at_unix_ms.saturating_sub(reading.tick_unix_ms),
+        if reading.incomplete { "at least " } else { "" }, reading.resident_bytes,
+        reading.members_read, reading.members_total, !reading.incomplete,
+    ));
+    for member in &reading.members {
+        out.push_str(&format!(
+            "  - pid {} start {}\n",
+            member.pid, member.start_token
+        ));
+    }
+}
+
+#[cfg(test)]
+mod memory_diagnostic_tests {
+    use super::*;
+    use cairn_common::executor_protocol::{MemoryDiagnosticEvidence, MemoryDiagnosticReading};
+    use cairn_common::process_identity::ProcessAnchor;
+
+    #[test]
+    fn memory_diagnostic_renderer_names_gaps_and_refuses_different_anchor() {
+        let anchor = ProcessAnchor {
+            pid: 42,
+            start_token: "1".into(),
+        };
+        let mut evidence = MemoryDiagnosticEvidence {
+            run_id: "registered".into(),
+            anchor: anchor.clone(),
+            expires_at_unix_ms: 61_000,
+            cached: None,
+        };
+        let rendered = render_memory_diagnostic(&evidence, None, 2_000);
+        assert!(rendered.contains("not accounting"));
+        assert!(rendered.contains("not a measured zero"));
+        assert!(rendered.contains("no longer registered"));
+
+        let cached = MemoryDiagnosticReading {
+            tick_unix_ms: 1_000,
+            members: vec![anchor.clone()],
+            resident_bytes: 123,
+            members_read: 1,
+            members_total: 2,
+            incomplete: true,
+        };
+        evidence.cached = Some(cached.clone());
+        let runner = (anchor.clone(), Some(cached));
+        let rendered = render_memory_diagnostic(&evidence, Some(&runner), 2_000);
+        assert_eq!(rendered.matches("age 1000 ms").count(), 2);
+        assert_eq!(rendered.matches("Resident bytes: at least 123").count(), 2);
+        assert_eq!(rendered.matches("RSS members read/known: 1/2").count(), 2);
+        assert_eq!(rendered.matches("Complete: false").count(), 2);
+        assert_eq!(rendered.matches("pid 42 start 1").count(), 3);
+
+        let different = (
+            ProcessAnchor {
+                pid: 42,
+                start_token: "2".into(),
+            },
+            runner.1,
+        );
+        let rendered = render_memory_diagnostic(&evidence, Some(&different), 2_000);
+        assert!(rendered.contains("Registered anchor changed; not comparable"));
+        assert_eq!(rendered.matches("Resident bytes").count(), 1);
+    }
+}

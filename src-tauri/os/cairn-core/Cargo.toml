@@ -13,6 +13,7 @@ keywords = ["agent", "orchestration", "mcp"]
 cairn-attention = { path = "../cairn-attention" }
 cairn-workflow = { path = "../cairn-workflow" }
 cairn-session = { path = "../cairn-session" }
+cairn-procmem = { path = "../cairn-procmem" }
 cairn-config = { path = "../cairn-config" }
 cairn-models = { path = "../cairn-models" }
 cairn-inference = { path = "../cairn-inference" }
@@ -154,6 +155,7 @@ keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "a
 libc = "0.2"
 
 [dev-dependencies]
+cairn-procmem = { path = "../cairn-procmem", features = ["test-utils"] }
 cairn-common = { path = "../cairn-common", features = ["test-utils"] }
 cairn-config = { path = "../cairn-config", features = ["test-utils"] }
 cairn-vcs = { path = "../cairn-vcs", features = ["test-utils"] }
@@ -177,6 +179,9 @@ cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
 cairn-db = { path = "../cairn-db", features = ["test-utils"] }
 # SCM_RIGHTS, so a run test can hold a command's stdout from outside its tree.
 nix = { version = "0.29", features = ["signal", "socket", "uio"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [features]
 internal-api = []

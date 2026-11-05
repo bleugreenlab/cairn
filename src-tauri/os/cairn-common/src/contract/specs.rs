@@ -667,11 +667,15 @@ pub(crate) const EXECUTOR_BUILD_ROOT: KeySpec = KeySpec::new(
     KeyType::Str,
     "local only: an existing directory on another volume where the runner's own executor keeps its cells, managed objects, dependency catalog and build caches; null restores the home. Written while the volume is mounted (it gets a marker), and takes effect at the next runner start. While the volume is unplugged the machine stays attached and declines work that needs a cell, and it adopts its cells again when the volume returns",
 );
+pub(crate) const EXECUTOR_MEMORY_DIAGNOSTIC: KeySpec = KeySpec::new(
+    "memoryDiagnostic", KeyType::Object,
+    "development local executor only: {runId,durationMs} attaches one measurement-only comparison to a currently registered runner process for 1..=60000 ms; null detaches. Requires expectedGeneration. Cannot be combined with other configuration. Reads never attach or sample",
+);
 pub(crate) const EXECUTOR_EXPECTED_GENERATION: KeySpec = KeySpec::with_aliases(
     "expectedGeneration",
     &["expected_generation"],
     KeyType::Int,
-    "the connection generation you read; required with runtimePolicy",
+    "the connection generation you read; required with runtimePolicy or memoryDiagnostic",
 );
 pub(crate) const EXECUTOR_REMOVAL_CONFIRM: KeySpec = KeySpec::new(
     "confirm",

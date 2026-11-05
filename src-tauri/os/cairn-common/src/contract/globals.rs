@@ -250,6 +250,7 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
                     EXECUTOR_MACHINE_SERVICES,
                     EXECUTOR_REPAIRED,
                     EXECUTOR_BUILD_ROOT,
+                    EXECUTOR_MEMORY_DIAGNOSTIC,
                     EXECUTOR_EXPECTED_GENERATION,
                 ],
                 label: "configure an enrolled machine",

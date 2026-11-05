@@ -581,7 +581,7 @@ pub(crate) fn failing_interrupt_stdin_for_test(
 /// Any request the script has no arm for is answered with a JSON-RPC error
 /// naming the method. Staying silent would instead block the caller for the
 /// client's full request timeout before the test sees anything.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn process_active_stdin_for_test(
     thread_id: &str,
     provider_turn_id: &str,
@@ -591,45 +591,54 @@ pub(crate) fn process_active_stdin_for_test(
     std::sync::Arc<std::sync::Mutex<Option<String>>>,
     tempfile::TempDir,
 ) {
-    use std::os::unix::fs::PermissionsExt;
-
     let fixture = tempfile::tempdir().expect("create app-server fixture directory");
-    let executable = fixture.path().join("codex-fixture");
-    let notification = terminal_notification.unwrap_or("");
+    // AppServerClient::spawn passes "app-server" as its first argument. Bun
+    // executes this extensionless JavaScript file in the fixture's cwd.
+    let executable = fixture.path().join("app-server");
+    let goal = serde_json::json!({
+        "threadId": thread_id,
+        "objective": "finish work",
+        "status": "active",
+        "tokenBudget": null,
+        "tokensUsed": 0,
+        "timeUsedSeconds": 0,
+        "createdAt": 1,
+        "updatedAt": 2,
+    });
+    let provider_turn_json = serde_json::to_string(provider_turn_id).unwrap();
+    let notification = serde_json::to_string(&terminal_notification).unwrap();
     let script = format!(
-        r#"#!/bin/sh
-goal='{{"threadId":"{thread_id}","objective":"finish work","status":"active","tokenBudget":null,"tokensUsed":0,"timeUsedSeconds":0,"createdAt":1,"updatedAt":2}}'
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
-  case "$line" in
-    *'"method":"turn/interrupt"'*)
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
-      if [ -n '{notification}' ]; then
-        printf '{{"jsonrpc":"2.0","method":"turn/{notification}","params":{{"turn":{{"id":"{provider_turn_id}","status":"{notification}"}},"reason":"interrupted"}}}}\n'
-      fi
-      ;;
-    *'"method":"thread/goal/get"'*|*'"method":"thread/goal/set"'*)
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"goal":%s}}}}\n' "$id" "$goal"
-      ;;
-    *'"id":'[0-9]*)
-      method=$(printf '%s' "$line" | sed -E 's/.*"method":"([^"]*)".*/\1/')
-      printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"codex process fixture has no reply for %s"}}}}\n' "$id" "$method"
-      ;;
-  esac
-done
+        r#"const {{ createInterface }} = require("node:readline");
+const goal = {goal};
+const providerTurnId = {provider_turn_json};
+const notification = {notification};
+const send = (message) => process.stdout.write(JSON.stringify({{ jsonrpc: "2.0", ...message }}) + "\n");
+for await (const line of createInterface({{ input: process.stdin, crlfDelay: Infinity }})) {{
+  const request = JSON.parse(line);
+  if (!Object.hasOwn(request, "id")) continue;
+  switch (request.method) {{
+    case "turn/interrupt":
+      send({{ id: request.id, result: {{}} }});
+      if (notification !== null) {{
+        send({{ method: "turn/" + notification, params: {{ turn: {{ id: providerTurnId, status: notification }}, reason: "interrupted" }} }});
+      }}
+      break;
+    case "thread/goal/get":
+    case "thread/goal/set":
+      send({{ id: request.id, result: {{ goal }} }});
+      break;
+    default:
+      send({{ id: request.id, error: {{ code: -32601, message: "codex process fixture has no reply for " + request.method }} }});
+  }}
+}}
 "#
     );
     std::fs::write(&executable, script).expect("write app-server fixture");
-    let mut permissions = std::fs::metadata(&executable)
-        .expect("stat app-server fixture")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&executable, permissions).expect("chmod app-server fixture");
 
     let client = std::sync::Arc::new(
         cairn_models::codex::app_server::AppServerClient::spawn(
             &crate::services::RealProcessSpawner,
-            executable.to_str().expect("fixture path is utf-8"),
+            &crate::env::resolve_sidecar("bun"),
             &[],
             &std::collections::HashMap::new(),
             fixture.path().to_str().expect("fixture cwd is utf-8"),

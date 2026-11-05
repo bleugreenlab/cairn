@@ -984,6 +984,7 @@ version = "0.13.7"
 dependencies = [
  "base64 0.22.1",
  "cairn-cell",
+ "cairn-procmem",
  "dirs 6.0.0",
  "flate2",
  "getrandom 0.3.4",
@@ -1055,6 +1056,7 @@ dependencies = [
  "cairn-models",
  "cairn-packs",
  "cairn-platform",
+ "cairn-procmem",
  "cairn-sandbox",
  "cairn-session",
  "cairn-symbols",
@@ -1319,6 +1321,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-procmem"
+version = "0.13.7"
+dependencies = [
+ "libc",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "cairn-sandbox"
 version = "0.13.7"
 dependencies = [
@@ -1345,6 +1356,7 @@ dependencies = [
  "cairn-domain",
  "cairn-models",
  "cairn-platform",
+ "cairn-procmem",
  "cairn-tokenize",
  "cairn-toks",
  "chrono",

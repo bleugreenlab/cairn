@@ -351,6 +351,7 @@ mod tests {
                 "machineServices",
                 "repaired",
                 "buildRoot",
+                "memoryDiagnostic",
                 "expectedGeneration"
             ],
             "host, identity, home, tunnel, and project membership stay unwritable; the one path a patch moves is the runner's own executor's build root, which is validated and marked and never moves the home or the machine authority"

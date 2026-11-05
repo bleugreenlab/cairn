@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -2319,6 +2320,7 @@ export default function Board() {
 /// A page that probes the OS directly, past the host's lockdown: bun's own
 /// module reads a file, connects over TCP and over a unix socket, and spawns a
 /// process. It renders what each attempt got as one JSON line.
+#[cfg(unix)]
 fn os_probe_page(canary: &Path, port: u16, socket: &str, bun: &Path) -> String {
     format!(
         r#"import {{ html, Page, Text, useEffect, useState }} from "@cairn/page-kit";
@@ -2351,6 +2353,7 @@ export default function Probe() {{
 }
 
 /// The attempts an [`os_probe_page`] rendered, parsed from its JSON line.
+#[cfg(unix)]
 fn probe_attempts(markdown: &str) -> Value {
     let line = markdown
         .lines()
@@ -2361,6 +2364,7 @@ fn probe_attempts(markdown: &str) -> Value {
 
 /// Run the render host with no confinement at all and return what it rendered:
 /// the negative control proving a probe CAN reach what the sandbox refuses.
+#[cfg(unix)]
 async fn render_unconfined(files: Value) -> String {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let bundle = crate::runtime::page_render_bundle().unwrap();
@@ -2417,6 +2421,7 @@ async fn render_unconfined(files: Value) -> String {
 }
 
 /// Connections waiting on a listener, accepted and counted without blocking.
+#[cfg(unix)]
 fn pending_connections<S>(accept: impl Fn() -> std::io::Result<S>) -> usize {
     let mut count = 0;
     while accept().is_ok() {
@@ -2431,6 +2436,7 @@ fn pending_connections<S>(accept: impl Fn() -> std::io::Result<S>) -> usize {
 /// reaches all four, so the test fails if the sandbox does nothing. The
 /// connects are judged at the listeners because bun names any failed connect
 /// ECONNREFUSED, even when the kernel refused the socket itself.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_rendered_page_cannot_reach_the_network_or_read_outside_its_allow_list() {
     if !renders_here("a_rendered_page_cannot_reach_the_network_or_read_outside_its_allow_list") {
@@ -2455,12 +2461,12 @@ async fn a_rendered_page_cannot_reach_the_network_or_read_outside_its_allow_list
     };
     // Elsewhere a short path under /tmp: a socket path is capped near 104
     // bytes, which a check lane's temp directory exceeds.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     let short = tempfile::Builder::new()
         .prefix("pg")
         .tempdir_in("/tmp")
         .unwrap();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     let (socket, _unix) = {
         let path = short.path().canonicalize().unwrap().join("s.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -2532,6 +2538,69 @@ async fn a_rendered_page_cannot_reach_the_network_or_read_outside_its_allow_list
     assert!(
         body.contains("### Diagnostics") && body.contains("probe "),
         "{body}"
+    );
+}
+
+/// Windows has no supported render confinement: the real render boundary must
+/// refuse before evaluating page code, not fall back to an unconfined host.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_page_render_is_refused_without_kernel_confinement_on_windows() {
+    let why = cairn_sandbox::IsolatedChild::availability()
+        .expect_err("Windows render confinement is not implemented");
+    assert!(why.contains("no kernel primitive"), "{why}");
+    let (orch, _) = seeded().await;
+    let uri = "cairn://p/prj/roadmap/pages/board";
+    let outside = tempfile::tempdir().unwrap();
+    let marker = outside.path().join("page-ran");
+    let marker_json = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+    let source = format!(
+        "import.meta.require('node:fs').writeFileSync({marker_json}, 'PAGE-RAN');\n{BOARD}"
+    );
+    write_page_source(
+        &orch,
+        uri,
+        ChangeMode::Create,
+        "Board",
+        json!({ "index.js": source }),
+    )
+    .await;
+    let rendered = render_page(
+        &orch,
+        uri,
+        std::time::Duration::from_millis(200),
+        &super::headless::PageReadAnswerer,
+    )
+    .await;
+    assert!(
+        matches!(&rendered.outcome, RenderOutcome::Refused { message }
+            if message.contains("Rendered reads need kernel confinement") && message.contains(&why)),
+        "{:?}",
+        rendered.outcome
+    );
+    assert!(rendered.markdown.is_empty(), "{:?}", rendered.markdown);
+    assert_eq!(rendered.reads, 0);
+    assert!(
+        rendered.diagnostics.is_empty(),
+        "{:?}",
+        rendered.diagnostics
+    );
+    assert!(
+        !marker.exists(),
+        "an unsupported render evaluated page code"
+    );
+    let body = read_as_agent(&orch, uri).await;
+    assert!(
+        body.contains("Rendered reads need kernel confinement") && body.contains(&why),
+        "{body}"
+    );
+    assert!(
+        !body.contains("Fixture board") && !body.contains("PAGE-RAN"),
+        "{body}"
+    );
+    assert!(
+        !marker.exists(),
+        "a rendered resource read evaluated page code"
     );
 }
 

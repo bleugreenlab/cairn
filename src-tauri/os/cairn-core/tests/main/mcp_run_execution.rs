@@ -3095,87 +3095,40 @@ async fn tree_bound_item_without_resolvable_context_fails_before_execution() {
 /// own, because the test keeps the pipe open until after this bound.
 const HELD_STDOUT_BOUND: Duration = Duration::from_secs(60);
 
-// A process outside the command can keep the command's stdout write end open
-// after the command itself has exited, so an unbounded reader join would hang
-// for as long as that process chose. The call must return with the output the
-// command wrote, while the pipe is still held.
-//
-// The holder is this test. The command hands its stdout descriptor over a unix
-// socket (SCM_RIGHTS) and exits, so the pipe stays open from the command's
-// first instruction until the descriptor is dropped below: first through the
-// command, then in the kernel's in-flight message, then here. No holder inside
-// the command's tree can promise that. A setsid escapee is one on Linux, but
-// macOS teardown signals the group of every descendant its sampler recorded
-// while the escapee was still linked to its parent, so the escapee survives
-// only when the sample happens to miss it.
-//
-// - A warm-up batch acquires the job's execution home first, so environment
-//   acquisition is not inside the bounded call.
-// - The handoff batch declares no `timeout`. A declared timeout also bounds
-//   how long placement may wait, and an item that exits at once never needs
-//   one; a short one only lets acquisition refuse the batch.
-// - The connection completes into the listener's backlog and the message is
-//   buffered with it, so accepting after the call returns loses nothing.
-#[tokio::test]
-async fn stdout_held_outside_the_command_does_not_hang_the_call() {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::net::UnixListener;
-
-    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixAddr};
-
-    let (_temp, _db, orch, cwd) = setup("run-held-stdout").await;
-    let warm = handle_run(
-        &orch,
-        &request(
-            &cwd,
-            Some("run-held-stdout"),
-            json!({ "commands": [{ "command": "true" }] }),
-        ),
-    )
-    .await;
-    assert!(
-        warm.contains("(no output)"),
-        "the warm-up batch must acquire the job's execution home and run: {warm}"
-    );
-
-    // Directly under /tmp so the socket path fits a unix socket address on
-    // macOS, whose per-user temp root is already long.
-    let socket_dir = tempfile::Builder::new()
+#[cfg(unix)]
+fn unix_stdout_handoff() -> (TempDir, std::os::unix::net::UnixListener, String) {
+    // A short path fits macOS's unix socket address even when the test's temp
+    // root is longer than the kernel's socket-path limit.
+    let directory = tempfile::Builder::new()
         .prefix("cairn-")
         .tempdir_in("/tmp")
         .expect("create a short socket directory");
-    let socket_path = socket_dir.path().join("held");
-    let listener = UnixListener::bind(&socket_path).expect("bind the holder's socket");
-
-    let handoff = format!(
-        r#"python3 -c 'import array, socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sys.argv[1]); s.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [1]))]); print("handed off", flush=True)' {}"#,
-        socket_path.display()
+    let socket_path = directory.path().join("held");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind the holder's socket");
+    let socket_path = serde_json::to_string(&socket_path.to_string_lossy()).unwrap();
+    let code = format!(
+        "import array, socket\nwith socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:\n    s.connect({socket_path})\n    s.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [1]))])\nprint('handed off', flush=True)\n"
     );
-    let payload = json!({ "commands": [{ "command": handoff }] });
-    let start = Instant::now();
-    let result = tokio::time::timeout(
-        HELD_STDOUT_BOUND,
-        handle_run(&orch, &request(&cwd, Some("run-held-stdout"), payload)),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the call must return while a process outside the command holds its stdout; still waiting after {HELD_STDOUT_BOUND:?}"
-        )
-    });
-    let elapsed = start.elapsed();
+    (directory, listener, code)
+}
 
-    assert!(
-        result.contains("handed off"),
-        "output written before the command exited must be captured: {result}"
-    );
+#[cfg(unix)]
+fn receive_unix_stdout(listener: &std::os::unix::net::UnixListener) -> std::fs::File {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::FileTypeExt;
+
+    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixAddr};
+
     listener
         .set_nonblocking(true)
-        .expect("accept without waiting");
-    let (connection, _) = listener.accept().unwrap_or_else(|error| {
-        panic!("the command must hand its stdout to the test, or this test proves nothing ({error}): {result}")
-    });
+        .expect("accept without waiting after the call returned");
+    let (connection, _) = listener
+        .accept()
+        .expect("the command connected to hand off stdout");
+    connection
+        .set_nonblocking(true)
+        .expect("receive the already buffered descriptor without waiting");
     let mut byte = [0u8; 1];
     let mut iov = [std::io::IoSliceMut::new(&mut byte)];
     let mut space = nix::cmsg_space!([std::os::fd::RawFd; 1]);
@@ -3186,23 +3139,171 @@ async fn stdout_held_outside_the_command_does_not_hang_the_call() {
         MsgFlags::empty(),
     )
     .expect("receive the handed-off descriptor");
-    let held: OwnedFd = message
+    let mut descriptors = Vec::new();
+    for control in message
         .cmsgs()
         .expect("read the handoff's control messages")
-        .find_map(|control| match control {
-            ControlMessageOwned::ScmRights(fds) => fds.first().copied(),
-            _ => None,
-        })
-        // SAFETY: SCM_RIGHTS installed this descriptor in this process for us.
-        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-        .unwrap_or_else(|| panic!("the handoff must carry a descriptor: {result}"));
-    let held = std::fs::File::from(held);
+    {
+        if let ControlMessageOwned::ScmRights(fds) = control {
+            for fd in fds {
+                // SAFETY: SCM_RIGHTS installed each descriptor in this process.
+                descriptors.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+    assert_eq!(descriptors.len(), 1, "the handoff carries exactly stdout");
+    let held = std::fs::File::from(descriptors.pop().unwrap());
     assert!(
         held.metadata()
             .expect("stat the held descriptor")
             .file_type()
             .is_fifo(),
-        "the held descriptor must be the command's stdout pipe, or this test proves nothing: {result}"
+        "the held descriptor must be the command's stdout pipe"
+    );
+    held
+}
+
+#[cfg(windows)]
+async fn windows_stdout_handoff() -> (tokio::net::TcpListener, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the holder's socket");
+    let port = listener.local_addr().unwrap().port();
+    // Only the receiver creates the duplicate, directly into its own process,
+    // so transport failure cannot strand an unowned handle in the receiver.
+    // The fixed-width packet carries the child's PID and its actual fd 1.
+    let code = format!(
+        "import msvcrt, os, socket, struct\nwith socket.create_connection(('127.0.0.1', {port}), timeout={timeout}) as s:\n    s.sendall(struct.pack('<IQ', os.getpid(), msvcrt.get_osfhandle(1)))\n    if s.recv(1) != b'K':\n        raise RuntimeError('stdout holder did not acknowledge ownership')\nprint('handed off', flush=True)\n",
+        timeout = HELD_STDOUT_BOUND.as_secs(),
+    );
+    (listener, code)
+}
+
+#[cfg(windows)]
+async fn receive_windows_stdout(listener: &tokio::net::TcpListener) -> std::fs::File {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use windows_sys::Win32::{
+        Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS},
+        Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE},
+        System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE},
+    };
+
+    let (mut connection, _) = listener.accept().await.expect("the command connected");
+    let mut packet = [0u8; 12];
+    connection
+        .read_exact(&mut packet)
+        .await
+        .expect("read the stdout handoff");
+    let pid = u32::from_le_bytes(packet[..4].try_into().unwrap());
+    let source = usize::try_from(u64::from_le_bytes(packet[4..].try_into().unwrap()))
+        .expect("the stdout handle fits this process's pointer width");
+    // SAFETY: opening a process requires no pointer arguments. The child waits
+    // for our acknowledgement, so its stdout handle remains live while copied.
+    let process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+    assert!(
+        !process.is_null(),
+        "open stdout owner: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: OpenProcess returned a new, owned process handle.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let mut duplicate = std::ptr::null_mut();
+    // SAFETY: source is the live child's fd 1 handle from the fixed-width
+    // packet; process and the current-process pseudo handle name the source
+    // and destination. duplicate points to storage for the newly owned handle.
+    let copied = unsafe {
+        DuplicateHandle(
+            process.as_raw_handle(),
+            source as _,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    assert_ne!(
+        copied,
+        0,
+        "duplicate stdout: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: successful DuplicateHandle created this handle in our process.
+    // Own it before any assertion, await, or other fallible operation.
+    let held = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(duplicate) });
+    // SAFETY: held owns the live duplicate for the duration of GetFileType.
+    assert_eq!(unsafe { GetFileType(held.as_raw_handle()) }, FILE_TYPE_PIPE);
+    drop(process);
+    connection
+        .write_all(b"K")
+        .await
+        .expect("acknowledge the held stdout");
+    held
+}
+
+// The holder is this test, outside the command's process tree. Unix transfers
+// fd 1 with SCM_RIGHTS; Windows duplicates the child's fd 1 into this process
+// and acknowledges ownership before the child exits. A descendant holder would
+// not prove this: command teardown may kill it and close the pipe itself.
+//
+// A warm-up acquires the execution home outside the bound. The handoff has no
+// item timeout, because a timeout also bounds placement, not just execution.
+// Unix can receive after the call returns because SCM_RIGHTS keeps the pipe
+// alive in the kernel's queued message. Windows receives concurrently; join!
+// retains the owned duplicate until the call returns. Cancelling the enclosing
+// timeout drops both futures and any duplicate, without a background receiver.
+#[tokio::test]
+async fn stdout_held_outside_the_command_does_not_hang_the_call() {
+    let (_temp, _db, orch, cwd) = setup("run-held-stdout").await;
+    let warm = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some("run-held-stdout"),
+            json!({ "commands": [{ "code": "pass", "interpreter": "python" }] }),
+        ),
+    )
+    .await;
+    assert!(
+        warm.contains("(no output)"),
+        "the warm-up batch must acquire the job's execution home and run: {warm}"
+    );
+
+    #[cfg(unix)]
+    let (_socket_dir, listener, code) = unix_stdout_handoff();
+    #[cfg(windows)]
+    let (listener, code) = windows_stdout_handoff().await;
+    let payload = json!({ "commands": [{ "code": code, "interpreter": "python" }] });
+    let request = request(&cwd, Some("run-held-stdout"), payload);
+    let start = Instant::now();
+    let (result, held) = tokio::time::timeout(HELD_STDOUT_BOUND, async {
+        let run = handle_run(&orch, &request);
+        #[cfg(unix)]
+        {
+            let result = run.await;
+            (result, receive_unix_stdout(&listener))
+        }
+        #[cfg(windows)]
+        {
+            tokio::join!(run, receive_windows_stdout(&listener))
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the call must return while a process outside the command holds its stdout; still waiting after {HELD_STDOUT_BOUND:?}"
+        )
+    });
+    let elapsed = start.elapsed();
+    let envelope: serde_json::Value =
+        serde_json::from_str(&result).expect("the call returns a serialized result envelope");
+    let text = envelope["text"]
+        .as_str()
+        .expect("the result envelope contains text");
+    assert!(
+        text.lines().any(|line| line.trim() == "handed off"),
+        "output written before the command exited must be captured: {result}"
     );
     assert!(
         elapsed < HELD_STDOUT_BOUND,

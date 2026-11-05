@@ -1697,7 +1697,11 @@ async fn the_sweep_does_nothing_until_this_processs_resume_pass_has_finished() {
         "and delivery falls back to the pointer"
     );
 
-    assert_eq!(resume(&orch).await.selected, 0, "the turn predates this boot");
+    assert_eq!(
+        resume(&orch).await.selected,
+        0,
+        "the turn predates this boot"
+    );
 
     let after = sweep_unresumed_children(&orch).await;
     assert_eq!(

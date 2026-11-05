@@ -24,6 +24,7 @@ members = [
   "os/cairn-models-types",
   "os/cairn-packs",
   "os/cairn-platform",
+  "os/cairn-procmem",
   "os/cairn-sandbox",
   "os/cairn-session",
   "os/cairn-speech-wire",

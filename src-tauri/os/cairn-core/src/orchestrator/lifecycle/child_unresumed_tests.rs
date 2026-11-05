@@ -170,9 +170,7 @@ async fn later_turn(db: &LocalDb, id: &str, seq: i64, state: &str, started: bool
 }
 
 async fn sweep(db: &LocalDb) -> Vec<String> {
-    let sweep = sweep_unresumed_in(db, &HashSet::new())
-        .await
-        .unwrap();
+    let sweep = sweep_unresumed_in(db, &HashSet::new()).await.unwrap();
     sweep
         .told
         .into_iter()
@@ -181,9 +179,7 @@ async fn sweep(db: &LocalDb) -> Vec<String> {
 }
 
 async fn standing(db: &LocalDb) -> Vec<UnresumedChild> {
-    unresumed_children(db, &HashSet::new())
-        .await
-        .unwrap()
+    unresumed_children(db, &HashSet::new()).await.unwrap()
 }
 
 /// `(recipient, key, content_ref, fingerprint, wake)` of every row, delivered or
@@ -516,9 +512,7 @@ async fn a_later_turn_withdraws_an_undelivered_fact() {
 
     later_turn(&db, "turn-next", 3, "running", true).await;
 
-    let swept = sweep_unresumed_in(&db, &HashSet::new())
-        .await
-        .unwrap();
+    let swept = sweep_unresumed_in(&db, &HashSet::new()).await.unwrap();
     assert_eq!(swept.withdrawn, 1);
     assert!(swept.told.is_empty());
     assert!(pushes(&db).await.is_empty());
@@ -562,9 +556,7 @@ async fn a_delivered_fact_is_kept_and_only_a_new_episode_wakes_again() {
     assert_eq!(pushes(&db).await.len(), 1);
 
     later_turn(&db, "turn-next", 3, "complete", true).await;
-    let swept = sweep_unresumed_in(&db, &HashSet::new())
-        .await
-        .unwrap();
+    let swept = sweep_unresumed_in(&db, &HashSet::new()).await.unwrap();
     assert_eq!(swept.withdrawn, 0, "the delivered row stays");
     assert_eq!(pushes(&db).await.len(), 1);
 
@@ -587,13 +579,10 @@ async fn a_review_task_waiting_on_the_node_does_not_hold_the_fact_back() {
     seed(&db).await;
     orphan(&db, "turn-e", 2, AFTER_BOOT).await;
     assert_eq!(
-        db.query_opt_text(
-            "SELECT status FROM jobs WHERE id = 'review-job'",
-            (),
-        )
-        .await
-        .unwrap()
-        .as_deref(),
+        db.query_opt_text("SELECT status FROM jobs WHERE id = 'review-job'", (),)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("pending")
     );
 
@@ -754,10 +743,7 @@ async fn a_live_run_or_an_in_flight_launch_holds_the_fact_back() {
     orphan(&db, "turn-e", 2, AFTER_BOOT).await;
 
     let claimed: HashSet<String> = ["child-job".to_string()].into();
-    assert!(unresumed_children(&db, &claimed)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(unresumed_children(&db, &claimed).await.unwrap().is_empty());
 
     for status in ["starting", "live"] {
         db.execute(

@@ -6927,7 +6927,16 @@ pub struct LearnedResourceEstimate {
 /// runner before anything is offered. A runner talking to an older executor gets
 /// nothing wrong: that executor is offered only what placement chose, and a
 /// refusal it answers continues on the runner.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 164;
+///
+/// Version 165 (cairn/5944) adds the development-only local
+/// MemoryDiagnosticRequest/Response control. The runner resolves a registered
+/// agent run to its captured identity and fences the local connection generation;
+/// no remote arbitrary-PID probe is exposed. ExecutorSubstrateReport gains an
+/// omitted-when-absent memoryDiagnostic cache. Older executors cannot decode the
+/// new control, so attach must be version-gated rather than silently time out.
+/// The shared sampler also reports incomplete RSS as absent live resident bytes,
+/// without invalidating independently measured CPU or storage windows.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 165;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -14731,6 +14740,9 @@ pub struct DrainHold {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorSubstrateReport {
+    /// Explicit, bounded development comparison; never admission or accounting evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_diagnostic: Option<MemoryDiagnosticEvidence>,
     pub admission: AdmissionHealth,
     /// What this machine has already committed itself to, as the machine counts
     /// it.
@@ -14803,6 +14815,51 @@ pub struct ExecutorSubstrateReport {
     /// always present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_volume: Option<BuildVolumeReport>,
+}
+
+/// Server-resolved runner identity; callers select a registered run, never a PID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryDiagnosticAttach {
+    pub run_id: String,
+    pub anchor: crate::process_identity::ProcessAnchor,
+    pub duration_ms: u64,
+}
+
+impl MemoryDiagnosticAttach {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.run_id.is_empty()
+            || self.anchor.pid == 0
+            || self.anchor.start_token.is_empty()
+            || !(1..=60_000).contains(&self.duration_ms)
+        {
+            return Err(
+                "memory diagnostic needs a registered anchor and durationMs in 1..=60000".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Cached evidence only; an absent reading means no successful tick, not zero RSS.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryDiagnosticEvidence {
+    pub run_id: String,
+    pub anchor: crate::process_identity::ProcessAnchor,
+    pub expires_at_unix_ms: u64,
+    pub cached: Option<MemoryDiagnosticReading>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryDiagnosticReading {
+    pub tick_unix_ms: u64,
+    pub members: Vec<crate::process_identity::ProcessAnchor>,
+    pub resident_bytes: u64,
+    pub members_read: u32,
+    pub members_total: u32,
+    pub incomplete: bool,
 }
 
 /// A fault in a repository every slot of a project shares, as this executor
@@ -19129,6 +19186,16 @@ pub enum ExecutorMessage {
         manifest_url: String,
         build_id: String,
     },
+    /// Authenticated local development-only comparison, fenced to this link.
+    MemoryDiagnosticRequest {
+        correlation_id: String,
+        expected_generation: u64,
+        attach: Option<MemoryDiagnosticAttach>,
+    },
+    MemoryDiagnosticResponse {
+        correlation_id: String,
+        result: Result<(), String>,
+    },
     RuntimePolicyRequest {
         correlation_id: String,
         policy: ExecutorRuntimePolicy,
@@ -19432,6 +19499,81 @@ pub enum RunnerCallbackResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_diagnostic_bounds_and_absent_report_envelope() {
+        let mut attach = MemoryDiagnosticAttach {
+            run_id: "run-1".into(),
+            anchor: crate::process_identity::ProcessAnchor {
+                pid: 42,
+                start_token: "10:20".into(),
+            },
+            duration_ms: 60_000,
+        };
+        assert!(attach.validate().is_ok());
+        for invalid in [0, 60_001, u64::MAX] {
+            attach.duration_ms = invalid;
+            assert!(attach.validate().is_err());
+        }
+        attach.duration_ms = 1;
+        assert!(attach.validate().is_ok());
+        attach.anchor.pid = 0;
+        assert!(attach.validate().is_err());
+        attach.anchor.pid = 42;
+        attach.anchor.start_token.clear();
+        assert!(attach.validate().is_err());
+
+        let absent = serde_json::to_value(ExecutorSubstrateReport::default()).unwrap();
+        assert!(!absent.as_object().unwrap().contains_key("memoryDiagnostic"));
+        let decoded: ExecutorSubstrateReport = serde_json::from_value(absent.clone()).unwrap();
+        assert!(decoded.memory_diagnostic.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), absent);
+    }
+
+    #[test]
+    fn memory_diagnostic_evidence_and_controls_round_trip_without_changing_absence() {
+        let attach = MemoryDiagnosticAttach {
+            run_id: "registered".into(),
+            anchor: crate::process_identity::ProcessAnchor {
+                pid: 42,
+                start_token: "10:20".into(),
+            },
+            duration_ms: 60_000,
+        };
+        let evidence = MemoryDiagnosticEvidence {
+            run_id: attach.run_id.clone(),
+            anchor: attach.anchor.clone(),
+            expires_at_unix_ms: 61_000,
+            cached: None,
+        };
+        let report = ExecutorSubstrateReport {
+            memory_diagnostic: Some(evidence.clone()),
+            ..Default::default()
+        };
+        let decoded: ExecutorSubstrateReport =
+            serde_json::from_value(serde_json::to_value(report).unwrap()).unwrap();
+        assert_eq!(decoded.memory_diagnostic, Some(evidence));
+        for message in [
+            ExecutorMessage::MemoryDiagnosticRequest {
+                correlation_id: "comparison".into(),
+                expected_generation: 7,
+                attach: Some(attach),
+            },
+            ExecutorMessage::MemoryDiagnosticRequest {
+                correlation_id: "detach".into(),
+                expected_generation: 7,
+                attach: None,
+            },
+            ExecutorMessage::MemoryDiagnosticResponse {
+                correlation_id: "comparison".into(),
+                result: Ok(()),
+            },
+        ] {
+            let wire = serde_json::to_value(message).unwrap();
+            let decoded: ExecutorMessage = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
+    }
 
     /// Work inside a residency live on the machine provisions nothing, however
     /// its objects arrive: a remote machine is offered managed objects, and

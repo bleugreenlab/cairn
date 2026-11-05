@@ -2365,6 +2365,14 @@ async fn render_resource_body(
                                 None,
                             ));
                             if executor.colocated {
+                                if let Some(diagnostic) = orch.fleet.memory_diagnostic(
+                                    executor.health.connection_generation, captured_at,
+                                ) {
+                                    let runner = orch.process_state.memory_diagnostic(&diagnostic.run_id);
+                                    rendered.push_str(&crate::resources::executors::render_memory_diagnostic(
+                                        &diagnostic, runner.as_ref(), captured_at,
+                                    ));
+                                }
                                 rendered.push_str(
                                     &crate::resources::executors::render_runner_scratch(
                                         &orch.host_scratch.report(),

@@ -13,6 +13,7 @@ cairn-db = { path = "../cairn-db" }
 cairn-models = { path = "../cairn-models" }
 cairn-domain = { path = "../cairn-domain" }
 cairn-platform = { path = "../cairn-platform" }
+cairn-procmem = { path = "../cairn-procmem" }
 cairn-tokenize = { path = "../cairn-tokenize" }
 cairn-toks = { path = "../cairn-toks" }
 chrono = "0.4"

@@ -1526,7 +1526,7 @@ pub struct Orchestrator {
     pub(crate) private_lanes: Arc<crate::execution::jobs::PrivateLaneLedger>,
     pub(crate) provider_admission_cache: Arc<crate::runtime_admission::ProviderAdmissionCache>,
     /// Live resident memory of every runner-hosted agent process tree,
-    /// measured on its own thread and read only as its last published value.
+    /// published by the shared process-tree sampler and read only from cache.
     pub agent_memory: Arc<crate::agent_process::live_memory::AgentMemorySampler>,
     /// Whether startup recovery has finished: the one authority both the
     /// callback gateway's 503 hold and the admission promoters read. See
@@ -2661,11 +2661,8 @@ impl Orchestrator {
         // A machine that reconnects holding replicas of closed scratches is
         // told to delete them, whether or not any work has asked for one yet.
         crate::node_scratch::lifecycle::ensure_subscribed(self);
-        self.agent_memory.start(
-            self.process_state.clone(),
-            Arc::new(crate::agent_process::memory::OsMemoryProbe),
-            self.services.emitter.clone(),
-        );
+        self.agent_memory
+            .start(self.process_state.clone(), self.services.emitter.clone());
     }
 
     pub fn start_embed_worker(&self) {

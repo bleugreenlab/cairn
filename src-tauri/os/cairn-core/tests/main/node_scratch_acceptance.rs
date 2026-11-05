@@ -589,9 +589,7 @@ impl Node {
     /// It is what a job with no route is guessed to found its home on.
     async fn attach_colocated(&self) {
         let orch = self.orch().clone();
-        cairn_exec::blocking::offload(move || common::attach_test_executor(&orch))
-            .await
-            .unwrap();
+        cairn_exec::blocking::offload(move || common::attach_test_executor(&orch)).await;
     }
 
     /// The placement record of `job`'s fresh home acquisition: what the handler

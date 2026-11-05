@@ -438,13 +438,15 @@ impl ChildProcess for MockChildProcess {
 
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         if self.exited {
-            // Use a trick: spawn a dummy process that exits immediately
-            // to get a real ExitStatus
-            use std::process::Command;
-            let status = if self.exit_code == 0 {
-                Command::new("true").status()?
-            } else {
-                Command::new("false").status()?
+            #[cfg(unix)]
+            let status = {
+                use std::os::unix::process::ExitStatusExt;
+                ExitStatus::from_raw((self.exit_code & 0xff) << 8)
+            };
+            #[cfg(windows)]
+            let status = {
+                use std::os::windows::process::ExitStatusExt;
+                ExitStatus::from_raw(self.exit_code as u32)
             };
             Ok(Some(status))
         } else {
@@ -560,6 +562,16 @@ mod tests {
         // Mark as exited
         mock.set_exited();
         assert!(mock.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn mock_child_process_preserves_exit_code_without_host_commands() {
+        for code in [0, 1, 7] {
+            let mut mock = MockChildProcess::failing(1, "", code);
+            let status = mock.try_wait().unwrap().expect("exited mock");
+            assert_eq!(status.code(), Some(code));
+            assert_eq!(status.success(), code == 0);
+        }
     }
 
     #[test]

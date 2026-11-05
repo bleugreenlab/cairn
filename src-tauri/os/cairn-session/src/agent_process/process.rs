@@ -21,7 +21,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cairn_models::claude::feeds::FeedRegistration;
@@ -595,6 +595,8 @@ impl RunHandle {
 #[derive(Default)]
 pub struct RunRegistry {
     by_id: HashMap<String, RunHandle>,
+    generations: HashMap<String, u64>,
+    next_generation: u64,
     session_index: HashMap<String, String>, // session_id → run_id
 }
 
@@ -623,6 +625,12 @@ impl RunRegistry {
     /// returned rather than stopped here because stopping waits on the child —
     /// [`AgentProcessState::register_process`] does it outside the registry lock.
     pub fn register(&mut self, run_id: String, handle: RunHandle) -> Option<RunHandle> {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("run registration generations exhausted");
+        self.generations
+            .insert(run_id.clone(), self.next_generation);
         let displaced = handle.session_id.as_ref().and_then(|sid| {
             let prior_run_id = self.session_index.insert(sid.clone(), run_id.clone())?;
             if prior_run_id == run_id {
@@ -635,6 +643,7 @@ impl RunRegistry {
                 run_id,
                 prior_run_id
             );
+            self.generations.remove(&prior_run_id);
             self.by_id.remove(&prior_run_id)
         });
         self.by_id.insert(run_id, handle);
@@ -643,6 +652,7 @@ impl RunRegistry {
 
     pub fn remove(&mut self, run_id: &str) -> Option<RunHandle> {
         if let Some(handle) = self.by_id.remove(run_id) {
+            self.generations.remove(run_id);
             if let Some(ref sid) = handle.session_id {
                 self.session_index.remove(sid);
             }
@@ -703,58 +713,189 @@ pub struct LiveTree {
     pub leader: ProcessAnchor,
 }
 
-/// Announces that an agent process registered, so a sampler parked on an
-/// empty registry wakes for it. A counter rather than a flag, so a wake that
-/// lands between a read of the registry and the wait is not lost.
+/// Registry lock whose mutable guards reconcile memory watches after unlocking.
+/// Generation invalidation happens under the registry lock; retirement never does.
 #[derive(Default)]
-pub struct LiveTreeSignal {
-    generation: Mutex<u64>,
-    changed: Condvar,
+pub struct ProcessRegistry {
+    inner: Mutex<RunRegistry>,
+    revision: std::sync::atomic::AtomicU64,
+    memory: RunnerMemoryBindings,
 }
-
-impl LiveTreeSignal {
-    pub fn generation(&self) -> u64 {
-        self.generation.lock().map(|g| *g).unwrap_or(0)
+pub struct ProcessRegistryGuard<'a> {
+    owner: &'a ProcessRegistry,
+    inner: Option<std::sync::MutexGuard<'a, RunRegistry>>,
+    dirty: bool,
+}
+impl std::ops::Deref for ProcessRegistryGuard<'_> {
+    type Target = RunRegistry;
+    fn deref(&self) -> &RunRegistry {
+        self.inner.as_ref().unwrap()
     }
-
-    pub fn notify(&self) {
-        if let Ok(mut generation) = self.generation.lock() {
-            *generation = generation.wrapping_add(1);
+}
+impl std::ops::DerefMut for ProcessRegistryGuard<'_> {
+    fn deref_mut(&mut self) -> &mut RunRegistry {
+        self.dirty = true;
+        self.inner.as_mut().unwrap()
+    }
+}
+impl Drop for ProcessRegistryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.dirty || std::thread::panicking() {
+            return;
         }
-        self.changed.notify_all();
+        let registry = self.inner.as_ref().unwrap();
+        let trees: Vec<_> = registry
+            .iter()
+            .filter_map(|(id, handle)| {
+                handle.leader.clone().map(|leader| RegisteredTree {
+                    run_id: id.clone(),
+                    leader,
+                    generation: registry.generations[id],
+                })
+            })
+            .collect();
+        let revision = self.owner.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        {
+            let mut index = self.owner.memory.index.lock().unwrap();
+            index.desired = trees
+                .iter()
+                .map(|tree| (tree.run_id.clone(), (tree.leader.clone(), tree.generation)))
+                .collect();
+            index.registered.retain(|id, (anchor, generation, _)| {
+                trees.iter().any(|tree| {
+                    tree.run_id == *id && tree.leader == *anchor && tree.generation == *generation
+                })
+            });
+        }
+        drop(self.inner.take());
+        self.owner.memory.reconcile(revision, trees);
     }
-
-    /// Block until the generation moves past `seen`, or until `deadline` when
-    /// one is given. Returns the generation it woke at.
-    pub fn wait_past(&self, seen: u64, deadline: Option<Instant>) -> u64 {
-        let Ok(mut generation) = self.generation.lock() else {
-            return seen;
+}
+impl ProcessRegistry {
+    pub fn clear_poison(&self) {
+        self.inner.clear_poison();
+    }
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+    pub fn lock(&self) -> std::sync::LockResult<ProcessRegistryGuard<'_>> {
+        match self.inner.lock() {
+            Ok(inner) => Ok(ProcessRegistryGuard {
+                owner: self,
+                inner: Some(inner),
+                dirty: false,
+            }),
+            Err(error) => Err(std::sync::PoisonError::new(ProcessRegistryGuard {
+                owner: self,
+                inner: Some(error.into_inner()),
+                dirty: false,
+            })),
+        }
+    }
+}
+pub trait RunnerMemoryObserver: cairn_procmem::BatchObserver {
+    /// Empty reconciliation before a worker exists; no registry/index lock is held.
+    /// Like sampler callbacks, this must not mutate watch lifetimes.
+    fn initially_empty(&self) {}
+    fn registration_failed(&self);
+}
+struct RegisteredTree {
+    run_id: String,
+    leader: ProcessAnchor,
+    generation: u64,
+}
+#[derive(Default)]
+struct RunnerMemoryBindings {
+    sampler: std::sync::OnceLock<Arc<cairn_procmem::ProcessTreeSampler>>,
+    observer: std::sync::OnceLock<Arc<dyn RunnerMemoryObserver>>,
+    lifecycle: Mutex<RunnerMemoryLifecycle>,
+    index: Mutex<RunnerMemoryIndex>,
+    evidence: Mutex<
+        HashMap<cairn_procmem::WatchId, cairn_common::executor_protocol::MemoryDiagnosticReading>,
+    >,
+}
+#[derive(Default)]
+struct RunnerMemoryLifecycle {
+    revision: u64,
+    watches: HashMap<String, (ProcessAnchor, u64, cairn_procmem::ProcessTreeWatch)>,
+}
+#[derive(Default)]
+struct RunnerMemoryIndex {
+    desired: HashMap<String, (ProcessAnchor, u64)>,
+    registered: HashMap<String, (ProcessAnchor, u64, cairn_procmem::WatchId)>,
+}
+impl RunnerMemoryBindings {
+    fn reconcile(&self, revision: u64, trees: Vec<RegisteredTree>) {
+        let Some(sampler) = self.sampler.get() else {
+            return;
         };
-        while *generation == seen {
-            match deadline {
-                None => match self.changed.wait(generation) {
-                    Ok(next) => generation = next,
-                    Err(_) => return seen,
+        // Observers never acquire lifecycle. Drop only queues retirement, so
+        // reconciliation cannot wait for an in-flight census or publication.
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if revision < lifecycle.revision {
+            return;
+        }
+        lifecycle.revision = revision;
+        let empty = trees.is_empty();
+        lifecycle.watches.retain(|id, (anchor, generation, _)| {
+            trees.iter().any(|tree| {
+                tree.run_id == *id && tree.leader == *anchor && tree.generation == *generation
+            })
+        });
+        let mut failed = false;
+        for tree in trees {
+            if lifecycle.watches.contains_key(&tree.run_id) {
+                continue;
+            }
+            let Some(start_time) = cairn_procmem::StartKey::parse(&tree.leader.start_token) else {
+                continue;
+            };
+            let mut index = self.index.lock().unwrap();
+            if index.desired.get(&tree.run_id) != Some(&(tree.leader.clone(), tree.generation)) {
+                continue;
+            }
+            // Register does not wait for a callback. Holding index through insert
+            // prevents the first worker tick from preceding its run binding.
+            match sampler.watch(
+                cairn_procmem::ProcessIdentity {
+                    pid: tree.leader.pid,
+                    start_time,
                 },
-                Some(deadline) => {
-                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                        break;
-                    };
-                    match self.changed.wait_timeout(generation, left) {
-                        Ok((next, _)) => generation = next,
-                        Err(_) => return seen,
-                    }
+                cairn_procmem::WatchOptions::default(),
+            ) {
+                Ok(watch) => {
+                    index.registered.insert(
+                        tree.run_id.clone(),
+                        (tree.leader.clone(), tree.generation, watch.id()),
+                    );
+                    lifecycle
+                        .watches
+                        .insert(tree.run_id, (tree.leader, tree.generation, watch));
+                }
+                Err(error) => {
+                    log::warn!("runner memory watch could not start: {error}");
+                    failed = true;
                 }
             }
         }
-        *generation
+        if empty {
+            if let Some(observer) = self.observer.get() {
+                observer.initially_empty();
+            }
+        }
+        if failed {
+            if let Some(observer) = self.observer.get() {
+                observer.registration_failed();
+            }
+        }
+        drop(lifecycle);
     }
 }
 
 /// State for tracking active agent processes
 pub struct AgentProcessState {
     /// Active processes keyed by run_id
-    pub processes: Mutex<RunRegistry>,
+    pub processes: ProcessRegistry,
     /// Cached path to default CLI binary (resolved once on first use)
     pub cli_binary_path: Mutex<Option<String>>,
     /// Run ids of workflow processes the user deliberately stopped (CAIRN-2516).
@@ -776,11 +917,110 @@ pub struct AgentProcessState {
     /// moves into RunHandle at registration, so warm reuse cannot acquire or
     /// attach a second claim.
     pending_admission_claims: Mutex<HashMap<String, ProcessAdmissionClaim>>,
-    /// Raised on every registration, for the agent memory sampler.
-    live_tree_signal: LiveTreeSignal,
 }
 
 impl AgentProcessState {
+    /// Install the one runner sampler and reconcile pre-existing registrations.
+    /// Subsequent mutable registry guards keep its bindings current.
+    pub fn start_memory_sampling(
+        &self,
+        sampler: Arc<cairn_procmem::ProcessTreeSampler>,
+        observer: Arc<dyn RunnerMemoryObserver>,
+    ) {
+        let memory = &self.processes.memory;
+        let _ = memory.observer.set(observer);
+        if memory.sampler.set(sampler).is_err() {
+            return;
+        }
+        // DerefMut marks this guard for reconciliation, after releasing it.
+        if let Ok(mut registry) = self.processes.lock() {
+            let _ = &mut *registry;
+        }
+    }
+
+    /// Record coherent cached evidence from one batch, never an on-demand walk.
+    /// This lock is independent of the watch lifecycle/retirement lock.
+    pub fn cache_memory_tick(&self, batch: &cairn_procmem::TickBatch<'_>) {
+        let mut evidence = self.processes.memory.evidence.lock().unwrap();
+        evidence.retain(|id, _| batch.watches.iter().any(|w| w.id == *id));
+        for watch in batch.watches {
+            if let cairn_procmem::SamplingStatus::Measured(reading) = &watch.status {
+                evidence.insert(
+                    watch.id,
+                    cairn_common::executor_protocol::MemoryDiagnosticReading {
+                        tick_unix_ms: reading.measured_at.unix_ms,
+                        members: watch
+                            .members
+                            .iter()
+                            .map(|member| ProcessAnchor {
+                                pid: member.pid,
+                                start_token: member.start_time.token(),
+                            })
+                            .collect(),
+                        resident_bytes: reading.resident_bytes,
+                        members_read: reading.members_read.min(u32::MAX as usize) as u32,
+                        members_total: reading.members_total.min(u32::MAX as usize) as u32,
+                        incomplete: reading.incomplete,
+                    },
+                );
+            } else if !matches!(watch.status, cairn_procmem::SamplingStatus::FailedSampling) {
+                evidence.remove(&watch.id);
+            }
+        }
+    }
+
+    /// Observer-readable bindings. No lifecycle lock or census is involved.
+    pub fn memory_bindings(&self) -> Vec<(String, ProcessAnchor, cairn_procmem::WatchId)> {
+        self.processes
+            .memory
+            .index
+            .lock()
+            .unwrap()
+            .registered
+            .iter()
+            .map(|(id, (anchor, _, watch))| (id.clone(), anchor.clone(), *watch))
+            .collect()
+    }
+
+    pub fn retire_memory_tick(&self, id: cairn_procmem::WatchId) {
+        self.processes.memory.evidence.lock().unwrap().remove(&id);
+    }
+
+    /// Resolve only a registered captured anchor, with cached batch evidence.
+    pub fn memory_diagnostic(
+        &self,
+        run_id: &str,
+    ) -> Option<(
+        ProcessAnchor,
+        Option<cairn_common::executor_protocol::MemoryDiagnosticReading>,
+    )> {
+        let (anchor, generation) = {
+            let registry = self.processes.lock().ok()?;
+            (
+                registry.get(run_id)?.leader.clone()?,
+                *registry.generations.get(run_id)?,
+            )
+        };
+        let id = self
+            .processes
+            .memory
+            .index
+            .lock()
+            .ok()?
+            .registered
+            .get(run_id)
+            .filter(|(captured, gen, _)| *captured == anchor && *gen == generation)
+            .map(|(_, _, id)| *id);
+        let cached = {
+            let evidence = self.processes.memory.evidence.lock().ok()?;
+            id.and_then(|id| evidence.get(&id).cloned())
+        };
+        let registry = self.processes.lock().ok()?;
+        (registry.generations.get(run_id) == Some(&generation)
+            && registry.get(run_id)?.leader.as_ref() == Some(&anchor))
+        .then_some((anchor, cached))
+    }
+
     pub fn admission_claim_is_current(
         &self,
         run_id: &str,
@@ -1073,10 +1313,6 @@ impl AgentProcessState {
                 })
             })
             .collect()
-    }
-
-    pub fn live_tree_signal(&self) -> &LiveTreeSignal {
-        &self.live_tree_signal
     }
 
     /// Count GC-safe (idle) processes.
@@ -1518,14 +1754,10 @@ impl AgentProcessState {
         if handle.leader.is_none() {
             handle.leader = handle.read_leader();
         }
-        let measurable = handle.leader.is_some();
         let displaced = {
             let mut processes = self.processes.lock().map_err(|e| e.to_string())?;
             processes.register(run_id, handle)
         };
-        if measurable {
-            self.live_tree_signal.notify();
-        }
         if let Some(displaced) = displaced {
             if let Ok(mut child_guard) = displaced.child.lock() {
                 if let Some(child) = child_guard.as_mut() {
@@ -1559,12 +1791,11 @@ impl AgentProcessState {
 impl Default for AgentProcessState {
     fn default() -> Self {
         Self {
-            processes: Mutex::new(RunRegistry::default()),
+            processes: ProcessRegistry::default(),
             cli_binary_path: Mutex::new(None),
             workflow_stop_requested: Mutex::new(std::collections::HashSet::new()),
             workflow_leases: Mutex::new(std::collections::HashMap::new()),
             pending_admission_claims: Mutex::new(HashMap::new()),
-            live_tree_signal: LiveTreeSignal::default(),
         }
     }
 }

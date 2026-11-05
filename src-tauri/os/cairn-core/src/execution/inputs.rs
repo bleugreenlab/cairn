@@ -1467,6 +1467,7 @@ mod tests {
                 "cairn-models-types",
                 "cairn-packs",
                 "cairn-platform",
+                "cairn-procmem",
                 "cairn-sandbox",
                 "cairn-session",
                 "cairn-speech-wire",
@@ -1485,7 +1486,8 @@ mod tests {
                 "cairn-cell",
                 "cairn-cmd",
                 "cairn-common",
-                "cairn-mcp-server"
+                "cairn-mcp-server",
+                "cairn-procmem"
             ]
         );
     }

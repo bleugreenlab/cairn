@@ -45,6 +45,25 @@ struct ConfigureRequest {
     /// volume, or `null` for the home. Absent leaves it as it is.
     #[serde(alias = "build_root", default, deserialize_with = "present_or_null")]
     build_root: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_diagnostic")]
+    memory_diagnostic: Option<Option<management::MemoryDiagnosticSelection>>,
+}
+
+impl ConfigureRequest {
+    fn diagnostic_generation(&self) -> Result<u64, &'static str> {
+        if self.new_name.is_some()
+            || self.runtime_policy.is_some()
+            || self.draining.is_some()
+            || self.role.is_some()
+            || self.machine_services.is_some()
+            || self.repaired.is_some()
+            || self.build_root.is_some()
+        {
+            return Err("memoryDiagnostic cannot be combined with configuration changes");
+        }
+        self.expected_generation
+            .ok_or("memoryDiagnostic requires expectedGeneration from cairn://executors/local")
+    }
 }
 
 /// Tell an absent key (`None`) from an explicit `null` (`Some(None)`).
@@ -53,6 +72,16 @@ where
     D: serde::Deserializer<'de>,
 {
     <Option<String> as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+fn present_diagnostic<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<management::MemoryDiagnosticSelection>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<management::MemoryDiagnosticSelection> as serde::Deserialize>::deserialize(deserializer)
+        .map(Some)
 }
 
 #[derive(serde::Deserialize)]
@@ -199,13 +228,34 @@ pub(super) async fn dispatch(
                         index,
                         item,
                         format!(
-                            "invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role ({}), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, and expectedGeneration.",
+                            "invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role ({}), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, memoryDiagnostic ({{runId,durationMs}} or null), and expectedGeneration.",
                             cairn_common::executor_protocol::MachineRole::ALL
                                 .map(cairn_common::executor_protocol::MachineRole::as_str)
                                 .join(", ")
                         ),
                     )
                 })?;
+            if let Some(selection) = &request.memory_diagnostic {
+                let generation = request
+                    .diagnostic_generation()
+                    .map_err(|error| build_failure(index, item, error))?;
+                management::resolve_memory_diagnostic(orch, name, generation, selection.as_ref())
+                    .map_err(|error| build_failure(index, item, error))?;
+                if !dry_run {
+                    management::set_memory_diagnostic(orch, name, generation, selection.as_ref())
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                }
+                return Ok(Some(format!(
+                    "{} memory diagnostic {}",
+                    if dry_run { "Would change" } else { "Changed" },
+                    if selection.is_some() {
+                        "(attached for at most 60 seconds; cached evidence only)"
+                    } else {
+                        "(detached)"
+                    },
+                )));
+            }
             if request.new_name.is_none()
                 && request.runtime_policy.is_none()
                 && request.draining.is_none()
@@ -399,4 +449,76 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+#[cfg(test)]
+mod memory_diagnostic_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn memory_diagnostic_patch_requires_generation_and_cannot_mix_configuration() {
+        let valid: ConfigureRequest = serde_json::from_value(json!({
+            "memoryDiagnostic":null, "expectedGeneration":7
+        }))
+        .unwrap();
+        assert_eq!(valid.diagnostic_generation().unwrap(), 7);
+        let missing: ConfigureRequest =
+            serde_json::from_value(json!({"memoryDiagnostic":null})).unwrap();
+        assert!(missing
+            .diagnostic_generation()
+            .unwrap_err()
+            .contains("expectedGeneration"));
+        for change in [
+            json!({"draining":false}),
+            json!({"newName":"replacement"}),
+            json!({"runtimePolicy": cairn_common::executor_protocol::ExecutorRuntimePolicy::default()}),
+            json!({"role":"general"}),
+            json!({"machineServices":{}}),
+            json!({"repaired":true}),
+            json!({"buildRoot":null}),
+        ] {
+            let mut payload = json!({"memoryDiagnostic":null,"expectedGeneration":7});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(change.as_object().unwrap().clone());
+            let request: ConfigureRequest = serde_json::from_value(payload).unwrap();
+            assert!(request
+                .diagnostic_generation()
+                .unwrap_err()
+                .contains("cannot be combined"));
+        }
+    }
+
+    #[test]
+    fn memory_diagnostic_patch_distinguishes_absence_detach_and_attach() {
+        let absent: ConfigureRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.memory_diagnostic.is_none());
+        let detach: ConfigureRequest = serde_json::from_value(json!({
+            "memoryDiagnostic": null, "expectedGeneration": 7
+        }))
+        .unwrap();
+        assert!(matches!(detach.memory_diagnostic, Some(None)));
+        let attach: ConfigureRequest = serde_json::from_value(json!({
+            "memoryDiagnostic": {"runId":"registered", "durationMs":60000},
+            "expectedGeneration": 7
+        }))
+        .unwrap();
+        let selection = attach.memory_diagnostic.unwrap().unwrap();
+        assert_eq!(selection.run_id, "registered");
+        assert_eq!(selection.duration_ms, 60_000);
+        assert!(
+            serde_json::from_value::<ConfigureRequest>(json!({
+                "memoryDiagnostic": {"runId":"registered", "durationMs":60000,
+                    "anchor":{"pid":42,"startToken":"1"}}
+            }))
+            .is_err(),
+            "resource callers cannot supply a PID or start identity"
+        );
+        assert!(serde_json::from_value::<ConfigureRequest>(json!({
+            "memoryDiagnostic": {"pid":42,"durationMs":60000}
+        }))
+        .is_err());
+    }
 }
