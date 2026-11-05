@@ -39,8 +39,6 @@ pub struct ChangeInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<Vec<ChangeItemInput>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_msg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<bool>,
@@ -82,10 +80,6 @@ impl schemars::JsonSchema for ChangeInput {
                             }
                         }
                     }
-                },
-                "branch": {
-                    "type": "string",
-                    "description": "Commit file changes onto an existing managed branch, named by thread-branch entity URI (canonical or cairn:~/branches/N) or raw ref. This mutates and advances the ref; unlike run branch:, it is not verdict-only."
                 },
                 "commit_msg": {
                     "type": "string",

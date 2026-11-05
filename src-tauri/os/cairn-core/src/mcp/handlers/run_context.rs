@@ -567,7 +567,7 @@ mod tests {
             .await
             .expect("a thread-owned job may not commit");
         assert!(
-            refusal.contains("thread-owned job") && refusal.contains("cairn:~/branches"),
+            refusal.contains("thread-owned job") && refusal.contains("child issue"),
             "the refusal must carry the posture and where the work belongs: {refusal}"
         );
 

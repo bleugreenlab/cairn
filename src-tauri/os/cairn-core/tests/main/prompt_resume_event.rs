@@ -118,8 +118,6 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
                       "kind": "file", "error": "not found"}],
         "commit": {"status": "committed", "sha": "parent-commit",
                    "pr_number": null, "message": null},
-        "branch": {"number": 1, "git_ref": "question-branch",
-                   "uri": "cairn://p/presume/branches/1", "stage": "active"},
         "partial_success": true,
         "blocking": {"text": "Question suspended", "artifact_uri": "cairn://stale"}
     });

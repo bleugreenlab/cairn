@@ -172,16 +172,8 @@ pub fn build_thread_task_uri(project: &str, name: &str, task_segment: &str) -> S
     format!("{}/task/{}", build_thread_uri(project, name), task_segment)
 }
 
-pub fn build_thread_branches_uri(project: &str, name: &str) -> String {
-    format!("{}/branches", build_thread_uri(project, name))
-}
-
 pub fn build_thread_queue_uri(project: &str, name: &str) -> String {
     format!("{}/queue", build_thread_uri(project, name))
-}
-
-pub fn build_thread_branch_uri(project: &str, name: &str, number: i32) -> String {
-    format!("{}/{}", build_thread_branches_uri(project, name), number)
 }
 
 pub fn build_project_issues_uri(project: &str) -> String {
@@ -1150,13 +1142,7 @@ impl CairnResource {
                 }
                 uri
             }
-            Self::ThreadBranches { project, thread } => build_thread_branches_uri(project, thread),
             Self::ThreadQueue { project, thread } => build_thread_queue_uri(project, thread),
-            Self::ThreadBranch {
-                project,
-                thread,
-                number,
-            } => build_thread_branch_uri(project, thread, *number),
             Self::ThreadDb { project, name } => {
                 format!("{}/db", build_thread_uri(project, name))
             }

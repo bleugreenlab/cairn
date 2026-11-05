@@ -13,15 +13,6 @@ pub(crate) fn fail_next_local_bookmarks_at() {
     FAIL_NEXT_LOCAL_BOOKMARKS_AT.store(true, Ordering::SeqCst);
 }
 
-/// Delete a provisional local bookmark without snapshotting any workspace.
-pub fn delete_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
-    jj.run(
-        store,
-        &["bookmark", "delete", branch, "--ignore-working-copy"],
-        "jj bookmark delete",
-    )
-    .map(|_| ())
-}
 /// Query only candidate bookmark names in one structured jj invocation. An
 /// empty candidate set is resolved without spawning jj.
 pub fn query_local_bookmarks(

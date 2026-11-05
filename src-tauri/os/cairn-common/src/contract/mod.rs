@@ -163,9 +163,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     issues::ISSUE_CONTRACT,
     issues::PROJECT_THREADS_CONTRACT,
     issues::THREAD_CONTRACT,
-    issues::THREAD_BRANCHES_CONTRACT,
     issues::THREAD_QUEUE_CONTRACT,
-    issues::THREAD_BRANCH_CONTRACT,
     issues::THREAD_DB_CONTRACT,
     issues::THREAD_DB_SCHEMA_CONTRACT,
     issues::THREAD_DB_TABLE_CONTRACT,
@@ -568,8 +566,6 @@ mod tests {
 
     #[test]
     fn example_keys_belong_to_the_primary_mutation() {
-        let branch = mutation_spec(ResourceKind::ThreadBranches, ChangeMode::Append).unwrap();
-        assert_eq!(example_payload_keys(branch.example), ["title", "pr"]);
         // Unknown keys on the primary payload still reach the contract guard;
         // nested values, escaped quotes and a sibling file change do not.
         assert_eq!(

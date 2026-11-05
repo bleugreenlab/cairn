@@ -366,7 +366,6 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     // guarantees that, so no pre-sweep special case is needed.
     owned("build_change_notifications", &[owner(OwnerSet::Jobs, "recipient IN {ids}")]),
     owned("feed_cursors", &[owner(OwnerSet::Threads, "(home_kind = 'thread' AND home_id IN {ids})"), owner(OwnerSet::Jobs, "(home_kind = 'job' AND home_id IN {ids})")]),
-    spec("thread_branches", "thread_id IN (SELECT id FROM threads WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))"),
     spec("turn_end_check_attempts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifact_content", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifacts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
@@ -1691,8 +1690,6 @@ pub(super) mod tests {
               VALUES ('comment-delete', 'thread-delete', 'comment', 'user', 1);
             INSERT INTO thread_read_positions(thread_id, acknowledged_event_rowid, updated_at)
               VALUES ('thread-delete', 0, 1);
-            INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
-              VALUES ('branch-delete', 'thread-delete', 1, 'accumulating', 'agent/delete', 'job-delete', 1, 1);
             INSERT INTO tenets(id, project_id, number, proposing_thread_id, statement, status, origin, proposer_principal_json, created_at, updated_at)
               VALUES ('tenet-delete', 'project-delete', 1, 'thread-delete', 'q', 'proposed', 'standing', '{"kind":"agent","node":"cairn://p/delete/thread-delete","run_id":null}', 1, 1);
             INSERT INTO tenet_ruling_imports(thread_id, project_id, imported_at)
@@ -1757,7 +1754,6 @@ pub(super) mod tests {
             "jj_reconcile_items",
             "pack_catalog_references",
             "post_comments",
-            "thread_branches",
             "thread_read_positions",
             "wake_conditions",
             "wake_schedules",
@@ -2369,13 +2365,6 @@ pub(super) mod tests {
         )
         .await
         .unwrap();
-        team.execute(
-            "INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
-             VALUES ('team-branch', ?1, 1, 'pr-open', 'agent/thread/1', ?2, 1, 1)",
-            (team_thread_id.clone(), team_job_id.clone()),
-        )
-        .await
-        .unwrap();
 
         local
             .execute(
@@ -2731,10 +2720,6 @@ pub(super) mod tests {
             "fixture did not seed the private rows a team project accumulates"
         );
         assert!(count(&fixture.team, "SELECT COUNT(*) FROM jobs").await > 0);
-        assert_eq!(
-            count(&fixture.team, "SELECT COUNT(*) FROM thread_branches").await,
-            1
-        );
         for table in [
             "discord_surface",
             "channel_state_card",
@@ -2781,7 +2766,6 @@ pub(super) mod tests {
             "jobs",
             "runs",
             "threads",
-            "thread_branches",
         ] {
             assert_eq!(
                 count(&fixture.team, &format!("SELECT COUNT(*) FROM {table}")).await,
@@ -2879,7 +2863,6 @@ pub(super) mod tests {
         let artifact_version_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
         let check_attempt_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
         let thread_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
-        let branch_id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
         let branch_job_id = "00000000-0000-4000-8000-000000000001";
 
         let local = Arc::new(migrated_db("move-local.db", TURSO_MIGRATIONS.to_vec()).await);
@@ -2957,8 +2940,8 @@ pub(super) mod tests {
             .unwrap();
         local
             .execute(
-                "INSERT INTO threads(id, project_id, name, next_branch_number, created_at, updated_at)
-                 VALUES (?1, ?2, 'branch-thread', 8, 1, 1)",
+                "INSERT INTO threads(id, project_id, name, created_at, updated_at)
+                 VALUES (?1, ?2, 'branch-thread', 1, 1)",
                 (thread_id, project_id),
             )
             .await
@@ -2968,14 +2951,6 @@ pub(super) mod tests {
                 "INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, branch, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'complete', 'branch-7', 'agent/branch-thread/7', 1, 1)",
                 (branch_job_id, thread_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO thread_branches(id, thread_id, number, title, stage, git_ref, job_id, created_at, moved_at)
-                 VALUES (?1, ?2, 7, 'Preserve this branch', 'pr-open', 'agent/branch-thread/7', ?3, 1, 2)",
-                (branch_id, thread_id, branch_job_id),
             )
             .await
             .unwrap();
@@ -3096,56 +3071,14 @@ pub(super) mod tests {
         let team_artifact_version_id = rekey_to_team(artifact_version_id, team_id).unwrap();
         let team_child_issue_id = rekey_to_team(child_issue_id, team_id).unwrap();
         let team_check_attempt_id = rekey_to_team(check_attempt_id, team_id).unwrap();
-        let team_thread_id = rekey_to_team(thread_id, team_id).unwrap();
         let team_branch_job_id = rekey_to_team(branch_job_id, team_id).unwrap();
-        assert_eq!(
-            team.query_one(
-                "SELECT thread_id, job_id, number, title, stage, git_ref, created_at, moved_at
-                 FROM thread_branches WHERE id = ?1",
-                (rekey_to_team(branch_id, team_id).unwrap(),),
-                |row| Ok((
-                    row.text(0)?,
-                    row.text(1)?,
-                    row.i64(2)?,
-                    row.text(3)?,
-                    row.text(4)?,
-                    row.text(5)?,
-                    row.i64(6)?,
-                    row.i64(7)?
-                )),
-            )
-            .await
-            .unwrap(),
-            (
-                team_thread_id.clone(),
-                team_branch_job_id.clone(),
-                7,
-                "Preserve this branch".to_string(),
-                "pr-open".to_string(),
-                "agent/branch-thread/7".to_string(),
-                1,
-                2
-            )
-        );
-        assert_eq!(
-            team.query_opt_i64(
-                "SELECT next_branch_number FROM threads WHERE id = ?1",
-                (team_thread_id,)
-            )
-            .await
-            .unwrap(),
-            Some(8)
-        );
+        // A retired thread branch's job moves as the thread task it now is.
         assert_eq!(
             crate::jobs::queries::home_uri_for_job(&team, &team_branch_job_id)
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("cairn://p/move/branch-thread/branches/7")
-        );
-        assert_eq!(
-            count(&local, "SELECT COUNT(*) FROM thread_branches").await,
-            0
+            Some("cairn://p/move/branch-thread/task/branch-7")
         );
         assert_eq!(count(&local, "SELECT COUNT(*) FROM threads").await, 0);
 

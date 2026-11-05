@@ -163,7 +163,6 @@ mod tests {
                 mode: Some("append".into()),
                 payload: Some(serde_json::json!({"content":"cairn://p/CAIRN/1086"})),
             }]),
-            branch: None,
             commit_msg: None,
             preview: None,
             atomic: None,

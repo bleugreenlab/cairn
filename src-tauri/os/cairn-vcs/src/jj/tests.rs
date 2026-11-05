@@ -8289,7 +8289,18 @@ fn import_commits(fx: &TrackedOrigin, commits: &[&str]) {
     }
     import_git(&fx.jj, &fx.store).unwrap();
     for n in 0..commits.len() {
-        delete_bookmark(&fx.jj, &fx.store, &format!("fixture-{n}")).unwrap();
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "delete",
+                    &format!("fixture-{n}"),
+                    "--ignore-working-copy",
+                ],
+                "jj bookmark delete",
+            )
+            .unwrap();
     }
     export_git_preserving_checkout(&fx.jj, &fx.store, true, "drop fixture bookmarks").unwrap();
 }

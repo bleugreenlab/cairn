@@ -2866,10 +2866,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         // the arm above: the parity check panics on the first unsampled kind and
         // never reaches any later one, so the whole tail of the table —
         // including attachments — was going unchecked.
-        K::ThreadBranches => "cairn://p/cairn/harness/branches",
         K::ThreadQueue => "cairn://p/cairn/harness/queue",
         K::ProjectQueue => "cairn://p/cairn/queue",
-        K::ThreadBranch => "cairn://p/cairn/harness/branches/1",
         K::ThreadDb => "cairn://p/cairn/harness/db",
         K::ThreadDbSchema => "cairn://p/cairn/harness/db/schema",
         K::ThreadDbTable => "cairn://p/cairn/harness/db/attempts",
@@ -4046,7 +4044,7 @@ async fn a_thread_dismisses_evidence_on_its_tenet_through_a_patch() {
         .id;
     orch.db
         .local
-        .execute_script(&format!(
+        .execute_script(format!(
             "INSERT INTO tenet_evidence_events (id, project_id, source_uri, source_kind, dedupe_key,
                  owner_device_id, text, created_at)
                VALUES ('ev-5984', '{project_id}', 'cairn://p/cairn/5984', 'issue_resolution',

@@ -78,11 +78,6 @@ pub struct ChangeItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangePayload {
     pub(crate) changes: Vec<ChangeItem>,
-    /// Destination for a write onto an already-minted managed branch. Unlike
-    /// `run branch:`, this is a mutating coordinate: a successful file batch
-    /// advances the named ref.
-    #[serde(default)]
-    pub(crate) branch: Option<String>,
     #[serde(default)]
     pub(crate) commit_msg: Option<String>,
     #[serde(default)]

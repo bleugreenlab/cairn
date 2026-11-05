@@ -137,9 +137,7 @@ impl CairnResource {
             Self::Issue { number, .. } => Some(format!("/p/{}/i/{}", project, number)),
             Self::ProjectThreads { .. }
             | Self::Thread { .. }
-            | Self::ThreadBranches { .. }
             | Self::ThreadQueue { .. }
-            | Self::ThreadBranch { .. }
             | Self::ThreadDb { .. }
             | Self::ThreadDbSchema { .. }
             | Self::ThreadDbTable { .. }
@@ -497,9 +495,7 @@ impl CairnResource {
             | Self::Issue { project, .. }
             | Self::ProjectThreads { project, .. }
             | Self::Thread { project, .. }
-            | Self::ThreadBranches { project, .. }
             | Self::ThreadQueue { project, .. }
-            | Self::ThreadBranch { project, .. }
             | Self::ThreadDb { project, .. }
             | Self::ThreadDbSchema { project, .. }
             | Self::ThreadDbTable { project, .. }
@@ -733,9 +729,7 @@ impl CairnResource {
             | Self::NodeSymbols { number, .. } => Some(*number),
             Self::ProjectThreads { .. }
             | Self::Thread { .. }
-            | Self::ThreadBranches { .. }
             | Self::ThreadQueue { .. }
-            | Self::ThreadBranch { .. }
             | Self::ThreadDb { .. }
             | Self::ThreadDbSchema { .. }
             | Self::ThreadDbTable { .. }

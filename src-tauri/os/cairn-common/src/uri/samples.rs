@@ -147,9 +147,7 @@ resource_samples! {
     // The thread itself is the common parser's; everything beneath it is the
     // core resolver's, and `Thread { path }` is the handoff both agree on.
     Thread { project: project(), name: thread(), path: Vec::new() } => Parser,
-    ThreadBranches { project: project(), thread: thread() } => ThreadResolver,
     ThreadQueue { project: project(), thread: thread() } => ThreadResolver,
-    ThreadBranch { project: project(), thread: thread(), number: 3 } => ThreadResolver,
     ThreadDb { project: project(), name: thread() } => ThreadResolver,
     ThreadDbSchema { project: project(), name: thread() } => ThreadResolver,
     ThreadDbTable { project: project(), name: thread(), table: "attempt log".to_string() } => ThreadResolver,

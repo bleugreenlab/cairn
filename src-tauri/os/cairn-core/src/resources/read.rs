@@ -2570,24 +2570,6 @@ async fn render_resource_body(
                     .await
             }
         }
-        CairnResource::ThreadBranches { project, thread } => {
-            if let Some(error) = reject_query_params("thread branches", &params) {
-                error
-            } else {
-                super::threads::read_thread_branches(db, &project, &thread).await
-            }
-        }
-        CairnResource::ThreadBranch {
-            project,
-            thread,
-            number,
-        } => {
-            if let Some(error) = reject_query_params("thread branch", &params) {
-                error
-            } else {
-                super::threads::read_thread_branch(db, &project, &thread, number).await
-            }
-        }
         CairnResource::ProjectCheckResults { project, revision } => {
             read_project_check_results(orch, request, &project, &revision, &params).await
         }

@@ -521,13 +521,7 @@ pub async fn list_jobs_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<Job
     list_jobs_by_predicate(db, "issue_id = ?1", issue_id, "created_at ASC").await
 }
 pub async fn list_jobs_for_thread(db: &LocalDb, thread_id: &str) -> Result<Vec<Job>, CairnError> {
-    list_jobs_by_predicate(
-        db,
-        "thread_id = ?1 AND NOT EXISTS (SELECT 1 FROM thread_branches tb WHERE tb.job_id = jobs.id)",
-        thread_id,
-        "created_at DESC",
-    )
-    .await
+    list_jobs_by_predicate(db, "thread_id = ?1", thread_id, "created_at DESC").await
 }
 
 pub async fn list_child_jobs(
@@ -3774,6 +3768,10 @@ mod tests {
                      'Survey', 3, 3)",
         )
         .await;
+        // The jobs behind the retired numbered thread branches have this shape:
+        // a completed child of the session, segment `branch-N`, holding a ref and
+        // possibly a PR. They read as ordinary tasks and stay addressable, and
+        // they must not displace the session.
         exec(
             &db,
             "INSERT INTO jobs (id, thread_id, parent_job_id, project_id, status, uri_segment,
@@ -3782,21 +3780,19 @@ mod tests {
                      'Branch 1', 'agent/thread-ux/1', 4, 4)",
         )
         .await;
-        exec(
-            &db,
-            "INSERT INTO thread_branches
-                 (id, thread_id, number, title, stage, git_ref, job_id, created_at, moved_at)
-             VALUES ('tb', 't', 1, 'Fix', 'pr-open', 'agent/thread-ux/1', 'j-branch', 4, 4);",
-        )
-        .await;
         assert_eq!(
             home_uri_for_job(&db, "j-branch").await.unwrap().as_deref(),
-            Some("cairn://p/cairn/thread-ux/branches/1"),
+            Some("cairn://p/cairn/thread-ux/task/branch-1"),
         );
         let thread_jobs = list_jobs_for_thread(&db, "t").await.unwrap();
         assert!(
-            thread_jobs.iter().all(|job| job.id != "j-branch"),
-            "branch backing jobs are entities, not thread tasks"
+            thread_jobs.iter().any(|job| job.id == "j-branch"),
+            "a retired branch's job lists as a thread task"
+        );
+        assert_eq!(
+            home_uri_for_job(&db, "j-session").await.unwrap().as_deref(),
+            Some("cairn://p/cairn/thread-ux"),
+            "the session still resolves to the thread itself"
         );
 
         assert_eq!(

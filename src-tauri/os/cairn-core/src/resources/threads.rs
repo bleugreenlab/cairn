@@ -168,151 +168,10 @@ fn render_thread_queue(
     out
 }
 
-pub(super) async fn read_thread_branches(db: &LocalDb, project_key: &str, thread: &str) -> String {
-    let project_key = project_key.to_owned();
-    let thread = thread.to_owned();
-    read_resource(db, move |conn| {
-        Box::pin(async move {
-            let project_key = project_key.as_str();
-            let thread = thread.as_str();
-            let project = match lookup_project_by_key(conn, project_key).await {
-                Ok(project) => project,
-                Err(error) => return Ok(error),
-            };
-            let mut rows = match conn.query(
-                "SELECT b.number, b.title, b.stage, b.moved_at, mr.status, mr.github_pr_number, mr.github_pr_url
-                 FROM thread_branches b JOIN threads t ON t.id = b.thread_id
-                 LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
-                 WHERE t.project_id = ?1 AND t.name = ?2 ORDER BY b.number",
-                params![project.project_id.as_str(), thread],
-            ).await { Ok(rows) => rows, Err(error) => return Ok(format!("Failed to load thread branches: {error}")) };
-            let mut out = format!("# Branches — {thread}\n\n");
-            let mut count = 0;
-            while let Ok(Some(row)) = rows.next().await {
-                let (
-                    Ok(number),
-                    Ok(title),
-                    Ok(stage),
-                    Ok(moved_at),
-                    Ok(pr_status),
-                    Ok(pr_number),
-                    Ok(pr_url),
-                ) = (
-                    row.i64(0),
-                    row.opt_text(1),
-                    row.text(2),
-                    row.i64(3),
-                    row.opt_text(4),
-                    row.opt_i64(5),
-                    row.opt_text(6),
-                )
-                else {
-                    continue;
-                };
-                count += 1;
-                let label = title.unwrap_or_else(|| "Untitled".to_string());
-                let pr = match (pr_number, pr_status, pr_url) {
-                    (Some(number), Some(status), Some(url)) => format!("PR [#{number}]({url}) {status}"),
-                    (Some(number), Some(status), None) => format!("PR #{number} {status}"),
-                    (_, Some(status), _) => format!("PR {status}"),
-                    _ => "no PR".to_string(),
-                };
-                out.push_str(&format!("- [#{number} — {label}](cairn://p/{project_key}/{thread}/branches/{number}) · {stage} · moved {} · {pr}\n", crate::clock::age(moved_at)));
-            }
-            if count == 0 {
-                out.push_str("No branches.\n");
-            }
-            Ok(out)
-        })
-    })
-    .await
-    .unwrap_or_else(|error| error)
-}
-
-pub(super) async fn read_thread_branch(
-    db: &LocalDb,
-    project_key: &str,
-    thread: &str,
-    number: i32,
-) -> String {
-    let project_key = project_key.to_owned();
-    let thread = thread.to_owned();
-    read_resource(db, move |conn| {
-        Box::pin(async move {
-            let project_key = project_key.as_str();
-            let thread = thread.as_str();
-            let project = match lookup_project_by_key(conn, project_key).await {
-                Ok(project) => project,
-                Err(error) => return Ok(error),
-            };
-            let mut rows = match conn.query(
-                "SELECT b.title, b.stage, b.git_ref, b.created_at, b.moved_at, mr.status, mr.github_pr_number, mr.github_pr_url
-                 FROM thread_branches b JOIN threads t ON t.id = b.thread_id
-                 LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
-                 WHERE t.project_id = ?1 AND t.name = ?2 AND b.number = ?3 LIMIT 1",
-                params![project.project_id.as_str(), thread, number],
-            ).await { Ok(rows) => rows, Err(error) => return Ok(format!("Failed to load thread branch: {error}")) };
-            let Some(row) = rows.next().await.ok().flatten() else {
-                return Ok(format!("Thread branch {thread}/{number} not found"));
-            };
-            let (
-                Ok(title),
-                Ok(stage),
-                Ok(git_ref),
-                Ok(created_at),
-                Ok(moved_at),
-                Ok(pr_status),
-                Ok(pr_number),
-                Ok(pr_url),
-            ) = (
-                row.opt_text(0),
-                row.text(1),
-                row.text(2),
-                row.i64(3),
-                row.i64(4),
-                row.opt_text(5),
-                row.opt_i64(6),
-                row.opt_text(7),
-            )
-            else {
-                return Ok("Failed to decode thread branch".into());
-            };
-            let mut out = format!("# Branch #{number} — {}\n\nStage: {stage}\n\nRef: `{git_ref}`\n\nCreated: {} · Last movement: {}\n", title.unwrap_or_else(|| "Untitled".into()), crate::clock::age(created_at), crate::clock::age(moved_at));
-            if let Some(status) = pr_status {
-                let label = pr_number
-                    .map(|n| format!("PR #{n}"))
-                    .unwrap_or_else(|| "PR".into());
-                if let Some(url) = pr_url {
-                    out.push_str(&format!("\n{label}: [{status}]({url})\n"));
-                } else {
-                    out.push_str(&format!("\n{label}: {status}\n"));
-                }
-            } else {
-                out.push_str("\nPR: none\n");
-            }
-            Ok(out)
-        })
-    })
-    .await
-    .unwrap_or_else(|error| error)
-}
-
 fn parse_seq(kind: &str, value: &str) -> Result<i32, String> {
     value
         .parse()
         .map_err(|_| format!("Invalid thread {kind}: {value}"))
-}
-
-/// A 1-based ordinal segment, which `0` and negatives do not name.
-///
-/// The common URI parser enforced this for `branches/<n>` back when it read
-/// thread sub-paths itself. The rule belongs with the meaning, so it moved here
-/// with it rather than being lost in the handoff.
-fn parse_ordinal(kind: &str, value: &str) -> Result<i32, String> {
-    match value.parse::<i32>() {
-        Ok(number) if number > 0 => Ok(number),
-        _ => Err(format!("Invalid thread {kind}: {value}")),
-    }
 }
 
 /// A thread database table or primary-key segment, percent-decoded as
@@ -381,18 +240,9 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
                 path,
             })
         }
-        ["branches"] => CairnResource::ThreadBranches {
-            project,
-            thread: name,
-        },
         ["queue"] => CairnResource::ThreadQueue {
             project,
             thread: name,
-        },
-        ["branches", number] => CairnResource::ThreadBranch {
-            project,
-            thread: name,
-            number: parse_ordinal("branch number", number)?,
         },
 
         ["db"] | ["task", _, "db"] => {

@@ -2499,7 +2499,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("tenet_evidence_events", TableScope::ProjectScoped),
     ("tenet_ruling_imports", TableScope::ProjectScoped),
     ("tenets", TableScope::ProjectScoped),
-    ("thread_branches", TableScope::ProjectScoped),
     ("threads", TableScope::ProjectScoped),
     ("todos", TableScope::ProjectScoped),
     ("token_rollup", TableScope::ProjectScoped),
@@ -3417,10 +3416,6 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "tenets",
         id_columns: &["id", "project_id", "proposing_thread_id"],
-    },
-    RekeyTableManifest {
-        table: "thread_branches",
-        id_columns: &["id", "thread_id", "job_id"],
     },
     RekeyTableManifest {
         table: "threads",
@@ -8401,18 +8396,25 @@ mod tests {
         assert!(again.is_empty(), "team migrations must be idempotent");
     }
 
+    /// A team database that never received 0221 applies it and then the drop, and
+    /// comes out with no ledger, the dormant column, and its threads intact. The
+    /// shipped lineage recorded later migrations without 0221, so a version cutoff
+    /// would not reproduce this.
     #[tokio::test]
-    async fn existing_team_database_gains_branch_ledger_without_resetting_threads() {
+    async fn team_database_that_missed_the_branch_ledger_applies_it_and_its_retirement() {
         let temp = tempdir().unwrap();
         let db = LocalDb::open(temp.path().join("team-branches.db"))
             .await
             .unwrap();
-        // Reproduce the shipped lineage: later migrations are already recorded,
-        // but 0221 was never composed into it. A version cutoff would miss this.
         let previous = TEAM_MIGRATIONS
             .iter()
             .copied()
-            .filter(|migration| migration.name() != "thread_branches")
+            .filter(|migration| {
+                !matches!(
+                    migration.name(),
+                    "thread_branches" | "retire_thread_branches"
+                )
+            })
             .collect::<Vec<_>>();
         MigrationRunner::new(previous).run(&db).await.unwrap();
         db.execute_script(
@@ -8420,37 +8422,36 @@ mod tests {
              INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
              VALUES ('p', 'team', 'Project', 'project', '/tmp/project', 1, 1);
              INSERT INTO threads(id, project_id, name, created_at, updated_at)
-             VALUES ('t', 'p', 'keep-this-thread', 1, 1);
-             INSERT INTO jobs(id, thread_id, project_id, status, created_at, updated_at)
-             VALUES ('j', 't', 'p', 'complete', 1, 1);",
+             VALUES ('t', 'p', 'keep-this-thread', 1, 1);",
         )
         .await
         .unwrap();
 
         let runner = MigrationRunner::new(TEAM_MIGRATIONS.to_vec());
-        assert_eq!(runner.run(&db).await.unwrap(), ["0221_thread_branches"]);
-        assert_eq!(
-            query_i64(&db, "SELECT next_branch_number FROM threads WHERE id = 't'")
-                .await
-                .unwrap(),
-            1
+        let applied = runner.run(&db).await.unwrap();
+        assert_eq!(applied.len(), 2, "{applied:?}");
+        assert_eq!(applied[0], "0221_thread_branches");
+        assert!(
+            applied[1].ends_with("retire_thread_branches"),
+            "{applied:?}"
         );
-        // Exercise allocation against the upgraded team schema, then restart:
-        // neither the ledger nor its next number may be reset by migration replay.
-        db.execute_script(
-            "INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
-             SELECT 'b', id, next_branch_number, 'pr-open', 'agent/thread/1', 'j', 2, 2
-             FROM threads WHERE id = 't';
-             UPDATE threads SET next_branch_number = next_branch_number + 1 WHERE id = 't';",
-        )
-        .await
-        .unwrap();
-        assert!(runner.run(&db).await.unwrap().is_empty());
+
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = 'thread_branches'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "neither the ledger nor its index survives"
+        );
         assert_eq!(
             query_i64(&db, "SELECT next_branch_number FROM threads WHERE id = 't'")
                 .await
                 .unwrap(),
-            2
+            1,
+            "the column stays, dormant, because threads is synced"
         );
         assert_eq!(
             query_text(&db, "SELECT name FROM threads WHERE id = 't'")
@@ -8458,11 +8459,64 @@ mod tests {
                 .unwrap(),
             "keep-this-thread"
         );
+        assert!(runner.run(&db).await.unwrap().is_empty());
+    }
+
+    /// The drop takes only the ledger. Each row's job and merge request are the
+    /// durable record of that branch, reached as a thread task afterward.
+    #[tokio::test]
+    async fn retiring_thread_branches_keeps_their_jobs_and_merge_requests() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("retire-branches.db"))
+            .await
+            .unwrap();
+        let previous = TURSO_MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|migration| migration.name() != "retire_thread_branches")
+            .collect::<Vec<_>>();
+        MigrationRunner::new(previous).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'Project', 'project', '/tmp/project', 1, 1);
+             INSERT INTO threads(id, project_id, name, created_at, updated_at)
+             VALUES ('t', 'p', 'execution', 1, 1);
+             INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, branch, created_at, updated_at)
+             VALUES ('j', 't', 'p', 'complete', 'branch-1', 'agent/execution/1', 1, 1);
+             INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
+             VALUES ('b', 't', 1, 'merged', 'agent/execution/1', 'j', 1, 1);
+             INSERT INTO merge_requests(id, job_id, project_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES ('mr', 'j', 'p', 'Fix main', 'agent/execution/1', 'main', 'merged', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        let applied = MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        assert_eq!(applied.len(), 1, "{applied:?}");
+
         assert_eq!(
-            query_i64(&db, "SELECT number FROM thread_branches WHERE id = 'b' AND thread_id = 't' AND job_id = 'j' AND git_ref = 'agent/thread/1' AND stage = 'pr-open'")
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = 'thread_branches'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_text(&db, "SELECT uri_segment FROM jobs WHERE id = 'j'")
                 .await
                 .unwrap(),
-            1
+            "branch-1"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT job_id FROM merge_requests WHERE id = 'mr'")
+                .await
+                .unwrap(),
+            "j"
         );
     }
 

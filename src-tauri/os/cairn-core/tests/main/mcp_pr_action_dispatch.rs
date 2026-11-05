@@ -259,29 +259,7 @@ async fn pr_node_merge_resolves_through_parent_job() {
     );
 }
 
-/// Seed a thread whose branch 1 is the builder job's PR.
-async fn insert_thread_branch(db: &LocalDb, project_id: &str) {
-    db.execute(
-        "INSERT INTO threads (id, project_id, name, created_at, updated_at)
-         VALUES ('thread-pin', ?1, 'pin-thread', 1, 1)",
-        params![project_id],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO thread_branches (id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
-         VALUES ('branch-pin', 'thread-pin', 1, 'pr-open', 'feature', 'job-builder', 1, 1)",
-        (),
-    )
-    .await
-    .unwrap();
-}
-
-const MERGE_SURFACES: [&str; 3] = [
-    "cairn://p/pra/1/1/builder/pr",
-    "cairn://p/pra/1/1/pr",
-    "cairn://p/pra/pin-thread/branches/1",
-];
+const MERGE_SURFACES: [&str; 2] = ["cairn://p/pra/1/1/builder/pr", "cairn://p/pra/1/1/pr"];
 
 /// Every merge surface hands `precondition:"pinBump"` to the merge, and the
 /// merge evaluates it: this fixture has no jj store, so the gate refuses with
@@ -291,7 +269,6 @@ async fn pin_bump_precondition_passes_through_every_merge_surface() {
     let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
     insert_merge_request(&db, &project_id, &issue_id).await;
     insert_pr_action_run(&db, &project_id, &issue_id).await;
-    insert_thread_branch(&db, &project_id).await;
     let orch = orchestrator(&temp, db.clone());
 
     for target in MERGE_SURFACES {
@@ -328,7 +305,7 @@ async fn pin_bump_precondition_passes_through_every_merge_surface() {
         )
         .await
         .unwrap(),
-        3,
+        2,
         "each refused attempt journals its violation"
     );
     assert_eq!(
@@ -347,7 +324,6 @@ async fn unknown_or_non_string_precondition_is_refused_on_every_merge_surface() 
     let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
     insert_merge_request(&db, &project_id, &issue_id).await;
     insert_pr_action_run(&db, &project_id, &issue_id).await;
-    insert_thread_branch(&db, &project_id).await;
     let orch = orchestrator(&temp, db.clone());
 
     for target in MERGE_SURFACES {

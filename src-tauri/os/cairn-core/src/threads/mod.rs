@@ -8,10 +8,9 @@
 //!   mechanism that makes that true: it replaces concluded history with a table
 //!   of contents whose lines are re-readable at their URIs, and keeps the
 //!   thread's authored arc and a recency window verbatim.
-//! - Its session owns no branch by default, so direct-to-base tracked writes are
-//!   refused. Numbered branch entities provide the explicit reviewable path.
-//!   [`commit_refusal_for_job`] is the refusal both commit verbs take before
-//!   they act on a `commit_msg`.
+//! - Its session owns no branch, so direct-to-base tracked writes are refused and
+//!   repository changes go through a child issue. [`commit_refusal_for_job`] is
+//!   the refusal both commit verbs take before they act on a `commit_msg`.
 
 pub mod arc_store;
 pub mod compaction;
@@ -594,7 +593,7 @@ pub(crate) async fn compaction_capability_for_job(db: &LocalDb, job_id: &str) ->
 /// Why a tool batch from `job_id` may not carry a `commit_msg`, or `None` when
 /// it may.
 ///
-/// A thread owns no branch by default. Its execution resolves to the `base` branch target,
+/// A thread owns no branch. Its execution resolves to the `base` branch target,
 /// which rewrites every agent node to [`crate::models::BranchMode::None`], and a
 /// job without a branch of its own reads and writes its *base branch*. So a
 /// `commit_msg` from a thread does not land on a reviewable side branch to be
@@ -619,7 +618,7 @@ pub(crate) async fn commit_refusal_for_job(db: &LocalDb, job_id: &str) -> Option
         return None;
     }
     Some(
-        "Refusing to commit from a thread-owned job without an explicit destination. A thread owns no branch by default, so this batch is running ON the project's base branch — a commit_msg here would land on the default branch directly, with no pull request and no review surface. Append to cairn:~/branches in the same write batch to mint a numbered branch, or set write branch: to an existing numbered branch. Re-send without commit_msg only when no tracked file change should persist."
+        "Refusing to commit from a thread-owned job. A thread owns no branch, so this batch is running ON the project's base branch — a commit_msg here would land on the default branch directly, with no pull request and no review surface. Repository changes go through a child issue: file one and let its builder commit. Re-send without commit_msg only when no tracked file change should persist."
             .to_string(),
     )
 }
@@ -840,12 +839,12 @@ mod tests {
             .await
             .expect("a thread job must be refused a commit_msg");
         assert!(
-            refusal.contains("thread-owned") && refusal.contains("no branch by default"),
+            refusal.contains("thread-owned") && refusal.contains("owns no branch"),
             "the refusal states the posture, not just the rejection: {refusal}"
         );
         assert!(
-            refusal.contains("cairn:~/branches") && refusal.contains("write branch:"),
-            "the refusal teaches both explicit branch destinations: {refusal}"
+            refusal.contains("child issue"),
+            "the refusal names where repository changes go: {refusal}"
         );
 
         assert_eq!(

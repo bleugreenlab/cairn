@@ -33,27 +33,6 @@ pub async fn append_issue_comment(
     .await
 }
 
-/// Persist the canonical create-pr artifact for a caller that has already
-/// opened the PR through `execution::actions::open_pr_for_job`.
-pub(crate) async fn store_create_pr_artifact_for_job(
-    orch: &Orchestrator,
-    job_id: &str,
-    title: &str,
-    body: Option<&str>,
-) -> Result<(), String> {
-    let data = serde_json::json!({ "title": title, "body": body });
-    store_artifact(
-        orch,
-        job_id,
-        "create-pr",
-        "create-pr",
-        serde_json::to_string(&data).map_err(|error| error.to_string())?,
-        true,
-    )
-    .await
-    .map(|_| ())
-}
-
 fn reject_retired_arc_collection_keys(payload: &serde_json::Value) -> Result<(), String> {
     let Some(keys) = payload.as_object() else {
         return Ok(());

@@ -235,7 +235,6 @@ fn parse_change_input(raw: &str) -> Result<ChangeInput, String> {
             serde_json::from_value(value).map_err(|e| e.to_string())?;
         Ok(ChangeInput {
             changes: Some(changes),
-            branch: None,
             commit_msg: None,
             preview: None,
             atomic: None,

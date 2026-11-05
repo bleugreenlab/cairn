@@ -952,53 +952,6 @@ fn parses_first_class_thread_resources() {
     }
 }
 
-/// Numbered thread branches build and identify like every other thread
-/// sub-resource, and reach the parser as the generic thread path the core
-/// resolver reads.
-///
-/// They used to be the one thread sub-path this parser knew, which is what made
-/// a missing thread arm look like an oversight in a complete vocabulary rather
-/// than the vocabulary being somewhere else entirely. Whether `branches/3`
-/// means a branch is settled in `delegate_thread_descendant`, next to `db`,
-/// `pages`, and `services`.
-#[test]
-fn numbered_thread_branch_resources_build_and_identify() {
-    let collection = CairnResource::ThreadBranches {
-        project: "cairn".into(),
-        thread: "design-review".into(),
-    };
-    assert_eq!(collection.kind(), ResourceKind::ThreadBranches);
-    assert_eq!(
-        collection.to_uri(),
-        build_thread_branches_uri("cairn", "design-review")
-    );
-
-    let branch = CairnResource::ThreadBranch {
-        project: "cairn".into(),
-        thread: "design-review".into(),
-        number: 3,
-    };
-    assert_eq!(branch.kind(), ResourceKind::ThreadBranch);
-    assert_eq!(
-        branch.to_uri(),
-        build_thread_branch_uri("cairn", "design-review", 3)
-    );
-
-    for uri in [
-        "cairn://p/cairn/design-review/branches",
-        "cairn://p/cairn/design-review/branches/3",
-        // Not a branch number, and this parser no longer has an opinion: the
-        // resolver refuses it with the reason instead of the whole URI reading
-        // as unaddressable.
-        "cairn://p/cairn/design-review/branches/0",
-    ] {
-        assert!(
-            matches!(parse_uri(uri), Some(CairnResource::Thread { .. })),
-            "{uri} must reach the core resolver as a generic thread path"
-        );
-    }
-}
-
 /// Retired surfaces stay reserved, so the thread resolver can refuse them with
 /// the service shape rather than read them as artifact type-names.
 #[test]

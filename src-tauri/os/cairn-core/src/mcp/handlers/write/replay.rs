@@ -198,28 +198,6 @@ pub(super) async fn invoking_write_call(
     }
 }
 
-/// Durably publish the locally sealed report while retaining exclusive ownership
-/// of the network completion that follows. The store lock protects insertion;
-/// the random token protects finalization after that lock is released.
-pub(super) async fn record_pending_file_report(
-    db: &LocalDb,
-    call: &WriteCall,
-    report: &str,
-) -> Option<ReplayOwner> {
-    let owner = ReplayOwner {
-        token: uuid::Uuid::new_v4().to_string(),
-    };
-    let now = wall_clock_ms();
-    match db.execute(
-        "INSERT OR IGNORE INTO write_replay_ledger(run_id, tool_use_id, report, created_at, owner_token, finalized, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?4)",
-        cairn_db::turso::params![call.run_id.clone(), call.id.clone(), report.to_string(), now, owner.token.clone()],
-    ).await {
-        Ok(1) => Some(owner),
-        Ok(_) => None,
-        Err(error) => { log::warn!("failed to record pending write-replay entry: {error}"); None }
-    }
-}
-
 const FILE_REPLAY_LEASE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The lease clock: wall-clock milliseconds, the unit `claimed_at` is stored in so
@@ -285,66 +263,6 @@ async fn await_file_replay_or_takeover_with_lease(
     }
 }
 
-async fn renew_owned_report(
-    db: &LocalDb,
-    call: &WriteCall,
-    owner: &ReplayOwner,
-    now_ms: i64,
-) -> bool {
-    matches!(
-        db.execute(
-            "UPDATE write_replay_ledger SET claimed_at=?4 WHERE run_id=?1 AND tool_use_id=?2 AND finalized=0 AND owner_token=?3",
-            cairn_db::turso::params![call.run_id.clone(), call.id.clone(), owner.token.clone(), now_ms],
-        )
-        .await,
-        Ok(1)
-    )
-}
-
-/// Drive potentially slow post-seal work while keeping this delivery's ownership
-/// live. Losing the token does not cancel an external effect already in flight;
-/// token-fenced finalization still prevents the stale delivery from publishing a
-/// result over its successor.
-pub(super) async fn with_owned_report_heartbeat<F: std::future::Future>(
-    db: &LocalDb,
-    call: &WriteCall,
-    owner: &ReplayOwner,
-    future: F,
-) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut heartbeat = tokio::time::interval(FILE_REPLAY_LEASE / 3);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            output = &mut future => return output,
-            _ = heartbeat.tick() => {
-                if !renew_owned_report(db, call, owner, wall_clock_ms()).await {
-                    log::warn!("write replay owner lost its lease while post-seal work was still running");
-                }
-            }
-        }
-    }
-}
-
-/// Replace the recoverable checkpoint without settling the call. This is used
-/// immediately after a non-idempotent completion phase so takeover starts after
-/// that effect rather than repeating it.
-pub(super) async fn checkpoint_owned_report(
-    db: &LocalDb,
-    call: &WriteCall,
-    owner: &ReplayOwner,
-    report: &str,
-) -> bool {
-    matches!(
-        db.execute(
-            "UPDATE write_replay_ledger SET report=?4 WHERE run_id=?1 AND tool_use_id=?2 AND finalized=0 AND owner_token=?3",
-            cairn_db::turso::params![call.run_id.clone(), call.id.clone(), owner.token.clone(), report.to_string()],
-        )
-        .await,
-        Ok(1)
-    )
-}
-
 pub(super) async fn finalize_owned_report(
     db: &LocalDb,
     call: &WriteCall,
@@ -380,10 +298,6 @@ pub(super) struct WriteCall {
 impl WriteCall {
     pub(super) fn tool_use_id(&self) -> &str {
         &self.id
-    }
-
-    pub(super) fn file_change_effect_id(&self, index: usize) -> String {
-        format!("write-file-change:{}:{}:{index}", self.run_id, self.id)
     }
 }
 
@@ -436,39 +350,31 @@ pub(crate) const RESOURCE_PENDING: &str = "__cairn_write_resource_pending__";
 pub(super) async fn checkpoint_blocking_report(
     db: &LocalDb,
     call: &WriteCall,
-    owner: Option<&ReplayOwner>,
     ordinary_claim: LedgerClaim,
     report: &str,
 ) -> Result<(), String> {
-    let saved = if let Some(owner) = owner {
-        checkpoint_owned_report(db, call, owner, report).await
+    let checkpoint = if ordinary_claim == LedgerClaim::Claimed {
+        report.to_string()
     } else {
-        let checkpoint = if ordinary_claim == LedgerClaim::Claimed {
-            report.to_string()
-        } else {
-            format!("{RESOURCE_PENDING}\n{report}")
-        };
-        let updated = db.execute(
-            "UPDATE write_replay_ledger SET report=?3 WHERE run_id=?1 AND tool_use_id=?2 AND (report=?4 OR ?5=1)",
-            cairn_db::turso::params![
-                call.run_id.clone(), call.id.clone(), checkpoint.clone(), RESOURCE_PENDING,
-                i64::from(ordinary_claim == LedgerClaim::Claimed),
-            ],
-        ).await.map_err(|e| e.to_string())?;
-        if updated == 1 {
-            true
-        } else {
-            // A batch whose file edits all failed has not inserted a file ledger
-            // row, but may still have successful resource effects to preserve.
-            db.execute(
-                "INSERT OR IGNORE INTO write_replay_ledger(run_id,tool_use_id,report,created_at) VALUES(?1,?2,?3,?4)",
-                cairn_db::turso::params![
-                    call.run_id.clone(), call.id.clone(), checkpoint,
-                    chrono::Utc::now().timestamp_millis(),
-                ],
-            ).await.map_err(|e| e.to_string())? == 1
-        }
+        format!("{RESOURCE_PENDING}\n{report}")
     };
+    let updated = db.execute(
+        "UPDATE write_replay_ledger SET report=?3 WHERE run_id=?1 AND tool_use_id=?2 AND (report=?4 OR ?5=1)",
+        cairn_db::turso::params![
+            call.run_id.clone(), call.id.clone(), checkpoint.clone(), RESOURCE_PENDING,
+            i64::from(ordinary_claim == LedgerClaim::Claimed),
+        ],
+    ).await.map_err(|e| e.to_string())?;
+    let saved = updated == 1
+        // A batch whose file edits all failed has not inserted a file ledger
+        // row, but may still have successful resource effects to preserve.
+        || db.execute(
+            "INSERT OR IGNORE INTO write_replay_ledger(run_id,tool_use_id,report,created_at) VALUES(?1,?2,?3,?4)",
+            cairn_db::turso::params![
+                call.run_id.clone(), call.id.clone(), checkpoint,
+                chrono::Utc::now().timestamp_millis(),
+            ],
+        ).await.map_err(|e| e.to_string())? == 1;
     if saved {
         Ok(())
     } else {
@@ -487,13 +393,10 @@ pub(super) async fn checkpoint_blocking_report(
 pub(super) async fn update_blocking_checkpoint(
     db: &LocalDb,
     call: &WriteCall,
-    owner: Option<&ReplayOwner>,
     ordinary_claim: LedgerClaim,
     report: &str,
 ) -> Result<(), String> {
-    let saved = if let Some(owner) = owner {
-        checkpoint_owned_report(db, call, owner, report).await
-    } else if ordinary_claim == LedgerClaim::Claimed {
+    let saved = if ordinary_claim == LedgerClaim::Claimed {
         db.execute(
             "UPDATE write_replay_ledger SET report=?3 WHERE run_id=?1 AND tool_use_id=?2",
             cairn_db::turso::params![call.run_id.clone(), call.id.clone(), report.to_string()],
@@ -924,14 +827,9 @@ impl ResourceWriteProgress {
         self.failures = failures.to_vec();
         self.in_flight = None;
         let partial = self.report(false);
-        if let Err(error) = update_blocking_checkpoint(
-            &self.db,
-            &self.call,
-            None,
-            LedgerClaim::NotClaimed,
-            &partial,
-        )
-        .await
+        if let Err(error) =
+            update_blocking_checkpoint(&self.db, &self.call, LedgerClaim::NotClaimed, &partial)
+                .await
         {
             log::warn!("could not checkpoint a resource write's progress: {error}");
         }
@@ -1420,11 +1318,26 @@ mod tests {
         fn now(&self) -> i64 {
             self.0.load(std::sync::atomic::Ordering::SeqCst)
         }
+    }
 
-        /// Move the clock forward and return the new time.
-        fn advance(&self, ms: i64) -> i64 {
-            self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst) + ms
-        }
+    /// A pending row claimed at `claimed_at`: the shape an interrupted delivery
+    /// leaves for takeover to settle.
+    async fn pending_report(
+        db: &LocalDb,
+        call: &WriteCall,
+        report: &str,
+        claimed_at: i64,
+    ) -> ReplayOwner {
+        let owner = ReplayOwner {
+            token: uuid::Uuid::new_v4().to_string(),
+        };
+        db.execute(
+            "INSERT INTO write_replay_ledger(run_id, tool_use_id, report, created_at, owner_token, finalized, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?4)",
+            cairn_db::turso::params![call.run_id.clone(), call.id.clone(), report.to_string(), claimed_at, owner.token.clone()],
+        )
+        .await
+        .unwrap();
+        owner
     }
 
     /// The publication ladder settles AFTER the ledger row is claimed under the
@@ -1506,12 +1419,11 @@ mod tests {
         let original = json!({
             "applied": [{"index": 0, "summary": "saved"}],
             "failures": [{"index": 1, "error": "refused"}],
-            "commit": {"sha": "abc"}, "partial_success": true,
-            "branch": {"uri": "cairn://p/test/branches/1"}
+            "commit": {"sha": "abc"}, "partial_success": true
         });
         let suffix = "\n<system-reminder>checks still pending</system-reminder>";
         let prior = format!("{original}{suffix}");
-        checkpoint_blocking_report(&db, &call, None, LedgerClaim::NotClaimed, &prior)
+        checkpoint_blocking_report(&db, &call, LedgerClaim::NotClaimed, &prior)
             .await
             .unwrap();
         assert!(matches!(
@@ -1550,7 +1462,7 @@ mod tests {
         );
         let updated =
             json!({"applied": [], "commit": {"sha": "abc"}, "partial_success": true}).to_string();
-        checkpoint_blocking_report(&db, &call, None, LedgerClaim::Claimed, &updated)
+        checkpoint_blocking_report(&db, &call, LedgerClaim::Claimed, &updated)
             .await
             .unwrap();
         assert_eq!(
@@ -1559,13 +1471,13 @@ mod tests {
         );
 
         let (db, call) = ledger_db("blocking-missing-checkpoint.db").await;
-        checkpoint_blocking_report(&db, &call, None, LedgerClaim::NotClaimed, &updated)
+        checkpoint_blocking_report(&db, &call, LedgerClaim::NotClaimed, &updated)
             .await
             .unwrap();
         let saved = recorded_report(&db, &call).await.unwrap();
         assert_eq!(blocking_checkpoint_report(&saved), Some(updated.as_str()));
         assert!(
-            checkpoint_blocking_report(&db, &call, None, LedgerClaim::NotClaimed, &prior)
+            checkpoint_blocking_report(&db, &call, LedgerClaim::NotClaimed, &prior)
                 .await
                 .is_err()
         );
@@ -1622,66 +1534,10 @@ mod tests {
         );
     }
 
-    /// A waiter that has waited longer than one lease in total must still not take
-    /// over an owner that renewed inside every lease window.
-    #[tokio::test]
-    async fn an_active_file_owner_is_not_taken_over_after_a_waiter_exceeds_one_lease() {
-        let (db, call) = ledger_db("write-replay-owned-active.db").await;
-        let owner = record_pending_file_report(&db, &call, &report("accumulating"))
-            .await
-            .unwrap();
-        let lease = std::time::Duration::from_millis(80);
-        let claimed = 1_000_000;
-        let clock = LeaseClock::at(claimed);
-        assert!(renew_owned_report(&db, &call, &owner, clock.now()).await);
-        let db = std::sync::Arc::new(db);
-        let waiter_db = db.clone();
-        let waiter_call = WriteCall {
-            run_id: call.run_id.clone(),
-            id: call.id.clone(),
-        };
-        let waiter_clock = clock.clone();
-        let waiter = tokio::spawn(async move {
-            await_file_replay_or_takeover_with_lease(&waiter_db, &waiter_call, lease, move || {
-                waiter_clock.now()
-            })
-            .await
-        });
-
-        // Each renewal lands 35 ms of lease time after the last, inside the 80 ms
-        // lease, while the waiter's total wait passes it. The real sleeps only give
-        // the waiter turns to poll; they cannot age the claim.
-        for _ in 0..4 {
-            assert!(renew_owned_report(&db, &call, &owner, clock.advance(35)).await);
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        }
-        assert!(
-            clock.now() - claimed > 80,
-            "the waiter has outwaited one lease"
-        );
-        assert!(
-            !waiter.is_finished(),
-            "fresh heartbeats must prevent takeover"
-        );
-        assert!(finalize_owned_report(&db, &call, &owner, &report("complete")).await);
-        assert!(matches!(
-            waiter.await.unwrap(),
-            FileReplayClaim::Replayed(_)
-        ));
-    }
-
     #[tokio::test]
     async fn a_stale_file_claimant_cannot_overwrite_its_takeover() {
         let (db, call) = ledger_db("write-replay-owned-takeover.db").await;
-        let stale = record_pending_file_report(&db, &call, &report("accumulating"))
-            .await
-            .expect("first delivery owns completion");
-        db.execute(
-            "UPDATE write_replay_ledger SET claimed_at=0 WHERE run_id=?1 AND tool_use_id=?2",
-            cairn_db::turso::params![call.run_id.clone(), call.id.clone()],
-        )
-        .await
-        .unwrap();
+        let stale = pending_report(&db, &call, &report("sealed"), 0).await;
 
         let (takeover, pending) = match await_file_replay_or_takeover_with_lease(
             &db,
@@ -1694,104 +1550,25 @@ mod tests {
             FileReplayClaim::TakenOver { owner, report } => (owner, report),
             _ => panic!("stalled claim was not taken over"),
         };
-        assert_eq!(status_of(&pending), "accumulating");
+        assert_eq!(status_of(&pending), "sealed");
         assert!(
             !finalize_owned_report(&db, &call, &stale, &report("stale-failure")).await,
             "the replaced token must not finalize"
         );
-        assert!(finalize_owned_report(&db, &call, &takeover, &report("pr-open")).await);
+        assert!(finalize_owned_report(&db, &call, &takeover, &report("settled")).await);
         assert_eq!(
             status_of(&recorded_report(&db, &call).await.unwrap()),
-            "pr-open"
+            "settled"
         );
-    }
-
-    #[tokio::test]
-    async fn takeover_resumes_from_the_latest_non_idempotent_checkpoint() {
-        let (db, call) = ledger_db("write-replay-owned-checkpoint.db").await;
-        let owner = record_pending_file_report(&db, &call, &report("accumulating"))
-            .await
-            .unwrap();
-        assert!(checkpoint_owned_report(&db, &call, &owner, &report("pr-open")).await);
-        db.execute(
-            "UPDATE write_replay_ledger SET claimed_at=0 WHERE run_id=?1 AND tool_use_id=?2",
-            cairn_db::turso::params![call.run_id.clone(), call.id.clone()],
-        )
-        .await
-        .unwrap();
-
-        match await_file_replay_or_takeover_with_lease(
-            &db,
-            &call,
-            std::time::Duration::from_millis(20),
-            wall_clock_ms,
-        )
-        .await
-        {
-            FileReplayClaim::TakenOver { report, .. } => {
-                assert_eq!(status_of(&report), "pr-open");
-            }
-            _ => panic!("stale checkpoint was not recovered"),
-        }
-    }
-
-    #[tokio::test]
-    async fn takeover_preserves_cloud_warning_and_completed_post_seal_phases() {
-        let (db, call) = ledger_db("write-replay-post-seal-warning.db").await;
-        let pending = json!({
-            "applied": [],
-            "branch": {"number": 7, "git_ref": "agent/thread-7", "uri": "cairn://p/cairn/7", "stage": "accumulating"},
-            "commit": {"status": "committed", "sha": "abc123", "pr_number": null,
-                       "message": "sealed commit cloud publication failed: content store offline"},
-            "_post_seal": {
-                "file_changes": [{"path": "src/lib.rs", "status": "modified", "additions": 2, "deletions": 1}],
-                "cloud": {"project_id": "cairn", "repository": "/repo.git"},
-                "ledger_recorded": true,
-                "cloud_published": true
-            }
-        }).to_string();
-        let owner = record_pending_file_report(&db, &call, &pending)
-            .await
-            .unwrap();
-        assert!(checkpoint_owned_report(&db, &call, &owner, &pending).await);
-        db.execute(
-            "UPDATE write_replay_ledger SET claimed_at=0 WHERE run_id=?1 AND tool_use_id=?2",
-            cairn_db::turso::params![call.run_id.clone(), call.id.clone()],
-        )
-        .await
-        .unwrap();
-
-        match await_file_replay_or_takeover_with_lease(
-            &db,
-            &call,
-            std::time::Duration::from_millis(20),
-            wall_clock_ms,
-        )
-        .await
-        {
-            FileReplayClaim::TakenOver { report, .. } => {
-                let report: serde_json::Value = serde_json::from_str(&report).unwrap();
-                assert_eq!(report["_post_seal"]["ledger_recorded"], true);
-                assert_eq!(report["_post_seal"]["cloud_published"], true);
-                assert_eq!(
-                    report["commit"]["message"],
-                    "sealed commit cloud publication failed: content store offline"
-                );
-            }
-            _ => panic!("stale post-seal checkpoint was not recovered"),
-        }
     }
 
     #[tokio::test]
     async fn a_file_redelivery_waits_for_the_current_owners_final_report() {
         let (db, call) = ledger_db("write-replay-owned-wait.db").await;
-        let owner = record_pending_file_report(&db, &call, &report("accumulating"))
-            .await
-            .unwrap();
         // The lease clock stands still, so only the owner's final report can end
         // the wait.
         let clock = LeaseClock::at(1_000_000);
-        assert!(renew_owned_report(&db, &call, &owner, clock.now()).await);
+        let owner = pending_report(&db, &call, &report("sealed"), clock.now()).await;
         let db = std::sync::Arc::new(db);
         let waiter_db = db.clone();
         let waiter_call = WriteCall {
@@ -1809,9 +1586,9 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         assert!(!waiter.is_finished());
-        assert!(finalize_owned_report(&db, &call, &owner, &report("pr-open")).await);
+        assert!(finalize_owned_report(&db, &call, &owner, &report("settled")).await);
         match waiter.await.unwrap() {
-            FileReplayClaim::Replayed(settled) => assert_eq!(status_of(&settled), "pr-open"),
+            FileReplayClaim::Replayed(settled) => assert_eq!(status_of(&settled), "settled"),
             _ => panic!("redelivery did not replay the owner's final report"),
         }
     }

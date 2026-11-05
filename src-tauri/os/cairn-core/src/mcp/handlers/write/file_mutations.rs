@@ -34,51 +34,6 @@ pub(super) struct FileChangePayload {
     pub replace_all: Option<bool>,
 }
 
-pub(super) async fn record_agent_file_change_once(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    id: &str,
-    file_path: &str,
-    status: &str,
-    additions: i32,
-    deletions: i32,
-) -> Result<(), String> {
-    let (context, db) =
-        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
-    let values = (
-        id.to_string(),
-        context.job_id.clone(),
-        file_path.to_string(),
-        status.to_string(),
-        additions,
-        deletions,
-        chrono::Utc::now().timestamp() as i32,
-    );
-    db.execute(
-        "INSERT OR IGNORE INTO file_changes (id, job_id, file_path, status, additions, deletions, previous_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
-        values,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    // Minted even when the row already existed: a replay that crashed between
-    // the insert and the mint still mints, and the source's dedupe absorbs a
-    // mint that already landed.
-    spawn_file_changed_mint(
-        orch,
-        db,
-        RecordedFileChange {
-            id: id.to_string(),
-            job_id: context.job_id,
-            path: file_path.to_string(),
-            previous_path: None,
-            status: status.to_string(),
-            additions,
-            deletions,
-        },
-    );
-    Ok(())
-}
-
 /// One agent write the `file_changes` ledger just recorded.
 pub(crate) struct RecordedFileChange {
     pub(crate) id: String,
@@ -1776,7 +1731,6 @@ pub(super) async fn finalize_file_commit(
     first_change: &IndexedChange<'_>,
     promoted_memory_uris: &[String],
     logical_resolution: &super::super::branch::BranchResolution,
-    destination_job_id: Option<&str>,
     proposed: crate::jj::ProposedPublication,
     marker_escape: Option<&str>,
 ) -> IndexedResult<CommitOutcome> {
@@ -1924,7 +1878,7 @@ pub(super) async fn finalize_file_commit(
         Ok(result) => {
             if let Some((run, _)) = routed_run.as_ref() {
                 orch.invalidate_node_check_status(
-                    destination_job_id.unwrap_or(&run.job_id),
+                    &run.job_id,
                     "logical-head-tree-or-contract-change",
                 );
             }
@@ -1937,7 +1891,7 @@ pub(super) async fn finalize_file_commit(
                 Some((run, db)) => {
                     crate::merge_requests::queries::publication_requirement_for_managed_branch(
                         db,
-                        destination_job_id.unwrap_or(&run.job_id),
+                        &run.job_id,
                         &run.project_id,
                         &logical_resolution.rev,
                     )

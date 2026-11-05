@@ -202,9 +202,9 @@ async fn stopped_write_result(
 #[derive(Debug, Clone)]
 pub(crate) struct LedgerRow {
     pub(crate) report: String,
-    /// False only for a sealed commit whose post-seal work (a minted branch's
-    /// publication) had not finished. A pending resource claim reads as
-    /// finalized here: it is told apart by [`replay::is_pending`].
+    /// False only for a sealed commit whose delivery was interrupted before its
+    /// row settled. A pending resource claim reads as finalized here: it is told
+    /// apart by [`replay::is_pending`].
     pub(crate) finalized: bool,
 }
 

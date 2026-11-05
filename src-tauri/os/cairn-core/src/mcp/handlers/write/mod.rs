@@ -9,15 +9,13 @@ mod types;
 
 use self::file_mutations::{
     apply_logical_file_batch, apply_prepared_logical, finalize_file_commit,
-    record_agent_file_change, record_agent_file_change_once, reverted_file_changes, CommitOutcome,
-    FileBatchSuccess,
+    record_agent_file_change, reverted_file_changes, CommitOutcome, FileBatchSuccess,
 };
 pub(crate) use self::preview::build_current_event_uri;
 use self::preview::{handle_apply_change, preview_change};
 use self::types::{
-    build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, BranchReport,
-    ChangeFailure, CloudPublicationInput, CommitReport, IndexedChange, IndexedFailure,
-    MintedPostSealState, PersistedFileChange,
+    build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, ChangeFailure,
+    CommitReport, IndexedChange, IndexedFailure,
 };
 use super::target::{target_family, TargetFamily};
 use crate::mcp::types::{ChangeMode, ChangePayload, McpCallbackRequest};
@@ -60,7 +58,7 @@ fn recorded_target_is_rebase(target: &str) -> bool {
 }
 
 /// What a page-origin batch may not be: anything but structured row writes to
-/// canonical thread-database targets, with no batch-level coordinate.
+/// canonical thread-database targets, with no batch-level option.
 ///
 /// The page bridge (`pages::write`) checks the page's manifest before it
 /// dispatches; this is the write path's own floor under it, so a request
@@ -74,11 +72,11 @@ fn row_origin_refusal(
     instrument: &cairn_common::protocol::RowWriteInstrument,
 ) -> Option<(usize, String)> {
     let noun = instrument.noun();
-    if payload.commit_msg.is_some() || payload.branch.is_some() || payload.preview.is_some() {
+    if payload.commit_msg.is_some() || payload.preview.is_some() {
         return Some((
             0,
             format!(
-                "a write through {noun} carries only changes and atomic: commit_msg, branch and preview are refused"
+                "a write through {noun} carries only changes and atomic: commit_msg and preview are refused"
             ),
         ));
     }
@@ -120,249 +118,6 @@ fn deny_change(changes: &[crate::mcp::types::ChangeItem], index: usize, message:
         false,
     ))
     .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
-}
-
-async fn rollback_unsealed_mint(
-    orch: &Orchestrator,
-    minted: Option<&super::branch::MintedThreadBranch>,
-) {
-    if let Some(minted) = minted {
-        if let Err(error) = super::branch::rollback_thread_branch_mint(orch, minted).await {
-            log::error!(
-                "failed to compensate unsealed thread branch {}: {error}",
-                minted.git_ref
-            );
-        }
-    }
-}
-
-async fn complete_minted_branch_pr(
-    orch: &Orchestrator,
-    payload: &ChangePayload,
-    index: usize,
-    job_id: &str,
-    resolution: &super::branch::BranchResolution,
-    git_ref: &str,
-    number: i64,
-) -> Result<String, String> {
-    let pr = payload.changes[index]
-        .payload
-        .as_ref()
-        .and_then(|value| value.get("pr"))
-        .ok_or("mint payload has no PR request")?;
-    let title = payload.changes[index]
-        .payload
-        .as_ref()
-        .and_then(|value| value.get("title"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("Thread branch {number}"));
-    let body = pr.get("body").and_then(serde_json::Value::as_str);
-    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await?;
-    let url = crate::execution::actions::open_pr_for_job(
-        orch,
-        &db,
-        job_id,
-        &resolution.project_id,
-        None,
-        git_ref,
-        None,
-        &title,
-        body,
-    )
-    .await?;
-    crate::mcp::handlers::comments_artifacts::store_create_pr_artifact_for_job(
-        orch, job_id, &title, body,
-    )
-    .await?;
-    db.execute(
-        "UPDATE thread_branches SET stage = 'pr-open', moved_at = unixepoch() WHERE job_id = ?1",
-        (job_id.to_string(),),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(url)
-}
-
-async fn checkpoint_minted_post_seal(
-    db: &crate::storage::LocalDb,
-    call: &replay::WriteCall,
-    owner: &replay::ReplayOwner,
-    report: &self::types::ChangeReport,
-    phase: &str,
-) -> Result<(), String> {
-    let checkpoint = serde_json::to_string(report)
-        .map_err(|error| format!("failed to serialize {phase} checkpoint: {error}"))?;
-    if replay::checkpoint_owned_report(db, call, owner, &checkpoint).await {
-        Ok(())
-    } else {
-        Err(format!("lost replay ownership while checkpointing {phase}"))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn finish_minted_post_seal(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    payload: &ChangePayload,
-    index: usize,
-    resolution: &super::branch::BranchResolution,
-    job_id: &str,
-    call: &replay::WriteCall,
-    owner: &replay::ReplayOwner,
-    mut report: self::types::ChangeReport,
-) -> Result<String, String> {
-    let state = report.post_seal.as_mut().ok_or_else(|| {
-        "the sealed minted replay has no persisted post-seal continuation inputs".to_string()
-    })?;
-
-    if !state.ledger_recorded {
-        for (change_index, change) in state.file_changes.iter().enumerate() {
-            record_agent_file_change_once(
-                orch,
-                request,
-                &call.file_change_effect_id(change_index),
-                &change.path,
-                &change.status,
-                change.additions,
-                change.deletions,
-            )
-            .await
-            .map_err(|error| format!("failed to record agent file change: {error}"))?;
-        }
-        state.ledger_recorded = true;
-        checkpoint_minted_post_seal(&orch.db.local, call, owner, &report, "file-change ledger")
-            .await?;
-    }
-
-    crate::orchestrator::base_advance::publish_managed_branch(
-        orch,
-        &resolution.repository_path,
-        &resolution.rev,
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "failed to publish sealed branch: {error}. The commit is sealed in Cairn's store; the \
-             open pull request still shows the previous head. {}",
-            super::PUBLISH_ACTION_REMEDY
-        )
-    })?;
-
-    let state = report.post_seal.as_mut().expect("post-seal state");
-    if !state.cloud_published {
-        if let Some(publication) = state.cloud.as_ref() {
-            let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await?;
-            if let Err(error) = crate::mcp::vcs::publish_sealed_commit_pack(
-                &db,
-                &publication.project_id,
-                &publication.repository,
-                report
-                    .commit
-                    .as_ref()
-                    .and_then(|commit| commit.sha.as_deref())
-                    .ok_or("post-seal publication has no sealed sha")?,
-            )
-            .await
-            {
-                let warning = format!("sealed commit cloud publication failed: {error}");
-                if let Some(commit) = report.commit.as_mut() {
-                    commit.message = Some(match commit.message.take() {
-                        Some(message) => format!("{message}; {warning}"),
-                        None => warning,
-                    });
-                }
-            }
-        }
-        report
-            .post_seal
-            .as_mut()
-            .expect("post-seal state")
-            .cloud_published = true;
-        checkpoint_minted_post_seal(&orch.db.local, call, owner, &report, "cloud publication")
-            .await?;
-    }
-
-    if report
-        .branch
-        .as_ref()
-        .is_some_and(|branch| branch.stage != "pr-open")
-    {
-        let branch = report.branch.as_ref().expect("minted branch report");
-        let url = complete_minted_branch_pr(
-            orch,
-            payload,
-            index,
-            job_id,
-            resolution,
-            &branch.git_ref,
-            branch.number,
-        )
-        .await
-        .map_err(|error| format!("failed to complete pull request: {error}"))?;
-        let branch = report.branch.as_mut().expect("minted branch report");
-        branch.stage = "pr-open".to_string();
-        branch.pr_url = Some(url);
-        checkpoint_minted_post_seal(&orch.db.local, call, owner, &report, "PR completion").await?;
-    }
-
-    let new_tip = report.commit.as_ref().and_then(|report| report.sha.clone());
-    if let (Some(commit), Some(new_tip)) = (report.commit.as_mut(), new_tip) {
-        let sync_failures = crate::dev_instances::sync_live_branch_instances(
-            orch,
-            &resolution.project_id,
-            &resolution.rev,
-            &new_tip,
-        )
-        .await;
-        if !sync_failures.is_empty() {
-            let warning = format!(
-                "live dev instance sync blocked ({} instance(s)); the owner received a blocking notice",
-                sync_failures.len()
-            );
-            commit.message = Some(match commit.message.take() {
-                Some(message) => format!("{message}; {warning}"),
-                None => warning,
-            });
-        }
-    }
-
-    let run_context = check_run_context_for_destination(
-        crate::mcp::handlers::run_context::lookup_run(&orch.db.local, request)
-            .await
-            .ok(),
-        Some(job_id),
-    );
-    if let Some(context) = run_context.as_ref() {
-        crate::execution::checks::cancel_stale_review_on_branch_advance(
-            orch,
-            &context.job_id,
-            crate::execution::checks::BranchAdvance::Commit,
-        )
-        .await;
-    }
-    let check_summary = match report.commit.as_ref().and_then(|commit| commit.sha.clone()) {
-        Some(sealed) => {
-            crate::execution::checks::run_write_checks_after_seal(
-                orch,
-                run_context.as_ref(),
-                &request.cwd,
-                call.tool_use_id(),
-                crate::execution::checks::WriteCheckTarget::Sealed {
-                    branch: resolution,
-                    commit: &sealed,
-                },
-            )
-            .await
-        }
-        None => None,
-    };
-    report.post_seal = None;
-    Ok(append_check_summary(
-        serde_json::to_string(&report)
-            .unwrap_or_else(|error| format!("Failed to serialize change report: {error}")),
-        &check_summary,
-    ))
 }
 
 /// Build a single-failure change report carrying the rendered multi-error
@@ -438,20 +193,6 @@ fn append_check_summary(text: String, summary: &Option<String>) -> String {
         Some(s) => format!("{text}\n\n{s}"),
         None => text,
     }
-}
-
-/// A thread session may advance a numbered branch, but the branch's backing job
-/// owns the resulting check wave. Preserve the authenticated run as the stream
-/// destination while replacing only the durable job coordinate used for check
-/// baselines, observations, cancellation, and `/checks` reads.
-fn check_run_context_for_destination(
-    mut context: Option<super::RunContext>,
-    destination_job_id: Option<&str>,
-) -> Option<super::RunContext> {
-    if let (Some(context), Some(destination_job_id)) = (context.as_mut(), destination_job_id) {
-        context.job_id = destination_job_id.to_string();
-    }
-    context
 }
 
 async fn rollback_promoted_memory_decisions(
@@ -707,78 +448,10 @@ async fn handle_write_attempt(
     // [`home_targets`].
     let home_targets = home_targets::resolve(orch, request, &mut payload.changes).await;
 
-    let mint_indices = payload
-        .changes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            if item.mode != ChangeMode::Append {
-                return None;
-            }
-            // The common parser stops a thread URI at `Thread { path }`; the
-            // resolver is the single reader that knows `branches` names the
-            // mint destination. Same call dispatch makes, one rung below.
-            let parsed = cairn_common::uri::parse_uri(&item.target)?;
-            match crate::resources::delegate_thread_descendant(parsed) {
-                Ok(cairn_common::uri::CairnResource::ThreadBranches { .. }) => Some(index),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>();
     let has_file_targets = payload
         .changes
         .iter()
         .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)));
-    if mint_indices.len() > 1 && has_file_targets {
-        return deny_change(&payload.changes, mint_indices[1],
-            "Refusing thread branch mint: this batch names more than one branch destination, so its file commit would be ambiguous. Keep exactly one append to the thread's branches collection.".to_string());
-    }
-    if !mint_indices.is_empty() && payload.branch.is_some() {
-        return deny_change(&payload.changes, mint_indices[0],
-            "Refusing thread branch write: the branches append and batch-level branch: name two destinations. Remove branch: to mint, or remove the append to commit onto the existing branch.".to_string());
-    }
-    let mint_index = mint_indices.first().copied();
-    if let Some(index) = mint_index {
-        let has_pr = payload.changes[index]
-            .payload
-            .as_ref()
-            .and_then(|value| value.get("pr"))
-            .and_then(serde_json::Value::as_object)
-            .is_some();
-        if !has_pr {
-            return deny_change(&payload.changes, index,
-                "Refusing an accumulating branch birth: this bottom rung requires payload.pr to be an object and opens the branch through PR review. Bare accumulating branches belong to the sibling workflow.".to_string());
-        }
-        if has_pr && !has_file_targets {
-            return deny_change(&payload.changes, index,
-                "Refusing to open a thread branch PR without file edits: a PR needs a commit. Include the file changes and commit_msg in this batch.".to_string());
-        }
-        if let Some(blocking_index) = payload
-            .changes
-            .iter()
-            .position(|item| blocking_append_kind(item).is_some())
-        {
-            return deny_change(
-                &payload.changes,
-                blocking_index,
-                "Refusing a blocking task or question in a minted-branch batch: crash recovery cannot safely repeat an unanswered blocking append after the commit is sealed. Mint the branch first, then send the blocking append in a separate write.".to_string(),
-            );
-        }
-        if let Some(memory_index) = payload.changes.iter().position(|item| {
-            item.payload
-                .as_ref()
-                .and_then(|value| value.get("action"))
-                .and_then(serde_json::Value::as_str)
-                == Some("promote")
-        }) {
-            return deny_change(
-                &payload.changes,
-                memory_index,
-                "Refusing memory promotion in a minted-branch batch: crash recovery cannot reconstruct the promotion bookkeeping after the commit is sealed. Promote the memory in a separate write; ordinary resource mutations remain supported alongside minting.".to_string(),
-            );
-        }
-    }
-
     // A file-bearing batch holds the store lock from head resolution through the
     // seal, and dispatches its resource items inside that hold. A rebase action
     // dispatched there would queue on the lock its own batch holds and never be
@@ -794,10 +467,9 @@ async fn handle_write_attempt(
         }
     }
 
-    // Direct-to-base remains forbidden. A single mint append licenses the
-    // commit because its destination is allocated after preview and before the
-    // logical head is resolved.
-    if payload.commit_msg.is_some() && payload.branch.is_none() && mint_index.is_none() {
+    // Direct-to-base remains forbidden: a thread's commit would land on the
+    // default branch with no pull request.
+    if payload.commit_msg.is_some() {
         if let Some(refusal) =
             crate::mcp::handlers::run_context::commit_posture_refusal(&orch.db, request).await
         {
@@ -1153,12 +825,10 @@ async fn handle_write_attempt(
     // takes the lock only to seal, re-reading the head, the replay ledger, and
     // the branch's held work under it first (I3, I5): any of them changed, and
     // the write runs again locked. Optimistic only where nothing before the
-    // seal has a side effect — every item a file edit, no branch mint (which
-    // needs the lock from the start), no host-path escape or authority prompt
-    // that a second run would raise again.
+    // seal has a side effect — every item a file edit, no host-path escape or
+    // authority prompt that a second run would raise again.
     let optimistic = locking == WriteLocking::Optimistic
         && has_file_targets
-        && mint_index.is_none()
         && !allow_escape
         && !had_authority_request
         && payload
@@ -1235,93 +905,15 @@ async fn handle_write_attempt(
                         return replay::mark_as_replay(&report);
                     }
                     replay::FileReplayClaim::TakenOver { owner, report } => {
-                        let prior = match serde_json::from_str::<self::types::ChangeReport>(&report)
-                        {
-                            Ok(prior) => prior,
-                            Err(error) => {
-                                log::warn!("write replay recovery remains pending: the sealed replay report is invalid: {error}");
-                                return "A prior delivery sealed this write, but its publication recovery did not complete; the pending replay remains retryable.".to_string();
-                            }
-                        };
-                        // Ordinary writes historically publish a finalized replay row
-                        // as soon as the commit is sealed. A row without minted-branch
-                        // continuation state can only be an interrupted row written by
-                        // the short-lived pending implementation. Settle that durable
-                        // report instead of trying to run mint-only recovery against it.
-                        if prior.branch.is_none() {
-                            if replay::finalize_owned_report(&orch.db.local, call, &owner, &report)
-                                .await
-                            {
-                                return replay::mark_as_replay(&report);
-                            }
-                            return "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string();
-                        }
-                        // Keep the resumable post-seal continuation off this
-                        // handler's poll stack. `handle_write` is also the hot
-                        // path for ordinary resource-only writes; embedding the
-                        // mint recovery future made those calls overflow a Tokio
-                        // worker stack before dispatch.
-                        let recovery = Box::pin(async {
-                            let index = mint_index.ok_or_else(|| {
-                                "the sealed write has no resumable minted-branch operation"
-                                    .to_string()
-                            })?;
-                            let branch = prior.branch.as_ref().ok_or_else(|| {
-                                "the sealed write does not describe a minted branch".to_string()
-                            })?;
-                            let branch_uri = branch.uri.clone();
-                            let (resolution, job_id) = super::branch::resolve_explicit_for_write(
-                                orch,
-                                request,
-                                &branch_uri,
-                            )
+                        // An ordinary write finalizes its row as soon as the commit is
+                        // sealed, so a pending row is what an interrupted delivery left
+                        // behind. Its sealed report is the answer.
+                        if replay::finalize_owned_report(&orch.db.local, call, &owner, &report)
                             .await
-                            .map_err(|error| {
-                                format!("failed to resolve the sealed branch: {error}")
-                            })?;
-                            let job_id = job_id.ok_or_else(|| {
-                                "the sealed branch no longer has its publication job".to_string()
-                            })?;
-                            off_frame(|| {
-                                finish_minted_post_seal(
-                                    orch,
-                                    request,
-                                    &payload,
-                                    index,
-                                    &resolution,
-                                    &job_id,
-                                    call,
-                                    &owner,
-                                    prior,
-                                )
-                            })
-                            .await
-                        });
-                        match replay::with_owned_report_heartbeat(
-                            &orch.db.local,
-                            call,
-                            &owner,
-                            recovery,
-                        )
-                        .await
                         {
-                            Ok(final_report) => {
-                                if replay::finalize_owned_report(
-                                    &orch.db.local,
-                                    call,
-                                    &owner,
-                                    &final_report,
-                                )
-                                .await
-                                {
-                                    return replay::mark_as_replay(&final_report);
-                                }
-                            }
-                            Err(error) => {
-                                log::warn!("write replay recovery remains pending: {error}");
-                            }
+                            return replay::mark_as_replay(&report);
                         }
-                        return "A prior delivery sealed this write, but its publication recovery did not complete; the pending replay remains retryable.".to_string();
+                        return "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string();
                     }
                     replay::FileReplayClaim::Stalled => {
                         return "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string();
@@ -1348,41 +940,8 @@ async fn handle_write_attempt(
         })
     });
 
-    let mut destination_job_id = None;
-    let mut minted_branch: Option<super::branch::MintedThreadBranch> = None;
-    let mut minted_pr_url: Option<String> = None;
     let mut logical_resolution = if has_file_targets {
-        let resolved = if let Some(index) = mint_index {
-            let title = payload.changes[index]
-                .payload
-                .as_ref()
-                .and_then(|value| value.get("title"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            match super::branch::mint_thread_branch_for_write(orch, request, title).await {
-                Ok(minted) => {
-                    destination_job_id = Some(minted.job_id.clone());
-                    let resolution = minted.resolution.clone();
-                    minted_branch = Some(minted);
-                    Ok(resolution)
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            match payload.branch.as_deref() {
-                Some(branch) => {
-                    match super::branch::resolve_explicit_for_write(orch, request, branch).await {
-                        Ok((resolution, job_id)) => {
-                            destination_job_id = job_id;
-                            Ok(resolution)
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                None => super::branch::resolve_current_for_read(orch, request).await,
-            }
-        };
-        match resolved {
+        match super::branch::resolve_current_for_read(orch, request).await {
             Ok(resolution) => Some(resolution),
             Err(error) => {
                 return serde_json::to_string(&empty_change_report(
@@ -1439,8 +998,7 @@ async fn handle_write_attempt(
             }
         }
     }
-    // A freshly minted branch has nothing held on it yet.
-    if minted_branch.is_none() && !optimistic {
+    if !optimistic {
         if let Some(resolution) = logical_resolution.as_mut() {
             *drained = super::run::held::drain_held_publications(
                 orch,
@@ -1547,7 +1105,6 @@ async fn handle_write_attempt(
                                 logical_snapshot.insert(format!("file:{path}"), content);
                             }
                             Err(error) => {
-                                rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                                 return serde_json::to_string(&empty_change_report(
                                 Vec::new(),
                                 vec![ChangeFailure {
@@ -1567,7 +1124,6 @@ async fn handle_write_attempt(
                     }
                 }
                 Err(error) => {
-                    rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                     return serde_json::to_string(&empty_change_report(
                         Vec::new(),
                         vec![ChangeFailure {
@@ -1613,7 +1169,6 @@ async fn handle_write_attempt(
         Ok(kind) => kind,
         Err(error) => {
             let index = blocking_indices.first().copied().unwrap_or(0);
-            rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
             return serde_json::to_string(&empty_change_report(
                 Vec::new(),
                 vec![ChangeFailure {
@@ -1709,7 +1264,6 @@ async fn handle_write_attempt(
                     )
                     .await;
                 }
-                rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                 return report;
             }
             failures.push(failure);
@@ -1791,7 +1345,6 @@ async fn handle_write_attempt(
                                 commit: failure_commit,
                             } = *failure;
                             if atomic {
-                                rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                                 return change_report_json(
                                     applied,
                                     vec![failure],
@@ -1826,7 +1379,6 @@ async fn handle_write_attempt(
                             )
                             .await;
                         }
-                        rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                         return report;
                     }
                     if let Some(failure_commit) = failure_commit {
@@ -1861,7 +1413,6 @@ async fn handle_write_attempt(
                         )
                         .await;
                     }
-                    rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                     return report;
                 }
                 if let Some(failure_commit) = failure_commit {
@@ -1874,23 +1425,6 @@ async fn handle_write_attempt(
         };
 
         if family == TargetFamily::Resource {
-            // The branch append is a batch-level destination declaration. Minting
-            // already consumed it before file preparation, so generic resource
-            // dispatch must not query for or mutate a second entity.
-            if mint_index == Some(index) {
-                if let Some(minted) = minted_branch.as_ref() {
-                    applied.push(AppliedChange {
-                        index,
-                        target: item.target.clone(),
-                        mode: mode_name(item.mode).to_string(),
-                        kind: "resource".to_string(),
-                        summary: format!("Minted {} ({})", minted.uri, minted.git_ref),
-                        data: None,
-                    });
-                    index += 1;
-                    continue;
-                }
-            }
             // Blocking appends run after all other changes, as one group.
             if blocking_append_kind(item).is_some() {
                 index += 1;
@@ -2021,7 +1555,6 @@ async fn handle_write_attempt(
                             )
                             .await;
                         }
-                        rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                         return report;
                     }
                     if let Some(failure_commit) = failure_commit {
@@ -2046,9 +1579,6 @@ async fn handle_write_attempt(
     // The publication ladder's second rung, carried out of the transaction:
     // `Err` means the commit reached the jj bookmark but not the branch ref.
     let mut export = Ok(());
-    // Whether this delivery owns the replay-ledger row, and so may correct the
-    // report it recorded once the ladder's remaining rungs have settled.
-    let mut replay_owner: Option<replay::ReplayOwner> = None;
     let mut ordinary_ledger_claim = replay::LedgerClaim::NotClaimed;
     if optimistic && first_file_change.is_some() {
         let guard = match crate::mcp::vcs::acquire_store_lock(
@@ -2142,7 +1672,6 @@ async fn handle_write_attempt(
             logical_resolution
                 .as_ref()
                 .expect("file writes require a resolved logical head"),
-            destination_job_id.as_deref(),
             match revert_commit.as_ref() {
                 Some(commit) => crate::jj::ProposedPublication::Revert(commit.clone()),
                 None => crate::jj::ProposedPublication::Mutations(logical_mutations.clone()),
@@ -2195,7 +1724,6 @@ async fn handle_write_attempt(
                 }
                 if atomic {
                     rollback_promoted_memory_decisions(orch, &promoted_memories).await;
-                    rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
                     return change_report_json(applied, vec![failure], failure_commit, atomic);
                 }
                 if revert_commit.is_some() {
@@ -2207,17 +1735,6 @@ async fn handle_write_attempt(
             }
         }
 
-        if minted_branch.is_some()
-            && commit
-                .as_ref()
-                .and_then(|report| report.sha.as_ref())
-                .is_none()
-        {
-            rollback_unsealed_mint(orch, minted_branch.as_ref()).await;
-            minted_branch = None;
-            destination_job_id = None;
-        }
-
         // Record the publication against the call that produced it, still inside
         // the epoch that published it, so a crash cannot leave a landed commit
         // with no ledger row for a later delivery to find. Only a batch that
@@ -2227,49 +1744,15 @@ async fn handle_write_attempt(
             write_call.as_ref(),
             commit.as_ref().and_then(|report| report.sha.as_ref()),
         ) {
-            let mut report = empty_change_report(
+            let report = serde_json::to_string(&empty_change_report(
                 applied.clone(),
                 failures.clone(),
                 commit.clone(),
                 !applied.is_empty() && !failures.is_empty(),
                 atomic,
-            );
-            report.branch = minted_branch.as_ref().map(|minted| BranchReport {
-                number: minted.number,
-                git_ref: minted.git_ref.clone(),
-                uri: minted.uri.clone(),
-                stage: "accumulating".to_string(),
-                pr_url: None,
-            });
-            if minted_branch.is_some() {
-                report.post_seal = Some(MintedPostSealState {
-                    file_changes: recorded_changes
-                        .iter()
-                        .map(|change| PersistedFileChange {
-                            path: change.path.clone(),
-                            status: change.status.to_string(),
-                            additions: change.additions,
-                            deletions: change.deletions,
-                        })
-                        .collect(),
-                    cloud: post_seal_publication.as_ref().map(|publication| {
-                        CloudPublicationInput {
-                            project_id: publication.project_id.clone(),
-                            repository: publication.repository.clone(),
-                        }
-                    }),
-                    ledger_recorded: false,
-                    cloud_published: false,
-                });
-            }
-            let report = serde_json::to_string(&report)
-                .unwrap_or_else(|error| format!("Failed to serialize change report: {error}"));
-            if minted_branch.is_some() {
-                replay_owner =
-                    replay::record_pending_file_report(&orch.db.local, call, &report).await;
-            } else {
-                ordinary_ledger_claim = replay::record_report(&orch.db.local, call, &report).await;
-            }
+            ))
+            .unwrap_or_else(|error| format!("Failed to serialize change report: {error}"));
+            ordinary_ledger_claim = replay::record_report(&orch.db.local, call, &report).await;
         }
         drop(_seal_phase);
     }
@@ -2277,15 +1760,13 @@ async fn handle_write_attempt(
     // origin, cloud, GitHub, artifact, and check work must not serialize every
     // repository writer behind this call.
     drop(write_store_guard);
-    // The post-seal mint path is intentionally a separate durable continuation.
-    // Box the completion state so an ordinary resource mutation does not inherit
-    // the complete mint/recovery future on its poll stack.
+    // Boxed so a resource-only write does not carry the whole completion future
+    // on its poll stack.
     let completion = Box::pin(async {
-        if minted_branch.is_none()
-            && commit
-                .as_ref()
-                .and_then(|report| report.sha.as_ref())
-                .is_some()
+        if commit
+            .as_ref()
+            .and_then(|report| report.sha.as_ref())
+            .is_some()
         {
             for change in &recorded_changes {
                 if let Err(error) = record_agent_file_change(
@@ -2319,11 +1800,6 @@ async fn handle_write_attempt(
         // Cairn can see it.
         let published = match (export, publication_requirement) {
             (Err(error), _) => Err(error),
-            (Ok(()), crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr)
-                if minted_branch.is_some() =>
-            {
-                Ok(())
-            }
             (Ok(()), crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr) => {
                 let _phase = store_trace.as_ref().map(|trace| trace.phase("origin push"));
                 match logical_resolution.as_ref() {
@@ -2384,155 +1860,33 @@ async fn handle_write_attempt(
             // The ledger recorded `committed` inside the store lock, before the
             // export and push could say otherwise. Correct it here or a redelivery of
             // this same call is answered, durably, with a success that did not happen.
-            if let (Some(call), Some(owner)) = (write_call.as_ref(), replay_owner.as_ref()) {
-                let _ = replay::finalize_owned_report(&orch.db.local, call, owner, &report).await;
-            } else if let (Some(call), replay::LedgerClaim::Claimed) =
+            if let (Some(call), replay::LedgerClaim::Claimed) =
                 (write_call.as_ref(), ordinary_ledger_claim)
             {
                 replay::finalize_report(&orch.db.local, call, &report).await;
             }
             return report;
         }
-        if minted_branch.is_none() {
-            if let Some(ref publication) = post_seal_publication {
-                let _phase = store_trace
-                    .as_ref()
-                    .map(|trace| trace.phase("sealed pack publication"));
-                if let Err(error) = crate::mcp::vcs::publish_sealed_commit_pack(
-                    publication.db.as_ref(),
-                    &publication.project_id,
-                    &publication.repository,
-                    commit
-                        .as_ref()
-                        .and_then(|report| report.sha.as_deref())
-                        .expect("post-seal publication requires a sealed sha"),
-                )
-                .await
-                {
-                    append_commit_warning(
-                        &mut commit,
-                        format!("sealed commit cloud publication failed: {error}"),
-                    );
-                }
-            }
-        }
-
-        if let (Some(index), Some(minted), Some(call), Some(owner)) = (
-            mint_index,
-            minted_branch.as_ref(),
-            write_call.as_ref(),
-            replay_owner.as_ref(),
-        ) {
-            let mut report = empty_change_report(
-                applied.clone(),
-                failures.clone(),
-                commit.clone(),
-                !applied.is_empty() && !failures.is_empty(),
-                atomic,
-            );
-            report.branch = Some(BranchReport {
-                number: minted.number,
-                git_ref: minted.git_ref.clone(),
-                uri: minted.uri.clone(),
-                stage: "accumulating".to_string(),
-                pr_url: None,
-            });
-            report.post_seal = Some(MintedPostSealState {
-                file_changes: recorded_changes
-                    .iter()
-                    .map(|change| PersistedFileChange {
-                        path: change.path.clone(),
-                        status: change.status.to_string(),
-                        additions: change.additions,
-                        deletions: change.deletions,
-                    })
-                    .collect(),
-                cloud: post_seal_publication
-                    .as_ref()
-                    .map(|publication| CloudPublicationInput {
-                        project_id: publication.project_id.clone(),
-                        repository: publication.repository.clone(),
-                    }),
-                ledger_recorded: false,
-                cloud_published: false,
-            });
-            return off_frame(|| {
-                finish_minted_post_seal(
-                    orch,
-                    request,
-                    &payload,
-                    index,
-                    &minted.resolution,
-                    &minted.job_id,
-                    call,
-                    owner,
-                    report,
-                )
-            })
-            .await
-            .unwrap_or_else(|error| {
-                format!("The minted branch sealed, but post-seal recovery remains pending: {error}")
-            });
-        }
-
-        if let (Some(index), Some(minted), Some(_)) = (
-            mint_index,
-            minted_branch.as_ref(),
-            commit.as_ref().and_then(|report| report.sha.as_deref()),
-        ) {
-            if let Some(pr) = payload.changes[index]
-                .payload
+        if let Some(ref publication) = post_seal_publication {
+            let _phase = store_trace
                 .as_ref()
-                .and_then(|value| value.get("pr"))
+                .map(|trace| trace.phase("sealed pack publication"));
+            if let Err(error) = crate::mcp::vcs::publish_sealed_commit_pack(
+                publication.db.as_ref(),
+                &publication.project_id,
+                &publication.repository,
+                commit
+                    .as_ref()
+                    .and_then(|report| report.sha.as_deref())
+                    .expect("post-seal publication requires a sealed sha"),
+            )
+            .await
             {
-                let _ = pr;
-                let opened = complete_minted_branch_pr(
-                    orch,
-                    &payload,
-                    index,
-                    &minted.job_id,
-                    &minted.resolution,
-                    &minted.git_ref,
-                    minted.number,
-                )
-                .await;
-                match opened {
-                Ok(url) => minted_pr_url = Some(url),
-                Err(error) => failures.push(ChangeFailure {
-                    index,
-                    target: payload.changes[index].target.clone(),
-                    mode: mode_name(payload.changes[index].mode).to_string(),
-                    kind: "pull-request".to_string(),
-                    error: format!("Commit sealed on {}, but opening its PR failed; the branch remains accumulating: {error}", minted.git_ref),
-                }),
+                append_commit_warning(
+                    &mut commit,
+                    format!("sealed commit cloud publication failed: {error}"),
+                );
             }
-            }
-        }
-
-        if let (Some(minted), Some(url)) = (minted_branch.as_ref(), minted_pr_url.as_ref()) {
-            let mut report = empty_change_report(
-                applied.clone(),
-                failures.clone(),
-                commit.clone(),
-                !applied.is_empty() && !failures.is_empty(),
-                atomic,
-            );
-            report.branch = Some(BranchReport {
-                number: minted.number,
-                git_ref: minted.git_ref.clone(),
-                uri: minted.uri.clone(),
-                stage: "pr-open".to_string(),
-                pr_url: Some(url.clone()),
-            });
-            if let (Some(call), Some(owner)) = (write_call.as_ref(), replay_owner.as_ref()) {
-                let checkpoint = serde_json::to_string(&report).unwrap_or_default();
-                if !replay::checkpoint_owned_report(&orch.db.local, call, owner, &checkpoint).await
-                {
-                    return "The minted branch PR completed, but replay ownership was lost before its completion checkpoint; a later delivery will recover the final result.".to_string();
-                }
-            }
-            return serde_json::to_string(&report)
-                .unwrap_or_else(|error| format!("Failed to serialize change report: {error}"));
         }
 
         if let (Some(resolution), Some(new_tip)) = (
@@ -2567,16 +1921,10 @@ async fn handle_write_attempt(
         let sealed_sha = commit.as_ref().and_then(|report| report.sha.clone());
         let check_summary: Option<String> =
             if let (true, Some(sealed_sha)) = (had_file_change, sealed_sha.as_deref()) {
-                // An explicit thread-branch destination is backed by its own durable job.
-                // Checks and cancellation belong to that job rather than to the thread
-                // session that happened to advance it, otherwise the branch's `/checks`
-                // resource remains hollow and review waves attach to the wrong owner.
-                let run_context = check_run_context_for_destination(
+                let run_context =
                     crate::mcp::handlers::run_context::lookup_run(&orch.db.local, request)
                         .await
-                        .ok(),
-                    destination_job_id.as_deref(),
-                );
+                        .ok();
                 let tool_use_id = request
                     .tool_use_id
                     .clone()
@@ -2666,18 +2014,6 @@ async fn handle_write_attempt(
 
         let mut report = empty_change_report(applied, failures, commit, false, atomic);
         report.partial_success = !report.applied.is_empty() && !report.failures.is_empty();
-        report.branch = minted_branch.as_ref().map(|minted| BranchReport {
-            number: minted.number,
-            git_ref: minted.git_ref.clone(),
-            uri: minted.uri.clone(),
-            stage: if minted_pr_url.is_some() {
-                "pr-open"
-            } else {
-                "accumulating"
-            }
-            .to_string(),
-            pr_url: minted_pr_url.clone(),
-        });
         // From here the carrier settles the row itself: the blocking group
         // through its own checkpoints, everything else just below.
         if let Some(progress) = resource_progress.as_mut() {
@@ -2698,7 +2034,6 @@ async fn handle_write_attempt(
                     replay::update_blocking_checkpoint(
                         &orch.db.local,
                         call,
-                        None,
                         replay::LedgerClaim::NotClaimed,
                         &outer,
                     )
@@ -2707,7 +2042,6 @@ async fn handle_write_attempt(
                     replay::checkpoint_blocking_report(
                         &orch.db.local,
                         call,
-                        replay_owner.as_ref(),
                         ordinary_ledger_claim,
                         &outer,
                     )
@@ -2758,7 +2092,6 @@ async fn handle_write_attempt(
                         if let Err(error) = replay::update_blocking_checkpoint(
                             &orch.db.local,
                             call,
-                            replay_owner.as_ref(),
                             ordinary_ledger_claim,
                             &outer,
                         )
@@ -2785,10 +2118,9 @@ async fn handle_write_attempt(
                 .unwrap_or_else(|e| format!("Failed to serialize change report: {e}")),
             &check_summary,
         );
-        if replay_owner.is_none()
-            && (guard_resource_report
-                || ordinary_ledger_claim == replay::LedgerClaim::Claimed
-                || blocking_checkpointed)
+        if guard_resource_report
+            || ordinary_ledger_claim == replay::LedgerClaim::Claimed
+            || blocking_checkpointed
         {
             replay::finalize_report(
                 &orch.db.local,
@@ -2799,16 +2131,7 @@ async fn handle_write_attempt(
         }
         result
     });
-    let result = match (write_call.as_ref(), replay_owner.as_ref()) {
-        (Some(call), Some(owner)) => {
-            replay::with_owned_report_heartbeat(&orch.db.local, call, owner, completion).await
-        }
-        _ => completion.await,
-    };
-    if let (Some(call), Some(owner)) = (write_call.as_ref(), replay_owner.as_ref()) {
-        let _ = replay::finalize_owned_report(&orch.db.local, call, owner, &result).await;
-    }
-    result
+    completion.await
 }
 
 /// What a fenced `write` may target by absolute path without a prompt: what a
@@ -2916,35 +2239,6 @@ mod change_preview_tests {
         assert_eq!(wire["commit"]["sha"], "abc123");
         assert_eq!(wire["blocking"]["text"], "question answer");
         assert!(wire["blocking"].get("artifact_uri").is_none());
-    }
-
-    #[test]
-    fn minted_post_seal_inputs_round_trip_without_guessing() {
-        let mut report = empty_change_report(Vec::new(), Vec::new(), None, false, false);
-        report.post_seal = Some(MintedPostSealState {
-            file_changes: vec![PersistedFileChange {
-                path: "src/lib.rs".to_string(),
-                status: "modified".to_string(),
-                additions: 3,
-                deletions: 1,
-            }],
-            cloud: Some(CloudPublicationInput {
-                project_id: "cairn".to_string(),
-                repository: std::path::PathBuf::from("/objects/repository.git"),
-            }),
-            ledger_recorded: false,
-            cloud_published: false,
-        });
-
-        let encoded = serde_json::to_string(&report).unwrap();
-        let decoded: self::types::ChangeReport = serde_json::from_str(&encoded).unwrap();
-        let state = decoded.post_seal.unwrap();
-        assert_eq!(state.file_changes[0].path, "src/lib.rs");
-        assert_eq!(state.file_changes[0].additions, 3);
-        assert_eq!(
-            state.cloud.unwrap().repository,
-            std::path::PathBuf::from("/objects/repository.git")
-        );
     }
 
     fn patch_item(target: &str, old: &str, new: &str) -> ChangeItem {
@@ -3839,36 +3133,6 @@ mod change_preview_tests {
         );
         // transactional stays false here, so it is still omitted.
         assert!(!object.contains_key("transactional"));
-    }
-
-    #[test]
-    fn thread_branch_checks_keep_the_run_stream_but_use_the_branch_job() {
-        let context = super::super::RunContext {
-            run_id: "thread-run".into(),
-            job_id: "thread-session-job".into(),
-            exec_seq: None,
-            issue_id: None,
-            issue_number: None,
-            thread_id: Some("thread-id".into()),
-            project_id: "project-id".into(),
-            project_key: "project".into(),
-            job_name: Some("Thread".into()),
-            agent_config_id: Some("thread".into()),
-        };
-
-        let routed = check_run_context_for_destination(Some(context), Some("thread-branch-job"))
-            .expect("authenticated context remains available");
-
-        assert_eq!(
-            routed.run_id, "thread-run",
-            "streaming stays on the caller run"
-        );
-        assert_eq!(
-            routed.job_id, "thread-branch-job",
-            "check ownership follows the branch"
-        );
-        assert_eq!(routed.thread_id.as_deref(), Some("thread-id"));
-        assert_eq!(routed.project_id, "project-id");
     }
 
     /// The write's two serialization shapes, pinned in source order. A locked

@@ -116,7 +116,6 @@ const CHILDREN_COLLAPSED_NOTICE: &str = "_Live state at composition, one line pe
 
 const NO_CHILDREN_NOTICE: &str = "_This thread has no children._\n\n";
 const CENSUS_TERMINAL_CHILDREN: usize = 30;
-const CENSUS_TERMINAL_BRANCHES: usize = 30;
 
 /// A composed thread seed, and the two measurements that price it.
 pub(crate) struct ThreadSeed {
@@ -176,8 +175,8 @@ pub(crate) async fn compose_thread_seed_with_policy(
     }
 
     // The node's own point lookups share one read. The census statements each
-    // take their own (`load_children`, `load_branches`), so no single read
-    // spans the whole census, however many children a thread has.
+    // take their own (`load_children`), so no single read spans the whole
+    // census, however many children a thread has.
     let job = job_id.to_owned();
     let (coordinates, source_session_id, thread_id) = read_resource(db, move |conn| {
         Box::pin(async move {
@@ -199,9 +198,6 @@ pub(crate) async fn compose_thread_seed_with_policy(
     let children = load_children(db, thread_id.as_deref())
         .await
         .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
-    let branches = load_branches(db, thread_id.as_deref())
-        .await
-        .map_err(|error| format!("Failed to resolve this thread's branches: {error}"))?;
     // The thread's own store is a second database, opened and counted after
     // every main read has released.
     let store = thread_store_census(thread_id, now).await;
@@ -285,7 +281,6 @@ pub(crate) async fn compose_thread_seed_with_policy(
     };
 
     let arc = render_arc(db, job_id, now).await;
-    let branches_census = render_branches(&branches, now);
     let census = render_children(&children, now);
 
     let mut era_text = String::from("## Eras\n\n");
@@ -315,10 +310,7 @@ pub(crate) async fn compose_thread_seed_with_policy(
     }
     era_text.push('\n');
 
-    let framing_tokens = seed_tokens(&branches_census)
-        + seed_tokens(&census)
-        + seed_tokens(&store)
-        + seed_tokens(&era_text);
+    let framing_tokens = seed_tokens(&census) + seed_tokens(&store) + seed_tokens(&era_text);
     let verbatim_budget = policy.budget_tokens.saturating_sub(framing_tokens);
     let floor_start = blocks.len().saturating_sub(RECENCY_FLOOR_TURNS);
     let live_start = era_end.map_or(0, |end| (end + 1).max(0) as usize);
@@ -415,7 +407,6 @@ pub(crate) async fn compose_thread_seed_with_policy(
     }
 
     let mut body = String::new();
-    body.push_str(&branches_census);
     body.push_str(&census);
     body.push_str(&store);
     body.push_str(&era_text);
@@ -432,7 +423,6 @@ pub(crate) async fn compose_thread_seed_with_policy(
         let degraded = degrade_to_budget(
             policy.budget_tokens,
             &children,
-            &branches_census,
             &store,
             existing_eras.len(),
             &coordinates.base_uri,
@@ -823,7 +813,6 @@ struct DegradedBody {
 fn degrade_to_budget(
     budget: usize,
     children: &[ChildStatus],
-    branches: &str,
     store: &str,
     era_count: usize,
     thread_uri: &str,
@@ -845,12 +834,9 @@ fn degrade_to_budget(
     let census = collapsed_census(
         children,
         thread_uri,
-        budget.saturating_sub(
-            reserve + seed_tokens(branches) + seed_tokens(store) + seed_tokens(&eras),
-        ),
+        budget.saturating_sub(reserve + seed_tokens(store) + seed_tokens(&eras)),
     );
-    let framing =
-        seed_tokens(branches) + seed_tokens(&census) + seed_tokens(store) + seed_tokens(&eras);
+    let framing = seed_tokens(&census) + seed_tokens(store) + seed_tokens(&eras);
     let recent = bounded_recent(
         blocks,
         budget.saturating_sub(framing),
@@ -859,7 +845,7 @@ fn degrade_to_budget(
         RECENCY_FLOOR_TURNS,
     );
 
-    let body = format!("{branches}{census}{store}{eras}{}", recent.section);
+    let body = format!("{census}{store}{eras}{}", recent.section);
     if seed_tokens(&body) <= budget {
         return DegradedBody {
             body,
@@ -1976,85 +1962,6 @@ async fn node_coordinates(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BranchStatus {
-    number: i64,
-    title: Option<String>,
-    stage: String,
-    moved_at: i64,
-    pr: Option<(Option<i64>, String)>,
-}
-
-impl BranchStatus {
-    fn is_active(&self) -> bool {
-        !matches!(self.stage.as_str(), "merged" | "abandoned")
-    }
-}
-
-fn render_branches(branches: &[BranchStatus], now: i64) -> String {
-    let mut out = String::from("## Branches\n\n");
-    if branches.is_empty() {
-        out.push_str("_This thread has no branches._\n\n");
-        return out;
-    }
-    let (active, mut terminal): (Vec<_>, Vec<_>) =
-        branches.iter().partition(|branch| branch.is_active());
-    terminal.sort_by_key(|branch| std::cmp::Reverse(branch.moved_at));
-    for branch in active
-        .into_iter()
-        .chain(terminal.iter().take(CENSUS_TERMINAL_BRANCHES).copied())
-    {
-        let title = branch.title.as_deref().unwrap_or("Untitled");
-        let age = now.saturating_sub(branch.moved_at);
-        let movement = if age < 60 {
-            "just now".to_string()
-        } else {
-            format!("{} ago", crate::clock::format_elapsed(age))
-        };
-        let pr = branch
-            .pr
-            .as_ref()
-            .map(|(number, status)| match number {
-                Some(number) => format!(" · PR #{number} {status}"),
-                None => format!(" · PR {status}"),
-            })
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "- `cairn:~/branches/{}` **{}** · {} · moved {}{}\n",
-            branch.number,
-            branch.stage,
-            one_line(title),
-            movement,
-            pr
-        ));
-    }
-    if terminal.len() > CENSUS_TERMINAL_BRANCHES {
-        out.push_str(&format!(
-            "- _… and {} earlier terminal branches → `cairn:~/branches`._\n",
-            terminal.len() - CENSUS_TERMINAL_BRANCHES
-        ));
-    }
-    out.push('\n');
-    out
-}
-
-async fn load_branches(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<BranchStatus>, String> {
-    let Some(thread_id) = thread_id else {
-        return Ok(Vec::new());
-    };
-    thread_rows(db, BRANCHES_SQL, thread_id, |row| {
-        let pr_status = row.opt_text(5)?;
-        Ok(Some(BranchStatus {
-            number: row.i64(0)?,
-            title: row.opt_text(1)?,
-            stage: row.text(2)?,
-            moved_at: row.i64(3)?,
-            pr: pr_status.map(|status| (row.opt_i64(4).ok().flatten(), status)),
-        }))
-    })
-    .await
-}
-
 // ── Census statements ──────────────────────────────────────────────────────────
 //
 // Every statement the census runs, each bound to the thread id alone and each
@@ -2072,13 +1979,6 @@ async fn load_branches(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<Bran
 // as its address line alone, so its facets would be read for nothing, and
 // resolved children are nearly all of a long-lived thread's (297 of 298 under
 // the `main` thread on 11-04). What orders them is on their own row.
-
-const BRANCHES_SQL: &str =
-    "SELECT b.number, b.title, b.stage, b.moved_at, mr.github_pr_number, mr.status
-       FROM thread_branches b
-       LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
-      WHERE b.thread_id = ?1
-      ORDER BY b.number";
 
 const CHILDREN_SQL: &str = "SELECT child.id, p.key, child.number, child.title, child.status,
             parent_project.key, parent.number,
@@ -3087,30 +2987,6 @@ mod tests {
                 "{uri}"
             );
         }
-    }
-
-    #[test]
-    fn branch_census_keeps_active_and_caps_terminal_branches() {
-        let mut branches = vec![BranchStatus {
-            number: 1,
-            title: Some("Live work".into()),
-            stage: "pr-open".into(),
-            moved_at: NOW - 120,
-            pr: Some((Some(42), "open".into())),
-        }];
-        for number in 2..=(CENSUS_TERMINAL_BRANCHES as i64 + 2) {
-            branches.push(BranchStatus {
-                number,
-                title: None,
-                stage: "merged".into(),
-                moved_at: NOW - number,
-                pr: None,
-            });
-        }
-        let rendered = render_branches(&branches, NOW);
-        assert!(rendered.contains("`cairn:~/branches/1` **pr-open**"));
-        assert!(rendered.contains("PR #42 open"));
-        assert!(rendered.contains("and 1 earlier terminal branches"));
     }
 
     #[test]
@@ -4205,6 +4081,10 @@ mod tests {
 
         assert!(seed.content.contains("## Children"));
         assert!(seed.content.contains("This thread has no children"));
+        assert!(
+            !seed.content.contains("## Branches"),
+            "a thread owns no branches, so its seed has no census of them"
+        );
     }
 
     #[tokio::test]
@@ -5098,8 +4978,7 @@ mod tests {
 
     /// Every statement the children census runs, by the name the probe and
     /// the plan pin report it under.
-    const CENSUS_STATEMENTS: [(&str, &str); 7] = [
-        ("branches", BRANCHES_SQL),
+    const CENSUS_STATEMENTS: [(&str, &str); 6] = [
         ("children", CHILDREN_SQL),
         ("nodes", CHILD_NODES_SQL),
         ("prs", CHILD_PRS_SQL),
@@ -5134,15 +5013,6 @@ mod tests {
                 !plan.iter().any(|step| step.starts_with("SCAN")),
                 "{label}: no table or index is scanned: {plan:#?}"
             );
-            if label == "branches" {
-                assert!(
-                    plan.iter()
-                        .any(|step| step.starts_with("SEARCH b USING")
-                            && step.contains("(thread_id=?")),
-                    "{label}: branches are sought by thread: {plan:#?}"
-                );
-                continue;
-            }
             assert_eq!(
                 plan.first().map(String::as_str),
                 Some("SEARCH child USING INDEX idx_issues_parent_thread_id (parent_thread_id=?)"),
@@ -5300,7 +5170,6 @@ mod tests {
     async fn a_job_outside_any_thread_has_an_empty_census() {
         let db = thread_fixture("thread-seed-no-thread.db").await;
         assert!(load_children(&db, None).await.unwrap().is_empty());
-        assert!(load_branches(&db, None).await.unwrap().is_empty());
     }
 
     /// What the children census costs on a real history: the whole census as
@@ -5333,7 +5202,7 @@ mod tests {
             println!("migrated in {:?}", started.elapsed());
         }
 
-        async fn census(db: &LocalDb, job_id: &str) -> (usize, usize) {
+        async fn census(db: &LocalDb, job_id: &str) {
             let job = job_id.to_owned();
             let started = Instant::now();
             let thread_id = read_resource(db, move |conn| {
@@ -5347,14 +5216,11 @@ mod tests {
             .unwrap();
             let node = started.elapsed();
             let children = load_children(db, thread_id.as_deref()).await.unwrap();
-            let branches = load_branches(db, thread_id.as_deref()).await.unwrap();
             println!(
-                "census: node read {node:?}; {} children, {} branches in {:?} total",
+                "census: node read {node:?}; {} children in {:?} total",
                 children.len(),
-                branches.len(),
                 started.elapsed()
             );
-            (children.len(), branches.len())
         }
         async fn statements(db: &LocalDb, thread_id: &str, pass: &str) {
             for (label, sql) in CENSUS_STATEMENTS {

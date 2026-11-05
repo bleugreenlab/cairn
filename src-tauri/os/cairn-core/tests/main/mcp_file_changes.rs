@@ -34,11 +34,9 @@ fn make_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
     make_request_as_run(cwd, payload, None)
 }
 
-/// A previous implementation temporarily left every sealed file write pending,
-/// even though only minted writes carry a resumable post-seal continuation. If
-/// the process died in that window, redelivery took ownership and then rejected
-/// the ordinary report for lacking minted-branch state. Preserve compatibility
-/// with such durable rows by settling their already-sealed report as the replay.
+/// A delivery that died after sealing can leave its ledger row pending. A
+/// redelivery takes ownership of that row and settles its already-sealed report
+/// as the replay, without sealing the write a second time.
 #[tokio::test]
 async fn an_orphaned_ordinary_pending_report_settles_without_a_second_commit() {
     let Some(repo) = ChangeTestRepo::try_new().await else {
@@ -102,302 +100,6 @@ async fn an_orphaned_ordinary_pending_report_settles_without_a_second_commit() {
         .await
         .unwrap();
     assert_eq!(finalized, 1, "redelivery must settle the orphaned row");
-}
-
-#[tokio::test]
-async fn failed_post_mint_patch_rolls_back_branch_identity_and_ref() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    repo.write("thread-rollback.txt", "base\n");
-    repo.seal_base("seed thread rollback specimen");
-    repo.become_a_thread().await;
-
-    let failed = repo.change_report(json!({
-        "changes": [
-            { "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Must roll back", "pr": { "body": "Never opened." } } },
-            { "target": "file:thread-rollback.txt", "mode": "patch", "payload": { "old_string": "missing", "new_string": "changed" } }
-        ],
-        "commit_msg": "must not seal",
-        "atomic": true
-    })).await;
-
-    assert_eq!(failure_count(&failed), 1, "{failed:?}");
-    assert_eq!(
-        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
-        0
-    );
-    assert_eq!(
-        count_rows(
-            &repo.orch.db.local,
-            "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'job-change'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        common::scalar_i64_by_id(
-            &repo.orch.db.local,
-            "SELECT next_branch_number FROM threads WHERE id = ?1",
-            "issue-change"
-        )
-        .await,
-        1
-    );
-    let jj = jj::environment_with_binary(&repo.jj_bin, repo.config.path());
-    assert_eq!(
-        jj::bookmark_commit(&jj, repo.dir.path(), "agent/change-thread/1"),
-        None
-    );
-    assert_eq!(repo.read("thread-rollback.txt"), "base\n");
-}
-
-#[tokio::test]
-async fn failed_mint_bookmark_creation_rolls_back_only_its_database_allocation() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    repo.write("thread-bookmark-collision.txt", "base\n");
-    repo.seal_base("seed bookmark collision specimen");
-    repo.become_a_thread().await;
-
-    let jj = jj::environment_with_binary(&repo.jj_bin, repo.config.path());
-    let original_head = repo.branch_head();
-    jj::create_bookmark_at(
-        &jj,
-        repo.dir.path(),
-        "agent/change-thread/1",
-        &original_head,
-    )
-    .unwrap();
-
-    let failed = repo.change_report(json!({
-        "changes": [
-            { "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Collides", "pr": { "body": "Never opened." } } },
-            { "target": "file:thread-bookmark-collision.txt", "mode": "patch", "payload": { "old_string": "base", "new_string": "changed" } }
-        ],
-        "commit_msg": "must not replace existing bookmark",
-        "atomic": true
-    })).await;
-
-    assert_eq!(failure_count(&failed), 1, "{failed:?}");
-    assert_eq!(
-        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
-        0
-    );
-    assert_eq!(
-        count_rows(
-            &repo.orch.db.local,
-            "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'job-change'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        common::scalar_i64_by_id(
-            &repo.orch.db.local,
-            "SELECT next_branch_number FROM threads WHERE id = ?1",
-            "issue-change"
-        )
-        .await,
-        1
-    );
-    assert_eq!(
-        jj::bookmark_commit(&jj, repo.dir.path(), "agent/change-thread/1"),
-        Some(original_head),
-        "a failed mint must not delete the bookmark it collided with"
-    );
-    assert_eq!(repo.read("thread-bookmark-collision.txt"), "base\n");
-}
-
-#[tokio::test]
-async fn invalid_utf8_snapshot_after_mint_rolls_back_branch_identity_and_ref() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    std::fs::write(repo.path("invalid-utf8.bin"), [0xff, 0xfe]).unwrap();
-    repo.seal_base("seed invalid UTF-8 specimen");
-    repo.become_a_thread().await;
-
-    let failed = repo.change_report(json!({
-        "changes": [
-            { "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Must roll back", "pr": { "body": "Never opened." } } },
-            { "target": "file:invalid-utf8.bin", "mode": "patch", "payload": { "old_string": "anything", "new_string": "changed" } }
-        ],
-        "commit_msg": "must not seal invalid UTF-8",
-        "atomic": true
-    })).await;
-
-    assert_eq!(failure_count(&failed), 1, "{failed:?}");
-    assert!(failed.to_string().contains("not valid UTF-8"), "{failed:?}");
-    assert_eq!(
-        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
-        0
-    );
-    assert_eq!(
-        count_rows(
-            &repo.orch.db.local,
-            "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'job-change'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        common::scalar_i64_by_id(
-            &repo.orch.db.local,
-            "SELECT next_branch_number FROM threads WHERE id = ?1",
-            "issue-change"
-        )
-        .await,
-        1
-    );
-    let jj = jj::environment_with_binary(&repo.jj_bin, repo.config.path());
-    assert_eq!(
-        jj::bookmark_commit(&jj, repo.dir.path(), "agent/change-thread/1"),
-        None
-    );
-    assert_eq!(
-        std::fs::read(repo.path("invalid-utf8.bin")).unwrap(),
-        [0xff, 0xfe]
-    );
-}
-
-#[tokio::test]
-async fn thread_branch_preview_and_invalid_batch_shapes_have_no_mint_side_effects() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    repo.write("thread-preview.txt", "base\n");
-    repo.seal_base("seed thread preview specimen");
-    repo.become_a_thread().await;
-
-    let mint = || json!({ "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Preview branch", "pr": { "body": "No side effects." } } });
-    let file = || json!({ "target": "file:thread-preview.txt", "mode": "patch", "payload": { "old_string": "base", "new_string": "changed" } });
-
-    let preview = repo.change_report(json!({ "changes": [mint(), file()], "commit_msg": "preview thread branch", "preview": true })).await;
-    assert_eq!(preview["branch"]["number"], 1, "{preview:?}");
-    assert_eq!(preview["branch"]["stage"], "pr-open", "{preview:?}");
-
-    for invalid in [
-        json!({ "changes": [mint(), mint(), file()], "commit_msg": "two mints" }),
-        json!({ "changes": [mint(), file()], "branch": "agent/change-thread/99", "commit_msg": "mint plus destination" }),
-    ] {
-        let refusal = repo.change_raw(invalid).await;
-        assert!(
-            refusal.contains("Refusing") || refusal.contains("refus"),
-            "{refusal}"
-        );
-    }
-
-    assert_eq!(
-        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
-        0
-    );
-    assert_eq!(
-        common::scalar_i64_by_id(
-            &repo.orch.db.local,
-            "SELECT next_branch_number FROM threads WHERE id = ?1",
-            "issue-change"
-        )
-        .await,
-        1
-    );
-    assert_eq!(repo.read("thread-preview.txt"), "base\n");
-}
-
-#[tokio::test]
-async fn a_thread_mints_a_pr_branch_and_follow_up_writes_stack_on_it() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    repo.write("thread-branch.txt", "base\n");
-    repo.seal_base("seed thread branch specimen");
-    repo.become_a_thread().await;
-
-    // A repository without a remote exercises the canonical local-PR path. The
-    // PR row and create-pr artifact are still real; only GitHub publication is
-    // intentionally absent from this integration fixture.
-    let output = std::process::Command::new("git")
-        .args(["remote", "remove", "origin"])
-        .current_dir(repo.project.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "remote removal failed: {output:?}");
-
-    let minted = repo
-        .change_report(json!({
-            "changes": [
-                {
-                    "target": "cairn:~/branches",
-                    "mode": "append",
-                    "payload": {
-                        "title": "Thread branch integration",
-                        "pr": { "body": "Exercises the bottom rung." }
-                    }
-                },
-                {
-                    "target": "file:thread-branch.txt",
-                    "mode": "patch",
-                    "payload": { "old_string": "base", "new_string": "minted" }
-                }
-            ],
-            "commit_msg": "mint thread branch"
-        }))
-        .await;
-
-    assert_successful_change(&minted, 2);
-    assert_eq!(minted["branch"]["stage"], "pr-open", "{minted:?}");
-    assert_eq!(minted["branch"]["pr_url"], "local://agent/change-thread/1");
-    let branch_uri = minted["branch"]["uri"].as_str().unwrap();
-    let branch_ref = minted["branch"]["git_ref"].as_str().unwrap();
-    assert_eq!(branch_uri, "cairn://p/chg/change-thread/branches/1");
-    assert_eq!(repo.read_at(branch_ref, "thread-branch.txt"), "minted\n");
-    assert_eq!(
-        common::scalar_text_by_id(
-            &repo.orch.db.local,
-            "SELECT stage FROM thread_branches WHERE job_id = ?1",
-            common::scalar_text_by_id(
-                &repo.orch.db.local,
-                "SELECT job_id FROM thread_branches WHERE thread_id = ?1",
-                "issue-change"
-            )
-            .await
-            .as_deref()
-            .unwrap()
-        )
-        .await
-        .as_deref(),
-        Some("pr-open")
-    );
-    assert_eq!(
-        common::scalar_i64_by_id(
-            &repo.orch.db.local,
-            "SELECT COUNT(*) FROM artifacts a JOIN thread_branches tb ON tb.job_id = a.job_id WHERE tb.thread_id = ?1 AND a.output_name = 'create-pr'",
-            "issue-change",
-        )
-        .await,
-        1
-    );
-
-    let stacked = repo
-        .change_report(json!({
-            "changes": [{
-                "target": "file:thread-branch.txt",
-                "mode": "patch",
-                "payload": { "old_string": "minted", "new_string": "stacked" }
-            }],
-            "branch": branch_uri,
-            "commit_msg": "stack on thread branch"
-        }))
-        .await;
-
-    assert_successful_change(&stacked, 1);
-    assert_eq!(repo.read_at(branch_ref, "thread-branch.txt"), "stacked\n");
 }
 
 fn resumed_model_context(repo: &ChangeTestRepo) -> String {
@@ -978,6 +680,13 @@ impl ChangeTestRepo {
     /// jj is unavailable. The cwd (`dir`) is a real `.jj` workspace over a shared
     /// store backed by a throwaway project git repo.
     async fn try_new() -> Option<Self> {
+        Self::try_new_on_base(|_| {}).await
+    }
+
+    /// [`Self::try_new`] over a base `prepare_base` shapes: it runs in the
+    /// project repo before the workspace exists, so what it commits is on the
+    /// builder's base commit and in the project's primary checkout alike.
+    async fn try_new_on_base(prepare_base: impl FnOnce(&Path)) -> Option<Self> {
         let jj_bin = common::jj_bin()?;
         let dir = tempfile::tempdir().unwrap();
         let project = tempfile::Builder::new()
@@ -985,6 +694,7 @@ impl ChangeTestRepo {
             .tempdir_in("/tmp")
             .unwrap();
         init_git_repo(project.path());
+        prepare_base(project.path());
         let origin = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("git")
             .args(["init", "-b", "main", "--bare"])
@@ -1196,6 +906,94 @@ impl ChangeTestRepo {
     }
 }
 
+/// A child issue's builder is how main gets repaired from inside Cairn when the
+/// project's `.cairn/config.yaml` does not parse, the state in which every batch
+/// placement is refused. A `write` reaches no executor, so it has to keep working
+/// there, along both paths a committing write's checks can take: no checks armed
+/// while the commit's own config is still broken, and a check that arms on the
+/// repair commit and is refused because the primary checkout is still broken.
+#[tokio::test]
+async fn a_builder_commits_and_repairs_main_while_the_project_config_does_not_parse() {
+    const UNPARSEABLE: &str = "checks: [unterminated\n";
+    const REPAIRED: &str = "checks:\n  repair-lane:\n    command: \"true\"\n    when: write\n";
+    // Far above the wave's own inline bound, so a write that hangs fails here
+    // rather than wedging the suite. Promptness itself is pinned by the summary
+    // below being a verdict rather than a pending line.
+    let hang_bound = std::time::Duration::from_secs(120);
+
+    let Some(repo) = ChangeTestRepo::try_new_on_base(|project| {
+        std::fs::create_dir_all(project.join(".cairn")).unwrap();
+        std::fs::write(project.join(".cairn/config.yaml"), UNPARSEABLE).unwrap();
+        for args in [
+            vec!["add", "."],
+            vec!["commit", "-m", "main breaks its config"],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(project)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git setup failed: {output:?}");
+        }
+    })
+    .await
+    else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    // The broken file has to be what placement actually reads, or everything
+    // below passes for the wrong reason.
+    cairn_core::config::project_settings::load_execution_project_policy(repo.project.path())
+        .expect_err("the primary checkout's config must refuse placement");
+    assert_eq!(repo.read(".cairn/config.yaml"), UNPARSEABLE);
+
+    let raw = tokio::time::timeout(
+        hang_bound,
+        repo.change_raw(json!({
+            "changes": [{
+                "target": "file:unrelated.txt",
+                "mode": "create",
+                "payload": { "content": "lands under a broken config\n" }
+            }],
+            "commit_msg": "commit while the config is broken"
+        })),
+    )
+    .await
+    .expect("a write under a broken config must not hang");
+    // A wave that armed would append its summary after the report, and this
+    // parse would refuse it: a commit whose own config does not parse arms none.
+    let report = parse_report(&raw);
+    assert_successful_change(&report, 1);
+    assert_eq!(repo.read("unrelated.txt"), "lands under a broken config\n");
+    assert_eq!(repo.read(".cairn/config.yaml"), UNPARSEABLE);
+
+    let raw = tokio::time::timeout(
+        hang_bound,
+        repo.change_raw(json!({
+            "changes": [{
+                "target": "file:.cairn/config.yaml",
+                "mode": "replace",
+                "payload": { "content": REPAIRED }
+            }],
+            "commit_msg": "repair the config"
+        })),
+    )
+    .await
+    .expect("the repair write must not hang on placement");
+    let (report, summary) = raw
+        .split_once("\n\n")
+        .unwrap_or_else(|| panic!("the repair commit's check must arm: {raw}"));
+    assert_successful_change(&parse_report(report), 1);
+    assert_eq!(repo.read(".cairn/config.yaml"), REPAIRED);
+    assert!(
+        summary.contains("repair-lane")
+            && summary.contains("not run")
+            && summary.contains(".cairn/config.yaml"),
+        "the armed check must fail by naming the config, not by waiting to be placed: {summary}"
+    );
+}
+
 /// The tracked-writes half of the thread posture, at the `write` door.
 ///
 /// A thread owns no branch, so its job runs ON the base branch and a commit from
@@ -1258,15 +1056,52 @@ async fn a_thread_cannot_commit_a_tracked_file_and_an_ordinary_issue_still_can()
         .await;
 
     assert!(
-        refusal.contains("thread-owned job")
-            && refusal.contains("cairn:~/branches")
-            && refusal.contains("write branch:"),
+        refusal.contains("thread-owned job") && refusal.contains("child issue"),
         "the thread must be told the posture and where the work belongs: {refusal}"
     );
     assert_eq!(
         repo.read("posture.txt"),
         "after\n",
         "the refusal must be taken before the mutation applies: {refusal}"
+    );
+}
+
+/// The `write` tool has no `branch` key, and a stale caller's stray one is an
+/// ignored unknown key. It must not get a thread past the commit refusal: naming
+/// a ref is not a way to commit from a thread, the base branch included.
+#[tokio::test]
+async fn a_stray_branch_key_does_not_get_a_thread_past_the_commit_refusal() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("posture.txt", "before\n");
+    repo.seal_base("seed stray branch specimen");
+    repo.become_a_thread().await;
+    let head = repo.branch_head();
+    let main_head = common::head_sha(repo.project.path());
+
+    let refusal = repo
+        .change_raw(json!({
+            "changes": [{
+                "target": "file:posture.txt",
+                "mode": "patch",
+                "payload": { "old_string": "before", "new_string": "from a thread" }
+            }],
+            "branch": "main",
+            "commit_msg": "should never land"
+        }))
+        .await;
+
+    assert!(
+        refusal.contains("thread-owned job") && refusal.contains("child issue"),
+        "a stray branch key must not skip the refusal: {refusal}"
+    );
+    assert_eq!(repo.branch_head(), head, "nothing committed: {refusal}");
+    assert_eq!(
+        common::head_sha(repo.project.path()),
+        main_head,
+        "nothing reached main: {refusal}"
     );
 }
 
@@ -1698,7 +1533,7 @@ async fn change_atomic_promote_amend_rolls_back_decision() {
     repo.orch
         .db
         .local
-        .execute_script(&format!(
+        .execute_script(format!(
             "\
             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)\
              VALUES ('issue-atomic-promote', '{project_id}', 1, 'Promote memory', 'active', 1, 1);\
@@ -1779,7 +1614,7 @@ async fn node_memory_append_uses_target_node_and_scope_owner() {
     let issue_id = insert_issue(&orch.db.local, &project_id, 1, "Memory target").await;
     orch.db
         .local
-        .execute_script(&format!(
+        .execute_script(format!(
             "\
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)\
              VALUES ('exec-memory-target', 'recipe', '{issue_id}', '{project_id}', 'running', 1, 1);\

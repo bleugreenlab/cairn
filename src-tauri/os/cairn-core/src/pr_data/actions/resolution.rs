@@ -17,25 +17,6 @@ pub struct PrResolutionAttribution {
     pub surface: &'static str,
 }
 
-async fn advance_thread_branch_lifecycle(
-    db: &LocalDb,
-    owner_id: &str,
-    resolution: PrNodeResolution,
-    now: i64,
-) -> Result<(), String> {
-    let branch_stage = match resolution {
-        PrNodeResolution::Merge => "merged",
-        PrNodeResolution::Close => "abandoned",
-    };
-    db.execute(
-        "UPDATE thread_branches SET stage = ?1, moved_at = ?2 WHERE job_id = ?3",
-        params![branch_stage, now, owner_id],
-    )
-    .await
-    .map_err(|e| db_error("Failed to advance thread branch lifecycle", e))?;
-    Ok(())
-}
-
 pub struct StoredPrResolutionAttribution {
     pub action: String,
     pub actor_kind: String,
@@ -377,12 +358,6 @@ async fn resolve_pr_node_as(
         };
         resolve_issue_for_pr(orch, &db, issue_id, issue_resolution).await?;
     }
-
-    // A numbered thread branch uses the same merge-request owner coordinate as
-    // an issue builder. Keep its lifecycle projection below the canonical PR
-    // transition so every merge/close entry point advances the entity exactly
-    // once, and only after the external operation has succeeded.
-    advance_thread_branch_lifecycle(&db, owner_id, resolution, now).await?;
 
     if let Some(issue_id) = issue_to_resolve {
         if merge_context.has_triage_batch {
@@ -734,63 +709,6 @@ mod tests {
 
     async fn scalar(db: &LocalDb, sql: &str, id: &str) -> Option<String> {
         db.query_opt_text(sql, params![id]).await.unwrap()
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn thread_pr_merge_and_close_advance_the_owning_branch_lifecycle() {
-        let db = migrated_db().await;
-        db.execute_script(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('branch-project', 'default', 'Branch project', 'branch', '/tmp/thread-branch-lifecycle', 1, 1);
-             INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at) VALUES ('thread-branch-owner', 'branch-project', 'owner', 'active', 'none', 1, 1);
-             INSERT INTO jobs (id, thread_id, project_id, status, created_at, updated_at) VALUES ('merge-owner', 'thread-branch-owner', 'branch-project', 'complete', 1, 1), ('close-owner', 'thread-branch-owner', 'branch-project', 'complete', 1, 1);
-             INSERT INTO thread_branches (id, thread_id, number, stage, git_ref, job_id, created_at, moved_at) VALUES ('merge-branch', 'thread-branch-owner', 1, 'pr-open', 'agent/owner/1', 'merge-owner', 1, 1), ('close-branch', 'thread-branch-owner', 2, 'pr-open', 'agent/owner/2', 'close-owner', 1, 1)",
-        ).await.unwrap();
-
-        advance_thread_branch_lifecycle(&db, "merge-owner", PrNodeResolution::Merge, 41)
-            .await
-            .unwrap();
-        advance_thread_branch_lifecycle(&db, "close-owner", PrNodeResolution::Close, 42)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            scalar(
-                &db,
-                "SELECT stage FROM thread_branches WHERE id = ?1",
-                "merge-branch"
-            )
-            .await
-            .as_deref(),
-            Some("merged")
-        );
-        assert_eq!(
-            scalar(
-                &db,
-                "SELECT stage FROM thread_branches WHERE id = ?1",
-                "close-branch"
-            )
-            .await
-            .as_deref(),
-            Some("abandoned")
-        );
-        assert_eq!(
-            db.query_opt_i64(
-                "SELECT moved_at FROM thread_branches WHERE id = 'merge-branch'",
-                ()
-            )
-            .await
-            .unwrap(),
-            Some(41)
-        );
-        assert_eq!(
-            db.query_opt_i64(
-                "SELECT moved_at FROM thread_branches WHERE id = 'close-branch'",
-                ()
-            )
-            .await
-            .unwrap(),
-            Some(42)
-        );
     }
 
     async fn live_run_count(db: &LocalDb) -> i64 {

@@ -174,7 +174,6 @@ async fn mutate(target: String, mode: String, payload: serde_json::Value, confir
             mode: Some(mode),
             payload: Some(payload),
         }]),
-        branch: None,
         commit_msg: None,
         preview: None,
         atomic: None,

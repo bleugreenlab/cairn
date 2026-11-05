@@ -95,26 +95,6 @@ pub(crate) const THREAD_DB_SCHEMA_CONTRACT: ResourceContract = ResourceContract 
     mutations: NO_MUTATIONS,
 };
 
-pub(crate) const THREAD_BRANCHES_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ThreadBranches,
-    uri_template: "cairn://p/{project}/{thread}/branches",
-    name: "Thread branches",
-    description: "Numbered branches owned by this thread. An append is the declaration rendered after the write pre-scan has atomically minted its backing ref and job.",
-    read_projections: NO_PROJECTIONS,
-    related: NO_RELATED,
-    cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Append,
-        required: &[
-            TITLE,
-            KeySpec::new("pr", KeyType::Object, "PR request with optional body"),
-        ],
-        optional: &[],
-        label: "mint thread branch",
-        example: "write({changes:[{target:\"cairn:~/branches\",mode:\"append\",payload:{title:\"...\",pr:{body:\"...\"}}},{target:\"file:path\",mode:\"patch\",payload:{old_string:\"old\",new_string:\"new\"}}],commit_msg:\"...\"})",
-    }],
-};
-
 pub(crate) const THREAD_QUEUE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ThreadQueue,
     uri_template: "cairn://p/{project}/{thread}/queue",
@@ -133,29 +113,6 @@ pub(crate) const THREAD_QUEUE_CONTRACT: ResourceContract = ResourceContract {
         optional: &[],
         label: "order this thread's held children",
         example: "write({changes:[{target:\"cairn:~/queue\",mode:\"patch\",payload:{order:[5841,5829]}}]})",
-    }],
-};
-
-pub(crate) const THREAD_BRANCH_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ThreadBranch,
-    uri_template: "cairn://p/{project}/{thread}/branches/{number}",
-    name: "Thread branch",
-    description: "A numbered thread branch with its backing ref, lifecycle stage, and PR state",
-    read_projections: NO_PROJECTIONS,
-    related: NO_RELATED,
-    cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Patch,
-        required: &[],
-        optional: &[
-            TITLE,
-            KeySpec::new("stage", KeyType::Str, "abandoned only"),
-            KeySpec::new("action", KeyType::Str, "merge|close — act on this branch's create-pr artifact"),
-            KeySpec::new("method", KeyType::Str, "merge method for action:merge (default squash)"),
-            PR_PRECONDITION,
-        ],
-        label: "patch or act on thread branch PR",
-        example: "write({changes:[{target:\"cairn:~/branches/1\",mode:\"patch\",payload:{action:\"merge\",method:\"squash\"}}]})",
     }],
 };
 
@@ -299,7 +256,7 @@ pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
     // resolves to a node-family kind whose template spells an issue coordinate a
     // thread does not have. Reading any of these addresses returns that family's
     // own affordance block, so this line only has to say the addresses exist.
-    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /arc, /branches, /queue (its children's cap-held executions in start order; patch {order:[N,...]} to reorder), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no default branch; numbered branches are explicit resources beneath /branches. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
+    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /arc, /queue (its children's cap-held executions in start order; patch {order:[N,...]} to reorder), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no branch. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

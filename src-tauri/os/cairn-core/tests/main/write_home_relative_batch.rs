@@ -32,9 +32,9 @@ async fn fixture() -> (
     (temp, db, orch)
 }
 
-/// A normal authenticated CLI write must not inherit the minted branch
-/// continuation's poll stack. This is the one-item project-thread creation that
-/// previously overflowed a Tokio runtime worker before resource dispatch.
+/// A normal authenticated CLI write must fit on a Tokio runtime worker's stack.
+/// This is the one-item project-thread creation that once overflowed it before
+/// resource dispatch.
 #[tokio::test]
 async fn authenticated_resource_only_thread_creation_completes() {
     let (_temp, db, orch, _repo) = common::project_resource_fixture(PROJECT).await;

@@ -1,8 +1,8 @@
 use super::file_mutations::{hash_file_target_uri, prepare_file_changes};
 use super::handle_write;
 use super::types::{
-    build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, BranchReport,
-    ChangeFailure, ChangeReport, IndexedChange,
+    build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, ChangeFailure,
+    ChangeReport, IndexedChange,
 };
 use crate::mcp::handlers::target::{target_family, TargetFamily};
 use crate::mcp::types::{ChangeMode, ChangePayload, McpCallbackRequest};
@@ -340,22 +340,6 @@ pub(crate) async fn build_current_event_uri(
     .flatten()
 }
 
-/// Whether a write target addresses a thread's branches collection.
-///
-/// Resolved the way dispatch resolves it: the common parser stops every thread
-/// URI at `Thread { path }`, and `delegate_thread_descendant` is the one reader
-/// that names the sub-resource. Matching the parse result directly reads as
-/// working code and silently sees no branch mint at all.
-fn names_thread_branches(target: &str) -> bool {
-    let Some(parsed) = parse_uri(target) else {
-        return false;
-    };
-    matches!(
-        crate::resources::delegate_thread_descendant(parsed),
-        Ok(CairnResource::ThreadBranches { .. })
-    )
-}
-
 pub(super) async fn preview_change(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -368,40 +352,6 @@ pub(super) async fn preview_change(
     {
         return "Invalid payload: preview=true cannot be used with mode=apply".to_string();
     }
-
-    let provisional_branch = if payload
-        .changes
-        .iter()
-        .any(|item| item.mode == ChangeMode::Append && names_thread_branches(&item.target))
-    {
-        match super::super::branch::preview_thread_branch_for_write(orch, request).await {
-            Ok((number, git_ref, uri)) => Some(BranchReport {
-                number,
-                git_ref,
-                uri,
-                stage: "pr-open".to_string(),
-                pr_url: None,
-            }),
-            Err(error) => {
-                return serde_json::to_string(&empty_change_report(
-                    Vec::new(),
-                    vec![ChangeFailure {
-                        index: 0,
-                        target: "thread branch preview".to_string(),
-                        mode: "preview".to_string(),
-                        kind: "resource".to_string(),
-                        error,
-                    }],
-                    None,
-                    false,
-                    true,
-                ))
-                .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"));
-            }
-        }
-    } else {
-        None
-    };
 
     let worktree = std::path::Path::new(&request.cwd);
     let mut applied = Vec::new();
@@ -646,7 +596,6 @@ pub(super) async fn preview_change(
     if let Some(error) = preview_status_error {
         return serde_json::to_string(&ChangeReport {
             applied,
-            branch: provisional_branch,
             failures: vec![ChangeFailure {
                 index: 0,
                 target: "change preview event".to_string(),
@@ -662,7 +611,6 @@ pub(super) async fn preview_change(
             apply_uri: None,
             target_hashes,
             replayed: None,
-            post_seal: None,
             held_publications: Vec::new(),
             blocking: None,
         })
@@ -671,7 +619,6 @@ pub(super) async fn preview_change(
 
     serde_json::to_string(&ChangeReport {
         applied,
-        branch: provisional_branch,
         failures: Vec::new(),
         commit: None,
         partial_success: false,
@@ -682,7 +629,6 @@ pub(super) async fn preview_change(
         target_hashes,
         // A preview applies nothing, so it is never a replay to suppress.
         replayed: None,
-        post_seal: None,
         held_publications: Vec::new(),
         blocking: None,
     })

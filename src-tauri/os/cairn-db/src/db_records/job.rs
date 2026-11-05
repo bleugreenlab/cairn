@@ -326,8 +326,6 @@ mod jobs_base_commit_sql_reach {
     /// - `effects/dag/delegation.rs` — workflow reparenting copies the parent's
     ///   record onto a delegated child alongside its branch; core retains the
     ///   host integration fixture for that copy.
-    /// - `mcp/handlers/branch.rs` — records the live-resolved starting commit
-    ///   when minting a numbered thread branch; it does not read the old row.
     /// - `storage/migrations.rs` — schema lineage and its fixtures.
     /// - `diff.rs` — a test fixture that seeds a deliberately stale record to
     ///   prove the live derivation ignores it.
@@ -338,7 +336,6 @@ mod jobs_base_commit_sql_reach {
         "os/cairn-workflow/src/effects/dag/delegation.rs",
         "os/cairn-core/src/execution/jobs/persistence.rs",
         "os/cairn-core/src/orchestrator/base_advance.rs",
-        "os/cairn-core/src/mcp/handlers/branch.rs",
         "os/cairn-db/src/storage/migrations.rs",
     ];
 

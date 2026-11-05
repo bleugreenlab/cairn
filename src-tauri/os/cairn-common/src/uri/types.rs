@@ -113,8 +113,7 @@ pub enum AttachmentRef {
 /// through.
 ///
 /// An issue and a thread each have durable identity and their own dense ordinal
-/// sequence, exactly as `thread_branches` numbers per thread. `Project` is the
-/// residual case — a chat that belongs to neither, or a paste into an issue that
+/// sequence. `Project` is the residual case — a chat that belongs to neither, or a paste into an issue that
 /// does not exist yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentScopeRef {
@@ -247,20 +246,11 @@ pub enum CairnResource {
         name: String,
         path: Vec<String>,
     },
-    ThreadBranches {
-        project: String,
-        thread: String,
-    },
     /// The thread's children's cap-held executions, in the order they start
     /// (cairn/5848).
     ThreadQueue {
         project: String,
         thread: String,
-    },
-    ThreadBranch {
-        project: String,
-        thread: String,
-        number: i32,
     },
     /// Durable SQL state owned by a thread, not by one of its ephemeral sessions.
     ThreadDb {
@@ -1183,9 +1173,7 @@ impl CairnResource {
             Self::Issue { .. } => ResourceKind::Issue,
             Self::ProjectThreads { .. } => ResourceKind::ProjectThreads,
             Self::Thread { .. } => ResourceKind::Thread,
-            Self::ThreadBranches { .. } => ResourceKind::ThreadBranches,
             Self::ThreadQueue { .. } => ResourceKind::ThreadQueue,
-            Self::ThreadBranch { .. } => ResourceKind::ThreadBranch,
             Self::ThreadDb { .. } => ResourceKind::ThreadDb,
             Self::ThreadDbSchema { .. } => ResourceKind::ThreadDbSchema,
             Self::ThreadDbTable { .. } => ResourceKind::ThreadDbTable,

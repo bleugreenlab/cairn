@@ -10,8 +10,6 @@ pub(super) struct ChangeReport {
     pub(super) applied: Vec<AppliedChange>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) blocking: Option<BlockingResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) branch: Option<BranchReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) failures: Vec<ChangeFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,44 +31,11 @@ pub(super) struct ChangeReport {
     /// reading came from the first delivery rather than from this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) replayed: Option<String>,
-    /// Durable continuation state for a minted write. It exists only while the
-    /// replay-ledger row is pending and is removed before the agent sees the
-    /// settled report.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "_post_seal"
-    )]
-    pub(super) post_seal: Option<MintedPostSealState>,
     /// What this write's commit barrier did with commits earlier batches on
     /// the branch sealed but could not publish. They are republished ahead of
     /// this write's own changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) held_publications: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct MintedPostSealState {
-    pub(super) file_changes: Vec<PersistedFileChange>,
-    pub(super) cloud: Option<CloudPublicationInput>,
-    #[serde(default)]
-    pub(super) ledger_recorded: bool,
-    #[serde(default)]
-    pub(super) cloud_published: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct PersistedFileChange {
-    pub(super) path: String,
-    pub(super) status: String,
-    pub(super) additions: i32,
-    pub(super) deletions: i32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct CloudPublicationInput {
-    pub(super) project_id: String,
-    pub(super) repository: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,16 +59,6 @@ pub(super) struct ChangeFailure {
     pub(super) mode: String,
     pub(super) kind: String,
     pub(super) error: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct BranchReport {
-    pub(super) number: i64,
-    pub(super) git_ref: String,
-    pub(super) uri: String,
-    pub(super) stage: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) pr_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,7 +137,6 @@ pub(super) fn empty_change_report(
     ChangeReport {
         applied,
         blocking: None,
-        branch: None,
         failures,
         commit,
         partial_success,
@@ -192,7 +146,6 @@ pub(super) fn empty_change_report(
         apply_uri: None,
         target_hashes: Vec::new(),
         replayed: None,
-        post_seal: None,
         held_publications: Vec::new(),
     }
 }

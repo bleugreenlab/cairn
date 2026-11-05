@@ -644,13 +644,13 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         // Every thread sub-path stops here, as an anonymous `Thread { path }`.
         //
         // This parser deliberately owns NONE of the thread sub-path vocabulary:
-        // what `db`, `services/<name>`, `pages/<name>`, `branches/<n>`,
-        // `chat/turn/<n>`, or `task/<name>/...` MEAN under a thread is decided
+        // what `db`, `services/<name>`, `pages/<name>`, `chat/turn/<n>`, or
+        // `task/<name>/...` MEAN under a thread is decided
         // in exactly one place, cairn-core's `delegate_thread_descendant`, which
         // read dispatch, write dispatch, and run-target expansion all call. A
         // second interpreter here would be free to know a different subset than
-        // that one does, and it was: `branches` had arms here while `procedures`
-        // did not, so every stored procedure and scheduled automation invoked
+        // that one does, and it was: the since-retired `branches` had arms here
+        // while `procedures` did not, so every stored procedure and scheduled automation invoked
         // through a re-parse of its own canonical URI was silently dropped for
         // fifteen days (CAIRN-4725).
         //
