@@ -122,6 +122,16 @@ impl OperatorCredentialFloor {
         floor
     }
 
+    /// Every home this process can name, family member or not. An unlistable
+    /// family contributes nothing here; a caller that must not miss a member
+    /// also matches the family by name.
+    pub(crate) fn every_home(&self) -> Vec<PathBuf> {
+        let mut homes = self.family_members().unwrap_or_default();
+        homes.extend(self.homes.iter().cloned());
+        homes.extend(self.named.iter().cloned());
+        homes
+    }
+
     /// The family's members, or the error that kept this process from listing
     /// them. An unlistable home is not an empty one.
     fn family_members(&self) -> std::io::Result<Vec<PathBuf>> {
@@ -325,6 +335,8 @@ pub struct MacosProfile {
 /// Every spawn seam states which of these it is, so the boundary in this module
 /// is a decision each seam makes once rather than a property of whichever
 /// branch of a policy match it happened to take.
+// A spawn builds one and consumes it, so boxing the policy would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Confinement {
     /// Cairn's own process: a runner, a dev-instance runtime, a service, or a

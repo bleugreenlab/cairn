@@ -13,14 +13,15 @@ use cairn_core::models::Fence;
 use cairn_db::turso::params;
 use serde_json::json;
 
-/// A fence-crossing `tool_input`, as `raise_fence` stores it. `descriptor` is the
-/// session-grant key; `request` is the originating verb, embedded for resume.
+/// A fence-crossing `tool_input` an agent may answer. `descriptor` is the
+/// session-grant key; `request` is the originating verb, embedded for resume, a
+/// `read` so that re-dispatching it here is harmless.
 fn crossing_tool_input() -> String {
     json!({
-        "kind": "sensitive_host_read",
+        "kind": "shell_path_crossing",
         "verb": "read",
         "descriptor": "/etc/hosts",
-        "summary": "read a sensitive denied path: /etc/hosts",
+        "summary": "the sandbox refused a write to /etc/hosts",
         "request": {
             "cwd": "/wt",
             "run_id": "run-1",
@@ -570,7 +571,7 @@ async fn raise_fence_honors_policy_and_session_grant() {
     orch.session_allowed_crossings
         .lock()
         .unwrap()
-        .insert("/outside".to_string());
+        .insert(Crossing::read_denied(Path::new("/outside")).descriptor);
     assert!(matches!(
         raise_fence(
             &orch,

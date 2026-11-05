@@ -432,7 +432,7 @@ async fn codex_answer_with_open_provider_turn_broadcasts_and_mints_nothing() {
 /// re-dispatches a `read` with an empty payload, which is harmless here.
 fn late_crossing_input(tool_use_id: &str) -> String {
     serde_json::json!({
-        "kind": "sensitive_host_read",
+        "kind": "shell_path_crossing",
         "verb": "read",
         "descriptor": format!("/host/secret-{tool_use_id}"),
         "summary": format!("read of a sensitive host path ({tool_use_id})"),

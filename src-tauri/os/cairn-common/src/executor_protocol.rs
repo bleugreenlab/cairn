@@ -6919,6 +6919,21 @@ pub struct LearnedResourceEstimate {
 /// selection; the executor's local installation and spawn behavior need no new
 /// interpretation by either peer.
 ///
+/// cairn/6016 does not move the number. [`RunnerCallback::SandboxDenied`]
+/// gains a defaulted `rerun` ([`CrossingRerun`], [`CrossingAccess`]): what
+/// approving the crossing gives the item's rerun, computed by the executor
+/// that runs it. An approved crossing now reruns the item under the policy
+/// the denied attempt ran under plus exactly that access to the denied path,
+/// where it used to rerun the item with no fence. What a runner gets wrong
+/// talking to an older executor: nothing it decodes differently. It reads no
+/// `rerun` from that executor and so refuses each crossing it relays instead
+/// of prompting for it, because that executor would rerun an approved item
+/// unfenced; the refusal names the executor's age. An older runner ignores the
+/// key and keeps prompting, and a newer executor still applies only the
+/// bounded grant after such an approval, or refuses the rerun when no bounded
+/// grant exists. Neither direction runs anything wider than before, which is
+/// why no machine is kept from attaching.
+///
 /// cairn/5875 does not move the number. `CellRequest::home_affinity` is
 /// `#[serde(skip)]`, like `scratch_sync`, so it never crosses, and
 /// `ResidencyAcquireRequest` does not change. A run batch's fresh home
@@ -19417,6 +19432,47 @@ pub enum SandboxDenial {
     Command,
 }
 
+/// The access an approved fence crossing adds to the denied path for the
+/// item's rerun. It is the only thing the approval adds.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum CrossingAccess {
+    /// A refused write (`file-write*`): the path becomes writable, and so
+    /// readable.
+    Write,
+    /// A refused read (`file-read*`): the path becomes readable and stays
+    /// unwritable.
+    Read,
+}
+
+impl CrossingAccess {
+    /// The access as a word for a sentence: "write" or "read".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+        }
+    }
+}
+
+/// What approving a relayed sandbox denial gives the item's rerun, as the
+/// executor that runs the rerun computed it from the policy the denied attempt
+/// ran under.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum CrossingRerun {
+    /// The rerun keeps that policy and adds exactly `access` to the denied
+    /// path.
+    Widened { access: CrossingAccess },
+    /// No bounded rerun exists, so an approval cannot run the item. `reason`
+    /// says why, in words for the agent and the operator.
+    Refused { reason: String },
+}
+
 /// A sandbox denial observed while executing one concrete subprocess.
 ///
 /// Pure-verdict callers keep this evidence without replacing the subprocess's
@@ -19445,6 +19501,12 @@ pub enum RunnerCallback {
         /// approver, never a grant's scope.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reported_denial: Option<String>,
+        /// What approving this crossing gives the rerun. Absent from an
+        /// executor that predates bounded reruns, which reran an approved item
+        /// with no fence at all, so the runner refuses such a crossing rather
+        /// than asking anyone to approve it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rerun: Option<CrossingRerun>,
     },
     CacheCheckpoint {
         runner_context_id: String,
@@ -20398,6 +20460,9 @@ mod tests {
                     cwd: "/tmp/worktree".into(),
                     denial: SandboxDenial::Path("/outside".into()),
                     reported_denial: None,
+                    rerun: Some(CrossingRerun::Widened {
+                        access: CrossingAccess::Write,
+                    }),
                 },
             },
             ExecutorMessage::CallbackRequest {

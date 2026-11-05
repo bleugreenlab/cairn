@@ -1,14 +1,13 @@
 //! Instructive refusals for command-scoped sandbox crossings.
 //!
-//! A command the kernel blocked without naming a path becomes an escape prompt
-//! that only an operator can answer, by re-running the command with no sandbox
-//! at all. For one family of commands that prompt is the wrong question: git's
-//! staging records and refs live outside a build slot's working directory, so a
-//! `git mv` or `git checkout -- <path>` is always blocked there, and it is never
-//! needed, because a batch's commit is derived from the working tree and the
-//! branch belongs to Cairn. Every such command has an ordinary in-sandbox
-//! equivalent, so the fence answers with that equivalent instead of spending an
-//! operator's attention.
+//! A command the kernel blocked without naming a path has nothing bounded to
+//! approve, so it gets a refusal, and that refusal is generic. One family of
+//! commands can be told something better: git's staging records and refs live
+//! outside a build slot's working directory, so a `git mv` or
+//! `git checkout -- <path>` is always blocked there, and it is never needed,
+//! because a batch's commit is derived from the working tree and the branch
+//! belongs to Cairn. Every such command has an ordinary in-sandbox equivalent,
+//! so the fence answers with that equivalent.
 //!
 //! The recognizer is deliberately narrow and fails safe. It reads the agent's
 //! command (through a whole-line launcher, see below), splits it into the
@@ -83,9 +82,8 @@ pub(crate) fn denied_command_refusal(command: &str) -> Option<String> {
 /// This is the route for a git call the command text cannot show: one made
 /// from an inline interpreter or a script. `reported` is the item's own denial
 /// line, which the agent's code wrote, so it is trusted only in the narrowing
-/// direction. It can turn an escape prompt into this refusal, which gives the
-/// agent less than the prompt could, and nothing read from it is echoed back or
-/// reaches what a grant would be scoped by.
+/// direction. It can only choose this refusal over the generic one, and nothing
+/// read from it is echoed back or reaches what a grant would be scoped by.
 pub(crate) fn reported_git_write_refusal(reported: &str) -> Option<String> {
     reported_paths(reported)
         .any(is_git_internal_write)

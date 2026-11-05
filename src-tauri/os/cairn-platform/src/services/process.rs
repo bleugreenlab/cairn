@@ -601,6 +601,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: cairn_sandbox::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -631,6 +632,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: cairn_sandbox::ViolationTag::fresh(),
             reach: Default::default(),
         };

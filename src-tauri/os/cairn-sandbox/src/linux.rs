@@ -398,6 +398,7 @@ mod tests {
             writable_regex: Vec::new(),
             worktree_writable: true,
             socket_resolvable: Vec::new(),
+            readable_extra: Vec::new(),
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -419,6 +420,55 @@ mod tests {
         assert!(
             !sibling.exists(),
             "a sibling under the scratch root is refused"
+        );
+    }
+
+    /// Live, through the same `install_pre_exec` a batch gets: an approved
+    /// crossing reruns under the denied attempt's policy plus the one path, so
+    /// the refused write to A lands and a write to B beside it is still
+    /// refused. Linux recovers no denied path on its own, so the path here is
+    /// the test's; what is under test is that the grant is exactly one rule.
+    #[test]
+    fn an_approved_write_crossing_opens_that_path_and_nothing_beside_it_live() {
+        let wt = tempfile::tempdir().unwrap();
+        let outside = crate::approved_crossing::outside_cairn_state();
+        let (a, b) = (outside.path().join("a"), outside.path().join("b"));
+        std::fs::write(&a, "before").unwrap();
+        std::fs::write(&b, "before").unwrap();
+        let policy = SandboxPolicy {
+            worktree: wt.path().to_path_buf(),
+            writable_extra: Vec::new(),
+            deny_read: Vec::new(),
+            writable_regex: Vec::new(),
+            worktree_writable: true,
+            socket_resolvable: Vec::new(),
+            readable_extra: Vec::new(),
+            violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
+        };
+        let write = |policy: &SandboxPolicy, path: &Path| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", &format!("echo after > '{}'", path.display())]);
+            install_pre_exec(&mut command, policy);
+            command.output().unwrap()
+        };
+
+        assert!(!write(&policy, &a).status.success());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "before");
+
+        let mut approved = policy.clone();
+        approved
+            .grant_crossing(&a, cairn_common::executor_protocol::CrossingAccess::Write)
+            .unwrap_or_else(|reason| panic!("{reason}"));
+        let landed = write(&approved, &a);
+        assert!(landed.status.success(), "{landed:?}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "after\n");
+
+        assert!(!write(&approved, &b).status.success());
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "before",
+            "a path beside the approved one stays refused"
         );
     }
 

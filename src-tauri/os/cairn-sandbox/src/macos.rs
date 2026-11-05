@@ -864,6 +864,7 @@ fn recover_a_canary_denial(access: ViolationStreamAccess) -> ViolationRecoveryOu
         writable_regex: Vec::new(),
         worktree_writable: true,
         socket_resolvable: Vec::new(),
+        readable_extra: Vec::new(),
         violation_tag: crate::ViolationTag::fresh(),
         reach: Default::default(),
     };
@@ -1107,6 +1108,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -1169,6 +1171,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -1335,6 +1338,7 @@ mod tests {
                 writable_regex: vec![],
                 worktree_writable: true,
                 socket_resolvable: vec![],
+                readable_extra: vec![],
                 violation_tag: crate::ViolationTag::fresh(),
                 reach: Default::default(),
             };
@@ -1382,6 +1386,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -1442,6 +1447,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -1490,6 +1496,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -1645,9 +1652,119 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         }
+    }
+
+    /// What an approved crossing does at the kernel: the rerun keeps the denied
+    /// attempt's policy plus the one path, so the write to A that was refused
+    /// lands, and a write to B beside it is still refused. The denial is
+    /// recovered the way a fenced spawn's caller recovers it, so the path the
+    /// grant names is the kernel's own record.
+    #[test]
+    fn an_approved_write_crossing_opens_that_path_and_nothing_beside_it_live() {
+        if skip_without_nested_sandbox_exec(
+            "an_approved_write_crossing_opens_that_path_and_nothing_beside_it_live",
+        ) {
+            return;
+        }
+        let wt = tempdir().unwrap();
+        let outside = crate::approved_crossing::outside_cairn_state();
+        let outside = outside.path().canonicalize().unwrap();
+        let (a, b) = (outside.join("a"), outside.join("b"));
+        let policy = outside_write_policy(wt.path());
+        let write = |path: &Path| format!("echo x > {}; true", path.display());
+
+        let (denial, evidence) = denial_under(&policy, write(&a));
+        assert!(!a.exists(), "the first attempt is refused");
+        let Some(crate::SandboxDenial::Path { path, operation }) = denial else {
+            panic!(
+                "expected a path-scoped denial of {}; {evidence}",
+                a.display()
+            );
+        };
+        assert_eq!(path, a);
+        let rerun = crate::bounded_rerun(Some(&policy), Some(&path), operation.as_deref());
+        assert_eq!(
+            rerun,
+            cairn_common::executor_protocol::CrossingRerun::Widened {
+                access: cairn_common::executor_protocol::CrossingAccess::Write
+            }
+        );
+
+        let mut approved = policy.clone();
+        approved
+            .grant_crossing(
+                &path,
+                cairn_common::executor_protocol::CrossingAccess::Write,
+            )
+            .unwrap_or_else(|reason| panic!("{reason}"));
+        let (denial, evidence) = denial_under(&approved, write(&a));
+        assert!(
+            a.exists(),
+            "the approved path is writable on the rerun; {evidence}"
+        );
+        assert!(denial.is_none(), "{denial:?}; {evidence}");
+
+        let (denial, evidence) = denial_under(&approved, write(&b));
+        assert!(!b.exists(), "a path beside the approved one stays refused");
+        assert!(
+            matches!(&denial, Some(crate::SandboxDenial::Path { path, .. }) if *path == b),
+            "the second path raises its own denial, got {denial:?}; {evidence}"
+        );
+    }
+
+    /// An approved read reopens that one file to reads: it stays unwritable,
+    /// and its sibling under the same denylist entry stays unreadable.
+    #[test]
+    fn an_approved_read_crossing_reopens_one_file_for_reads_only_live() {
+        if skip_without_nested_sandbox_exec(
+            "an_approved_read_crossing_reopens_one_file_for_reads_only_live",
+        ) {
+            return;
+        }
+        let wt = tempdir().unwrap();
+        let outside = crate::approved_crossing::outside_cairn_state();
+        let secret = outside.path().canonicalize().unwrap().join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        let (known, other) = (secret.join("known_hosts"), secret.join("id_rsa"));
+        std::fs::write(&known, "host").unwrap();
+        std::fs::write(&other, "key").unwrap();
+        let mut policy = outside_write_policy(wt.path());
+        policy.deny_read = vec![secret.clone()];
+        let run = |policy: &SandboxPolicy, cmd: String| {
+            let (program, args) = wrap_argv("/bin/sh", &["-c".into(), cmd], policy);
+            Command::new(program).args(args).output().unwrap()
+        };
+        assert!(!run(&policy, format!("cat {}", known.display()))
+            .status
+            .success());
+
+        let mut approved = policy.clone();
+        approved
+            .grant_crossing(
+                &known,
+                cairn_common::executor_protocol::CrossingAccess::Read,
+            )
+            .unwrap_or_else(|reason| panic!("{reason}"));
+        let read = run(&approved, format!("cat {}", known.display()));
+        assert!(read.status.success(), "{read:?}");
+        assert_eq!(String::from_utf8_lossy(&read.stdout), "host");
+        assert!(
+            !run(&approved, format!("cat {}", other.display()))
+                .status
+                .success(),
+            "the denied sibling stays unreadable"
+        );
+        assert!(
+            !run(&approved, format!("echo x > {}", known.display()))
+                .status
+                .success(),
+            "a read grant is not a write grant"
+        );
+        assert_eq!(std::fs::read_to_string(&known).unwrap(), "host");
     }
 
     /// The kernel logs a violation under the process that made the denied
@@ -2015,6 +2132,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -2100,6 +2218,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -2436,6 +2555,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -2479,6 +2599,7 @@ mod tests {
             writable_regex: vec![super::super::glob_to_regex(&glob)],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
         };

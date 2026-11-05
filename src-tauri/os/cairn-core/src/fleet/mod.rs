@@ -12623,6 +12623,7 @@ impl Fleet {
                 command,
                 denial,
                 reported_denial,
+                rerun,
                 ..
             } => {
                 // An executor refuses its own operator credential denials
@@ -12658,18 +12659,19 @@ impl Fleet {
                         diagnostic: "permission context unavailable: sandbox denial has no authenticated originating run".into(),
                     },
                 };
-                let crossing = match denial {
+                let denied_path = match &denial {
                     cairn_common::executor_protocol::SandboxDenial::Path(path) => {
-                        fence::Crossing::shell_path(std::path::Path::new(&path), &command)
+                        Some(std::path::Path::new(path))
                     }
-                    cairn_common::executor_protocol::SandboxDenial::Command => {
-                        fence::Crossing::unattributed_denial(
-                            &command,
-                            &command,
-                            reported_denial.as_deref(),
-                        )
-                    }
+                    cairn_common::executor_protocol::SandboxDenial::Command => None,
                 };
+                let crossing = fence::Crossing::for_denied_item(
+                    denied_path,
+                    rerun.as_ref(),
+                    &command,
+                    &command,
+                    reported_denial.as_deref(),
+                );
                 match fence::raise_fence_with_handoff(
                     orch,
                     &run_id,
@@ -42817,6 +42819,7 @@ mod handoff_tests {
         INLINE_DURABLE_WAIT_BUDGET, LEGACY_EXECUTOR_CALLBACK_TIMEOUT, RELAYED_FENCE_WAIT_BUDGET,
     };
     use cairn_common::executor_protocol::SandboxDenial;
+    use cairn_common::executor_protocol::{CrossingAccess, CrossingRerun};
 
     const RUN: &str = "run-1";
     const TURN: &str = "turn-1";
@@ -42879,21 +42882,37 @@ mod handoff_tests {
         orch
     }
 
+    fn no_path_rerun() -> CrossingRerun {
+        CrossingRerun::Refused {
+            reason: cairn_sandbox::NO_PATH_RECOVERED.into(),
+        }
+    }
+
     /// Raise the sandbox denial the executor relays, and wait until its
     /// permission row exists.
     async fn raise(orch: &Orchestrator) -> tokio::task::JoinHandle<RunnerCallbackResult> {
+        raise_denial(orch, "/etc/hosts", CrossingAccess::Write).await
+    }
+
+    async fn raise_denial(
+        orch: &Orchestrator,
+        path: &str,
+        access: CrossingAccess,
+    ) -> tokio::task::JoinHandle<RunnerCallbackResult> {
         let task = {
             let orch = orch.clone();
+            let path = path.to_string();
             tokio::spawn(async move {
                 orch.fleet
                     .handle_runner_callback(
                         &orch,
                         RunnerCallback::SandboxDenied {
                             runner_context_id: "ctx".into(),
-                            command: "cat /etc/hosts".into(),
+                            command: format!("cat {path}"),
                             cwd: "/tmp/worktree".into(),
-                            denial: SandboxDenial::Path("/etc/hosts".into()),
+                            denial: SandboxDenial::Path(path),
                             reported_denial: None,
+                            rerun: Some(CrossingRerun::Widened { access }),
                         },
                     )
                     .await
@@ -42996,10 +43015,59 @@ mod handoff_tests {
         assert!(orch.park_slots.armed(RUN), "the budget path parks the turn");
     }
 
+    /// The executor's denylist is the executor's: a key on a remote machine is
+    /// on no list this runner holds, so the operator gate cannot rest on the
+    /// runner's list. The relayed read carries the sensitive-read kind through
+    /// the stored prompt, and that is what refuses an agent's own allow.
+    #[tokio::test(start_paused = true)]
+    async fn a_relayed_read_of_a_key_only_the_executor_denies_cannot_be_self_approved() {
+        let orch = fence_orchestrator(true).await;
+        let key = "/Users/remote-executor-account/.ssh/id_ed25519";
+        assert!(
+            !orch
+                .sandbox_deny_read()
+                .iter()
+                .any(|denied| crate::services::sandbox::paths_overlap(
+                    std::path::Path::new(key),
+                    denied
+                )),
+            "this case is only meaningful for a path off the runner's own denylist"
+        );
+        let task = raise_denial(&orch, key, CrossingAccess::Read).await;
+
+        let (request_id, _, _) = permission(&orch).await;
+        let tool_input = orch
+            .db
+            .local
+            .query_one(
+                "SELECT tool_input FROM permission_requests WHERE id = ?1",
+                (request_id.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&tool_input).unwrap();
+        assert_eq!(stored["kind"], "sensitive_host_read");
+        assert_eq!(stored["descriptor"], format!("read:{key}"));
+
+        let refusal = resolve_permission_request(
+            &orch,
+            &request_id,
+            PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch)
+                .with_actor("cairn://p/prj/1/1/agent")
+                .with_containment_scope(PermissionScope::Session),
+        )
+        .await
+        .expect_err("an agent may not give itself a read of the denylist");
+        assert!(refusal.contains("sensitive-read denylist"), "{refusal}");
+        assert_eq!(permission(&orch).await.1, "pending");
+        assert!(orch.session_allowed_crossings.lock().unwrap().is_empty());
+        task.abort();
+    }
+
     /// A relayed command-scoped denial for a git index write is answered with
     /// its in-sandbox route at once, and no permission is raised for anyone to
-    /// answer. The control beside it shows the same harness does raise one for
-    /// a command the refusal does not recognize.
+    /// answer.
     #[tokio::test]
     async fn a_relayed_git_index_write_is_refused_without_raising_a_permission() {
         let orch = fence_orchestrator(true).await;
@@ -43020,6 +43088,7 @@ mod handoff_tests {
                         cwd: "/tmp/worktree".into(),
                         denial: SandboxDenial::Command,
                         reported_denial: None,
+                        rerun: Some(no_path_rerun()),
                     },
                 )
                 .await;
@@ -43052,6 +43121,9 @@ mod handoff_tests {
                             .into(),
                     ),
                     reported_denial: None,
+                    rerun: Some(CrossingRerun::Widened {
+                        access: CrossingAccess::Write,
+                    }),
                 },
             )
             .await;
@@ -43065,31 +43137,50 @@ mod handoff_tests {
         assert!(!orch.park_slots.armed(RUN));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_relayed_unrecognized_command_denial_still_raises_a_permission() {
+    /// A relayed denial with no bounded rerun is answered with why, at once: a
+    /// command the refusal does not recognize, with no path to approve, and a
+    /// path denial from an executor too old to rerun it narrowly. No permission
+    /// is raised for either, and no turn is parked.
+    #[tokio::test]
+    async fn a_relayed_denial_with_no_bounded_rerun_is_refused_without_a_permission() {
         let orch = fence_orchestrator(true).await;
-        let task = {
-            let orch = orch.clone();
-            tokio::spawn(async move {
-                orch.fleet
-                    .handle_runner_callback(
-                        &orch,
-                        RunnerCallback::SandboxDenied {
-                            runner_context_id: "ctx".into(),
-                            // Positional arguments make the launcher's
-                            // script unreadable, so this stays unrecognized.
-                            command: " sh -c 'git mv \"$1\" b' _ a".into(),
-                            cwd: "/tmp/worktree".into(),
-                            denial: SandboxDenial::Command,
-                            reported_denial: None,
-                        },
-                    )
-                    .await
-            })
-        };
-        tokio::time::sleep(RELAYED_FENCE_WAIT_BUDGET + Duration::from_millis(10)).await;
-        assert_eq!(task.await.unwrap(), RunnerCallbackResult::Suspended);
-        assert_eq!(permission_rows(&orch).await, 1);
+        for (denial, rerun, expected) in [
+            (
+                SandboxDenial::Command,
+                Some(no_path_rerun()),
+                cairn_sandbox::NO_PATH_RECOVERED.to_string(),
+            ),
+            (
+                SandboxDenial::Path("/outside/a".into()),
+                None,
+                "predates bounded reruns".to_string(),
+            ),
+        ] {
+            let result = orch
+                .fleet
+                .handle_runner_callback(
+                    &orch,
+                    RunnerCallback::SandboxDenied {
+                        runner_context_id: "ctx".into(),
+                        // Positional arguments make the launcher's script
+                        // unreadable, so this stays unrecognized.
+                        command: " sh -c 'git mv \"$1\" b' _ a".into(),
+                        cwd: "/tmp/worktree".into(),
+                        denial,
+                        reported_denial: None,
+                        rerun,
+                    },
+                )
+                .await;
+            match result {
+                RunnerCallbackResult::Rejected { diagnostic } => {
+                    assert!(diagnostic.contains(&expected), "{diagnostic}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(permission_rows(&orch).await, 0);
+        assert!(!orch.park_slots.armed(RUN));
     }
 
     /// Acceptance 3: the batch settles before the budget, so the fence wait is

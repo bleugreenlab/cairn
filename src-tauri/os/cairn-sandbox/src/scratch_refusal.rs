@@ -39,7 +39,7 @@ pub fn is_scratch_root_write(path: &Path) -> bool {
 ///
 /// The fence adjudicates on the runner, but a denied write may have been made
 /// on a remote executor whose Cairn home the runner does not know. An approved
-/// crossing reruns the item with no fence at all, so a root refused by name
+/// crossing opens the path it names on the rerun, so a root refused by name
 /// here and merely prompted for there would be one place with two rules. The
 /// structural match closes that without a protocol field.
 pub fn scratch_root_containing(path: &Path) -> Option<PathBuf> {
@@ -67,7 +67,7 @@ pub fn scratch_root_containing(path: &Path) -> Option<PathBuf> {
 
 /// Whether `dir` is a user's home directory by shape (`/Users/<name>`,
 /// `/home/<name>`, `/root`, `/var/root`), or this process's own home.
-fn is_user_home(dir: &Path) -> bool {
+pub(crate) fn is_user_home(dir: &Path) -> bool {
     if crate::home_dir().is_some_and(|home| home == dir) {
         return true;
     }
@@ -83,7 +83,7 @@ fn is_user_home(dir: &Path) -> bool {
 const SCRATCH_DIR: &str = "scratch";
 
 /// `.cairn`, or a `.cairn-` home: a dev instance's, an executor's.
-fn is_cairn_home_name(name: &str) -> bool {
+pub(crate) fn is_cairn_home_name(name: &str) -> bool {
     name == ".cairn" || name.starts_with(".cairn-")
 }
 

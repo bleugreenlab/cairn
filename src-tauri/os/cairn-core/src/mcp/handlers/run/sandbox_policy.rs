@@ -1,7 +1,7 @@
 //! OS sandbox policy construction for a run, including the read-only
 //! live-checkout regime and the jj workspace-refresh carveout.
 
-use crate::mcp::handlers::normalize_command;
+use crate::mcp::handlers::fence::descriptor_grant;
 use crate::mcp::handlers::shell_words::command_for_classification;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
@@ -107,7 +107,7 @@ pub(crate) enum RunConfinement {
     /// The fence confines the spawn; the operator credential boundary rides in
     /// the profile.
     Fenced {
-        policy: sandbox::SandboxPolicy,
+        policy: Box<sandbox::SandboxPolicy>,
         fence: Fence,
     },
     /// The fence leaves the spawn open, but it is still agent work, so it
@@ -127,7 +127,7 @@ impl RunConfinement {
     /// The fence policy and the dial that produced it, when there is one.
     pub(crate) fn fenced(&self) -> Option<(&sandbox::SandboxPolicy, Fence)> {
         match self {
-            Self::Fenced { policy, fence } => Some((policy, *fence)),
+            Self::Fenced { policy, fence } => Some((policy.as_ref(), *fence)),
             Self::CredentialFloor | Self::DeclaredCheck => None,
         }
     }
@@ -135,7 +135,7 @@ impl RunConfinement {
     /// The spawn-seam form of this decision.
     pub(crate) fn into_confinement(self) -> sandbox::Confinement {
         match self {
-            Self::Fenced { policy, .. } => sandbox::Confinement::Fenced(policy),
+            Self::Fenced { policy, .. } => sandbox::Confinement::Fenced(*policy),
             Self::CredentialFloor => sandbox::Confinement::CredentialFloor,
             Self::DeclaredCheck => sandbox::Confinement::for_branch_code(),
         }
@@ -163,8 +163,8 @@ impl RunConfinement {
 /// *fence* profile exists, and nothing else does. Whether the spawn carries the
 /// operator credential boundary is not the dial's question: every agent spawn
 /// does, under `allow`, with no resolvable run identity (a project terminal an
-/// agent created is an agent's process all the same), after a command grant or
-/// an accepted dev command, and when the OS cannot sandbox at all. The one
+/// agent created is an agent's process all the same), after an accepted dev
+/// command, and when the OS cannot sandbox at all. The one
 /// exception is a project-declared check in the agent's own checkout, which
 /// runs as the check cadences do (see [`RunConfinement::DeclaredCheck`]).
 pub(crate) async fn resolve_run_confinement(
@@ -173,15 +173,13 @@ pub(crate) async fn resolve_run_confinement(
     checkout_kind: RunCheckout,
     run_id: Option<&str>,
     project_id: Option<&str>,
-    command_for_grant: Option<&str>,
+    command: Option<&str>,
 ) -> RunConfinement {
     use crate::mcp::handlers::permission::resolve_fence_policy;
 
     // Exemptions and carveouts match what the command runs, so a whole-line
-    // `bash -lc '<cmd>'` is read as `<cmd>`; anything else as written. The
-    // session grant below reads the same view through `normalize_command`, so
-    // it is handed the raw command, keyed exactly like the crossing descriptor.
-    let classified = command_for_grant.map(command_for_classification);
+    // `bash -lc '<cmd>'` is read as `<cmd>`; anything else as written.
+    let classified = command.map(command_for_classification);
     let classified = classified.as_deref();
 
     // The checkout decides the fenced profile's shape. The live checkout is
@@ -251,17 +249,6 @@ pub(crate) async fn resolve_run_confinement(
         .map(|s| s.iter().cloned().collect())
         .unwrap_or_default();
 
-    // A command-scoped session grant escalates: drop the fence profile so the
-    // approved command (shell command, or a skill script's program) runs with
-    // full reach without re-tripping the fence. Keyed identically to the crossing
-    // descriptor raised in `run_one`. Executor-only: the project's live checkout
-    // is read-only and non-negotiable, so a command grant must never re-open it
-    // to writes. The grant answers the fence's question, so the operator
-    // credential boundary stays.
-    if !readonly_non_worktree && session_grant_covers(&granted, command_for_grant) {
-        return RunConfinement::CredentialFloor;
-    }
-
     let deny_read = orch.sandbox_deny_read();
 
     // User-owned acceptance is the single trust decision for an exact command
@@ -284,7 +271,7 @@ pub(crate) async fn resolve_run_confinement(
     if accepted_command && !readonly_non_worktree {
         log::info!(
             "accepted dev command matched project shortcut; launching unfenced (command={:?}, cwd={cwd})",
-            command_for_grant.unwrap_or_default()
+            command.unwrap_or_default()
         );
         return RunConfinement::CredentialFloor;
     }
@@ -295,21 +282,31 @@ pub(crate) async fn resolve_run_confinement(
     // that lies within (or contains) the checkout, so a grant can never re-open it.
     let checkout = std::path::Path::new(cwd);
     let mut policy = if readonly_non_worktree {
-        sandbox::SandboxPolicy::for_readonly_checkout(checkout, &granted, deny_read)
+        sandbox::SandboxPolicy::for_readonly_checkout(checkout, &[], deny_read)
     } else {
-        sandbox::SandboxPolicy::for_run(checkout, &granted, deny_read)
+        sandbox::SandboxPolicy::for_run(checkout, &[], deny_read)
     };
+    apply_session_grants(&mut policy, &granted);
     if !readonly_non_worktree {
         apply_safe_jj_workspace_refresh_status_carveout(&mut policy, checkout, classified);
     }
 
-    RunConfinement::Fenced { policy, fence }
+    RunConfinement::Fenced {
+        policy: Box::new(policy),
+        fence,
+    }
 }
 
-/// Whether a command-scoped session grant covers `command`, keyed identically
-/// to the crossing descriptor the fence raises for it.
-fn session_grant_covers(granted: &[String], command: Option<&str>) -> bool {
-    command.is_some_and(|command| granted.contains(&normalize_command(command)))
+/// Add a session's grants to a policy under the rule a rerun's approval meets, so
+/// a grant no crossing could have earned there (the `write` verb can self-approve
+/// a path such as a Cairn home) does not arrive through a terminal's policy. A
+/// grant this policy refuses is dropped and the spawn stays narrower.
+fn apply_session_grants(policy: &mut sandbox::SandboxPolicy, granted: &[String]) {
+    for (path, access) in granted.iter().filter_map(|grant| descriptor_grant(grant)) {
+        if let Err(reason) = policy.grant_crossing(&path, access) {
+            log::warn!("session grant left out of a fence policy: {reason}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -339,31 +336,32 @@ mod tests {
         ));
     }
 
-    /// A grant names what a command runs: a whole-line launcher of the granted
-    /// command is covered, and a chain that merely starts with one is not.
+    /// A session grant reaches a policy under the rule an approval meets: a read
+    /// stays a read, a write lands, and neither a Cairn home nor a command's text
+    /// gets in.
     #[test]
-    fn a_session_grant_covers_a_whole_line_launcher_of_its_command_only() {
-        let granted = vec![normalize_command("git status --short")];
-        assert!(session_grant_covers(&granted, Some("git status --short")));
-        assert!(session_grant_covers(
-            &granted,
-            Some("bash -lc 'git status --short'")
-        ));
-        assert!(!session_grant_covers(
-            &granted,
-            Some("bash -c 'git status --short' && echo x")
-        ));
-        assert!(!session_grant_covers(&granted, None));
+    fn session_grants_reach_a_policy_only_as_a_bounded_grant() {
+        use crate::mcp::handlers::fence::Crossing;
+        let read = std::path::Path::new("/outside/known_hosts");
+        // Present on every platform the fence runs on: Landlock grants only a
+        // path that exists.
+        let write = std::path::Path::new("/etc/hosts");
+        let granted = vec![
+            Crossing::read_denied(read).descriptor,
+            Crossing::write_outside(write).descriptor,
+            Crossing::write_outside(std::path::Path::new("/home/dev/.cairn")).descriptor,
+            "git status --short".to_string(),
+        ];
+        let checkout = std::path::Path::new("/work/wt");
+        let baseline = sandbox::SandboxPolicy::for_run(checkout, &[], vec![]);
+        let mut policy = baseline.clone();
 
-        let fence_descriptor = crate::mcp::handlers::fence::Crossing::shell_command(
-            String::new(),
-            "bash -lc 'git status --short'",
-        )
-        .descriptor;
-        assert!(session_grant_covers(
-            &[fence_descriptor],
-            Some("bash -lc 'git status --short'")
-        ));
+        apply_session_grants(&mut policy, &granted);
+
+        let mut expected = baseline.writable_extra;
+        expected.push(write.to_path_buf());
+        assert_eq!(policy.writable_extra, expected);
+        assert_eq!(policy.readable_extra, vec![read.to_path_buf()]);
     }
 
     #[test]
@@ -399,6 +397,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: sandbox::ViolationTag::fresh(),
             reach: Default::default(),
         };
@@ -431,6 +430,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            readable_extra: vec![],
             violation_tag: sandbox::ViolationTag::fresh(),
             reach: Default::default(),
         };

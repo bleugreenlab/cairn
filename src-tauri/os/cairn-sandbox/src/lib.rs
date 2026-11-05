@@ -23,6 +23,7 @@
 //! unconfined: no agent process may read a Cairn home's `operator_auth_secret`.
 //! Each seam states its [`Confinement`] so that choice is made explicitly.
 
+mod approved_crossing;
 pub mod containment;
 #[cfg(all(test, target_os = "linux"))]
 mod host_socket_tests;
@@ -38,6 +39,9 @@ pub mod scratch_refusal;
 mod setuid_refusal;
 mod write_refusal;
 
+pub use approved_crossing::{
+    bounded_rerun, cairn_state_reached_by, crossing_access, NO_PATH_RECOVERED, NO_POLICY_TO_WIDEN,
+};
 pub use isolated::{IsolatedChild, IsolatedLimits};
 pub use operator_credential::{
     credential_denial, detect_credential_floor_denial, Confinement, MacosProfile,
@@ -122,6 +126,10 @@ pub struct SandboxPolicy {
     /// secrets (external credential stores). For an `Ask` agent a denied read
     /// still surfaces as an approvable crossing; only `Deny` makes it final.
     pub deny_read: Vec<PathBuf>,
+    /// Subpaths re-allowed for reads and never for writes: approved read
+    /// crossings ([`SandboxPolicy::grant_crossing`]). Linux does not enforce a
+    /// broad policy's read denylist, so a read crossing never arises there.
+    pub readable_extra: Vec<PathBuf>,
     /// Additional writable scopes expressed as anchored regexes rather than
     /// concrete subpaths. These let a long-lived **service** sandbox (see
     /// [`SandboxPolicy::for_service`]) grant writes across many sibling paths
@@ -341,7 +349,7 @@ fn sudoers_command(argv: &[String]) -> String {
         .join(" ")
 }
 
-fn paths_overlap(a: &Path, b: &Path) -> bool {
+pub fn paths_overlap(a: &Path, b: &Path) -> bool {
     // Compare canonical forms so macOS /var -> /private/var and /tmp ->
     // /private/tmp aliases cannot smuggle an ancestor write allowance back over
     // a read-only checkout.
@@ -374,6 +382,7 @@ impl SandboxPolicy {
             writable_regex: Vec::new(),
             worktree_writable: true,
             socket_resolvable: Vec::new(),
+            readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: Default::default(),
         }
@@ -418,6 +427,7 @@ impl SandboxPolicy {
             writable_regex: Vec::new(),
             worktree_writable: false,
             socket_resolvable: Vec::new(),
+            readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: Default::default(),
         }
@@ -455,6 +465,7 @@ impl SandboxPolicy {
             // a daemon's own control socket lives there.
             worktree_writable: true,
             socket_resolvable: Vec::new(),
+            readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: Default::default(),
         }
@@ -490,6 +501,7 @@ impl SandboxPolicy {
             writable_regex: Vec::new(),
             worktree_writable: true,
             socket_resolvable: Vec::new(),
+            readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: PolicyReach {
                 reads: ReadScope::Allowlist { roots },
@@ -612,14 +624,15 @@ impl SandboxPolicy {
     }
 
     /// Readable subpaths re-allowed after the read denylist: the worktree
-    /// (**always**, even for a read-only checkout) + extras. So a denylist entry
-    /// covering a prefix of the checkout can never block the agent from reading
-    /// its own source, and a read-only checkout stays fully readable while its
-    /// writes are denied.
+    /// (**always**, even for a read-only checkout) + extras + approved reads.
+    /// So a denylist entry covering a prefix of the checkout can never block
+    /// the agent from reading its own source, and a read-only checkout stays
+    /// fully readable while its writes are denied.
     #[cfg(any(test, target_os = "macos"))]
     fn readable_paths(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.worktree.clone()];
         paths.extend(self.writable_extra.iter().cloned());
+        paths.extend(self.readable_extra.iter().cloned());
         paths
     }
 }
@@ -1928,8 +1941,8 @@ mod tests {
             detect_denial(Some(13), "open: Permission denied", None, t, true),
             Some(SandboxDenial::Command)
         );
-        // A container engine refused by the fence raises the crossing whose
-        // approval reruns it unconfined.
+        // A container engine refused by the fence raises a crossing, which is
+        // how the agent learns why it failed; it names no path to approve.
         assert_eq!(
             detect_denial(Some(125), PODMAN_FENCED_RUNTIME_LOCK, None, t, true),
             Some(SandboxDenial::Command)

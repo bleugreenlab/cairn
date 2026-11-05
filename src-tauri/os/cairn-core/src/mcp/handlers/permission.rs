@@ -1752,20 +1752,48 @@ impl CrossingDetail {
         self.origin.as_deref() == Some("terminal")
     }
 
-    /// Whether allowing this crossing re-executes the command **unsandboxed**.
+    /// Whether this crossing names no path an approval could widen.
     ///
     /// A path-scoped crossing widens one named path and the sandbox is still
-    /// constructed around the re-execution. Anything else has no path to widen
-    /// -- the kernel reported a blocked command without reporting what it
-    /// touched -- so the only way to let it proceed is to run it with no sandbox
-    /// at all.
+    /// constructed around the re-execution. Anything else has no path to widen:
+    /// the kernel reported a blocked command without reporting what it touched,
+    /// or the row carries a kind this build does not know. The fence no longer
+    /// raises such a crossing, so it arrives only as a stored prompt.
     ///
     /// Asked as "is this a known path-scoped kind?" rather than "is this the
-    /// command kind?", so an unrecognized tag is an escape. See
+    /// command kind?", so an unrecognized tag lands here. See
     /// [`fence::tag_is_path_scoped`] for the two ways an unrecognized tag
     /// arrives.
-    fn is_unsandboxed_escape(&self) -> bool {
+    fn names_no_path(&self) -> bool {
         !crate::mcp::handlers::fence::tag_is_path_scoped(&self.kind)
+    }
+
+    /// The key a session grant holds this crossing under. A crossing that names
+    /// no path has nothing for a grant to hold: its descriptor is a command, and
+    /// a command's text must not reach a policy's list of granted paths.
+    fn session_key(&self) -> Option<&str> {
+        (!self.names_no_path()).then_some(self.descriptor.as_str())
+    }
+
+    /// Whether allowing this crossing would open a path on the sensitive-read
+    /// denylist: a read crossing, which only that list refuses, or any crossing
+    /// whose path overlaps it, since a writable path is readable too.
+    fn opens_sensitive_read(&self, deny_read: &[std::path::PathBuf]) -> bool {
+        use crate::mcp::handlers::fence::{descriptor_grant, CrossingKind};
+        self.kind == CrossingKind::SensitiveHostRead.tag()
+            || descriptor_grant(&self.descriptor).is_some_and(|(path, _)| {
+                deny_read
+                    .iter()
+                    .any(|denied| crate::services::sandbox::paths_overlap(&path, denied))
+            })
+    }
+
+    /// The part of Cairn's own state allowing this crossing would reach, whatever
+    /// verb raised it. A rerun's grant refuses this outright; the `write` verb
+    /// builds no policy, so its crossing arrives here.
+    fn cairn_state_reached(&self) -> Option<std::path::PathBuf> {
+        crate::mcp::handlers::fence::descriptor_grant(&self.descriptor)
+            .and_then(|(path, _)| crate::services::sandbox::cairn_state_reached_by(&path))
     }
 }
 
@@ -2152,20 +2180,18 @@ async fn resolve_permission_request_impl(
         }
     }
 
-    // The same capability, one layer down. Allowing a COMMAND-scoped crossing
-    // re-executes an agent-authored command with no sandbox at all, which is
-    // the state in which every path-based protection stops being constructed --
-    // including the one keeping this agent away from the credential that
-    // approves authority. That is an escape, not a containment answer, and it
-    // is the same act `allow_all_for_request` requires an operator for; the
-    // difference is that this one lasts for a command and that one lasts for
-    // the run.
+    // A stored prompt that names no path. No approval reruns anything with no
+    // sandbox any more, so an allow here re-dispatches the item under the same
+    // fence and it is refused again. It stays an operator's to answer because
+    // the kind is what is not understood: a tag this build does not recognize
+    // says nothing about what its author meant an allow to do, and this is the
+    // gate that fails closed on it.
     //
     // Path-scoped crossings stay open to every surface. They widen one named
     // path, the sandbox is still built around the re-execution, and an agent
     // recognizing that it needs one file outside its worktree is ordinary work.
     if let Some(detail) = crossing.as_ref() {
-        if detail.is_unsandboxed_escape()
+        if detail.names_no_path()
             && matches!(decision, PermissionDecision::Allow)
             && answer.operator_approval().is_none()
         {
@@ -2173,14 +2199,44 @@ async fn resolve_permission_request_impl(
                 "{OPERATOR_PENDING_REFUSAL} this prompt names no host path to widen -- either the \
                  sandbox blocked a command without reporting which path it touched, or the \
                  prompt was recorded by a \
-                 build whose crossing kind ('{}') this one does not recognize. Either way the only \
-                 way to let it proceed is to re-run the command with no sandbox at all, which is \
-                 an escape rather than one crossing, and only an operator can approve that. This \
-                 answer came from '{}', which may deny it, or allow a path-scoped crossing. The \
-                 request is still pending for the operator.",
+                 build whose crossing kind ('{}') this one does not recognize. Nothing runs with \
+                 no sandbox at all on an approval, so there is no bounded effect here for this \
+                 answer to approve, and only an operator may allow it. This answer came from \
+                 '{}', which may deny it, or allow a path-scoped crossing. The request is still \
+                 pending for the operator.",
                 detail.kind,
                 answer.issuer(),
             ));
+        }
+        // The denylist is what stands between an agent and a credential store.
+        // An agent that could approve its own crossing could deny-read its way
+        // to a private key and then read it, which would make the list advisory.
+        if matches!(decision, PermissionDecision::Allow)
+            && answer.operator_approval().is_none()
+            && detail.opens_sensitive_read(&orch.sandbox_deny_read())
+        {
+            return Err(format!(
+                "{OPERATOR_PENDING_REFUSAL} this crossing opens a path on the sensitive-read \
+                 denylist, which holds credential stores and private keys, so only an operator \
+                 may allow it. This answer came from '{}', which may deny it. The request is \
+                 still pending for the operator.",
+                answer.issuer(),
+            ));
+        }
+        // An operator may have a reason to touch Cairn's own state. An agent
+        // approving its own way into a home or another job's cell does not, and
+        // which verb carried the crossing makes no difference to that.
+        if matches!(decision, PermissionDecision::Allow) && answer.operator_approval().is_none() {
+            if let Some(state) = detail.cairn_state_reached() {
+                return Err(format!(
+                    "{OPERATOR_PENDING_REFUSAL} this crossing reaches {}, which is Cairn's own \
+                     state: its settings, databases and credentials, or the cells other work runs \
+                     in, so only an operator may allow it. This answer came from '{}', which may \
+                     deny it. The request is still pending for the operator.",
+                    state.display(),
+                    answer.issuer(),
+                ));
+            }
         }
     }
 
@@ -2394,8 +2450,10 @@ async fn resolve_permission_request_impl(
     {
         match crossing.as_ref() {
             Some(detail) => {
-                if let Ok(mut allowed) = orch.session_allowed_crossings.lock() {
-                    allowed.insert(detail.descriptor.clone());
+                if let (Some(key), Ok(mut allowed)) =
+                    (detail.session_key(), orch.session_allowed_crossings.lock())
+                {
+                    allowed.insert(key.to_string());
                 }
             }
             None => {
@@ -2804,17 +2862,19 @@ async fn resume_suspended_permission(
                 // transiently so the re-dispatched verb passes the fence exactly
                 // for this re-execution, then remove it. A `session` grant is
                 // already persisted by the caller.
-                let transient = matches!(scope, PermissionScope::Once);
-                if transient {
-                    if let Ok(mut allowed) = orch.session_allowed_crossings.lock() {
-                        allowed.insert(detail.descriptor.clone());
-                    }
+                let transient = matches!(scope, PermissionScope::Once)
+                    .then(|| detail.session_key())
+                    .flatten();
+                if let (Some(key), Ok(mut allowed)) =
+                    (transient, orch.session_allowed_crossings.lock())
+                {
+                    allowed.insert(key.to_string());
                 }
                 let result = re_dispatch_verb(orch, detail).await;
-                if transient {
-                    if let Ok(mut allowed) = orch.session_allowed_crossings.lock() {
-                        allowed.remove(&detail.descriptor);
-                    }
+                if let (Some(key), Ok(mut allowed)) =
+                    (transient, orch.session_allowed_crossings.lock())
+                {
+                    allowed.remove(key);
                 }
                 // If the re-dispatched verb tripped ANOTHER ungranted crossing
                 // it durably re-suspended the run on a fresh pending request.
@@ -3703,10 +3763,8 @@ pub(crate) mod tests {
     /// An agent answers through its own `permissions` resource, which is an
     /// [`AnswerSurface::ResourcePatch`]. It may allow a path-scoped crossing --
     /// that widens one named path with the sandbox still built around the
-    /// re-execution. It may not allow a command-scoped one, because there is no
-    /// path to widen and the only way to let it proceed is to re-run the
-    /// agent-authored command with no sandbox at all, which is the state in
-    /// which every path-based protection stops being constructed.
+    /// re-execution. It may not allow a stored command-scoped one, which names
+    /// no path to widen.
     ///
     /// This is deliberately not a test about the invoke boundary. Closing one
     /// switch there left two others open, because the boundary tests pinned the
@@ -4056,7 +4114,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_cannot_self_approve_an_unsandboxed_command_escape() {
+    async fn an_agent_cannot_allow_a_stored_prompt_that_names_no_path() {
         for scope in [PermissionScope::Once, PermissionScope::Session] {
             let orch = test_orchestrator().await;
             seed_allow_all_permission(&orch).await;
@@ -4075,7 +4133,7 @@ pub(crate) mod tests {
                 agent_resource_answer(PermissionDecision::Allow).with_containment_scope(scope),
             )
             .await
-            .expect_err("an agent must not be able to lift its own sandbox");
+            .expect_err("a prompt that names no path is an operator's to allow");
             assert!(
                 refusal.contains("no sandbox at all"),
                 "unexpected refusal: {refusal}"
@@ -4151,7 +4209,7 @@ pub(crate) mod tests {
             recovered_permission_answer(PermissionDecision::Allow, &winner).unwrap(),
         )
         .await
-        .expect_err("a channel reply cannot approve an unsandboxed escape");
+        .expect_err("a channel reply cannot allow a prompt that names no path");
         assert!(
             crate::channels::ledger::is_operator_pending_refusal(&refusal),
             "the refusal has to say it is waiting on a person: {refusal}"
@@ -4196,7 +4254,7 @@ pub(crate) mod tests {
     /// The operator can still allow it — through the desktop proxy or an
     /// owner/admin JWT, both of which carry the capability.
     #[tokio::test]
-    async fn an_operator_can_allow_an_unsandboxed_command_escape() {
+    async fn an_operator_can_allow_a_stored_prompt_that_names_no_path() {
         let orch = test_orchestrator().await;
         seed_allow_all_permission(&orch).await;
         store_crossing(
@@ -4245,6 +4303,164 @@ pub(crate) mod tests {
         .expect("a path-scoped crossing stays answerable by the agent");
 
         assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+    }
+
+    /// An agent may not give itself the sensitive-read denylist, through a `run`
+    /// read crossing, the `read` verb's, or a write whose path overlaps the list.
+    /// It may still deny one, and an operator may allow one.
+    #[tokio::test]
+    async fn an_agent_cannot_allow_a_crossing_that_opens_the_sensitive_denylist() {
+        use super::super::fence::Crossing;
+        let key = crate::services::sandbox::default_deny_read()
+            .into_iter()
+            .next()
+            .expect("the built-in denylist has entries")
+            .join("id_ed25519");
+        type MakeCrossing = fn(&std::path::Path) -> Crossing;
+        let cases: [(&str, MakeCrossing); 3] = [
+            ("run read", |path| {
+                Crossing::for_denied_item(
+                    Some(path),
+                    Some(&cairn_common::executor_protocol::CrossingRerun::Widened {
+                        access: cairn_common::executor_protocol::CrossingAccess::Read,
+                    }),
+                    "cat",
+                    "cat key",
+                    None,
+                )
+            }),
+            ("read verb", Crossing::read_denied),
+            ("overlapping write", Crossing::write_outside),
+        ];
+        for (case, crossing) in cases {
+            for scope in [PermissionScope::Once, PermissionScope::Session] {
+                let orch = test_orchestrator().await;
+                seed_allow_all_permission(&orch).await;
+                store_crossing(&orch, crossing(&key)).await;
+
+                let refusal = resolve_permission_request(
+                    &orch,
+                    "perm-request-1",
+                    agent_resource_answer(PermissionDecision::Allow).with_containment_scope(scope),
+                )
+                .await
+                .expect_err("the denylist is an operator's to open");
+                assert!(
+                    refusal.contains("sensitive-read denylist"),
+                    "{case}: {refusal}"
+                );
+                assert_eq!(
+                    perm_status(&orch).await.as_deref(),
+                    Some("pending"),
+                    "{case}"
+                );
+                assert!(
+                    orch.session_allowed_crossings.lock().unwrap().is_empty(),
+                    "{case}: a refused answer leaves no grant"
+                );
+
+                resolve_permission_request(
+                    &orch,
+                    "perm-request-1",
+                    agent_resource_answer(PermissionDecision::Deny),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{case}: an agent may deny: {error}"));
+                assert_eq!(
+                    perm_status(&orch).await.as_deref(),
+                    Some("denied"),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// An agent may not approve its own way into Cairn's state through any verb.
+    /// `Crossing::write_outside` is what the `write` verb raises, and it builds
+    /// no policy for `grant_crossing` to refuse, so this gate is what stops it.
+    /// An operator may allow one, and an agent may still deny one.
+    #[tokio::test]
+    async fn only_an_operator_may_allow_a_crossing_into_cairns_own_state() {
+        use super::super::fence::Crossing;
+        let own_home = cairn_common::paths::cairn_home().join("agents/builder.yaml");
+        let cases: [(&str, Crossing); 4] = [
+            (
+                "write verb, a file in a home",
+                Crossing::write_outside(std::path::Path::new("/Users/dev/.cairn/agents/x.yaml")),
+            ),
+            (
+                "write verb, this process's home",
+                Crossing::write_outside(&own_home),
+            ),
+            (
+                "write verb, a home itself",
+                Crossing::write_outside(std::path::Path::new("/home/dev/.cairn-exec")),
+            ),
+            (
+                "run, another job's cell",
+                Crossing::shell_path(
+                    std::path::Path::new("/mnt/b/build-slots/cairn/slot-9/src/lib.rs"),
+                    "touch x",
+                ),
+            ),
+        ];
+        for (case, crossing) in cases {
+            let orch = test_orchestrator().await;
+            seed_allow_all_permission(&orch).await;
+            store_crossing(&orch, crossing.clone()).await;
+
+            let refusal = resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                agent_resource_answer(PermissionDecision::Allow)
+                    .with_containment_scope(PermissionScope::Session),
+            )
+            .await
+            .expect_err("Cairn's own state is an operator's to open");
+            // A home can be on the denylist too, which then answers first.
+            assert!(
+                refusal.contains("only an operator may allow it"),
+                "{case}: {refusal}"
+            );
+            assert_eq!(
+                perm_status(&orch).await.as_deref(),
+                Some("pending"),
+                "{case}"
+            );
+            assert!(
+                orch.session_allowed_crossings.lock().unwrap().is_empty(),
+                "{case}: a refused answer leaves no grant"
+            );
+
+            resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{case}: an operator may allow: {error}"));
+            assert_eq!(
+                perm_status(&orch).await.as_deref(),
+                Some("allowed"),
+                "{case}"
+            );
+
+            let orch = test_orchestrator().await;
+            seed_allow_all_permission(&orch).await;
+            store_crossing(&orch, crossing).await;
+            resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                agent_resource_answer(PermissionDecision::Deny),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{case}: an agent may deny: {error}"));
+            assert_eq!(
+                perm_status(&orch).await.as_deref(),
+                Some("denied"),
+                "{case}"
+            );
+        }
     }
 
     /// A prompt written before the path/command kinds were split is treated as
@@ -4296,7 +4512,7 @@ pub(crate) mod tests {
     /// Denial stays open on an escape too: recognizing that something should not
     /// happen is not a capability.
     #[tokio::test]
-    async fn an_agent_can_still_deny_an_unsandboxed_command_escape() {
+    async fn an_agent_can_still_deny_a_stored_prompt_that_names_no_path() {
         let orch = test_orchestrator().await;
         seed_allow_all_permission(&orch).await;
         store_crossing(
@@ -4424,7 +4640,7 @@ pub(crate) mod tests {
         let detail = serde_json::json!({
             "kind": "sensitive_host_read",
             "verb": "read",
-            "descriptor": "/etc/hosts",
+            "descriptor": "read:/etc/hosts",
             "summary": "read a sensitive denied path: /etc/hosts",
             "request": {
                 "cwd": "/scratch/run-1",
@@ -4437,7 +4653,7 @@ pub(crate) mod tests {
         .to_string();
         let parsed = parse_crossing_detail(&detail).expect("fence detail should parse");
         assert_eq!(parsed.verb, "read");
-        assert_eq!(parsed.descriptor, "/etc/hosts");
+        assert_eq!(parsed.descriptor, "read:/etc/hosts");
         assert_eq!(parsed.request.tool, "read");
     }
 

@@ -13,6 +13,7 @@ use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 use crate::services::{sandbox, SpawnConfig};
 use crate::storage::{LocalDb, RowExt};
+use cairn_common::executor_protocol::{CrossingAccess, CrossingRerun};
 use cairn_common::uri::CairnResource;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -27,8 +28,9 @@ struct ExecOutput {
     stderr: String,
     exit_code: Option<i32>,
     timed_out: bool,
-    /// A kernel sandbox denial detected after execution (drives the fence).
-    denial: Option<sandbox::SandboxDenial>,
+    /// A kernel sandbox denial detected after execution (drives the fence), and
+    /// what approving it would give the rerun under this spawn's policy.
+    denial: Option<(sandbox::SandboxDenial, CrossingRerun)>,
     /// Whether the operator credential boundary refused the command, which is
     /// answered with its own refusal and never adjudicated.
     credential_refused: bool,
@@ -565,7 +567,7 @@ pub(crate) async fn run_one(
         timeout_ms,
         shell_command.as_deref(),
         stdin.as_deref(),
-        true,
+        &[],
     )
     .await
     {
@@ -575,11 +577,11 @@ pub(crate) async fn run_one(
 
     // Denial-driven namespace fence: if the kernel sandbox blocked this command,
     // adjudicate the crossing under the agent's escape policy. On allow we
-    // re-execute escalated (sandbox off) so the now-granted crossing proceeds.
+    // re-execute under the same policy plus exactly the approved access.
     if exec.credential_refused {
         return ItemOutcome::failed(header, sandbox::OPERATOR_CREDENTIAL_REFUSAL);
     }
-    if let Some(denial) = exec.denial.take() {
+    if let Some((denial, rerun)) = exec.denial.take() {
         use crate::mcp::handlers::fence;
         // The operator credential boundary is answered before anything else: it
         // is never a fence crossing, and in the live checkout it is not the
@@ -601,29 +603,40 @@ pub(crate) async fn run_one(
             return ItemOutcome::failed(header, READ_ONLY_CHECKOUT_DENIAL);
         }
         // A blocked touch of the workspace configuration document or the desktop
-        // operator credential is not an approvable crossing: allowing one
-        // re-executes this command with the sandbox switched off, which would
-        // let the access actually land on the strength of a prompt that only
-        // ever said "a file outside the project is being touched". That refusal
-        // now lives in `fence::raise_fence`, which both this site and the
-        // executor-relayed one in `fleet/mod.rs` reach, rather than here where
-        // only one of them would get it.
+        // operator credential is not an approvable crossing: allowing one would
+        // let the access actually land on the strength of a prompt about a file
+        // outside the project. That refusal lives in `fence::raise_fence`, which
+        // both this site and the executor-relayed one in `fleet/mod.rs` reach,
+        // rather than here where only one of them would get it.
         match fence::resolve_run_fence(orch, request).await {
             fence::RunFenceResolution::Resolved(run_id, fence_mode) => {
                 let command = shell_command.as_deref().unwrap_or(&program);
-                let crossing = match &denial {
-                    sandbox::SandboxDenial::Path { path, .. } => {
-                        fence::Crossing::shell_path(path.as_path(), command)
-                    }
-                    sandbox::SandboxDenial::Command => fence::Crossing::unattributed_denial(
-                        &header,
-                        command,
-                        sandbox::reported_denial_line(&format!("{}\n{}", exec.stdout, exec.stderr))
-                            .as_deref(),
-                    ),
+                let denied_path = match &denial {
+                    sandbox::SandboxDenial::Path { path, .. } => Some(path.as_path()),
+                    sandbox::SandboxDenial::Command => None,
                 };
+                let reported =
+                    sandbox::reported_denial_line(&format!("{}\n{}", exec.stdout, exec.stderr));
+                let crossing = fence::Crossing::for_denied_item(
+                    denied_path,
+                    Some(&rerun),
+                    &header,
+                    command,
+                    reported.as_deref(),
+                );
                 match fence::raise_fence(orch, &run_id, fence_mode, request, crossing).await {
                     fence::FenceDecision::Allow => {
+                        let grant = match (denied_path, &rerun) {
+                            (Some(path), CrossingRerun::Widened { access }) => {
+                                (path.to_path_buf(), *access)
+                            }
+                            (_, CrossingRerun::Refused { reason }) => {
+                                return ItemOutcome::failed(header, reason.clone())
+                            }
+                            (None, CrossingRerun::Widened { .. }) => {
+                                return ItemOutcome::failed(header, sandbox::NO_PATH_RECOVERED)
+                            }
+                        };
                         match execute_process(
                             orch,
                             cwd,
@@ -634,7 +647,7 @@ pub(crate) async fn run_one(
                             timeout_ms,
                             shell_command.as_deref(),
                             stdin.as_deref(),
-                            false,
+                            std::slice::from_ref(&grant),
                         )
                         .await
                         {
@@ -1300,7 +1313,7 @@ async fn execute_process(
     timeout_ms: u32,
     shell_command: Option<&str>,
     stdin: Option<&str>,
-    sandbox_enabled: bool,
+    approved: &[(std::path::PathBuf, CrossingAccess)],
 ) -> Result<ExecOutput, String> {
     // A project service's batch is always placed, never spawned here: a host
     // spawn carries the machine secret, which accepts any claimed run. The
@@ -1318,28 +1331,31 @@ async fn execute_process(
     let tool_use_id = tool_use_id.to_string();
     let inline_command_id = Uuid::new_v4().to_string();
 
-    // Decide this spawn's confinement. `sandbox_enabled` is false on an
-    // escalated re-execution after a fence grant: the grant lifted the fence,
-    // and the spawn keeps the operator credential boundary all the same.
+    // Decide this spawn's confinement. A rerun after an approved crossing gets
+    // the same decision plus what was approved; a spawn with no policy cannot
+    // take a grant, because running it would grant everything.
     // Host execution only ever runs in the agent's jj residence or the project's
     // live checkout, so the path tells the truth here.
     let checkout_kind = super::sandbox_policy::RunCheckout::infer(cwd);
-    let run_confinement = if sandbox_enabled {
-        // Grant key: the shell command for shell items, else the program for
-        // skill scripts — so a command-scoped session grant generalizes to
-        // scripts too (the only crossing kind Linux produces).
-        resolve_run_confinement(
-            orch,
-            cwd,
-            checkout_kind,
-            run_context.map(|c| c.run_id.as_str()),
-            run_context.map(|c| c.project_id.as_str()),
-            shell_command.or(Some(program)),
-        )
-        .await
-    } else {
-        RunConfinement::CredentialFloor
-    };
+    let mut run_confinement = resolve_run_confinement(
+        orch,
+        cwd,
+        checkout_kind,
+        run_context.map(|c| c.run_id.as_str()),
+        run_context.map(|c| c.project_id.as_str()),
+        shell_command.or(Some(program)),
+    )
+    .await;
+    if !approved.is_empty() {
+        let RunConfinement::Fenced { policy, .. } = &mut run_confinement else {
+            return Err(
+                "an approved fence crossing widens a fence policy, and this spawn has none".into(),
+            );
+        };
+        for (path, access) in approved {
+            policy.grant_crossing(path, *access)?;
+        }
+    }
     let fence_mode = run_confinement.fenced().map(|(_, fence)| fence);
     // Ask agents get a synthetic command-scoped macOS fallback when path recovery
     // misses; Deny agents preserve their raw fail-fast output. Ambient live-checkout
@@ -1513,7 +1529,7 @@ async fn execute_process(
         } else {
             None
         };
-        let (denial, credential_refused) = split_host_denial(denial);
+        let (denial, credential_refused) = split_host_denial(&applied_confinement, denial);
         if let Ok(mut child) = child.lock() {
             let _ = child.kill();
         }
@@ -1607,7 +1623,7 @@ async fn execute_process(
     } else {
         None
     };
-    let (denial, credential_refused) = split_host_denial(denial);
+    let (denial, credential_refused) = split_host_denial(&applied_confinement, denial);
     let setuid_refusal = sandbox::setuid_refusal_note(
         &applied_confinement,
         exit_code,
@@ -1664,10 +1680,23 @@ fn classify_host_denial(
     Some(HostDenial::Fence(detected))
 }
 
-fn split_host_denial(denial: Option<HostDenial>) -> (Option<sandbox::SandboxDenial>, bool) {
+fn split_host_denial(
+    confinement: &sandbox::Confinement,
+    denial: Option<HostDenial>,
+) -> (Option<(sandbox::SandboxDenial, CrossingRerun)>, bool) {
     match denial {
         Some(HostDenial::OperatorCredential) => (None, true),
-        Some(HostDenial::Fence(denial)) => (Some(denial), false),
+        Some(HostDenial::Fence(denial)) => {
+            let rerun = match &denial {
+                sandbox::SandboxDenial::Path { path, operation } => {
+                    sandbox::bounded_rerun(confinement.policy(), Some(path), operation.as_deref())
+                }
+                sandbox::SandboxDenial::Command => {
+                    sandbox::bounded_rerun(confinement.policy(), None, None)
+                }
+            };
+            (Some((denial, rerun)), false)
+        }
         None => (None, false),
     }
 }

@@ -24,15 +24,43 @@
 //! broad, matching `run`); a `write` is gated when its target escapes the
 //! logical project namespace. See `docs/worktree-fence.md`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use cairn_common::executor_protocol::{CrossingAccess, CrossingRerun};
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
+use crate::services::sandbox::NO_PATH_RECOVERED;
 
 use super::permission::{await_permission_decision, fence_policy_for_run, Handoff, PermissionWait};
 
 mod command_refusal;
+
+/// Why a crossing relayed by an executor that does not say what its rerun would
+/// get cannot be approved.
+const EXECUTOR_PREDATES_BOUNDED_RERUN: &str = "The executor running this item predates bounded reruns: it would rerun an approved item with no fence at all, so this crossing is refused rather than offered for approval. Updating that executor restores the prompt.";
+
+/// The descriptor prefix of a read crossing. A session grant's descriptor is
+/// what a policy is built from, and a bare path there is writable, so a read
+/// needs a key of its own for a read grant to stay a read.
+const READ_DESCRIPTOR_PREFIX: &str = "read:";
+
+fn read_descriptor(path: &Path) -> String {
+    format!("{READ_DESCRIPTOR_PREFIX}{}", path.display())
+}
+
+/// What a path-scoped descriptor grants: the path, and the access to it. `None`
+/// for anything else, which names no path to grant.
+pub(crate) fn descriptor_grant(descriptor: &str) -> Option<(PathBuf, CrossingAccess)> {
+    match descriptor.strip_prefix(READ_DESCRIPTOR_PREFIX) {
+        Some(path) => Some((PathBuf::from(path), CrossingAccess::Read)),
+        None if descriptor.starts_with('/') => {
+            Some((PathBuf::from(descriptor), CrossingAccess::Write))
+        }
+        None => None,
+    }
+}
 
 /// Typed result of resolving the fence attached to a request. Ambient means no
 /// authenticated identity was supplied; unavailable means one was supplied but
@@ -72,8 +100,8 @@ pub(crate) enum CrossingKind {
     ShellPathCrossing,
     /// A shell command the kernel blocked without reporting which path it
     /// touched. Separated from [`CrossingKind::ShellPathCrossing`] because
-    /// allowing it re-executes with no sandbox rather than widening a named
-    /// path.
+    /// there is no named path to widen, so no approval can run it: the fence
+    /// refuses this kind, and only a stored row can still be answered.
     ShellCommandEscape,
 }
 
@@ -99,13 +127,12 @@ impl CrossingKind {
         CrossingKind::ShellCommandEscape,
     ];
 
-    /// Whether this kind's descriptor is a resolved host path, and therefore
-    /// whether allowing it widens one named path rather than removing the
-    /// sandbox.
+    /// Whether this kind's descriptor names a resolved host path, and therefore
+    /// whether allowing it can widen anything.
     ///
     /// Exhaustive on purpose: adding a variant is a compile error here, which
-    /// forces the question "does allowing this remove containment?" to be
-    /// answered rather than inherited.
+    /// forces the question "what would allowing this widen?" to be answered
+    /// rather than inherited.
     fn is_path_scoped(self) -> bool {
         match self {
             CrossingKind::SensitiveHostRead
@@ -125,8 +152,8 @@ impl CrossingKind {
 /// - a row written by a build BEFORE the path/command split, which tagged both
 ///   shell crossings `shell_escape`. Pending prompts are durable and nothing
 ///   expires them, so an agent suspended on a command crossing across an
-///   upgrade would otherwise resume able to self-approve its own escape. A
-///   descriptor-shape heuristic was considered and rejected: a normalized
+///   upgrade would otherwise resume able to answer a prompt that is only an
+///   operator's. A descriptor-shape heuristic was considered and rejected: a normalized
 ///   command can begin with `/` (`/bin/cat /etc/shadow`), so it would read as a
 ///   path in exactly the case that matters. This over-restricts a legacy
 ///   path-scoped shell crossing to an operator for the life of that one pending
@@ -157,6 +184,10 @@ pub struct Crossing {
     /// recovered. The agent's code wrote it, so like `command` it is consulted
     /// only for the instructive refusal, never for grant matching.
     reported: Option<String>,
+    /// Why approving this crossing could not run the item, when that is so.
+    /// Such a crossing is refused rather than put in front of anyone, and a
+    /// session grant does not answer it either.
+    unapprovable: Option<String>,
 }
 
 impl Crossing {
@@ -164,14 +195,14 @@ impl Crossing {
     /// Reads are otherwise broad; this is the only read the fence gates, kept
     /// consistent with the `run`-verb OS sandbox's read denylist.
     pub fn read_denied(path: &Path) -> Self {
-        let descriptor = path.display().to_string();
         Crossing {
             kind: CrossingKind::SensitiveHostRead,
             verb: "read",
-            summary: format!("read a sensitive denied path: {descriptor}"),
-            descriptor,
+            summary: format!("read a sensitive denied path: {}", path.display()),
+            descriptor: read_descriptor(path),
             command: None,
             reported: None,
+            unapprovable: None,
         }
     }
 
@@ -184,10 +215,12 @@ impl Crossing {
             descriptor,
             command: None,
             reported: None,
+            unapprovable: None,
         }
     }
 
-    /// A kernel denial of `path` inside the item that ran `command`.
+    /// A kernel denial of a write to `path` inside the item that ran `command`.
+    /// The summary is the approval card, so it states what the rerun gets.
     ///
     /// The descriptor is the path, so a session grant generalizes across
     /// commands touching it (parity with read/write crossings) rather than
@@ -199,22 +232,78 @@ impl Crossing {
         Crossing {
             kind: CrossingKind::ShellPathCrossing,
             verb: "run",
-            summary: format!("command references an external host path: {descriptor}"),
+            summary: format!(
+                "the sandbox refused a write to {descriptor}. Approving reruns this item under the same fence with {descriptor} also writable, and everything beneath it if it is a directory. Nothing else changes."
+            ),
             descriptor,
             command: Some(command.to_string()),
             reported: None,
+            unapprovable: None,
+        }
+    }
+
+    /// A kernel denial of a read of `path` inside the item that ran `command`.
+    /// Only the sensitive-read denylist refuses a read, which is what makes
+    /// this the same kind as [`Crossing::read_denied`].
+    fn shell_read(path: &Path, command: &str) -> Self {
+        let shown = path.display();
+        Crossing {
+            kind: CrossingKind::SensitiveHostRead,
+            verb: "run",
+            summary: format!(
+                "the sandbox refused a read of {shown}. Approving reruns this item under the same fence with {shown} also readable, and everything beneath it if it is a directory. It stays unwritable, and nothing else changes."
+            ),
+            descriptor: read_descriptor(path),
+            command: Some(command.to_string()),
+            reported: None,
+            unapprovable: None,
+        }
+    }
+
+    /// The crossing for a denied `run` item, at either adjudication site.
+    ///
+    /// `path` is what the kernel's own record named. `rerun` is what the machine
+    /// that would run the rerun said approving it gives, and it is what the card
+    /// may promise, so anything short of a bounded rerun is refused here rather
+    /// than asked about. `None` comes from an executor too old to say.
+    pub(crate) fn for_denied_item(
+        path: Option<&Path>,
+        rerun: Option<&CrossingRerun>,
+        label: &str,
+        command: &str,
+        reported: Option<&str>,
+    ) -> Self {
+        let unapprovable = match rerun {
+            Some(CrossingRerun::Widened { .. }) if path.is_some() => None,
+            Some(CrossingRerun::Widened { .. }) => Some(NO_PATH_RECOVERED.to_string()),
+            Some(CrossingRerun::Refused { reason }) => Some(reason.clone()),
+            None => Some(EXECUTOR_PREDATES_BOUNDED_RERUN.to_string()),
+        };
+        let crossing = match (path, rerun) {
+            (
+                Some(path),
+                Some(CrossingRerun::Widened {
+                    access: CrossingAccess::Read,
+                }),
+            ) => Self::shell_read(path, command),
+            (Some(path), _) => Self::shell_path(path, command),
+            (None, _) => Self::unattributed_denial(label, command, reported),
+        };
+        Crossing {
+            unapprovable,
+            ..crossing
         }
     }
 
     /// Shell crossing with no recovered path. The descriptor is the normalized
     /// command.
     ///
-    /// Its own kind, because allowing it is a different act from allowing the
-    /// others. They widen one named path and the sandbox is still constructed;
-    /// this one re-executes an agent-authored command with **no sandbox at
-    /// all**, because there is no path to widen. That distinction has to be
-    /// visible in the stored prompt rather than inferred later from a
-    /// descriptor's shape, so the resolver can require an operator for it.
+    /// Its own kind, because no approval can run it. The others widen one named
+    /// path under the same fence; here there is no path to widen, and the only
+    /// other way to let the item proceed, a rerun with **no sandbox at all**, is
+    /// not something an approval does. So it is refused with that reason, and
+    /// the kind stays visible in a stored prompt rather than inferred later from
+    /// a descriptor's shape.
     pub(crate) fn shell_command(summary: String, command: &str) -> Self {
         Crossing {
             kind: CrossingKind::ShellCommandEscape,
@@ -223,6 +312,7 @@ impl Crossing {
             summary,
             command: Some(command.to_string()),
             reported: None,
+            unapprovable: Some(NO_PATH_RECOVERED.to_string()),
         }
     }
 
@@ -277,9 +367,13 @@ impl Crossing {
 
     /// The host path this crossing names, or `None` for a command-scoped one.
     fn host_path(&self) -> Option<&Path> {
-        self.kind
-            .is_path_scoped()
-            .then(|| Path::new(self.descriptor.as_str()))
+        self.kind.is_path_scoped().then(|| {
+            Path::new(
+                self.descriptor
+                    .strip_prefix(READ_DESCRIPTOR_PREFIX)
+                    .unwrap_or(&self.descriptor),
+            )
+        })
     }
 
     /// The instructive refusal for a crossing whose blocked step has an
@@ -292,9 +386,9 @@ impl Crossing {
     /// git-internal one must be refused rather than prompted for, because an
     /// allow would open git's index or refs to direct writes. When it did not,
     /// the output's reported denial line stands in for it. That line is
-    /// unverified, which is why it may only choose a refusal: a refusal gives
-    /// the agent less than the escape prompt it replaces, so a forged line can
-    /// cost its author an answer but never widen access.
+    /// unverified, which is why it may only choose a refusal: it picks which
+    /// refusal the agent reads, so a forged line can cost its author a better
+    /// sentence but never widen access.
     ///
     /// A write under Cairn's scratch root is refused the same way, after the
     /// git refusals: by the path a `run` or `write` crossing names, else by the
@@ -470,6 +564,10 @@ pub(crate) fn decide_without_asking(
     // refusal above it leaves an `allow` fence alone: an agent trusted to
     // escape is spending nobody's attention, and its command does what it
     // says once unsandboxed.
+    //
+    // A crossing no approval could run is refused next, ahead of the session
+    // grants: asking would offer an answer that changes nothing, and a grant
+    // has nothing to add to the rerun either.
     match fence {
         Fence::Allow => Some(FenceDecision::Allow),
         Fence::Deny => Some(FenceDecision::Deny(
@@ -484,7 +582,12 @@ pub(crate) fn decide_without_asking(
             if let Some(refusal) = crossing.route_refusal() {
                 return Some(FenceDecision::Deny(refusal));
             }
-            // A session grant for this descriptor short-circuits to allow.
+            if let Some(reason) = &crossing.unapprovable {
+                return Some(FenceDecision::Deny(reason.clone()));
+            }
+            // A grant answers only its own descriptor. A read is not answered
+            // by a write grant on its path: an agent may give itself the write,
+            // and a read of the sensitive denylist is an operator's to allow.
             if let Ok(allowed) = orch.session_allowed_crossings.lock() {
                 if allowed.contains(&crossing.descriptor) {
                     return Some(FenceDecision::Allow);
@@ -561,10 +664,9 @@ mod tests {
         assert_eq!(c.descriptor, "/etc/hosts");
     }
 
-    /// A command-scoped escape is its own kind, and that is load-bearing: the
-    /// resolver reads the stored kind to decide whether allowing this crossing
-    /// requires an operator, because allowing it re-executes with no sandbox
-    /// where a path-scoped crossing only widens the path it names.
+    /// A command-scoped crossing is its own kind, and that is load-bearing: the
+    /// resolver reads the stored kind to decide whether allowing a stored prompt
+    /// requires an operator, because such a prompt names no path to widen.
     #[test]
     fn shell_command_crossing_normalizes_descriptor() {
         let c = Crossing::shell_command("blocked".to_string(), "sudo   rm  -rf /");
@@ -653,17 +755,156 @@ mod tests {
     }
 
     /// An unattributed denial whose output names anything other than a git
-    /// directory's own records keeps today's escape prompt.
-    #[test]
-    fn an_unattributed_denial_elsewhere_keeps_the_escape_prompt() {
+    /// directory's own records has no route to offer, and no path to approve:
+    /// it gets the no-path refusal, and nobody is asked.
+    #[tokio::test]
+    async fn an_unattributed_denial_elsewhere_is_refused_for_having_no_path_to_approve() {
+        let orch = super::super::permission::tests::test_orchestrator().await;
         for reported in [
             "error: cannot open '/Users/x/.ssh/known_hosts': Permission denied",
             "fatal: Unable to create '/home/dev/project/build/index.lock': Permission denied",
         ] {
-            let c = Crossing::unattributed_denial("uv run -", "uv run -", Some(reported));
+            let crossing = || Crossing::unattributed_denial("uv run -", "uv run -", Some(reported));
+            let c = crossing();
             assert_eq!(c.kind, CrossingKind::ShellCommandEscape);
             assert_eq!(c.route_refusal(), None, "{reported}");
+            match raise_fence(&orch, "run-1", Fence::Ask, &run_request(), crossing()).await {
+                FenceDecision::Deny(refusal) => assert_eq!(refusal, NO_PATH_RECOVERED),
+                other => panic!("{reported}: expected the no-path refusal, got {other:?}"),
+            }
         }
+        assert_eq!(permission_rows(&orch).await, 0);
+    }
+
+    /// The card promises what the rerun gets. A prompt exists only when the
+    /// executor said the rerun is bounded, and a read stays a read.
+    #[test]
+    fn a_denied_items_card_states_the_access_the_rerun_gets() {
+        let path = Path::new("/outside/a");
+        let widened = |access| CrossingRerun::Widened { access };
+
+        let write = Crossing::for_denied_item(
+            Some(path),
+            Some(&widened(CrossingAccess::Write)),
+            "touch",
+            "touch /outside/a",
+            None,
+        );
+        assert_eq!(write.unapprovable, None);
+        assert_eq!(write.descriptor, "/outside/a");
+        assert_eq!(write.kind, CrossingKind::ShellPathCrossing);
+        assert!(
+            write.summary.contains("refused a write to /outside/a")
+                && write.summary.contains("same fence")
+                && write.summary.contains("also writable")
+                && write.summary.contains("Nothing else changes"),
+            "{}",
+            write.summary
+        );
+
+        let read = Crossing::for_denied_item(
+            Some(path),
+            Some(&widened(CrossingAccess::Read)),
+            "cat",
+            "cat /outside/a",
+            None,
+        );
+        assert_eq!(read.unapprovable, None);
+        assert_eq!(read.descriptor, "read:/outside/a");
+        assert_eq!(read.host_path(), Some(path));
+        assert!(
+            read.summary.contains("refused a read of /outside/a")
+                && read.summary.contains("also readable")
+                && read.summary.contains("stays unwritable"),
+            "{}",
+            read.summary
+        );
+    }
+
+    /// Every way a relayed denial can lack a bounded rerun is refused with its
+    /// reason, under `ask` and ahead of a session grant, and nobody is asked.
+    #[tokio::test]
+    async fn a_denied_item_with_no_bounded_rerun_is_refused_and_asks_nobody() {
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        orch.session_allowed_crossings
+            .lock()
+            .unwrap()
+            .insert("/outside/a".to_string());
+        let refused = CrossingRerun::Refused {
+            reason: "no bounded grant here".to_string(),
+        };
+        let write = CrossingRerun::Widened {
+            access: CrossingAccess::Write,
+        };
+        let path = Path::new("/outside/a");
+        for (case, path, rerun, expected) in [
+            (
+                "the executor refused",
+                Some(path),
+                Some(&refused),
+                "no bounded grant here",
+            ),
+            (
+                "an older executor",
+                Some(path),
+                None,
+                EXECUTOR_PREDATES_BOUNDED_RERUN,
+            ),
+            ("no path, widened", None, Some(&write), NO_PATH_RECOVERED),
+            (
+                "no path, refused",
+                None,
+                Some(&refused),
+                "no bounded grant here",
+            ),
+        ] {
+            let crossing = Crossing::for_denied_item(path, rerun, "sh -c", "mkdir x", None);
+            match raise_fence(&orch, "run-1", Fence::Ask, &run_request(), crossing).await {
+                FenceDecision::Deny(refusal) => assert_eq!(refusal, expected, "{case}"),
+                other => panic!("{case}: expected a refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(permission_rows(&orch).await, 0);
+    }
+
+    /// A read and a write of one path are two grants, and neither answers the
+    /// other. The write may be self-approved, so if it answered the read it
+    /// would launder the read past the operator gate on the sensitive denylist.
+    #[tokio::test]
+    async fn a_session_grant_answers_only_its_own_access() {
+        let path = Path::new("/outside/a");
+        let write = || Crossing::shell_path(path, "touch /outside/a");
+        let read = || Crossing::read_denied(path);
+        assert_eq!(
+            descriptor_grant(&read().descriptor),
+            Some((path.to_path_buf(), CrossingAccess::Read))
+        );
+        assert_eq!(
+            descriptor_grant(&write().descriptor),
+            Some((path.to_path_buf(), CrossingAccess::Write))
+        );
+        assert_eq!(descriptor_grant("git status --short"), None);
+
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        let answered = |crossing: Crossing| {
+            matches!(
+                decide_without_asking(&orch, Fence::Ask, &crossing),
+                Some(FenceDecision::Allow)
+            )
+        };
+        let grant = |descriptor: String| {
+            let mut allowed = orch.session_allowed_crossings.lock().unwrap();
+            allowed.clear();
+            allowed.insert(descriptor);
+        };
+
+        grant(read().descriptor);
+        assert!(answered(read()));
+        assert!(!answered(write()));
+
+        grant(write().descriptor);
+        assert!(answered(write()));
+        assert!(!answered(read()));
     }
 
     async fn permission_rows(orch: &Orchestrator) -> i64 {
@@ -825,7 +1066,7 @@ mod tests {
     }
 
     /// A path denial whose command has no in-sandbox route still raises the
-    /// path-scoped prompt it always did.
+    /// path-scoped prompt, and the stored card states the rerun's effect.
     #[tokio::test]
     async fn a_path_denial_for_an_unrecognized_command_still_prompts() {
         let orch = super::super::permission::tests::test_orchestrator().await;
@@ -887,6 +1128,8 @@ mod tests {
         let stored: serde_json::Value = serde_json::from_str(&tool_input).unwrap();
         assert_eq!(stored["kind"], CrossingKind::ShellPathCrossing.tag());
         assert_eq!(stored["descriptor"], "/outside/x");
+        let card = stored["summary"].as_str().unwrap();
+        assert!(card.contains("also writable"), "{card}");
     }
 
     /// A write under Cairn's scratch root, however it reached the fence, is
@@ -953,8 +1196,8 @@ mod tests {
     }
 
     /// A remote executor's scratch root is refused by name too: an approval
-    /// would rerun the item with no fence, which would make the root
-    /// approvable there while it is refused here.
+    /// would open the root's path on the rerun, which would make it approvable
+    /// there while it is refused here.
     #[tokio::test]
     async fn a_remote_executors_scratch_root_is_refused_by_name_too() {
         let remote = Path::new("/home/dev/.cairn-executor/scratch/lab");
@@ -1037,7 +1280,11 @@ mod tests {
 
     #[test]
     fn read_and_write_crossings_describe_paths() {
-        assert_eq!(Crossing::read_denied(Path::new("/x")).descriptor, "/x");
+        assert_eq!(Crossing::read_denied(Path::new("/x")).descriptor, "read:/x");
+        assert_eq!(
+            Crossing::read_denied(Path::new("/x")).host_path(),
+            Some(Path::new("/x"))
+        );
         assert_eq!(Crossing::write_outside(Path::new("/y")).descriptor, "/y");
     }
 }

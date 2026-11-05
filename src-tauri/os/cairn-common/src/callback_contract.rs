@@ -429,6 +429,7 @@ mod tests {
             cwd: "/w".into(),
             denial: SandboxDenial::Command,
             reported_denial: None,
+            rerun: None,
         }
     }
 
