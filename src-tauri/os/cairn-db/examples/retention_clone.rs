@@ -32,13 +32,23 @@
 //!                              carries the host's load average, because on a
 //!                              busy host the storm adds to real load rather than
 //!                              simulating it
-//!   passes <db> <now> <n>      run `n` production evictor passes
-//!                              (`retention::run_pass`, `EvictorBudget::PRODUCTION`)
-//!                              back to back on one `EvictorState`, under
-//!                              loadfold's full storm (12 spinners, fsync, pooled
-//!                              callers), and report the rules each pass served,
-//!                              its folds, the cost per page each rule learned,
-//!                              and what the concurrent callers saw
+//!   passes <db> <now> <n> [folds_per_pass]
+//!                              run `n` production evictor passes
+//!                              (`retention::run_pass`, `EvictorBudget::PRODUCTION`,
+//!                              with the fold cap overridden when given) back to
+//!                              back on one `EvictorState`, under loadfold's full
+//!                              storm (12 spinners, fsync, pooled callers), and
+//!                              report the rules each pass served, its folds and
+//!                              writes, the cost per page each rule learned, and
+//!                              what the concurrent callers saw
+//!   foldfit <db> <now> <rules> <windows> <reps> <max_seconds>
+//!                              under the same storm, for each comma-separated rule
+//!                              and window size (pages, 0 for a fold of the storm's
+//!                              log alone), fold the log, delete that many pages,
+//!                              and fold them with the production call; report each
+//!                              fold's work and the fit of work against pages as a
+//!                              fixed floor plus a per-page slope, per rule. No new
+//!                              window starts past `max_seconds`
 //!   qosprobe                   the QoS class a plain `std::thread` gets when a
 //!                              user-initiated thread spawns it, which is how a
 //!                              production runtime worker spawns the checkpoint
@@ -56,7 +66,7 @@ use std::time::{Duration, Instant};
 use cairn_db::storage::retention::{
     quantile, run_pass, run_rules, Eviction, EvictorBudget, EvictorState, PassEnd,
 };
-use cairn_db::storage::{DrainBudget, LocalDb, RowExt};
+use cairn_db::storage::{CheckpointReport, DrainBudget, LocalDb, RowExt};
 use cairn_db::turso::Value;
 use rand::RngCore;
 use serde_json::{json, Value as Json};
@@ -87,7 +97,11 @@ async fn main() {
         ["logdelta", db, sql] => logdelta(db, sql).await,
         ["loadfold", db, mib, threads, fsync] => loadfold(db, mib, threads, fsync).await,
         ["qosprobe"] => Ok(qos_probe()),
-        ["passes", db, now, n] => passes(db, now, n).await,
+        ["passes", db, now, n] => passes(db, now, n, None).await,
+        ["passes", db, now, n, folds] => passes(db, now, n, Some(folds)).await,
+        ["foldfit", db, now, rules, windows, reps, max_seconds] => {
+            foldfit(db, now, rules, windows, reps, max_seconds).await
+        }
         _ => Err(
             "usage: retention_clone fold|sql|catchup|logdelta|loadfold <db> ... (see the module \
              docs)"
@@ -230,15 +244,7 @@ async fn logdelta(path: &str, sql: &str) -> Res<Json> {
 /// production shape of a full catch-up.
 async fn catchup(path: &str, now: &str, rules: &str) -> Res<Json> {
     let now: i64 = now.parse().map_err(|_| format!("bad clock {now}"))?;
-    let rules = rules
-        .split(',')
-        .map(|name| {
-            Eviction::ALL
-                .into_iter()
-                .find(|rule| rule.name() == name)
-                .ok_or_else(|| format!("unknown rule {name}"))
-        })
-        .collect::<Res<Vec<_>>>()?;
+    let rules = parse_rules(rules)?;
     let (db, open_s) = open(path).await?;
     let budget = EvictorBudget {
         pass_time: Duration::from_secs(24 * 3600),
@@ -327,6 +333,18 @@ async fn catchup(path: &str, now: &str, rules: &str) -> Res<Json> {
         "folds_failed": folds.iter().filter(|f| f["ok"] == json!(false)).count(),
         "rules": out,
     }))
+}
+
+fn parse_rules(rules: &str) -> Res<Vec<Eviction>> {
+    rules
+        .split(',')
+        .map(|name| {
+            Eviction::ALL
+                .into_iter()
+                .find(|rule| rule.name() == name)
+                .ok_or_else(|| format!("unknown rule {name}"))
+        })
+        .collect()
 }
 
 fn fold_work(folds: &[Json]) -> Json {
@@ -442,9 +460,18 @@ async fn loadfold(path: &str, mib: &str, threads: &str, fsync: &str) -> Res<Json
     }))
 }
 
-async fn passes(path: &str, now: &str, n: &str) -> Res<Json> {
+async fn passes(path: &str, now: &str, n: &str, folds: Option<&&str>) -> Res<Json> {
     let now: i64 = now.parse().map_err(|_| format!("bad clock {now}"))?;
     let n: usize = n.parse().map_err(|_| format!("bad pass count {n}"))?;
+    let budget = match folds {
+        None => EvictorBudget::PRODUCTION,
+        Some(folds) => EvictorBudget {
+            folds_per_pass: folds
+                .parse()
+                .map_err(|_| format!("bad folds_per_pass {folds}"))?,
+            ..EvictorBudget::PRODUCTION
+        },
+    };
     let dir = Path::new(path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -469,13 +496,24 @@ async fn passes(path: &str, now: &str, n: &str) -> Res<Json> {
     let mut state = EvictorState::default();
     let mut out = Vec::new();
     let mut abandoned = 0usize;
+    let mut first_served: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut all_writes = Vec::new();
     for pass in 1..=n {
-        let report = run_pass(&db, now, EvictorBudget::PRODUCTION, &mut state).await;
+        let report = run_pass(&db, now, budget, &mut state).await;
         let in_engine = db.checkpoint_in_flight();
         abandoned += usize::from(in_engine);
         while db.checkpoint_in_flight() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        for rule in report.rules.iter().filter(|rule| rule.pages > 0) {
+            first_served.entry(rule.eviction.name()).or_insert(pass);
+        }
+        let writes: Vec<u64> = report
+            .rules
+            .iter()
+            .flat_map(|rule| rule.write_ms.iter().copied())
+            .collect();
+        all_writes.extend(&writes);
         out.push(json!({
             "pass": pass,
             "end": format!("{:?}", report.end),
@@ -483,10 +521,19 @@ async fn passes(path: &str, now: &str, n: &str) -> Res<Json> {
             "duration_ms": report.duration.as_millis() as u64,
             "log_peak_mib": report.log_peak_bytes as f64 / 1048576.0,
             "attempt_left_in_engine": in_engine,
+            "write_ms_p50": quantile(&writes, 0.5),
+            "write_ms_max": writes.iter().max().copied().unwrap_or(0),
+            "fold_work_ms_total": report.folds.iter()
+                .map(|fold| fold.work().as_millis() as u64).sum::<u64>(),
+            "fold_drain_ms_total": report.folds.iter()
+                .map(|fold| fold.drain.as_millis() as u64).sum::<u64>(),
             "rules": report.rules.iter().map(|rule| json!({
                 "rule": rule.eviction.name(),
                 "pages": rule.pages,
                 "rows": rule.rows,
+                "write_ms_p50": quantile(&rule.write_ms, 0.5),
+                "write_ms_max": rule.write_ms.iter().max().copied().unwrap_or(0),
+                "select_ms_max": rule.select_ms.iter().max().copied().unwrap_or(0),
                 "finished": rule.finished,
                 "error": rule.error,
             })).collect::<Vec<_>>(),
@@ -502,13 +549,104 @@ async fn passes(path: &str, now: &str, n: &str) -> Res<Json> {
     let seconds = started.elapsed().as_secs_f64();
     let load_avg_during = load_average();
     let load = load.finish().await;
+    let target = budget
+        .fold_work_target
+        .unwrap_or(Duration::from_millis(500));
     let learned: serde_json::Map<String, Json> = Eviction::ALL
         .iter()
         .map(|rule| {
             (
                 rule.name().to_string(),
-                json!(state.fold_ms_per_page(*rule)),
+                json!({
+                    "fold_ms_per_page": state.fold_ms_per_page(*rule),
+                    "pages_per_fold": state.pages_per_fold(*rule, target),
+                }),
             )
+        })
+        .collect();
+    Ok(json!({
+        "folds_per_pass": budget.folds_per_pass,
+        "open_s": open_s,
+        "inherited_fold": inherited,
+        "load_avg_before": load_avg_before,
+        "load_avg_during": load_avg_during,
+        "seconds": seconds,
+        "attempts_left_in_engine": abandoned,
+        "first_served_pass": first_served,
+        "write_ms_p50": quantile(&all_writes, 0.5),
+        "write_ms_max": all_writes.iter().max().copied().unwrap_or(0),
+        "writes_over_1s": all_writes.iter().filter(|ms| **ms > 1000).count(),
+        "learned": learned,
+        "passes": out,
+        "load": load,
+    }))
+}
+
+async fn foldfit(
+    path: &str,
+    now: &str,
+    rules: &str,
+    windows: &str,
+    reps: &str,
+    max_seconds: &str,
+) -> Res<Json> {
+    let now: i64 = now.parse().map_err(|_| format!("bad clock {now}"))?;
+    let rules = parse_rules(rules)?;
+    let windows = windows
+        .split(',')
+        .map(|w| w.parse().map_err(|_| format!("bad window {w}")))
+        .collect::<Res<Vec<usize>>>()?;
+    let reps: usize = reps.parse().map_err(|_| format!("bad reps {reps}"))?;
+    let limit = Duration::from_secs(
+        max_seconds
+            .parse()
+            .map_err(|_| format!("bad max_seconds {max_seconds}"))?,
+    );
+    let dir = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let (db, open_s) = open(path).await?;
+    let db = Arc::new(db);
+    let inherited = quiet_fold(&db).await?;
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS fold_probe (id INTEGER PRIMARY KEY, payload BLOB)",
+        "CREATE TABLE IF NOT EXISTS fold_probe_load (id INTEGER PRIMARY KEY, at INTEGER)",
+    ] {
+        db.execute(sql, ())
+            .await
+            .map_err(|e| format!("{e}: {sql}"))?;
+    }
+
+    let load_avg_before = load_average();
+    let load = Load::start(db.clone(), 12, Some(dir));
+    tokio::time::sleep(STORM_SETTLE).await;
+    let started = Instant::now();
+    let mut samples: Vec<FoldSample> = Vec::new();
+    'reps: for rep in 0..reps {
+        for rule in &rules {
+            // Rotated each rep, so a window size is not tied to one position
+            // after a large window's dirty pages.
+            for offset in 0..windows.len() {
+                if started.elapsed() >= limit {
+                    break 'reps;
+                }
+                let window = windows[(offset + rep) % windows.len()];
+                samples.push(fold_window(&db, now, *rule, window).await?);
+            }
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    let load_avg_during = load_average();
+    let load = load.finish().await;
+
+    let fits: Vec<Json> = rules
+        .iter()
+        .map(|rule| {
+            let of_rule: Vec<&FoldSample> =
+                samples.iter().filter(|s| s.rule == rule.name()).collect();
+            fit_json(rule.name(), &of_rule, &windows)
         })
         .collect();
     Ok(json!({
@@ -517,11 +655,164 @@ async fn passes(path: &str, now: &str, n: &str) -> Res<Json> {
         "load_avg_before": load_avg_before,
         "load_avg_during": load_avg_during,
         "seconds": seconds,
-        "attempts_left_in_engine": abandoned,
-        "learned_fold_ms_per_page": learned,
-        "passes": out,
+        "windows_abandoned": samples.iter().filter(|s| s.abandoned).count(),
+        "fits": fits,
+        "samples": samples.iter().map(FoldSample::json).collect::<Vec<_>>(),
         "load": load,
     }))
+}
+
+/// One window `foldfit` deleted and folded.
+struct FoldSample {
+    rule: &'static str,
+    wanted: usize,
+    pages: usize,
+    rows: usize,
+    delete_ms: u64,
+    write_ms_max: u64,
+    log_bytes: u64,
+    settle_work_ms: u64,
+    work_ms: u64,
+    drain_ms: u64,
+    succeeded: bool,
+    abandoned: bool,
+    errors: Vec<String>,
+}
+
+impl FoldSample {
+    fn json(&self) -> Json {
+        json!({
+            "rule": self.rule,
+            "wanted": self.wanted,
+            "pages": self.pages,
+            "rows": self.rows,
+            "delete_ms": self.delete_ms,
+            "write_ms_max": self.write_ms_max,
+            "log_mib": self.log_bytes as f64 / 1048576.0,
+            "settle_work_ms": self.settle_work_ms,
+            "work_ms": self.work_ms,
+            "drain_ms": self.drain_ms,
+            "succeeded": self.succeeded,
+            "abandoned": self.abandoned,
+            "errors": self.errors,
+        })
+    }
+}
+
+/// Fold the log, delete `wanted` pages of `rule`, and fold those with the
+/// production call. A budget of one row ends each `run_rules` after one page,
+/// and with no fold trigger it never folds on its own, so the window holds
+/// exactly the pages asked for (fewer only when the rule runs out).
+async fn fold_window(db: &LocalDb, now: i64, rule: Eviction, wanted: usize) -> Res<FoldSample> {
+    let budget = EvictorBudget {
+        pass_time: Duration::from_secs(3600),
+        pass_rows: 1,
+        fold_at_log_bytes: u64::MAX,
+        fold_work_target: None,
+        folds_per_pass: 0,
+        slow_write: Duration::MAX,
+    };
+    let (settle, settle_abandoned) = production_fold(db).await?;
+    let mut state = EvictorState::default();
+    let (mut pages, mut rows, mut write_ms_max) = (0usize, 0usize, 0u64);
+    let mut errors = Vec::new();
+    let delete_started = Instant::now();
+    for _ in 0..wanted {
+        let report = run_rules(db, now, budget, &mut state, &[rule]).await;
+        let Some(result) = report.rules.first() else {
+            break;
+        };
+        pages += result.pages;
+        rows += result.rows;
+        write_ms_max = write_ms_max.max(result.write_ms.iter().max().copied().unwrap_or(0));
+        errors.extend(result.error.clone());
+        if result.finished || result.error.is_some() {
+            break;
+        }
+    }
+    let delete_ms = delete_started.elapsed().as_millis() as u64;
+    let log_bytes = db.logical_log_bytes();
+    let (fold, abandoned) = production_fold(db).await?;
+    errors.extend(settle.error.clone());
+    errors.extend(fold.error.clone());
+    Ok(FoldSample {
+        rule: rule.name(),
+        wanted,
+        pages,
+        rows,
+        delete_ms,
+        write_ms_max,
+        log_bytes,
+        settle_work_ms: settle
+            .duration
+            .saturating_sub(settle.drain.waited)
+            .as_millis() as u64,
+        work_ms: fold.duration.saturating_sub(fold.drain.waited).as_millis() as u64,
+        drain_ms: fold.drain.waited.as_millis() as u64,
+        succeeded: fold.succeeded(),
+        abandoned: abandoned || settle_abandoned,
+        errors,
+    })
+}
+
+/// The evictor's checkpoint call, waiting out an attempt the backstop gave up
+/// on so the next window starts from a log nothing is folding. The flag says
+/// whether that happened.
+async fn production_fold(db: &LocalDb) -> Res<(CheckpointReport, bool)> {
+    let report = db
+        .checkpoint(3, Duration::from_millis(50), DrainBudget::PRODUCTION)
+        .await
+        .map_err(|e| e.to_string())?;
+    let abandoned = db.checkpoint_in_flight();
+    while db.checkpoint_in_flight() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok((report, abandoned))
+}
+
+/// Least squares of fold work on pages over one rule's windows, with the
+/// median work at each window size beside it so a fit a line does not describe
+/// shows as one.
+fn fit_json(rule: &str, samples: &[&FoldSample], windows: &[usize]) -> Json {
+    let n = samples.len() as f64;
+    let mean_x = samples.iter().map(|s| s.pages as f64).sum::<f64>() / n.max(1.0);
+    let mean_y = samples.iter().map(|s| s.work_ms as f64).sum::<f64>() / n.max(1.0);
+    let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+    for sample in samples {
+        let (dx, dy) = (sample.pages as f64 - mean_x, sample.work_ms as f64 - mean_y);
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+    let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let by_window: Vec<Json> = windows
+        .iter()
+        .map(|window| {
+            let work: Vec<u64> = samples
+                .iter()
+                .filter(|s| s.wanted == *window)
+                .map(|s| s.work_ms)
+                .collect();
+            let of_window = samples.iter().filter(|s| s.wanted == *window);
+            json!({
+                "pages": window,
+                "samples": work.len(),
+                "work_ms_median": quantile(&work, 0.5),
+                "work_ms_max": work.iter().max().copied().unwrap_or(0),
+                "rows_max": of_window.map(|s| s.rows).max().unwrap_or(0),
+            })
+        })
+        .collect();
+    let settles: Vec<u64> = samples.iter().map(|s| s.settle_work_ms).collect();
+    json!({
+        "rule": rule,
+        "samples": samples.len(),
+        "floor_ms": mean_y - slope * mean_x,
+        "slope_ms_per_page": slope,
+        "r2": if sxx > 0.0 && syy > 0.0 { sxy * sxy / (sxx * syy) } else { 0.0 },
+        "settle_work_ms_median": quantile(&settles, 0.5),
+        "by_window": by_window,
+    })
 }
 
 /// Fold whatever the log holds with nothing else running, and say what it was

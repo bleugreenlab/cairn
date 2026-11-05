@@ -43,7 +43,7 @@
 //! columns sit after a large payload, and building `effect_outbox(state,
 //! updated_at)` took 39 s on the 10-30 production clone.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::storage::{DbResult, DrainBudget, LocalDb, RowExt, TrackedConnection};
@@ -1389,42 +1389,40 @@ pub struct EvictorBudget {
     pub pass_rows: usize,
     /// Logical-log size at which the pass folds before its next page.
     pub fold_at_log_bytes: u64,
-    /// The fold work (excluding the drain) the pass lets its unfolded pages
-    /// accumulate before it folds them, or `None` to fold on log size alone.
-    /// See [`EvictorState`].
+    /// The fold work (excluding the drain and the fold's fixed cost) the pass
+    /// lets its unfolded pages accumulate before it folds them, or `None` to
+    /// fold on log size alone. See [`EvictorState`].
     pub fold_work_target: Option<Duration>,
     /// Folds one pass may ask for; past it the pass ends and leaves the rest
     /// to the next pass.
     pub folds_per_pass: usize,
+    /// How long one page's write may take before the pass stops starting pages.
+    pub slow_write: Duration,
 }
 
 impl EvictorBudget {
     /// The orchestrator's pass, every [`PASS_INTERVAL`]. Each fold closes the
     /// connection gate for its drain plus about half a second of work.
     ///
-    /// One fold a pass, not the eight the clone rehearsal sized. The cap came
-    /// in after the first build carrying the evictor wedged in the minute a
-    /// pass folded (cairn/5644). What made those folds dangerous has since
-    /// changed. A fold that is merely slow keeps the gate shut until it
-    /// returns, so it costs a pause rather than a burst of `database is
-    /// locked`, and only a two-minute backstop gives an attempt up. The
-    /// periodic pass folds at 64 MiB, so a pass no longer starts against ten
-    /// minutes of other writers' log. And the checkpoint thread runs at the
-    /// runtime workers' QoS, which on the 11-03 clone kept a 256 MiB fold under
-    /// a CPU and fsync storm at 1.5 s where it had taken 23 s (cairn/5655). The
-    /// cap stays until a clone run of production passes under that storm shows
-    /// no fold abandoned (`examples/retention_clone.rs passes`).
+    /// Eight folds keep one pass's fold work under about 10 s: the first fold
+    /// settles whatever log the pass inherited (up to the periodic fold's
+    /// 64 MiB, usually 1 to 4 s in production), and each of the other seven
+    /// costs about the half-second target plus the fold's fixed cost. Nothing
+    /// bounds a fold that runs long, and production has seen one at 19 s over
+    /// 34 MiB. Under a CPU and fsync storm on a clone of production, twelve
+    /// passes at this cap did at most 5.6 s of fold work a pass, with no fold
+    /// over 1.6 s, none abandoned, and no caller refused (cairn/6041).
     ///
-    /// Meanwhile a pass deletes about one page: its first fold settles the page
-    /// the last pass left unfolded, and the next fold due ends it. The rotation
-    /// in [`run_pass`] makes that page a different rule's each pass, where the
-    /// cap used to leave every rule after the first unserved.
+    /// A page's write taking a second means the host is saturated. Eviction is
+    /// background work, so the pass stops adding to it rather than finishing
+    /// its budget.
     pub const PRODUCTION: Self = Self {
         pass_time: Duration::from_secs(90),
         pass_rows: 200_000,
         fold_at_log_bytes: super::FOLD_AT_LOG_BYTES,
         fold_work_target: Some(Duration::from_millis(500)),
-        folds_per_pass: 1,
+        folds_per_pass: 8,
+        slow_write: Duration::from_secs(1),
     };
 }
 
@@ -1447,6 +1445,24 @@ pub fn evictor_enabled(setting: Option<&str>) -> bool {
 /// The most pages one fold covers, however cheap a rule's pages fold.
 const MAX_PAGES_PER_FOLD: usize = 64;
 
+/// How many times larger than the window it was last measured over a rule's
+/// next window may be. Once the floor is taken out, one low sample can read as
+/// a page costing nothing, and the fold that disproves it should not be
+/// [`MAX_PAGES_PER_FOLD`] pages of code maps.
+const MAX_WINDOW_GROWTH: usize = 4;
+
+/// How many measured folds the floor is the least of: about five passes, so it
+/// follows the host's condition rather than its best moment.
+const FLOOR_SAMPLES: usize = 32;
+
+/// One rule's measured fold cost.
+#[derive(Debug, Clone, Copy)]
+struct FoldCost {
+    ms_per_page: f64,
+    /// The pages of the window last measured.
+    window: usize,
+}
+
 /// What the evictor has learned about folding, kept across passes.
 ///
 /// A fold's cost follows the payload the deletes freed, not the log they
@@ -1458,17 +1474,30 @@ const MAX_PAGES_PER_FOLD: usize = 64;
 /// cost more than [`EvictorBudget::fold_work_target`]. A rule it has not
 /// measured yet folds after its first page.
 ///
-/// It learns only from folds whose window its own pages filled. A pass's first
-/// fold, made before the pass has deleted anything, covers whatever log other
-/// writers left since the last fold, and pages carried over from an earlier
-/// pass. Charging that to the carried-over pages made one page look like
-/// twenty seconds of work, which clamped every rule to a fold per page and so
-/// to a fold-due check after every page (cairn/5655). That fold settles the
-/// log and teaches nothing.
+/// It learns only from folds whose window began at the pass's own previous
+/// fold. A pass's first fold covers whatever log other writers left since the
+/// last fold, up to the periodic fold's 64 MiB, and any pages carried over from
+/// an earlier pass. In production that log, not the pass's page, is where the
+/// fold's work went: about 1 s at 30 MiB, against 70-300 ms over a log near
+/// empty. Charging it to the page made a rule look many times its cost
+/// (cairn/5655, cairn/6041). That fold settles the log and teaches nothing.
+///
+/// A fold also has a fixed cost that no page caused. Counting that against the
+/// pages made the estimate depend on the window, and stopped a window growing
+/// at all once the fixed cost reached the target, so the estimate is the work
+/// above a floor, and the target bounds what the pages add. The floor is the
+/// least of the recent measured folds. Each of those is the true fixed cost
+/// plus that fold's own pages, so the floor errs high and understates a page,
+/// which errs toward a larger window. When one-page folds set the floor, the
+/// understatement is one page's worth of the window: about a quarter at four
+/// pages, less beyond, and all of it at one page, where the sample can read as
+/// zero. `MAX_WINDOW_GROWTH` and `MAX_PAGES_PER_FOLD` are what bound that.
 #[derive(Debug, Default)]
 pub struct EvictorState {
-    /// Fold work per deleted page, per rule.
-    fold_ms_per_page: HashMap<Eviction, f64>,
+    /// Fold work per deleted page above the floor, per rule.
+    costs: HashMap<Eviction, FoldCost>,
+    /// The work of the last [`FLOOR_SAMPLES`] measured folds, in milliseconds.
+    recent_work_ms: VecDeque<u64>,
     /// Deleted pages no fold has covered yet, and the rule that wrote them.
     unfolded: Option<(Eviction, usize)>,
     /// The index in [`Eviction::ALL`] the next [`run_pass`] starts at.
@@ -1476,21 +1505,25 @@ pub struct EvictorState {
 }
 
 impl EvictorState {
-    /// The fold work per page learned for `eviction`, in milliseconds, or
-    /// `None` before its first measured fold.
+    /// The fold work per page learned for `eviction`, above the floor, in
+    /// milliseconds, or `None` before its first measured fold.
     pub fn fold_ms_per_page(&self, eviction: Eviction) -> Option<f64> {
-        self.fold_ms_per_page.get(&eviction).copied()
+        self.costs.get(&eviction).map(|cost| cost.ms_per_page)
     }
 
     /// How many unfolded pages of `eviction` one fold may cover.
-    fn pages_per_fold(&self, eviction: Eviction, target: Duration) -> usize {
-        match self.fold_ms_per_page.get(&eviction) {
-            Some(ms) if *ms > 0.0 => {
-                ((target.as_millis() as f64 / ms) as usize).clamp(1, MAX_PAGES_PER_FOLD)
-            }
-            Some(_) => MAX_PAGES_PER_FOLD,
-            None => 1,
-        }
+    pub fn pages_per_fold(&self, eviction: Eviction, target: Duration) -> usize {
+        let Some(cost) = self.costs.get(&eviction) else {
+            return 1;
+        };
+        let affordable = if cost.ms_per_page > 0.0 {
+            (target.as_millis() as f64 / cost.ms_per_page) as usize
+        } else {
+            MAX_PAGES_PER_FOLD
+        };
+        affordable
+            .min(cost.window * MAX_WINDOW_GROWTH)
+            .clamp(1, MAX_PAGES_PER_FOLD)
     }
 
     /// Whether the unfolded pages must be folded before `next` deletes more.
@@ -1511,13 +1544,26 @@ impl EvictorState {
     }
 
     fn folded(&mut self, work: Duration) {
-        if let Some((rule, pages)) = self.unfolded.take() {
-            let sample = work.as_millis() as f64 / pages as f64;
-            let estimate = match self.fold_ms_per_page.get(&rule) {
-                Some(previous) => (previous + sample) / 2.0,
-                None => sample,
-            };
-            self.fold_ms_per_page.insert(rule, estimate);
+        let Some((rule, pages)) = self.unfolded.take() else {
+            return;
+        };
+        let work_ms = work.as_millis() as u64;
+        let floor_ms = self.recent_work_ms.iter().min().copied().unwrap_or(0);
+        let sample = work_ms.saturating_sub(floor_ms) as f64 / pages as f64;
+        let ms_per_page = match self.costs.get(&rule) {
+            Some(previous) => (previous.ms_per_page + sample) / 2.0,
+            None => sample,
+        };
+        self.costs.insert(
+            rule,
+            FoldCost {
+                ms_per_page,
+                window: pages,
+            },
+        );
+        self.recent_work_ms.push_back(work_ms);
+        if self.recent_work_ms.len() > FLOOR_SAMPLES {
+            self.recent_work_ms.pop_front();
         }
     }
 
@@ -1574,6 +1620,8 @@ pub enum PassEnd {
     TimeBudget,
     RowBudget,
     FoldBudget,
+    /// A page's write took at least [`EvictorBudget::slow_write`].
+    SlowWrite,
     /// A fold failed; deleting more would only grow the log.
     FoldFailed,
 }
@@ -1708,7 +1756,7 @@ pub async fn run_rules(
         end: PassEnd::Complete,
     };
     let mut rows_total = 0usize;
-    let mut deleted_this_pass = false;
+    let mut slow_write = false;
     'rules: for &eviction in rules {
         let mut rule = RuleReport {
             eviction,
@@ -1722,13 +1770,19 @@ pub async fn run_rules(
         };
         let mut cursor = Cursor::default();
         loop {
-            if started.elapsed() >= budget.pass_time {
+            if slow_write {
+                // The pass is over whichever way this goes, unless the fold it
+                // owes fails, which is the worse news to report.
+                let fold = fold_if_due(db, budget, state, eviction, &mut report).await;
+                report.end = match fold {
+                    Some(PassEnd::FoldFailed) => PassEnd::FoldFailed,
+                    _ => PassEnd::SlowWrite,
+                };
+            } else if started.elapsed() >= budget.pass_time {
                 report.end = PassEnd::TimeBudget;
             } else if rows_total >= budget.pass_rows {
                 report.end = PassEnd::RowBudget;
-            } else if let Some(end) =
-                fold_if_due(db, budget, state, eviction, !deleted_this_pass, &mut report).await
-            {
+            } else if let Some(end) = fold_if_due(db, budget, state, eviction, &mut report).await {
                 report.end = end;
             }
             if report.end != PassEnd::Complete {
@@ -1739,13 +1793,13 @@ pub async fn run_rules(
                 Ok(page) => {
                     rule.select_ms.push(page.select.as_millis() as u64);
                     if page.rows > 0 {
-                        deleted_this_pass = true;
                         state.deleted_page(eviction);
                         rule.pages += 1;
                         rule.rows += page.rows;
                         rule.max_page_rows = rule.max_page_rows.max(page.rows);
                         rule.write_ms.push(page.write.as_millis() as u64);
                         rows_total += page.rows;
+                        slow_write = page.write >= budget.slow_write;
                     }
                     report.log_peak_bytes = report.log_peak_bytes.max(db.logical_log_bytes());
                     if page.done {
@@ -1768,15 +1822,14 @@ pub async fn run_rules(
 
 /// Fold before `next` deletes another page when the log has passed the
 /// budget's threshold or the unfolded pages would cost more than the fold
-/// target. A `settling` fold, one made before this pass has deleted a page,
-/// counts against the fold budget like any other but does not train the
-/// estimate (see [`EvictorState`]). Returns why the pass must end, if it must.
+/// target. The pass's first fold counts against the fold budget like any other
+/// but does not train the estimate (see [`EvictorState`]). Returns why the pass
+/// must end, if it must.
 async fn fold_if_due(
     db: &LocalDb,
     budget: EvictorBudget,
     state: &mut EvictorState,
     next: Eviction,
-    settling: bool,
     report: &mut PassReport,
 ) -> Option<PassEnd> {
     let log_bytes = db.logical_log_bytes();
@@ -1818,7 +1871,7 @@ async fn fold_if_due(
             false,
         ),
     };
-    if succeeded && settling {
+    if succeeded && report.folds.is_empty() {
         state.settled();
     } else if succeeded {
         state.folded(record.work());

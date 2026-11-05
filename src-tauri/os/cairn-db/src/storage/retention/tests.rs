@@ -15,6 +15,7 @@ const UNBOUNDED: EvictorBudget = EvictorBudget {
     fold_at_log_bytes: u64::MAX,
     fold_work_target: None,
     folds_per_pass: 0,
+    slow_write: Duration::MAX,
 };
 
 #[test]
@@ -429,12 +430,14 @@ fn the_next_pass_starts_where_this_one_was_cut_short() {
     assert_eq!(state.start, 0, "wraps past the end");
 }
 
-/// A fold before the pass deletes anything covers other writers' log and pages
-/// carried over from the previous pass, so it clears them without teaching the
-/// estimate. A fold over the pass's own pages does teach it.
+/// A pass's first fold covers other writers' log and pages carried over from
+/// the previous pass, so it clears them without teaching the estimate, even
+/// when the pass has deleted a page first. The next fold's window began at that
+/// fold, so it does teach it.
 #[tokio::test]
-async fn a_settling_fold_does_not_train_the_estimate() {
+async fn a_passs_first_fold_does_not_train_the_estimate() {
     let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
     let budget = EvictorBudget {
         fold_work_target: Some(Duration::from_millis(500)),
         folds_per_pass: 2,
@@ -443,33 +446,36 @@ async fn a_settling_fold_does_not_train_the_estimate() {
 
     let mut state = EvictorState::default();
     state.deleted_page(Eviction::DoneOutbox);
-    let settling = run_rules(&db, NOW, budget, &mut state, &[Eviction::DoneOutbox]).await;
-    assert_eq!(settling.folds.len(), 1, "{settling}");
-    assert!(settling.folds[0].succeeded, "{settling}");
+    let carried = run_rules(&db, NOW, budget, &mut state, &[Eviction::DoneOutbox]).await;
+    assert_eq!(carried.folds.len(), 1, "{carried}");
+    assert!(carried.folds[0].succeeded, "{carried}");
     assert!(state.unfolded.is_none());
     assert_eq!(state.fold_ms_per_page(Eviction::DoneOutbox), None);
 
-    insert_outbox(
-        &db,
-        "done-old",
-        "done",
-        NOW - 3 * 24 * HOUR,
-        NOW - 2 * 24 * HOUR,
-    )
-    .await;
-    let trained = run_rules(
+    let old = NOW - 3 * 24 * HOUR;
+    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+    insert_stream(&db, "finalized-old", "finalized", old, Some(old), 2).await;
+    let report = run_rules(
         &db,
         NOW,
         budget,
         &mut state,
-        &[Eviction::DoneOutbox, Eviction::AppliedSearchOutbox],
+        &[
+            Eviction::DoneOutbox,
+            Eviction::TerminalStreams,
+            Eviction::WatchdogLifecycle,
+        ],
     )
     .await;
-    assert_eq!(trained.folds.len(), 1, "{trained}");
-    assert_eq!(trained.rows(), 1, "{trained}");
+    assert_eq!(report.folds.len(), 2, "{report}");
+    assert_eq!(
+        state.fold_ms_per_page(Eviction::DoneOutbox),
+        None,
+        "the pass's first page was covered by its first fold: {report}"
+    );
     assert!(
-        state.fold_ms_per_page(Eviction::DoneOutbox).is_some(),
-        "a fold over the pass's own page trains its rule"
+        state.fold_ms_per_page(Eviction::TerminalStreams).is_some(),
+        "a window that began at the pass's own fold trains its rule: {report}"
     );
 }
 
@@ -1008,12 +1014,10 @@ fn folds_are_sized_by_the_measured_cost_of_each_rule() {
         "unmeasured: one page"
     );
 
-    state.folded(Duration::from_millis(100));
-    assert_eq!(state.pages_per_fold(Eviction::DoneOutbox, target), 5);
-    for _ in 0..4 {
-        state.deleted_page(Eviction::DoneOutbox);
-        assert!(!state.fold_due(Eviction::DoneOutbox, target));
-    }
+    state.folded(Duration::from_millis(250));
+    assert_eq!(state.pages_per_fold(Eviction::DoneOutbox, target), 2);
+    state.deleted_page(Eviction::DoneOutbox);
+    assert!(!state.fold_due(Eviction::DoneOutbox, target));
     state.deleted_page(Eviction::DoneOutbox);
     assert!(state.fold_due(Eviction::DoneOutbox, target));
     assert!(
@@ -1024,6 +1028,196 @@ fn folds_are_sized_by_the_measured_cost_of_each_rule() {
     // A page that folds slower than the target is still folded one at a time.
     state.folded(Duration::from_millis(30_000));
     assert_eq!(state.pages_per_fold(Eviction::DoneOutbox, target), 1);
+}
+
+/// A pass stops starting pages after a slow write, whichever rule it was in,
+/// and a page that deleted nothing wrote nothing and cannot be slow.
+#[tokio::test]
+async fn a_slow_write_ends_the_pass() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let old = NOW - 3 * 24 * HOUR;
+    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+    insert_stream(&db, "finalized-old", "finalized", old, Some(old), 2).await;
+    let budget = EvictorBudget {
+        slow_write: Duration::ZERO,
+        ..UNBOUNDED
+    };
+
+    let report = run(
+        &db,
+        budget,
+        &[
+            Eviction::AppliedSearchOutbox,
+            Eviction::DoneOutbox,
+            Eviction::TerminalStreams,
+        ],
+    )
+    .await;
+
+    assert_eq!(report.end, PassEnd::SlowWrite, "{report}");
+    assert_eq!(report.rows(), 1, "{report}");
+    assert!(report.to_string().starts_with("end=SlowWrite "), "{report}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM message_streams").await, 1);
+}
+
+/// The slow page is folded under the normal rules before the pass ends, and
+/// when the fold budget is spent it is carried like any other page. Either way
+/// the report says the write ended the pass.
+#[tokio::test]
+async fn a_slow_write_folds_what_is_due_then_ends_the_pass() {
+    for (folds_per_pass, folds, carried) in [(8, 2, false), (1, 1, true)] {
+        let (_temp, db) = private_db().await;
+        seed_owners(&db).await;
+        let old = NOW - 3 * 24 * HOUR;
+        insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+        let budget = EvictorBudget {
+            fold_at_log_bytes: 0,
+            folds_per_pass,
+            slow_write: Duration::ZERO,
+            ..UNBOUNDED
+        };
+        let mut state = EvictorState::default();
+
+        let report = run_rules(
+            &db,
+            NOW,
+            budget,
+            &mut state,
+            &[Eviction::DoneOutbox, Eviction::AppliedSearchOutbox],
+        )
+        .await;
+
+        assert_eq!(report.end, PassEnd::SlowWrite, "{report}");
+        assert_eq!(report.folds.len(), folds, "{report}");
+        assert_eq!(state.unfolded.is_some(), carried, "{report}");
+    }
+}
+
+/// Delete `pages` of `rule` and fold them for `work_ms`.
+fn fold_window(state: &mut EvictorState, rule: Eviction, pages: usize, work_ms: u64) {
+    for _ in 0..pages {
+        state.deleted_page(rule);
+    }
+    state.folded(Duration::from_millis(work_ms));
+}
+
+/// A fold's fixed cost is not a page's: the estimate is the work above the
+/// least recent fold, whichever rule that fold served.
+#[test]
+fn the_floor_comes_out_of_a_rules_cost() {
+    let mut state = EvictorState::default();
+    fold_window(&mut state, Eviction::SupersededArcVersions, 1, 200);
+    assert_eq!(
+        state.fold_ms_per_page(Eviction::SupersededArcVersions),
+        Some(200.0),
+        "no floor yet: the whole fold is charged, which errs toward folding early"
+    );
+
+    fold_window(&mut state, Eviction::TerminalStreams, 4, 600);
+    assert_eq!(
+        state.fold_ms_per_page(Eviction::TerminalStreams),
+        Some(100.0)
+    );
+
+    fold_window(&mut state, Eviction::TerminalStreams, 2, 300);
+    assert_eq!(
+        state.fold_ms_per_page(Eviction::TerminalStreams),
+        Some(75.0),
+        "(100 + (300 - 200) / 2) / 2"
+    );
+}
+
+/// The floor is the least of the recent folds, so a host that has slowed stops
+/// being measured against its best moment.
+#[test]
+fn the_floor_follows_the_host() {
+    let mut state = EvictorState::default();
+    fold_window(&mut state, Eviction::DoneOutbox, 1, 10);
+    for _ in 0..FLOOR_SAMPLES {
+        fold_window(&mut state, Eviction::DoneOutbox, 1, 1000);
+    }
+
+    fold_window(&mut state, Eviction::TerminalStreams, 1, 1100);
+    assert_eq!(
+        state.fold_ms_per_page(Eviction::TerminalStreams),
+        Some(100.0)
+    );
+}
+
+/// A one-page fold that sets the floor also contains a page, so the next
+/// one-page sample reads as zero, and a rule's first sample can read as zero
+/// against another rule's floor. Neither jumps to the page cap: the window grows
+/// fourfold at most and settles near what the true slope affords.
+#[test]
+fn a_floor_set_by_one_page_folds_still_settles_on_a_finite_window() {
+    let target = Duration::from_millis(500);
+    let rule = Eviction::TerminalStreams;
+    let work = |pages: usize| 200 + 60 * pages as u64;
+    let mut state = EvictorState::default();
+
+    fold_window(&mut state, rule, 1, work(1));
+    assert_eq!(state.pages_per_fold(rule, target), 1);
+    fold_window(&mut state, rule, 1, work(1));
+    assert_eq!(
+        state.fold_ms_per_page(rule),
+        Some(130.0),
+        "the second sample read as zero and only halved the estimate"
+    );
+
+    let mut pages = state.pages_per_fold(rule, target);
+    for _ in 0..16 {
+        fold_window(&mut state, rule, pages, work(pages));
+        let next = state.pages_per_fold(rule, target);
+        assert!(next <= pages * MAX_WINDOW_GROWTH, "{pages} -> {next}");
+        pages = next;
+    }
+    assert!(
+        (8..=10).contains(&pages),
+        "500 ms at 60 ms a page affords about 8: {pages}"
+    );
+
+    let other = Eviction::SettledWaits;
+    fold_window(&mut state, other, 1, 100);
+    assert_eq!(state.fold_ms_per_page(other), Some(0.0));
+    assert_eq!(state.pages_per_fold(other, target), MAX_WINDOW_GROWTH);
+}
+
+/// When a fold's fixed cost alone passes the target, the pages add little to
+/// it, so the window still grows to what the slope affords. Charging the fixed
+/// cost to the pages left this at one page forever.
+#[test]
+fn a_floor_above_the_target_does_not_pin_a_rule_to_one_page() {
+    let target = Duration::from_millis(500);
+    let rule = Eviction::TerminalStreams;
+    let mut state = EvictorState::default();
+    for _ in 0..16 {
+        let pages = state.pages_per_fold(rule, target);
+        fold_window(&mut state, rule, pages, 800 + 10 * pages as u64);
+    }
+    let pages = state.pages_per_fold(rule, target);
+    assert!((32..=MAX_PAGES_PER_FOLD).contains(&pages), "{pages}");
+}
+
+/// However cheap a sample says a rule is, its window grows fourfold at most,
+/// so the first large window is not the one that discovers the sample was wrong.
+#[test]
+fn a_window_grows_at_most_fourfold_up_to_the_cap() {
+    let target = Duration::from_millis(500);
+    let rule = Eviction::InvalidatedCodemaps;
+    let mut state = EvictorState::default();
+    let mut windows = Vec::new();
+    for _ in 0..4 {
+        windows.push(state.pages_per_fold(rule, target));
+        let pages = *windows.last().unwrap();
+        fold_window(&mut state, rule, pages, 0);
+    }
+    windows.push(state.pages_per_fold(rule, target));
+    assert_eq!(windows, vec![1, 4, 16, 64, 64]);
+
+    // A dear window brings it straight back down.
+    fold_window(&mut state, rule, 64, 64_000);
+    assert_eq!(state.pages_per_fold(rule, target), 1);
 }
 
 #[test]
