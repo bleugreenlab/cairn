@@ -130,7 +130,7 @@ fn random_text(rng: &mut Rng, fragments: usize) -> String {
 
 /// The oracle: one encode of the exact prefix, no splitting anywhere.
 fn exact_count(tokenizer: &Tokenizer, text: &str) -> u32 {
-    tokenizer.encode(text).unwrap().len() as u32
+    tokenizer.encode_whole(text).unwrap().len() as u32
 }
 
 fn assert_cut_contract(name: &str, tokenizer: &Tokenizer, text: &str, budget: u32, cut: Cut) {
@@ -265,6 +265,11 @@ fn long_text_part_sums_are_exact() {
         );
         let whole = exact_count(&tokenizer, &text);
         assert_eq!(tokenizer.count(&text).unwrap(), whole, "{name}");
+        assert_eq!(
+            tokenizer.encode(&text).unwrap(),
+            tokenizer.encode_whole(&text).unwrap(),
+            "{name}: part-wise ids"
+        );
         for budget in [whole / 5, whole / 2, whole - 1] {
             let cut = tokenizer.cut(&text, budget).unwrap();
             assert_cut_contract(&name, &tokenizer, &text, budget, cut);

@@ -13,6 +13,7 @@ pub const VERSION: &str = "0.3.2";
 
 pub const TOKS_TIER_AUTO: u32 = 0;
 
+pub const TOKS_ADDED_NONE: u32 = 2;
 pub const TOKS_NO_POSTPROCESS: u32 = 4;
 pub const TOKS_CONTINUATION: u32 = 8;
 pub const TOKS_NO_TRUNCATE: u32 = 16;

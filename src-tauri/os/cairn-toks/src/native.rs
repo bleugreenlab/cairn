@@ -28,11 +28,28 @@ use std::ptr::{self, NonNull};
 use std::sync::{Mutex, PoisonError};
 
 use crate::sys;
-use crate::{Cut, CutStrategy, EncodeError, LoadError};
+use crate::{AddedTokens, Cut, CutStrategy, EncodeError, LoadError};
 
 /// Content tokens only: no template ids, no whole-document truncation or
-/// padding. The added-token mode is toks' default, hf's.
-const FLAGS: u32 = sys::TOKS_NO_POSTPROCESS | sys::TOKS_NO_TRUNCATE | sys::TOKS_NO_PAD;
+/// padding. Each tokenizer adds its added-token mode ([`Tokenizer::flags`]).
+const CONTENT: u32 = sys::TOKS_NO_POSTPROCESS | sys::TOKS_NO_TRUNCATE | sys::TOKS_NO_PAD;
+
+/// gpt-oss's `tokenizer.json`, compressed (see `crate::O200K_REPO`). Only this
+/// build embeds it: the stub has nothing to load it into.
+const O200K_ZST: &[u8] = include_bytes!("../data/gpt-oss-tokenizer.json.zst");
+
+pub(crate) fn o200k_json() -> Result<Vec<u8>, LoadError> {
+    let json = zstd::bulk::decompress(O200K_ZST, crate::O200K_SIZE)
+        .map_err(|error| LoadError::Embedded(format!("zstd: {error}")))?;
+    if json.len() != crate::O200K_SIZE {
+        return Err(LoadError::Embedded(format!(
+            "{} bytes unpacked, the pin is {}",
+            json.len(),
+            crate::O200K_SIZE
+        )));
+    }
+    Ok(json)
+}
 
 /// The text length a pooled scratch is sized for. toks' scratch is about
 /// 6 MiB plus 36 B per byte of this (111 B under NFC), so 64 KiB keeps a
@@ -80,6 +97,9 @@ impl Drop for Ctx {
 
 pub(crate) struct Tokenizer {
     ctx: Ctx,
+    /// Every encode and split call's flags: [`CONTENT`] plus the added-token
+    /// mode chosen at load.
+    flags: u32,
     source_sha256: [u8; 32],
     name: String,
     /// toks' cut window for this tokenizer: no certified cut is decided by a
@@ -91,8 +111,8 @@ pub(crate) struct Tokenizer {
 }
 
 impl Tokenizer {
-    pub(crate) fn from_json(bytes: &[u8]) -> Result<Self, LoadError> {
-        load(|out, opts| {
+    pub(crate) fn from_json(bytes: &[u8], added: AddedTokens) -> Result<Self, LoadError> {
+        load(added, |out, opts| {
             // SAFETY: `bytes` is valid for its length; toks copies it.
             unsafe { sys::toks_load_mem_copy(out, bytes.as_ptr().cast(), bytes.len() as u64, opts) }
         })
@@ -102,7 +122,9 @@ impl Tokenizer {
         let path = CString::new(dir.as_os_str().as_bytes())
             .map_err(|_| LoadError::Path(dir.display().to_string()))?;
         // SAFETY: `path` is NUL-terminated and outlives the call.
-        load(|out, opts| unsafe { sys::toks_load(out, path.as_ptr(), opts) })
+        load(AddedTokens::Matched, |out, opts| unsafe {
+            sys::toks_load(out, path.as_ptr(), opts)
+        })
     }
 
     pub(crate) fn source_sha256(&self) -> [u8; 32] {
@@ -147,16 +169,30 @@ impl Tokenizer {
         }
     }
 
+    /// A text past the pooled scratch size is encoded part by part at
+    /// certified cuts, exactly as `count` sums it, so the scratch stays the
+    /// pooled one instead of growing with the text.
     pub(crate) fn encode(&self, text: &str) -> Result<Vec<u32>, EncodeError> {
         check_len(text)?;
-        if text.is_empty() {
-            return Ok(Vec::new());
-        }
+        let bytes = text.as_bytes();
         let mut scratch = self.checkout()?;
-        let n = scratch.encode(text.as_bytes(), FLAGS, &mut [])?;
-        let mut ids = vec![0u32; n as usize];
-        let written = scratch.encode(text.as_bytes(), FLAGS, &mut ids)?;
-        ids.truncate(written as usize);
+        let mut ids = Vec::new();
+        if bytes.len() <= PART_MAX {
+            scratch.append_ids(bytes, false, &mut ids)?;
+            return Ok(ids);
+        }
+        let bounds = self.bounds(text, PART_MAX / 2)?;
+        for (index, part) in bounds.windows(2).enumerate() {
+            scratch.append_ids(&bytes[part[0]..part[1]], index > 0, &mut ids)?;
+        }
+        Ok(ids)
+    }
+
+    pub(crate) fn encode_whole(&self, text: &str) -> Result<Vec<u32>, EncodeError> {
+        check_len(text)?;
+        let mut ids = Vec::new();
+        self.checkout()?
+            .append_ids(text.as_bytes(), false, &mut ids)?;
         Ok(ids)
     }
 
@@ -276,7 +312,7 @@ impl Tokenizer {
                 self.ctx.ptr(),
                 text.as_ptr().cast(),
                 text.len() as u64,
-                FLAGS,
+                self.flags,
                 n_want,
                 offsets.as_mut_ptr(),
                 offsets.len() as u64,
@@ -291,15 +327,20 @@ impl Tokenizer {
     }
 
     fn token_len(&self, id: u32) -> usize {
+        self.token_bytes(id).map_or(0, <[u8]>::len)
+    }
+
+    pub(crate) fn token_bytes(&self, id: u32) -> Option<&[u8]> {
         let mut len = 0u64;
         // SAFETY: toks_token returns NULL for an id with no string and leaves
         // len meaningful only otherwise.
         let bytes = unsafe { sys::toks_token(self.ctx.ptr(), id, &mut len) };
         if bytes.is_null() {
-            0
-        } else {
-            len as usize
+            return None;
         }
+        // SAFETY: toks_token's bytes are zero-copy views into the context,
+        // read-only and alive as long as it is, which `&self` bounds.
+        Some(unsafe { std::slice::from_raw_parts(bytes, len as usize) })
     }
 
     fn checkout(&self) -> Result<Scratch<'_>, EncodeError> {
@@ -339,6 +380,7 @@ impl Tokenizer {
 }
 
 fn load(
+    added: AddedTokens,
     call: impl FnOnce(*mut *mut sys::toks_ctx, *const sys::toks_load_opts) -> i64,
 ) -> Result<Tokenizer, LoadError> {
     let mut diag = sys::toks_diag {
@@ -399,8 +441,13 @@ fn load(
     let window = longest_added_token(&ctx) + WINDOW_SLACK;
     // SAFETY: ctx is live; the call is pure.
     let scratch_bytes = unsafe { sys::toks_scratch_bytes(ctx.ptr(), PART_MAX as u64, 0) };
+    let flags = match added {
+        AddedTokens::Matched => CONTENT,
+        AddedTokens::Ignored => CONTENT | sys::TOKS_ADDED_NONE,
+    };
     let mut tokenizer = Tokenizer {
         ctx,
+        flags,
         source_sha256: info.source_sha256,
         name,
         window,
@@ -441,11 +488,39 @@ impl Scratch<'_> {
             return Ok(0);
         }
         let flags = if continuation {
-            FLAGS | sys::TOKS_CONTINUATION
+            self.tokenizer.flags | sys::TOKS_CONTINUATION
         } else {
-            FLAGS
+            self.tokenizer.flags
         };
         self.encode(text, flags, &mut [])
+    }
+
+    /// Append `text`'s ids to `ids`, in one encode when they fit the guess.
+    fn append_ids(
+        &mut self,
+        text: &[u8],
+        continuation: bool,
+        ids: &mut Vec<u32>,
+    ) -> Result<(), EncodeError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let flags = if continuation {
+            self.tokenizer.flags | sys::TOKS_CONTINUATION
+        } else {
+            self.tokenizer.flags
+        };
+        let start = ids.len();
+        // Most texts have fewer ids than bytes; toks reports the full count
+        // when they do not, and the second call fills the rest.
+        ids.resize(start + text.len() + 16, 0);
+        let mut n = self.encode(text, flags, &mut ids[start..])? as usize;
+        if n > ids.len() - start {
+            ids.resize(start + n, 0);
+            n = self.encode(text, flags, &mut ids[start..])? as usize;
+        }
+        ids.truncate(start + n);
+        Ok(())
     }
 
     /// Encode with this scratch, or with a one-off scratch sized for a text

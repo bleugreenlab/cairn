@@ -1,10 +1,11 @@
 //! Model-aware token meters used by core transcript and context accounting.
 //!
 //! Three meters exist. Claude's tokenizer is unpublished, so Claude text is
-//! counted by `cairn-tokenize`'s estimator; OpenAI's o200k is exact through
-//! `tiktoken-rs`; and an open-weight model whose tokenizer Cairn pins
-//! (`cairn_models::types::tokenizers`) is counted exactly by its own tokenizer
-//! through toks ([`ExactTokenMeter`]).
+//! counted by `cairn-tokenize`'s estimator; OpenAI's o200k is exact, through
+//! toks over the gpt-oss copy `cairn-toks` embeds where toks is linked and
+//! through `tiktoken-rs` elsewhere ([`O200kTokenMeter`]); and an open-weight
+//! model whose tokenizer Cairn pins (`cairn_models::types::tokenizers`) is
+//! counted exactly by its own tokenizer through toks ([`ExactTokenMeter`]).
 //!
 //! Which tokenizer a model uses is catalog knowledge: discovery attaches a
 //! [`TokenizerRef`] to each offer it can pin, and the orchestrator publishes
@@ -58,32 +59,85 @@ impl TokenMeter for ClaudeTokenMeter {
     }
 }
 
-fn o200k() -> &'static CoreBPE {
-    static BPE: OnceLock<CoreBPE> = OnceLock::new();
-    BPE.get_or_init(|| o200k_base().expect("o200k_base BPE initializes"))
-}
-
 impl TokenMeter for O200kTokenMeter {
     fn count(&self, text: &str) -> u32 {
-        o200k()
-            .encode_ordinary(text)
-            .len()
-            .try_into()
-            .unwrap_or(u32::MAX)
+        O200k::selected().count(text)
     }
 
     fn cut(&self, text: &str, budget: u32) -> Cut {
-        let tokens = o200k().encode_ordinary(text);
-        if tokens.len() <= budget as usize {
+        O200k::selected().cut(text, budget)
+    }
+}
+
+/// The encoder under [`O200kTokenMeter`]. Both give exactly tiktoken's
+/// `encode_ordinary` ids (the equivalence tests below hold them to it), so
+/// which one counts changes the cost of a count and never its value.
+#[derive(Clone, Copy)]
+enum O200k {
+    /// gpt-oss's o200k tokenizer through toks, about a hundred times faster.
+    /// Every target toks links.
+    Toks(&'static cairn_toks::Tokenizer),
+    /// Targets without toks (Windows, Intel macOS), and any text past toks'
+    /// 512 MiB per-call limit.
+    Tiktoken,
+}
+
+impl O200k {
+    fn selected() -> Self {
+        static SELECTED: OnceLock<O200k> = OnceLock::new();
+        *SELECTED.get_or_init(|| match cairn_toks::o200k() {
+            Ok(tokenizer) => O200k::Toks(tokenizer),
+            Err(cairn_toks::LoadError::UnsupportedTarget) => O200k::Tiktoken,
+            // The embedded file is fixed at build time and loaded by this
+            // crate's tests, so this is a broken build rather than bad input;
+            // counts stay exact on tiktoken-rs.
+            Err(error) => {
+                log::error!("o200k counts with tiktoken-rs: {error}");
+                O200k::Tiktoken
+            }
+        })
+    }
+
+    fn count(self, text: &str) -> u32 {
+        match self {
+            O200k::Toks(tokenizer) => tokenizer
+                .count(text)
+                .unwrap_or_else(|_| O200k::Tiktoken.count(text)),
+            O200k::Tiktoken => tiktoken_o200k()
+                .encode_ordinary(text)
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The byte length of each of `text`'s tokens, in order.
+    fn token_bytes(self, text: &str) -> Vec<usize> {
+        match self {
+            O200k::Toks(tokenizer) => match tokenizer.encode(text) {
+                Ok(ids) => ids
+                    .into_iter()
+                    .map(|id| tokenizer.token_bytes(id).map_or(0, <[u8]>::len))
+                    .collect(),
+                Err(_) => O200k::Tiktoken.token_bytes(text),
+            },
+            O200k::Tiktoken => {
+                let bpe = tiktoken_o200k();
+                bpe._decode_native_and_split(bpe.encode_ordinary(text))
+                    .map(|bytes| bytes.len())
+                    .collect()
+            }
+        }
+    }
+
+    fn cut(self, text: &str, budget: u32) -> Cut {
+        let token_bytes = self.token_bytes(text);
+        if token_bytes.len() <= budget as usize {
             return Cut {
                 byte_offset: text.len(),
-                tokens: tokens.len() as u32,
+                tokens: token_bytes.len() as u32,
             };
         }
-        let token_bytes: Vec<usize> = o200k()
-            ._decode_native_and_split(tokens)
-            .map(|bytes| bytes.len())
-            .collect();
         let start = token_bytes
             .iter()
             .take(budget.saturating_sub(1) as usize)
@@ -114,6 +168,11 @@ impl TokenMeter for O200kTokenMeter {
         }
         best
     }
+}
+
+fn tiktoken_o200k() -> &'static CoreBPE {
+    static BPE: OnceLock<CoreBPE> = OnceLock::new();
+    BPE.get_or_init(|| o200k_base().expect("o200k_base BPE initializes"))
 }
 
 /// The last offset at or before `limit` where o200k's pre-tokenizer must split
@@ -683,17 +742,24 @@ mod tests {
         );
     }
 
+    /// Every o200k backend this target builds: tiktoken-rs always, toks where
+    /// it links. The tests below hold each one to the same answers.
+    fn o200k_backends() -> Vec<(&'static str, O200k)> {
+        let mut backends = vec![("tiktoken", O200k::Tiktoken)];
+        if cairn_toks::NATIVE {
+            let toks = cairn_toks::o200k().expect("the embedded o200k tokenizer loads");
+            backends.push(("toks", O200k::Toks(toks)));
+        }
+        backends
+    }
+
     /// o200k's cut with every candidate prefix recounted from the start of the
     /// text: the definition the split recount must reproduce exactly.
-    fn o200k_cut_by_whole_prefix(text: &str, budget: u32) -> Cut {
-        let tokens = o200k().encode_ordinary(text);
-        if tokens.len() <= budget as usize {
-            return O200K_TOKEN_METER.cut(text, budget);
+    fn o200k_cut_by_whole_prefix(o200k: O200k, text: &str, budget: u32) -> Cut {
+        let token_bytes = o200k.token_bytes(text);
+        if token_bytes.len() <= budget as usize {
+            return o200k.cut(text, budget);
         }
-        let token_bytes: Vec<usize> = o200k()
-            ._decode_native_and_split(tokens)
-            .map(|bytes| bytes.len())
-            .collect();
         let start: usize = token_bytes
             .iter()
             .take(budget.saturating_sub(1) as usize)
@@ -708,7 +774,7 @@ mod tests {
             tokens: 0,
         };
         for byte_offset in (start..=end).filter(|at| text.is_char_boundary(*at)) {
-            let count = O200K_TOKEN_METER.count(&text[..byte_offset]);
+            let count = o200k.count(&text[..byte_offset]);
             if count <= budget && byte_offset >= best.byte_offset {
                 best = Cut {
                     byte_offset,
@@ -719,8 +785,10 @@ mod tests {
         best
     }
 
-    #[test]
-    fn o200k_cut_recounted_from_a_split_matches_a_whole_prefix_recount() {
+    /// The split-point cases cairn/5074 pinned, as numbered multi-line text:
+    /// `/`, `\r\n`, blank and whitespace-only lines, no-break space, next-line,
+    /// ideographic space, tabs, CJK, combining marks and emoji.
+    fn split_point_text() -> String {
         let lines = [
             "fn main() {",
             "    let x = compute(&input[3..], 9)?;  ",
@@ -737,7 +805,7 @@ mod tests {
             "a;\u{a0}b\u{85}c \t d",
             "x  ,  y\u{3000}z",
         ];
-        let text: String = (0..240)
+        (0..240)
             .map(|i| {
                 let line = lines[(i * 7) % lines.len()];
                 let ending = if i % 5 == 0 { "\r\n" } else { "\n" };
@@ -747,17 +815,24 @@ mod tests {
                     format!("{:>6}\t{line}{ending}", i + 1)
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn o200k_cut_recounted_from_a_split_matches_a_whole_prefix_recount() {
+        let text = split_point_text();
         // The same lines run together, so only splits inside a line apply.
         let one_line = text.replace(['\r', '\n'], " ");
-        for text in [text, one_line] {
-            let total = O200K_TOKEN_METER.count(&text);
-            for budget in (0..total).step_by(23) {
-                assert_eq!(
-                    O200K_TOKEN_METER.cut(&text, budget),
-                    o200k_cut_by_whole_prefix(&text, budget),
-                    "budget {budget}"
-                );
+        for (name, o200k) in o200k_backends() {
+            for text in [&text, &one_line] {
+                let total = o200k.count(text);
+                for budget in (0..total).step_by(23) {
+                    assert_eq!(
+                        o200k.cut(text, budget),
+                        o200k_cut_by_whole_prefix(o200k, text, budget),
+                        "{name}: budget {budget}"
+                    );
+                }
             }
         }
     }
@@ -770,6 +845,283 @@ mod tests {
         assert_eq!(o200k_split_before("ab\r\nc", 5), 4);
         assert_eq!(o200k_split_before("one word", 8), 3);
         assert_eq!(o200k_split_before(";\r\n", 3), 0);
+    }
+
+    /// Text where the two o200k backends could plausibly part: special-token
+    /// spellings from gpt-oss's file (toks must encode them as text, as
+    /// `encode_ordinary` does), and the pre-tokenizer's whitespace, slash,
+    /// contraction, digit, joiner and control-character boundaries.
+    const O200K_EDGES: &[&str] = &[
+        "",
+        "<|endoftext|>",
+        "<|startoftext|><|start|>user<|message|>hi<|end|><|start|>assistant",
+        "<|reserved_200000|> <|endofprompt|><|return|><|call|><|constrain|><|channel|>",
+        "text<|endoftext|>more text <|endoftext|>\n<|endoftext",
+        "\r\n\r\n\n  \n\t\n\r\r \r",
+        "a\u{a0}\u{a0}b\u{85}\u{85}c\u{3000}\u{3000}d\u{2028}e\u{200b}f\u{feff}g",
+        "   leading and trailing   ",
+        "//\n/\n///path\r\n/x \n/",
+        "1234567890123 3.14159 1e10 0x1F \u{661}\u{662}\u{663}",
+        "I'M HE'LL they'RE 's 't don\u{2019}t",
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{1f1fa}\u{1f1f8} \u{2764}\u{fe0f}",
+        "e\u{301}\u{302}\u{303} \u{915}\u{94d}\u{937} \u{e01}\u{e31}",
+        "\u{0}\u{1}\u{1b}[0m\u{7f}\u{80}\u{9f}\u{a0}",
+        "\u{e000}\u{f8ff}\u{fffd}\u{10ffff}",
+    ];
+
+    /// A small deterministic generator, so a failure reproduces from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// Short texts of random code points across every UTF-8 length and the
+    /// classes the pattern distinguishes, joined by the edge fragments.
+    fn random_o200k_texts(count: usize) -> Vec<String> {
+        const RANGES: &[(u32, u32)] = &[
+            (0x20, 0x7e),
+            (0x20, 0x7e),
+            (0x00, 0x20),
+            (0x80, 0x24f),
+            (0x300, 0x36f),
+            (0x370, 0x52f),
+            (0x600, 0x6ff),
+            (0x900, 0x97f),
+            (0x2000, 0x206f),
+            (0x3000, 0x30ff),
+            (0x4e00, 0x9fff),
+            (0xac00, 0xd7a3),
+            (0x1f300, 0x1faff),
+            (0xe000, 0xf8ff),
+            (0xfff0, 0xffff),
+        ];
+        let mut rng = Rng(0x0200_0005_eed5);
+        (0..count)
+            .map(|_| {
+                let mut text = String::new();
+                for _ in 0..rng.below(48) {
+                    if rng.below(6) == 0 {
+                        text.push_str(O200K_EDGES[rng.below(O200K_EDGES.len())]);
+                    } else {
+                        let (lo, hi) = RANGES[rng.below(RANGES.len())];
+                        let code = lo + rng.below((hi - lo + 1) as usize) as u32;
+                        text.extend(char::from_u32(code));
+                    }
+                }
+                text
+            })
+            .collect()
+    }
+
+    /// What the toks backend is chosen on: exactly tiktoken's
+    /// `encode_ordinary` ids, not only its counts, over cairn-tokenize's
+    /// held-out corpus (Multipl-E and Rosetta), the pinned split-point text,
+    /// the edges above and random text, then the same counts, token byte
+    /// lengths and cuts through each backend's own paths. The whole corpus as
+    /// one text runs toks' part sums against tiktoken's single encode.
+    #[test]
+    fn the_toks_o200k_backend_is_tiktokens_encoder() {
+        if !cairn_toks::NATIVE {
+            assert!(cairn_toks::o200k().is_err(), "no toks, no embedded file");
+            assert!(matches!(O200k::selected(), O200k::Tiktoken));
+        } else {
+            assert!(matches!(O200k::selected(), O200k::Toks(_)));
+        }
+        let selected = O200k::selected();
+        if let O200k::Toks(tokenizer) = selected {
+            assert!(tokenizer.has_certified_cuts());
+        }
+        let held_out = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cairn-tokenize/tests/fixtures/held_out.jsonl"
+        ));
+        let mut texts: Vec<String> = held_out
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                row["text"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert!(texts.len() > 250, "the held-out corpus is all there");
+        texts.push(split_point_text());
+        let documents = texts.len();
+        texts.extend(O200K_EDGES.iter().map(|edge| edge.to_string()));
+        let corpus = texts.concat();
+        assert!(
+            corpus.len() > 8 * 64 * 1024,
+            "long enough for many 64 KiB certified parts: {} bytes",
+            corpus.len()
+        );
+        texts.push(corpus);
+        texts.extend(random_o200k_texts(4000));
+
+        let (toks, tiktoken) = (selected, O200k::Tiktoken);
+        for (index, text) in texts.iter().enumerate() {
+            let expected = tiktoken_o200k().encode_ordinary(text);
+            let ids = match toks {
+                O200k::Toks(tokenizer) => tokenizer.encode(text).unwrap(),
+                O200k::Tiktoken => tiktoken_o200k().encode_ordinary(text),
+            };
+            if ids != expected {
+                let at = ids
+                    .iter()
+                    .zip(&expected)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                panic!(
+                    "text {index}: ids part at token {at} of {}: toks {:?} vs tiktoken {:?}",
+                    expected.len(),
+                    &ids[at..(at + 4).min(ids.len())],
+                    &expected[at..(at + 4).min(expected.len())],
+                );
+            }
+            assert_eq!(toks.count(text), expected.len() as u32, "text {index}");
+            assert_eq!(
+                toks.token_bytes(text),
+                tiktoken.token_bytes(text),
+                "text {index}"
+            );
+        }
+
+        // The cut is the same algorithm over the same counts, so it must land
+        // on the same byte; checked on every held-out document and the pinned
+        // split-point text at budgets across each.
+        for (index, text) in texts.iter().take(documents).enumerate() {
+            let total = tiktoken.count(text);
+            for budget in [
+                0,
+                1,
+                2,
+                total / 7,
+                total / 3,
+                total / 2,
+                total.saturating_sub(1),
+                total,
+            ] {
+                assert_eq!(
+                    toks.cut(text, budget),
+                    tiktoken.cut(text, budget),
+                    "text {index}, budget {budget}"
+                );
+            }
+        }
+    }
+
+    /// One o200k backend as a meter, to drive the renderer with.
+    struct Backend(O200k);
+
+    impl TokenMeter for Backend {
+        fn count(&self, text: &str) -> u32 {
+            self.0.count(text)
+        }
+
+        fn cut(&self, text: &str, budget: u32) -> Cut {
+            self.0.cut(text, budget)
+        }
+    }
+
+    /// A read body of one of six shapes: numbered code, prose, CJK lines,
+    /// dense JSON, one line with no newline, and CRLF text with blank and
+    /// whitespace-only lines and the added tokens' text.
+    fn golden_body(shape: usize, bytes: usize) -> String {
+        let mut out = String::new();
+        let mut i = 0usize;
+        while out.len() < bytes {
+            match shape {
+                0 => out.push_str(&format!(
+                    "{:>6}\t    let v_{i} = f(&input[{i}..], {i} * 3)?; // step {i}\n",
+                    i + 1
+                )),
+                1 => out.push_str(&format!(
+                    "Paragraph {i}: budgets matter most where windows are smallest. "
+                )),
+                2 => out.push_str(&format!(
+                    "\u{7b2c}{i}\u{6bb5}\u{ff1a}\u{30c8}\u{30fc}\u{30af}\u{30f3}\u{4e88}\u{7b97}\u{3002}\u{4e2d}\u{6587}\n"
+                )),
+                3 => out.push_str(&format!("{{\"id\":{i},\"k\":[{i},{i},\"x/y\"]}},")),
+                4 => out.push_str(&format!("word{i} ")),
+                _ => out.push_str(&format!(
+                    "line {i}<|endoftext|>\r\n\r\n   \r\n\t/{i}\u{a0}\u{3000}\n"
+                )),
+            }
+            i += 1;
+        }
+        let mut end = bytes.min(out.len());
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out
+    }
+
+    const GOLDEN_SIZES: &[usize] = &[600, 6_000, 40_000, 120_000, 200_000];
+    const GOLDEN_BUDGETS: &[u32] = &[0, 1, 7, 100, 1_000, 5_000, 20_000];
+
+    /// The renderer meets a meter only through `count` and `cut`, so with the
+    /// two backends answering alike every read renders byte-identically:
+    /// bounded renders, fixed segment budgets, `Context` batches and the
+    /// legacy character path, over six body shapes at five sizes.
+    #[test]
+    fn reads_render_byte_identically_under_either_o200k_backend() {
+        use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
+        use cairn_db::storage::render::{
+            assemble, assemble_legacy_chars, render_segment, render_segment_bounded, ReadBudget,
+        };
+
+        let selected = O200k::selected();
+        assert_eq!(matches!(selected, O200k::Toks(_)), cairn_toks::NATIVE);
+        let (toks, tiktoken) = (Backend(selected), Backend(O200k::Tiktoken));
+        let segment = |uri: String, body: &str| {
+            ReadSegment::text(
+                body.to_string(),
+                SegmentMeta::new(uri, SegmentKind::File, NaturalUnit::Line),
+            )
+        };
+        let mut cases = 0;
+        for &bytes in GOLDEN_SIZES {
+            let bodies: Vec<String> = (0..6).map(|shape| golden_body(shape, bytes)).collect();
+            for (shape, body) in bodies.iter().enumerate() {
+                let uri = format!("file:shape{shape}-{bytes}.txt");
+                assert_eq!(
+                    render_segment_bounded(segment(uri.clone(), body), &toks).text,
+                    render_segment_bounded(segment(uri.clone(), body), &tiktoken).text,
+                    "bounded render of shape {shape} at {bytes} bytes"
+                );
+                for &budget in GOLDEN_BUDGETS {
+                    assert_eq!(
+                        render_segment(segment(uri.clone(), body), budget, &toks).text,
+                        render_segment(segment(uri.clone(), body), budget, &tiktoken).text,
+                        "shape {shape} at {bytes} bytes, budget {budget}"
+                    );
+                }
+                cases += 1 + GOLDEN_BUDGETS.len();
+            }
+            let batch = || {
+                bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(shape, body)| segment(format!("file:part{shape}.txt"), body))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                assemble(batch(), ReadBudget::Context, &toks),
+                assemble(batch(), ReadBudget::Context, &tiktoken),
+                "Context batch at {bytes} bytes"
+            );
+            assert_eq!(
+                assemble_legacy_chars(batch(), &toks),
+                assemble_legacy_chars(batch(), &tiktoken),
+                "legacy batch at {bytes} bytes"
+            );
+            cases += 2;
+        }
+        eprintln!("{cases} renders identical under both o200k backends");
     }
 
     fn digest_of(family: &str) -> [u8; 32] {
