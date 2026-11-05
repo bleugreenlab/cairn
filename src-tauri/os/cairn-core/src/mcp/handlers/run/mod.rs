@@ -152,6 +152,10 @@ pub(crate) enum RunFailure {
     /// was the runner's own decision (the batch ceiling); a user stop or an
     /// executor cancel carries none.
     Cancelled(Option<String>),
+    /// The host restarted under the batch. A batch's commit is published before
+    /// its result is recorded, so one that carried a `commit_msg` may have landed
+    /// even though its result is gone.
+    LostToRestart { commits: bool },
 }
 
 impl RunFailure {
@@ -171,6 +175,16 @@ impl RunFailure {
             Self::NotPublished(detail) => format!("{RUN_NOT_PUBLISHED}: {detail}"),
             Self::Cancelled(None) => format!("{RUN_CANCELLED} before it finished."),
             Self::Cancelled(Some(detail)) => format!("{RUN_CANCELLED}: {detail}"),
+            Self::LostToRestart { commits } => {
+                let what_landed = if *commits {
+                    "Its `commit_msg` may have landed before the restart. Look for that message in `cairn:@/vcs/log` and read the files before re-running the batch."
+                } else {
+                    "Nothing was committed. Re-run the batch if you still need it."
+                };
+                format!(
+                    "{RUN_OUTCOME_UNKNOWN}: this host restarted while the batch was still running, so its result was lost. {what_landed}"
+                )
+            }
         }
     }
 }
@@ -321,7 +335,8 @@ mod failure_contract_tests {
             | RunFailure::Unaccounted(_)
             | RunFailure::DispatchedWithoutResult(_)
             | RunFailure::NotPublished(_)
-            | RunFailure::Cancelled(_) => {}
+            | RunFailure::Cancelled(_)
+            | RunFailure::LostToRestart { .. } => {}
         }
         vec![
             RunFailure::NotExecuted("its environment could not be reached (timeout).".to_string()),
@@ -339,7 +354,8 @@ mod failure_contract_tests {
             RunFailure::NotPublished("their result could not be read back (eof).".to_string()),
             RunFailure::Cancelled(None),
             RunFailure::Cancelled(Some(RUN_CEILING_DETAIL.to_string())),
-            RunFailure::NotPublished(run_batch_lost_to_restart_text(true)),
+            RunFailure::LostToRestart { commits: true },
+            RunFailure::LostToRestart { commits: false },
         ]
     }
 
@@ -379,9 +395,9 @@ mod failure_contract_tests {
             "RUN_NOT_PUBLISHED",
             "RUN_CANCELLED",
         ] {
-            // `RUN_CANCELLED` and `RUN_NOT_EXECUTED` each serve two variants.
+            // These openings each serve two variants.
             let expected = match identifier {
-                "RUN_CANCELLED" | "RUN_NOT_EXECUTED" => 4,
+                "RUN_CANCELLED" | "RUN_NOT_EXECUTED" | "RUN_OUTCOME_UNKNOWN" => 4,
                 _ => 3,
             };
             assert_eq!(
@@ -5078,15 +5094,7 @@ pub(crate) const RUN_ITEM_SUSPENDED_MARKER: &str =
 /// result is genuinely unrecoverable; saying so unblocks the agent, where
 /// leaving the row pending would strand it.
 pub(crate) fn run_batch_lost_to_restart_text(commits: bool) -> String {
-    let commit_clause = if commits {
-        " Its `commit_msg` never landed — nothing was committed."
-    } else {
-        " Nothing was committed."
-    };
-    RunFailure::NotPublished(format!(
-        "this host restarted while the batch was still running, so its result was lost.{commit_clause} Re-run the batch if you still need it."
-    ))
-    .text()
+    RunFailure::LostToRestart { commits }.text()
 }
 
 /// Where a job's process batch obtains its checkout.
@@ -9171,17 +9179,21 @@ mod tests {
 
     /// A suspended batch whose host restarts under it cannot be re-driven, so it
     /// resolves to a failure that says so rather than leaving the agent parked
-    /// forever on a result that will never arrive.
+    /// forever on a result that will never arrive. A commit is published before
+    /// the batch's result is recorded, so only a batch with no `commit_msg` can
+    /// claim nothing landed.
     #[test]
-    fn a_batch_lost_to_a_restart_says_so_and_says_nothing_landed() {
+    fn a_batch_lost_to_a_restart_says_so_and_says_what_may_have_landed() {
         for commits in [true, false] {
             let text = run_batch_lost_to_restart_text(commits);
             assert!(envelope_reports_run_failure(&text), "{text}");
             assert!(text.contains("restarted"), "{text}");
-            assert!(
+            assert_eq!(
                 text.to_lowercase().contains("nothing was committed"),
+                !commits,
                 "{text}"
             );
+            assert_eq!(text.contains("cairn:@/vcs/log"), commits, "{text}");
             crate::system_prompt::assert_no_substrate_vocabulary("host-restart failure", &text);
         }
     }

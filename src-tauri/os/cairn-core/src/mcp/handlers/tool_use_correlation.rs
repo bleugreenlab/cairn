@@ -1,4 +1,4 @@
-use crate::storage::LocalDb;
+use crate::storage::{DbResult, LocalDb};
 use std::collections::HashSet;
 
 /// What correlating a callback with its own provider tool invocation found. The
@@ -119,6 +119,39 @@ where
 /// candidates come from this turn's assistant events, and an answered invocation
 /// is never the live call regardless of which turn recorded it.
 async fn spoken_for_ids(db: &LocalDb, run_id: &str) -> HashSet<String> {
+    ids_closed_by(
+        db,
+        run_id,
+        "SELECT tool_use_id FROM agent_waits WHERE run_id = ?1",
+    )
+    .await
+    .unwrap_or_default()
+}
+
+/// Provider ids of this run a host-restart settlement must not answer: those
+/// already answered, and those an active wait still speaks for. A wait that has
+/// ended no longer owns its call, so unlike [`spoken_for_ids`] it does not count.
+///
+/// A failed read is an error rather than an empty set: answering from an empty
+/// set would write a false result over a real one.
+pub(crate) async fn answered_or_actively_owned_ids(
+    db: &LocalDb,
+    run_id: &str,
+) -> DbResult<HashSet<String>> {
+    ids_closed_by(
+        db,
+        run_id,
+        "SELECT tool_use_id FROM agent_waits
+         WHERE run_id = ?1 AND state IN ('pending', 'resolving')",
+    )
+    .await
+}
+
+async fn ids_closed_by(
+    db: &LocalDb,
+    run_id: &str,
+    waits_sql: &'static str,
+) -> DbResult<HashSet<String>> {
     let run_id = run_id.to_string();
     db.read(|conn| {
         let run_id = run_id.clone();
@@ -137,10 +170,7 @@ async fn spoken_for_ids(db: &LocalDb, run_id: &str) -> HashSet<String> {
                 }
             }
             let mut claimed = conn
-                .query(
-                    "SELECT tool_use_id FROM agent_waits WHERE run_id = ?1",
-                    cairn_db::turso::params![run_id],
-                )
+                .query(waits_sql, cairn_db::turso::params![run_id])
                 .await?;
             while let Some(row) = claimed.next().await? {
                 out.insert(row.text(0)?);
@@ -149,7 +179,6 @@ async fn spoken_for_ids(db: &LocalDb, run_id: &str) -> HashSet<String> {
         })
     })
     .await
-    .unwrap_or_default()
 }
 
 /// The newest assistant events of a run, scoped to one turn when given one.

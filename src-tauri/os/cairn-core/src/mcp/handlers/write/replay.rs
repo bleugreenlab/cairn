@@ -429,7 +429,7 @@ fn change_identity(input: &serde_json::Value, home_uri: &str) -> Option<serde_js
 }
 
 /// The report a previous delivery of this call already produced, if any.
-const RESOURCE_PENDING: &str = "__cairn_write_resource_pending__";
+pub(crate) const RESOURCE_PENDING: &str = "__cairn_write_resource_pending__";
 
 /// Save the outer report before a blocking producer can suspend or complete.
 /// Resource replay must still see a pending claim, not a settled partial write.
@@ -954,9 +954,9 @@ impl ResourceWriteProgress {
         if stopped {
             mark_unsettled(&mut value, &self.items, |index| {
                 if Some(index) == self.in_flight {
-                    NOT_CONFIRMED
+                    NOT_CONFIRMED.to_string()
                 } else {
-                    NOT_APPLIED
+                    NOT_APPLIED.to_string()
                 }
             });
         }
@@ -999,7 +999,9 @@ impl Drop for ResourceWriteProgress {
         let (db, call) = (self.db.clone(), self.call.clone());
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(async move { seal_if_pending(&db, &call, &report).await });
+                runtime.spawn(async move {
+                    seal_if_pending(&db, &call.run_id, &call.id, &report).await
+                });
             }
             Err(_) => log::warn!(
                 "a resource write was dropped outside a runtime; its replay row stays pending"
@@ -1008,21 +1010,23 @@ impl Drop for ResourceWriteProgress {
     }
 }
 
-async fn seal_if_pending(db: &LocalDb, call: &WriteCall, report: &str) {
+/// Replace a still-pending row's marker with `report`, so a redelivery replays
+/// it instead of stalling. A row already settled is final and is left alone.
+pub(crate) async fn seal_if_pending(db: &LocalDb, run_id: &str, tool_use_id: &str, report: &str) {
     let sealed = db
         .execute(
             "UPDATE write_replay_ledger SET report=?3
              WHERE run_id=?1 AND tool_use_id=?2 AND substr(report, 1, length(?4)) = ?4",
             cairn_db::turso::params![
-                call.run_id.clone(),
-                call.id.clone(),
+                run_id.to_string(),
+                tool_use_id.to_string(),
                 report.to_string(),
                 RESOURCE_PENDING,
             ],
         )
         .await;
     if let Err(error) = sealed {
-        log::warn!("could not seal a dropped resource write's replay row: {error}");
+        log::warn!("could not seal a resource write's replay row: {error}");
     }
 }
 
@@ -1031,7 +1035,7 @@ async fn seal_if_pending(db: &LocalDb, call: &WriteCall, report: &str) {
 fn mark_unsettled(
     report: &mut serde_json::Value,
     items: &[(String, String)],
-    phrase: impl Fn(usize) -> &'static str,
+    phrase: impl Fn(usize) -> String,
 ) {
     let settled: std::collections::HashSet<u64> = ["applied", "failures"]
         .iter()
@@ -1078,6 +1082,54 @@ fn mark_unsettled(
 /// `{changes:[...]}`) `not confirmed`. Never `not applied`: the carrier may
 /// still be running, and must not be contradicted.
 pub(crate) fn unsettled_write_report(row: &str, input: &serde_json::Value) -> String {
+    unsettled_report(row, input, |_| NOT_CONFIRMED.to_string())
+}
+
+/// A restart's report for a resource write whose row is still pending: what its
+/// last checkpoint lists, and every other item of `input` `not confirmed`, each
+/// naming what to read before retrying it. Unlike a stop, no carrier is left to
+/// contradict, but the restart gives no way to tell the item that was running
+/// from those after it, so none is called `not applied`.
+pub(crate) fn restart_write_report(row: &str, input: &serde_json::Value) -> String {
+    let changes = input
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    unsettled_report(row, input, |index| {
+        changes
+            .get(index)
+            .map(restart_item_phrase)
+            .unwrap_or_else(|| NOT_CONFIRMED.to_string())
+    })
+}
+
+fn restart_item_phrase(change: &serde_json::Value) -> String {
+    let target = change
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !super::recorded_target_is_rebase(target) {
+        return format!(
+            "not confirmed: Cairn restarted while this item ran; read `{target}` before retrying it"
+        );
+    }
+    let request = match change
+        .pointer("/payload/action")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("replay") => "the replay",
+        Some("fast-forward-from-origin") => "the fast-forward",
+        _ => "it",
+    };
+    format!("not confirmed: re-read `{target}` before requesting {request} again")
+}
+
+fn unsettled_report(
+    row: &str,
+    input: &serde_json::Value,
+    phrase: impl Fn(usize) -> String,
+) -> String {
     let mut report = blocking_checkpoint_report(row)
         .and_then(|body| {
             serde_json::Deserializer::from_str(body)
@@ -1106,7 +1158,7 @@ pub(crate) fn unsettled_write_report(row: &str, input: &serde_json::Value) -> St
                 .collect()
         })
         .unwrap_or_default();
-    mark_unsettled(&mut report, &items, |_| NOT_CONFIRMED);
+    mark_unsettled(&mut report, &items, phrase);
     serde_json::to_string(&report).unwrap_or_else(|_| row.to_string())
 }
 

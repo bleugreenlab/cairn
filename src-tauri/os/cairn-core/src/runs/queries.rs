@@ -69,6 +69,7 @@ pub fn reconcile_stale_runs(
         &admitted,
     );
     if let Ok(result) = result {
+        answer_calls_cut_off_by_restart(orch, &result.settled_turns);
         // `recompute_job` sweeps a job's whole execution, and the repair
         // candidates cluster by execution (a resolved issue contributes every
         // job it left unsettled), so sweep each execution once.
@@ -86,6 +87,38 @@ pub fn reconcile_stale_runs(
             if let Err(error) = outcome {
                 log::warn!("Failed to re-derive job status for {job_id}: {error}");
             }
+        }
+    }
+}
+
+/// Answer the calls of every turn this boot's sweep found running.
+///
+/// A turn yielded for a held call counts too: the held call stays its wait's to
+/// answer, but a sibling call of that turn has nobody else. A pending turn never
+/// ran, so it made no calls. One turn's failure is logged and costs only that
+/// turn its answers; the sweep has already settled it.
+fn answer_calls_cut_off_by_restart(
+    orch: &crate::orchestrator::Orchestrator,
+    turns: &[SettledTurn],
+) {
+    use crate::orchestrator::lifecycle::{settle_unanswered_calls, InterruptCause};
+    for turn in turns {
+        let (Some(run_id), true) = (
+            turn.run_id.as_deref(),
+            matches!(
+                turn.outcome,
+                SettledTurnOutcome::Interrupted | SettledTurnOutcome::YieldedForHeldCall
+            ),
+        ) else {
+            continue;
+        };
+        if let Err(error) =
+            settle_unanswered_calls(orch, run_id, &turn.turn_id, InterruptCause::HostRestart)
+        {
+            log::warn!(
+                "Could not answer the calls a restart cut off on turn {}: {error}",
+                turn.turn_id
+            );
         }
     }
 }

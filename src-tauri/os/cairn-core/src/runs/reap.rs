@@ -174,7 +174,7 @@ pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &
                 Box::pin(async move {
                     let mut settled = Vec::new();
                     for run_id in &stale {
-                        if let Some(turn_ids) = crate::runs::queries::settle_stale_run(
+                        if let Some(turns) = crate::runs::queries::settle_stale_run(
                             conn,
                             run_id,
                             STALE_RUN_EXIT_REASON,
@@ -183,6 +183,8 @@ pub fn reap_stale_runs_for_job(orch: &Orchestrator, db: &Arc<LocalDb>, job_id: &
                         )
                         .await?
                         {
+                            let turn_ids: Vec<String> =
+                                turns.into_iter().map(|turn| turn.turn_id).collect();
                             settled.push((run_id.clone(), turn_ids));
                         }
                     }

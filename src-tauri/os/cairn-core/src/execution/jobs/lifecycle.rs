@@ -1677,13 +1677,9 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     // Provenance rides in the opening prompt rather than a side channel: it is
     // the one piece of context a successor must not be able to miss, and this is
     // the event a rebuilt or compacted session re-reads.
-    for note in [
-        continuation.briefing(),
-        base_note,
-        restart_note.map(str::to_string),
-    ]
-    .into_iter()
-    .flatten()
+    for note in [continuation.briefing(), base_note, restart_note]
+        .into_iter()
+        .flatten()
     {
         if !prompt.is_empty() {
             prompt.push_str("\n\n");
@@ -3560,7 +3556,7 @@ fn continue_job_launch_locked(
         (suppress_user_event && !suppress_self_suspend_note)
             .then(|| RESUME_AFTER_SELF_SUSPEND_NOTE.to_string()),
         artifact_handoff_note,
-        restart_note.map(str::to_string),
+        restart_note,
     ]
     .into_iter()
     .flatten()
@@ -3971,21 +3967,34 @@ pub(crate) const ORPHANED_PENDING_RESUME_NOTE: &str = "Cairn restarted before yo
 /// restart on whichever launch next reaches it. Callers read this before
 /// minting the launch's own turn.
 ///
+/// A turn the restart cut off mid-flight also names each call the restart
+/// settlement answered, with the settlement's own text: this prompt is the one
+/// channel that reaches the model on a native resume. A turn with none keeps the
+/// generic note, which does not claim nothing was in flight, because the
+/// transcript may never have recorded a call the process had dispatched.
+///
 /// The note frames a prompt and never gates one, so a failed read is logged and
 /// reads as no note.
-fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<&'static str> {
+fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<String> {
     let db = owning_db.clone();
     let job_id_owned = job_id.to_string();
     let latest = run_db(async move {
         db.query_opt(
-            "SELECT COALESCE(end_reason, ''), started_at IS NOT NULL FROM turns
+            "SELECT COALESCE(end_reason, ''), started_at IS NOT NULL, id, run_id FROM turns
               WHERE job_id = ?1
                 AND start_reason != 'memory_review'
                 AND COALESCE(end_reason, '') != 'launch_refused'
               ORDER BY created_at DESC, sequence DESC
               LIMIT 1",
             (job_id_owned,),
-            |row| Ok((row.text(0)?, row.i64(1)? != 0)),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.i64(1)? != 0,
+                    row.text(2)?,
+                    row.opt_text(3)?,
+                ))
+            },
         )
         .await
         .map_err(|error| error.to_string())
@@ -3993,9 +4002,28 @@ fn restart_resume_note(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<&'stati
     let host_restart = crate::models::TurnEndReason::HostRestart.to_string();
     let orphaned = crate::models::TurnEndReason::OrphanedPending.to_string();
     match latest {
-        Ok(Some((reason, true))) if reason == host_restart => Some(HOST_RESTART_RESUME_NOTE),
-        Ok(Some((reason, _))) if reason == host_restart || reason == orphaned => {
-            Some(ORPHANED_PENDING_RESUME_NOTE)
+        Ok(Some((reason, true, turn_id, run_id))) if reason == host_restart => {
+            let calls = run_id.and_then(|run_id| {
+                let db = owning_db.clone();
+                run_db(async move {
+                    crate::orchestrator::lifecycle::restart_answered_calls_note(
+                        &db, &run_id, &turn_id,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                })
+                .unwrap_or_else(|error| {
+                    log::warn!("Could not read the calls a restart answered: {error}");
+                    None
+                })
+            });
+            Some(match calls {
+                Some(calls) => format!("{HOST_RESTART_RESUME_NOTE}\n\n{calls}"),
+                None => HOST_RESTART_RESUME_NOTE.to_string(),
+            })
+        }
+        Ok(Some((reason, _, _, _))) if reason == host_restart || reason == orphaned => {
+            Some(ORPHANED_PENDING_RESUME_NOTE.to_string())
         }
         Ok(_) => None,
         Err(error) => {

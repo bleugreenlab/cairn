@@ -34,16 +34,29 @@ use cairn_platform::stack::off_frame;
 /// inline, which a batch carrying file edits already holds for its whole
 /// logical transaction, and that lock is not reentrant.
 fn rebase_item_index(changes: &[crate::mcp::types::ChangeItem]) -> Option<usize> {
-    changes.iter().position(|item| {
-        cairn_common::uri::parse_uri(&item.target)
-            .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok())
-            .is_some_and(|resource| {
-                matches!(
-                    resource,
-                    cairn_common::uri::CairnResource::NodeRebase { .. }
-                )
-            })
-    })
+    changes
+        .iter()
+        .position(|item| target_is_rebase(&item.target))
+}
+
+fn target_is_rebase(target: &str) -> bool {
+    cairn_common::uri::parse_uri(target)
+        .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok())
+        .is_some_and(|resource| {
+            matches!(
+                resource,
+                cairn_common::uri::CairnResource::NodeRebase { .. }
+            )
+        })
+}
+
+/// [`target_is_rebase`] for a target as a transcript recorded it, which may still
+/// be home-relative. Only the address's shape is read, so any node home answers.
+fn recorded_target_is_rebase(target: &str) -> bool {
+    match crate::resources::resolve_home_relative_against("cairn://p/any/1/1/any", target) {
+        Some(canonical) => target_is_rebase(&canonical),
+        None => target_is_rebase(target),
+    }
 }
 
 /// What a page-origin batch may not be: anything but structured row writes to

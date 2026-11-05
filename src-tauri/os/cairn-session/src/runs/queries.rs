@@ -515,6 +515,33 @@ pub enum StaleRunSettlement {
     Reaped,
 }
 
+/// What a stale-run settlement or the boot sweep did to one turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettledTurnOutcome {
+    /// A running turn, `interrupted`. `host_restart` when the boot sweep did it.
+    Interrupted,
+    /// A pending turn of a stale run the boot sweep settled, `cancelled`
+    /// `host_restart`.
+    Cancelled,
+    /// A pending turn of a stale run the in-session reaper settled, `failed`.
+    Failed,
+    /// A running turn that held a `run` call open, `yielded` for that call's
+    /// wait, which resumes it.
+    YieldedForHeldCall,
+    /// A pending turn no run ever claimed, `cancelled` `orphaned_pending`.
+    OrphanedPending,
+}
+
+/// One turn a settlement ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettledTurn {
+    pub job_id: Option<String>,
+    /// `None` for a turn no run ever claimed.
+    pub run_id: Option<String>,
+    pub turn_id: String,
+    pub outcome: SettledTurnOutcome,
+}
+
 #[derive(Default)]
 pub struct ReconcileResult {
     stale_run_count: usize,
@@ -528,6 +555,9 @@ pub struct ReconcileResult {
     /// alone left cached `idle` after their work ended. The caller settles them
     /// rather than re-deriving them; see the query that selects them.
     pub stranded_thread_task_ids: Vec<String>,
+    /// Every turn this sweep ended, for the work owed per turn once its writes
+    /// have landed.
+    pub settled_turns: Vec<SettledTurn>,
     /// Stale runs whose surviving process this sweep actually stopped, as
     /// opposed to ones merely assumed dead.
     reaped_count: usize,
@@ -1651,6 +1681,7 @@ async fn reconcile_stale_runs_db(
             let mut reaped_count = 0usize;
             let mut stale_run_count = 0usize;
             let mut reproject_job_ids = std::collections::HashSet::new();
+            let mut swept_turns = Vec::new();
             for (run_id, session_id, job_id) in &stale {
                 let was_reaped = session_id
                     .as_deref()
@@ -1676,6 +1707,7 @@ async fn reconcile_stale_runs_db(
                     reaped_count += 1;
                 }
                 turn_count += settled_turns.len();
+                swept_turns.extend(settled_turns);
                 // Every job whose run this sweep settled is re-derived, whether
                 // or not a turn was stranded on the run: its cached `running`
                 // was written for a run that no longer exists, and nothing else
@@ -1739,6 +1771,12 @@ async fn reconcile_stale_runs_db(
                 if updated > 0 {
                     orphaned_pending_count += 1;
                     reproject_job_ids.insert(job_id.clone());
+                    swept_turns.push(SettledTurn {
+                        job_id: Some(job_id.clone()),
+                        run_id: None,
+                        turn_id: turn_id.clone(),
+                        outcome: SettledTurnOutcome::OrphanedPending,
+                    });
                 }
             }
 
@@ -1959,6 +1997,7 @@ async fn reconcile_stale_runs_db(
                 orphaned_pending_count,
                 reproject_job_ids: reproject_job_ids.into_iter().collect(),
                 stranded_thread_task_ids,
+                settled_turns: swept_turns,
             })
         })
     })
@@ -1972,9 +2011,8 @@ async fn reconcile_stale_runs_db(
 /// write, so the queue never carries a launch whose run is already over. A
 /// call row past `queued` may have a process behind it, so it is not touched
 /// here: the caller hands the settled run to the call-release path, which
-/// stops that process as it releases the row. Returns the ids
-/// of the turns settled, or `None` when the run was no longer non-terminal and
-/// nothing was written.
+/// stops that process as it releases the row. Returns the turns settled, or
+/// `None` when the run was no longer non-terminal and nothing was written.
 ///
 /// The status is re-checked inside the UPDATE rather than trusted from the
 /// caller's read. Every caller decides staleness outside this write — the
@@ -2003,7 +2041,7 @@ pub async fn settle_stale_run(
     exit_reason: &str,
     settlement: StaleRunSettlement,
     now: i64,
-) -> DbResult<Option<Vec<String>>> {
+) -> DbResult<Option<Vec<SettledTurn>>> {
     let updated = conn
         .execute(
             "UPDATE runs
@@ -2039,7 +2077,7 @@ pub async fn settle_stale_run(
 
     let mut turn_rows = conn
         .query(
-            "SELECT id, state
+            "SELECT id, state, job_id
              FROM turns
              WHERE run_id = ?1
                AND state IN ('running', 'pending')",
@@ -2048,11 +2086,17 @@ pub async fn settle_stale_run(
         .await?;
     let mut stranded = Vec::new();
     while let Some(row) = turn_rows.next().await? {
-        stranded.push((row.text(0)?, row.text(1)?));
+        stranded.push((row.text(0)?, row.text(1)?, row.opt_text(2)?));
     }
 
     let mut settled = Vec::new();
-    for (turn_id, turn_state) in stranded {
+    for (turn_id, turn_state, job_id) in stranded {
+        let settled_as = |turn_id: String, outcome| SettledTurn {
+            job_id: job_id.clone(),
+            run_id: Some(run_id.to_string()),
+            turn_id,
+            outcome,
+        };
         // On a host restart, a running turn whose `run` call was held open on
         // its socket owns an active durable row, and that row's reconciler
         // resumes it exactly as it resumes a park. Settle it as the park it
@@ -2072,7 +2116,7 @@ pub async fn settle_stale_run(
                 params![now, turn_id.as_str()],
             )
             .await?;
-            settled.push(turn_id);
+            settled.push(settled_as(turn_id, SettledTurnOutcome::YieldedForHeldCall));
             continue;
         }
         if settlement == StaleRunSettlement::Reaped && turn_state == "running" {
@@ -2091,11 +2135,21 @@ pub async fn settle_stale_run(
             )
             .await?;
         }
-        let (target_state, end_reason) = match (settlement, turn_state.as_str()) {
-            (StaleRunSettlement::HostRestart, "running") => ("interrupted", Some("host_restart")),
-            (StaleRunSettlement::HostRestart, "pending") => ("cancelled", Some("host_restart")),
-            (StaleRunSettlement::Reaped, "running") => ("interrupted", None),
-            (StaleRunSettlement::Reaped, "pending") => ("failed", None),
+        let (target_state, end_reason, outcome) = match (settlement, turn_state.as_str()) {
+            (StaleRunSettlement::HostRestart, "running") => (
+                "interrupted",
+                Some("host_restart"),
+                SettledTurnOutcome::Interrupted,
+            ),
+            (StaleRunSettlement::HostRestart, "pending") => (
+                "cancelled",
+                Some("host_restart"),
+                SettledTurnOutcome::Cancelled,
+            ),
+            (StaleRunSettlement::Reaped, "running") => {
+                ("interrupted", None, SettledTurnOutcome::Interrupted)
+            }
+            (StaleRunSettlement::Reaped, "pending") => ("failed", None, SettledTurnOutcome::Failed),
             _ => continue,
         };
         conn.execute(
@@ -2131,7 +2185,7 @@ pub async fn settle_stale_run(
                 ),
             }
         }
-        settled.push(turn_id);
+        settled.push(settled_as(turn_id, outcome));
     }
     Ok(Some(settled))
 }

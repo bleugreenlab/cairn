@@ -700,14 +700,71 @@ async fn a_held_call_resumes_once_after_restart_in_either_order() {
     a_held_call_resumes_once_after_restart("restart-held-reverse-order", false).await;
 }
 
+/// An assistant event of `turn` on `job`'s run at `sequence`, making `tools`.
+async fn seed_calls(db: &LocalDb, job: &str, turn: &str, sequence: i64, tools: serde_json::Value) {
+    db.execute(
+        "INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,parent_tool_use_id,created_at)
+         VALUES('e-calls-' || ?1 || ?3,'r-' || ?1,'s-' || ?1,?2,?3,?3,'assistant',?4,NULL,?3)",
+        params![
+            job,
+            turn,
+            sequence,
+            serde_json::json!({
+                "eventType": "assistant",
+                "sessionId": format!("s-{job}"),
+                "isError": false,
+                "toolUses": tools,
+            })
+            .to_string()
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+async fn seed_ledger_row(db: &LocalDb, job: &str, tool_use_id: &str, report: &str) {
+    db.execute(
+        "INSERT INTO write_replay_ledger(run_id,tool_use_id,report,created_at)
+         VALUES('r-' || ?1,?2,?3,1)",
+        params![job, tool_use_id, report],
+    )
+    .await
+    .unwrap();
+}
+
+/// Every recorded result for one call, as the parsed transcript events.
+async fn results_for(db: &LocalDb, tool_use_id: &str) -> Vec<serde_json::Value> {
+    let tool_use_id = tool_use_id.to_string();
+    db.read(move |conn| {
+        let tool_use_id = tool_use_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT data FROM events
+                     WHERE event_type = 'tool_result'
+                       AND json_extract(data, '$.toolUseId') = ?1",
+                    params![tool_use_id.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(serde_json::from_str(&row.get::<String>(0)?).unwrap());
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
+}
+
 /// The restart cut a `run` call off between its `tool_use` and its result. The
-/// continuation must not open owing that result: it is a fresh turn on a fresh
-/// run, and the interrupted turn's dangling call stays where it was, neither
-/// re-issued nor re-attached (cairn/5000 owns settling it). How the provider's
-/// native resume treats the dangling call is only observable on a real rebuild.
+/// sweep answers it on the interrupted turn, and the continuation, a fresh turn
+/// on a fresh run, still opens owing nothing, with the answer in its prompt. How
+/// the provider's native resume presents its own copy of the call is only
+/// observable on a real rebuild.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resumed_turn_inherits_no_pending_tool_call() {
-    let (orch, db, _prompts, _backend) = host("restart-resume-tool-call").await;
+async fn a_restart_answers_the_cut_off_call_and_the_resume_owes_none() {
+    let (orch, db, prompts, _backend) = host("restart-resume-tool-call").await;
     seed_node_job(&db, "jc", 1, "active").await;
     seed_turn(
         &db,
@@ -767,10 +824,429 @@ async fn a_resumed_turn_inherits_no_pending_tool_call() {
         owed(run, turns[0].0.clone()).await.is_empty(),
         "the continuation opens owing no tool result"
     );
+    assert!(
+        owed("r-jc".into(), "turn-jc".into()).await.is_empty(),
+        "the interrupted turn owes nothing once the sweep answered it"
+    );
+    let results = results_for(&db, "toolu_cut").await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["raw"]["reason"], "host_restart");
+    let lost = crate::mcp::handlers::run::run_batch_lost_to_restart_text(false);
+    assert_eq!(results[0]["toolResult"], lost.as_str());
+    let prompt = launch_prompts(&db, &prompts, "jc").await;
+    assert!(prompt.contains(&lost), "{prompt}");
+    assert!(prompt.contains("`run` on `cargo build`"), "{prompt}");
+}
+
+/// cairn/5000's specimen: a `cairn:~/rebase` replay was in flight when the host
+/// was rebuilt, and nothing ever answered it. It resolves once to a failure that
+/// says what to re-read, the ledger agrees, the job is not left running, and the
+/// agent hears the same words when its one resume opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebase_replay_write_cut_off_by_a_restart_resolves_once_and_the_session_continues() {
+    let (orch, db, prompts, _backend) = host("restart-rebase-replay-write").await;
+    seed_node_job(&db, "jw", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-jw",
+        "jw",
+        Some("r-jw"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_calls(
+        &db,
+        "jw",
+        "turn-jw",
+        2,
+        serde_json::json!([{
+            "id": "toolu_replay",
+            "name": "mcp__cairn__write",
+            "input": {"changes": [{
+                "target": "cairn:~/rebase",
+                "mode": "patch",
+                "payload": {"action": "replay", "resolution": "take-committed-tip"}
+            }]}
+        }]),
+    )
+    .await;
+    seed_ledger_row(
+        &db,
+        "jw",
+        "toolu_replay",
+        crate::mcp::handlers::write::replay::RESOURCE_PENDING,
+    )
+    .await;
+
+    reconcile(&orch).await;
+
+    assert_eq!(status(&db, "jw").await, "pending");
+    let results = results_for(&db, "toolu_replay").await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["isError"], true);
+    assert_eq!(results[0]["raw"]["reason"], "host_restart");
+    assert_eq!(results[0]["raw"]["effect"], "partial");
+    let answer = results[0]["toolResult"].as_str().unwrap();
+    assert!(answer.contains("re-read `cairn:~/rebase`"), "{answer}");
+    assert!(answer.contains("requesting the replay again"), "{answer}");
+    assert!(
+        !answer.to_lowercase().contains("nothing was committed"),
+        "{answer}"
+    );
+    let row = text(
+        &db,
+        "SELECT report FROM write_replay_ledger WHERE tool_use_id = ?1",
+        "toolu_replay",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !crate::mcp::handlers::write::replay::is_pending(&row),
+        "the ledger settles with the transcript: {row}"
+    );
+
+    let summary = resume(&orch).await;
+    assert_eq!(summary.admitted, 1, "{summary:?}");
+    let prompt = launch_prompts(&db, &prompts, "jw").await;
+    assert!(prompt.contains(RESTART_NOTE), "{prompt}");
+    assert!(prompt.contains("`write` on `cairn:~/rebase`"), "{prompt}");
+    assert!(prompt.contains(answer), "{prompt}");
+
+    // A later pass finds the call answered and the job already resumed.
+    reconcile(&orch).await;
+    assert_eq!(resume(&orch).await, super::RestartResumeSummary::default());
+    assert_eq!(results_for(&db, "toolu_replay").await.len(), 1);
+    assert_eq!(launched_turns(&db, "jw").await.len(), 1);
+}
+
+/// What a restart says about each kind of call, from the only evidence it has.
+#[test]
+fn each_kind_of_call_is_answered_with_what_the_restart_can_know() {
+    use crate::mcp::handlers::run::run_batch_lost_to_restart_text;
+    use crate::orchestrator::lifecycle::{restart_answer, CallEffect, LedgerRow};
+    use serde_json::json;
+
+    let opening = "Cairn restarted while this call was in flight, so its result was lost.";
+    let resource_write = json!({"changes": [
+        {"target": "cairn:~/todos", "mode": "patch", "payload": {}},
+        {"target": "cairn:~/plan", "mode": "patch", "payload": {}},
+    ]});
+    let file_write = json!({
+        "changes": [{"target": "file:src/lib.rs", "mode": "patch", "payload": {}}],
+        "commit_msg": "edit",
+    });
+    let row = |report: &str| LedgerRow {
+        report: report.to_string(),
+        finalized: true,
+    };
+    let write = "mcp__cairn__write";
+    let none = serde_json::Value::Null;
+
+    let read = restart_answer(
+        "mcp__cairn__read",
+        &json!({"paths": ["file:a"]}),
+        None,
+        false,
+    );
+    assert_eq!(read.effect, CallEffect::None);
+    assert!(
+        read.text.contains("A read changes nothing"),
+        "{}",
+        read.text
+    );
+
+    let never_started = restart_answer(write, &resource_write, None, false);
+    assert_eq!(never_started.effect, CallEffect::None);
+    assert!(never_started.text.contains("None of its items ran"));
+
+    // Byte-identical open writes cannot name their own call, so they claim no
+    // ledger row: the absence of one proves nothing.
+    let twin = restart_answer(write, &resource_write, None, true);
+    assert_eq!(twin.effect, CallEffect::Unknown);
+    assert!(
+        !twin.text.contains("None of its items ran"),
+        "{}",
+        twin.text
+    );
+
+    let checkpoint = format!(
+        "{}\n{}",
+        crate::mcp::handlers::write::replay::RESOURCE_PENDING,
+        json!({"applied": [{"index": 0, "target": "cairn:~/todos", "mode": "patch"}]}),
+    );
+    let pending = restart_answer(write, &resource_write, Some(&row(&checkpoint)), false);
+    assert_eq!(pending.effect, CallEffect::Partial);
+    let sealed = pending
+        .seal_report
+        .as_deref()
+        .expect("a pending row is sealed");
+    assert!(pending.text.ends_with(sealed), "{}", pending.text);
+    let report: serde_json::Value = serde_json::from_str(sealed).unwrap();
+    assert_eq!(report["applied"][0]["target"], "cairn:~/todos");
+    assert_eq!(report["failures"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(report["failures"][0]["target"], "cairn:~/plan");
+    let phrase = report["failures"][0]["error"].as_str().unwrap();
+    assert!(phrase.starts_with("not confirmed"), "{phrase}");
+    assert!(phrase.contains("`cairn:~/plan`"), "{phrase}");
+
+    let recorded = r#"{"applied":[{"index":0}],"commit":{"status":"committed"}}"#;
+    let landed = restart_answer(write, &file_write, Some(&row(recorded)), false);
+    assert_eq!(landed.effect, CallEffect::Landed);
+    assert!(landed.text.contains(recorded), "{}", landed.text);
+    assert!(landed.text.contains("Do not retry"), "{}", landed.text);
+    assert!(landed.seal_report.is_none());
+
+    let stopped = json!({"applied": [], "failures": [
+        {"index": 0, "kind": crate::mcp::handlers::write::replay::STOPPED_KIND, "error": "not applied"}
+    ]})
+    .to_string();
+    let sealed_by_stop = restart_answer(write, &resource_write, Some(&row(&stopped)), false);
+    assert_eq!(sealed_by_stop.effect, CallEffect::Partial);
+    assert!(!sealed_by_stop.text.contains("Do not retry"));
+
+    let post_seal = LedgerRow {
+        report: recorded.to_string(),
+        finalized: false,
+    };
+    let unfinished = restart_answer(write, &file_write, Some(&post_seal), false);
+    assert_eq!(unfinished.effect, CallEffect::Partial);
+    assert!(
+        unfinished.text.contains("pull request"),
+        "{}",
+        unfinished.text
+    );
+
+    let maybe_committed = restart_answer(write, &file_write, None, false);
+    assert_eq!(maybe_committed.effect, CallEffect::Unknown);
+    assert!(maybe_committed.text.contains("cairn:@/vcs/log"));
+    assert!(!maybe_committed
+        .text
+        .to_lowercase()
+        .contains("nothing was committed"));
+
+    let commit_run = restart_answer(
+        "mcp__cairn__run",
+        &json!({"commands": [{"command": "x"}], "commit_msg": "m"}),
+        None,
+        false,
+    );
+    assert_eq!(commit_run.effect, CallEffect::Unknown);
+    assert_eq!(commit_run.text, run_batch_lost_to_restart_text(true));
+    let plain_run = restart_answer("run", &json!({"commands": []}), None, false);
+    assert_eq!(plain_run.effect, CallEffect::None);
+    assert_eq!(plain_run.text, run_batch_lost_to_restart_text(false));
+
+    // A provider's own shell has no `run` semantics: nothing restores its tree.
+    for name in ["Bash", "Task", "mcp__other__thing"] {
+        let other = restart_answer(name, &none, None, false);
+        assert_eq!(other.effect, CallEffect::Unknown, "{name}");
+        assert!(other.text.contains("outcome is unknown"), "{}", other.text);
+    }
+
+    for answer in [
+        &read,
+        &never_started,
+        &twin,
+        &pending,
+        &landed,
+        &sealed_by_stop,
+        &unfinished,
+        &maybe_committed,
+    ] {
+        assert!(answer.text.starts_with(opening), "{}", answer.text);
+        crate::system_prompt::assert_no_substrate_vocabulary("restart answer", &answer.text);
+    }
+}
+
+/// A write whose report was recorded took effect, so its answer carries that
+/// report and does not read as a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_that_landed_before_the_restart_is_answered_with_its_report() {
+    let (orch, db, _prompts, _backend) = host("restart-landed-write").await;
+    seed_node_job(&db, "jl", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-jl",
+        "jl",
+        Some("r-jl"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_calls(
+        &db,
+        "jl",
+        "turn-jl",
+        2,
+        serde_json::json!([{
+            "id": "toolu_landed",
+            "name": "mcp__cairn__write",
+            "input": {"changes": [{"target": "file:a.rs", "mode": "patch", "payload": {}}], "commit_msg": "m"}
+        }]),
+    )
+    .await;
+    let report = r#"{"applied":[{"index":0}],"commit":{"status":"committed","sha":"abc"}}"#;
+    seed_ledger_row(&db, "jl", "toolu_landed", report).await;
+
+    reconcile(&orch).await;
+
+    let results = results_for(&db, "toolu_landed").await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["isError"], false);
+    assert_eq!(results[0]["raw"]["effect"], "landed");
+    assert!(results[0]["toolResult"].as_str().unwrap().contains(report));
     assert_eq!(
-        owed("r-jc".into(), "turn-jc".into()).await,
-        vec!["toolu_cut".to_string()],
-        "the interrupted turn's dangling call is left as it was"
+        text(
+            &db,
+            "SELECT report FROM write_replay_ledger WHERE tool_use_id = ?1",
+            "toolu_landed"
+        )
+        .await
+        .as_deref(),
+        Some(report),
+        "a finished row is final"
+    );
+}
+
+/// One owner per call: an active wait row keeps its call, and the settlement
+/// answers the turn's other open call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_an_active_wait_owns_is_left_to_that_wait() {
+    let (orch, db, _prompts, _backend) = host("restart-owned-call").await;
+    seed_node_job(&db, "jo", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-jo",
+        "jo",
+        Some("r-jo"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_calls(
+        &db,
+        "jo",
+        "turn-jo",
+        2,
+        serde_json::json!([
+            {"id": "toolu_owned", "name": "mcp__cairn__run", "input": {"commands": [{"waitFor": {"duration": "3m"}}]}},
+            {"id": "toolu_free", "name": "mcp__cairn__read", "input": {"paths": ["file:a.rs"]}},
+        ]),
+    )
+    .await;
+    db.execute(
+        "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at)
+         VALUES('wait-jo','jo','r-jo','s-jo','turn-jo','toolu_owned','{\"kind\":\"duration\"}',NULL,'pending',1)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    reconcile(&orch).await;
+
+    assert!(results_for(&db, "toolu_owned").await.is_empty());
+    let free = results_for(&db, "toolu_free").await;
+    assert_eq!(free.len(), 1, "{free:?}");
+    assert_eq!(free[0]["raw"]["effect"], "none");
+}
+
+/// A turn holding a `run` call open settles as a park, not as interrupted, but a
+/// sibling call it had in flight has no wait to answer it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_of_a_held_call_is_answered_and_the_held_call_stays_its_waits() {
+    let (orch, db, _prompts, _backend) = host("restart-held-sibling").await;
+    seed_node_job(&db, "js", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-js",
+        "js",
+        Some("r-js"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_held_run_call(&db, "js", "turn-js").await;
+    seed_calls(
+        &db,
+        "js",
+        "turn-js",
+        2,
+        serde_json::json!([
+            {"id": "toolu-held", "name": "mcp__cairn__run", "input": {"commands": [{"command": "cargo test"}]}},
+            {"id": "toolu_sibling", "name": "mcp__cairn__read", "input": {"paths": ["file:a.rs"]}},
+        ]),
+    )
+    .await;
+
+    reconcile(&orch).await;
+
+    assert_eq!(settlement(&db, "turn-js").await, "yielded/-");
+    assert!(results_for(&db, "toolu-held").await.is_empty());
+    assert_eq!(results_for(&db, "toolu_sibling").await.len(), 1);
+}
+
+/// Not every recorded result carries its turn. A real answer must not be buried
+/// under a false one because it did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_answered_by_a_result_with_no_turn_is_not_answered_again() {
+    let (orch, db, prompts, _backend) = host("restart-turnless-result").await;
+    seed_node_job(&db, "jn", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-jn",
+        "jn",
+        Some("r-jn"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    seed_calls(
+        &db,
+        "jn",
+        "turn-jn",
+        2,
+        serde_json::json!([{"id": "toolu_done", "name": "mcp__cairn__read", "input": {"paths": ["file:a.rs"]}}]),
+    )
+    .await;
+    db.execute(
+        "INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,parent_tool_use_id,created_at)
+         VALUES('e-done','r-jn','s-jn',NULL,3,3,'tool_result',?1,NULL,3)",
+        params![serde_json::json!({
+            "eventType": "tool_result",
+            "sessionId": "s-jn",
+            "isError": false,
+            "toolUseId": "toolu_done",
+            "toolResult": "the real answer",
+        })
+        .to_string()],
+    )
+    .await
+    .unwrap();
+
+    reconcile(&orch).await;
+
+    let results = results_for(&db, "toolu_done").await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["toolResult"], "the real answer");
+
+    // With nothing to name, the note is the plain restart notice.
+    assert_eq!(resume(&orch).await.admitted, 1);
+    let prompt = launch_prompts(&db, &prompts, "jn").await;
+    assert!(prompt.contains(RESTART_NOTE), "{prompt}");
+    assert!(
+        !prompt.contains("The calls that were in flight"),
+        "{prompt}"
     );
 }
 

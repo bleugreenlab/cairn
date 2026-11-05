@@ -3262,7 +3262,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            resolution.contains("restarted") && resolution.contains("nothing was committed"),
+            resolution.contains("restarted") && resolution.contains("may have landed"),
             "unexpected restart resolution: {resolution}"
         );
         // Exactly one resume, exactly one delivered result.
