@@ -123,9 +123,10 @@ fn the_vcs_backend_never_resolves_seal_ownership_at_call_time() {
 /// shape, so converting or deleting one fails the test until its entry goes.
 const RUNTIME_BRIDGES_ALLOWED: &[(&str, &str, &str)] = &[(
     "os/cairn-db/src/storage/blocking.rs",
-    "run_db_blocking",
-    "the one sanctioned bridge: on a multi-thread runtime it hands the worker's queue off \
-         with block_in_place before it joins (cairn/5788)",
+    "on_a_scoped_thread",
+    "the one sanctioned bridge's last resort: only a current-thread runtime or a process with \
+         no bridge runtime installed reaches it, never a multi-thread worker (cairn/5788, \
+         cairn/6044)",
 )];
 
 /// The name a line declares a function by, if it does.
@@ -228,7 +229,8 @@ fn no_production_code_hand_rolls_a_runtime_bridge() {
     assert!(
         found
             .iter()
-            .any(|(path, name)| path.ends_with("storage/blocking.rs") && name == "run_db_blocking"),
+            .any(|(path, name)| path.ends_with("storage/blocking.rs")
+                && name == "on_a_scoped_thread"),
         "the detector no longer recognizes the sanctioned bridge itself, so it proves nothing: \
          {found:?}"
     );

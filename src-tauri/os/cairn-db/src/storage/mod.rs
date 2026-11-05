@@ -34,7 +34,7 @@ pub mod served_api;
 /// within cairn-db; cairn-core re-exports this exact alias at `crate::db::TeamId`.
 pub type TeamId = String;
 
-pub use blocking::{panic_message, run_db_blocking};
+pub use blocking::{install_bridge_runtime, panic_message, run_db_blocking};
 pub use context_tokens::get_latest_context_token_event;
 pub use error::{DbError, DbResult};
 pub use fact_log::{
