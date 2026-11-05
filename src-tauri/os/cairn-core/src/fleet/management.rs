@@ -1771,6 +1771,7 @@ pub fn set_machine_services(
         Ok(summaries)
     })?;
     crate::project_services::supervisor::machine::spawn_apply(orch, "machine-service selection");
+    orch.emit_machine_service_change();
     Ok(summaries)
 }
 
@@ -1831,6 +1832,9 @@ fn check_selectable(
         .map_err(|error| format!("{key}'s declaration does not parse: {error}"))?;
     if selection.override_command().is_some() {
         return Ok(());
+    }
+    if let Some(refusal) = declared.refusal {
+        return Err(format!("{key} cannot run its artifact: {refusal}"));
     }
     let (Some(native), Some(target)) = (package.declaration.native(), target) else {
         return Ok(());

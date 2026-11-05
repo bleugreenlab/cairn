@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use cairn_common::uri::build_pack_uri;
 
-use crate::config::mcp_servers::{workspace_mcp_entries, NotReady, WorkspaceMcpEntry};
+use crate::config::machine_services::MachineServiceSnapshot;
+use crate::config::mcp_servers::{
+    workspace_mcp_entries, MachineStateTag, NotReady, WorkspaceMcpEntry,
+};
 use crate::config::pack::library::cache::{self as library_cache, CachedIndex};
 use crate::config::pack::library::{EntryOrigin, EntryRefusal, IndexEntry, LibrarySource};
 use crate::config::pack::mcp::McpVarRequirement;
@@ -23,6 +26,9 @@ use crate::config::pack::{
     UpstreamRef,
 };
 use crate::library::{LibraryContext, PendingUpdate, RuntimeChange};
+use crate::project_services::declaration::Transport;
+use crate::project_services::pack_source::declared_machine_service;
+use cairn_config::fleet::MachineServiceKey;
 
 /// One entry a verified library index offers.
 struct LibraryOffer {
@@ -139,13 +145,22 @@ impl PackView {
             .unwrap_or("")
     }
 
+    /// What the source says about this pack, then what the install recorded
+    /// that the source does not: an index derived by an older build cannot say
+    /// what this build's sync left out.
     fn notes(&self) -> Vec<String> {
-        self.available
+        let mut notes = self
+            .available
             .as_ref()
             .map(|m| m.notes.clone())
             .or_else(|| self.offered.as_ref().map(|o| o.entry.notes.clone()))
-            .or_else(|| self.installed.as_ref().map(|l| l.notes.clone()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for note in self.installed.iter().flat_map(|lock| &lock.notes) {
+            if !notes.contains(note) {
+                notes.push(note.clone());
+            }
+        }
+        notes
     }
 
     /// The definition of one MCP item: the live registry's, else the offered
@@ -245,6 +260,54 @@ pub struct PackCatalogItem {
     /// For an endpoint: the host it connects to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connects_to: Option<String>,
+    /// For a live service item of an installed pack: which machines it can run
+    /// on and how each stands. The Library renders this; it never derives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_service: Option<MachineServiceItem>,
+}
+
+/// A machine service's standing across the fleet, as of this read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineServiceItem {
+    /// `<pack>/<service>`: the key a selection is written under.
+    pub key: String,
+    /// The version the shipped declaration pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_version: Option<String>,
+    /// `mcp-stdio`, `none`, or `ndjson`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Why the pack's own artifact may not run here, so a new selection would
+    /// be refused: its declaration does not parse, or its copy was edited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    pub machines: Vec<MachineServiceMachine>,
+}
+
+/// One machine's row: a machine the service ships an artifact for, or one that
+/// selected it whatever its platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineServiceMachine {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub attached: bool,
+    /// Presence of this machine's key in the fleet row.
+    pub selected: bool,
+    /// The rest describe the instance, so only a selected machine has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<MachineStateTag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_command: Option<String>,
+    /// What it runs and who chose it, in the instance's own words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
 }
 
 /// How many live items of one kind a pack carries, for the compact
@@ -563,9 +626,13 @@ fn pack_views(
 
 /// The typed catalog for `config_dir`, reading `library`'s verified caches.
 /// Never touches the network.
-pub fn pack_catalog(config_dir: &Path, library: &LibraryContext) -> PackCatalog {
+pub fn pack_catalog(
+    config_dir: &Path,
+    library: &LibraryContext,
+    machines: &MachineServiceSnapshot,
+) -> PackCatalog {
     let resource_dir = pack::source_dir(config_dir);
-    let mcp_entries = workspace_mcp_entries(config_dir);
+    let mcp_entries = workspace_mcp_entries(config_dir, machines);
     let (views, sources) = pack_views(resource_dir.as_deref(), config_dir, library);
     let packs = views
         .iter()
@@ -576,6 +643,7 @@ pub fn pack_catalog(config_dir: &Path, library: &LibraryContext) -> PackCatalog 
                 view,
                 &mcp_entries,
                 library,
+                machines,
             )
         })
         .collect();
@@ -592,6 +660,7 @@ fn project(
     view: &PackView,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
     library: &LibraryContext,
+    machines: &MachineServiceSnapshot,
 ) -> PackCatalogEntry {
     let classify = |entry: &mut PackCatalogItem, kind: PackItemKind| {
         let definition = (kind == PackItemKind::Mcp)
@@ -617,6 +686,10 @@ fn project(
             let mut entry = catalog_item(item, state, mcp_entries);
             entry.behind_shipped = verdict.behind;
             classify(&mut entry, kind);
+            if kind == PackItemKind::Service && view.installed.is_some() {
+                entry.machine_service =
+                    machine_service_item(config_dir, &view.id, &entry.id, machines);
+            }
             entry
         })
         .collect();
@@ -705,6 +778,67 @@ fn project(
         behind_count: items.iter().filter(|item| item.behind_shipped).count(),
         items,
     }
+}
+
+/// The Library's per-machine view of one installed service: the machines its
+/// declaration ships an artifact for, plus any selected one whatever its target.
+fn machine_service_item(
+    config_dir: &Path,
+    pack_id: &str,
+    service: &str,
+    machines: &MachineServiceSnapshot,
+) -> Option<MachineServiceItem> {
+    let key = MachineServiceKey::new(pack_id, service).ok()?;
+    let declared = declared_machine_service(config_dir, &key);
+    let package = declared.as_ref().and_then(|d| d.package.as_ref().ok());
+    let native = package.and_then(|package| package.declaration.native());
+    let views = machines.views(&key);
+    let rows = machines
+        .machines
+        .iter()
+        .filter_map(|candidate| {
+            let view = views.iter().find(|view| view.machine == candidate.name);
+            let ships_here = candidate
+                .target
+                .as_deref()
+                .zip(native)
+                .is_some_and(|(target, native)| native.targets.contains_key(target));
+            if view.is_none() && !ships_here {
+                return None;
+            }
+            let verdict = view.map(|view| view.state.verdict(&view.machine));
+            Some(MachineServiceMachine {
+                name: candidate.name.clone(),
+                target: candidate.target.clone(),
+                attached: candidate.attached,
+                selected: view.is_some(),
+                state: verdict.as_ref().map(|verdict| verdict.state),
+                reason: verdict.and_then(|verdict| verdict.reason),
+                installed_version: view.and_then(|view| view.installed_version.clone()),
+                override_command: view.and_then(|view| view.override_command.clone()),
+                provenance: view.map(|view| view.provenance.clone()),
+            })
+        })
+        .collect();
+    Some(MachineServiceItem {
+        key: key.to_string(),
+        pinned_version: native.map(|native| native.version.clone()),
+        transport: package.map(|package| {
+            match package.declaration.transport {
+                Transport::McpStdio => "mcp-stdio",
+                Transport::None => "none",
+                Transport::Ndjson => "ndjson",
+            }
+            .to_string()
+        }),
+        refusal: declared.as_ref().and_then(|declared| {
+            declared
+                .refusal
+                .clone()
+                .or_else(|| declared.package.as_ref().err().cloned())
+        }),
+        machines: rows,
+    })
 }
 
 #[derive(Default)]
@@ -865,6 +999,7 @@ fn catalog_item(
         setup: entry.map(|e| e.setup.clone()).unwrap_or_default(),
         runs: ItemRuns::Content,
         connects_to: None,
+        machine_service: None,
     }
 }
 
@@ -933,7 +1068,10 @@ pub fn pack_item_diff(
     let yours_root = config_dir.join(&path);
 
     let mut files = Vec::new();
-    if matches!(kind, PackItemKind::Skill | PackItemKind::Workflow) {
+    if matches!(
+        kind,
+        PackItemKind::Service | PackItemKind::Skill | PackItemKind::Workflow
+    ) {
         let shipped = tree_texts(&shipped_root)?;
         let yours = tree_texts(&yours_root)?;
         let names: std::collections::BTreeSet<&String> =
@@ -1011,6 +1149,19 @@ fn item_label(item: &PackCatalogItem) -> String {
     if let Some(reason) = &item.not_ready {
         label.push_str(&format!(" (not ready: {})", reason.summary()));
     }
+    if let Some(service) = &item.machine_service {
+        let selected: Vec<String> = service
+            .machines
+            .iter()
+            .filter(|machine| machine.selected)
+            .map(|machine| format!("{}: {}", machine.name, machine_state_words(machine)))
+            .collect();
+        label.push_str(&if selected.is_empty() {
+            " (not selected on any machine)".to_string()
+        } else {
+            format!(" ({})", selected.join(", "))
+        });
+    }
     match item.state {
         PackItemState::EditedByUser if item.behind_shipped => {
             label.push_str(" (your copy, behind shipped)")
@@ -1020,6 +1171,63 @@ fn item_label(item: &PackCatalogItem) -> String {
         PackItemState::PackOwned => {}
     }
     label
+}
+
+/// One selected machine's state as a phrase.
+fn machine_state_words(machine: &MachineServiceMachine) -> String {
+    let word = match machine.state {
+        Some(MachineStateTag::NotInstalled) | None => "not installed",
+        Some(MachineStateTag::Installing) => "installing",
+        Some(MachineStateTag::MachineAbsent) => "machine absent",
+        Some(MachineStateTag::Starting) => "starting",
+        Some(MachineStateTag::WaitingForOperator) => "waiting for the operator",
+        Some(MachineStateTag::Ready) => "ready",
+        Some(MachineStateTag::Degraded) => "degraded",
+        Some(MachineStateTag::Failed) => "failed",
+    };
+    match &machine.reason {
+        Some(reason) => format!("{word}: {reason}"),
+        None => word.to_string(),
+    }
+}
+
+/// Every machine service item's machines, one line each, and how to change them.
+fn render_machine_services(out: &mut String, entry: &PackCatalogEntry) {
+    for item in &entry.items {
+        let Some(service) = &item.machine_service else {
+            continue;
+        };
+        out.push_str(&format!("## Machine service `{}`\n\n", service.key));
+        if let Some(version) = &service.pinned_version {
+            out.push_str(&format!("Pinned version: {version}\n"));
+        }
+        if let Some(refusal) = &service.refusal {
+            out.push_str(&format!("Refused: {refusal}\n"));
+        }
+        out.push('\n');
+        for machine in &service.machines {
+            let standing = if machine.selected {
+                machine_state_words(machine)
+            } else {
+                "not selected".to_string()
+            };
+            let runs = machine
+                .provenance
+                .as_deref()
+                .map(|provenance| format!(" · {provenance}"))
+                .unwrap_or_default();
+            out.push_str(&format!("- {}: {standing}{runs}\n", machine.name));
+        }
+        if service.machines.is_empty() {
+            out.push_str("- No machine this service ships an artifact for.\n");
+        }
+        out.push_str(&format!(
+            "\nSelect it on a machine with `write cairn://executors/<name>` patch \
+             `{{machineServices: {{\"{key}\": {{}}}}}}`, which runs the service there; `null` \
+             removes it.\n\n",
+            key = service.key
+        ));
+    }
 }
 
 fn render_items(out: &mut String, entry: &PackCatalogEntry) {
@@ -1045,9 +1253,10 @@ fn render_items(out: &mut String, entry: &PackCatalogEntry) {
 pub(crate) fn read_packs(
     config_dir: &Path,
     library: &LibraryContext,
+    machines: &MachineServiceSnapshot,
     state_filter: Option<&str>,
 ) -> String {
-    render_packs(&pack_catalog(config_dir, library), state_filter)
+    render_packs(&pack_catalog(config_dir, library, machines), state_filter)
 }
 
 /// One line per configured source: whether its index is believed, and why not.
@@ -1138,6 +1347,10 @@ fn describe_definition(definition: &McpServerConfig) -> String {
             definition.transport,
             definition.url.as_deref().unwrap_or("?")
         ),
+        crate::config::mcp_servers::MACHINE_SERVICE_TRANSPORT => format!(
+            "machine service {}",
+            definition.service.as_deref().unwrap_or("?")
+        ),
         _ => {
             let mut argv = vec![definition.command.clone().unwrap_or_default()];
             argv.extend(definition.args.iter().cloned());
@@ -1162,6 +1375,7 @@ fn describe_definition(definition: &McpServerConfig) -> String {
 const SECTIONS: &[(&str, &str, &str)] = &[
     (PACK_ENTRY_KIND, "Packs", "pack"),
     ("mcp", "MCP servers", "MCP server"),
+    ("service", "Machine services", "machine service"),
     ("skill", "Skills", "skill"),
     ("agent", "Agents", "agent"),
     ("recipe", "Recipes", "recipe"),
@@ -1310,8 +1524,13 @@ fn display_version(entry: &PackCatalogEntry) -> &str {
         .unwrap_or("0.0.0")
 }
 
-pub(crate) fn read_pack(config_dir: &Path, library: &LibraryContext, pack_id: &str) -> String {
-    let catalog = pack_catalog(config_dir, library);
+pub(crate) fn read_pack(
+    config_dir: &Path,
+    library: &LibraryContext,
+    machines: &MachineServiceSnapshot,
+    pack_id: &str,
+) -> String {
+    let catalog = pack_catalog(config_dir, library, machines);
     match catalog.find(pack_id) {
         Some(entry) => render_pack(entry),
         None => format!("Pack not found: {pack_id}"),
@@ -1424,6 +1643,7 @@ fn render_pack(entry: &PackCatalogEntry) -> String {
 
     out.push_str("## Contents\n\n");
     render_items(&mut out, entry);
+    render_machine_services(&mut out, entry);
 
     let edited = entry.edited_items();
     if !edited.is_empty() {
@@ -1486,6 +1706,7 @@ mod tests {
             setup: Vec::new(),
             runs: ItemRuns::Content,
             connects_to: None,
+            machine_service: None,
         }
     }
 

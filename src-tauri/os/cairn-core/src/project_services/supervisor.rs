@@ -1106,6 +1106,7 @@ fn install(orch: &Orchestrator, cell: &Arc<Cell>, incarnation: Arc<Incarnation>)
         state.status = ServiceState::Running;
         state.backoff_until = None;
     }
+    machine::announce_state(orch, cell);
     if let Some(idle) = idle {
         tokio::spawn(idle_watch(orch.clone(), cell.clone(), generation, idle));
     }
@@ -1379,6 +1380,7 @@ async fn on_exit(
             "runner",
         )
         .await;
+        machine::announce_state(orch, cell);
         return;
     }
     crashed(
@@ -1506,6 +1508,7 @@ async fn record_crash(orch: &Orchestrator, cell: &Arc<Cell>, generation: u64, wh
         (None, _) => what.to_string(),
     };
     lifecycle(orch, cell, generation, &text, "runner").await;
+    machine::announce_state(orch, cell);
     if let Some((delay, expected_generation)) = delay {
         let (orch, cell) = (orch.clone(), cell.clone());
         tokio::spawn(async move {

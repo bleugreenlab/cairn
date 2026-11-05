@@ -62,6 +62,7 @@ impl RawImportedServer {
             // declaration on its own.
             secrets: Vec::new(),
             cwd: None,
+            service: None,
             agent_plugin_runtime: None,
         }
     }

@@ -22,12 +22,14 @@ pub struct AgentPluginRuntime {
 ///
 /// A struct (rather than a tagged enum) so the stdio fields and the remote
 /// (`http`/`sse`) fields share one schema; the active transport selects which
-/// fields apply. `type` defaults to `stdio`.
+/// fields apply. `type` defaults to `stdio`. `machine-service` is the third
+/// shape: only `service`, because its process is that service's resident.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerConfig {
     /// Transport type: `stdio` (spawned child process), `http` (streamable
-    /// HTTP), or `sse` (legacy HTTP+SSE). `http`/`sse` use `url` + `headers`.
+    /// HTTP), `sse` (legacy HTTP+SSE), or `machine-service` (a service the same
+    /// pack ships, running on a machine). `http`/`sse` use `url` + `headers`.
     #[serde(rename = "type", default = "default_transport")]
     pub transport: String,
     /// Stdio: command to spawn the server process.
@@ -80,6 +82,9 @@ pub struct McpServerConfig {
     /// `security::broker` for the full reasoning.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// `machine-service`: the id of the service the same pack ships.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     /// Installation-only Agent Plugin launch context.
     #[serde(skip)]
     pub agent_plugin_runtime: Option<AgentPluginRuntime>,
@@ -120,7 +125,9 @@ pub const MCP_CONFIG_FINGERPRINT_ALGORITHM: &str = "sha256";
 /// reconfigure, which is the intended cost.
 /// v3 added stdio `cwd`, which changes where a server executes and therefore
 /// belongs to the authority identity just like its command and arguments.
-pub const MCP_CONFIG_FINGERPRINT_ENCODING_VERSION: u32 = 3;
+/// v4 added `service`, which decides which process a `machine-service` entry
+/// reaches.
+pub const MCP_CONFIG_FINGERPRINT_ENCODING_VERSION: u32 = 4;
 
 /// Domain separator. Keeps these digests from colliding with any other
 /// sha256-over-config in the system, now or later.
@@ -183,6 +190,7 @@ pub fn fingerprint_mcp_config(
                 enabled,
                 oauth,
                 secrets,
+                service,
                 agent_plugin_runtime: _,
             } = config;
             encoder.field("config", "present");
@@ -199,6 +207,7 @@ pub fn fingerprint_mcp_config(
             // output, so widening or narrowing it is a change to what the
             // approval covered.
             encoder.sequence("secrets", secrets);
+            encoder.field("service", service.as_deref().unwrap_or(""));
             match oauth.as_ref() {
                 None => encoder.field("oauth", "absent"),
                 Some(oauth) => {
@@ -475,6 +484,7 @@ impl McpServerConfig {
             // The declaration names variables, not values, so it survives
             // expansion unchanged.
             secrets: self.secrets.clone(),
+            service: self.service.clone(),
             agent_plugin_runtime: None,
         }
     }
@@ -511,6 +521,112 @@ impl McpServerConfig {
     }
 }
 
+/// The `type` of an MCP entry whose process is a machine service's resident.
+pub const MACHINE_SERVICE_TRANSPORT: &str = "machine-service";
+
+impl McpServerConfig {
+    /// What is wrong with this entry's `machine-service` shape, naming the key.
+    /// Whether the service it references exists is a separate question, answered
+    /// where declarations can be read.
+    pub fn machine_service_shape_error(&self) -> Option<String> {
+        if self.transport != MACHINE_SERVICE_TRANSPORT {
+            return self.service.is_some().then(|| {
+                format!(
+                    "`service` applies only to `type: {MACHINE_SERVICE_TRANSPORT}`, not `type: {}`",
+                    self.transport
+                )
+            });
+        }
+        // Destructured exhaustively, so a field added later must say whether a
+        // resident has any use for it.
+        let McpServerConfig {
+            transport: _,
+            service,
+            enabled: _,
+            agent_plugin_runtime: _,
+            command,
+            args,
+            env,
+            cwd,
+            url,
+            headers,
+            oauth,
+            secrets,
+        } = self;
+        if service.as_deref().is_none_or(|id| id.trim().is_empty()) {
+            return Some(format!(
+                "`type: {MACHINE_SERVICE_TRANSPORT}` requires `service`"
+            ));
+        }
+        [
+            ("command", command.is_some()),
+            ("args", !args.is_empty()),
+            ("env", !env.is_empty()),
+            ("cwd", cwd.is_some()),
+            ("url", url.is_some()),
+            ("headers", !headers.is_empty()),
+            ("oauth", oauth.is_some()),
+            ("secrets", !secrets.is_empty()),
+        ]
+        .into_iter()
+        .find(|(_, set)| *set)
+        .map(|(key, _)| {
+            format!(
+                "`{key}` is not allowed on `type: {MACHINE_SERVICE_TRANSPORT}`: its process is the \
+                 service's resident"
+            )
+        })
+    }
+}
+
+/// A machine service instance's state, on the wire. Mirrors the supervisor's
+/// instance state one to one; the state itself is derived live and never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MachineStateTag {
+    NotInstalled,
+    Installing,
+    MachineAbsent,
+    Starting,
+    WaitingForOperator,
+    Ready,
+    Degraded,
+    Failed,
+}
+
+/// One selected machine's part in why a machine service is not ready.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineVerdict {
+    pub machine: String,
+    pub state: MachineStateTag,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl MachineVerdict {
+    fn phrase(&self) -> String {
+        let machine = &self.machine;
+        let because = self
+            .reason
+            .as_deref()
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
+        match self.state {
+            MachineStateTag::NotInstalled => format!("not installed on {machine}{because}"),
+            MachineStateTag::Installing => format!("installing on {machine}"),
+            MachineStateTag::MachineAbsent => format!("{machine} is away"),
+            MachineStateTag::Starting => format!("starting on {machine}"),
+            MachineStateTag::WaitingForOperator => {
+                format!("waiting for the operator on {machine}")
+            }
+            MachineStateTag::Ready => format!("ready on {machine}"),
+            MachineStateTag::Degraded => format!("degraded on {machine}{because}"),
+            MachineStateTag::Failed => format!("failed on {machine}{because}"),
+        }
+    }
+}
+
 /// Why a configured MCP server cannot connect yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "reason")]
@@ -519,6 +635,14 @@ pub enum NotReady {
     MissingVars { vars: Vec<String> },
     /// OAuth is configured but no usable token is stored.
     NeedsAuth,
+    /// No machine has this service's resident ready. `machines` lists every
+    /// selected machine and its state; empty means it is selected on none.
+    MachineService {
+        service: String,
+        machines: Vec<MachineVerdict>,
+    },
+    /// The entry names a service it cannot reach: `error` says which key is why.
+    MachineServiceInvalid { error: String },
 }
 
 impl NotReady {
@@ -527,6 +651,16 @@ impl NotReady {
         match self {
             NotReady::MissingVars { vars } => format!("missing_vars({})", vars.join(", ")),
             NotReady::NeedsAuth => "needs_auth".to_string(),
+            NotReady::MachineService { machines, .. } if machines.is_empty() => {
+                "machine_service(not installed on any machine)".to_string()
+            }
+            NotReady::MachineService { machines, .. } => {
+                let phrases: Vec<String> = machines.iter().map(MachineVerdict::phrase).collect();
+                format!("machine_service({})", phrases.join("; "))
+            }
+            NotReady::MachineServiceInvalid { error } => {
+                format!("machine_service_invalid({error})")
+            }
         }
     }
 }
@@ -614,6 +748,7 @@ mod fingerprint_tests {
             oauth: None,
             secrets: Vec::new(),
             cwd: None,
+            service: None,
             agent_plugin_runtime: None,
         }
     }
@@ -699,6 +834,10 @@ mod fingerprint_tests {
         enabled.enabled = false;
         variants.push(("enabled", enabled));
 
+        let mut service = base();
+        service.service = Some("axon".to_string());
+        variants.push(("service", service));
+
         let mut oauth = base();
         oauth.oauth = Some(OAuthServerConfig {
             client_id: Some("client".to_string()),
@@ -740,6 +879,7 @@ mod fingerprint_secret_tests {
             oauth: None,
             secrets: Vec::new(),
             cwd: None,
+            service: None,
             agent_plugin_runtime: None,
         }
     }

@@ -10,10 +10,11 @@ use crate::services::{FileSystem, GitClient};
 /// `packs/` holds each installed pack's lock and MCP definitions; `responses/`
 /// holds response templates, which the sync has always materialized but which
 /// were never tracked — leaving them permanently frozen on first install.
-/// `routes/` holds route definitions, the shipped ones included.
+/// `routes/` holds route definitions, the shipped ones included. `services/`
+/// mirrors the machine service declarations packs ship, so an edit is visible.
 /// `agent-pins.yaml` holds the backend/icon/tier choices layered over
 /// pack-owned agents (`cairn_config::agent_pins`).
-pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/responses/\n!/routes/\n!/workflows/\n!/packs/\n!/AGENTS.md\n!/settings.yaml\n!/agent-pins.yaml\n!/.gitignore\n.DS_Store\n";
+pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/responses/\n!/routes/\n!/services/\n!/workflows/\n!/packs/\n!/AGENTS.md\n!/settings.yaml\n!/agent-pins.yaml\n!/.gitignore\n.DS_Store\n";
 
 pub(crate) fn ensure_workspace_repo(
     git: &dyn GitClient,
@@ -131,6 +132,7 @@ mod tests {
         // never be established and it freezes on first write.
         assert!(WORKSPACE_GITIGNORE.contains("!/responses/"));
         assert!(WORKSPACE_GITIGNORE.contains("!/routes/"));
+        assert!(WORKSPACE_GITIGNORE.contains("!/services/"));
         assert!(WORKSPACE_GITIGNORE.contains("!/packs/"));
         assert!(!WORKSPACE_GITIGNORE.contains("!worktrees"));
         assert!(!WORKSPACE_GITIGNORE.contains("!logs"));

@@ -504,16 +504,23 @@ async fn resolve_mcp_server_config(
         .as_deref()
         .map(crate::config::mcp_servers::load_project_mcp_servers)
         .unwrap_or_default();
-    let servers =
-        crate::config::mcp_servers::resolve_mcp_servers(&orch.config_dir, project_path.as_deref());
+    let machines = crate::config::machine_services::MachineServiceSnapshot::capture(orch);
+    let servers = crate::config::mcp_servers::resolve_mcp_server_entries(
+        &orch.config_dir,
+        project_path.as_deref(),
+        &machines,
+    );
 
     match servers.get(server) {
-        Some(cfg) => {
+        Some(entry) => {
+            if let Some(refusal) = entry.machine_service_refusal(server, &machines) {
+                return Err(refusal);
+            }
             let project_scope = project_path
                 .as_deref()
                 .filter(|_| project_servers.contains_key(server));
             let credential_key = crate::config::secrets::credential_key(server, project_scope);
-            Ok((cfg.clone(), credential_key))
+            Ok((entry.config.clone(), credential_key))
         }
         None => {
             let mut names: Vec<&str> = servers.keys().map(|s| s.as_str()).collect();

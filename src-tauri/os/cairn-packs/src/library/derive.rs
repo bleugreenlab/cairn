@@ -13,6 +13,7 @@ use super::index::{EntryOrigin, IndexEntry, IndexItem, IndexSource, LibraryIndex
 use super::marketplace::{self, PluginSource, PluginSpec, MARKETPLACE_FILE};
 use super::stage::{stage, StagePlan, SynthesizedManifest};
 use super::{is_full_commit, is_safe_relative};
+use crate::lock::PackSourceKind;
 use crate::manifest::{self, normalize_id, ItemRuns, PackItemKind};
 use crate::server_config::McpServerConfig;
 use crate::ContentHash;
@@ -229,7 +230,7 @@ pub fn entry_from_staged(
         None => BTreeMap::new(),
     };
     let mut items = Vec::new();
-    for item in manifest.items() {
+    for item in manifest.items_from(PackSourceKind::Url) {
         let definition = (item.kind == PackItemKind::Mcp)
             .then(|| mcp.get(&item.id).cloned())
             .flatten();
@@ -258,7 +259,7 @@ pub fn entry_from_staged(
     if items.is_empty() {
         return Err("it ships nothing Cairn can install".into());
     }
-    let mut notes = manifest.notes.clone();
+    let mut notes = manifest.notes_from(PackSourceKind::Url);
     notes.extend(extra_notes);
     Ok(IndexEntry {
         id: manifest.id.clone(),

@@ -39,6 +39,7 @@ pub mod contextual_packages;
 pub mod credential_witness;
 pub mod dev_commands;
 pub mod keybinds;
+pub mod machine_services;
 pub mod mcp_import;
 pub mod mcp_servers;
 pub mod mcp_setup;

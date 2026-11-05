@@ -2213,6 +2213,8 @@ mod tests {
             machine: "bgsrv-mac".into(),
             state,
             provenance: "installed 0.3.6 (pack)".into(),
+            installed_version: Some("0.3.6".into()),
+            override_command: None,
             catalog: verbs
                 .iter()
                 .map(|name| crate::mcp::gateway::McpToolDef {

@@ -2,7 +2,7 @@
 //!
 //! A pack is a **source-side** grouping. Installing one copies its contents into
 //! the flat `~/.cairn` layout (`agents/`, `recipes/`, `responses/`, `routes/`,
-//! `skills/`, `workflows/`) that discovery and global ids already assume — packs do not
+//! `services/`, `skills/`, `workflows/`) that discovery and global ids already assume — packs do not
 //! namespace what they install. That is what makes repacking the shipped tree a
 //! pure file move: an existing workspace's files already sit at exactly the
 //! paths a pack-aware sync would write, so the migration writes nothing.
@@ -100,7 +100,7 @@ pub fn is_os_metadata_path(relative_path: &Path) -> bool {
 
 pub fn hash_item_path(kind: PackItemKind, root: &Path, path: &Path) -> Result<ContentHash, String> {
     match kind {
-        PackItemKind::Skill | PackItemKind::Workflow => hash_tree(path),
+        PackItemKind::Service | PackItemKind::Skill | PackItemKind::Workflow => hash_tree(path),
         PackItemKind::Mcp => Err("MCP items must be hashed from their server definition".into()),
         PackItemKind::Agent
         | PackItemKind::Recipe
@@ -146,13 +146,14 @@ pub(crate) fn canonical_json(value: serde_json::Value) -> serde_json::Value {
 /// Content directories a pack may ship, and the exact subtrees a workspace
 /// install materializes. Flat dirs (`agents`, `recipes`, `responses`, `routes`)
 /// are per-file copy-when-missing with in-place pack updates; package dirs
-/// (`skills`, `workflows`) are whole-directory copy-when-missing and never
-/// overwritten, so a user's edited package is preserved.
-pub const CONTENT_DIRS: [&str; 6] = [
+/// (`services`, `skills`, `workflows`) are whole-directory copy-when-missing and
+/// never overwritten, so a user's edited package is preserved.
+pub const CONTENT_DIRS: [&str; 7] = [
     "agents",
     "recipes",
     "responses",
     "routes",
+    "services",
     "skills",
     "workflows",
 ];
@@ -441,6 +442,26 @@ mod tests {
             clean,
             ".meta.json records an agent edit and must stay in the hash"
         );
+    }
+
+    #[test]
+    fn a_service_hashes_as_a_tree_and_ignores_os_metadata() {
+        let temp = TempDir::new().unwrap();
+        let service = temp.path().join("services/axon");
+        write(&service.join("service.yaml"), "name: Axon\n");
+        let hash = |path: &Path| hash_item_path(PackItemKind::Service, temp.path(), path).unwrap();
+        let clean = hash(&service);
+        assert_eq!(clean, hash_tree(&service).unwrap());
+
+        write(&service.join(".DS_Store"), "finder");
+        assert_eq!(
+            hash(&service),
+            clean,
+            "opening it in Finder must not fork it"
+        );
+
+        write(&service.join("service.yaml"), "name: Mine\n");
+        assert_ne!(hash(&service), clean);
     }
 
     #[test]

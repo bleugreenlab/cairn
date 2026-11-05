@@ -253,7 +253,10 @@ fn valid_origin(
         && origin.server == server
         && origin.ownership_scope == binding.ownership_scope
         && origin.owner == binding.owner
-        && matches!(origin.transport.as_str(), "stdio" | "http" | "sse")
+        && matches!(
+            origin.transport.as_str(),
+            "stdio" | "http" | "sse" | "machine-service"
+        )
         && !origin.endpoint.is_empty()
         && origin.protocol_version == binding.protocol_version
         && binding.credential_key

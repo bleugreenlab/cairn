@@ -2604,6 +2604,7 @@ pub fn start_agent_session(
                 let mcp_servers = crate::config::mcp_servers::prompt_mcp_servers(
                     &orch.config_dir,
                     project_path_for_prompt.as_deref(),
+                    &crate::config::machine_services::MachineServiceSnapshot::capture(orch),
                 );
                 if let Some(section) =
                     crate::mcp::handlers::mcp_resources::render_mcp_affordance_block(&mcp_servers)

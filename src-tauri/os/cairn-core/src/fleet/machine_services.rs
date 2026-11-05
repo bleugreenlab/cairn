@@ -36,6 +36,9 @@ pub fn wanted_artifacts(
                 &orch.config_dir,
                 key,
             )?;
+            if declared.refusal.is_some() {
+                return None;
+            }
             let package = declared.package.ok()?;
             let native = package.declaration.native()?;
             let artifact = native.targets.get(target)?;

@@ -9,6 +9,7 @@
 //! Tool *invocation* never happens here — every `tools/call` goes through `run`
 //! (a tool may mutate). This handler is read-only by contract.
 
+use crate::config::machine_services::MachineServiceSnapshot;
 use crate::config::mcp_servers::McpServerConfigExt;
 use crate::config::mcp_servers::{
     load_project_mcp_servers, resolve_mcp_server_entries, McpServerConfig, ResolvedMcpServer,
@@ -33,6 +34,7 @@ pub(crate) struct McpCaller {
     project_id: Option<String>,
     project_servers: HashMap<String, McpServerConfig>,
     servers: HashMap<String, ResolvedMcpServer>,
+    machines: MachineServiceSnapshot,
 }
 
 impl McpCaller {
@@ -56,13 +58,16 @@ impl McpCaller {
             .as_deref()
             .map(load_project_mcp_servers)
             .unwrap_or_default();
-        let servers = resolve_mcp_server_entries(&orch.config_dir, project_path.as_deref());
+        let machines = MachineServiceSnapshot::capture(orch);
+        let servers =
+            resolve_mcp_server_entries(&orch.config_dir, project_path.as_deref(), &machines);
         Self {
             session_key,
             project_path,
             project_id: run_context.map(|ctx| ctx.project_id),
             project_servers,
             servers,
+            machines,
         }
     }
 
@@ -73,6 +78,7 @@ impl McpCaller {
             project_path: self.project_path.as_deref(),
             project_id: self.project_id.as_deref(),
             project_servers: &self.project_servers,
+            machines: &self.machines,
         }
     }
 
@@ -124,6 +130,9 @@ pub(crate) async fn handle_mcp_read(
                 return unknown_server(&server, servers);
             };
             let target = read.target(&server, entry);
+            if let Some(refusal) = &target.machine_service_refusal {
+                return refusal.clone();
+            }
             match gateway
                 .read_resource(
                     session_key,
@@ -149,6 +158,7 @@ struct ReadContext<'a> {
     project_path: Option<&'a std::path::Path>,
     project_id: Option<&'a str>,
     project_servers: &'a HashMap<String, McpServerConfig>,
+    machines: &'a MachineServiceSnapshot,
 }
 
 impl<'a> ReadContext<'a> {
@@ -168,6 +178,7 @@ impl<'a> ReadContext<'a> {
                 .unwrap_or(ToolScope::Workspace),
             project_id: self.project_id,
             credential_key: crate::config::secrets::credential_key(name, project_scope),
+            machine_service_refusal: entry.machine_service_refusal(name, self.machines),
         }
     }
 }
@@ -180,6 +191,8 @@ struct DiscoveryTarget<'a> {
     scope: ToolScope<'a>,
     project_id: Option<&'a str>,
     credential_key: String,
+    /// Why the gateway cannot reach this server, when it is a machine service.
+    machine_service_refusal: Option<String>,
 }
 
 async fn list_servers(
@@ -435,6 +448,12 @@ fn public_endpoint(authored: &McpServerConfig) -> String {
     if authored.transport == "stdio" {
         return authored.command.clone().unwrap_or_default();
     }
+    if authored.transport == crate::config::mcp_servers::MACHINE_SERVICE_TRANSPORT {
+        return format!(
+            "machine-service:{}",
+            authored.service.as_deref().unwrap_or_default()
+        );
+    }
     let url = authored.url.as_deref().unwrap_or_default();
     let url = url.split(['?', '#']).next().unwrap_or_default();
     match url.split_once("://") {
@@ -471,7 +490,7 @@ fn publish(
         .as_deref()
         .ok_or("the connection reported no negotiated protocol version")?;
     let guard = crate::config::credential_witness::acquire()?;
-    let registry = resolve_mcp_server_entries(read.config_dir, read.project_path);
+    let registry = resolve_mcp_server_entries(read.config_dir, read.project_path, read.machines);
     let current = registry
         .get(target.name)
         .ok_or("it was removed while its catalog was being fetched")?;
@@ -519,6 +538,9 @@ async fn discover_tools(
     read: &ReadContext<'_>,
     target: &DiscoveryTarget<'_>,
 ) -> Result<DiscoveredTools, String> {
+    if let Some(refusal) = &target.machine_service_refusal {
+        return Err(refusal.clone());
+    }
     let protocols = gateway.catalog_capture_protocols();
     let before = if protocols.is_empty() {
         Err("this host does not cache MCP catalogs".to_string())
@@ -1091,9 +1113,13 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 crate::config::mcp_servers::upsert_workspace_mcp_server(dir.path(), name, &config)
                     .unwrap();
-                let entry = resolve_mcp_server_entries(dir.path(), None)
-                    .remove(name)
-                    .unwrap();
+                let entry = resolve_mcp_server_entries(
+                    dir.path(),
+                    None,
+                    &crate::config::machine_services::MachineServiceSnapshot::empty(),
+                )
+                .remove(name)
+                .unwrap();
                 Self {
                     dir,
                     name: name.into(),
@@ -1109,12 +1135,17 @@ mod tests {
             }
 
             fn read(&self) -> ReadContext<'_> {
+                static NO_MACHINES: MachineServiceSnapshot = MachineServiceSnapshot {
+                    instances: std::collections::BTreeMap::new(),
+                    machines: Vec::new(),
+                };
                 ReadContext {
                     config_dir: self.dir.path(),
                     session_key: "session",
                     project_path: None,
                     project_id: Some("project"),
                     project_servers: &self.projects,
+                    machines: &NO_MACHINES,
                 }
             }
 
@@ -1610,6 +1641,7 @@ mod tests {
             oauth: None,
             secrets: Vec::new(),
             cwd: None,
+            service: None,
             agent_plugin_runtime: None,
         };
         // Reverse insertion order must not affect the rendered order.
@@ -1635,6 +1667,9 @@ mod tests {
     /// can bypass it. Full prompt integration tests remain necessary; this catches
     /// accidental direct dependency revival alongside the renderer's input type.
     #[test]
+    /// Prompt assembly may capture the machine-service snapshot, which is why
+    /// `MachineServiceSnapshot` is not forbidden here: it holds instance states,
+    /// no catalog and no credential.
     fn affordance_prompt_source_has_no_catalog_or_credential_witness() {
         let session = include_str!("../../orchestrator/session.rs");
         let production = session.split("#[cfg(test)]").next().unwrap();

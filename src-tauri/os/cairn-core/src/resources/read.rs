@@ -3155,14 +3155,24 @@ async fn render_resource_body(
                 Some(value) if value != "installed" && value != "available" => {
                     format!("Unsupported ?state={value} (installed | available)")
                 }
-                _ => super::packs::read_packs(&orch.config_dir, &orch.library, state.as_deref()),
+                _ => super::packs::read_packs(
+                    &orch.config_dir,
+                    &orch.library,
+                    &crate::config::machine_services::MachineServiceSnapshot::capture(orch),
+                    state.as_deref(),
+                ),
             }
         }
         CairnResource::Pack { pack_id } => {
             if let Some(error) = reject_query_params("pack", &params) {
                 error
             } else {
-                super::packs::read_pack(&orch.config_dir, &orch.library, &pack_id)
+                super::packs::read_pack(
+                    &orch.config_dir,
+                    &orch.library,
+                    &crate::config::machine_services::MachineServiceSnapshot::capture(orch),
+                    &pack_id,
+                )
             }
         }
         CairnResource::Labels => {
@@ -3795,6 +3805,8 @@ mod tests {
             machine: machine.into(),
             state,
             provenance: provenance.into(),
+            installed_version: None,
+            override_command: None,
             catalog: vec![crate::mcp::gateway::McpToolDef {
                 name: "look".into(),
                 description: None,

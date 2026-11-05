@@ -170,14 +170,14 @@ fn resultant_config(
     match mutation {
         AuthorityMutation::Create => {
             let config = apply_payload_fields(base_config(), payload)?;
-            validate_config(&config)?;
+            validate_config(&config, None)?;
             Ok(Some(config))
         }
         AuthorityMutation::Update => match existing.get(name) {
             None => Ok(None),
             Some(base) => {
                 let config = apply_payload_fields(base.clone(), payload)?;
-                validate_config(&config)?;
+                validate_config(&config, Some(base))?;
                 Ok(Some(config))
             }
         },
@@ -224,6 +224,7 @@ fn base_config() -> McpServerConfig {
         // created here starts with the keychain as its only declaration.
         secrets: Vec::new(),
         cwd: None,
+        service: None,
         agent_plugin_runtime: None,
     }
 }
@@ -313,8 +314,29 @@ fn apply_payload_fields(
 }
 
 /// Transport-specific shape check: stdio needs a command, http/sse need a url.
-fn validate_config(config: &McpServerConfig) -> Result<(), String> {
+///
+/// A `machine-service` entry is a pack's to ship, not anyone's to author. The
+/// one edit it allows is to the pack's own entry in place, `existing`, keeping
+/// its `service`, which is how disabling it from settings works.
+fn validate_config(
+    config: &McpServerConfig,
+    existing: Option<&McpServerConfig>,
+) -> Result<(), String> {
+    if let Some(error) = config.machine_service_shape_error() {
+        return Err(error);
+    }
     match config.transport.as_str() {
+        crate::config::mcp_servers::MACHINE_SERVICE_TRANSPORT => {
+            let shadows_its_pack = existing.is_some_and(|existing| {
+                existing.transport == config.transport && existing.service == config.service
+            });
+            if !shadows_its_pack {
+                return Err(
+                    "`type: machine-service` is shipped by a pack and cannot be authored here"
+                        .to_string(),
+                );
+            }
+        }
         "stdio" => {
             if config
                 .command
@@ -498,7 +520,7 @@ pub(super) async fn apply_mcp_create(
     let name = require_name(payload)?;
     let scope = parse_mcp_scope(Some(payload))?;
     let config = apply_payload_fields(base_config(), payload)?;
-    validate_config(&config)?;
+    validate_config(&config, None)?;
 
     if existing_servers(orch, request, scope)
         .await?
@@ -544,8 +566,8 @@ pub(super) async fn apply_mcp_patch(
             scope_label(scope)
         )
     })?;
-    let config = apply_payload_fields(base, payload)?;
-    validate_config(&config)?;
+    let config = apply_payload_fields(base.clone(), payload)?;
+    validate_config(&config, Some(&base))?;
 
     if dry_run {
         return Ok(format!(
@@ -1143,7 +1165,7 @@ mod tests {
             &serde_json::json!({"name": "x", "args": ["--foo"]}),
         )
         .unwrap();
-        let err = validate_config(&cfg).unwrap_err();
+        let err = validate_config(&cfg, None).unwrap_err();
         assert!(err.contains("requires a non-empty 'command'"), "got: {err}");
     }
 
@@ -1154,8 +1176,37 @@ mod tests {
             &serde_json::json!({"name": "x", "type": "http"}),
         )
         .unwrap();
-        let err = validate_config(&cfg).unwrap_err();
+        let err = validate_config(&cfg, None).unwrap_err();
         assert!(err.contains("requires a non-empty 'url'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_machine_service_entry_is_only_ever_its_packs_own() {
+        let shipped: McpServerConfig =
+            serde_yaml::from_str("type: machine-service\nservice: axon\n").unwrap();
+
+        let created = validate_config(&shipped, None).unwrap_err();
+        assert!(created.contains("shipped by a pack"), "got: {created}");
+
+        // Disabling the pack's entry from settings is an edit in place.
+        let disabled = apply_payload_fields(
+            shipped.clone(),
+            &serde_json::json!({"name": "axon", "enabled": false}),
+        )
+        .unwrap();
+        validate_config(&disabled, Some(&shipped)).unwrap();
+
+        let mut repointed = shipped.clone();
+        repointed.service = Some("other".to_string());
+        assert!(validate_config(&repointed, Some(&shipped)).is_err());
+
+        let widened = apply_payload_fields(
+            shipped.clone(),
+            &serde_json::json!({"name": "axon", "command": "/bin/sh"}),
+        )
+        .unwrap();
+        let error = validate_config(&widened, Some(&shipped)).unwrap_err();
+        assert!(error.contains("`command`"), "got: {error}");
     }
 
     #[test]
@@ -1196,7 +1247,7 @@ mod tests {
             }),
         )
         .unwrap();
-        validate_config(&cfg).unwrap();
+        validate_config(&cfg, None).unwrap();
         assert_eq!(cfg.transport, "stdio");
         assert_eq!(cfg.command.as_deref(), Some("npx"));
         assert_eq!(cfg.args, vec!["@playwright/mcp@latest"]);

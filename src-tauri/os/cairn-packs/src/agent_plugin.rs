@@ -286,6 +286,8 @@ fn discover_extension(
             None
         }
     };
+    // No `services` row: the extension carries no machine service, because only
+    // the app bundle may declare one.
     for (dir, kind, suffix, marker) in [
         ("agents", PackItemKind::Agent, "md", None),
         ("recipes", PackItemKind::Recipe, "yaml", None),
@@ -384,6 +386,7 @@ fn convert_server(root: &Path, value: &Value) -> Result<AgentPluginServer, Strin
         enabled: true,
         oauth: None,
         secrets: Vec::new(),
+        service: None,
         agent_plugin_runtime: None,
     };
     if kind == "stdio" {
@@ -442,6 +445,13 @@ pub fn export(
     let extension = items
         .iter()
         .any(|i| !matches!(i.kind, PackItemKind::Skill | PackItemKind::Mcp));
+    if let Some(service) = items.iter().find(|i| i.kind == PackItemKind::Service) {
+        return Err(format!(
+            "machine service '{}' is not portable: an Agent Plugin cannot carry one; remove it \
+             from the pack to export the rest",
+            service.id
+        ));
+    }
     let mut out = Map::new();
     out.insert("$schema".into(), PLUGIN_SCHEMA_URI.into());
     out.insert("name".into(), manifest.id.clone().into());
@@ -501,7 +511,7 @@ pub fn export(
             PackItemKind::Workflow => PathBuf::from(CAIRN_EXTENSION)
                 .join("workflows")
                 .join(&item.id),
-            PackItemKind::Mcp => unreachable!(),
+            PackItemKind::Mcp | PackItemKind::Service => unreachable!(),
         };
         copy_tree(&source, &stage.path().join(target))?;
     }
@@ -527,6 +537,11 @@ pub fn export(
     if !servers.is_empty() {
         let mut values = Map::new();
         for (name, server) in servers {
+            // Left behind: it reaches a service the plugin cannot carry, so
+            // nothing on the other side could ever answer it.
+            if server.config.transport == crate::server_config::MACHINE_SERVICE_TRANSPORT {
+                continue;
+            }
             values.insert(name.clone(), export_server(server)?);
         }
         write_json(

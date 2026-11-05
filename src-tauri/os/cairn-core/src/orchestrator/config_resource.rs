@@ -1085,6 +1085,18 @@ impl Orchestrator {
             .emitter
             .emit("config-changed", serde_json::json!({"entity_type": "pack"}));
     }
+
+    /// Tell open windows that a machine service's readiness moved, so a verdict
+    /// that is re-derived on every read gets read.
+    ///
+    /// The same event as [`Self::emit_pack_registry_change`] without its apply:
+    /// applying changes cell state, and that change is what calls this.
+    pub fn emit_machine_service_change(&self) {
+        let _ = self
+            .services
+            .emitter
+            .emit("config-changed", serde_json::json!({"entity_type": "pack"}));
+    }
 }
 
 pub(crate) fn emit_db_change<R: ConfigResource>(orch: &Orchestrator, action: &str) {

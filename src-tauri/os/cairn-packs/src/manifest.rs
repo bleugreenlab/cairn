@@ -1,8 +1,8 @@
 //! Pack manifests: the source-side description of an installable resource pack.
 //!
 //! A **pack** is a directory holding Cairn resources — skills, agents, recipes,
-//! workflows, response templates, and MCP server definitions — plus an optional
-//! manifest naming it. Packs are the unit of *offering and installing*; they are
+//! workflows, response templates, machine services, and MCP server definitions
+//! — plus an optional manifest naming it. Packs are the unit of *offering and installing*; they are
 //! deliberately NOT a namespace. Installation copies a pack's contents into the
 //! flat `~/.cairn` layout (`agents/`, `recipes/`, `skills/`, …) that discovery
 //! and global ids already assume, so repacking the shipped tree is a pure source
@@ -28,8 +28,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::lock::PackSourceKind;
+
 /// The native manifest filename, at the pack root.
 pub const MANIFEST_FILE: &str = "cairn-pack.yaml";
+/// Where a pack's machine services live, in its source and in the workspace.
+pub const SERVICES_DIR: &str = "services";
 /// Claude Code's plugin manifest, relative to the pack root.
 pub const CLAUDE_PLUGIN_MANIFEST: &str = ".claude-plugin/plugin.json";
 /// A pack's MCP server definitions, native form.
@@ -65,6 +69,7 @@ pub enum PackItemKind {
     Recipe,
     Response,
     Route,
+    Service,
     Skill,
     Workflow,
 }
@@ -77,6 +82,7 @@ impl PackItemKind {
             PackItemKind::Recipe => "recipe",
             PackItemKind::Response => "response",
             PackItemKind::Route => "route",
+            PackItemKind::Service => "service",
             PackItemKind::Skill => "skill",
             PackItemKind::Workflow => "workflow",
         }
@@ -91,6 +97,7 @@ impl PackItemKind {
             "recipe" => Some(PackItemKind::Recipe),
             "response" => Some(PackItemKind::Response),
             "route" => Some(PackItemKind::Route),
+            "service" => Some(PackItemKind::Service),
             "skill" => Some(PackItemKind::Skill),
             "workflow" => Some(PackItemKind::Workflow),
             _ => None,
@@ -98,12 +105,13 @@ impl PackItemKind {
     }
 
     /// Every kind, for error text that enumerates the alternatives.
-    pub const ALL: [PackItemKind; 7] = [
+    pub const ALL: [PackItemKind; 8] = [
         PackItemKind::Agent,
         PackItemKind::Mcp,
         PackItemKind::Recipe,
         PackItemKind::Response,
         PackItemKind::Route,
+        PackItemKind::Service,
         PackItemKind::Skill,
         PackItemKind::Workflow,
     ];
@@ -112,9 +120,9 @@ impl PackItemKind {
 /// What installing an item lets happen on this machine.
 ///
 /// Derived from the item, never declared by it, so a library index cannot
-/// describe a stdio server as inert. The Library shows it, and an update that
-/// changes an [`ItemRuns::Endpoint`] or [`ItemRuns::Here`] item waits for the
-/// operator's click instead of being applied in the background.
+/// describe a stdio server as inert. The Library shows it, and a library index
+/// update that changes an [`ItemRuns::Endpoint`] or [`ItemRuns::Here`] item waits
+/// for the operator's click instead of being applied in the background.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -126,8 +134,8 @@ pub enum ItemRuns {
     Content,
     /// A remote MCP server (`http`/`sse`) the workspace connects to.
     Endpoint,
-    /// Something that executes on this machine: a stdio MCP server, or a
-    /// workflow, whose `main.ts` runs.
+    /// Something that executes on this machine: a stdio MCP server, a workflow,
+    /// whose `main.ts` runs, or a machine service.
     Here,
 }
 
@@ -137,7 +145,7 @@ impl ItemRuns {
         mcp: Option<&crate::server_config::McpServerConfig>,
     ) -> Self {
         match kind {
-            PackItemKind::Workflow => ItemRuns::Here,
+            PackItemKind::Workflow | PackItemKind::Service => ItemRuns::Here,
             PackItemKind::Mcp => match mcp.map(|config| config.transport.as_str()) {
                 Some("http" | "sse") => ItemRuns::Endpoint,
                 // An MCP item with no readable definition is assumed to spawn.
@@ -164,6 +172,13 @@ impl ItemRuns {
         self != ItemRuns::Content
     }
 }
+
+/// Why a pack from anywhere but the app bundle does not bring its machine
+/// services with it. A service declaration names artifact URLs, hashes and a
+/// command, and only the app's own bundle is trusted to declare one, so
+/// materializing a remote one would be a catalog row no machine can ever run.
+pub const NON_BUNDLED_SERVICES_NOTE: &str =
+    "machine services from a remote or local source are not supported yet";
 
 /// One installable unit inside a pack.
 ///
@@ -318,8 +333,8 @@ pub fn load(dir: &Path) -> Result<PackManifest, String> {
 
     Err(format!(
         "{dir:?} is not a pack: expected {MANIFEST_FILE}, {CLAUDE_PLUGIN_MANIFEST}, a SKILL.md, \
-         or one of the conventional content directories (agents, recipes, responses, routes, skills, \
-         workflows)"
+         or one of the conventional content directories (agents, recipes, responses, routes, \
+         services, skills, workflows)"
     ))
 }
 
@@ -481,6 +496,40 @@ impl PackManifest {
         items
     }
 
+    /// What installing this pack from a source of `kind` puts in the workspace:
+    /// [`Self::items`], less the machine services only the app bundle may carry.
+    pub fn items_from(&self, kind: PackSourceKind) -> Vec<PackItem> {
+        let items = self.items();
+        if kind == PackSourceKind::Bundled {
+            return items;
+        }
+        items
+            .into_iter()
+            .filter(|item| item.kind != PackItemKind::Service)
+            .collect()
+    }
+
+    /// [`Self::notes`] for an install from a source of `kind`, saying what
+    /// [`Self::items_from`] left out.
+    pub fn notes_from(&self, kind: PackSourceKind) -> Vec<String> {
+        let mut notes = self.notes.clone();
+        if kind != PackSourceKind::Bundled {
+            let skipped: Vec<String> = self
+                .items()
+                .into_iter()
+                .filter(|item| item.kind == PackItemKind::Service)
+                .map(|item| item.id)
+                .collect();
+            if !skipped.is_empty() {
+                notes.push(format!(
+                    "{NON_BUNDLED_SERVICES_NOTE}; not installed: {}",
+                    skipped.join(", ")
+                ));
+            }
+        }
+        notes
+    }
+
     /// Path to this pack's MCP definitions in its source tree, if it ships any.
     pub fn mcp_source(&self) -> Option<PathBuf> {
         let native = self.root.join(PACK_MCP_FILE);
@@ -545,6 +594,11 @@ pub fn discover_items(root: &Path) -> Vec<PackItem> {
                         items.push(PackItem::file(PackItemKind::Workflow, file_name, rel));
                     }
                 }
+                "services" => {
+                    if path.is_dir() && path.join("service.yaml").is_file() {
+                        items.push(PackItem::file(PackItemKind::Service, file_name, rel));
+                    }
+                }
                 "agents" | "recipes" | "responses" | "routes" => {
                     if !path.is_file() {
                         continue;
@@ -583,6 +637,55 @@ mod tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn a_service_needs_its_manifest_and_a_services_only_directory_is_a_pack() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("kit");
+        write(&root.join("services/axon/service.yaml"), "name: Axon\n");
+        write(&root.join("services/notes/README.md"), "not a service\n");
+
+        let manifest = load(&root).unwrap();
+        assert_eq!(manifest.format, PackFormat::Conventional);
+        assert_eq!(
+            manifest.items(),
+            vec![PackItem::file(
+                PackItemKind::Service,
+                "axon",
+                "services/axon"
+            )]
+        );
+        assert_eq!(PackItemKind::parse("service"), Some(PackItemKind::Service));
+    }
+
+    #[test]
+    fn a_machine_service_classifies_as_running_here() {
+        let runs = ItemRuns::classify(PackItemKind::Service, None);
+        assert_eq!(runs, ItemRuns::Here);
+        assert!(runs.is_runnable());
+    }
+
+    #[test]
+    fn only_the_bundle_carries_a_service_and_anything_else_says_it_did_not() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("kit");
+        write(&root.join("services/axon/service.yaml"), "name: Axon\n");
+        write(&root.join("agents/a.md"), "agent\n");
+        let manifest = load(&root).unwrap();
+
+        assert_eq!(manifest.items_from(PackSourceKind::Bundled).len(), 2);
+        assert!(manifest.notes_from(PackSourceKind::Bundled).is_empty());
+        for kind in [PackSourceKind::Url, PackSourceKind::Local] {
+            assert_eq!(
+                manifest.items_from(kind),
+                vec![PackItem::file(PackItemKind::Agent, "a", "agents/a.md")]
+            );
+            assert_eq!(
+                manifest.notes_from(kind),
+                vec![format!("{NON_BUNDLED_SERVICES_NOTE}; not installed: axon")]
+            );
+        }
     }
 
     #[test]

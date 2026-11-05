@@ -145,6 +145,11 @@ pub fn parse_pack_mcp_file(path: &Path) -> Result<PackMcpFile, String> {
         }
     }
     for (name, config) in servers.iter_mut() {
+        if let Some(error) = config.machine_service_shape_error() {
+            return Err(format!(
+                "Failed to parse pack MCP file {path:?}: server `{name}`: {error}"
+            ));
+        }
         // Destructured exhaustively, not field-accessed, on purpose — the same
         // technique `fingerprint_mcp_config` uses, for a related reason.
         //
@@ -170,6 +175,9 @@ pub fn parse_pack_mcp_file(path: &Path) -> Result<PackMcpFile, String> {
             enabled: _,
             oauth: _,
             secrets,
+            // Its effect stays inside this server: it names which resident the
+            // entry reaches, and the entry is withheld unless its own pack ships it.
+            service: _,
             agent_plugin_runtime: _,
         } = config;
         if secrets.is_empty() {
@@ -295,6 +303,51 @@ mod tests {
         // does not reject the pack's server.
         assert_eq!(helper.command.as_deref(), Some("helper"));
         assert_eq!(helper.args, vec!["${HOME}/state".to_string()]);
+    }
+
+    fn parse(servers: &str) -> Result<PackMcpFile, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.yaml");
+        std::fs::write(&path, format!("mcpServers:\n  axon:\n{servers}")).unwrap();
+        parse_pack_mcp_file(&path)
+    }
+
+    #[test]
+    fn a_machine_service_entry_parses_with_its_service_and_nothing_else() {
+        let file = parse("    type: machine-service\n    service: axon\n").unwrap();
+        let entry = &file.servers["axon"];
+        assert_eq!(entry.transport, "machine-service");
+        assert_eq!(entry.service.as_deref(), Some("axon"));
+    }
+
+    #[test]
+    fn a_malformed_machine_service_entry_is_refused_naming_the_key() {
+        let missing = parse("    type: machine-service\n").unwrap_err();
+        assert!(missing.contains("server `axon`"), "{missing}");
+        assert!(missing.contains("requires `service`"), "{missing}");
+
+        for (key, line) in [
+            ("command", "command: /bin/axon"),
+            ("args", "args: [mcp]"),
+            ("env", "env: {A: b}"),
+            ("cwd", "cwd: /tmp"),
+            ("url", "url: https://x.test"),
+            ("headers", "headers: {A: b}"),
+            ("oauth", "oauth: {scopes: []}"),
+            ("secrets", "secrets: [HOME]"),
+        ] {
+            let error = parse(&format!(
+                "    type: machine-service\n    service: axon\n    {line}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                error.contains(&format!("`{key}` is not allowed")),
+                "{error}"
+            );
+        }
+
+        let stray = parse("    command: axon\n    service: axon\n").unwrap_err();
+        assert!(stray.contains("`service` applies only to"), "{stray}");
     }
 
     #[test]

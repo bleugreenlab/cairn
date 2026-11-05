@@ -409,6 +409,11 @@ pub(crate) trait ServiceSource: Send + Sync {
     fn list(&self) -> Result<Vec<ServiceListing>, String>;
     /// One service's declaration and files; `None` when it is not declared.
     fn package(&self, id: &str) -> Result<Option<ServicePackage>, String>;
+    /// Why the source refuses to run what it ships for `id`, when it does. A
+    /// selection that brings its own binary still may.
+    fn refusal(&self, _id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Where a package came from, as its errors name it: a directory in the

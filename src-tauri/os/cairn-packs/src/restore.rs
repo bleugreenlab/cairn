@@ -62,6 +62,7 @@ pub fn bundled_resource_ids(
         "recipes" => pack::PackItemKind::Recipe,
         "responses" => pack::PackItemKind::Response,
         "routes" => pack::PackItemKind::Route,
+        "services" => pack::PackItemKind::Service,
         "skills" => pack::PackItemKind::Skill,
         "workflows" => pack::PackItemKind::Workflow,
         other => return Err(format!("`{other}` is not a pack content directory")),

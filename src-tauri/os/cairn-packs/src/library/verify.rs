@@ -194,6 +194,12 @@ fn check_entry(entry: &IndexEntry) -> Result<(), String> {
         if !crate::is_canonical_sha256(&item.hash) {
             return Err(format!("{label} has a malformed hash"));
         }
+        if item.kind == PackItemKind::Service {
+            return Err(format!(
+                "{label} cannot be offered: {}",
+                crate::manifest::NON_BUNDLED_SERVICES_NOTE
+            ));
+        }
         if item.kind == PackItemKind::Mcp {
             let Some(definition) = &item.definition else {
                 return Err(format!("{label} carries no definition"));
@@ -456,6 +462,33 @@ mod tests {
         assert!(verify_index(&source, &bytes, &signature, 0)
             .unwrap_err()
             .contains("more than once"));
+    }
+
+    #[test]
+    fn an_index_listing_a_machine_service_is_refused_by_name() {
+        let signer = TestSigner::new("k", 7);
+        let source = signed_source(URL, &signer);
+        let mut carrying = entry("kit");
+        carrying.items = vec![IndexItem {
+            kind: PackItemKind::Service,
+            id: "probe".into(),
+            path: Some("services/probe".into()),
+            from: None,
+            hash: hash("service"),
+            runs: ItemRuns::Here,
+            definition: None,
+        }];
+        let (bytes, signature) = signed(&signer, &index(3, vec![carrying, entry("linear")]));
+        let verified = verify_index(&source, &bytes, &signature, 0).unwrap();
+        assert_eq!(verified.index.entries.len(), 1);
+        assert_eq!(verified.refused[0].id, "kit");
+        assert!(
+            verified.refused[0]
+                .reason
+                .contains(crate::manifest::NON_BUNDLED_SERVICES_NOTE),
+            "{}",
+            verified.refused[0].reason
+        );
     }
 
     #[test]

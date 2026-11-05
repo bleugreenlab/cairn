@@ -573,7 +573,7 @@ pub(crate) fn install_library_entry(
         action: action.into(),
         pack_id: id.clone(),
         changed_paths: result.changed_paths,
-        diagnostics: staged.manifest.notes.clone(),
+        diagnostics: staged.manifest.notes_from(staged.source.kind),
         summary: format!("{verb} pack '{id}' from the {}", source.label),
         ..Default::default()
     })
@@ -876,6 +876,10 @@ pub fn apply_pack_delete(orch: &Orchestrator, pack_id: &str) -> Result<PackMutat
         )?;
     }
     let result = uninstall_pack(&RealGitClient, &RealFileSystem, &orch.config_dir, pack_id)?;
+    crate::config::machine_services::clear_selections(
+        orch,
+        crate::config::machine_services::service_keys(&lock),
+    )?;
     // Again after the registry no longer offers them: a capture published
     // between the eviction above and the uninstall would otherwise survive it.
     for server in &servers {
@@ -973,6 +977,9 @@ pub fn apply_pack_item_removal(
         }
         PackItemKind::Workflow => {
             crate::config::workflows::delete_workflow(config_dir, item_id, None)?
+        }
+        PackItemKind::Service => {
+            crate::config::machine_services::delete_pack_service(orch, pack_id, item_id)?;
         }
         PackItemKind::Mcp => crate::config::mcp_tools::withdraw_and_unregister(
             config_dir,
@@ -1094,6 +1101,8 @@ mod tests {
     /// actually holds it.
     const PING_ROUTE: &str = "name: Ping\ndescription: fixture route\nenabled: true\nnodes:\n  - id: in\n    type: trigger\n    when: { fact: github_comment }\n  - id: out\n    type: sink\n    sink: { kind: issue, labels: [x] }\nedges:\n  - { from: in, to: out }\n";
 
+    const PROBE_SERVICE: &str = "name: Probe\nruntime: native\nplacement: per-machine\ntransport: mcp-stdio\nargs: [serve]\nartifacts:\n  version: 1.2.3\n  prove: [--version]\n  targets:\n    x86_64-unknown-linux-gnu:\n      url: https://example.invalid/probe\n      sha256: eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54\n      size: 10\n      executable: probe\nprobe:\n  args: [status]\n  every: 5m\n  ready: /ready\n";
+
     /// A `core` pack carrying one of every file-backed kind, plus an optional
     /// `matlab` pack whose only content is a connector — between them every
     /// `PackItemKind` is represented.
@@ -1112,6 +1121,7 @@ mod tests {
             "---\nname: Example\ndescription: Example skill\n---\n",
         );
         write(&core.join("workflows/flow/workflow.yaml"), "name: Flow\n");
+        write(&core.join("services/probe/service.yaml"), PROBE_SERVICE);
 
         write(
             &source_pack(resources, "matlab").join("cairn-pack.yaml"),
@@ -1285,24 +1295,213 @@ mod tests {
     }
 
     fn item_state(ws: &Workspace, pack_id: &str, kind: &str, id: &str) -> Option<PackItemState> {
-        pack_catalog(&ws.home, &ws.orch.library)
-            .find(pack_id)?
-            .items
-            .iter()
-            .find(|item| item.kind == kind && item.id == id)
-            .map(|item| item.state)
+        pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        )
+        .find(pack_id)?
+        .items
+        .iter()
+        .find(|item| item.kind == kind && item.id == id)
+        .map(|item| item.state)
     }
 
     /// Removing one item is a first-class operation for every kind a pack can
     /// carry — not just the file-backed ones, and never at the cost of the pack
     /// around it. The MCP arm is the one that would silently regress: its
     /// deletion path is the only one that also touches a settings file.
+    fn select_probe(ws: &Workspace, key: &cairn_config::fleet::MachineServiceKey) {
+        crate::fleet::management::mutate_fleet(&ws.orch, |config| {
+            config.machine_services.select(
+                key.clone(),
+                "alpha",
+                cairn_config::fleet::MachineSelection {
+                    override_: Some(cairn_config::fleet::CommandOverride {
+                        command: "/opt/probe".to_string(),
+                    }),
+                },
+            )
+        })
+        .unwrap();
+    }
+
+    fn selected_on(ws: &Workspace, key: &cairn_config::fleet::MachineServiceKey) -> Vec<String> {
+        crate::config::settings::load_fleet(&ws.home)
+            .machine_services
+            .machines_for(key)
+            .into_iter()
+            .map(|(machine, _)| machine.to_string())
+            .collect()
+    }
+
+    /// Which machines run a service is fleet state, but a removed service has
+    /// no business keeping it: the row must not outlive what it selects, and
+    /// bringing the service back starts with no machine selected.
+    #[tokio::test]
+    async fn removing_a_service_or_uninstalling_its_pack_clears_its_selections() {
+        let ws = workspace().await;
+        let key: cairn_config::fleet::MachineServiceKey = "core/probe".parse().unwrap();
+
+        select_probe(&ws, &key);
+        assert_eq!(selected_on(&ws, &key), ["alpha"]);
+        apply_pack_item_removal(&ws.orch, "core", PackItemKind::Service, "probe").unwrap();
+        assert!(selected_on(&ws, &key).is_empty(), "overrides included");
+
+        apply_pack_action(&ws.orch, "restore", "core").unwrap();
+        assert!(ws.home.join("services/probe/service.yaml").exists());
+        assert!(selected_on(&ws, &key).is_empty(), "restore selects nothing");
+
+        select_probe(&ws, &key);
+        apply_pack_delete(&ws.orch, "core").unwrap();
+        assert!(selected_on(&ws, &key).is_empty());
+
+        apply_pack_action(&ws.orch, "install", "core").unwrap();
+        assert!(
+            selected_on(&ws, &key).is_empty(),
+            "reinstall selects nothing"
+        );
+    }
+
+    /// A manifest shipping one service is that service: it lists under Machine
+    /// services, with a row for each machine it ships an artifact for and each
+    /// machine that selected it, and the agent's page says the same. An empty
+    /// section does not render at all.
+    #[tokio::test]
+    async fn a_single_service_manifest_lists_under_machine_services_with_its_machines() {
+        use crate::config::machine_services::{
+            InstanceView, MachineCandidate, MachineServiceSnapshot,
+        };
+        use crate::config::mcp_servers::MachineStateTag;
+        use crate::project_services::supervisor::machine::InstanceState;
+        use crate::resources::packs::{read_pack, read_packs};
+
+        let ws = workspace().await;
+        let none = MachineServiceSnapshot::empty();
+        assert!(
+            !read_packs(&ws.home, &ws.orch.library, &none, None).contains("## Machine services"),
+            "a pack's service does not make the section, and an empty one does not render"
+        );
+
+        let solo = source_pack(&ws.resources, "solo");
+        write(
+            &solo.join("cairn-pack.yaml"),
+            "id: solo\nname: Solo\nversion: 1.0.0\n",
+        );
+        write(&solo.join("services/solo/service.yaml"), PROBE_SERVICE);
+        apply_pack_action(&ws.orch, "install", "solo").unwrap();
+
+        let candidate = |name: &str, target: &str| MachineCandidate {
+            name: name.to_string(),
+            target: Some(target.to_string()),
+            attached: true,
+        };
+        let machines = MachineServiceSnapshot {
+            instances: std::collections::BTreeMap::from([(
+                "solo/solo".parse().unwrap(),
+                vec![InstanceView {
+                    machine: "selected-anyway".to_string(),
+                    state: InstanceState::WaitingForOperator {
+                        reason: "permission-denied".to_string(),
+                    },
+                    installed_version: None,
+                    override_command: Some("/opt/solo".to_string()),
+                    provenance: "override /opt/solo (someone)".to_string(),
+                    serves_mcp: true,
+                }],
+            )]),
+            machines: vec![
+                candidate("shipped-for", "x86_64-unknown-linux-gnu"),
+                candidate("not-shipped-for", "aarch64-apple-darwin"),
+                candidate("selected-anyway", "aarch64-apple-darwin"),
+            ],
+        };
+
+        let catalog = pack_catalog(&ws.home, &ws.orch.library, &machines);
+        let entry = catalog.find("solo").unwrap();
+        assert_eq!(entry.entry_kind, "service");
+        assert_eq!(entry.runs, pack::ItemRuns::Here);
+        let service = entry.items[0].machine_service.as_ref().unwrap();
+        assert_eq!(service.key, "solo/solo");
+        assert_eq!(service.pinned_version.as_deref(), Some("1.2.3"));
+        assert_eq!(service.transport.as_deref(), Some("mcp-stdio"));
+        let names: Vec<&str> = service.machines.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["shipped-for", "selected-anyway"]);
+        assert!(!service.machines[0].selected && service.machines[0].state.is_none());
+        let selected = &service.machines[1];
+        assert!(selected.selected);
+        assert_eq!(selected.state, Some(MachineStateTag::WaitingForOperator));
+        assert_eq!(selected.override_command.as_deref(), Some("/opt/solo"));
+        assert_eq!(
+            selected.provenance.as_deref(),
+            Some("override /opt/solo (someone)"),
+            "who set it comes from the data, never a hardcoded word"
+        );
+
+        let page = read_packs(&ws.home, &ws.orch.library, &machines, None);
+        assert!(page.contains("## Machine services (1)"), "{page}");
+        let detail = read_pack(&ws.home, &ws.orch.library, &machines, "solo");
+        assert!(
+            detail.contains("selected-anyway: waiting for the operator"),
+            "{detail}"
+        );
+        assert!(detail.contains("override /opt/solo (someone)"), "{detail}");
+        assert!(detail.contains("machineServices"), "{detail}");
+    }
+
+    /// A local or remote source's service never reaches the workspace, cannot be
+    /// selected because nothing declares it, and the pack's page says why.
+    #[tokio::test]
+    async fn a_local_pack_lists_no_service_and_carries_the_sentence() {
+        use crate::config::machine_services::MachineServiceSnapshot;
+        use crate::resources::packs::read_pack;
+
+        let ws = workspace().await;
+        let source = ws._temp.path().join("plugin-source");
+        write(
+            &source.join("cairn-pack.yaml"),
+            "id: local-kit\nname: Local Kit\n",
+        );
+        write(
+            &source.join("skills/local-kit/SKILL.md"),
+            "---\nname: local-kit\ndescription: Useful.\n---\n",
+        );
+        write(
+            &source.join("services/local-probe/service.yaml"),
+            PROBE_SERVICE,
+        );
+        sync_resolved_pack(
+            &RealGitClient,
+            &RealFileSystem,
+            &ws.home,
+            pack::manifest::load(&source).unwrap(),
+            pack::PackSource::local(source.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+
+        let none = MachineServiceSnapshot::empty();
+        let catalog = pack_catalog(&ws.home, &ws.orch.library, &none);
+        let entry = catalog.find("local-kit").unwrap();
+        assert!(entry.items.iter().all(|item| item.kind != "service"));
+        assert!(!ws.home.join("services/local-probe").exists());
+        let sentence = pack::manifest::NON_BUNDLED_SERVICES_NOTE;
+        assert!(entry.notes.iter().any(|note| note.contains(sentence)));
+        assert!(read_pack(&ws.home, &ws.orch.library, &none, "local-kit").contains(sentence));
+        assert!(
+            crate::project_services::pack_source::declared_machine_service(
+                &ws.home,
+                &"local-kit/local-probe".parse().unwrap(),
+            )
+            .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn every_item_kind_can_be_removed_and_restored_without_uninstalling_its_pack() {
         let ws = workspace().await;
         apply_pack_action(&ws.orch, "install", "matlab").unwrap();
 
-        let cases: [(&str, PackItemKind, &str, &str); 7] = [
+        let cases: [(&str, PackItemKind, &str, &str); 8] = [
             ("core", PackItemKind::Agent, "explore", "agents/explore.md"),
             (
                 "core",
@@ -1317,6 +1516,7 @@ mod tests {
                 "responses/conveyor.md",
             ),
             ("core", PackItemKind::Route, "ping", "routes/ping.yaml"),
+            ("core", PackItemKind::Service, "probe", "services/probe"),
             ("core", PackItemKind::Skill, "example", "skills/example"),
             ("core", PackItemKind::Workflow, "flow", "workflows/flow"),
             ("matlab", PackItemKind::Mcp, "matlab", ""),
@@ -1358,6 +1558,7 @@ mod tests {
             "recipes/default.yaml",
             "responses/conveyor.md",
             "routes/ping.yaml",
+            "services/probe/service.yaml",
             "skills/example/SKILL.md",
             "workflows/flow/workflow.yaml",
         ] {
@@ -1384,10 +1585,14 @@ mod tests {
         let ws = workspace().await;
         write(&ws.home.join("agents/explore.md"), "my agent\n");
 
-        let entry = pack_catalog(&ws.home, &ws.orch.library)
-            .find("core")
-            .unwrap()
-            .clone();
+        let entry = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        )
+        .find("core")
+        .unwrap()
+        .clone();
         let item = entry
             .items
             .iter()
@@ -1547,7 +1752,11 @@ mod tests {
         assert!(ws.home.join("agents/explore.md").exists());
         assert!(!ws.home.join("recipes/default.yaml").exists());
 
-        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let catalog = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         let core = catalog.find("core").unwrap();
         assert_eq!(core.state, PackState::Available);
         assert!(core.uninstalled_by_user);
@@ -1767,7 +1976,11 @@ mod tests {
     #[tokio::test]
     async fn the_catalog_reports_installed_available_default_source_and_readiness() {
         let ws = workspace().await;
-        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let catalog = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         assert!(catalog.source_recorded);
 
         let core = catalog.find("core").unwrap();
@@ -1779,7 +1992,7 @@ mod tests {
         assert_eq!(core.source.kind, "bundled");
         assert_eq!(
             core.counts.iter().map(|c| c.count).sum::<usize>(),
-            6,
+            7,
             "one of every file-backed kind"
         );
 
@@ -1791,7 +2004,11 @@ mod tests {
         // Installing the connector surfaces the reason it is inert: its command
         // references a `${VAR}` with no value anywhere.
         apply_pack_action(&ws.orch, "install", "matlab").unwrap();
-        let installed = pack_catalog(&ws.home, &ws.orch.library);
+        let installed = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         let connector = installed
             .find("matlab")
             .unwrap()
@@ -1815,10 +2032,14 @@ mod tests {
             "shipped v2\n",
         );
         assert!(
-            pack_catalog(&ws.home, &ws.orch.library)
-                .find("core")
-                .unwrap()
-                .update_available
+            pack_catalog(
+                &ws.home,
+                &ws.orch.library,
+                &crate::config::machine_services::MachineServiceSnapshot::empty()
+            )
+            .find("core")
+            .unwrap()
+            .update_available
         );
     }
 
@@ -1893,7 +2114,11 @@ mod tests {
         fixture.publish();
         let ws = library_workspace(&fixture).await;
 
-        let before = pack_catalog(&ws.home, &ws.orch.library);
+        let before = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         assert_eq!(before.sources[0].state, "not-fetched");
         assert!(
             before.find("acme").is_none(),
@@ -1902,10 +2127,14 @@ mod tests {
 
         let report = refresh_library_sources(&ws.orch, true);
         assert_eq!(report.sources[0].outcome, "updated", "{report:?}");
-        let offered = pack_catalog(&ws.home, &ws.orch.library)
-            .find("acme")
-            .cloned()
-            .expect("the library's entry is offered");
+        let offered = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        )
+        .find("acme")
+        .cloned()
+        .expect("the library's entry is offered");
         assert_eq!(offered.state, PackState::Available);
         assert_eq!(offered.source.label, "Cairn library");
         assert_eq!(offered.source.signer.as_deref(), Some("cairn-library-test"));
@@ -1935,10 +2164,14 @@ mod tests {
         assert!(stage_dirs(&ws).is_empty(), "the stage is dropped");
 
         // The same readiness gate as a bundled pack server.
-        let entry = pack_catalog(&ws.home, &ws.orch.library)
-            .find("acme")
-            .cloned()
-            .unwrap();
+        let entry = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        )
+        .find("acme")
+        .cloned()
+        .unwrap();
         let server = entry.items.iter().find(|item| item.kind == "mcp").unwrap();
         assert!(
             matches!(&server.not_ready, Some(NotReady::MissingVars { vars }) if vars == &["FIXTURE_TOKEN_FILE".to_string()]),
@@ -1947,7 +2180,12 @@ mod tests {
         );
         assert_eq!(server.setup[0].setup.label.as_deref(), Some("Token file"));
         assert!(
-            !crate::config::mcp_servers::resolve_mcp_servers(&ws.home, None).contains_key("acme"),
+            !crate::config::mcp_servers::resolve_mcp_servers(
+                &ws.home,
+                None,
+                &crate::config::machine_services::MachineServiceSnapshot::empty()
+            )
+            .contains_key("acme"),
             "an ingested server with an unset variable is withheld from agents"
         );
     }
@@ -1973,10 +2211,14 @@ mod tests {
             "a refresh never applies a change to what runs"
         );
 
-        let entry = pack_catalog(&ws.home, &ws.orch.library)
-            .find("acme")
-            .cloned()
-            .unwrap();
+        let entry = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        )
+        .find("acme")
+        .cloned()
+        .unwrap();
         assert!(entry.update_available && entry.update_needs_review);
         let change = &entry.runtime_changes[0];
         assert_eq!(
@@ -2006,7 +2248,11 @@ mod tests {
 
         apply_pack_action_as(&ws.orch, "update", "acme", UpdateAuthority::Operator).unwrap();
         assert!(mcp_layer(&ws, "acme").contains("acme-mcp-v2"));
-        let after = pack_catalog(&ws.home, &ws.orch.library);
+        let after = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         let entry = after.find("acme").unwrap();
         assert!(!entry.update_available && !entry.update_needs_review);
     }
@@ -2043,7 +2289,11 @@ mod tests {
             item_state(&ws, "guides", "skill", "tips"),
             Some(PackItemState::EditedByUser)
         );
-        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let catalog = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         let tips = catalog
             .find("guides")
             .unwrap()
@@ -2080,7 +2330,11 @@ mod tests {
             report.sources[0].error.as_deref(),
             Some("index signature does not verify against the Cairn library's trusted keys")
         );
-        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let catalog = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         assert_eq!(
             catalog.sources[0].state, "verified",
             "the previous index stays"
@@ -2100,14 +2354,23 @@ mod tests {
         let cached = fixture.cache_dir(&ws.home).join("index.json");
         let text = std::fs::read_to_string(&cached).unwrap();
         std::fs::write(&cached, text.replace("acme-mcp", "evil-mcp")).unwrap();
-        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let catalog = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         assert_eq!(catalog.sources[0].state, "unverified");
         assert!(catalog.sources[0]
             .refusal
             .as_deref()
             .is_some_and(|r| r.contains("does not verify")));
         assert!(catalog.find("acme").is_none(), "its entries are dropped");
-        let page = crate::resources::packs::read_packs(&ws.home, &ws.orch.library, None);
+        let page = crate::resources::packs::read_packs(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+            None,
+        );
         assert!(page.contains("the cached index is not trusted"), "{page}");
     }
 
@@ -2196,7 +2459,11 @@ mod tests {
                 .kind,
             pack::PackSourceKind::Bundled
         );
-        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let catalog = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         assert!(catalog.sources[0].refused_entries.iter().any(
             |refusal| refusal.id == "matlab" && refusal.reason.contains("ships with this app")
         ));
@@ -2214,10 +2481,14 @@ mod tests {
         );
         assert_eq!(after.content_hash, before.content_hash);
         assert_eq!(mcp_layer(&ws, "matlab"), layer, "so readiness is unchanged");
-        let entry = pack_catalog(&ws.home, &ws.orch.library)
-            .find("matlab")
-            .cloned()
-            .unwrap();
+        let entry = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        )
+        .find("matlab")
+        .cloned()
+        .unwrap();
         assert_eq!(entry.source.label, "Cairn library");
         assert!(
             !entry.update_available,
@@ -2239,7 +2510,11 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|e| e.contains("has no `cairn-index` branch")));
-        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let catalog = pack_catalog(
+            &ws.home,
+            &ws.orch.library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         assert_eq!(catalog.sources[0].state, "unreachable");
         let ids: Vec<&str> = catalog
             .packs

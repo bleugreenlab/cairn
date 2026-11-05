@@ -20,6 +20,7 @@
 //!   here, live, and never stored.
 
 use super::*;
+use crate::config::mcp_servers::{MachineStateTag, MachineVerdict};
 use crate::mcp::gateway::{DuplexIo, McpToolDef, PlacedFacade};
 use cairn_common::executor_protocol::{
     InstalledMachineService, MachineServiceInstallOutcome, ManagedProgram, RemotePlatform,
@@ -31,8 +32,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 /// How long one probe one-shot may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-/// How often a cell whose machine is absent looks for it again.
-const ABSENT_POLL: Duration = Duration::from_secs(1);
+/// How often a cell looks at what the fleet says about its machine. Attaching,
+/// detaching and a changed install report arrive unannounced, and a resident
+/// that stays ready is only probed every `probe.every`.
+const MACHINE_POLL: Duration = Duration::from_secs(1);
 /// How often a cell that cannot start (nothing installed, crashed) looks again.
 const BLOCKED_POLL: Duration = Duration::from_secs(10);
 /// The longest a resident that is not ready goes between probes, so a
@@ -68,6 +71,11 @@ pub(crate) fn attached_machines(orch: &Orchestrator) -> Vec<MachineView> {
         .collect()
 }
 
+/// The machines attached now, through the host every instance is derived from.
+pub(crate) fn attached_now(orch: &Orchestrator) -> Vec<MachineView> {
+    supervisor(orch).host().machines(orch)
+}
+
 /// What the last probe of a resident found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
@@ -99,8 +107,11 @@ pub(crate) struct MachineCell {
     /// Why the service cannot start here, from the last attempt to read what
     /// this machine runs; cleared when one succeeds.
     blocked: StdMutex<Option<String>>,
+    /// The state last announced to open windows, so an unchanged probe stays
+    /// silent.
+    pub(super) announced: StdMutex<Option<InstanceState>>,
     probe_task: AtomicBool,
-    wake: Notify,
+    pub(super) wake: Notify,
     /// No longer selected: its probe task ends and nothing starts it again.
     retired: AtomicBool,
     facade: OnceLock<Arc<MachineServiceFacade>>,
@@ -116,6 +127,7 @@ impl MachineCell {
             machine: machine.clone(),
             probe: StdMutex::new(None),
             blocked: StdMutex::new(None),
+            announced: StdMutex::new(None),
             probe_task: AtomicBool::new(false),
             wake: Notify::new(),
             retired: AtomicBool::new(false),
@@ -177,6 +189,10 @@ impl ServiceSource for MachineSource {
         self.base.list()
     }
 
+    fn refusal(&self, id: &str) -> Option<String> {
+        self.base.refusal(id)
+    }
+
     fn package(&self, id: &str) -> Result<Option<ServicePackage>, String> {
         let Some(mut package) = self.base.package(id)? else {
             return Ok(None);
@@ -188,6 +204,11 @@ impl ServiceSource for MachineSource {
         let Some(selection) = self.row.selection(&key, &self.machine) else {
             return Ok(None);
         };
+        if selection.override_command().is_none() {
+            if let Some(refusal) = self.base.refusal(id) {
+                return Err(refusal);
+            }
+        }
         let (program, provenance) =
             resolve_program(&key, &self.machine, selection, native, self.view.as_ref())?;
         let mut hasher = Sha256::new();
@@ -259,7 +280,19 @@ pub(crate) async fn apply_machine_services(orch: &Orchestrator, reason: &str) {
     let row = crate::config::settings::load_fleet(&orch.config_dir).machine_services;
     let mut wanted: Vec<(String, String, String)> = Vec::new();
     for (pack, source) in supervisor(orch).sources().packs(orch) {
-        let listings = match tokio::task::spawn_blocking(move || source.list()).await {
+        let listed = tokio::task::spawn_blocking(move || {
+            source.list().map(|listings| {
+                listings
+                    .into_iter()
+                    .map(|listing| {
+                        let refused = source.refusal(&listing.id).is_some();
+                        (listing, refused)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await;
+        let listings = match listed {
             Ok(Ok(listings)) => listings,
             Ok(Err(error)) => {
                 tracing::warn!(%error, pack, "could not list a pack's services");
@@ -267,7 +300,7 @@ pub(crate) async fn apply_machine_services(orch: &Orchestrator, reason: &str) {
             }
             Err(_) => continue,
         };
-        for listing in listings {
+        for (listing, refused) in listings {
             let Ok(declaration) = &listing.declaration else {
                 continue;
             };
@@ -277,7 +310,11 @@ pub(crate) async fn apply_machine_services(orch: &Orchestrator, reason: &str) {
             let Ok(key) = MachineServiceKey::new(&pack, &listing.id) else {
                 continue;
             };
-            for (machine, _) in row.machines_for(&key) {
+            for (machine, selection) in row.machines_for(&key) {
+                // Left out rather than blocked, so one already running drains.
+                if refused && selection.override_command().is_none() {
+                    continue;
+                }
                 wanted.push((pack.clone(), listing.id.clone(), machine.to_string()));
             }
         }
@@ -435,12 +472,29 @@ async fn ensure_cell(orch: &Orchestrator, cell: &Arc<Cell>, reason: &str) {
     }
 }
 
+fn machine_view(orch: &Orchestrator, machine: &str) -> Option<MachineView> {
+    attached_now(orch)
+        .into_iter()
+        .find(|view| view.name == machine)
+}
+
 fn attached(orch: &Orchestrator, machine: &str) -> bool {
-    supervisor(orch)
-        .host()
-        .machines(orch)
-        .iter()
-        .any(|view| view.name == machine)
+    machine_view(orch, machine).is_some()
+}
+
+/// Whether this cell runs the pack's artifact and its pack refuses that.
+async fn refused_here(orch: &Orchestrator, machine_cell: &MachineCell) -> bool {
+    let orch = orch.clone();
+    let key = machine_cell.key.clone();
+    let machine = machine_cell.machine.clone();
+    tokio::task::spawn_blocking(move || {
+        let row = crate::config::settings::load_fleet(&orch.config_dir).machine_services;
+        row.selection(&key, &machine)
+            .is_some_and(|selection| selection.override_command().is_none())
+            && declared(&orch, &key).refusal.is_some()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Start the cell's probe task, or wake the running one.
@@ -465,8 +519,21 @@ async fn probe_loop(orch: Orchestrator, cell: Arc<Cell>) {
         if machine_cell.retired.load(Ordering::Acquire) {
             break;
         }
+        // Read before the pass acts on it, so a change during the pass ends the
+        // wait after it.
+        let seen = machine_view(&orch, &machine_cell.machine);
+        // Nothing watches the copy, so this pass is where an edit is noticed.
+        // Apply is what leaves a refused cell out, and it drains this one.
+        if refused_here(&orch, machine_cell).await {
+            apply_machine_services(&orch, "its copy was edited").await;
+        }
         ensure_cell(&orch, &cell, "runner (machine service)").await;
-        let pause = match cell.serving() {
+        // A resident survives a link gap, and a probe of a machine that is away
+        // can only time out.
+        let pause = match cell
+            .serving()
+            .filter(|_| attached(&orch, &machine_cell.machine))
+        {
             Some(incarnation) => {
                 let every = incarnation
                     .declaration
@@ -481,15 +548,35 @@ async fn probe_loop(orch: Orchestrator, cell: Arc<Cell>) {
                     every.min(NOT_READY_POLL)
                 }
             }
-            None if !attached(&orch, &machine_cell.machine) => ABSENT_POLL,
             None => BLOCKED_POLL,
         };
-        tokio::select! {
-            () = tokio::time::sleep(pause) => {}
-            () = machine_cell.wake.notified() => {}
-        }
+        announce_state(&orch, &cell);
+        wait_for_next_pass(&orch, machine_cell, seen, pause).await;
     }
     machine_cell.probe_task.store(false, Ordering::Release);
+}
+
+/// Wait out `pause`, ending early if the cell is woken or its machine no longer
+/// looks the way it did in `seen`.
+async fn wait_for_next_pass(
+    orch: &Orchestrator,
+    machine_cell: &MachineCell,
+    seen: Option<MachineView>,
+    pause: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + pause;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::select! {
+            () = tokio::time::sleep(remaining.min(MACHINE_POLL)) => {}
+            () = machine_cell.wake.notified() => return,
+        }
+        if tokio::time::Instant::now() >= deadline
+            || machine_view(orch, &machine_cell.machine) != seen
+        {
+            return;
+        }
+    }
 }
 
 fn spec_for(cell: &Cell, incarnation: &Incarnation) -> LaunchSpec {
@@ -805,7 +892,7 @@ async fn pump(
 /// A machine service instance's state, derived live from its cell, its probe
 /// and its machine's report.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum InstanceState {
+pub enum InstanceState {
     NotInstalled { reason: String },
     Installing,
     MachineAbsent,
@@ -832,6 +919,28 @@ impl InstanceState {
             Self::Failed { reason } => format!("failed: {reason}"),
         }
     }
+
+    /// This state on `machine`, as the wire carries it.
+    pub(crate) fn verdict(&self, machine: &str) -> MachineVerdict {
+        let (state, reason) = match self {
+            Self::NotInstalled { reason } => (MachineStateTag::NotInstalled, Some(reason.clone())),
+            Self::Installing => (MachineStateTag::Installing, None),
+            Self::MachineAbsent => (MachineStateTag::MachineAbsent, None),
+            Self::Starting => (MachineStateTag::Starting, None),
+            Self::WaitingForOperator { reason } => (
+                MachineStateTag::WaitingForOperator,
+                Some(operator_reason(reason)),
+            ),
+            Self::Ready => (MachineStateTag::Ready, None),
+            Self::Degraded { reason } => (MachineStateTag::Degraded, Some(reason.clone())),
+            Self::Failed { reason } => (MachineStateTag::Failed, Some(reason.clone())),
+        };
+        MachineVerdict {
+            machine: machine.to_string(),
+            state,
+            reason,
+        }
+    }
 }
 
 /// What a person reads for the reasons a resident commonly waits on.
@@ -855,6 +964,10 @@ pub(crate) struct MachineServiceInstance {
     /// `override <path> (operator)`, `installed <version> (pack)`, or
     /// `not installed: <reason>`.
     pub provenance: String,
+    /// The pack artifact this machine holds, when it is the one declared.
+    pub installed_version: Option<String>,
+    /// The binary the selection runs instead of the pack's artifact.
+    pub override_command: Option<String>,
     pub catalog: Vec<McpToolDef>,
     pub probed_at_ms: Option<i64>,
     /// Whether the resident speaks MCP on its stdio (`transport: mcp-stdio`).
@@ -885,9 +998,7 @@ pub(crate) fn instances(
     let views = supervisor(orch).host().machines(orch);
     row.machines_for(key)
         .into_iter()
-        .map(|(machine, selection)| {
-            instance(orch, key, machine, selection, declared.as_ref(), &views)
-        })
+        .map(|(machine, selection)| instance(orch, key, machine, selection, &declared, &views))
         .collect()
 }
 
@@ -901,7 +1012,7 @@ pub(crate) fn instances_on(orch: &Orchestrator, machine: &str) -> Vec<MachineSer
             let declared = declared(orch, key);
             let name = cairn_common::executor_protocol::normalize_executor_name(machine)
                 .unwrap_or_else(|| machine.to_string());
-            instance(orch, key, &name, selection, declared.as_ref(), &views)
+            instance(orch, key, &name, selection, &declared, &views)
         })
         .collect()
 }
@@ -915,16 +1026,28 @@ pub(crate) fn selected_keys(orch: &Orchestrator) -> Vec<MachineServiceKey> {
         .collect()
 }
 
-fn declared(
-    orch: &Orchestrator,
-    key: &MachineServiceKey,
-) -> Option<Result<ServicePackage, String>> {
-    let (_, source) = supervisor(orch)
+/// What the installed packs say about one key.
+struct Declared {
+    /// The shipped declaration or why it does not parse; `None` when no
+    /// installed pack declares the key.
+    package: Option<Result<ServicePackage, String>>,
+    /// Why the pack's own artifact may not run.
+    refusal: Option<String>,
+}
+
+fn declared(orch: &Orchestrator, key: &MachineServiceKey) -> Declared {
+    let source = supervisor(orch)
         .sources()
         .packs(orch)
         .into_iter()
-        .find(|(pack, _)| *pack == key.pack)?;
-    source.package(&key.service).transpose()
+        .find(|(pack, _)| *pack == key.pack)
+        .map(|(_, source)| source);
+    Declared {
+        package: source
+            .as_ref()
+            .and_then(|source| source.package(&key.service).transpose()),
+        refusal: source.and_then(|source| source.refusal(&key.service)),
+    }
 }
 
 fn instance(
@@ -932,28 +1055,12 @@ fn instance(
     key: &MachineServiceKey,
     machine: &str,
     selection: &MachineSelection,
-    declared: Option<&Result<ServicePackage, String>>,
+    declared: &Declared,
     views: &[MachineView],
 ) -> MachineServiceInstance {
     let view = views.iter().find(|view| view.name == machine);
     let cell = supervisor(orch).existing("", &ServiceOwner::pack(&key.pack, machine), &key.service);
-    let native = declared
-        .and_then(|declared| declared.as_ref().ok())
-        .and_then(|package| package.declaration.native());
-    let artifact_sha = view
-        .and_then(|view| view.target.as_deref())
-        .and_then(|target| native.and_then(|native| native.targets.get(target)))
-        .map(|artifact| artifact.sha256.as_str());
-    let report = view.and_then(|view| {
-        let mine = |installed: &&InstalledMachineService| {
-            installed.pack == key.pack && installed.service == key.service
-        };
-        view.installed
-            .iter()
-            .filter(mine)
-            .find(|installed| Some(installed.sha256.as_str()) == artifact_sha)
-            .or_else(|| view.installed.iter().find(mine))
-    });
+    let (artifact_sha, report) = holding(key, declared, view);
     let installed_version = report
         .filter(|report| report.outcome == MachineServiceInstallOutcome::Installed)
         .filter(|report| Some(report.sha256.as_str()) == artifact_sha)
@@ -981,38 +1088,141 @@ fn instance(
     };
     let machine_cell = cell.as_ref().and_then(|cell| cell.machine.as_ref());
     let probe = machine_cell.and_then(|machine_cell| machine_cell.probe.lock().unwrap().clone());
-    let state = match declared {
-        None => InstanceState::NotInstalled {
-            reason: format!("no installed pack declares {key}"),
-        },
-        Some(Err(error)) => InstanceState::Failed {
-            reason: format!("its declaration does not parse: {error}"),
-        },
-        Some(Ok(_)) => live_state(
-            view.is_some(),
-            selection.override_.is_none()
-                && report.is_some_and(|report| {
-                    report.outcome == MachineServiceInstallOutcome::Installing
-                }),
-            cell.as_deref(),
-            probe.as_ref(),
-        ),
-    };
+    let state = derive_state(
+        key,
+        selection,
+        declared,
+        view.is_some(),
+        report,
+        cell.as_deref(),
+        probe.as_ref(),
+    );
     MachineServiceInstance {
         key: key.clone(),
         machine: machine.to_string(),
         state,
         provenance,
+        installed_version,
+        override_command: selection.override_command().map(str::to_string),
         catalog: probe
             .as_ref()
             .map(|probe| probe.catalog.clone())
             .unwrap_or_default(),
         probed_at_ms: probe.as_ref().map(|probe| probe.at_ms),
         serves_mcp: declared
+            .package
+            .as_ref()
             .and_then(|declared| declared.as_ref().ok())
             .is_some_and(|package| package.declaration.transport == Transport::McpStdio),
         facade: cell.as_ref().and_then(|cell| facade_for(orch, cell)),
     }
+}
+
+/// The artifact the pack declares for this machine, and what the machine reports
+/// holding for `key`: that artifact when it holds it, else whatever it does hold.
+fn holding<'a>(
+    key: &MachineServiceKey,
+    declared: &'a Declared,
+    view: Option<&'a MachineView>,
+) -> (Option<&'a str>, Option<&'a InstalledMachineService>) {
+    let native = declared
+        .package
+        .as_ref()
+        .and_then(|declared| declared.as_ref().ok())
+        .and_then(|package| package.declaration.native());
+    let artifact_sha = view
+        .and_then(|view| view.target.as_deref())
+        .and_then(|target| native.and_then(|native| native.targets.get(target)))
+        .map(|artifact| artifact.sha256.as_str());
+    let report = view.and_then(|view| {
+        let mine = |installed: &&InstalledMachineService| {
+            installed.pack == key.pack && installed.service == key.service
+        };
+        view.installed
+            .iter()
+            .filter(mine)
+            .find(|installed| Some(installed.sha256.as_str()) == artifact_sha)
+            .or_else(|| view.installed.iter().find(mine))
+    });
+    (artifact_sha, report)
+}
+
+/// An instance's state, for everything that reports or announces one.
+fn derive_state(
+    key: &MachineServiceKey,
+    selection: &MachineSelection,
+    declared: &Declared,
+    attached: bool,
+    report: Option<&InstalledMachineService>,
+    cell: Option<&Cell>,
+    probe: Option<&ProbeReport>,
+) -> InstanceState {
+    let runs_artifact = selection.override_command().is_none();
+    match (&declared.package, &declared.refusal) {
+        (None, _) => InstanceState::NotInstalled {
+            reason: format!("no installed pack declares {key}"),
+        },
+        (Some(Err(error)), _) => InstanceState::Failed {
+            reason: format!("its declaration does not parse: {error}"),
+        },
+        (Some(Ok(_)), Some(refusal)) if runs_artifact => InstanceState::Failed {
+            reason: refusal.clone(),
+        },
+        (Some(Ok(_)), _) => live_state(
+            attached,
+            runs_artifact
+                && report.is_some_and(|report| {
+                    report.outcome == MachineServiceInstallOutcome::Installing
+                }),
+            cell,
+            probe,
+        ),
+    }
+}
+
+/// Tell open windows this instance's state changed, if it has since the last
+/// time this was asked.
+///
+/// The comparison is what keeps a five-minute probe that keeps saying `ready`
+/// from refetching every catalog in every window. Returns whether it announced.
+pub(super) fn announce_state(orch: &Orchestrator, cell: &Arc<Cell>) -> bool {
+    let Some(machine_cell) = cell.machine.as_ref() else {
+        return false;
+    };
+    let row = crate::config::settings::load_fleet(&orch.config_dir).machine_services;
+    let key = &machine_cell.key;
+    // An unselected machine reports no instance, and the write that unselected
+    // it told open windows itself.
+    let Some(selection) = row.selection(key, &machine_cell.machine) else {
+        return false;
+    };
+    let declared = declared(orch, key);
+    let view = machine_view(orch, &machine_cell.machine);
+    let (_, report) = holding(key, &declared, view.as_ref());
+    // As `instance` reads it: a drained cell has left the set.
+    let current = supervisor(orch).existing("", &cell.owner, &cell.service);
+    let probe = current
+        .as_ref()
+        .and_then(|cell| cell.machine.as_ref())
+        .and_then(|machine_cell| machine_cell.probe.lock().unwrap().clone());
+    let state = derive_state(
+        key,
+        selection,
+        &declared,
+        view.is_some(),
+        report,
+        current.as_deref(),
+        probe.as_ref(),
+    );
+    {
+        let mut announced = machine_cell.announced.lock().unwrap();
+        if announced.as_ref() == Some(&state) {
+            return false;
+        }
+        *announced = Some(state);
+    }
+    orch.emit_machine_service_change();
+    true
 }
 
 /// Run [`apply_machine_services`] on its own task, from code that is not

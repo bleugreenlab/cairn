@@ -200,15 +200,28 @@ mod tests {
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(pack_lock::read_lock(&repo, "linear").is_none());
         let library = crate::library::LibraryContext::configured();
-        let catalog = crate::resources::packs::read_packs(&repo, &library, None);
+        let catalog = crate::resources::packs::read_packs(
+            &repo,
+            &library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+            None,
+        );
         assert!(catalog.contains("`matlab`"), "{catalog}");
         assert!(catalog.contains("`linear`"), "{catalog}");
         assert_eq!(
-            crate::resources::packs::read_packs(&repo, &library, Some("installed"))
-                .matches("State: installed")
+            crate::resources::packs::read_packs(
+                &repo,
+                &library,
+                &crate::config::machine_services::MachineServiceSnapshot::empty(),
+                Some("installed")
+            )
+            .matches("State: installed")
+            .count(),
+            pack::discover_available_packs(src_tauri)
+                .iter()
+                .filter(|manifest| manifest.default)
                 .count(),
-            1,
-            "only core is installed on a fresh workspace"
+            "only the default set is installed on a fresh workspace"
         );
 
         // Installing matlab lands its skill AND its MCP definition.
@@ -234,13 +247,21 @@ mod tests {
 
         // Both connectors are visible in settings with a reason, and inert for
         // agents until the user supplies what they need.
-        let entries = crate::config::mcp_servers::workspace_mcp_entries(&repo);
+        let entries = crate::config::mcp_servers::workspace_mcp_entries(
+            &repo,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+        );
         assert_eq!(entries["linear"].origin, "pack:linear");
         assert_eq!(entries["matlab"].origin, "pack:matlab");
         assert!(entries["linear"].not_ready.is_some());
         assert!(entries["matlab"].not_ready.is_some());
 
-        let pack_page = crate::resources::packs::read_pack(&repo, &library, "linear");
+        let pack_page = crate::resources::packs::read_pack(
+            &repo,
+            &library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+            "linear",
+        );
         assert!(pack_page.contains("State: installed"), "{pack_page}");
         assert!(pack_page.contains("needs_auth"), "{pack_page}");
 
@@ -249,7 +270,11 @@ mod tests {
         assert!(result.kept.is_empty());
         assert!(!repo.join("skills/matlab").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
-        assert!(!crate::config::mcp_servers::workspace_mcp_entries(&repo).contains_key("matlab"));
+        assert!(!crate::config::mcp_servers::workspace_mcp_entries(
+            &repo,
+            &crate::config::machine_services::MachineServiceSnapshot::empty()
+        )
+        .contains_key("matlab"));
     }
 
     /// Every connector this repository ships must actually reach the catalog,
@@ -1108,6 +1133,89 @@ mod tests {
                 .unwrap()
                 .contains("v2")
         );
+    }
+
+    const PROBE_SERVICE: &str = "name: Probe\nruntime: native\nplacement: per-machine\ntransport: mcp-stdio\nargs: [serve]\nartifacts:\n  version: 1.0.0\n  prove: [--version]\n  targets:\n    x86_64-unknown-linux-gnu:\n      url: https://example.invalid/probe\n      sha256: eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54\n      size: 10\n      executable: probe\nprobe:\n  args: [status]\n  every: 5m\n  ready: /ready\n";
+
+    /// The whole ownership model on a service: it is materialized and hashed, a
+    /// shipped change reaches it in place, an edit forks it and stays, and a
+    /// removal survives the next sync while its pack keeps updating.
+    #[test]
+    fn a_packed_service_is_owned_like_any_tree_item() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        write_complete_resources(&resources);
+        write_manifest(&resources, "kit", true, &[]);
+        let source = source_pack(&resources, "kit").join("services/probe/service.yaml");
+        write(&source, PROBE_SERVICE);
+        let copy = repo.join("services/probe/service.yaml");
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+        let item = || {
+            pack_lock::read_lock(&repo, "kit")
+                .unwrap()
+                .item(PackItemKind::Service, "probe")
+                .cloned()
+        };
+
+        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), PROBE_SERVICE);
+        let baseline = item().unwrap();
+        assert_eq!(baseline.path.as_deref(), Some("services/probe"));
+        assert!(baseline.content_hash.is_some() && !baseline.forked);
+
+        write(&source, &format!("{PROBE_SERVICE}# v2\n"));
+        sync_workspace_packs(&git, &fs, &resources, &repo, "2.0.0").unwrap();
+        assert!(std::fs::read_to_string(&copy).unwrap().ends_with("# v2\n"));
+        assert_ne!(item().unwrap().content_hash, baseline.content_hash);
+
+        write(&copy, "name: Mine\n");
+        write(&source, &format!("{PROBE_SERVICE}# v3\n"));
+        sync_workspace_packs(&git, &fs, &resources, &repo, "3.0.0").unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "name: Mine\n");
+        assert!(item().unwrap().forked, "an edit forks it");
+
+        std::fs::remove_dir_all(repo.join("services/probe")).unwrap();
+        pack::note_removed_item(&repo, PackItemKind::Service, "probe");
+        write(&source, &format!("{PROBE_SERVICE}# v4\n"));
+        sync_workspace_packs(&git, &fs, &resources, &repo, "4.0.0").unwrap();
+        assert!(!copy.exists(), "a removal survives the next sync");
+        assert!(pack_lock::read_lock(&repo, "kit")
+            .unwrap()
+            .is_removed(PackItemKind::Service, "probe"));
+    }
+
+    /// The lock an installed axon holds today lists no items, because nothing
+    /// recognised its one file. The next sync adds both the service and its MCP
+    /// entry. Installed explicitly, because whether the pack is in the default
+    /// set is not this test's question.
+    #[test]
+    fn an_item_less_lock_gains_a_service_and_its_entry_on_the_next_sync() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        write_complete_resources(&resources);
+        write_manifest(&resources, "kit", false, &[]);
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+        sync_one_pack(&git, &fs, &resources, &repo, "kit").unwrap();
+        assert!(pack_lock::read_lock(&repo, "kit").unwrap().items.is_empty());
+
+        let root = source_pack(&resources, "kit");
+        write(&root.join("services/probe/service.yaml"), PROBE_SERVICE);
+        write(
+            &root.join("mcp.yaml"),
+            "mcpServers:\n  probe:\n    type: machine-service\n    service: probe\n",
+        );
+        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+
+        let lock = pack_lock::read_lock(&repo, "kit").unwrap();
+        assert!(lock.item(PackItemKind::Service, "probe").is_some());
+        assert!(lock.item(PackItemKind::Mcp, "probe").is_some());
+        assert!(repo.join("services/probe/service.yaml").exists());
+        let entry = &pack::mcp::load_pack_mcp_servers(&repo)["probe"];
+        assert_eq!(entry.config.service.as_deref(), Some("probe"));
     }
 
     /// A fresh workspace seeds the packed `fan-out` workflow package, the loader

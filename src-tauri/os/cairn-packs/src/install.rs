@@ -119,7 +119,7 @@ pub fn check_install_collisions(
     let pack_servers = pack::mcp::load_pack_mcp_servers(config_dir);
     let settings_servers = settings_mcp_server_names(config_dir);
 
-    for item in manifest.items() {
+    for item in manifest.items_from(incoming.kind) {
         if own_items.contains(&(item.kind, item.id.clone())) {
             continue;
         }
@@ -472,7 +472,7 @@ fn apply_plans(
                 &plan.manifest,
                 plan.hash.clone(),
                 plan.source.clone(),
-                plan.manifest.items(),
+                plan.manifest.items_from(plan.source.kind),
             )
         });
 
@@ -624,7 +624,7 @@ fn sync_pack(
     outcome: &mut SyncOutcome,
 ) -> Result<(), String> {
     let pack_id = lock.id.clone();
-    let source_items = manifest.items();
+    let source_items = manifest.items_from(source.kind);
     let source_mcp = source_mcp_servers(manifest)?;
     let source_keys: BTreeSet<_> = source_items
         .iter()
@@ -717,7 +717,7 @@ fn sync_pack(
     lock.author = manifest.author.clone();
     lock.homepage = manifest.homepage.clone();
     lock.keywords = manifest.keywords.clone();
-    lock.notes = manifest.notes.clone();
+    lock.notes = manifest.notes_from(source.kind);
     lock.content_hash = pack_hash.to_string();
     lock.source = source.clone();
     lock.sort_items();
@@ -739,14 +739,22 @@ pub fn matches_baseline(
     Ok(current == baseline || matches_legacy_tree_baseline(config_dir, item, baseline)?)
 }
 
-/// A skill or workflow baseline recorded before OS metadata left the tree hash
-/// matches when the tree, metadata included, still hashes to it.
+/// Whether this kind installs as a whole directory rather than one file.
+fn is_tree_item(kind: PackItemKind) -> bool {
+    matches!(
+        kind,
+        PackItemKind::Service | PackItemKind::Skill | PackItemKind::Workflow
+    )
+}
+
+/// A tree item's baseline recorded before OS metadata left the tree hash matches
+/// when the tree, metadata included, still hashes to it.
 fn matches_legacy_tree_baseline(
     config_dir: &Path,
     item: &PackLockItem,
     baseline: &str,
 ) -> Result<bool, String> {
-    if !matches!(item.kind, PackItemKind::Skill | PackItemKind::Workflow) {
+    if !is_tree_item(item.kind) {
         return Ok(false);
     }
     let Some(path) = &item.path else {
@@ -863,7 +871,7 @@ fn materialize_item(
         .ok_or_else(|| "File-backed pack item has no path".to_string())?;
     let source = manifest.root.join(path);
     let destination = config_dir.join(path);
-    if matches!(item.kind, PackItemKind::Skill | PackItemKind::Workflow) {
+    if is_tree_item(item.kind) {
         if fs.exists(&destination) {
             fs.remove_dir_all(&destination)?;
         }
@@ -893,7 +901,7 @@ fn remove_item_content(
     if !fs.exists(&destination) {
         return Ok(());
     }
-    if matches!(item.kind, PackItemKind::Skill | PackItemKind::Workflow) {
+    if is_tree_item(item.kind) {
         fs.remove_dir_all(&destination)
     } else {
         fs.remove_file(&destination)
@@ -1234,6 +1242,57 @@ mod tests {
         assert!(!is_pack_authored_subject("Snapshot workspace config"));
         assert!(!is_pack_authored_subject("Merge branch 'bundle'"));
         assert!(!is_pack_authored_subject("User edits explore"));
+    }
+
+    /// A remote or local source's service would be a catalog row with machines
+    /// that can never run it, so it never reaches the workspace, and a path
+    /// it never takes is no collision either.
+    #[test]
+    fn a_non_bundled_source_installs_around_its_service_and_notes_why() {
+        for (name, source) in [
+            ("local", PackSource::local("source".to_string())),
+            ("url", library_source()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = temp.path().join("home");
+            let dir = temp.path().join("kit");
+            write(&dir.join("cairn-pack.yaml"), "id: kit\n");
+            write(
+                &dir.join("skills/kit/SKILL.md"),
+                "---\nname: kit\ndescription: Useful.\n---\n",
+            );
+            write(&dir.join("services/probe/service.yaml"), "name: Probe\n");
+            write(&config.join("services/probe/mine.txt"), "mine\n");
+            let manifest = pack::manifest::load(&dir).unwrap();
+
+            check_install_collisions(&config, &manifest, &source, &[]).unwrap();
+            sync_resolved_pack(
+                &cairn_platform::services::RealGitClient,
+                &RealFileSystem,
+                &config,
+                manifest,
+                source,
+            )
+            .unwrap();
+
+            let lock = pack_lock::read_lock(&config, "kit").unwrap();
+            assert!(lock.item(PackItemKind::Skill, "kit").is_some(), "{name}");
+            assert!(
+                lock.item(PackItemKind::Service, "probe").is_none(),
+                "{name}"
+            );
+            assert!(
+                !config.join("services/probe/service.yaml").exists(),
+                "{name}"
+            );
+            assert!(
+                lock.notes
+                    .iter()
+                    .any(|note| note.contains(pack::manifest::NON_BUNDLED_SERVICES_NOTE)),
+                "{name}: {:?}",
+                lock.notes
+            );
+        }
     }
 
     #[test]

@@ -3,12 +3,16 @@
 //! resident per machine (`placement: per-machine`); which machines is the
 //! operator's fleet row, `buildSlots.machineServices`.
 //!
-//! Only the declaration is read here. Pack sync materializes the item kinds it
-//! knows into the workspace, and a service is not yet one of them, so the
-//! source of truth is the installed pack's own source tree. Today that tree is
-//! known for a bundled pack (the app's resource directory); a pack installed
-//! from a URL or a local directory lists no services until pack sync carries
-//! them.
+//! Only the declaration is read here, and always from the app's own bundle. Pack
+//! sync also materializes a service into `~/.cairn/services/<id>/`, which gives
+//! it a hash in the lock, a catalog row, and removal and restore like every other
+//! kind; that copy is a mirror and an edit tripwire, never what runs, because the
+//! config directory is writable by agents and a declaration names artifact URLs,
+//! hashes and a command. So the lock decides what is declared: an item recorded
+//! as removed is not, and one whose copy was edited stays declared while its
+//! artifact is refused until it is reset; a per-machine override, which runs
+//! the shipped declaration with the operator's own binary, still may. A pack
+//! installed from a URL or a local directory declares no services.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +21,7 @@ use super::declaration::{
     ServicePackage, ServiceSource, MANIFEST_FILE, PACK_SERVICES_DIR,
 };
 use cairn_config::fleet::MachineServiceKey;
+use cairn_packs::{ContentHash, PackItemKind};
 
 /// One installed pack's service declarations.
 pub(crate) struct PackServiceSource {
@@ -25,19 +30,31 @@ pub(crate) struct PackServiceSource {
     /// `None` when the pack is not installed or its source is not readable
     /// here, which lists nothing: every cell it owned drains.
     root: Option<PathBuf>,
+    /// The workspace and the lock that decide which of the source's services
+    /// are declared. `None` only for a source a test builds from a directory.
+    installed: Option<(PathBuf, cairn_packs::PackLock)>,
 }
 
 impl PackServiceSource {
     /// The pack `pack` as this workspace has it installed.
     pub(crate) fn open(config_dir: &Path, pack: &str) -> Self {
-        let lock = installed_lock(config_dir, pack);
+        match installed_lock(config_dir, pack) {
+            Some(lock) => Self::of_lock(config_dir, lock),
+            None => Self {
+                pack: pack.to_string(),
+                revision: format!("{pack} (not installed)"),
+                root: None,
+                installed: None,
+            },
+        }
+    }
+
+    fn of_lock(config_dir: &Path, lock: cairn_packs::PackLock) -> Self {
         Self {
-            pack: pack.to_string(),
-            revision: lock.as_ref().map_or_else(
-                || format!("{pack} (not installed)"),
-                |lock| format!("{} {}", lock.id, lock.version),
-            ),
-            root: lock.and_then(|lock| source_root(config_dir, &lock)),
+            pack: lock.id.clone(),
+            revision: format!("{} {}", lock.id, lock.version),
+            root: source_root(config_dir, &lock),
+            installed: Some((config_dir.to_path_buf(), lock)),
         }
     }
 
@@ -48,6 +65,7 @@ impl PackServiceSource {
             pack: pack.to_string(),
             revision: format!("{pack} (test)"),
             root: Some(root),
+            installed: None,
         }
     }
 
@@ -56,11 +74,7 @@ impl PackServiceSource {
         cairn_packs::lock::installed_packs(config_dir)
             .into_iter()
             .filter(|lock| !cairn_packs::lock::is_uninstalled(config_dir, &lock.id))
-            .map(|lock| Self {
-                revision: format!("{} {}", lock.id, lock.version),
-                root: source_root(config_dir, &lock),
-                pack: lock.id,
-            })
+            .map(|lock| Self::of_lock(config_dir, lock))
             .collect()
     }
 
@@ -70,6 +84,13 @@ impl PackServiceSource {
 
     fn services_dir(&self) -> Option<PathBuf> {
         self.root.as_ref().map(|root| root.join(PACK_SERVICES_DIR))
+    }
+
+    /// Whether the user took the service `id` out of this pack.
+    fn is_removed(&self, id: &str) -> bool {
+        self.installed
+            .as_ref()
+            .is_some_and(|(_, lock)| lock.is_removed(PackItemKind::Service, id))
     }
 
     fn manifest_bytes(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
@@ -90,6 +111,19 @@ fn installed_lock(config_dir: &Path, pack: &str) -> Option<cairn_packs::PackLock
         return None;
     }
     cairn_packs::lock::read_lock(config_dir, pack)
+}
+
+/// Whether a service's materialized copy has moved from its baseline since the
+/// last sync, which is the same fact the catalog reports as the user's copy.
+fn copy_was_edited(config_dir: &Path, item: &cairn_packs::PackLockItem) -> bool {
+    let (Some(path), Some(_)) = (&item.path, &item.content_hash) else {
+        return false;
+    };
+    match cairn_packs::hash_item_path(item.kind, config_dir, &config_dir.join(path)) {
+        // A missing copy holds no edit; the next sync puts it back.
+        Ok(ContentHash::Missing) | Err(_) => false,
+        Ok(current) => !cairn_packs::matches_baseline(config_dir, item, &current).unwrap_or(false),
+    }
 }
 
 /// Where an installed pack's source tree is on this machine.
@@ -128,6 +162,9 @@ impl ServiceSource for PackServiceSource {
             let Some(bytes) = self.manifest_bytes(&id)? else {
                 continue;
             };
+            if self.is_removed(&id) {
+                continue;
+            }
             let origin = PackageOrigin::pack(&self.pack, &id);
             let declaration = match std::str::from_utf8(&bytes) {
                 Ok(text) => parse_service_manifest_in(&origin, &id, text),
@@ -149,12 +186,27 @@ impl ServiceSource for PackServiceSource {
         let Some(bytes) = self.manifest_bytes(id)? else {
             return Ok(None);
         };
+        if self.is_removed(id) {
+            return Ok(None);
+        }
         package_from_files_in(
             &PackageOrigin::pack(&self.pack, id),
             id,
             vec![(MANIFEST_FILE.to_string(), bytes)],
         )
         .map(Some)
+    }
+
+    fn refusal(&self, id: &str) -> Option<String> {
+        let (config_dir, lock) = self.installed.as_ref()?;
+        let item = lock.item(PackItemKind::Service, id)?;
+        (item.forked || copy_was_edited(config_dir, item)).then(|| {
+            format!(
+                "`{PACK_SERVICES_DIR}/{id}/{MANIFEST_FILE}` was edited; a machine service runs \
+                 only its shipped declaration. Reset it to the pack version, or set a per-machine \
+                 override."
+            )
+        })
     }
 }
 
@@ -164,6 +216,8 @@ pub(crate) struct DeclaredMachineService {
     /// The declaration, or why it does not parse: an invalid declaration is
     /// listed rather than hidden, so status can say why nothing runs.
     pub package: Result<ServicePackage, String>,
+    /// Why the pack's own artifact may not run; see [`ServiceSource::refusal`].
+    pub refusal: Option<String>,
 }
 
 /// Every per-machine service the installed packs declare, in key order.
@@ -196,7 +250,12 @@ fn machine_services_in(source: &PackServiceSource) -> Vec<DeclaredMachineService
                 Ok(_) => return None,
                 Err(error) => Err(error),
             };
-            Some(DeclaredMachineService { key, package })
+            let refusal = source.refusal(&listing.id);
+            Some(DeclaredMachineService {
+                key,
+                package,
+                refusal,
+            })
         })
         .collect()
 }
@@ -288,6 +347,97 @@ mod tests {
         );
         assert_eq!(declared[0].key.to_string(), "axon/axon");
         assert!(source.package("notes").unwrap().is_none());
+    }
+
+    /// `pack` installed from a bundle shipping one service: (home, resources).
+    fn installed_pack(dir: &Path, manifest: &str) -> (PathBuf, PathBuf) {
+        let (home, resources) = (dir.join("home"), dir.join("resources"));
+        let root = resources.join("packs/kit");
+        std::fs::create_dir_all(root.join("services/probe")).unwrap();
+        std::fs::write(
+            root.join("cairn-pack.yaml"),
+            "id: kit\nname: Kit\nversion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("services/probe/service.yaml"), manifest).unwrap();
+        cairn_packs::sync_one_pack(
+            &crate::services::RealGitClient,
+            &crate::services::RealFileSystem,
+            &resources,
+            &home,
+            "kit",
+        )
+        .unwrap();
+        (home, resources)
+    }
+
+    fn key() -> MachineServiceKey {
+        "kit/probe".parse().unwrap()
+    }
+
+    #[test]
+    fn a_service_removed_from_its_pack_is_not_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _) = installed_pack(dir.path(), AXON);
+        assert!(declared_machine_service(&home, &key()).is_some());
+
+        std::fs::remove_dir_all(home.join("services/probe")).unwrap();
+        cairn_packs::note_removed_item(&home, PackItemKind::Service, "probe");
+        assert!(declared_machine_service(&home, &key()).is_none());
+        let source = PackServiceSource::open(&home, "kit");
+        assert!(source.list().unwrap().is_empty());
+        assert!(source.package("probe").unwrap().is_none());
+    }
+
+    /// The copy is a tripwire, not what runs: the shipped declaration stays
+    /// readable, which is what an override runs, and the artifact is refused
+    /// from the moment of the edit rather than from the next sync.
+    #[test]
+    fn an_edited_copy_refuses_the_artifact_and_names_both_ways_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _) = installed_pack(dir.path(), AXON);
+        assert!(declared_machine_service(&home, &key())
+            .unwrap()
+            .refusal
+            .is_none());
+
+        std::fs::write(home.join("services/probe/service.yaml"), "name: Mine\n").unwrap();
+        let declared = declared_machine_service(&home, &key()).unwrap();
+        assert_eq!(
+            declared.refusal.as_deref(),
+            Some(
+                "`services/probe/service.yaml` was edited; a machine service runs only its shipped \
+                 declaration. Reset it to the pack version, or set a per-machine override."
+            )
+        );
+        let package = declared.package.expect("the shipped declaration is intact");
+        assert_eq!(package.declaration.native().unwrap().version, "0.3.6");
+    }
+
+    #[test]
+    fn a_service_from_a_non_bundled_source_is_never_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _) = installed_pack(dir.path(), AXON);
+        let mut lock = cairn_packs::lock::read_lock(&home, "kit").unwrap();
+        lock.source = cairn_packs::PackSource::local("elsewhere".to_string());
+        cairn_packs::lock::write_lock(&crate::services::RealFileSystem, &home, &lock).unwrap();
+        assert!(declared_machine_service(&home, &key()).is_none());
+    }
+
+    #[test]
+    fn a_bundled_declaration_without_a_size_is_listed_with_an_error_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sizeless: String = AXON
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("size:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let (home, _) = installed_pack(dir.path(), &sizeless);
+        let declared = declared_machine_service(&home, &key()).expect("listed with its error");
+        let Err(error) = declared.package else {
+            panic!("a declaration without a size must be refused");
+        };
+        assert!(error.contains("`size`"), "{error}");
     }
 
     #[test]
