@@ -1483,6 +1483,15 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         }
     }
     out.push_str(&render_volume_discards(executor));
+    if let Some(budget) = &health.disk.cell_target_budget {
+        out.push_str(&format!(
+            "- Cell target budget: {} each (half of the volume across {} cell{}, never below {}); every idle pass collects stale incremental sessions, then trims cells still over budget\n",
+            bytes(budget.budget_bytes),
+            budget.cells,
+            if budget.cells == 1 { "" } else { "s" },
+            bytes(budget.floor_bytes),
+        ));
+    }
     out.push('\n');
 
     out.push_str("## Admission\n");
@@ -1771,6 +1780,42 @@ fn render_pool_slots(executor: &ExecutorInspection) -> String {
         }
         if let Some(seed) = &cell.seeded_from {
             out.push_str(&format!("  - Seeded: {}\n", seed.describe()));
+        }
+        if let Some(budget) = &executor.health.disk.cell_target_budget {
+            if let Some(usage) = budget
+                .usages
+                .iter()
+                .find(|usage| usage.project_id == cell.project_id && usage.cell_id == cell.cell_id)
+            {
+                out.push_str(&format!(
+                    "  - Target: {}, budget {}, measured {}; incremental {} in {} universes\n",
+                    bytes(usage.target_bytes),
+                    bytes(budget.budget_bytes),
+                    age(executor
+                        .captured_at_unix_ms
+                        .saturating_sub(usage.at_unix_ms)),
+                    bytes(usage.incremental_bytes),
+                    usage.incremental_universes,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  - Target: not yet measured in an idle pass, budget {}\n",
+                    bytes(budget.budget_bytes),
+                ));
+            }
+            if let Some(trim) = budget
+                .trims
+                .iter()
+                .find(|trim| trim.project_id == cell.project_id && trim.cell_id == cell.cell_id)
+            {
+                out.push_str(&format!(
+                    "  - Last target trim: {} {}, {} stale sessions collected, {} old universes collected\n",
+                    bytes(trim.removed_bytes),
+                    age(executor.captured_at_unix_ms.saturating_sub(trim.at_unix_ms)),
+                    trim.stale_sessions_collected,
+                    trim.incremental_universes_collected,
+                ));
+            }
         }
         if let Some(transition) = occupancy.cell_transitions.iter().find(|transition| {
             transition.project_id == cell.project_id && transition.cell_id == cell.cell_id
@@ -5406,7 +5451,7 @@ fn render_toolchain_probes(capabilities: &ExecutorCapabilities) -> String {
 
 #[cfg(test)]
 mod storage_section_tests {
-    use super::tests::inspection;
+    use super::tests::{cached_slot, inspection};
     use super::{external_cache_breakdown, render_executor};
     use cairn_common::executor_protocol::{
         DiskAccounting, DiskCategoryAccounting, DiskHealthStatus, DiskPathUsage,
@@ -5872,6 +5917,69 @@ mod storage_section_tests {
         assert!(render_executor(&executor).contains(
             "- Volume discards: left to the operating system's filesystem, which discards on its own\n"
         ));
+    }
+
+    /// The budget is on the page, and a cell it trimmed says so on its own line,
+    /// in the shape the machine's operator reads a target in (cairn/5996).
+    #[test]
+    fn the_cell_target_budget_and_a_cells_last_trim_are_on_the_page() {
+        let mut executor = tight_local();
+        let slot = cached_slot();
+        let at = executor.captured_at_unix_ms;
+        executor.health.disk.cell_target_budget =
+            Some(cairn_common::executor_protocol::CellTargetBudgetReport {
+                budget_bytes: 180 << 30,
+                floor_bytes: 96 << 30,
+                cells: 10,
+                usages: vec![cairn_common::executor_protocol::CellTargetUsage {
+                    project_id: slot.project_id.clone(),
+                    cell_id: slot.cell_id.clone(),
+                    target_bytes: 180 << 30,
+                    incremental_bytes: 32 << 30,
+                    incremental_universes: 5,
+                    at_unix_ms: at - 2 * 60 * 1_000,
+                }],
+                trims: vec![cairn_common::executor_protocol::CellTargetTrim {
+                    project_id: slot.project_id.clone(),
+                    cell_id: slot.cell_id.clone(),
+                    removed_bytes: 126 << 30,
+                    stale_sessions_collected: 3,
+                    incremental_universes_collected: 2,
+                    at_unix_ms: at - 3 * 60 * 1_000,
+                }],
+            });
+        executor.occupancy.cells = vec![slot];
+
+        let rendered = render_executor(&executor);
+
+        for expected in [
+            "- Cell target budget: 180.0 GiB each (half of the volume across 10 cells, never below 96.0 GiB)",
+            "  - Target: 180.0 GiB, budget 180.0 GiB, measured 2m ago; incremental 32.0 GiB in 5 universes\n",
+            "  - Last target trim: 126.0 GiB 3m ago, 3 stale sessions collected, 2 old universes collected\n",
+        ] {
+            assert!(rendered.contains(expected), "{expected}\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn target_budget_names_unmeasured_cells_and_does_not_invent_a_trim() {
+        let mut executor = tight_local();
+        executor.occupancy.cells = vec![cached_slot()];
+        executor.health.disk.cell_target_budget =
+            Some(cairn_common::executor_protocol::CellTargetBudgetReport {
+                budget_bytes: 180 << 30,
+                floor_bytes: 96 << 30,
+                cells: 1,
+                usages: Vec::new(),
+                trims: Vec::new(),
+            });
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("Target: not yet measured in an idle pass, budget 180.0 GiB"));
+        assert!(!rendered.contains("Last target trim:"));
+        executor.health.disk.cell_target_budget = None;
+        let older = render_executor(&executor);
+        assert!(!older.contains("Cell target budget:"));
+        assert!(!older.contains("Target: not yet measured"));
     }
 
     /// An unrelieved pass says what it asked for, what each rung gave, what it
@@ -6652,7 +6760,7 @@ mod tests {
         assert_eq!(group_thousands(999), "999");
     }
 
-    fn cached_slot() -> cairn_common::executor_protocol::PersistentCellState {
+    pub(super) fn cached_slot() -> cairn_common::executor_protocol::PersistentCellState {
         serde_json::from_value(serde_json::json!({
             "executorId": "executor-private-uuid", "projectId": "project-private-uuid",
             "slotId": "slot-1", "path": "/private/machine/build-slots/CAIRN/slot-1",

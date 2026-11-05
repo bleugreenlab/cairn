@@ -6825,6 +6825,18 @@ pub struct LearnedResourceEstimate {
 /// variant or field changes, and a runner talking to an older executor gets
 /// nothing wrong.
 ///
+/// cairn/5996 does not move the number. Under disk pressure the executor now
+/// moves the build output of a cell a residency holds, between its holder's
+/// commands, out of the checkout and deletes it, fenced by the residency
+/// operation lock it already took for every batch and operation, and on every
+/// maintenance pass it holds each idle cell's build target to a budget sized
+/// from the volume and the pool. [`DiskHealth`] gains a defaulted
+/// `cellTargetBudget` ([`CellTargetBudgetReport`]) reporting that. A holder's
+/// next batch may build cold; no frame or variant changes. What a runner gets
+/// wrong talking to an older executor: nothing; that executor leaves held
+/// cells' build output alone and its page shows no budget line. An older
+/// runner ignores the field.
+///
 /// cairn/5920 does not move the number. A node's placement default is runner
 /// state: the runner fills a batch's, terminal's or REPL's existing
 /// `executor` selector from it when the call names none, exactly as if the
@@ -11331,6 +11343,18 @@ impl CellOccupancy {
             && self.clone_source.is_none()
     }
 
+    /// Nothing is running in the cell and nothing holds its tree: no command,
+    /// no live resident process, no prior epoch draining, no clone reading it. A held cell
+    /// in this state is between its holder's commands, and a resident process
+    /// whose exit is recorded no longer occupies it.
+    pub fn is_quiet(&self) -> bool {
+        self.command.is_none()
+            && self.command_ownership.is_none()
+            && self.draining.is_none()
+            && self.clone_source.is_none()
+            && self.live_processes().next().is_none()
+    }
+
     /// The deadline of a clone-source hold still in force at `now_unix_ms`.
     pub fn active_clone_source_deadline(&self, now_unix_ms: u64) -> Option<u64> {
         self.clone_source
@@ -13862,13 +13886,60 @@ pub enum VolumeDiscardRefusalKind {
     Failed,
 }
 
-/// Storage governance: the budget, the derived pressure verdict, and the
-/// janitor's state.
+/// The budget each idle cell's build target is held to, and what holding them
+/// to it last took.
 ///
-/// The bytes themselves are measurements and live on
-/// [`MachineTelemetry::volume`] and [`MachineTelemetry::disk_accounting`], where
-/// each carries its own collection time. `status` is derived from the volume
-/// reading, so `Unknown` here means that reading is a gap.
+/// Half the build volume divided by the cells in the pool, never below
+/// `floor_bytes` ([`SLOT_TARGET_MAX_BYTES`] by default). The floor must sit above
+/// a full test build: a smaller budget deletes every completed build
+/// (CAIRN-4349). If the floor exceeds that volume share, pressure reclamation
+/// still governs actual headroom; this is not an aggregate reservation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellTargetBudgetReport {
+    pub budget_bytes: u64,
+    pub floor_bytes: u64,
+    /// The cells in the pool when the budget was last sized.
+    pub cells: usize,
+    /// Last complete target measurement of each cell still in the pool.
+    #[serde(default)]
+    pub usages: Vec<CellTargetUsage>,
+    /// The last trim of each cell still in the pool, oldest first.
+    #[serde(default)]
+    pub trims: Vec<CellTargetTrim>,
+}
+
+/// A target measurement from an idle maintenance pass, not a live estimate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellTargetUsage {
+    pub project_id: String,
+    pub cell_id: String,
+    pub target_bytes: u64,
+    pub incremental_bytes: u64,
+    pub incremental_universes: usize,
+    pub at_unix_ms: u64,
+}
+
+/// What enforcing the budget last took from one cell.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CellTargetTrim {
+    pub project_id: String,
+    pub cell_id: String,
+    pub removed_bytes: u64,
+    /// Incremental sessions rustc would not have read again, among what went.
+    #[serde(default)]
+    pub stale_sessions_collected: usize,
+    /// Old incremental universes removed by the least-recently-used cap.
+    #[serde(default)]
+    pub incremental_universes_collected: usize,
+    pub at_unix_ms: u64,
+}
+
+/// Storage governance: the budget, the derived pressure verdict, and the
+/// janitor's state. The bytes themselves live on [`MachineTelemetry::volume`]
+/// and [`MachineTelemetry::disk_accounting`], with their own collection times.
 ///
 /// `status` and [`Self::reclamation`] are deliberately separate verdicts. The
 /// first is physical — how much room is left on the volume — and the second is
@@ -13910,6 +13981,11 @@ pub struct DiskHealth {
     /// not report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_discards: Option<VolumeDiscardReport>,
+    /// The budget each cell's build target is held to and what enforcing it
+    /// last took, or `None` before the first pass and from a peer that does
+    /// not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_target_budget: Option<CellTargetBudgetReport>,
     /// The admission floor `status` was computed against: `pressured` below it.
     /// Zero from a peer that does not report its thresholds.
     #[serde(default)]
@@ -14205,6 +14281,7 @@ impl Default for DiskHealth {
             reclamation: None,
             accounting_cadence: None,
             volume_discards: None,
+            cell_target_budget: None,
             watermark_bytes: 0,
             critical_free_bytes: 0,
             pressure_free_bytes: 0,
@@ -14247,8 +14324,8 @@ pub struct ExecutorRuntimePolicy {
     /// storage sweep reclaims it.
     #[serde(default = "default_quarantine_forensic_window_ms")]
     pub quarantine_forensic_window_ms: u64,
-    /// Bytes of build output one build cell may hold before a slot-target
-    /// reclaim empties it outright rather than trimming it.
+    /// Floor of the per-cell build-target budget. A roomy build volume sizes
+    /// that budget above this floor, across the materialized pool.
     #[serde(default = "default_slot_target_max_bytes")]
     pub slot_target_max_bytes: u64,
     #[serde(default)]
@@ -14373,10 +14450,12 @@ pub const FREE_DISK_WATERMARK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// so releasing a slot deleted the build that had just finished and the next
 /// lane recompiled it. One night measured 484 GB reclaimed in five hours while
 /// the volume still had 414 GiB free (CAIRN-4349). Reclamation is a disk
-/// pressure tier now, and this number only bounds a cell that has grown past
-/// any plausible build, so it has to sit above a full test build of the largest
+/// pressure tier and an idle budget pass now. This number is the budget's
+/// floor, so it has to sit above a full test build of the largest
 /// project the machine serves. Below that it is not a budget at all — it is a
-/// delete-everything policy with a number attached.
+/// delete-everything policy with a number attached. It is the floor of the
+/// per-cell target budget, which a roomy machine sizes above it from its volume
+/// and pool (cairn/5996).
 pub const SLOT_TARGET_MAX_BYTES: u64 = 96 * 1024 * 1024 * 1024;
 
 /// How long a quarantined build cell is held before the storage sweep reclaims
@@ -21884,6 +21963,7 @@ mod tests {
             reclamation: None,
             accounting_cadence: None,
             volume_discards: None,
+            cell_target_budget: None,
             watermark_bytes: 2,
             critical_free_bytes: 16,
             pressure_free_bytes: 64,
@@ -23644,6 +23724,42 @@ mod tests {
             serde_json::from_value::<HostPressureCondition>(condition_value).unwrap(),
             condition
         );
+    }
+
+    #[test]
+    fn cell_target_budget_round_trips_and_older_health_reports_no_budget() {
+        let mut health = DiskHealth::default();
+        assert!(serde_json::to_value(&health)
+            .unwrap()
+            .get("cellTargetBudget")
+            .is_none());
+        let older: DiskHealth =
+            serde_json::from_value(serde_json::to_value(&health).unwrap()).unwrap();
+        assert_eq!(older.cell_target_budget, None);
+        health.cell_target_budget = Some(CellTargetBudgetReport {
+            budget_bytes: 180,
+            floor_bytes: 96,
+            cells: 10,
+            usages: vec![CellTargetUsage {
+                project_id: "p".into(),
+                cell_id: "slot-1".into(),
+                target_bytes: 180,
+                incremental_bytes: 32,
+                incremental_universes: 5,
+                at_unix_ms: 10,
+            }],
+            trims: vec![CellTargetTrim {
+                project_id: "p".into(),
+                cell_id: "slot-1".into(),
+                removed_bytes: 126,
+                stale_sessions_collected: 3,
+                incremental_universes_collected: 2,
+                at_unix_ms: 9,
+            }],
+        });
+        let round_trip: DiskHealth =
+            serde_json::from_value(serde_json::to_value(&health).unwrap()).unwrap();
+        assert_eq!(round_trip.cell_target_budget, health.cell_target_budget);
     }
 
     #[test]
