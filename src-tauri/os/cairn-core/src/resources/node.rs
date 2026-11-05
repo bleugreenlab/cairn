@@ -1046,6 +1046,7 @@ fn summarize_questions_json(questions_json: &str) -> String {
 }
 
 struct NodeQuestionRow {
+    prompt_id: String,
     segment: String,
     questions_json: String,
     response: Option<String>,
@@ -1053,6 +1054,8 @@ struct NodeQuestionRow {
     resolution: Option<cairn_db::models::ResolutionReceipt>,
     /// `Some` when withdrawn, holding the stored cause if there is one.
     withdrawn: Option<Option<String>>,
+    /// Why the answer did not resume the job, when it did not.
+    resume_error: Option<String>,
 }
 
 impl NodeQuestionRow {
@@ -1080,7 +1083,7 @@ async fn load_node_questions(
             SELECT p.uri_segment, p.questions, p.response, p.answered_at,
                    p.resolution_id, p.resolution_surface, p.resolution_provider,
                    p.resolution_conversation, p.resolution_actor, p.created_at,
-                   p.withdrawn_at, p.withdrawn_cause
+                   p.withdrawn_at, p.withdrawn_cause, p.resume_error, p.id
             FROM prompts p
             JOIN runs r ON p.run_id = r.id
             WHERE r.job_id = ?1
@@ -1102,6 +1105,7 @@ async fn load_node_questions(
             };
             fallback_ordinal += 1;
             questions.push(NodeQuestionRow {
+                prompt_id: row.text(13).unwrap_or_default(),
                 segment: segment.unwrap_or_else(|| format!("q-{}", fallback_ordinal)),
                 questions_json,
                 response,
@@ -1121,6 +1125,7 @@ async fn load_node_questions(
                     .ok()
                     .flatten()
                     .map(|_| row.opt_text(11).ok().flatten()),
+                resume_error: row.opt_text(12).ok().flatten(),
             });
         }
     }
@@ -1168,6 +1173,9 @@ pub(super) async fn read_node_questions(
             }
             if let Some(receipt) = &question.resolution {
                 output.push_str(&format!("  {}\n", format_resolution_receipt(receipt)));
+            }
+            if let Some(line) = resume_refusal_line(question.resume_error.as_deref()) {
+                output.push_str(&format!("  \u{26a0} {line}\n"));
             }
         }
         output.push('\n');
@@ -1229,6 +1237,9 @@ pub(super) async fn read_node_question(
         )),
         None => output.push_str("## Response\n\n(awaiting answer)\n\n"),
     }
+    if let Some(line) = resume_refusal_line(question.resume_error.as_deref()) {
+        output.push_str(&format!("## Resume\n\n{line}\n\n"));
+    }
 
     output
 }
@@ -1239,6 +1250,7 @@ pub(super) async fn read_node_question(
 /// first, `{"state":"pending"}` (the caller reads again). The script-facing
 /// await behind the harness `ask()`, as [`wait_for_task_artifact`] is behind
 /// `agent()`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn wait_for_question(
     orch: &crate::orchestrator::Orchestrator,
     db: &LocalDb,
@@ -1247,6 +1259,7 @@ pub(super) async fn wait_for_question(
     exec_seq: i32,
     node_name: &str,
     segment: &str,
+    reader_run_id: Option<&str>,
 ) -> String {
     // Answers are broadcast; a withdrawal is not, so the wait also re-reads
     // on a short tick.
@@ -1280,6 +1293,17 @@ pub(super) async fn wait_for_question(
                 .to_string()
             }
             state => {
+                if let Some(run_id) = reader_run_id {
+                    if let Err(error) = crate::messages::queued::take_question_answer_for_reader(
+                        db,
+                        run_id,
+                        &question.prompt_id,
+                    )
+                    .await
+                    {
+                        log::warn!("{error}; the answer may also arrive at a tool boundary");
+                    }
+                }
                 let response = question.response.unwrap_or_default();
                 let questions: Vec<crate::models::question::Question> =
                     serde_json::from_str(&question.questions_json).unwrap_or_default();
@@ -1324,13 +1348,11 @@ struct NodePermissionRow {
     resume_error: Option<String>,
 }
 
-/// The line an answered permission carries when its answer was recorded but the
-/// job could not continue, so the refusal is visible where the answer is.
-fn resume_refusal_line(request: &NodePermissionRow) -> Option<String> {
-    request
-        .resume_error
-        .as_deref()
-        .map(|reason| format!("answered, but the resume was refused: {reason}"))
+/// The line an answered permission or question carries when its answer was
+/// recorded but the job could not continue, so the refusal is visible where the
+/// answer is.
+fn resume_refusal_line(resume_error: Option<&str>) -> Option<String> {
+    resume_error.map(|reason| format!("answered, but the resume was refused: {reason}"))
 }
 
 fn format_resolution_receipt(receipt: &cairn_db::models::ResolutionReceipt) -> String {
@@ -1467,7 +1489,7 @@ pub(super) async fn read_node_permissions(
             if let Some(receipt) = &request.resolution {
                 output.push_str(&format!("  {}\n", format_resolution_receipt(receipt)));
             }
-            if let Some(line) = resume_refusal_line(request) {
+            if let Some(line) = resume_refusal_line(request.resume_error.as_deref()) {
                 output.push_str(&format!("  \u{26a0} {line}\n"));
             }
         }
@@ -1502,7 +1524,7 @@ pub(super) async fn read_node_permission(
     output.push_str(&format!("Status: {}\n\n", request.status));
     output.push_str(&format!("## Request\n\n{}\n\n", request.summary));
     push_permission_resolution(&mut output, &request.status, request.response.as_deref());
-    if let Some(line) = resume_refusal_line(&request) {
+    if let Some(line) = resume_refusal_line(request.resume_error.as_deref()) {
         output.push_str(&format!("## Resume\n\n{line}\n\n"));
     }
 
@@ -1596,7 +1618,7 @@ pub(super) async fn read_task_permissions(
                     permission_status_text(&request.status, request.response.as_deref())
                 ));
             }
-            if let Some(line) = resume_refusal_line(request) {
+            if let Some(line) = resume_refusal_line(request.resume_error.as_deref()) {
                 output.push_str(&format!("  \u{26a0} {line}\n"));
             }
         }
@@ -1640,7 +1662,7 @@ pub(super) async fn read_task_permission(
     output.push_str(&format!("Status: {}\n\n", request.status));
     output.push_str(&format!("## Request\n\n{}\n\n", request.summary));
     push_permission_resolution(&mut output, &request.status, request.response.as_deref());
-    if let Some(line) = resume_refusal_line(&request) {
+    if let Some(line) = resume_refusal_line(request.resume_error.as_deref()) {
         output.push_str(&format!("## Resume\n\n{line}\n\n"));
     }
 
@@ -3534,7 +3556,10 @@ async fn job_event_row(
 
 #[cfg(test)]
 mod task_permission_tests {
-    use super::{read_node_permission, read_task_permission, read_task_permissions};
+    use super::{
+        read_node_permission, read_node_question, read_node_questions, read_task_permission,
+        read_task_permissions,
+    };
     use crate::storage::LocalDb;
 
     async fn test_db() -> LocalDb {
@@ -3609,6 +3634,32 @@ mod task_permission_tests {
         let single = read_task_permission(&db, "prj", 2, 1, "builder", "review", "perm-1").await;
         assert!(
             single.contains("## Resume") && single.contains("session closed"),
+            "{single}"
+        );
+    }
+
+    /// The same for a question: answered, and the refused resume beside it.
+    #[tokio::test]
+    async fn a_refused_resume_is_rendered_on_the_question() {
+        let db = test_db().await;
+        seed(&db).await;
+        for sql in [
+            "INSERT INTO runs (id, job_id, issue_id, created_at, updated_at) VALUES ('run-parent','j-parent','i',1,1)",
+            "INSERT INTO prompts (id, run_id, job_id, questions, response, created_at, answered_at, uri_segment, resume_error) VALUES ('p1','run-parent','j-parent','[{\"question\":\"Which?\",\"options\":[]}]','the first',1,2,'q-1','session closed')",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+
+        let list = read_node_questions(&db, "prj", 2, 1, "builder").await;
+        assert!(
+            list.contains("answered, but the resume was refused: session closed"),
+            "{list}"
+        );
+        let single = read_node_question(&db, "prj", 2, 1, "builder", "q-1").await;
+        assert!(
+            single.contains("Status: answered")
+                && single.contains("## Resume")
+                && single.contains("session closed"),
             "{single}"
         );
     }

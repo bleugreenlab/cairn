@@ -173,15 +173,19 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
         conversation: Some("test-conversation".to_string()),
         actor: Some("test-actor".to_string()),
     };
-    let outcome = answer_prompt_id(&orch, "prompt-1", answers.clone(), provenance).await;
-    // This fixture has no launchable execution. Dispatch may fail only after the
-    // real answer producer has durably written its synthetic transcript event.
-    if let Err(error) = outcome {
-        assert!(
-            error.starts_with("Failed to resume prompt response:"),
-            "{error}"
-        );
-    }
+    let outcome = answer_prompt_id(&orch, "prompt-1", answers.clone(), provenance)
+        .await
+        .expect("a recorded answer is applied whatever its resume does");
+    // This fixture's `active` session refuses every continuation. The refusal
+    // is reported beside the answer, after the producer has durably written
+    // its synthetic transcript event.
+    assert!(
+        matches!(
+            outcome.continuation,
+            Some(cairn_core::internal::mcp::handlers::host_wait_successor::HostWaitContinuation::Refused { .. })
+        ),
+        "{outcome:?}"
+    );
 
     let data = common::scalar_text_by_id(
         &orch.db.local,

@@ -3,12 +3,10 @@
 //! Handles: ask_user
 
 use crate::agent_process::process::GoalPauseOwner;
-use crate::execution::jobs::GoalReactivation;
 use crate::mcp::types::{AskUserPayload, McpCallbackRequest, Question};
 use crate::models::question::{PromptAnswers, QuestionAnswer};
 
-use crate::execution::jobs::{continue_job_impl, ResumeContext};
-use crate::models::{TurnStartReason, TurnState, TurnYieldReason};
+use crate::models::TurnYieldReason;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, RowExt};
 use cairn_common::ids;
@@ -16,9 +14,13 @@ use cairn_db::turso::params;
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::host_wait_successor::{
+    continue_into_host_wait_successor, emit_successor_turn_events, ensure_host_wait_successor_conn,
+    record_resume_error, start_host_wait_successor, HostWaitAnswer, HostWaitContinuation,
+    HostWaitKind, HostWaitSuccessor,
+};
 use super::permission::{
-    emit_successor_turn_events, ensure_and_start_successor_turn, issue_id_for_run,
-    recompute_issue_status_for_issue, yield_turn_for_host, WithdrawalCause,
+    issue_id_for_run, recompute_issue_status_for_issue, yield_turn_for_host, WithdrawalCause,
 };
 
 /// What the agent reads for a question that outlived the inline budget.
@@ -167,8 +169,10 @@ async fn ask_questions_owned(
         let questions_json = serde_json::to_string(&payload.questions).unwrap_or_default();
         // Originating `write` tool_use id. Persisted so the slow-path (>45s)
         // resume can attach a synthetic tool_result to the same Question call
-        // the fast path resolves inline.
-        let request_tool_use_id = if mcp_wait_id.is_some() {
+        // the fast path resolves inline. A non-blocking ask has already
+        // returned its own result, so its answer answers no open call: a stored
+        // `tool_use_id` is exactly the fact that one does.
+        let request_tool_use_id = if mcp_wait_id.is_some() || background {
             None
         } else {
             tool_use_id
@@ -232,9 +236,9 @@ async fn ask_questions_owned(
                         INSERT INTO prompts (
                             id, run_id, job_id, questions, response,
                             created_at, answered_at, turn_id, uri_segment, tool_use_id,
-                            mcp_wait_id
+                            mcp_wait_id, background
                         )
-                        SELECT ?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9
+                        SELECT ?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, ?10
                         WHERE ?9 IS NULL OR EXISTS (
                             SELECT 1 FROM agent_waits
                             WHERE id = ?9 AND state IN ('pending', 'resolving')
@@ -249,7 +253,8 @@ async fn ask_questions_owned(
                                 current_turn_id.as_deref(),
                                 uri_segment.as_str(),
                                 request_tool_use_id.as_deref(),
-                                mcp_wait_id.as_deref()
+                                mcp_wait_id.as_deref(),
+                                i64::from(background)
                             ],
                         )
                         .await?;
@@ -432,10 +437,16 @@ async fn ask_questions_owned(
         return QuestionsOutcome {
             text: match &question_uri {
                 Some(uri) => format!(
-                    "Question '{}' recorded; the answer will be available at {}",
+                    "Question '{}' recorded; keep working. Its answer reaches you when it is \
+                     given, at your next tool call or by resuming you if your turn has ended, \
+                     and stays readable at {}",
                     uri_segment, uri
                 ),
-                None => format!("Question '{}' recorded.", uri_segment),
+                None => format!(
+                    "Question '{}' recorded; keep working. Its answer reaches you when it is \
+                     given, at your next tool call or by resuming you if your turn has ended.",
+                    uri_segment
+                ),
             },
             answers: None,
             uri: question_uri,
@@ -490,13 +501,15 @@ async fn ask_questions_owned(
 
     match result {
         Ok(Ok(answered)) => {
-            // Create successor turn for the prompt response and transition run back to Running
+            // The answer minted its `prompt_response` successor (pending) before
+            // it broadcast; the inline waiter is the one owner that starts it,
+            // because this process continues the provider turn.
             if let Some(ref pred_turn_id) = current_turn_id {
-                match ensure_and_start_successor_turn(
+                match start_host_wait_successor(
                     &owning_db,
                     &run_id,
                     pred_turn_id,
-                    TurnStartReason::PromptResponse,
+                    HostWaitKind::Question,
                 )
                 .await
                 {
@@ -577,6 +590,11 @@ pub struct PromptAnswerOutcome {
     /// answer surface shows instead of an acknowledgement. Nothing was
     /// recorded, replayed, or resumed.
     pub withdrawn: Option<String>,
+    /// How the answer reached the asking job, reported apart from the answer
+    /// itself: the answer is recorded whatever this says. `None` when no
+    /// delivery was needed -- an inline waiter took it, a durable MCP wait owns
+    /// it, or it was a duplicate.
+    pub continuation: Option<HostWaitContinuation>,
 }
 
 impl PromptAnswerOutcome {
@@ -585,6 +603,31 @@ impl PromptAnswerOutcome {
             duplicate: false,
             response: String::new(),
             withdrawn: Some(withdrawn_question_notice(cause)),
+            continuation: None,
+        }
+    }
+
+    /// What an answer surface says about a recorded, non-duplicate answer to
+    /// question `segment`. The answer is always reported as applied; how it
+    /// reached the job is said beside it, never in place of it.
+    pub fn answered_summary(&self, segment: &str) -> String {
+        match &self.continuation {
+            None | Some(HostWaitContinuation::Driven) => format!("Answered question {segment}"),
+            Some(HostWaitContinuation::Queued) => format!(
+                "Answered question {segment}; the job was busy, so the answer was queued for \
+                 its next turn"
+            ),
+            Some(HostWaitContinuation::AtNextToolBoundary) => format!(
+                "Answered question {segment}; the agent is mid-turn and receives the answer at \
+                 its next tool call"
+            ),
+            Some(HostWaitContinuation::AfterCurrentWait) => format!(
+                "Answered question {segment}; the agent is waiting on something else and \
+                 receives the answer when it continues"
+            ),
+            Some(HostWaitContinuation::Refused { reason }) => format!(
+                "Answered question {segment} (recorded), but the job could not continue: {reason}"
+            ),
         }
     }
 }
@@ -670,7 +713,7 @@ async fn prompt_withdrawal_conn(
 
 /// What recording an answer did.
 enum PromptRecord {
-    Recorded(PromptResume),
+    Recorded(Box<PromptResume>),
     /// The question was withdrawn first; nothing was written.
     Withdrawn(Option<WithdrawalCause>),
 }
@@ -681,11 +724,21 @@ struct PromptResume {
     mcp_wait_id: Option<String>,
     session_id: Option<String>,
     predecessor_turn_id: Option<String>,
-    successor_turn_id: Option<String>,
+    /// What the answer did to the asking turn's lineage, decided in the
+    /// transaction that recorded it. `None` for a duplicate, an MCP-owned
+    /// question, a question with no asking turn, or a non-blocking question whose
+    /// turn another wait holds.
+    successor: Option<HostWaitSuccessor>,
     job_id: Option<String>,
     issue_id: Option<String>,
+    /// Set only for a blocking ask: the call the answer is the result of.
     tool_use_id: Option<String>,
+    uri_segment: Option<String>,
     duplicate: bool,
+    /// The ask did not suspend its turn, so no inline waiter is ever this answer's.
+    background: bool,
+    /// The answer committed with a queued row for the asker, delivered this way.
+    boundary_delivery: Option<crate::messages::queued::Delivery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1089,6 +1142,7 @@ async fn answer_prompt_id_impl(
                 duplicate: true,
                 response: winning_response,
                 withdrawn: None,
+                continuation: None,
             });
         };
         // A legacy winner still to run was typed text, so the typed-input
@@ -1157,10 +1211,21 @@ async fn answer_prompt_id_impl(
         .write(|conn| {
             let prompt_id = prompt_id_owned.clone();
             let answers = answered.answers.clone();
+            let rendered = answered.rendered.clone();
             let provenance = provenance.clone();
+            let process_state = orch.process_state.clone();
             Box::pin(
                 async move {
-                    let result = match record_prompt_response_conn(conn, &prompt_id, &answers, now).await? {
+                    let result = match record_prompt_response_conn(
+                        conn,
+                        &prompt_id,
+                        &answers,
+                        &rendered,
+                        now,
+                        &process_state,
+                    )
+                    .await?
+                    {
                         PromptRecord::Recorded(result) => result,
                         withdrawn @ PromptRecord::Withdrawn(_) => return Ok(withdrawn),
                     };
@@ -1182,6 +1247,17 @@ async fn answer_prompt_id_impl(
         PromptRecord::Withdrawn(cause) => return Ok(PromptAnswerOutcome::withdrawn(cause)),
     };
 
+    // Read after the commit and immediately before the broadcast, so an inline
+    // budget expiring during the commit cannot leave an answer that believes a
+    // waiter took it. Read after the send instead, the waiter's own wakeup would
+    // look like a durable suspend and the answer would be resumed a second time.
+    let inline_waiter_was_present = question_has_inline_waiter(
+        &orch.process_state,
+        resume.background,
+        &resume.run_id,
+        resume.predecessor_turn_id.as_deref(),
+    );
+
     if !resume.duplicate {
         let _ = orch
             .prompt_responses
@@ -1192,18 +1268,6 @@ async fn answer_prompt_id_impl(
         // Answer recorded — attention likely cleared. Re-read and wake watch.
         orch.wake_for_issue(issue_id).await;
     }
-
-    let should_resume = !resume.duplicate
-        && resume.successor_turn_id.is_some()
-        && !orch
-            .process_state
-            .is_awaiting_host(&resume.run_id, resume.predecessor_turn_id.as_deref());
-
-    let job_id = if should_resume {
-        resume.job_id.clone()
-    } else {
-        None
-    };
 
     let changed_issue = match resume.issue_id.as_deref() {
         Some(issue_id) => crate::issues::crud::get(&owning_db, issue_id)
@@ -1217,8 +1281,12 @@ async fn answer_prompt_id_impl(
     let prompt_change =
         crate::notify::prompt_db_change_for_id(&owning_db, &prompt_id_owned, "update").await;
     let _ = orch.services.emitter.emit("db-change", prompt_change);
-    if let Some(turn_id) = resume.successor_turn_id.as_deref() {
-        let change = crate::notify::turn_db_change_for_id(&owning_db, turn_id, "update").await;
+    if let Some(HostWaitSuccessor::Successor {
+        turn_id, inserted, ..
+    }) = resume.successor.as_ref()
+    {
+        let action = if *inserted { "insert" } else { "update" };
+        let change = crate::notify::turn_db_change_for_id(&owning_db, turn_id, action).await;
         let _ = orch.services.emitter.emit("db-change", change);
     }
     if let Some(issue) = changed_issue.as_ref() {
@@ -1239,13 +1307,153 @@ async fn answer_prompt_id_impl(
             duplicate: resume.duplicate,
             response,
             withdrawn: None,
+            continuation: None,
         });
     }
 
-    if let Some(job_id) = job_id {
-        let suppress_user_event = if let (Some(tool_use_id), Some(session_id)) =
-            (resume.tool_use_id.as_deref(), resume.session_id.as_deref())
+    // A row committed with the answer only needs announcing.
+    //
+    // Slow path otherwise: no inline waiter was present before the answer was
+    // broadcast, so the asking turn has ended and the job is continued from the
+    // stored answer. The answer is committed either way, so nothing below fails it.
+    if let Some(delivery) = resume.boundary_delivery {
+        announce_queued_answer(orch, &owning_db, resume.job_id.as_deref(), delivery).await;
+    }
+    let continuation = match (resume.boundary_delivery, resume.successor.as_ref()) {
+        (Some(crate::messages::queued::Delivery::Passive), _) => {
+            Some(HostWaitContinuation::AfterCurrentWait)
+        }
+        (Some(_), _) => Some(HostWaitContinuation::AtNextToolBoundary),
+        (None, Some(successor))
+            if !resume.duplicate && !inline_waiter_was_present && successor.resumes_job() =>
         {
+            Some(
+                resume_answered_question(
+                    orch,
+                    &owning_db,
+                    prompt_id,
+                    &resume,
+                    successor,
+                    &answered,
+                    &provenance,
+                )
+                .await,
+            )
+        }
+        _ => None,
+    };
+
+    Ok(PromptAnswerOutcome {
+        duplicate: resume.duplicate,
+        response,
+        withdrawn: None,
+        continuation,
+    })
+}
+
+/// An answer as the agent reads it when it is not the result of a waiting call.
+/// Unframed it would read as a stray user turn.
+fn framed_answer(segment: Option<&str>, rendered: &str) -> String {
+    match segment {
+        Some(segment) => format!("Your question {segment} was answered:\n\n{rendered}"),
+        None => format!("Your question was answered:\n\n{rendered}"),
+    }
+}
+
+/// Whether an inline waiter is this question's own. `is_awaiting_host` says only
+/// that some wait on the turn has one, and a non-blocking ask never does: a
+/// process it finds in `AwaitingHost` is waiting on a permission or a sibling
+/// question, and nothing there will take this answer.
+fn question_has_inline_waiter(
+    process_state: &crate::agent_process::process::AgentProcessState,
+    background: bool,
+    run_id: &str,
+    turn_id: Option<&str>,
+) -> bool {
+    !background && process_state.is_awaiting_host(run_id, turn_id)
+}
+
+/// Whether another wait holds this turn and has not answered yet. A non-blocking
+/// ask never yields its turn, so a yielded one was yielded by something else; a
+/// successor means that something has already moved on.
+async fn turn_held_by_another_wait_conn(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM turns t WHERE t.id = ?1 AND t.state = 'yielded'
+             AND NOT EXISTS (SELECT 1 FROM turns s WHERE s.predecessor_id = t.id)",
+            params![turn_id],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
+/// Tell the surfaces watching a job that its answer row committed. A waking row's
+/// nudge is for a turn that ended since the answer classified it as open: a live
+/// turn ignores it and takes the row at its next boundary, while an idle job is
+/// resumed and claims the row. It runs off this task because a resume may launch.
+async fn announce_queued_answer(
+    orch: &Orchestrator,
+    owning_db: &crate::storage::LocalDb,
+    job_id: Option<&str>,
+    delivery: crate::messages::queued::Delivery,
+) {
+    let Some(job_id) = job_id else {
+        return;
+    };
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "queued_messages", "action": "update"}),
+    );
+    if let Err(error) =
+        crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(owning_db, job_id)
+            .await
+    {
+        log::warn!("catch-up push creation for a question's answer failed: {error}");
+    }
+    if !delivery.wakes_idle() {
+        return;
+    }
+    let orch = orch.clone();
+    let job_id = job_id.to_string();
+    std::thread::spawn(move || {
+        if let Err(error) =
+            crate::messages::delivery::nudge_job_for_urgency(&orch, &job_id, delivery)
+        {
+            log::warn!("answer delivery nudge for job {job_id} failed: {error}");
+        }
+    });
+}
+
+/// Deliver an answer to a job whose asking turn has ended: into the answer's
+/// own `prompt_response` successor when it has one, or through the job's queue
+/// when the job is busy or something else (a steer, a follow-up) already
+/// continued the asking turn.
+///
+/// A blocking ask's answer is the result of the call still waiting on it, so it
+/// is stored in place as that call's synthetic `tool_result` and drives the
+/// successor as the rendered answer alone. Anything else reaches the agent as a
+/// message, framed so it does not read as a stray user turn.
+async fn resume_answered_question(
+    orch: &Orchestrator,
+    owning_db: &crate::storage::LocalDb,
+    prompt_id: &str,
+    resume: &PromptResume,
+    successor: &HostWaitSuccessor,
+    answered: &AnsweredPrompt,
+    provenance: &crate::turns::queries::ResolutionProvenance,
+) -> HostWaitContinuation {
+    let Some(job_id) = resume.job_id.as_deref() else {
+        return HostWaitContinuation::Refused {
+            reason: "the question's run has no owning job".to_string(),
+        };
+    };
+    let framed = framed_answer(resume.uri_segment.as_deref(), &answered.rendered);
+    let answers_open_tool_call = resume.tool_use_id.is_some();
+    let suppress_user_event = match (resume.tool_use_id.as_deref(), resume.session_id.as_deref()) {
+        (Some(tool_use_id), Some(session_id)) => {
             let now = chrono::Utc::now().timestamp() as i32;
             let receipt = cairn_db::models::ResolutionReceipt {
                 id: Some(provenance.id.clone()),
@@ -1255,7 +1463,7 @@ async fn answer_prompt_id_impl(
                 actor: provenance.actor.clone(),
                 resolved_at: now as i64 * 1000,
             };
-            if let Err(error) = crate::execution::jobs::store_blocking_write_result_with_resolution(
+            match crate::execution::jobs::store_blocking_write_result_with_resolution(
                 orch,
                 &resume.run_id,
                 session_id,
@@ -1268,41 +1476,59 @@ async fn answer_prompt_id_impl(
                 resume.predecessor_turn_id.as_deref(),
                 Some(&receipt),
             ) {
-                // The prompt answer and successor are already durable. Dispatching
-                // with a visible user event keeps retry semantics intact, while
-                // OpenRouter history normalization supplies the missing result.
-                log::warn!(
-                    "Failed to persist synthetic prompt tool_result for run {} and call {}: {}. Resuming with a user event",
-                    resume.run_id,
-                    tool_use_id,
-                    error
-                );
-                false
-            } else {
-                true
+                Ok(()) => true,
+                Err(error) => {
+                    // The answer and successor are already durable. Continuing
+                    // with a visible user event keeps the answer in front of
+                    // the agent, and OpenRouter history normalization supplies
+                    // the missing result.
+                    log::warn!(
+                        "Failed to persist synthetic prompt tool_result for run {} and call {}: \
+                         {}. Resuming with a user event",
+                        resume.run_id,
+                        tool_use_id,
+                        error
+                    );
+                    false
+                }
             }
-        } else {
-            false
-        };
+        }
+        _ => false,
+    };
 
-        let prompt_resume = ResumeContext {
-            suppress_user_event,
-            goal_reactivation: Some(GoalReactivation::OwnedConditionResolved(
-                GoalPauseOwner::UserInput {
-                    request_id: prompt_id.to_string(),
-                },
-            )),
-            ..Default::default()
-        };
-        continue_job_impl(orch, &job_id, Some(&response), None, Some(prompt_resume))
-            .map_err(|e| format!("Failed to resume prompt response: {}", e))?;
+    match successor {
+        HostWaitSuccessor::Successor { turn_id, .. } => {
+            let driven = if answers_open_tool_call {
+                answered.rendered.clone()
+            } else {
+                framed.clone()
+            };
+            let wait = HostWaitAnswer {
+                kind: HostWaitKind::Question,
+                id: prompt_id.to_string(),
+                suppress_user_event,
+                answers_open_tool_call,
+                queued_content: Some(framed),
+            };
+            continue_into_host_wait_successor(orch, owning_db, &wait, job_id, turn_id, &driven)
+                .await
+        }
+        _ => match crate::execution::jobs::continue_job_or_enqueue(
+            orch,
+            job_id,
+            Some(&framed),
+            None,
+            Some(prompt_id),
+        ) {
+            Ok(_) => HostWaitContinuation::Queued,
+            Err(error) => {
+                let reason = format!("the job was busy and queueing the answer failed: {error}");
+                record_resume_error(orch, owning_db, HostWaitKind::Question, prompt_id, &reason)
+                    .await;
+                HostWaitContinuation::Refused { reason }
+            }
+        },
     }
-
-    Ok(PromptAnswerOutcome {
-        duplicate: resume.duplicate,
-        response,
-        withdrawn: None,
-    })
 }
 
 async fn lookup_prompt_for_node_question(
@@ -1382,7 +1608,9 @@ async fn record_prompt_response_conn(
     conn: &cairn_db::turso::Connection,
     prompt_id: &str,
     answers: &PromptAnswers,
+    rendered: &str,
     answered_at: i64,
+    process_state: &crate::agent_process::process::AgentProcessState,
 ) -> DbResult<PromptRecord> {
     // First, before an MCP continuation can claim the answer: a withdrawn
     // question takes no answer from any path.
@@ -1401,7 +1629,9 @@ async fn record_prompt_response_conn(
             "
             SELECT p.run_id, r.issue_id, p.turn_id, r.job_id, r.session_id,
                    p.tool_use_id,
-                   CASE WHEN p.response IS NULL THEN 0 ELSE 1 END
+                   CASE WHEN p.response IS NULL THEN 0 ELSE 1 END,
+                   p.uri_segment,
+                   p.background
             FROM prompts p
             JOIN runs r ON p.run_id = r.id
             WHERE p.id = ?1
@@ -1421,6 +1651,8 @@ async fn record_prompt_response_conn(
     let session_id = row.opt_text(4)?;
     let tool_use_id = row.opt_text(5)?;
     let already_answered = row.i64(6)? != 0;
+    let uri_segment = row.opt_text(7)?;
+    let background = row.i64(8)? != 0;
     let (mcp_wait_id, mcp_duplicate) = match mcp_claim {
         Some(super::mcp_continuation::AnswerClaim::Claimed { wait_id, .. }) => {
             (Some(wait_id), false)
@@ -1448,131 +1680,91 @@ async fn record_prompt_response_conn(
             == 0
     };
 
-    let successor_turn_id = if mcp_wait_id.is_none() && !duplicate {
-        if let (Some(pred_turn_id), Some(job_id), Some(session_id)) = (
-            predecessor_turn_id.as_deref(),
-            job_id.as_deref(),
-            session_id.as_deref(),
-        ) {
-            Some(ensure_prompt_successor_turn_conn(conn, session_id, job_id, pred_turn_id).await?)
-        } else {
-            None
+    // The answer and its successor commit together: a reader never sees an
+    // answered question whose continuation is undecided. The minter classifies
+    // rather than fails, so an open asking turn, a busy job, or a steer that
+    // already continued the turn can never roll the answer back.
+    let answer_owns_delivery = mcp_wait_id.is_none() && !duplicate;
+    // A non-blocking question is no part of what holds its turn, so it never
+    // mints on a turn another wait is holding: that wait's answer would then find
+    // a stranger's successor and lose its own continuation.
+    let held_by_another_wait = match predecessor_turn_id.as_deref() {
+        Some(predecessor) if answer_owns_delivery && background => {
+            turn_held_by_another_wait_conn(conn, predecessor).await?
         }
-    } else {
-        None
+        _ => false,
     };
+    let successor = match predecessor_turn_id.as_deref() {
+        Some(predecessor) if answer_owns_delivery && !held_by_another_wait => {
+            match ensure_host_wait_successor_conn(
+                conn,
+                &run_id,
+                predecessor,
+                HostWaitKind::Question,
+            )
+            .await?
+            {
+                // A sibling blocking question's successor is that answer's to
+                // start, and its inline waiter may be about to.
+                HostWaitSuccessor::Successor {
+                    turn_id,
+                    inserted: false,
+                    ..
+                } if background => Some(HostWaitSuccessor::ForeignSuccessor { turn_id }),
+                successor => Some(successor),
+            }
+        }
+        _ => None,
+    };
+
+    // When nothing resumes and no waiter takes the answer, the asker hears it from
+    // a queued row, committed here beside the answer so that anyone reading the
+    // answer can also see the delivery.
+    use crate::messages::queued::Delivery;
+    let boundary_delivery = match (&successor, job_id.as_deref()) {
+        (None, Some(_)) if held_by_another_wait => Some(Delivery::Passive),
+        (Some(HostWaitSuccessor::ProviderTurnOpen), Some(_))
+            if !question_has_inline_waiter(
+                process_state,
+                background,
+                &run_id,
+                predecessor_turn_id.as_deref(),
+            ) =>
+        {
+            Some(Delivery::Steer)
+        }
+        _ => None,
+    };
+    if let (Some(delivery), Some(job_id)) = (boundary_delivery, job_id.as_deref()) {
+        crate::messages::queued::insert_question_answer_conn(
+            conn,
+            prompt_id,
+            job_id,
+            &framed_answer(uri_segment.as_deref(), rendered),
+            delivery,
+            answered_at,
+        )
+        .await?;
+    }
 
     if let Some(issue_id) = issue_id.as_deref() {
         crate::transitions::outcome::recompute_issue_status_conn(conn, issue_id).await?;
     }
 
-    Ok(PromptRecord::Recorded(PromptResume {
+    Ok(PromptRecord::Recorded(Box::new(PromptResume {
         run_id,
         mcp_wait_id,
         session_id,
         predecessor_turn_id,
-        successor_turn_id,
+        successor,
         job_id,
         issue_id,
         tool_use_id,
+        uri_segment,
         duplicate,
-    }))
-}
-
-async fn ensure_prompt_successor_turn_conn(
-    conn: &cairn_db::turso::Connection,
-    session_id: &str,
-    job_id: &str,
-    predecessor_id: &str,
-) -> DbResult<String> {
-    if let Some(existing) = get_successor_turn_id_conn(conn, predecessor_id).await? {
-        return Ok(existing);
-    }
-
-    let mut pred_rows = conn
-        .query(
-            "SELECT state FROM turns WHERE id = ?1",
-            params![predecessor_id],
-        )
-        .await?;
-    let pred_row = pred_rows.next().await?.ok_or_else(|| {
-        DbError::internal(format!("predecessor turn not found: {predecessor_id}"))
-    })?;
-    let pred_state: TurnState = pred_row
-        .text(0)?
-        .parse()
-        .map_err(|e| DbError::internal(format!("invalid predecessor state: {e}")))?;
-    if !pred_state.is_terminal() {
-        return Err(DbError::internal(format!(
-            "predecessor turn {predecessor_id} is in non-terminal state {pred_state:?}"
-        )));
-    }
-
-    let mut sequence_rows = conn
-        .query(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM turns WHERE session_id = ?1",
-            params![session_id],
-        )
-        .await?;
-    let sequence = sequence_rows
-        .next()
-        .await?
-        .ok_or_else(|| DbError::internal("missing next turn sequence"))?
-        .i64(0)?;
-
-    let now = chrono::Utc::now().timestamp();
-    let turn_id = ids::mint_child(job_id);
-    let state = TurnState::Pending.to_string();
-    let start_reason = TurnStartReason::PromptResponse.to_string();
-
-    conn.execute(
-        "
-        INSERT INTO turns (
-            id, session_id, run_id, job_id, sequence, predecessor_id,
-            state, yield_reason, start_reason, created_at, started_at, ended_at, updated_at
-        )
-        VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, ?7, ?8, NULL, NULL, ?9)
-        ",
-        params![
-            turn_id.as_str(),
-            session_id,
-            job_id,
-            sequence,
-            predecessor_id,
-            state.as_str(),
-            start_reason.as_str(),
-            now,
-            now
-        ],
-    )
-    .await?;
-
-    conn.execute(
-        "UPDATE jobs SET current_turn_id = ?1, updated_at = ?2 WHERE id = ?3",
-        params![turn_id.as_str(), now, job_id],
-    )
-    .await?;
-
-    Ok(turn_id)
-}
-
-async fn get_successor_turn_id_conn(
-    conn: &cairn_db::turso::Connection,
-    predecessor_id: &str,
-) -> DbResult<Option<String>> {
-    let mut rows = conn
-        .query(
-            "
-            SELECT id
-            FROM turns
-            WHERE predecessor_id = ?1
-            ORDER BY sequence ASC
-            LIMIT 1
-            ",
-            params![predecessor_id],
-        )
-        .await?;
-    crate::storage::next_text(&mut rows, 0).await
+        background,
+        boundary_delivery,
+    })))
 }
 
 #[cfg(test)]

@@ -13,9 +13,8 @@
 //! condition resume the agent, which the subsequent park then re-suspended --
 //! the "never resumed" race (CAIRN-2970).
 
-use super::permission::{
-    emit_successor_turn_events, ensure_wait_resolved_successor, yield_turn_for_host, WaitSuccessor,
-};
+use super::host_wait_successor::emit_successor_turn_events;
+use super::permission::{ensure_wait_resolved_successor, yield_turn_for_host, WaitSuccessor};
 use super::run::TerminalWaitEvent;
 use crate::execution::jobs::{continue_job_impl, ResumeContext};
 use crate::models::{TurnState, TurnYieldReason};

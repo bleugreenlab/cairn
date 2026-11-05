@@ -155,7 +155,7 @@ pub(super) async fn dispatch(
                 } else if outcome.duplicate {
                     format!("Question {} was already answered", segment)
                 } else {
-                    format!("Answered question {}", segment)
+                    outcome.answered_summary(segment)
                 }
             }
         }

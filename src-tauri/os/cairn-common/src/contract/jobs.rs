@@ -194,7 +194,7 @@ pub(crate) const NODE_QUESTIONS_CONTRACT: ResourceContract =
                 KeySpec::new(
                     "blocking",
                     KeyType::Bool,
-                    "default true; false records the question and returns its URI at once (read it, or read it ?wait, for the answer)",
+                    "default true; false records the question and returns its URI at once, and you keep working: the answer reaches you when it is given, at your next tool call or by resuming you if your turn has ended (it also stays readable at the URI, and ?wait blocks on it)",
                 ),
                 KeySpec::new(
                     "ordinal",

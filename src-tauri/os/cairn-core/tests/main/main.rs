@@ -75,6 +75,7 @@ mod project_prs;
 mod projects;
 mod prompt_resume_event;
 mod provider_limit_holds;
+mod question_late_answer_resume;
 mod queued_direct_messages;
 mod read_fence_grep_parity;
 mod resident_relay_acceptance;

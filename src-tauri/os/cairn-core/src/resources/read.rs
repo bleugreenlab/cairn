@@ -1234,7 +1234,14 @@ pub(crate) async fn produce_cairn_resource(
         if find_query_value(&split.params, "wait").is_some() {
             let routed = orch.db.for_project(project).await;
             let body = super::node::wait_for_question(
-                orch, &routed, project, *number, *exec_seq, node_id, segment,
+                orch,
+                &routed,
+                project,
+                *number,
+                *exec_seq,
+                node_id,
+                segment,
+                request.run_id.as_deref(),
             )
             .await;
             return RenderedResource::line(body, None, None, None);

@@ -4,7 +4,10 @@
 //! durable record of what the operator said to that job — the record the
 //! watcher catch-up digest reads (CAIRN-3390). Nothing else may write here: a
 //! machinery- or agent-authored message recorded as a row would be reported to
-//! coordinators as the operator's own words.
+//! coordinators as the operator's own words. The one other writer is a question's
+//! answer on its way to its asker, keyed by the prompt id
+//! ([`insert_question_answer_conn`]): an answer is someone's words to this job,
+//! and it needs the same boundary timing.
 //!
 //! While a job's agent is running, a user-typed follow-up is persisted here
 //! rather than starting a competing turn. The [`Delivery`] tag records the
@@ -234,6 +237,71 @@ async fn record_operator_message(
     }
 
     recorded.map(|(message, _)| message)
+}
+
+/// Queue a question's answer for its asker's next tool boundary, in the
+/// transaction that records the answer. Committing the two together means a
+/// reader who sees the answer also sees the row, so
+/// [`take_question_answer_for_reader`] can never miss it, and a crash cannot
+/// leave an answer the asker is never told about. The prompt id is the row id,
+/// so one answer holds one row for the row's whole life.
+///
+/// `delivery` is `steer` for a turn that is simply running, so a turn ending
+/// before its next tool boundary still wakes the job for the row. It is `passive`
+/// for a turn another wait holds: a waking row counts toward `flush_on_idle`,
+/// which would resume the job around that wait, while a passive one rides along
+/// on whatever continues the job.
+pub(crate) async fn insert_question_answer_conn(
+    conn: &cairn_db::turso::Connection,
+    prompt_id: &str,
+    job_id: &str,
+    content: &str,
+    delivery: Delivery,
+    now: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO queued_messages
+         (id, job_id, content, delivery, created_at, delivered_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        params![prompt_id, job_id, content, delivery.as_str(), now],
+    )
+    .await?;
+    Ok(())
+}
+
+/// A reader in the asking job's own run is taking the answer directly, so its
+/// pending boundary delivery would only repeat it. A reader in any other job
+/// leaves the row alone: the asker has still not been told. The usual read finds
+/// nothing pending and opens no write transaction.
+pub(crate) async fn take_question_answer_for_reader(
+    db: &LocalDb,
+    reader_run_id: &str,
+    prompt_id: &str,
+) -> Result<(), String> {
+    const PENDING_FOR_READER: &str = "id = ?1 AND delivered_at IS NULL
+         AND job_id = (SELECT job_id FROM runs WHERE id = ?2)";
+    let pending = db
+        .query_all(
+            format!("SELECT {SELECT_COLUMNS} FROM queued_messages WHERE {PENDING_FOR_READER}"),
+            params![prompt_id.to_string(), reader_run_id.to_string()],
+            message_from_row,
+        )
+        .await
+        .map_err(|error| format!("Failed to read a question's queued answer: {error}"))?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    db.execute(
+        format!("UPDATE queued_messages SET delivered_at = ?3 WHERE {PENDING_FOR_READER}"),
+        params![
+            prompt_id.to_string(),
+            reader_run_id.to_string(),
+            chrono::Utc::now().timestamp()
+        ],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("Failed to stamp a question's queued answer: {error}"))
 }
 
 /// Pending (undelivered) queued messages for a job, oldest first.

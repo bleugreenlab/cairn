@@ -1075,8 +1075,10 @@ mod non_blocking_question_tests {
         .await
         .unwrap();
         let waited: serde_json::Value = serde_json::from_str(
-            &crate::resources::node::wait_for_question(&orch, &db, "prj", 7, 1, "flow", "q-1")
-                .await,
+            &crate::resources::node::wait_for_question(
+                &orch, &db, "prj", 7, 1, "flow", "q-1", None,
+            )
+            .await,
         )
         .unwrap();
         assert_eq!(waited["state"], "answered");
@@ -1132,8 +1134,10 @@ mod non_blocking_question_tests {
         .await
         .unwrap();
         let waited: serde_json::Value = serde_json::from_str(
-            &crate::resources::node::wait_for_question(&orch, &db, "prj", 7, 1, "flow", "q-2")
-                .await,
+            &crate::resources::node::wait_for_question(
+                &orch, &db, "prj", 7, 1, "flow", "q-2", None,
+            )
+            .await,
         )
         .unwrap();
         assert_eq!(

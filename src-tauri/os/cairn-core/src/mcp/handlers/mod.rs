@@ -12,6 +12,7 @@ pub(crate) mod durable_suspend;
 pub mod executions;
 pub mod fence;
 pub mod fetch_web;
+pub mod host_wait_successor;
 pub mod issue_resources;
 pub mod issues;
 pub(crate) mod mcp_continuation;
