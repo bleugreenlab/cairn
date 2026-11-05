@@ -96,9 +96,9 @@ use sha2::{Digest, Sha256};
 use crate::execution::checks::{
     applicable_turn_end_checks, check_input_hashes, execute_check_contract,
     load_checks_contract_at_commit, resolve_check_contract_at_commit, resolve_check_timeout_ms,
-    run_planned_checks_with_board, submit_planned_check_batch, CheckExecMode, CheckFailureKind,
-    CheckOutcome, CheckRunProducer, CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem,
-    PlannedCheckBatchRequest, CHECKS_CONFIG_PATH, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
+    submit_planned_check_batch, CheckExecMode, CheckFailureKind, CheckOutcome, CheckRunProducer,
+    CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem, PlannedCheckBatchRequest,
+    CHECKS_CONFIG_PATH, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
@@ -1578,18 +1578,15 @@ async fn run_turn_end_checks_inner(
         }
     );
 
-    // 10. Prepare the host-readable, job-scoped log DIRECTORY (cleared for a fresh
-    // run). Each check's output lands in its OWN file when the batch returns, so
-    // a lane's tail is scoped to that check instead of the whole suite's
-    // interleaved output.
+    // 10. Retain the job's earlier log evidence. Each completed placement
+    // group replaces only its own members' files; a held or cancelled sibling
+    // cannot erase the finished group's output.
     let log_dir = turn_end_log_dir(orch, job_id);
     prepare_log_dir(&log_dir);
 
-    // The wave's status board, published for the `/checks` projection. The
-    // members run in order in one cell, and the executor reports each one's
-    // start and finish against it by plan index, so the projection can say which
-    // member is executing, for how long, and which wait behind it. The engine
-    // records the verdicts onto the same board when the batch returns.
+    // The executor reports member progress by original plan index. Placement
+    // groups run independently; their completion callbacks record onto the same
+    // board before the wave as a whole finishes.
     let board = review_wave_board(orch, job_id, &to_run);
     cancel.set_wave_board(board.clone());
     let _ = orch.services.emitter.emit(
@@ -1639,11 +1636,9 @@ async fn run_turn_end_checks_inner(
         extra_env.extend(baseline);
     }
 
-    // 12. Submit every remaining miss through one sequential pure-verdict lease,
-    // then feed the keyed outcomes through the shared persistence, parsing, and
-    // ordering path. Lanes held back above are absent from the batch and absent
-    // from its results; the engine answers each of them from the stored verdict,
-    // so they still land on the tree, in plan order, in the delivery below.
+    // 12. Submit remaining misses as pure-verdict placement groups. Each group's
+    // callback feeds its original indices through the canonical engine immediately.
+    // Cache-covered members are resolved separately and delivery stays in plan order.
     let timeouts: Vec<u32> = to_run
         .iter()
         .map(|(plan, _)| {
@@ -1667,13 +1662,47 @@ async fn run_turn_end_checks_inner(
             .collect::<Vec<_>>(),
     )
     .await;
-    let batched_results = if submit.is_empty() {
+    let sealed_coordinates: Vec<_> = to_run
+        .iter()
+        .map(|(_, input_hash)| {
+            crate::execution::cache::SealedCheckCoordinate::new(
+                &sealed_commit,
+                &defined_by_commit,
+                &tree_hash,
+                input_hash,
+            )
+        })
+        .collect();
+    let recorder = std::sync::Arc::new(ReviewGroupRecorder {
+        orch: orch.clone(),
+        db: db.clone(),
+        project_id: coords.project_id.clone(),
+        job_id: job_id.to_string(),
+        attempt_id: attempt_id.to_string(),
+        evaluated: sealed_commit.clone(),
+        defined_by: defined_by_commit.clone(),
+        tree_hash: tree_hash.clone(),
+        plans: to_run.clone(),
+        sealed_coordinates,
+        infra_scopes: infra_scopes.clone(),
+        tool_use_id: checks_tool_id.clone(),
+        board: board.clone(),
+        log_dir,
+        steps: ReviewPersistenceSteps::default(),
+        outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+    // Cache-only members need no placement callback. Resolve them once, before
+    // submitting the misses; completed placement members never re-enter reuse.
+    let cached_indices: Vec<_> = (0..to_run.len()).filter(|i| !submit.contains(i)).collect();
+    recorder
+        .record(cached_indices, std::collections::HashMap::new(), false)
+        .await;
+    if submit.is_empty() {
         log::info!(
             "turn-end checks for job {}: every applicable lane already holds a verdict for this \
              tree; taking no admission",
             short_id(job_id)
         );
-        std::collections::HashMap::new()
     } else {
         let items: Vec<_> = submit
             .iter()
@@ -1729,6 +1758,7 @@ async fn run_turn_end_checks_inner(
             run_context: None,
             mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
             status_board: Some(board.clone()),
+            on_group_complete: Some(recorder.callback()),
             // A turn-end wave answers for one node's own tip, so no other wave
             // is asking its question and there is nothing for it to displace.
             purpose: None,
@@ -1750,7 +1780,7 @@ async fn run_turn_end_checks_inner(
         }
         transition_turn_end_attempt(orch, job_id, attempt_id, "submitted", None)?;
         cancel.mark_wave_submitted();
-        let outcome = tokio::select! {
+        tokio::select! {
             biased;
             reason = cancel.cancelled() => {
                 log::info!(
@@ -1778,64 +1808,34 @@ async fn run_turn_end_checks_inner(
             results = submit_planned_check_batch(orch, batch) => results
                 .map_err(|error| format!("turn-end check batch configuration failed: {error}"))?,
         };
-        outcome.results
-    };
-    for (index, result) in &batched_results {
-        if let Ok(result) = result {
-            let _ = std::fs::write(
-                turn_end_log_path(orch, job_id, &to_run[*index].0.name),
-                &result.output,
-            );
-        }
     }
-    let batched_results = std::sync::Arc::new(std::sync::Mutex::new(batched_results));
-    let sealed_coordinates: Vec<_> = to_run
-        .iter()
-        .map(|(_, input_hash)| {
-            crate::execution::cache::SealedCheckCoordinate::new(
-                &sealed_commit,
-                &defined_by_commit,
-                &tree_hash,
-                input_hash,
+    // Every final group must acknowledge receipt. Report a missing callback as
+    // a coordinator fault rather than panicking or inventing a code verdict.
+    let missing: Vec<_> = {
+        let completed = recorder.outcomes.lock().unwrap();
+        (0..to_run.len())
+            .filter(|index| !completed.contains_key(index))
+            .collect()
+    };
+    if !missing.is_empty() {
+        recorder
+            .record_completion_failure(
+                &missing,
+                "final placement group returned without completing its persistence callback",
             )
-        })
-        .collect();
-    let outcomes = run_planned_checks_with_board(
-        db.clone(),
-        &coords.project_id,
-        crate::execution::checks::CheckRunCommit {
-            evaluated: &sealed_commit,
-            defined_by: &defined_by_commit,
-        },
-        &tree_hash,
-        job_id,
-        &to_run,
-        &sealed_coordinates,
-        &infra_scopes,
-        &checks_tool_id,
-        CheckExecMode::Shared,
-        Some(orch),
-        Some(board),
-        TURN_END_EFFECTIVE_ENV,
-        false,
-        move |index, _command, _stream_id| {
-            let batched_results = batched_results.clone();
-            async move {
-                batched_results
-                    .lock()
-                    .unwrap()
+            .await;
+    }
+    // Consuming completed values avoids an aggregate second observation/cache alias.
+    let outcomes = {
+        let mut completed = recorder.outcomes.lock().unwrap();
+        (0..to_run.len())
+            .map(|index| {
+                completed
                     .remove(&index)
-                    .unwrap_or_else(|| {
-                        Err(crate::execution::checks::CheckExecutionFailure::substrate(
-                            crate::execution::checks::SubstrateFailureShape::Result,
-                            format!("missing review batch outcome for plan index {index}"),
-                        ))
-                    })
-            }
-        },
-        |_| {},
-    )
-    .await;
+                    .expect("every final group must complete its persistence callback")
+            })
+            .collect::<Vec<_>>()
+    };
 
     let verdicts: Vec<String> = outcomes
         .iter()
@@ -2807,11 +2807,449 @@ fn turn_end_log_dir(orch: &Orchestrator, job_id: &str) -> PathBuf {
     orch.config_dir.join("turn-checks").join(job_id)
 }
 
-/// The live log file for a SINGLE check within a job's turn-end run. Each check
-/// tees into its OWN file (created the instant it starts), so the PR-node /
-/// `/checks` render can tail exactly that check's output — several may be running
-/// and tailing at once under concurrent isolation — instead of a shared blob that
-/// made every running check preview the same interleaved text.
+/// A durability failure belongs to the wave, independently of its verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReviewDurabilityError {
+    pub(crate) member: String,
+    pub(crate) step: String,
+    pub(crate) error: String,
+}
+
+pub(crate) async fn turn_end_durability_errors(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Vec<ReviewDurabilityError>, String> {
+    let job = job_id.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, json_extract(plan_json, '$.durabilityErrors')
+                     FROM turn_end_check_attempts WHERE job_id=?1
+                     ORDER BY created_at, id",
+                    (job.as_str(),),
+                )
+                .await?;
+            let mut failures = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let attempt = row.text(0)?;
+                if let Some(json) = row.opt_text(1)? {
+                    let mut wave_failures: Vec<ReviewDurabilityError> = serde_json::from_str(&json)
+                        .map_err(|error| {
+                            crate::storage::DbError::Row(format!(
+                                "review wave {attempt} has malformed durability errors: {error}"
+                            ))
+                        })?;
+                    for failure in &mut wave_failures {
+                        failure.error = format!("wave {attempt}: {}", failure.error);
+                    }
+                    failures.extend(wave_failures);
+                }
+            }
+            Ok(failures)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn record_review_durability_error(
+    db: &LocalDb,
+    job_id: &str,
+    attempt_id: &str,
+    failure: ReviewDurabilityError,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&failure).expect("durability error serializes");
+    db.execute(
+        "UPDATE turn_end_check_attempts
+         SET plan_json=json_insert(
+             json_set(COALESCE(plan_json, '{}'), '$.durabilityErrors',
+                 json(COALESCE(json_extract(plan_json, '$.durabilityErrors'), '[]'))),
+             '$.durabilityErrors[#]', json(?1))
+         WHERE id=?2 AND job_id=?3",
+        (json.as_str(), attempt_id, job_id),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+type ReviewObservationWriter = std::sync::Arc<
+    dyn Fn(
+            std::sync::Arc<LocalDb>,
+            crate::execution::cache::FreshCheckObservationWrite,
+        ) -> Result<(), String>
+        + Send
+        + Sync,
+>;
+type ReviewLogWriter = std::sync::Arc<dyn Fn(&Path, &str) -> Result<(), String> + Send + Sync>;
+
+/// A detached recorder may retain observations at its original coordinates,
+/// but only the newest wave may replace the job's shared log path.
+/// `Ok(false)` is a stale recorder, not a persistence failure.
+fn guarded_review_log_write(
+    orch: &Orchestrator,
+    job_id: &str,
+    attempt_id: &str,
+    path: &Path,
+    output: &str,
+    writer: &ReviewLogWriter,
+) -> Result<bool, String> {
+    orch.with_current_review_log_generation(job_id, attempt_id, || writer(path, output))
+        .transpose()
+        .map(|written| written.is_some())
+}
+
+/// Independent named operations: failure of either must not prevent the other.
+type ReviewFaultWriter = std::sync::Arc<
+    dyn Fn(
+            std::sync::Arc<LocalDb>,
+            String,
+            String,
+            ReviewDurabilityError,
+        ) -> futures_util::future::BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
+>;
+
+struct ReviewPersistenceSteps {
+    observation: ReviewObservationWriter,
+    log: ReviewLogWriter,
+    fact: ReviewFaultWriter,
+}
+
+impl Default for ReviewPersistenceSteps {
+    fn default() -> Self {
+        Self {
+            fact: std::sync::Arc::new(|db, job, attempt, failure| {
+                Box::pin(async move {
+                    record_review_durability_error(&db, &job, &attempt, failure).await
+                })
+            }),
+            observation: std::sync::Arc::new(
+                crate::execution::cache::record_fresh_check_observation,
+            ),
+            log: std::sync::Arc::new(|path, output| {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                std::fs::write(path, output).map_err(|error| error.to_string())
+            }),
+        }
+    }
+}
+
+struct ReviewGroupRecorder {
+    orch: Orchestrator,
+    db: std::sync::Arc<LocalDb>,
+    project_id: String,
+    job_id: String,
+    attempt_id: String,
+    evaluated: String,
+    defined_by: String,
+    tree_hash: String,
+    plans: Vec<(CheckPlan, String)>,
+    sealed_coordinates: Vec<crate::execution::cache::SealedCheckCoordinate>,
+    infra_scopes: Vec<crate::execution::cache::InfraScopes>,
+    tool_use_id: String,
+    board: CheckStatusBoard,
+    log_dir: PathBuf,
+    steps: ReviewPersistenceSteps,
+    outcomes: std::sync::Mutex<std::collections::HashMap<usize, CheckOutcome>>,
+}
+
+impl ReviewGroupRecorder {
+    fn callback(self: &std::sync::Arc<Self>) -> crate::execution::checks::CheckGroupCompletion {
+        let recorder = self.clone();
+        std::sync::Arc::new(move |results| {
+            // Snapshot before yielding. PublicationCoordination is a shared
+            // arbitration handle, not an acquired publisher guard.
+            let results = results
+                .iter()
+                .map(|(&index, result)| {
+                    let result = match result {
+                        Ok(result) => Ok(crate::mcp::handlers::run::CheckExecResult {
+                            exit_code: result.exit_code,
+                            output: result.output.clone(),
+                            timed_out: result.timed_out,
+                            duration_ms: result.duration_ms,
+                            provenance: result.provenance.clone(),
+                            publication: result.publication.clone(),
+                        }),
+                        Err(error) => Err(error.clone()),
+                    };
+                    (index, result)
+                })
+                .collect::<crate::execution::checks::CheckGroupResults>();
+            let mut indices = results.keys().copied().collect::<Vec<_>>();
+            indices.sort_unstable();
+            let recorder = recorder.clone();
+            let recovery = recorder.clone();
+            let recovery_indices = indices.clone();
+            // The supervisor owns the worker and recovery across cancellation.
+            // Dropping the callback's JoinHandle detaches this supervisor rather
+            // than discarding received results or their failure explanation.
+            let completion = tokio::spawn(async move {
+                let worker = recorder.clone();
+                let worker_indices = indices.clone();
+                let task = tokio::spawn(async move {
+                    worker.record(worker_indices, results, true).await;
+                });
+                if let Err(error) = task.await {
+                    recorder
+                        .record_completion_failure(&indices, &error.to_string())
+                        .await;
+                }
+            });
+            Box::pin(async move {
+                if let Err(error) = completion.await {
+                    recovery
+                        .record_completion_failure(&recovery_indices, &error.to_string())
+                        .await;
+                }
+            })
+        })
+    }
+
+    fn show_fault(&self, failure: &ReviewDurabilityError) {
+        let mut visible = failure.clone();
+        visible.error = format!("wave {}: {}", self.attempt_id, visible.error);
+        self.orch
+            .remember_review_durability_error(&self.job_id, visible.clone());
+        self.board.record_durability_error(visible);
+        log::error!(target: "cairn::review_durability",
+            "review wave {}, member {}, {} persistence: {}",
+            self.attempt_id, failure.member, failure.step, failure.error);
+    }
+
+    async fn record_fault(&self, failure: ReviewDurabilityError) {
+        self.show_fault(&failure);
+        self.persist_fault(failure).await;
+    }
+
+    fn start_fault(
+        self: &std::sync::Arc<Self>,
+        failure: ReviewDurabilityError,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        self.show_fault(&failure);
+        let member = failure.member.clone();
+        let recorder = self.clone();
+        // The fact write remains owned even if a later member panics. It must
+        // not block the independent observation or log operation.
+        (
+            member,
+            tokio::spawn(async move { recorder.persist_fault(failure).await }),
+        )
+    }
+
+    async fn persist_fault(&self, failure: ReviewDurabilityError) {
+        let fact_error = (self.steps.fact)(
+            self.db.clone(),
+            self.job_id.clone(),
+            self.attempt_id.clone(),
+            failure.clone(),
+        )
+        .await
+        .err();
+        if let Some(error) = fact_error {
+            let fact_failure = ReviewDurabilityError {
+                member: failure.member.clone(),
+                step: "fact".into(),
+                error: format!("wave {}: {error}", self.attempt_id),
+            };
+            self.orch
+                .remember_review_durability_error(&self.job_id, fact_failure.clone());
+            self.board.record_durability_error(fact_failure);
+            log::error!(target: "cairn::review_durability",
+                "review wave {}, member {}, fact persistence: {}",
+                self.attempt_id, failure.member, error);
+        }
+    }
+
+    async fn record_completion_failure(&self, indices: &[usize], error: &str) {
+        for &index in indices {
+            if self
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&index)
+            {
+                continue;
+            }
+            let member = self.plans[index].0.name.clone();
+            self.record_fault(ReviewDurabilityError {
+                member: member.clone(),
+                step: "completion".into(),
+                error: error.into(),
+            })
+            .await;
+            let reason = format!("review group persistence task failed: {error}");
+            self.board
+                .transition(index, "unverified", Some(reason.clone()));
+            // A coordinator failure is never a verdict about the evaluated tree.
+            // Do not overwrite any observation the worker committed before failing.
+            self.outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(index)
+                .or_insert(CheckOutcome {
+                    name: member,
+                    passed: false,
+                    exit_code: None,
+                    failure_kind: Some(CheckFailureKind::Infrastructure),
+                    parsed: None,
+                    output_tail: reason.clone(),
+                    cached: false,
+                    duration_ms: 0,
+                    suppressed_after: None,
+                    recorded: None,
+                    not_recorded: Some(reason),
+                });
+        }
+        self.orch.invalidate_project_check_results(&self.project_id);
+    }
+
+    async fn record(
+        self: &std::sync::Arc<Self>,
+        indices: Vec<usize>,
+        results: crate::execution::checks::CheckGroupResults,
+        received: bool,
+    ) {
+        let received_members = results.len();
+        let mut fault_tasks = Vec::new();
+        let mut written_logs = 0;
+        // Logs do not depend on observation acceptance. Retain diagnostic text
+        // for infrastructure/stopped results as well as successful processes.
+        for (&index, result) in &results {
+            let name = &self.plans[index].0.name;
+            let output = match result {
+                Ok(result) => result.output.clone(),
+                Err(crate::execution::checks::CheckExecutionFailure::Substrate(failure)) => {
+                    failure.diagnostic().to_string()
+                }
+                Err(crate::execution::checks::CheckExecutionFailure::Process(error)) => {
+                    error.clone()
+                }
+                Err(error) => format!("{error:?}"),
+            };
+            let path = self
+                .log_dir
+                .join(format!("{}.log", sanitize_log_name(name)));
+            match guarded_review_log_write(
+                &self.orch,
+                &self.job_id,
+                &self.attempt_id,
+                &path,
+                &output,
+                &self.steps.log,
+            ) {
+                Ok(true) => written_logs += 1,
+                Ok(false) => {}
+                Err(error) => fault_tasks.push(self.start_fault(ReviewDurabilityError {
+                    member: name.clone(),
+                    step: "log".into(),
+                    error,
+                })),
+            }
+        }
+        let results = std::sync::Mutex::new(results);
+        let mut outcomes = Vec::new();
+        for &member_index in &indices {
+            let mut completed = crate::execution::checks::run_planned_checks_selected(
+                self.db.clone(),
+                &self.project_id,
+                crate::execution::checks::CheckRunCommit {
+                    evaluated: &self.evaluated,
+                    defined_by: &self.defined_by,
+                },
+                &self.tree_hash,
+                &self.job_id,
+                &self.plans,
+                &self.sealed_coordinates,
+                &self.infra_scopes,
+                &self.tool_use_id,
+                CheckExecMode::Shared,
+                Some(&self.orch),
+                Some(self.board.clone()),
+                TURN_END_EFFECTIVE_ENV,
+                received,
+                Some(&[member_index]),
+                self.steps.observation.as_ref(),
+                |index, _, _| {
+                    let result = results.lock().unwrap().remove(&index).unwrap_or_else(|| {
+                        Err(crate::execution::checks::CheckExecutionFailure::substrate(
+                            crate::execution::checks::SubstrateFailureShape::Result,
+                            format!("missing review batch outcome for plan index {index}"),
+                        ))
+                    });
+                    std::future::ready(result)
+                },
+                |_| {},
+            )
+            .await;
+            let outcome = completed
+                .pop()
+                .expect("one selected member resolves one outcome");
+            // Publish each canonical outcome before beginning the next member.
+            // A later member's writer can panic after this observation is durable.
+            self.outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(member_index, outcome.clone());
+            if let Some(error) = outcome
+                .not_recorded
+                .as_deref()
+                .and_then(|reason| reason.strip_prefix("the observation write failed: "))
+            {
+                fault_tasks.push(self.start_fault(ReviewDurabilityError {
+                    member: outcome.name.clone(),
+                    step: "observation".into(),
+                    error: error.into(),
+                }));
+            }
+            outcomes.push(outcome);
+        }
+        let failed_steps = fault_tasks.len();
+        for (member, task) in fault_tasks {
+            if let Err(error) = task.await {
+                let failure = ReviewDurabilityError {
+                    member,
+                    step: "fact".into(),
+                    error: format!("fact persistence worker failed: {error}"),
+                };
+                self.show_fault(&failure);
+            }
+        }
+        if received {
+            let members = outcomes
+                .iter()
+                .map(|outcome| outcome.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let observations = outcomes
+                .iter()
+                .filter_map(|outcome| {
+                    outcome
+                        .recorded
+                        .as_ref()
+                        .map(|recorded| format!("{}={}", outcome.name, recorded.id))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::info!(target: "cairn::review_durability",
+                "review wave {} for job {} at {}: group recording complete; members=[{}]; observations=[{}]; logs_written={}/{}; failed_steps={}",
+                self.attempt_id, self.job_id, self.evaluated, members, observations,
+                written_logs, received_members, failed_steps);
+        }
+        self.orch.invalidate_project_check_results(&self.project_id);
+        let _ = self.orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "check_result_cache", "action": "update"}),
+        );
+    }
+}
+
+/// Each completed member has its own retained, host-readable output file.
 fn turn_end_log_path(orch: &Orchestrator, job_id: &str, check_name: &str) -> PathBuf {
     turn_end_log_dir(orch, job_id).join(format!("{}.log", sanitize_log_name(check_name)))
 }
@@ -2831,19 +3269,21 @@ fn sanitize_log_name(name: &str) -> String {
         .collect()
 }
 
-/// Clear the job's per-check log directory so a fresh suite starts clean — a stale
-/// per-check log must not make a not-yet-started check look like it is running
-/// with old output. Best-effort: a failure here only costs the live tail, never
-/// the run.
+/// Keep the preceding wave's evidence until a completed member replaces its
+/// own log. Running state comes from the board, never from file existence.
 fn prepare_log_dir(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::create_dir_all(dir);
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        log::warn!(
+            "could not prepare review log directory {}: {error}",
+            dir.display()
+        );
+    }
 }
 
 /// Last `max_chars` chars of a single check's log file, or `None` when it is
 /// missing or empty. Whether a lane is running is not read from here: the
 /// wave's status board says that, and a running lane's file is written only
-/// when its batch returns.
+/// when its placement group completes.
 pub(crate) fn read_turn_end_log_tail(
     orch: &Orchestrator,
     job_id: &str,
@@ -3852,9 +4292,7 @@ mod tests {
                 NodeCheckState::Running,
                 LaneProgress::Finished {
                     since_unix_ms: Some(now),
-                    annotation: Some(
-                        "finished in 4m 12s (exit 0); recorded when the wave ends".into(),
-                    ),
+                    annotation: Some("finished in 4m 12s (exit 0); awaiting recording".into()),
                 },
             ),
             review(
@@ -3874,7 +4312,7 @@ mod tests {
         assert!(s.contains("- rust-tests: running for 15h 41m"), "{s}");
         assert!(s.contains("- lint: queued behind rust-tests"), "{s}");
         assert!(
-            s.contains("- rust-lint: finished in 4m 12s (exit 0); recorded when the wave ends"),
+            s.contains("- rust-lint: finished in 4m 12s (exit 0); awaiting recording"),
             "{s}"
         );
         assert!(s.find(header) < s.find("- lint"), "the header leads: {s}");
@@ -3891,7 +4329,7 @@ mod tests {
             name: name.into(),
             state: state.into(),
             annotation: (state == "finished")
-                .then(|| "finished in 2s (exit 1); recorded when the wave ends".into()),
+                .then(|| "finished in 2s (exit 1); awaiting recording".into()),
             cached: false,
             since_unix_ms: Some(7),
         };
@@ -3906,7 +4344,7 @@ mod tests {
             wave_lane_progress(&board, "a", None),
             Some(LaneProgress::Finished {
                 since_unix_ms: Some(7),
-                annotation: Some("finished in 2s (exit 1); recorded when the wave ends".into()),
+                annotation: Some("finished in 2s (exit 1); awaiting recording".into()),
             })
         );
         assert_eq!(
@@ -4362,6 +4800,681 @@ pinBumps:
             .1
             .is_empty());
         assert!(wave_lanes(None, &[modified(CODEX_PIN)]).1.is_empty());
+    }
+
+    async fn durability_group_fixture(
+        steps: ReviewPersistenceSteps,
+    ) -> (std::sync::Arc<ReviewGroupRecorder>, tempfile::TempDir) {
+        durability_group_fixture_with_names(steps, &["held", "completed"]).await
+    }
+
+    async fn durability_group_fixture_with_names(
+        steps: ReviewPersistenceSteps,
+        names: &[&str],
+    ) -> (std::sync::Arc<ReviewGroupRecorder>, tempfile::TempDir) {
+        let orch = launchability_orchestrator("active", "complete").await;
+        orch.register_review_log_generation("j-1", "durability-wave");
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO turn_end_check_attempts
+             (id,job_id,state,plan_json,created_at,updated_at)
+             VALUES('durability-wave','j-1','submitted','{}',1,1);
+             UPDATE jobs SET turn_end_check_attempt_id='durability-wave' WHERE id='j-1';",
+        )
+        .await
+        .unwrap();
+        let configured: crate::config::project_settings::CheckCommand =
+            serde_yaml::from_str("command: 'true'").unwrap();
+        let plans: Vec<_> = names
+            .iter()
+            .copied()
+            .map(|name| {
+                let (mut plan, input) = uncached_plan(name);
+                plan.command = "true".into();
+                plan.verdict_platforms =
+                    vec![crate::execution::check_identity::gating_platform().into()];
+                plan.verdict_environment_names =
+                    crate::execution::check_identity::verdict_environment_names(&configured);
+                plan.verdict_runtime = crate::execution::check_identity::expected_verdict_runtime(
+                    &configured,
+                    crate::execution::checks::check_toolchain_identity(),
+                );
+                (plan, input)
+            })
+            .collect();
+        let board = CheckStatusBoard::for_review_wave(&plans, || {});
+        let log_dir = tempfile::tempdir().unwrap();
+        let recorder = ReviewGroupRecorder {
+            orch,
+            db,
+            project_id: "p".into(),
+            job_id: "j-1".into(),
+            attempt_id: "durability-wave".into(),
+            evaluated: "original-head".into(),
+            defined_by: "original-definition".into(),
+            tree_hash: "original-tree".into(),
+            sealed_coordinates: plans
+                .iter()
+                .map(|(_, input)| {
+                    crate::execution::cache::SealedCheckCoordinate::new(
+                        "original-head",
+                        "original-definition",
+                        "original-tree",
+                        input,
+                    )
+                })
+                .collect(),
+            infra_scopes: plans
+                .iter()
+                .map(|_| crate::execution::cache::InfraScopes::head_only("j-1", "original-head"))
+                .collect(),
+            plans,
+            tool_use_id: "turn-checks:j-1".into(),
+            board,
+            log_dir: log_dir.path().into(),
+            steps,
+            outcomes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        (std::sync::Arc::new(recorder), log_dir)
+    }
+
+    fn durability_group_result() -> crate::execution::checks::CheckGroupResults {
+        std::collections::HashMap::from([(
+            1,
+            Ok(crate::mcp::handlers::run::CheckExecResult {
+                exit_code: Some(0),
+                output: "completed bytes\n".into(),
+                timed_out: false,
+                duration_ms: Some(7),
+                provenance: None,
+                publication: None,
+            }),
+        )])
+    }
+
+    async fn durability_group_observation_count(db: &LocalDb) -> i64 {
+        db.query_opt_text(
+            "SELECT CAST(count(*) AS TEXT) FROM check_result_observations",
+            (),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_old_generation_cannot_replace_successor_log() {
+        let (recorder, logs) = durability_group_fixture(ReviewPersistenceSteps::default()).await;
+        let path = logs.path().join("completed.log");
+        let (held, ready) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let old = recorder.clone();
+        let old_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            // Pause before entering the guard, not inside the injected writer:
+            // an ownership check followed by an unlocked write would be unsafe.
+            held.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .unwrap();
+            guarded_review_log_write(
+                &old.orch,
+                &old.job_id,
+                &old.attempt_id,
+                &old_path,
+                "old wave bytes",
+                &old.steps.log,
+            )
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .unwrap();
+        recorder
+            .orch
+            .register_review_log_generation(&recorder.job_id, "successor-wave");
+        assert!(guarded_review_log_write(
+            &recorder.orch,
+            &recorder.job_id,
+            "successor-wave",
+            &path,
+            "new wave bytes",
+            &recorder.steps.log,
+        )
+        .unwrap());
+        release.send(()).unwrap();
+        assert!(
+            !worker.join().unwrap().unwrap(),
+            "old generation is skipped"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new wave bytes");
+
+        // Generation is scoped by job, not globally: another job's wave cannot
+        // revoke this job's writer.
+        recorder
+            .orch
+            .register_review_log_generation("another-job", "another-wave");
+        assert!(guarded_review_log_write(
+            &recorder.orch,
+            &recorder.job_id,
+            "successor-wave",
+            &logs.path().join("held.log"),
+            "independent member bytes",
+            &recorder.steps.log,
+        )
+        .unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_observation_failure_still_writes_log_and_survives_successor() {
+        let steps = ReviewPersistenceSteps {
+            observation: std::sync::Arc::new(|_, _| Err("injected observation failure".into())),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, logs) = durability_group_fixture(steps).await;
+        recorder.callback()(&durability_group_result()).await;
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 0);
+        assert_eq!(
+            std::fs::read_to_string(logs.path().join("completed.log")).unwrap(),
+            "completed bytes\n"
+        );
+        let failures = turn_end_durability_errors(&recorder.db, "j-1")
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].member, "completed");
+        assert_eq!(failures[0].step, "observation");
+        assert!(failures[0].error.contains("injected observation failure"));
+        assert!(recorder.outcomes.lock().unwrap()[&1].recorded.is_none());
+        // Neither the terminal reason nor a new wave's pointer erases the fact.
+        transition_turn_end_attempt(
+            &recorder.orch,
+            "j-1",
+            "durability-wave",
+            "cancelled",
+            Some("held sibling was cancelled"),
+        )
+        .unwrap();
+        recorder
+            .db
+            .execute_script(
+                "INSERT INTO turn_end_check_attempts
+             (id,job_id,state,plan_json,created_at,updated_at)
+             VALUES('successor-wave','j-1','submitted','{}',2,2);
+             UPDATE jobs SET turn_end_check_attempt_id='successor-wave' WHERE id='j-1';",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            turn_end_durability_errors(&recorder.db, "j-1")
+                .await
+                .unwrap(),
+            failures
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_log_failure_still_records_original_coordinate_and_reuses() {
+        let steps = ReviewPersistenceSteps {
+            log: std::sync::Arc::new(|_, _| Err("injected log failure".into())),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, logs) = durability_group_fixture(steps).await;
+        recorder.callback()(&durability_group_result()).await;
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 1);
+        assert!(!logs.path().join("completed.log").exists());
+        let failures = turn_end_durability_errors(&recorder.db, "j-1")
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].step, "log");
+        assert_eq!(failures[0].member, "completed");
+        assert!(failures[0].error.contains("injected log failure"));
+        let coordinate = recorder
+            .db
+            .query_opt_text(
+                "SELECT commit_sha || ':' || defined_by_commit_sha || ':' || input_hash
+             FROM check_result_observations WHERE check_name='completed'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordinate,
+            "original-head:original-definition:input-completed"
+        );
+        let (plan, input) = &recorder.plans[1];
+        assert!(
+            crate::execution::checks::reusable_verdict_for_plan(
+                recorder.db.clone(),
+                "p",
+                plan,
+                input,
+                TURN_END_EFFECTIVE_ENV,
+            )
+            .is_some(),
+            "the next wave reuses the committed observation even if log writing failed"
+        );
+        assert!(
+            !recorder.outcomes.lock().unwrap().contains_key(&0),
+            "held original index untouched"
+        );
+        assert_eq!(recorder.board.snapshot()[0].state, "pending");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_dropping_callback_keeps_received_result_and_previous_logs() {
+        let done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let completed = done.clone();
+        let steps = ReviewPersistenceSteps {
+            observation: std::sync::Arc::new(move |db, observation| {
+                let result =
+                    crate::execution::cache::record_fresh_check_observation(db, observation);
+                completed.notify_one();
+                result
+            }),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, logs) = durability_group_fixture(steps).await;
+        std::fs::write(logs.path().join("held.log"), "prior wave bytes").unwrap();
+        let results = durability_group_result();
+        let callback = recorder.callback();
+        // Creating the callback transfers receipt to its owned task. A wave
+        // cancelled before polling the returned future cannot discard that task.
+        drop(callback(&results));
+        tokio::time::timeout(std::time::Duration::from_secs(120), done.notified())
+            .await
+            .expect("detached completed group records despite cancellation");
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 1);
+        assert_eq!(
+            std::fs::read_to_string(logs.path().join("completed.log")).unwrap(),
+            "completed bytes\n"
+        );
+        prepare_log_dir(logs.path());
+        assert_eq!(
+            std::fs::read_to_string(logs.path().join("held.log")).unwrap(),
+            "prior wave bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(logs.path().join("completed.log")).unwrap(),
+            "completed bytes\n"
+        );
+        let (plan, input) = &recorder.plans[1];
+        assert!(crate::execution::checks::reusable_verdict_for_plan(
+            recorder.db.clone(),
+            "p",
+            plan,
+            input,
+            TURN_END_EFFECTIVE_ENV,
+        )
+        .is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_worker_panic_retains_prior_named_faults() {
+        for step in ["log", "observation"] {
+            let log = ReviewPersistenceSteps::default().log;
+            let steps = ReviewPersistenceSteps {
+                observation: std::sync::Arc::new(move |db, observation| {
+                    if observation.check_name == "second" {
+                        panic!("later member writer panic");
+                    }
+                    if step == "observation" {
+                        return Err("first observation failed before later panic".into());
+                    }
+                    crate::execution::cache::record_fresh_check_observation(db, observation)
+                }),
+                log: std::sync::Arc::new(move |path, output| {
+                    if step == "log" && path.file_name().unwrap() == "first.log" {
+                        return Err("first log failed before later panic".into());
+                    }
+                    log(path, output)
+                }),
+                ..ReviewPersistenceSteps::default()
+            };
+            let (recorder, _logs) =
+                durability_group_fixture_with_names(steps, &["first", "second"]).await;
+            let results = std::collections::HashMap::from([
+                (0, durability_group_result().remove(&1).unwrap()),
+                (1, durability_group_result().remove(&1).unwrap()),
+            ]);
+            recorder.callback()(&results).await;
+            assert!(recorder
+                .board
+                .durability_errors()
+                .iter()
+                .any(|failure| failure.member == "first"
+                    && failure.step == step
+                    && failure.error.contains("before later panic")));
+            tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                loop {
+                    let facts = turn_end_durability_errors(&recorder.db, "j-1")
+                        .await
+                        .unwrap();
+                    if facts.iter().any(|failure| {
+                        failure.member == "first"
+                            && failure.step == step
+                            && failure.error.contains("before later panic")
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("independently owned fact survives later member panic");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_log_fact_sink_does_not_block_observation() {
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ready = entered.clone();
+        let resume = release.clone();
+        let steps = ReviewPersistenceSteps {
+            log: std::sync::Arc::new(|_, _| Err("log write failed while fact sink held".into())),
+            fact: std::sync::Arc::new(move |_, _, _, _| {
+                let ready = ready.clone();
+                let resume = resume.clone();
+                Box::pin(async move {
+                    ready.notify_one();
+                    resume.notified().await;
+                    Ok(())
+                })
+            }),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, _logs) = durability_group_fixture(steps).await;
+        let callback = recorder.callback();
+        let task = tokio::spawn(async move { callback(&durability_group_result()).await });
+        tokio::time::timeout(std::time::Duration::from_secs(120), entered.notified())
+            .await
+            .expect("fact sink entered");
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                if durability_group_observation_count(&recorder.db).await == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observation commits without waiting for log-fault sink");
+        assert!(!task.is_finished());
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(120), task)
+            .await
+            .expect("group completes once fact sink released")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_worker_failure_preserves_an_already_recorded_red() {
+        let steps = ReviewPersistenceSteps {
+            observation: std::sync::Arc::new(|db, observation| {
+                if observation.check_name == "second" {
+                    panic!("second member observation writer panicked");
+                }
+                crate::execution::cache::record_fresh_check_observation(db, observation)
+            }),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, _logs) =
+            durability_group_fixture_with_names(steps, &["first", "second"]).await;
+        let mut red = durability_group_result().remove(&1).unwrap().unwrap();
+        red.exit_code = Some(1);
+        red.output = "a genuine code failure".into();
+        let results = std::collections::HashMap::from([
+            (0, Ok(red)),
+            (1, durability_group_result().remove(&1).unwrap()),
+        ]);
+        recorder.callback()(&results).await;
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 1);
+        let verdict = recorder
+            .db
+            .query_opt_text(
+                "SELECT verdict FROM check_result_observations WHERE check_name='first'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verdict, "failed");
+        {
+            let outcomes = recorder.outcomes.lock().unwrap();
+            assert!(outcomes[&0].is_genuine_failure());
+            assert_eq!(outcomes[&0].exit_code, Some(1));
+            assert!(outcomes[&0].recorded.is_some());
+            assert!(!outcomes[&1].is_genuine_failure());
+            assert!(outcomes[&1].recorded.is_none());
+            assert_eq!(recorder.board.snapshot()[0].state, "failed");
+        }
+        let faults = turn_end_durability_errors(&recorder.db, "j-1")
+            .await
+            .unwrap();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].member, "second");
+        assert_eq!(faults[0].step, "completion");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_error_is_logged_before_a_held_fact_sink() {
+        const TARGET: &str = "cairn::review_durability";
+        crate::test_support::capture_log(TARGET);
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ready = entered.clone();
+        let resume = release.clone();
+        let steps = ReviewPersistenceSteps {
+            fact: std::sync::Arc::new(move |_, _, _, _| {
+                let ready = ready.clone();
+                let resume = resume.clone();
+                Box::pin(async move {
+                    ready.notify_one();
+                    resume.notified().await;
+                    Ok(())
+                })
+            }),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, _logs) = durability_group_fixture(steps).await;
+        let worker = recorder.clone();
+        let task = tokio::spawn(async move {
+            worker
+                .record_fault(ReviewDurabilityError {
+                    member: "completed".into(),
+                    step: "observation".into(),
+                    error: "held-fact-sink-original-error".into(),
+                })
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(120), entered.notified())
+            .await
+            .expect("fact sink entered");
+        assert!(!task.is_finished(), "fact sink remains held");
+        assert!(crate::test_support::captured_log(TARGET)
+            .iter()
+            .any(|line| line.contains("member completed")
+                && line.contains("observation persistence")
+                && line.contains("held-fact-sink-original-error")));
+        assert!(recorder
+            .board
+            .durability_errors()
+            .iter()
+            .any(|failure| failure.error.contains("held-fact-sink-original-error")));
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(120), task)
+            .await
+            .expect("released fact sink completes")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_task_failure_is_visible_without_an_aggregate_panic() {
+        let steps = ReviewPersistenceSteps {
+            observation: std::sync::Arc::new(|_, _| panic!("injected completion panic")),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, logs) = durability_group_fixture(steps).await;
+        recorder.callback()(&durability_group_result()).await;
+        let failures = turn_end_durability_errors(&recorder.db, "j-1")
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].step, "completion");
+        assert!(failures[0].error.contains("injected completion panic"));
+        let outcomes = recorder.outcomes.lock().unwrap();
+        assert!(outcomes.contains_key(&1));
+        assert!(
+            !outcomes[&1].is_genuine_failure(),
+            "coordinator panic is not a code verdict"
+        );
+        assert!(outcomes[&1].exit_code.is_none());
+        assert!(logs.path().join("completed.log").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_noncontiguous_members_keep_original_indices_and_coordinates() {
+        let (recorder, logs) = durability_group_fixture_with_names(
+            ReviewPersistenceSteps::default(),
+            &["first", "held", "third"],
+        )
+        .await;
+        let results = std::collections::HashMap::from([
+            (2, durability_group_result().remove(&1).unwrap()),
+            (0, durability_group_result().remove(&1).unwrap()),
+        ]);
+        recorder.callback()(&results).await;
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 2);
+        {
+            let outcomes = recorder.outcomes.lock().unwrap();
+            assert_eq!(outcomes.len(), 2);
+            assert_eq!(outcomes[&0].name, "first");
+            assert_eq!(outcomes[&2].name, "third");
+            assert!(outcomes[&0].recorded.is_some());
+            assert!(outcomes[&2].recorded.is_some());
+            assert!(!outcomes.contains_key(&1));
+        }
+        assert_eq!(recorder.board.snapshot()[1].state, "pending");
+        assert!(!logs.path().join("held.log").exists());
+        for name in ["first", "third"] {
+            assert_eq!(
+                std::fs::read_to_string(logs.path().join(format!("{name}.log"))).unwrap(),
+                "completed bytes\n"
+            );
+            let coordinate = recorder
+                .db
+                .query_opt_text(
+                    "SELECT commit_sha || ':' || defined_by_commit_sha || ':' || input_hash
+                 FROM check_result_observations WHERE check_name=?1",
+                    (name,),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                coordinate,
+                format!("original-head:original-definition:input-{name}")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_observation_and_fact_sink_failure_survives_slot_release_in_memory() {
+        const TARGET: &str = "cairn::review_durability";
+        crate::test_support::capture_log(TARGET);
+        let steps = ReviewPersistenceSteps {
+            observation: std::sync::Arc::new(|_, _| {
+                Err("injected-observation-and-fact-sink".into())
+            }),
+            fact: std::sync::Arc::new(|_, _, _, _| {
+                Box::pin(async { Err("injected fact sink failure".into()) })
+            }),
+            ..ReviewPersistenceSteps::default()
+        };
+        let (recorder, logs) = durability_group_fixture(steps).await;
+        let slot = recorder
+            .orch
+            .try_begin_turn_end_checks("j-1", "durability-wave")
+            .unwrap();
+        drop(slot);
+        assert!(recorder.orch.turn_end_check_runtime_status("j-1").is_none());
+        recorder.callback()(&durability_group_result()).await;
+        assert_eq!(durability_group_observation_count(&recorder.db).await, 0);
+        assert!(turn_end_durability_errors(&recorder.db, "j-1")
+            .await
+            .unwrap()
+            .is_empty());
+        let board_errors = recorder.board.durability_errors();
+        assert_eq!(board_errors.len(), 2);
+        assert!(board_errors
+            .iter()
+            .any(|failure| failure.member == "completed"
+                && failure.step == "observation"
+                && failure.error.contains("injected-observation-and-fact-sink")));
+        assert!(board_errors.iter().any(|failure| failure.step == "fact"
+            && failure.error.contains("injected fact sink failure")));
+        assert_eq!(
+            std::fs::read_to_string(logs.path().join("completed.log")).unwrap(),
+            "completed bytes\n"
+        );
+        assert!(!recorder.outcomes.lock().unwrap()[&1].is_genuine_failure());
+        let orch = recorder.orch.clone();
+        drop(recorder);
+        assert_eq!(orch.review_durability_errors("j-1"), board_errors);
+        let lines: Vec<_> = crate::test_support::captured_log(TARGET)
+            .into_iter()
+            .filter(|line| line.contains("injected-observation-and-fact-sink"))
+            .collect();
+        assert_eq!(lines.len(), 1, "the original ERROR precedes the fact sink");
+        assert!(lines[0].contains("member completed"));
+        assert!(lines[0].contains("observation persistence"));
+        assert!(crate::test_support::captured_log(TARGET)
+            .iter()
+            .any(|line| line.contains("member completed")
+                && line.contains("fact persistence")
+                && line.contains("injected fact sink failure")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_dispatch_error_keeps_its_reason_without_a_code_failure() {
+        let (recorder, logs) = durability_group_fixture(ReviewPersistenceSteps::default()).await;
+        let results = std::collections::HashMap::from([(
+            1,
+            Err(crate::execution::checks::CheckExecutionFailure::substrate(
+                crate::execution::checks::SubstrateFailureShape::Dispatch,
+                "group-specific reason",
+            )),
+        )]);
+        recorder.callback()(&results).await;
+        let outcomes = recorder.outcomes.lock().unwrap();
+        assert!(!outcomes[&1].is_genuine_failure());
+        assert!(outcomes[&1].output_tail.contains("group-specific reason"));
+        assert_eq!(
+            std::fs::read_to_string(logs.path().join("completed.log")).unwrap(),
+            "group-specific reason"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durability_group_malformed_failure_facts_are_not_silently_empty() {
+        let (recorder, _logs) = durability_group_fixture(ReviewPersistenceSteps::default()).await;
+        recorder
+            .db
+            .execute(
+                "UPDATE turn_end_check_attempts SET plan_json=?1 WHERE id='durability-wave'",
+                (r#"{"durabilityErrors":[{"wrong":"shape"}]}"#,),
+            )
+            .await
+            .unwrap();
+        let error = turn_end_durability_errors(&recorder.db, "j-1")
+            .await
+            .unwrap_err();
+        assert!(error.contains("durability-wave"));
+        assert!(error.contains("malformed durability errors"));
     }
 
     fn uncached_plan(name: &str) -> (CheckPlan, String) {

@@ -89,6 +89,20 @@ fn encode_cursor(received_at: &str, id: i64) -> String {
     format!("{received_at}|{id}")
 }
 
+/// Match the api's strict timestamp bound, with an id tie-breaker only for a
+/// composite cursor. Compare instants, not RFC 3339 spellings.
+fn is_after_cursor(event: &RelayEvent, cursor: Option<&str>) -> Result<bool, String> {
+    let Some(cursor) = cursor else {
+        return Ok(true);
+    };
+    let (since, after_id) = decode_cursor(cursor);
+    let since = chrono::DateTime::parse_from_rfc3339(since)
+        .map_err(|error| format!("invalid relay cursor timestamp: {error}"))?;
+    let received_at = chrono::DateTime::parse_from_rfc3339(&event.received_at)
+        .map_err(|error| format!("invalid relay event timestamp: {error}"))?;
+    Ok(received_at > since || (received_at == since && after_id.is_some_and(|id| event.id > id)))
+}
+
 fn event_cursor(event: &RelayEvent) -> String {
     encode_cursor(&event.received_at, event.id)
 }
@@ -271,6 +285,7 @@ pub(crate) enum EventOutcome {
 
 /// What every event on one sync shares.
 struct PageContext<'a> {
+    request_cursor: Option<&'a str>,
     private_key: &'a str,
     key_rotated_at: Option<&'a str>,
     /// The GitHub App's slug, when an App is connected.
@@ -369,6 +384,9 @@ async fn apply_page(
 ) -> Result<Option<String>, String> {
     let mut cursor = None;
     for event in events {
+        if !is_after_cursor(&event, ctx.request_cursor)? {
+            continue;
+        }
         let event_cursor = event_cursor(&event);
         let outcome = handle_event(orch, &event, ctx).await?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -459,11 +477,16 @@ pub(crate) async fn sync_once(orch: &Orchestrator, relay_url: &str) -> Result<()
 
         if !horizon_checked {
             horizon_checked = true;
-            channel::clear_rejection(&orch.db.local).await?;
+            if channel.health_state.as_deref() == Some("unauthorized") {
+                channel::clear_rejection(&orch.db.local).await?;
+            }
             if let Some(clamped) = response
                 .retention_horizon
                 .as_deref()
-                .filter(|horizon| precedes_horizon(cursor.as_deref(), horizon))
+                .filter(|horizon| {
+                    precedes_horizon(cursor.as_deref(), horizon)
+                        && !drained_since(channel.drained_at.as_deref(), horizon)
+                })
                 .and_then(horizon_cursor)
             {
                 // The horizon moves forward on every request, so an idle
@@ -472,35 +495,28 @@ pub(crate) async fn sync_once(orch: &Orchestrator, relay_url: &str) -> Result<()
                 // first sync has nothing to lose.
                 let stale = cursor
                     .as_deref()
-                    .filter(|_| {
-                        !response
-                            .retention_horizon
-                            .as_deref()
-                            .is_some_and(|horizon| {
-                                drained_since(channel.drained_at.as_deref(), horizon)
-                            })
-                    })
                     .map(|cursor| decode_cursor(cursor).0.to_string());
                 if let Some(stale) = &stale {
                     log::warn!("relay cursor {stale} is behind the retention horizon; syncing from {clamped}");
                 }
-                let now = chrono::Utc::now().to_rfc3339();
-                channel::update_relay_channel(&orch.db.local, {
-                    let clamped = clamped.clone();
-                    move |channel| {
-                        channel.last_event_sync = Some(clamped);
-                        if let Some(stale) = stale {
+                if let Some(stale) = stale {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    channel::update_relay_channel(&orch.db.local, {
+                        let clamped = clamped.clone();
+                        move |channel| {
+                            channel.last_event_sync = Some(clamped);
                             record_retention_gap(channel, &stale, &now);
                         }
-                    }
-                })
-                .await?;
+                    })
+                    .await?;
+                }
                 cursor = Some(clamped);
                 continue;
             }
         }
 
         let ctx = PageContext {
+            request_cursor: cursor.as_deref(),
             private_key: &private_key,
             key_rotated_at: channel.key_rotated_at.as_deref(),
             app_slug: app_slug.as_deref(),
@@ -770,6 +786,7 @@ mod tests {
 
         fn ctx(&self) -> PageContext<'_> {
             PageContext {
+                request_cursor: None,
                 private_key: &self.private_key,
                 key_rotated_at: None,
                 app_slug: Some("cairn-app"),
@@ -825,6 +842,179 @@ mod tests {
                 encryption: Some("sealed-v2".into()),
                 ..self.bug_event(id, "src_bugs", report)
             }
+        }
+    }
+
+    async fn serve_page(events: Vec<RelayEvent>) -> (String, tokio::task::JoinHandle<()>) {
+        let events: Vec<Value> = events
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "id": event.id, "event_type": event.event_type, "payload": event.payload,
+                    "received_at": event.received_at, "encrypted": event.encrypted,
+                    "endpoint_id": event.endpoint_id, "delivery_id": event.delivery_id,
+                    "verification": event.verification, "encryption": event.encryption
+                })
+            })
+            .collect();
+        let app = axum::Router::new().route(
+            "/events/{channel}",
+            axum::routing::get(move || {
+                let events = events.clone();
+                async move { axum::Json(json!({"events": events, "has_more": false})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, task)
+    }
+
+    async fn seed_sync_channel(db: &crate::storage::LocalDb, feed: &SealedFeed, cursor: String) {
+        let encrypted =
+            crypto::encrypt_private_key(&feed.private_key, &crypto::get_machine_id()).unwrap();
+        channel::update_relay_channel(db, move |channel| {
+            channel.channel_id = Some("ch-1".into());
+            channel.secret = Some("secret".into());
+            channel.private_key_encrypted = Some(encrypted);
+            channel.last_event_sync = Some(cursor);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn cursor_order_compares_instants_then_ids() {
+        let cursor = Some("2026-10-18T20:00:01.114Z|9");
+        let mut event = RelayEvent {
+            id: 9,
+            received_at: "2026-10-18T13:00:01.114000-07:00".into(),
+            ..Default::default()
+        };
+        assert!(!is_after_cursor(&event, cursor).unwrap());
+        event.id = 8;
+        assert!(!is_after_cursor(&event, cursor).unwrap());
+        event.id = 10;
+        assert!(is_after_cursor(&event, cursor).unwrap());
+        assert!(!is_after_cursor(&event, Some("2026-10-18T20:00:01.114Z")).unwrap());
+        event.received_at = "2026-10-18T20:00:01.115Z".into();
+        event.id = 1;
+        assert!(is_after_cursor(&event, cursor).unwrap());
+        event.received_at = "2026-10-18T20:00:01.113Z".into();
+        event.id = 99;
+        assert!(!is_after_cursor(&event, cursor).unwrap());
+    }
+
+    #[tokio::test]
+    async fn sync_drops_cursor_row_before_opening_and_writes_only_the_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let feed = SealedFeed::new(&db).await;
+        let mut replay = feed.bug_event(2, "src_bugs", 7);
+        let cursor = event_cursor(&replay);
+        // A replay must be discarded before decryption, not merely deduped by
+        // the endpoint consumer: opening this body would pause the channel.
+        replay.payload = json!("not a sealed body");
+        seed_sync_channel(&db, &feed, cursor).await;
+        let before = channel::get_relay_channel(&db).await.unwrap();
+        let (url, server) = serve_page(vec![replay]).await;
+        let writes = db.write_transaction_count();
+        sync_once(&orch, &url).await.unwrap();
+        assert_eq!(db.write_transaction_count(), writes + 1);
+        let mut after = channel::get_relay_channel(&db).await.unwrap();
+        assert!(after.drained_at.is_some());
+        after.drained_at = before.drained_at.clone();
+        assert_eq!(after, before);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM ingress_events").await, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_accepted_events_page_clears_only_an_existing_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let feed = SealedFeed::new(&db).await;
+        seed_sync_channel(&db, &feed, "2026-10-18T20:00:02.000Z|2".into()).await;
+        channel::mark_rejected(&db).await.unwrap();
+        let (url, server) = serve_page(vec![]).await;
+        let writes = db.write_transaction_count();
+        sync_once(&orch, &url).await.unwrap();
+        assert_eq!(db.write_transaction_count(), writes + 2);
+        assert_eq!(
+            channel::get_relay_channel(&db)
+                .await
+                .unwrap()
+                .health_state
+                .as_deref(),
+            Some("healthy")
+        );
+        let writes = db.write_transaction_count();
+        sync_once(&orch, &url).await.unwrap();
+        assert_eq!(db.write_transaction_count(), writes + 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_handles_only_the_new_row_after_a_replayed_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let feed = SealedFeed::new(&db).await;
+        let mut replay = feed.bug_event(2, "src_bugs", 7);
+        seed_sync_channel(&db, &feed, event_cursor(&replay)).await;
+        replay.payload = json!("not a sealed body");
+        let new = feed.bug_event(3, "src_bugs", 8);
+        let expected = event_cursor(&new);
+        let (url, server) = serve_page(vec![replay, new]).await;
+        sync_once(&orch, &url).await.unwrap();
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM ingress_events").await, 1);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM ingress_events WHERE delivery_id = 'bug-report:8' AND status = 'ok'").await, 1);
+        assert_eq!(
+            channel::get_relay_channel(&db)
+                .await
+                .unwrap()
+                .last_event_sync,
+            Some(expected)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replayed_delivery_and_skip_do_not_change_health_evidence() {
+        for endpoint in ["src_bugs", "src_unknown"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+            let feed = SealedFeed::new(&db).await;
+            let event = feed.bug_event(2, endpoint, 7);
+            let cursor = event_cursor(&event);
+            apply_page(&orch, vec![event], &feed.ctx()).await.unwrap();
+            seed_sync_channel(&db, &feed, cursor.clone()).await;
+            // Use a sentinel to prove a replay cannot restamp successful
+            // delivery or clear failure evidence that arrived since it.
+            channel::update_relay_channel(&db, |channel| {
+                channel.last_successful_delivery_at = Some("2026-10-18T19:00:00Z".into());
+                if endpoint == "src_bugs" {
+                    channel.health_state = Some("suspect".into());
+                    channel.health_reason = Some("relay_key_mismatch".into());
+                    channel.consecutive_failures = Some(1);
+                    channel.last_failure_at = Some("2026-10-18T21:00:00Z".into());
+                }
+            })
+            .await
+            .unwrap();
+            let before = channel::get_relay_channel(&db).await.unwrap();
+            let ctx = PageContext {
+                request_cursor: Some(&cursor),
+                ..feed.ctx()
+            };
+            let writes = db.write_transaction_count();
+            assert_eq!(
+                apply_page(&orch, vec![feed.bug_event(2, endpoint, 7)], &ctx)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(db.write_transaction_count(), writes);
+            assert_eq!(channel::get_relay_channel(&db).await.unwrap(), before);
         }
     }
 

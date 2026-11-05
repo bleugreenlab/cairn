@@ -6855,6 +6855,11 @@ impl Fleet {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn coalesced_leader_in_flight_for_test(&self, identity: &RequestIdentity) -> bool {
+        self.coalesced_leaders.lock().unwrap().contains(identity)
+    }
+
     /// Where one request's own execution stands, read by the identity it was
     /// queued under: `(request_id, attempt_id)`. A write-check batch is never
     /// coalesced, so it is read here directly rather than through a subscriber.
@@ -12594,7 +12599,7 @@ impl Fleet {
                             index,
                             "finished",
                             Some(format!(
-                                "finished in {} ({exit}); recorded when the wave ends",
+                                "finished in {} ({exit}); awaiting recording",
                                 crate::execution::checks_status::human_duration(duration_ms)
                             )),
                         );
@@ -38799,7 +38804,7 @@ mod tests {
         let snapshot = board.snapshot();
         assert_eq!(
             snapshot[0].annotation.as_deref(),
-            Some("finished in 4m 12s (exit 0); recorded when the wave ends")
+            Some("finished in 4m 12s (exit 0); awaiting recording")
         );
         assert!(
             snapshot[1].since_unix_ms.is_some(),

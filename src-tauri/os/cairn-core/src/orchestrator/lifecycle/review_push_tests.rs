@@ -4247,17 +4247,15 @@ async fn a_silent_member_ends_its_wave_as_a_named_stall_beside_recorded_siblings
 /// Owner acceptance for cairn/6083 (cairn/6091): cancellation must retain a
 /// complete group's immutable evidence even while another placement is held.
 ///
-/// The second grant is an ordering barrier ONLY while placement groups are
-/// submitted serially: the first full Result has returned into the coordinator
-/// before it submits the second group. ProcessItemCompleted is not that barrier.
-/// When 6083 makes submission concurrent, replace this trigger with the owner's
-/// explicit durable-completion acknowledgment (observation AND log), not a sleep
-/// or a status callback, before treating a green run as acceptance.
+/// Grant order and process-status callbacks do not prove persistence. Before
+/// cancellation, read the completed group's immutable observations through a
+/// fresh database handle and its logs from disk while the other group runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(jj)]
-#[ignore = "owner acceptance: cairn/6083 must retain completed groups across cancellation; concurrent submission needs a durable-completion acknowledgment"]
 async fn cancellation_retains_completed_placement_evidence_under_the_original_plan() {
-    use cairn_common::executor_protocol::{CellOutcome, CommandStop, ExecutorMessage};
+    use cairn_common::executor_protocol::{
+        CellOutcome, CommandStop, ExecutorMessage, RunnerCallback,
+    };
 
     let bin = crate::jj::tests::jj_bin()
         .expect("owner acceptance requires jj; a missing fixture capability is not a pass");
@@ -4317,7 +4315,10 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
     ));
     let mut original_plan = None;
     let mut original_plan_json = None;
-    for group in 0..2 {
+    let mut held_started = false;
+    let mut held_request = None;
+    let mut waiting_since = None;
+    for _ in 0..2 {
         let (request, batch) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
             loop {
                 match executor
@@ -4345,6 +4346,17 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
         })
         .await
         .expect("the next placement group reaches the fake machine");
+        assert_eq!(
+            request.wait_horizon_unix_ms,
+            u64::MAX,
+            "each group retains the durable parked horizon, not a finite wait deadline"
+        );
+        assert_ne!(request.waiting_since_unix_ms, 0);
+        assert_eq!(
+            request.waiting_since_unix_ms,
+            *waiting_since.get_or_insert(request.waiting_since_unix_ms),
+            "concurrent groups share the wave's original wait start"
+        );
         let board = orch
             .turn_end_check_runtime_status("j-prod")
             .and_then(|status| status.board)
@@ -4361,18 +4373,27 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
                 board.snapshot()[index].name.clone()
             })
             .collect();
-        if group == 1 {
-            assert_eq!(names, ["held-b"], "distinct placement stays pending");
-            // Intentionally send neither status completion nor a full Result.
-            // On the serial implementation this grant proves the first group's
-            // authoritative Result has been consumed, not merely sent.
-            orch.cancel_turn_end_checks(
-                "j-prod",
-                crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
-            );
-            break;
+        if names == ["held-b"] {
+            assert!(!held_started, "the held group is granted exactly once");
+            held_request = Some((request.request_id.clone(), request.attempt_id.clone()));
+            orch.fleet
+                .handle_runner_callback(
+                    &orch,
+                    RunnerCallback::ProcessItemStarted {
+                        runner_context_id: batch.runner_context_id.clone().unwrap(),
+                        stream_id: batch.items[0].stream_id.clone(),
+                    },
+                )
+                .await;
+            held_started = true;
+            // Send neither status completion nor a full Result for this group.
+            continue;
         }
         assert_eq!(names, ["fast-a", "stopped-a"]);
+        assert!(
+            original_plan.is_none(),
+            "the completed group is granted once"
+        );
         let attempt_id = attempt.clone();
         let plan_json = orch
             .db
@@ -4455,6 +4476,70 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
         original_plan = Some(plan);
         original_plan_json = Some(plan_json);
     }
+    assert!(held_started, "the sibling is running before cancellation");
+    // Poll authoritative outputs, not grant order or a process-status event.
+    // This timeout only bounds a regression; elapsed time never implies success.
+    let durable = LocalDb::open(orch.db.local.path()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            let count = durable
+                .read(|conn| {
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT COUNT(*) FROM check_result_observations \
+                                 WHERE job_id='j-prod' AND cadence='review' \
+                                 AND check_name IN ('fast-a','stopped-a')",
+                                (),
+                            )
+                            .await?;
+                        rows.next().await?.unwrap().i64(0)
+                    })
+                })
+                .await
+                .unwrap();
+            let logs_present = ["fast-a", "stopped-a"].iter().all(|name| {
+                std::fs::read_to_string(
+                    orch.config_dir
+                        .join("turn-checks/j-prod")
+                        .join(format!("{name}.log")),
+                )
+                .is_ok_and(|output| output.contains(&format!("{name} original output")))
+            });
+            if count == 2 && logs_present {
+                break;
+            }
+            assert!(
+                !wave.is_finished(),
+                "durability must precede wave completion"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both observations and logs become durable while the sibling runs");
+    assert!(!wave.is_finished());
+    let board = orch
+        .turn_end_check_runtime_status("j-prod")
+        .and_then(|status| status.board)
+        .unwrap();
+    assert_eq!(
+        board
+            .snapshot()
+            .iter()
+            .find(|entry| entry.name == "held-b")
+            .unwrap()
+            .state,
+        "running",
+        "the other placement has not returned its result"
+    );
+    // The head has not advanced. A staleness cancellation would deliberately
+    // arm an automatic successor before joining, racing the same-input wave
+    // this fixture starts explicitly below.
+    orch.cancel_turn_end_checks(
+        "j-prod",
+        crate::orchestrator::TurnEndCancelReason::UserRequested,
+    );
     tokio::time::timeout(std::time::Duration::from_secs(120), wave)
         .await
         .expect("cancellation joins without a held-group result")
@@ -4463,6 +4548,52 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
         !orch.turn_end_checks_in_flight("j-prod"),
         "the slot is released"
     );
+    let held_request = held_request.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            if let ExecutorMessage::Cancel {
+                request_id,
+                attempt_id,
+            } = executor
+                .recv()
+                .await
+                .expect("the fake fleet link stays open")
+            {
+                assert_eq!((request_id.clone(), attempt_id.clone()), held_request);
+                // Cancellation is a stop request, not proof the command ended.
+                // Answer as an executor does after stopping its process, without
+                // manufacturing any process result or reusable verdict.
+                orch.fleet.handle_executor_message(
+                    crate::fleet::COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::Result {
+                        request_id: request_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        outcome: CellOutcome::Cancelled {
+                            request_id,
+                            attempt_id,
+                        },
+                    },
+                );
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the original held request is told to stop and answers cancelled");
+    // Result delivery settles the queue synchronously, but its leader removes
+    // the coalescing tombstone asynchronously. Reusing the same inputs before
+    // that removal would join the cancelled execution rather than start anew.
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while orch
+            .fleet
+            .coalesced_leader_in_flight_for_test(&held_request)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the original cancelled leader publishes its terminal outcome");
 
     // Read through a fresh handle, not the hot cache or the wave's status board.
     let reopened = LocalDb::open(orch.db.local.path()).await.unwrap();
@@ -4574,9 +4705,11 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
     assert_eq!(stopped["reusable"], 0);
     assert_eq!(stopped["failure"], "infrastructure");
 
+    let lookup_plan = plan.clone();
     let reused = reopened
         .read(move |conn| {
             Box::pin(async move {
+                let plan = lookup_plan;
                 let hit = crate::execution::checks::reusable_verdict_for_check_conn(
                     conn,
                     "p-rev",
@@ -4611,4 +4744,174 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
         passed["id"].as_str(),
         "same-input reuse cites the original immutable observation"
     );
+
+    // Exercise the coordinator's next wave, not only its cache predicate. The
+    // successful lane must be reused; both lanes without verdicts must submit.
+    let (next_attempt, next_slot) = claimed_slot(&orch, "j-prod");
+    let next_wave = tokio::spawn(crate::execution::checks_turn_end::run_turn_end_checks(
+        orch.clone(),
+        "j-prod".to_string(),
+        next_slot,
+    ));
+    let mut submitted = std::collections::HashSet::new();
+    let mut pending_requests = std::collections::HashSet::new();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while submitted.len() < 2 {
+            match executor
+                .recv()
+                .await
+                .expect("the fake fleet link stays open")
+            {
+                ExecutorMessage::Offer { entry_id, .. } => {
+                    orch.fleet.handle_executor_message(
+                        crate::fleet::COLOCATED_EXECUTOR_ID,
+                        generation,
+                        ExecutorMessage::Claim { entry_id },
+                    );
+                }
+                ExecutorMessage::Granted {
+                    request,
+                    batch: Some(batch),
+                    ..
+                } => {
+                    pending_requests.insert((request.request_id, request.attempt_id));
+                    let board = orch
+                        .turn_end_check_runtime_status("j-prod")
+                        .and_then(|status| status.board)
+                        .unwrap();
+                    for item in &batch.items {
+                        let index: usize = item
+                            .stream_id
+                            .rsplit_once(":check-")
+                            .and_then(|(_, index)| index.parse().ok())
+                            .unwrap();
+                        let name = board.snapshot()[index].name.clone();
+                        assert_ne!(
+                            name, "fast-a",
+                            "the completed verdict is not executed again"
+                        );
+                        assert!(
+                            submitted.insert(name),
+                            "a missing verdict submits only once"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the next wave submits both lanes without reusable verdicts");
+    assert_eq!(
+        submitted,
+        ["held-b".to_string(), "stopped-a".to_string()].into()
+    );
+    let next_plan: crate::execution::checks_turn_end::WavePlan = reopened
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT plan_json FROM turn_end_check_attempts WHERE id=?1",
+                        (next_attempt.as_str(),),
+                    )
+                    .await?;
+                rows.next().await?.unwrap().text(0)
+            })
+        })
+        .await
+        .map(|json| serde_json::from_str(&json).unwrap())
+        .unwrap();
+    assert_eq!(next_plan.head, plan.head);
+    assert_eq!(next_plan.tree_hash, plan.tree_hash);
+    assert_eq!(next_plan.input_hashes, plan.input_hashes);
+    let next_board = orch
+        .turn_end_check_runtime_status("j-prod")
+        .and_then(|status| status.board)
+        .unwrap();
+    let snapshot = next_board.snapshot();
+    let cached = snapshot
+        .iter()
+        .find(|entry| entry.name == "fast-a")
+        .unwrap();
+    assert_eq!(cached.state, "passed");
+    assert!(cached.cached, "the coordinator reports actual reuse");
+    assert!(
+        std::fs::read_to_string(orch.config_dir.join("turn-checks/j-prod/fast-a.log"))
+            .unwrap()
+            .contains("fast-a original output"),
+        "launching another wave must not erase the reused member's log"
+    );
+
+    // Neither successor group returns a Result: cancellation must reach both
+    // outstanding requests, rather than only the most recently submitted one.
+    assert_eq!(pending_requests.len(), 2);
+    let successor_requests = pending_requests.clone();
+    orch.cancel_turn_end_checks(
+        "j-prod",
+        crate::orchestrator::TurnEndCancelReason::UserRequested,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(120), next_wave)
+        .await
+        .expect("cancellation joins with every successor group still held")
+        .expect("the successor wave does not panic");
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while !pending_requests.is_empty() {
+            if let ExecutorMessage::Cancel {
+                request_id,
+                attempt_id,
+            } = executor
+                .recv()
+                .await
+                .expect("the fake fleet link stays open")
+            {
+                assert!(pending_requests.remove(&(request_id.clone(), attempt_id.clone())));
+                orch.fleet.handle_executor_message(
+                    crate::fleet::COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::Result {
+                        request_id: request_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        outcome: CellOutcome::Cancelled {
+                            request_id,
+                            attempt_id,
+                        },
+                    },
+                );
+            }
+        }
+    })
+    .await
+    .expect("cancellation is delivered to every outstanding placement request");
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while successor_requests
+            .iter()
+            .any(|identity| orch.fleet.coalesced_leader_in_flight_for_test(identity))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both successor leaders publish their cancelled outcomes");
+    assert!(!orch.turn_end_checks_in_flight("j-prod"));
+    let remaining = reopened
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM check_result_observations \
+                     WHERE job_id='j-prod' AND check_name='fast-a' AND cadence='review'",
+                        (),
+                    )
+                    .await?;
+                let id = rows.next().await?.unwrap().text(0)?;
+                assert!(
+                    rows.next().await?.is_none(),
+                    "reuse does not invent another observation"
+                );
+                Ok::<_, crate::storage::DbError>(id)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(Some(remaining.as_str()), passed["id"].as_str());
 }

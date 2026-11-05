@@ -793,9 +793,10 @@ pub struct NodeCheckStatus {
     pub(crate) base_attribution: Option<BaseAttribution>,
 }
 
-/// Where one member of a running review wave stands. The members run in order
-/// in one cell, so at most one is `running`; the rest have `finished` (and
-/// wait for the wave to record them) or are `queued` behind it. A member whose
+/// Where one member of a running review wave stands. Members run in order
+/// within each placement group; independent groups can run concurrently.
+/// Completed members await recording, and queued members wait only for their
+/// own group's runner. A member whose
 /// question another request was already answering is `shared`: that
 /// execution's reports go to its own leader, not this wave.
 ///
@@ -815,12 +816,19 @@ pub(crate) enum LaneProgress {
     Queued { behind: Option<String> },
     #[serde(rename_all = "camelCase")]
     Shared { request_id: Option<String> },
+    #[serde(rename_all = "camelCase")]
+    Dispatching {
+        dispatch_phase: String,
+        label: Option<String>,
+        diagnostic: Option<String>,
+        since_unix_ms: Option<u64>,
+    },
 }
 
 impl LaneProgress {
     /// Whether the lane has left the queue.
     fn is_started(&self) -> bool {
-        !matches!(self, Self::Queued { .. })
+        !matches!(self, Self::Queued { .. } | Self::Dispatching { .. })
     }
 
     /// The lane's line, at `now_unix_ms`.
@@ -839,13 +847,25 @@ impl LaneProgress {
                 annotation: Some(annotation),
                 ..
             } => annotation.clone(),
-            Self::Finished { .. } => "finished; recorded when the wave ends".to_string(),
+            Self::Finished { .. } => "finished; awaiting recording".to_string(),
             Self::Queued { behind: Some(name) } => format!("queued behind {name}"),
             Self::Queued { behind: None } => "queued".to_string(),
             Self::Shared {
                 request_id: Some(id),
             } => format!("answered by a shared execution (request {id})"),
             Self::Shared { request_id: None } => "answered by a shared execution".to_string(),
+            Self::Dispatching {
+                dispatch_phase,
+                label,
+                diagnostic,
+                ..
+            } => {
+                let label = label.as_deref().unwrap_or(dispatch_phase);
+                match diagnostic {
+                    Some(diagnostic) => format!("{label}: {diagnostic}"),
+                    None => label.to_string(),
+                }
+            }
         }
     }
 }
@@ -880,6 +900,28 @@ pub(crate) fn wave_lane_progress(
                 .map(|other| other.name.clone()),
         },
     })
+}
+
+/// Resolve membership before interpreting a board: raw entry order is not a
+/// placement boundary.
+pub(crate) fn grouped_lane_progress(
+    board: &crate::execution::checks::CheckStatusBoard,
+    name: &str,
+    request_id: Option<&String>,
+) -> Option<LaneProgress> {
+    let progress = wave_lane_progress(&board.lane_snapshot(name), name, request_id)?;
+    if matches!(progress, LaneProgress::Queued { behind: None }) {
+        let phase = board.lane_phase(name);
+        if let Some(dispatch_phase) = phase.phase.filter(|phase| phase != "running") {
+            return Some(LaneProgress::Dispatching {
+                dispatch_phase,
+                label: phase.label,
+                diagnostic: phase.diagnostic,
+                since_unix_ms: phase.since_unix_ms,
+            });
+        }
+    }
+    Some(progress)
 }
 
 /// A duration as a reader wants it: `42s`, `4m 12s`, `15h 41m`.
@@ -1045,8 +1087,48 @@ async fn compute_node_check_statuses(
             settled_statuses(orch, job_id, &db, &coords, cadence, &mut clock).await,
         )
     };
+    let mut statuses = statuses?;
+    let durability =
+        crate::execution::checks_turn_end::turn_end_durability_errors(&db, job_id).await;
+    append_durability_notices(&mut statuses, durability);
+    append_durability_notices(&mut statuses, Ok(orch.review_durability_errors(job_id)));
+    clock.lap("durability");
     clock.report(job_id, branch);
-    statuses
+    Some(statuses)
+}
+
+fn append_durability_notices(
+    statuses: &mut [NodeCheckStatus],
+    durability: Result<Vec<crate::execution::checks_turn_end::ReviewDurabilityError>, String>,
+) {
+    for status in statuses
+        .iter_mut()
+        .filter(|status| status.when == CheckWhen::Review.as_str())
+    {
+        let notices = match &durability {
+            Ok(errors) => errors
+                .iter()
+                .filter(|error| error.member == status.name)
+                .map(|error| {
+                    format!(
+                        "{} persistence failed for {}: {}",
+                        error.step, error.member, error.error
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => vec![format!("Review durability status unreadable: {error}")],
+        };
+        for message in notices {
+            let notice = status.notice.get_or_insert_with(String::new);
+            if notice.contains(&message) {
+                continue;
+            }
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&message);
+        }
+    }
 }
 
 /// The projection while a wave is in flight.
@@ -1142,11 +1224,7 @@ async fn live_statuses(
         Some(&plan.applicable_names),
         &status.request_ids,
         cadence,
-        status
-            .board
-            .as_ref()
-            .map(crate::execution::checks::CheckStatusBoard::snapshot)
-            .as_deref(),
+        status.board.as_ref(),
     );
     Some(with_unsupported_lanes(statuses, job_id, &plan.unsupported))
 }
@@ -1554,7 +1632,7 @@ fn assemble_statuses(
     applicable_names: Option<&HashSet<String>>,
     request_ids: &HashMap<String, String>,
     cadence: WaveCadence,
-    wave_board: Option<&[CheckStatusEntry]>,
+    wave_board: Option<&crate::execution::checks::CheckStatusBoard>,
 ) -> Vec<NodeCheckStatus> {
     let LaneVerdicts {
         rows: rows_by_name,
@@ -1604,18 +1682,15 @@ fn assemble_statuses(
                 return status;
             }
 
-            // A review wave's members run IN ORDER in one cell, and the wave's
-            // own board says which one the executor is running, which have
-            // finished, and which wait behind it. So at most one review lane
-            // reads as running, and a silent-but-active member still does,
-            // because the executor reported its start. Before the wave has
-            // published a board (still planning or deferring), every review
-            // lane is pending. A running write wave carries no per-lane
-            // board here, so its lanes read as running together.
+            // Placement groups run independently. The board supplies each
+            // lane's own group, so another group's runner or dispatch report
+            // cannot become its blocker or machine. Before publication every
+            // review lane is pending; write waves have no per-lane board here.
             let progress = (cadence.review && check.when == CheckWhen::Review && !not_applicable)
                 .then(|| {
-                    wave_board
-                        .and_then(|board| wave_lane_progress(board, &name, request_ids.get(&name)))
+                    wave_board.and_then(|board| {
+                        grouped_lane_progress(board, &name, request_ids.get(&name))
+                    })
                 })
                 .flatten();
             let started = (cadence.write && check.when == CheckWhen::Write && !not_applicable)
@@ -1628,15 +1703,11 @@ fn assemble_statuses(
                 LaneEvidence::Recorded | LaneEvidence::Pending => NodeCheckState::Pending,
             };
 
-            // Only the actively-running check carries a live tail (and it may
-            // still be None before its first line); pending and not-applicable
-            // rows have none.
-            let output_tail = if started {
+            let output_tail = unrecorded_output_tail(check.when, started, || {
                 read_turn_end_log_tail(orch, job_id, &name)
-            } else {
-                None
-            };
+            });
 
+            let executor = wave_board.and_then(|board| board.lane_phase(&name).executor);
             NodeCheckStatus {
                 job_id: job_id.to_string(),
                 request_id: request_ids.get(&name).cloned(),
@@ -1659,7 +1730,7 @@ fn assemble_statuses(
                 output_tail,
                 failure_kind: None,
                 suppressed_after: None,
-                executor: None,
+                executor,
                 verified_on: None,
                 notice: None,
                 declared_unverified: None,
@@ -1668,6 +1739,21 @@ fn assemble_statuses(
             }
         })
         .collect()
+}
+
+// Review logs are retained across waves and replaced only when a placement
+// group completes. Until a current observation exists, the job/member path can
+// still belong to an earlier wave; only write checks stream into it live.
+fn unrecorded_output_tail(
+    when: CheckWhen,
+    started: bool,
+    read_tail: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if when == CheckWhen::Write && started {
+        read_tail()
+    } else {
+        None
+    }
 }
 
 /// Verdicts this job recorded on an earlier head whose own patch is the current
@@ -2591,6 +2677,100 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn a_new_review_wave_never_reads_a_retained_previous_wave_log() {
+        let previous_wave_log = "previous head: test failed";
+        for started in [false, true] {
+            assert_eq!(
+                unrecorded_output_tail(CheckWhen::Review, started, || {
+                    panic!("must not read retained log: {previous_wave_log}")
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            unrecorded_output_tail(CheckWhen::Write, false, || panic!("not started")),
+            None
+        );
+        assert_eq!(
+            unrecorded_output_tail(CheckWhen::Write, true, || Some(
+                "current write output".into()
+            )),
+            Some("current write output".into())
+        );
+        let mut current = verdict_row("rust", false);
+        current.output_tail = "current head: test failed".into();
+        current.passed = false;
+        let status = status_from_row(
+            "job",
+            None,
+            "rust",
+            CheckPolicy::Advisory,
+            CheckWhen::Review,
+            &current,
+            None,
+        );
+        assert!(status
+            .output_tail
+            .unwrap()
+            .contains("current head: test failed"));
+    }
+
+    #[test]
+    fn durability_notices_preserve_member_verdicts_and_existing_notices() {
+        use crate::execution::checks_turn_end::ReviewDurabilityError;
+        let mut statuses = vec![
+            test_status("rust", "advisory", "review", NodeCheckState::Passed),
+            test_status("lint", "advisory", "review", NodeCheckState::Pending),
+            test_status("rust", "advisory", "write", NodeCheckState::Passed),
+        ];
+        statuses[0].notice = Some("Earlier observation retained.".into());
+        append_durability_notices(
+            &mut statuses,
+            Ok(vec![
+                ReviewDurabilityError {
+                    member: "rust".into(),
+                    step: "log".into(),
+                    error: "disk full".into(),
+                },
+                ReviewDurabilityError {
+                    member: "lint".into(),
+                    step: "observation".into(),
+                    error: "database unavailable".into(),
+                },
+            ]),
+        );
+        assert_eq!(statuses[0].state, NodeCheckState::Passed);
+        assert_eq!(statuses[1].state, NodeCheckState::Pending);
+        assert_eq!(
+            statuses[0].notice.as_deref(),
+            Some("Earlier observation retained. log persistence failed for rust: disk full")
+        );
+        assert_eq!(
+            statuses[1].notice.as_deref(),
+            Some("observation persistence failed for lint: database unavailable")
+        );
+        assert_eq!(statuses[2].notice, None);
+        assert!(format_status_annotation(&statuses[0])
+            .unwrap()
+            .contains("disk full"));
+    }
+
+    #[test]
+    fn unreadable_durability_status_is_explicit_on_review_lanes() {
+        let mut statuses = vec![
+            test_status("rust", "advisory", "review", NodeCheckState::Passed),
+            test_status("lint", "advisory", "write", NodeCheckState::Passed),
+        ];
+        append_durability_notices(&mut statuses, Err("invalid durability facts".into()));
+        assert_eq!(
+            statuses[0].notice.as_deref(),
+            Some("Review durability status unreadable: invalid durability facts")
+        );
+        assert_eq!(statuses[0].state, NodeCheckState::Passed);
+        assert_eq!(statuses[1].notice, None);
+    }
 
     #[test]
     fn a_check_this_build_cannot_run_is_an_unsupported_lane_with_its_notice() {

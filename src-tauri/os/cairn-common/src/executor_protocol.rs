@@ -5522,6 +5522,14 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6083 does not move the number. The runner submits independent
+/// pure-verdict placement groups concurrently and records each group's results
+/// when it returns. Each group is the same ordinary batch an older executor
+/// already accepts; no frame, variant, field, or per-cell ordering changes.
+/// The fleet edit changes only runner-side status text. A runner talking to an
+/// older executor gets nothing wrong: that executor handles each request and
+/// reports its existing per-item outcomes as before.
+///
 /// cairn/5909 does not move the number. The Windows prerequisite script the
 /// executor embeds also judges `clang-cl` under `-CheckPrerequisites`, so a
 /// Windows host lacking it now reports the existing `Missing` verdict, and

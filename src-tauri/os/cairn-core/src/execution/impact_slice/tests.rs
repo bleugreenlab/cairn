@@ -278,6 +278,7 @@ fn lane_with_env(
         run_context: None,
         mutation_policy: crate::fleet::MutationPolicy::AllowDelta,
         status_board: None,
+        on_group_complete: None,
         purpose: None,
     };
     (batch, item)

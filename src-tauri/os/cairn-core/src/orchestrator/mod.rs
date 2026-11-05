@@ -106,6 +106,7 @@ pub use crate::account::AnonDeviceManager;
 pub use account_manager::AccountManager;
 pub use attention::{AttentionEvent, AttentionFact, AttentionFactKey};
 
+type ReviewLogGeneration = Arc<Mutex<Option<String>>>;
 type ProviderUsageSnapshots = Arc<cairn_models::usage::book::UsageBook>;
 pub(crate) type ProviderUsageCaptures = Arc<Mutex<HashSet<(String, String)>>>;
 
@@ -880,6 +881,8 @@ impl OrchestratorBuilder {
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             suspension_resolvers: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            review_durability_errors: Arc::new(Mutex::new(HashMap::new())),
+            review_log_generations: Arc::new(Mutex::new(HashMap::new())),
             recent_turn_end_check_requests: self.recent_turn_end_check_requests,
             main_cadence: Arc::new(Mutex::new(Default::default())),
             artifact_revisions: Arc::new(
@@ -1133,9 +1136,10 @@ pub(crate) struct TurnEndCheckRuntimeStatus {
     /// When the wave published its plan.
     pub planned_at_unix_ms: u64,
     /// The wave's own status board, once it has decided which lanes to submit:
-    /// which member the executor is running, which have finished, and which
-    /// wait behind them. Members run in order in one cell, so at most one is
-    /// running at a time.
+    /// which members each placement group is running, which have finished,
+    /// and which wait behind their own group's runner. Members run in order
+    /// within a group; independent groups can run concurrently, with their own
+    /// machine and dispatch phase.
     pub board: Option<crate::execution::checks::CheckStatusBoard>,
     /// When the wave was submitted to the fleet; `None` while it still plans
     /// or defers to the node's own work.
@@ -1643,6 +1647,13 @@ pub struct Orchestrator {
         Mutex<HashMap<String, crate::orchestrator::build_services::BuildServiceRuntimeDiagnostic>>,
     >,
     turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
+    /// Fault notices outlive a wave's slot, including late detached completion.
+    /// Runtime-only: an unfinished observation is rerun after process exit.
+    review_durability_errors:
+        Arc<Mutex<HashMap<String, Vec<crate::execution::checks_turn_end::ReviewDurabilityError>>>>,
+    /// The newest wave allowed to replace each job's shared member log files.
+    /// Entries outlive slot release because completion recorders can detach.
+    review_log_generations: Arc<Mutex<HashMap<String, ReviewLogGeneration>>>,
     /// Request identities from the newest review wave for each job. Kept after
     /// settlement so the equally short-lived Work history can join a completed
     /// executor row back to its exact check lane without guessing by command.
@@ -2732,6 +2743,67 @@ impl Orchestrator {
     /// attempt `attempt_id`. The returned [`TurnEndSlot`] holds the slot until it
     /// is finished or dropped; `Err` means a wave already holds it, and the
     /// caller must NOT spawn another suite.
+    pub(crate) fn remember_review_durability_error(
+        &self,
+        job_id: &str,
+        failure: crate::execution::checks_turn_end::ReviewDurabilityError,
+    ) {
+        let mut errors = self
+            .review_durability_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let errors = errors.entry(job_id.to_string()).or_default();
+        if !errors.contains(&failure) {
+            errors.push(failure);
+        }
+    }
+
+    pub(crate) fn review_durability_errors(
+        &self,
+        job_id: &str,
+    ) -> Vec<crate::execution::checks_turn_end::ReviewDurabilityError> {
+        self.review_durability_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(job_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn review_log_generation(&self, job_id: &str) -> ReviewLogGeneration {
+        self.review_log_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(job_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) fn register_review_log_generation(&self, job_id: &str, attempt_id: &str) {
+        *self
+            .review_log_generation(job_id)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attempt_id.to_string());
+    }
+
+    /// Keep generation comparison and the entire synchronous write under the
+    /// same per-job lock. Never call back into slot acquisition from `write`.
+    pub(crate) fn with_current_review_log_generation<T>(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        write: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let generation = self.review_log_generation(job_id);
+        let current = generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_deref() != Some(attempt_id) {
+            return None;
+        }
+        Some(write())
+    }
+
     pub fn try_begin_turn_end_checks(
         &self,
         job_id: &str,
@@ -2744,6 +2816,10 @@ impl Orchestrator {
         if map.contains_key(job_id) {
             return Err(TurnEndSlotHeld);
         }
+        // Invalidate detached old recorders before this wave can start planning.
+        // Registration and writes share the generation lock, so an old writer
+        // already inside it finishes before the new generation is installed.
+        self.register_review_log_generation(job_id, attempt_id);
         let cancel = TurnEndCancel::default();
         map.insert(job_id.to_string(), cancel.clone());
         drop(map);

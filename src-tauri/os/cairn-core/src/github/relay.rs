@@ -495,6 +495,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_replayed_mapped_mention_mints_one_fact_and_one_wake() {
+        use crate::services::testing::{MockGitClient, TestServicesBuilder};
+        let temp = tempfile::tempdir().unwrap();
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .returning(|_| Ok("git@github.com:cairn/cairn.git".into()));
+        let (orch, db) = crate::routes::fixture::orchestrator_with(
+            temp.path(),
+            &[],
+            TestServicesBuilder::new().with_git(git),
+        )
+        .await;
+        crate::routes::fixture::standing_triggers(&db, "watcher", r#"[{"fact":"github_comment"}]"#)
+            .await;
+        let payload = comment("alice", "User", "@cairn-app please investigate");
+        for _ in 0..2 {
+            assert_eq!(
+                process_event(
+                    &orch,
+                    101,
+                    "issue_comment",
+                    &payload,
+                    "cairn-app",
+                    machine(&orch)
+                )
+                .await
+                .unwrap(),
+                ProcessEventOutcome::Routed
+            );
+            crate::routes::drain_fact_log(&orch).await;
+        }
+        for sql in [
+            "SELECT COUNT(*) FROM fact_log WHERE source = 'github_comment'",
+            "SELECT COUNT(*) FROM fact_log_wakes WHERE job_id = 'watcher'",
+            "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'watcher-run' AND content LIKE '[Event]%'",
+        ] {
+            assert_eq!(db.query_opt_i64(sql, ()).await.unwrap(), Some(1), "{sql}");
+        }
+    }
+
+    #[tokio::test]
     async fn process_event_reports_ignored_non_mentions() {
         let (orch, _) = test_orchestrator("relay-ignored-event.db").await;
 

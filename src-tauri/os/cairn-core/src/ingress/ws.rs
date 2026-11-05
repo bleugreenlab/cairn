@@ -36,6 +36,8 @@ const PING_EVERY: Duration = Duration::from_secs(30);
 const SILENCE_LIMIT: Duration = Duration::from_secs(75);
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// A handshake alone proves nothing: older relays upgrade before authenticating.
+const WORKING_CONNECTION_MIN: Duration = Duration::from_secs(30);
 
 /// What the doorbell tells the sync loop: whether it is up, and a ring.
 #[derive(Debug, Default)]
@@ -134,11 +136,20 @@ fn is_events_nudge(text: &str) -> bool {
         .is_some_and(|frame| frame["kind"] == "events")
 }
 
+enum ListenEnd {
+    Disconnected(String),
+    ChannelChanged,
+}
+
 /// Read frames until the socket ends or goes silent, ringing on each nudge.
 ///
 /// The stream is not split: reading through the whole `WebSocketStream` is
 /// what lets tungstenite answer the api's protocol pings.
-async fn listen(mut socket: RelaySocket, doorbell: &Doorbell, relay: &channel::RelaySignals) {
+async fn listen(
+    mut socket: RelaySocket,
+    doorbell: &Doorbell,
+    relay: &channel::RelaySignals,
+) -> ListenEnd {
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await;
@@ -147,34 +158,34 @@ async fn listen(mut socket: RelaySocket, doorbell: &Doorbell, relay: &channel::R
         tokio::select! {
             frame = socket.next() => {
                 let frame = match frame {
-                    None => return,
-                    Some(Err(error)) => {
-                        log::debug!("relay doorbell read failed: {error}");
-                        return;
-                    }
+                    None => return ListenEnd::Disconnected("stream ended without a close frame".into()),
+                    Some(Err(error)) => return ListenEnd::Disconnected(format!("read failed: {error}")),
                     Some(Ok(frame)) => frame,
                 };
                 heard = tokio::time::Instant::now();
                 match frame {
                     Message::Text(text) if is_events_nudge(&text) => doorbell.ring(),
-                    Message::Close(_) => return,
+                    Message::Close(frame) => return ListenEnd::Disconnected(match frame {
+                        Some(frame) => format!("close code={}, reason={}", u16::from(frame.code), frame.reason),
+                        None => "close without a code or reason".into(),
+                    }),
                     _ => {}
                 }
             }
             _ = ping.tick() => {
-                if socket.send(Message::Text("ping".into())).await.is_err() {
-                    return;
+                if let Err(error) = socket.send(Message::Text("ping".into())).await {
+                    return ListenEnd::Disconnected(format!("ping failed: {error}"));
                 }
             }
             // The channel was replaced or deleted: this socket may be on one
             // the install no longer holds. Reconnect, re-reading the row.
-            _ = relay.channel_changed() => return,
+            _ = relay.channel_changed() => return ListenEnd::ChannelChanged,
             _ = tokio::time::sleep_until(heard + SILENCE_LIMIT) => {
                 log::debug!(
                     "relay doorbell heard nothing for {}s; reconnecting",
                     SILENCE_LIMIT.as_secs()
                 );
-                return;
+                return ListenEnd::Disconnected("silence limit exceeded".into());
             }
         }
     }
@@ -184,6 +195,7 @@ async fn listen(mut socket: RelaySocket, doorbell: &Doorbell, relay: &channel::R
 pub(crate) async fn maintain(orch: Orchestrator, relay_url: String, doorbell: Arc<Doorbell>) {
     let relay = orch.relay.clone();
     let mut backoff = RECONNECT_MIN;
+    let mut short_connections = 0_u32;
     loop {
         let channel = channel::get_relay_channel(&orch.db.local)
             .await
@@ -207,16 +219,32 @@ pub(crate) async fn maintain(orch: Orchestrator, relay_url: String, doorbell: Ar
             }
             Ok(url) => match connect(&url, secret).await {
                 Ok(socket) => {
-                    backoff = RECONNECT_MIN;
-                    if let Err(error) = channel::clear_rejection(&orch.db.local).await {
-                        log::warn!("relay doorbell could not record the accepted channel: {error}");
-                    }
+                    let opened_at = tokio::time::Instant::now();
                     doorbell.set_connected(true);
-                    listen(socket, &doorbell, &relay).await;
+                    let ended = listen(socket, &doorbell, &relay).await;
                     doorbell.set_connected(false);
-                    // Back to 15-second polling, starting with a sync now:
-                    // a nudge may have been lost with the socket.
-                    doorbell.ring();
+                    let ListenEnd::Disconnected(reason) = ended else {
+                        backoff = RECONNECT_MIN;
+                        short_connections = 0;
+                        continue;
+                    };
+                    if opened_at.elapsed() >= WORKING_CONNECTION_MIN {
+                        backoff = RECONNECT_MIN;
+                        short_connections = 0;
+                        // A working socket may have lost a nudge when it ended.
+                        doorbell.ring();
+                    } else {
+                        short_connections = short_connections.saturating_add(1);
+                        if short_connections == 2 {
+                            log::warn!(
+                                "relay doorbell repeatedly closes before {}s: {reason}; reconnect backoff grows to {}s",
+                                WORKING_CONNECTION_MIN.as_secs(),
+                                RECONNECT_MAX.as_secs()
+                            );
+                        } else {
+                            log::debug!("relay doorbell ended before working: {reason}");
+                        }
+                    }
                 }
                 Err(ConnectError::Rejected) => {
                     if let Err(error) = channel::mark_rejected(&orch.db.local).await {
@@ -231,7 +259,11 @@ pub(crate) async fn maintain(orch: Orchestrator, relay_url: String, doorbell: Ar
         }
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = relay.channel_changed() => backoff = RECONNECT_MIN,
+            _ = relay.channel_changed() => {
+                backoff = RECONNECT_MIN;
+                short_connections = 0;
+                continue;
+            },
         }
         backoff = (backoff * 2).min(RECONNECT_MAX);
     }
@@ -270,6 +302,7 @@ mod tests {
         socket_channels: Mutex<Vec<String>>,
         events: Mutex<Vec<Value>>,
         event_queries: Mutex<Vec<String>>,
+        close_socket: AtomicBool,
         reject_socket: AtomicBool,
         reject_events: AtomicBool,
         connects: AtomicUsize,
@@ -332,7 +365,19 @@ mod tests {
         relay.connects.fetch_add(1, Ordering::AcqRel);
         relay.socket_channels.lock().unwrap().push(channel);
         let signals = relay.signals.subscribe();
-        upgrade.on_upgrade(move |socket| doorbell_socket(socket, signals))
+        let close = relay.close_socket.load(Ordering::Acquire);
+        upgrade.on_upgrade(move |mut socket| async move {
+            if close {
+                let _ = socket
+                    .send(AxumMessage::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1008,
+                        reason: "Unauthorized".into(),
+                    })))
+                    .await;
+            } else {
+                doorbell_socket(socket, signals).await;
+            }
+        })
     }
 
     async fn doorbell_socket(mut socket: WebSocket, mut signals: broadcast::Receiver<Signal>) {
@@ -363,6 +408,7 @@ mod tests {
             socket_channels: Mutex::default(),
             events: Mutex::default(),
             event_queries: Mutex::default(),
+            close_socket: AtomicBool::new(false),
             reject_socket: AtomicBool::new(false),
             reject_events: AtomicBool::new(false),
             connects: AtomicUsize::new(0),
@@ -459,6 +505,110 @@ mod tests {
         .await
         .unwrap()
         .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn immediate_closes_back_off_without_ringing_or_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db, _) = seeded(temp.path(), None).await;
+        let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
+        relay.close_socket.store(true, Ordering::Release);
+        let doorbell = Arc::new(Doorbell::default());
+        let writes = db.write_transaction_count();
+        let task = tokio::spawn(maintain(orch, url, doorbell.clone()));
+        eventually(
+            "the first immediate close",
+            Duration::from_secs(5),
+            async || relay.connects.load(Ordering::Acquire) == 1 && !doorbell.is_connected(),
+        )
+        .await;
+
+        tokio::time::pause();
+        // Yield without advancing time so network and database work can settle
+        // between explicit ticks; retry delays must be virtual, not wall time.
+        for _ in 0..240 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..500 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let dials = relay.connects.load(Ordering::Acquire);
+        // At most eight dials fit this window with growing backoff. Allow
+        // loopback handshakes to lag under load; only require retries continue.
+        assert!(dials <= 8, "too many dials: {dials}");
+        assert!(dials >= 4, "retries did not continue: {dials}");
+        assert!(!doorbell.is_connected());
+        assert!(futures_util::FutureExt::now_or_never(doorbell.rung()).is_none());
+        assert_eq!(db.write_transaction_count(), writes);
+        task.abort();
+        tokio::time::resume();
+        assert_ne!(
+            channel::get_relay_channel(&db)
+                .await
+                .unwrap()
+                .health_state
+                .as_deref(),
+            Some("unauthorized")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_immediate_close_preserves_its_code_and_reason() {
+        let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
+        relay.close_socket.store(true, Ordering::Release);
+        let socket = connect(&socket_url(&url, "ch-1").unwrap(), SECRET)
+            .await
+            .unwrap_or_else(|_| panic!("handshake failed"));
+        let ended = listen(
+            socket,
+            &Doorbell::default(),
+            &channel::RelaySignals::default(),
+        )
+        .await;
+        let ListenEnd::Disconnected(reason) = ended else {
+            panic!("unexpected channel change")
+        };
+        assert_eq!(reason, "close code=1008, reason=Unauthorized");
+    }
+
+    #[tokio::test]
+    async fn a_handshake_does_not_clear_an_existing_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db, _) = seeded(temp.path(), None).await;
+        channel::mark_rejected(&db).await.unwrap();
+        let (url, _) = mock_relay("2026-10-01T00:00:00.000Z").await;
+        let doorbell = Arc::new(Doorbell::default());
+        let writes = db.write_transaction_count();
+        let task = tokio::spawn(maintain(orch, url, doorbell.clone()));
+        tokio::time::timeout(Duration::from_secs(5), doorbell.rung())
+            .await
+            .unwrap();
+        assert_eq!(db.write_transaction_count(), writes);
+        assert_eq!(
+            channel::get_relay_channel(&db)
+                .await
+                .unwrap()
+                .health_state
+                .as_deref(),
+            Some("unauthorized")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_healthy_doorbell_never_enters_a_write_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db, _) = seeded(temp.path(), None).await;
+        let (url, _) = mock_relay("2026-10-01T00:00:00.000Z").await;
+        let doorbell = Arc::new(Doorbell::default());
+        let writes = db.write_transaction_count();
+        let task = tokio::spawn(maintain(orch, url, doorbell.clone()));
+        tokio::time::timeout(Duration::from_secs(5), doorbell.rung())
+            .await
+            .unwrap();
+        assert!(doorbell.is_connected());
+        assert_eq!(db.write_transaction_count(), writes);
+        task.abort();
     }
 
     #[test]
@@ -664,16 +814,15 @@ mod tests {
         let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
         crate::ingress::sync::sync_once(&orch, &url).await.unwrap();
         *relay.horizon.lock().unwrap() = "2026-10-02T00:00:00.000Z".into();
+        let writes = db.write_transaction_count();
         crate::ingress::sync::sync_once(&orch, &url).await.unwrap();
         crate::ingress::sync::sync_once(&orch, &url).await.unwrap();
+        assert_eq!(db.write_transaction_count(), writes + 2);
         let channel = channel::get_relay_channel(&db).await.unwrap();
         assert_ne!(channel.health_state.as_deref(), Some("skipping"));
         assert_eq!(channel.health_reason, None);
         assert!(channel.drained_at.is_some());
-        assert_eq!(
-            channel.last_event_sync.as_deref(),
-            Some("2026-10-01T23:59:59.999Z")
-        );
+        assert_eq!(channel.last_event_sync, None);
     }
 
     /// A channel last drained before the horizon really did lose events.

@@ -757,15 +757,15 @@ where
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct CheckPhaseStatus {
-    phase: Option<String>,
-    label: Option<String>,
-    diagnostic: Option<String>,
+pub(crate) struct CheckPhaseStatus {
+    pub(crate) phase: Option<String>,
+    pub(crate) label: Option<String>,
+    pub(crate) diagnostic: Option<String>,
     /// The machine running the batch, once one has claimed it.
-    executor: Option<String>,
+    pub(crate) executor: Option<String>,
     /// When the current phase began: when the batch started waiting, was
     /// claimed, or started being prepared.
-    since_unix_ms: Option<u64>,
+    pub(crate) since_unix_ms: Option<u64>,
     /// What holds a queued batch, in a few words (`declined by local (host
     /// pressure: cpu 97%)`), for a line too short for the full diagnostic.
     /// `None` when no machine has declined it.
@@ -775,9 +775,19 @@ struct CheckPhaseStatus {
 type CheckStatusNotify = Arc<dyn Fn(Vec<CheckStatusEntry>, CheckPhaseStatus) + Send + Sync>;
 
 #[derive(Clone)]
+struct CheckStatusGroup {
+    indices: Vec<usize>,
+    phase: CheckPhaseStatus,
+}
+
+#[derive(Clone)]
 pub(crate) struct CheckStatusBoard {
     entries: Arc<std::sync::Mutex<Vec<CheckStatusEntry>>>,
     phase: Arc<std::sync::Mutex<CheckPhaseStatus>>,
+    groups: Arc<std::sync::Mutex<Vec<CheckStatusGroup>>>,
+    durability_errors:
+        Arc<std::sync::Mutex<Vec<crate::execution::checks_turn_end::ReviewDurabilityError>>>,
+    group: Option<usize>,
     notify: CheckStatusNotify,
     /// Whether the check engine, not the executor's per-item report, owns
     /// this board's verdicts. See [`Self::for_review_wave`].
@@ -802,6 +812,9 @@ impl CheckStatusBoard {
                     .collect(),
             )),
             phase: Arc::new(std::sync::Mutex::new(CheckPhaseStatus::default())),
+            groups: Arc::new(std::sync::Mutex::new(Vec::new())),
+            durability_errors: Arc::new(std::sync::Mutex::new(Vec::new())),
+            group: None,
             notify,
             engine_owned: false,
         }
@@ -810,8 +823,8 @@ impl CheckStatusBoard {
     /// The board a turn-end review wave publishes while it runs, indexed by
     /// plan position like the wave's stream ids.
     ///
-    /// Its verdicts belong to the check engine, which records them only when
-    /// the whole batch returns: an item the executor stopped (a silent tree, a
+    /// Its verdicts belong to the check engine, which records each completed
+    /// placement group: an item the executor stopped (a silent tree, a
     /// cancel) is a non-verdict whatever its exit code says. So an executor's
     /// per-item completion marks a lane `finished`, an interim state annotated
     /// with its exit and duration, never `passed` or `failed`. `on_change` runs
@@ -834,14 +847,146 @@ impl CheckStatusBoard {
         self.entries.lock().unwrap().clone()
     }
 
-    /// The machine that claimed the batch, once one has.
+    pub(crate) fn record_durability_error(
+        &self,
+        failure: crate::execution::checks_turn_end::ReviewDurabilityError,
+    ) {
+        let mut failures = self
+            .durability_errors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !failures.contains(&failure) {
+            failures.push(failure);
+        }
+        drop(failures);
+        self.emit();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durability_errors(
+        &self,
+    ) -> Vec<crate::execution::checks_turn_end::ReviewDurabilityError> {
+        self.durability_errors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Scope dispatch reports to original plan indices, sharing the root entries.
+    /// Members remain sequential within this group, independently of siblings.
+    pub(crate) fn for_group(&self, indices: &[usize]) -> Self {
+        let mut groups = self.groups.lock().unwrap();
+        let group = groups
+            .iter()
+            .position(|group| group.indices == indices)
+            .unwrap_or_else(|| {
+                groups.push(CheckStatusGroup {
+                    indices: indices.to_vec(),
+                    phase: CheckPhaseStatus::default(),
+                });
+                groups.len() - 1
+            });
+        Self {
+            group: Some(group),
+            ..self.clone()
+        }
+    }
+
+    /// The lane's placement-group entries, never a sibling group's runner.
+    pub(crate) fn lane_snapshot(&self, name: &str) -> Vec<CheckStatusEntry> {
+        let entries = self.snapshot();
+        let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
+            return Vec::new();
+        };
+        let groups = self.groups.lock().unwrap();
+        match groups
+            .iter()
+            .find(|group| group.indices.contains(&entry.index))
+        {
+            Some(group) => entries
+                .iter()
+                .filter(|entry| group.indices.contains(&entry.index))
+                .cloned()
+                .collect(),
+            None if groups.is_empty() => entries,
+            None => vec![entry.clone()],
+        }
+    }
+
+    pub(crate) fn lane_phase(&self, name: &str) -> CheckPhaseStatus {
+        let index = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.index);
+        let groups = self.groups.lock().unwrap();
+        groups
+            .iter()
+            .find(|group| index.is_some_and(|index| group.indices.contains(&index)))
+            .map(|group| group.phase.clone())
+            .unwrap_or_else(|| {
+                if groups.is_empty() {
+                    self.phase.lock().unwrap().clone()
+                } else {
+                    CheckPhaseStatus::default()
+                }
+            })
+    }
+
+    /// A root board names a machine only when every group has the same claim.
     pub(crate) fn executor(&self) -> Option<String> {
-        self.phase.lock().unwrap().executor.clone()
+        let groups = self.groups.lock().unwrap();
+        if let Some(group) = self.group {
+            return groups[group].phase.executor.clone();
+        }
+        let Some(first) = groups.first() else {
+            return self.phase.lock().unwrap().executor.clone();
+        };
+        let executor = first.phase.executor.clone()?;
+        groups
+            .iter()
+            .all(|group| group.phase.executor.as_ref() == Some(&executor))
+            .then_some(executor)
+    }
+
+    fn update_phase(&self, index: Option<usize>, update: impl FnOnce(&mut CheckPhaseStatus)) {
+        let mut groups = self.groups.lock().unwrap();
+        let group = self.group.or_else(|| {
+            index.and_then(|index| {
+                groups
+                    .iter()
+                    .position(|group| group.indices.contains(&index))
+            })
+        });
+        if let Some(group) = group {
+            update(&mut groups[group].phase);
+        } else {
+            update(&mut self.phase.lock().unwrap());
+        }
+    }
+
+    fn group_is_recorded(&self, index: usize) -> bool {
+        let entries = self.entries.lock().unwrap();
+        let groups = self.groups.lock().unwrap();
+        let group = self
+            .group
+            .map(|group| &groups[group])
+            .or_else(|| groups.iter().find(|group| group.indices.contains(&index)));
+        entries
+            .iter()
+            .filter(|entry| group.is_none_or(|group| group.indices.contains(&entry.index)))
+            .all(|entry| matches!(entry.state.as_str(), "passed" | "failed" | "unverified"))
     }
 
     fn emit(&self) {
         let entries = self.entries.lock().unwrap().clone();
-        let phase = self.phase.lock().unwrap().clone();
+        let phase = if let Some(group) = self.group {
+            self.groups.lock().unwrap()[group].phase.clone()
+        } else {
+            self.phase.lock().unwrap().clone()
+        };
         (self.notify)(entries, phase);
     }
 
@@ -881,34 +1026,30 @@ impl CheckStatusBoard {
             // A phase already running carries the machine and start time its
             // claim named; a lane's own start (and every output chunk after
             // it) must not wipe them back to a bare `running checks`.
-            let mut phase = self.phase.lock().unwrap();
-            if phase.phase.as_deref() != Some("running") {
-                *phase = CheckPhaseStatus {
-                    phase: Some("running".into()),
-                    label: Some("running checks".into()),
-                    ..CheckPhaseStatus::default()
-                };
-            }
-        } else if self
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|entry| matches!(entry.state.as_str(), "passed" | "failed" | "unverified"))
-        {
-            *self.phase.lock().unwrap() = CheckPhaseStatus::default();
+            self.update_phase(Some(index), |phase| {
+                if phase.phase.as_deref() != Some("running") {
+                    phase.phase = Some("running".into());
+                    phase.label = Some("running checks".into());
+                    phase.diagnostic = None;
+                    phase.held_by = None;
+                }
+            });
+        } else if self.group_is_recorded(index) {
+            self.update_phase(Some(index), |phase| *phase = CheckPhaseStatus::default());
         }
         self.emit();
     }
 
     fn set_phase(&self, phase: Option<&str>, label: Option<&str>, diagnostic: Option<String>) {
-        *self.phase.lock().unwrap() = check_phase_status(phase, label, diagnostic);
+        self.update_phase(None, |status| {
+            *status = check_phase_status(phase, label, diagnostic)
+        });
         self.emit();
     }
 
     /// Show a phase [`DispatchNarrator`] rendered, machine and time included.
     fn show_phase(&self, status: CheckPhaseStatus) {
-        *self.phase.lock().unwrap() = status;
+        self.update_phase(None, |phase| *phase = status);
         self.emit();
     }
 }
@@ -2154,6 +2295,7 @@ pub(crate) async fn execute_check_contract(
                         run_context: None,
                         mutation_policy: MutationPolicy::PureVerdict,
                         status_board: Some(status_board.clone()),
+                        on_group_complete: None,
                         purpose,
                     },
                 )
@@ -3327,6 +3469,7 @@ pub(crate) async fn execute_job_verdict(
             run_context: None,
             mutation_policy: MutationPolicy::PureVerdict,
             status_board: None,
+            on_group_complete: None,
             purpose: None,
         },
     )
@@ -3695,6 +3838,7 @@ async fn refuse_items_under_unreadable_config(
 const CAPACITY_RETRY_BACKOFF_MS: u64 = 2_000;
 
 struct CheckPatience {
+    waiting_since_unix_ms: u64,
     mobility: PlacementMobility,
     work_class: crate::fleet::PlacementWorkClass,
 }
@@ -3711,6 +3855,7 @@ struct GroupWait {
 impl CheckPatience {
     fn declare(batch: &PlannedCheckBatchRequest) -> Self {
         Self {
+            waiting_since_unix_ms: unix_time_ms_for_checks(),
             mobility: batch_placement_mobility(&batch.mutation_policy),
             work_class: crate::execution::wire::check_placement_work_class(batch.priority),
         }
@@ -4140,13 +4285,24 @@ async fn submit_admitted_check_batch(
         .into_iter()
         .filter_map(|item| runner_globs(&item).map(|globs| (item, globs)))
         .collect::<Vec<_>>();
+    if let Some(complete) = &batch.on_group_complete {
+        if !refused.is_empty() {
+            complete(&refused).await;
+        }
+    }
     let slice_batch = batch.clone();
     let slice_run = async move {
-        if sliced.is_empty() {
+        let results = if sliced.is_empty() {
             HashMap::new()
         } else {
             run_lanes(&slice_batch, sliced).await
+        };
+        if let Some(complete) = &slice_batch.on_group_complete {
+            if !results.is_empty() {
+                complete(&results).await;
+            }
         }
+        results
     };
     // Nothing survived the reservation for a cell: request no cell, so a fully
     // suppressed (or fully runner-answered) suite costs no build-slot admission.
@@ -4298,33 +4454,42 @@ async fn submit_reserved_check_batch(
                 delta: None,
                 store_dir: Some(batch.store_dir.clone()),
             };
-            for (placement, items) in groups {
-                // Each group derives its own wait, from its own eligible
-                // machines, at the moment it is presented. Groups also run one
-                // after another, so each re-reads what is LEFT of the shared
-                // ceiling -- otherwise a batch naming two executors could wait
-                // twice as long as it declared, and a ten-machine one, ten
-                // times.
-                let wait = patience.for_group(
-                    orch,
-                    &batch,
-                    placement.executor.as_ref(),
-                    &placement.verdict_platforms,
-                    &placement.avoid,
-                );
-                let mut outcome = submit_single_planned_check_batch(
-                    orch,
-                    PlannedCheckBatchRequest {
-                        items,
-                        ..batch.clone()
-                    },
-                    &wait,
-                    patience,
-                )
-                .await?;
-                attribute_capacity_wait(&mut outcome, &wait);
-                combined.results.extend(outcome.results);
-            }
+            let submissions = groups.into_iter().map(|(placement, items)| {
+                let mut group = PlannedCheckBatchRequest {
+                    items,
+                    ..batch.clone()
+                };
+                let indices: Vec<_> = group.items.iter().map(|item| item.index).collect();
+                group.status_board = group
+                    .status_board
+                    .as_ref()
+                    .map(|board| board.for_group(&indices));
+                async move {
+                    submit_placement_group_until_final(
+                        &indices,
+                        group.on_group_complete.as_ref(),
+                        || async {
+                            let wait = patience.for_group(
+                                orch,
+                                &group,
+                                placement.executor.as_ref(),
+                                &placement.verdict_platforms,
+                                &placement.avoid,
+                            );
+                            let submitted = submit_single_planned_check_batch(
+                                orch,
+                                group.clone(),
+                                &wait,
+                                patience,
+                            )
+                            .await;
+                            (wait, submitted)
+                        },
+                    )
+                    .await
+                }
+            });
+            combined.results = collect_placement_group_results(submissions).await;
             return Ok(PresentedBatch { outcome: combined });
         }
         batch.items = groups.pop().map(|(_, items)| items).unwrap_or_default();
@@ -4343,9 +4508,72 @@ async fn submit_reserved_check_batch(
         &forecast_verdict_platforms,
         &forecast_avoid,
     );
+    let complete = batch.on_group_complete.clone();
     let mut outcome = submit_single_planned_check_batch(orch, batch, &wait, patience).await?;
     attribute_capacity_wait(&mut outcome, &wait);
+    if capacity_retry_decision(&outcome) == CapacityRetry::Surface {
+        if let Some(complete) = complete {
+            complete(&outcome.results).await;
+        }
+    }
     Ok(PresentedBatch { outcome })
+}
+
+/// Retry only this group's transient refusals, and hand its final result to
+/// recording exactly once. Siblings are neither re-presented nor re-recorded.
+async fn submit_placement_group_until_final<F, Fut>(
+    indices: &[usize],
+    complete: Option<&CheckGroupCompletion>,
+    mut submit: F,
+) -> PlannedCheckBatchOutcome
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = (GroupWait, Result<PlannedCheckBatchOutcome, String>)>,
+{
+    loop {
+        let (wait, submitted) = submit().await;
+        let mut outcome = placement_group_outcome(indices, submitted);
+        attribute_capacity_wait(&mut outcome, &wait);
+        if let CapacityRetry::Again { backoff } = capacity_retry_decision(&outcome) {
+            tokio::time::sleep(backoff).await;
+            continue;
+        }
+        if let Some(complete) = complete {
+            complete(&outcome.results).await;
+        }
+        return outcome;
+    }
+}
+
+/// Poll every group under the caller's cancellation boundary. Dropping this
+/// future drops every group's subscriber guards, not just the first request.
+/// Completion work lives inside each group future, so a held sibling cannot
+/// postpone another group's durable acceptance.
+async fn collect_placement_group_results<F>(
+    groups: impl IntoIterator<Item = F>,
+) -> HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>
+where
+    F: std::future::Future<Output = PlannedCheckBatchOutcome>,
+{
+    futures_util::future::join_all(groups)
+        .await
+        .into_iter()
+        .flat_map(|outcome| outcome.results)
+        .collect()
+}
+
+fn placement_group_outcome(
+    indices: &[usize],
+    submitted: Result<PlannedCheckBatchOutcome, String>,
+) -> PlannedCheckBatchOutcome {
+    submitted.unwrap_or_else(|reason| {
+        // A malformed group's submission is a dispatch failure, never a
+        // command exit. Keep its own reason without discarding other groups.
+        PlannedCheckBatchOutcome::failed(
+            indices.to_vec(),
+            SubstrateFailure::new(SubstrateFailureShape::Dispatch, reason),
+        )
+    })
 }
 
 /// The placement question one batch can ask: where its checks may run, and which
@@ -4518,7 +4746,11 @@ async fn submit_single_planned_check_batch(
         avoided_executor_ids,
     );
     let indexed: Vec<_> = batch.items.iter().map(|item| item.index).collect();
-    let request = wire.request;
+    let mut request = wire.request;
+    // All groups, including capacity retries, share the wave's waiting origin.
+    // Check requests retain the wire's durable parked horizon; elapsed time has
+    // no authority to turn an unanswered check into a verdict.
+    request.waiting_since_unix_ms = patience.waiting_since_unix_ms;
     let items = wire.items;
     let mutation_policy = request.mutation_policy.clone();
     if let Some(board) = &batch.status_board {
@@ -4927,6 +5159,11 @@ pub(crate) struct PlannedCheckBatchItem {
     pub avoid_executor_ids: Vec<String>,
 }
 
+pub(crate) type CheckGroupResults = HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>;
+pub(crate) type CheckGroupCompletion = Arc<
+    dyn for<'a> Fn(&'a CheckGroupResults) -> futures_util::future::BoxFuture<'a, ()> + Send + Sync,
+>;
+
 #[derive(Clone)]
 pub(crate) struct PlannedCheckBatchRequest {
     pub project_id: String,
@@ -4942,6 +5179,8 @@ pub(crate) struct PlannedCheckBatchRequest {
     pub run_context: Option<RunContext>,
     pub mutation_policy: MutationPolicy,
     pub status_board: Option<CheckStatusBoard>,
+    /// Awaited once for each final placement group before returning its results.
+    pub on_group_complete: Option<CheckGroupCompletion>,
     /// The question this batch answers, when it answers a standing one.
     ///
     /// Present for work whose whole point is to hold one answer current —
@@ -8028,6 +8267,7 @@ async fn run_write_checks_after_seal_inner(
                         run_context: Some(context),
                         mutation_policy: MutationPolicy::PureVerdict,
                         status_board: None,
+                        on_group_complete: None,
                         purpose: None,
                     },
                 )
@@ -8254,6 +8494,7 @@ async fn submit_write_check_batch_for(
                         run_context: Some(run_context.clone()),
                         mutation_policy,
                         status_board,
+                        on_group_complete: None,
                         purpose: None,
                     },
                 )
@@ -9083,6 +9324,7 @@ fn diff_tree_entries_for_selector(
 /// per-test detail (enrichment, may be absent), and the retained combined-output
 /// tail used as the excerpt fallback. Carried out of [`run_planned_checks`] so
 /// the inline summary can render WHAT failed, not just the exit code.
+#[derive(Clone)]
 pub(crate) struct CheckOutcome {
     pub(crate) name: String,
     pub(crate) passed: bool,
@@ -10261,6 +10503,60 @@ where
     E: Into<CheckExecutionFailure>,
     N: Fn(Vec<CheckStatusEntry>) + Send + Sync + 'static,
 {
+    run_planned_checks_selected(
+        db,
+        project_id,
+        commit,
+        tree_hash,
+        job_id,
+        plans,
+        sealed_coordinates,
+        infra_scopes,
+        tool_use_id,
+        mode,
+        diagnostic_orch,
+        status_board,
+        effective_env,
+        retry,
+        None,
+        &record_fresh_check_observation,
+        execute,
+        notify,
+    )
+    .await
+}
+
+/// The canonical engine, optionally restricted to original plan indices whose
+/// authoritative placement results have arrived. Unselected members are untouched.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_planned_checks_selected<F, Fut, N, E>(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    job_id: &str,
+    plans: &[(CheckPlan, String)],
+    sealed_coordinates: &[crate::execution::cache::SealedCheckCoordinate],
+    infra_scopes: &[InfraScopes],
+    tool_use_id: &str,
+    mode: CheckExecMode,
+    diagnostic_orch: Option<&Orchestrator>,
+    status_board: Option<CheckStatusBoard>,
+    effective_env: &[(String, String)],
+    retry: bool,
+    selected_indices: Option<&[usize]>,
+    record_observation: &(dyn Fn(Arc<LocalDb>, FreshCheckObservationWrite) -> Result<(), String>
+          + Send
+          + Sync),
+    execute: F,
+    notify: N,
+) -> Vec<CheckOutcome>
+where
+    F: Fn(usize, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<CheckExecResult, E>>,
+    E: Into<CheckExecutionFailure>,
+    N: Fn(Vec<CheckStatusEntry>) + Send + Sync + 'static,
+{
     assert_eq!(
         plans.len(),
         sealed_coordinates.len(),
@@ -10310,6 +10606,9 @@ where
     let mut outcomes: Vec<Option<CheckOutcome>> = (0..plans.len()).map(|_| None).collect();
     let mut misses: Vec<usize> = Vec::new();
     for (index, (plan, input_hash)) in plans.iter().enumerate() {
+        if selected_indices.is_some_and(|selected| !selected.contains(&index)) {
+            continue;
+        }
         if retry {
             misses.push(index);
             continue;
@@ -10885,7 +11184,7 @@ where
                             executor_id: observation.executor_id.clone(),
                             reusable: observation.reusable,
                         };
-                        let (recorded, not_recorded) = match record_fresh_check_observation(
+                        let (recorded, not_recorded) = match record_observation(
                             db.clone(),
                             observation,
                         ) {
@@ -11020,7 +11319,9 @@ where
 
     outcomes
         .into_iter()
-        .map(|o| o.expect("every plan resolved to a hit or a miss outcome"))
+        .enumerate()
+        .filter(|(index, _)| selected_indices.is_none_or(|selected| selected.contains(index)))
+        .map(|(_, o)| o.expect("every selected plan resolved to a hit or a miss outcome"))
         .collect()
 }
 
@@ -12817,6 +13118,159 @@ mod tests {
         assert!(!partitions_by_placement(&MutationPolicy::AllowDelta));
     }
 
+    fn completed_placement_group(index: usize) -> PlannedCheckBatchOutcome {
+        PlannedCheckBatchOutcome {
+            results: HashMap::from([(
+                index,
+                exec_ok(Some(0), format!("group {index}")).map_err(CheckExecutionFailure::from),
+            )]),
+            request: None,
+            delta: None,
+            store_dir: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_placement_group_does_not_delay_its_siblings_completion() {
+        let (release, held) = tokio::sync::oneshot::channel();
+        let (completed, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let groups = [(0, Some(held)), (1, None)]
+            .into_iter()
+            .map(|(index, held)| {
+                let completed = completed.clone();
+                async move {
+                    if let Some(held) = held {
+                        held.await.unwrap();
+                    }
+                    let outcome = completed_placement_group(index);
+                    completed.send(index).unwrap();
+                    outcome
+                }
+            });
+        let wave = collect_placement_group_results(groups);
+        tokio::pin!(wave);
+        tokio::select! {
+            biased;
+            _ = &mut wave => panic!("the first group must still be held"),
+            completed = received.recv() => assert_eq!(completed, Some(1)),
+        }
+        release.send(()).unwrap();
+        let results = wave.await;
+        assert!(results[&0].is_ok());
+        assert!(results[&1].is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_placement_group_error_preserves_other_results_and_its_own_reason() {
+        let results = collect_placement_group_results([
+            std::future::ready(placement_group_outcome(
+                &[0, 2],
+                Err("group-specific configuration fault".into()),
+            )),
+            std::future::ready(completed_placement_group(1)),
+        ])
+        .await;
+        assert!(results[&1].is_ok());
+        for index in [0, 2] {
+            let Err(CheckExecutionFailure::Substrate(failure)) = &results[&index] else {
+                panic!("a submission fault is not a command verdict");
+            };
+            assert_eq!(failure.shape(), SubstrateFailureShape::Dispatch);
+            assert_eq!(failure.diagnostic(), "group-specific configuration fault");
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_capacity_retry_never_resubmits_or_rerecords_a_completed_sibling() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let recorded = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let (completed, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let complete: CheckGroupCompletion = {
+            let recorded = recorded.clone();
+            Arc::new(move |results| {
+                for (&index, result) in results {
+                    assert!(result.is_ok(), "a capacity refusal is not a final result");
+                    recorded[index].fetch_add(1, Ordering::SeqCst);
+                    completed.send(index).unwrap();
+                }
+                Box::pin(std::future::ready(()))
+            })
+        };
+        let groups = (0..2).map(|index| {
+            let attempts = attempts.clone();
+            let complete = complete.clone();
+            async move {
+                submit_placement_group_until_final(&[index], Some(&complete), || {
+                    let attempt = attempts[index].fetch_add(1, Ordering::SeqCst);
+                    let outcome = if index == 0 && attempt == 0 {
+                        PlannedCheckBatchOutcome::failed(
+                            vec![index],
+                            SubstrateFailure::new(
+                                SubstrateFailureShape::Capacity,
+                                "provisioning a cell",
+                            ),
+                        )
+                    } else {
+                        completed_placement_group(index)
+                    };
+                    std::future::ready((
+                        GroupWait {
+                            description: "the group's own capacity hold".into(),
+                            relief_ms: None,
+                            unforecastable: false,
+                        },
+                        Ok(outcome),
+                    ))
+                })
+                .await
+            }
+        });
+        let wave = collect_placement_group_results(groups);
+        tokio::pin!(wave);
+        tokio::select! {
+            biased;
+            _ = &mut wave => panic!("group zero must still be waiting to retry"),
+            completed = received.recv() => assert_eq!(completed, Some(1)),
+        }
+        assert_eq!(attempts[0].load(Ordering::SeqCst), 1);
+        let results = wave.await;
+        assert!(results.values().all(Result::is_ok));
+        assert_eq!(attempts[0].load(Ordering::SeqCst), 2);
+        assert_eq!(attempts[1].load(Ordering::SeqCst), 1);
+        assert_eq!(recorded[0].load(Ordering::SeqCst), 1);
+        assert_eq!(recorded[1].load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_placement_wave_drops_every_pending_group() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Interest(Arc<AtomicUsize>);
+        impl Drop for Interest {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let groups = (0..3).map(|_| {
+            let active = active.clone();
+            async move {
+                active.fetch_add(1, Ordering::SeqCst);
+                let _interest = Interest(active);
+                std::future::pending::<PlannedCheckBatchOutcome>().await
+            }
+        });
+        let mut wave = Box::pin(collect_placement_group_results(groups));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(wave.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(active.load(Ordering::SeqCst), 3);
+        drop(wave);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn platform_scoped_checks_are_not_members_of_an_other_platform_batch() {
         let checks = HashMap::from([
@@ -13621,6 +14075,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn group_status_board_keeps_concurrent_runners_and_blockers_local() {
+        use crate::execution::checks_status::{grouped_lane_progress, LaneProgress};
+        let plans = [
+            "linux-run",
+            "mac-run",
+            "linux-next",
+            "mac-next",
+            "unscheduled",
+        ]
+        .into_iter()
+        .map(|name| (plan(name, "true"), "input".into()))
+        .collect::<Vec<_>>();
+        let board = CheckStatusBoard::for_review_wave(&plans, || {});
+        let linux = board.for_group(&[0, 2]);
+        let mac = board.for_group(&[1, 3]);
+        linux.show_phase(CheckPhaseStatus {
+            phase: Some("running".into()),
+            executor: Some("linux-box".into()),
+            since_unix_ms: Some(100),
+            ..Default::default()
+        });
+        mac.show_phase(CheckPhaseStatus {
+            phase: Some("running".into()),
+            executor: Some("mac-box".into()),
+            since_unix_ms: Some(200),
+            ..Default::default()
+        });
+        linux.transition(0, "running", None);
+        mac.transition(1, "running", None);
+        assert_eq!(
+            board
+                .snapshot()
+                .iter()
+                .filter(|entry| entry.state == "running")
+                .count(),
+            2
+        );
+        for (name, behind, machine) in [
+            ("linux-next", "linux-run", "linux-box"),
+            ("mac-next", "mac-run", "mac-box"),
+        ] {
+            assert_eq!(
+                grouped_lane_progress(&board, name, None),
+                Some(LaneProgress::Queued {
+                    behind: Some(behind.into())
+                })
+            );
+            assert_eq!(board.lane_phase(name).executor.as_deref(), Some(machine));
+        }
+        assert_eq!(
+            grouped_lane_progress(&board, "unscheduled", None),
+            Some(LaneProgress::Queued { behind: None })
+        );
+        assert_eq!(board.executor(), None);
+        let since = board.snapshot()[0].since_unix_ms;
+        linux.transition(0, "running", None);
+        assert_eq!(board.snapshot()[0].since_unix_ms, since);
+        assert_eq!(board.lane_phase("linux-run").since_unix_ms, Some(100));
+
+        linux.transition(
+            0,
+            "finished",
+            Some("finished in 2s (exit 0); awaiting recording".into()),
+        );
+        assert_eq!(board.snapshot()[0].state, "finished");
+        assert!(grouped_lane_progress(&board, "linux-run", None)
+            .unwrap()
+            .describe(300)
+            .contains("awaiting recording"));
+        // Recording one group neither finishes nor changes a sibling's claim.
+        board.transition(0, "passed", None);
+        assert_eq!(board.snapshot()[0].state, "passed");
+        assert_eq!(
+            board.lane_phase("linux-run").executor.as_deref(),
+            Some("linux-box")
+        );
+        board.transition(2, "unverified", None);
+        assert_eq!(board.lane_phase("linux-run"), CheckPhaseStatus::default());
+        assert_eq!(board.snapshot()[1].state, "running");
+        assert_eq!(
+            board.lane_phase("mac-run").executor.as_deref(),
+            Some("mac-box")
+        );
+    }
+
+    #[test]
+    fn group_status_board_projects_a_held_groups_own_dispatch_phase() {
+        use crate::execution::checks_status::{grouped_lane_progress, LaneProgress};
+        let plans = ["busy", "held"]
+            .into_iter()
+            .map(|name| (plan(name, "true"), "input".into()))
+            .collect::<Vec<_>>();
+        let board = CheckStatusBoard::for_review_wave(&plans, || {});
+        let busy = board.for_group(&[0]);
+        let held = board.for_group(&[1]);
+        busy.show_phase(CheckPhaseStatus {
+            phase: Some("running".into()),
+            executor: Some("busy-box".into()),
+            ..Default::default()
+        });
+        busy.transition(0, "running", None);
+        held.show_phase(CheckPhaseStatus {
+            phase: Some("queued".into()),
+            label: Some("waiting for macOS capacity".into()),
+            diagnostic: Some("mac-box declined: memory pressure".into()),
+            since_unix_ms: Some(7),
+            ..Default::default()
+        });
+        let progress = grouped_lane_progress(&board, "held", None).unwrap();
+        assert_eq!(
+            progress,
+            LaneProgress::Dispatching {
+                dispatch_phase: "queued".into(),
+                label: Some("waiting for macOS capacity".into()),
+                diagnostic: Some("mac-box declined: memory pressure".into()),
+                since_unix_ms: Some(7),
+            }
+        );
+        assert_eq!(board.lane_phase("held").executor, None);
+        assert_eq!(
+            board.lane_phase("busy").executor.as_deref(),
+            Some("busy-box")
+        );
+        let json = serde_json::to_value(progress).unwrap();
+        assert_eq!(json["phase"], "dispatching");
+        assert_eq!(json["dispatchPhase"], "queued");
+        assert_eq!(json["sinceUnixMs"], 7);
+    }
+
     /// A `tree: impact` lane runs on the runner and never meets the fleet's
     /// queue, so the narrator never reports it claimed. It reports its own
     /// start instead; without that its wave would read as never admitted and
@@ -13653,6 +14237,7 @@ mod tests {
             run_context: None,
             mutation_policy: MutationPolicy::PureVerdict,
             status_board: Some(board),
+            on_group_complete: None,
             purpose: None,
         };
 
@@ -24845,6 +25430,7 @@ mod executor_base_content_tests {
             run_context: None,
             mutation_policy: MutationPolicy::PureVerdict,
             status_board: None,
+            on_group_complete: None,
             purpose: None,
         };
         crate::execution::wire::build_check_batch_wire(
