@@ -2241,8 +2241,26 @@ pub(crate) struct CheckResultObservationProjection {
     pub cell_origin: Option<ObservedCellOrigin>,
     pub build_jobs: Option<cairn_common::executor_protocol::BuildJobs>,
     pub tests: Vec<CheckTestResultRow>,
+    /// Global counts, independent of the requested page and filters.
+    pub persisted_counts: ObservationTestCounts,
     pub test_total: usize,
     pub test_offset: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ObservationTestCounts {
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub deferred: usize,
+    /// Ledger-reported self-skips, which nextest normally reports as passes.
+    pub self_skipped: usize,
+}
+
+impl ObservationTestCounts {
+    pub(crate) fn total(&self) -> usize {
+        self.passed + self.failed + self.skipped + self.deferred
+    }
 }
 
 /// Where the cell a command ran in came from, as the executor's `CellOrigin`
@@ -2381,6 +2399,35 @@ const OBSERVATION_TEST_FILTER: &str =
 /// An observation's whole test manifest, in test order.
 fn observation_tests_sql() -> String {
     format!("SELECT {OBSERVATION_TEST_COLUMNS} FROM {OBSERVATION_TEST_OUTCOMES} ORDER BY test_id")
+}
+
+/// Status counts over the whole observation, before any page/name/status filter.
+fn observation_test_totals_sql() -> String {
+    format!("SELECT status,COUNT(*),COUNT(skip_reason) FROM {OBSERVATION_TEST_OUTCOMES} GROUP BY status")
+}
+
+async fn observation_test_totals(
+    conn: &crate::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<ObservationTestCounts> {
+    let mut rows = conn
+        .query(observation_test_totals_sql(), params![id])
+        .await?;
+    let mut counts = ObservationTestCounts::default();
+    while let Some(row) = rows.next().await? {
+        let count = row.i64(1)? as usize;
+        match row.text(0)?.as_str() {
+            "passed" => counts.passed = count,
+            "failed" => counts.failed = count,
+            "skipped" => {
+                counts.skipped = count;
+                counts.self_skipped = row.i64(2)? as usize;
+            }
+            "deferred" => counts.deferred = count,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 fn observation_test_count_sql() -> String {
@@ -3025,6 +3072,7 @@ pub(crate) fn get_check_result_observation(
                     output_tail: row.text(33)?,
                     selection: row.opt_text(38)?, deferred_count: row.i64(39)?,
                     phases, execution_warmth, cell_origin, build_jobs, tests: Vec::new(),
+                    persisted_counts: observation_test_totals(conn, &observation_id).await?,
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
@@ -3132,6 +3180,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                     cell_origin,
                     build_jobs,
                     tests: Vec::new(),
+                    persisted_counts: observation_test_totals(conn, &id).await?,
                     test_total: 0,
                     test_offset: 0,
                 };
@@ -3553,6 +3602,7 @@ mod tests {
 
         for (label, sql, binds) in [
             ("manifest", observation_tests_sql(), 1),
+            ("global counts", observation_test_totals_sql(), 1),
             ("test count", observation_test_count_sql(), 3),
             ("test page", observation_test_page_sql(), 5),
         ] {
@@ -3885,6 +3935,9 @@ mod tests {
                 .expect("the observation is citable by its handle");
         assert_eq!(by_handle.selection.as_deref(), Some("fast"));
         assert_eq!(by_handle.deferred_count, 1);
+        assert_eq!(by_handle.persisted_counts.passed, 1);
+        assert_eq!(by_handle.persisted_counts.deferred, 1);
+        assert_eq!(by_handle.persisted_counts.total(), 2);
         let statuses: Vec<_> = by_handle
             .tests
             .iter()
@@ -3909,6 +3962,7 @@ mod tests {
         )
         .unwrap()
         .expect("the commit coordinate resolves");
+        assert_eq!(deferred_page.persisted_counts, by_handle.persisted_counts);
         assert_eq!(deferred_page.test_total, 1);
         assert_eq!(deferred_page.tests[0].test_id, "crate::slow");
 
@@ -5914,6 +5968,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_observation_counts_name_self_skips_separately_from_ignored_rows() {
+        let db = cache_db().await;
+        let mut write = observation("obs-self-skips", "commit-self-skips", "env-a");
+        let mut ignored = write.tests[0].clone();
+        ignored.test_id = "crate::ignored".into();
+        ignored.status = "skipped".into();
+        write.tests[0].status = "skipped".into();
+        write.tests[0].skip_reason = Some("team-schema-replay".into());
+        write.tests.push(ignored);
+        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+        let by_handle =
+            get_check_result_observation_by_handle(db.clone(), "project-a", &write.public_handle)
+                .unwrap()
+                .unwrap();
+        let empty_page = get_check_result_observation(
+            db,
+            "project-a",
+            "commit-self-skips",
+            "rust",
+            "env-a",
+            1,
+            Some("passed"),
+            None,
+            1,
+            100,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(empty_page.tests.is_empty());
+        assert_eq!(empty_page.test_total, 0);
+        assert_eq!(empty_page.persisted_counts, by_handle.persisted_counts);
+        assert_eq!(
+            empty_page.persisted_counts,
+            ObservationTestCounts {
+                skipped: 2,
+                self_skipped: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn observation_test_pages_are_stable_filtered_and_exhaustive() {
         let db = cache_db().await;
         let mut write = observation("obs-pages", "commit-pages", "env-a");
@@ -5974,6 +6070,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(filtered.persisted_counts.passed, 167);
+        assert_eq!(filtered.persisted_counts.failed, 84);
+        assert_eq!(filtered.persisted_counts.total(), 251);
         assert_eq!(filtered.test_total, 34);
         assert_eq!(filtered.tests.len(), 10);
         assert!(filtered

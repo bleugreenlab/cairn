@@ -4,7 +4,7 @@ use crate::config::project_settings::{CheckCommand, RuntimeInstrument};
 use crate::execution::inputs::InputSelector;
 
 pub const CHECK_RESULT_SCHEMA_VERSION: u32 = 1;
-pub const CHECK_PARSER_VERSION: u32 = 1;
+pub const CHECK_PARSER_VERSION: u32 = 2;
 const CONTENT_IDENTITY_VERSION: &str = "check-content-v1";
 
 /// Runtime declarations used by the Rust self-skip ledger. Their values change

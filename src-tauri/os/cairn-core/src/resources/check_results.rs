@@ -352,6 +352,7 @@ fn render_observation_page(
     permalink: Option<&str>,
     ran_on: Option<&str>,
 ) -> RecordPage {
+    let (count_lines, count_mismatch) = observation_count_lines(observation);
     let short_commit = commit.get(..12).unwrap_or(commit);
     let handle = format!("{}@{short_commit}", observation.check_name);
     let params = encode_query_params(&[
@@ -409,8 +410,8 @@ fn render_observation_page(
         ),
         verdict_platform_line(observation, ran_on),
         verdict_runtime_line(observation),
-        format!("- Complete: {}", observation.complete),
-        format!("- Reusable: {}", observation.reusable),
+        format!("- Complete: {}", observation.complete && !count_mismatch),
+        format!("- Reusable: {}", observation.reusable && !count_mismatch),
         format!(
             "- Parser/schema: {}/{}",
             observation.parser_version, observation.result_schema_version
@@ -427,8 +428,15 @@ fn render_observation_page(
                 .unwrap_or("unrecorded (legacy row)")
         ),
     ];
-    // A fast-tier observation has a row for every test it deferred, so a test
-    // with no row here was not selected; it was never silently unobserved.
+    body.extend(count_lines);
+    if count_mismatch {
+        body.push(format!(
+            "- Recorded authority (overridden by count mismatch): complete={}, reusable={}",
+            observation.complete, observation.reusable
+        ));
+    }
+    // Deferrals are persisted separately from judged outcomes; the page keeps
+    // that distinction even on observations whose enumeration is incomplete.
     if observation.selection.as_deref()
         == Some(crate::execution::check_parsers::FAST_TIER_SELECTION)
     {
@@ -515,7 +523,10 @@ fn render_observation_page(
             "{} passed, {} failed, {} skipped{deferred} on this page",
             passed, failed, skipped
         ),
-        format!("- Total: {}", observation.test_total),
+        format!(
+            "- Total: {} (matching current filters)",
+            observation.test_total
+        ),
         format!("- Offset: {}", observation.test_offset),
         format!("- Limit: {}", query.limit),
     ]);
@@ -622,6 +633,73 @@ fn render_observation_page(
         more: false,
         prelude_lines: Some(prelude_lines),
     }
+}
+
+/// Compare a single nextest run with the global manifest, never with a page.
+/// A composed tier's summaries may overlap, so even a retained single pass is
+/// not a witness for the composition.
+fn observation_count_lines(observation: &CheckResultObservationProjection) -> (Vec<String>, bool) {
+    let counts = &observation.persisted_counts;
+    let mut lines = vec![
+        format!(
+            "- Persisted outcomes (global): {} total; {} passed, {} failed, {} skipped, {} deferred",
+            counts.total(), counts.passed, counts.failed, counts.skipped, counts.deferred
+        ),
+        format!(
+            "- Self-skips: {} (ledger-reported; transferred from runner passes to persisted skips when reconciling)",
+            counts.self_skipped
+        ),
+    ];
+    let unavailable = if observation.selection.as_deref()
+        == Some(crate::execution::check_parsers::FAST_TIER_SELECTION)
+    {
+        Some("composed fast tier; pass summaries are not a whole-lane tally")
+    } else if observation.phases.as_ref().is_some_and(|phases| {
+        phases
+            .passes
+            .iter()
+            .filter(|pass| !matches!(pass.name.as_str(), "warmup" | "build"))
+            .count()
+            > 1
+    }) {
+        Some("multiple test passes; no unambiguous whole-lane tally")
+    } else {
+        None
+    };
+    let summary = crate::execution::check_parsers::nextest_summary_counts(&observation.output_tail);
+    if let Some(reason) = unavailable {
+        lines.push(format!(
+            "- Runner witness unavailable: {reason}; using persisted counts"
+        ));
+        lines.push("- Count reconciliation: unavailable".into());
+        return (lines, false);
+    }
+    let Some(summary) = summary else {
+        lines.push("- Runner witness unavailable: no single unambiguous nextest Summary retained; using persisted counts".into());
+        lines.push("- Count reconciliation: unavailable".into());
+        return (lines, false);
+    };
+    lines.push(format!(
+        "- Runner-reported (nextest Summary): {} total; {} passed, {} failed, {} skipped, {} timed out",
+        summary.run + summary.skipped, summary.passed, summary.failed, summary.skipped, summary.timed_out
+    ));
+    if observation.selection.as_deref() == Some("filtered") {
+        lines.push("- Count reconciliation: unavailable (filtered selection; runner skips may include unselected tests outside the persisted manifest)".into());
+        return (lines, false);
+    }
+    let matched = counts.passed.checked_add(counts.self_skipped) == Some(summary.passed)
+        && Some(counts.failed) == summary.failed.checked_add(summary.timed_out)
+        && counts.skipped.checked_sub(counts.self_skipped) == Some(summary.skipped)
+        && counts.deferred == 0;
+    if matched {
+        lines.push("- Count reconciliation: matched after self-skip pass-to-skip transfers (counts only; not proof of test identity)".into());
+    } else {
+        lines.push(format!(
+            "- Count reconciliation: MISMATCH after {} self-skip pass-to-skip transfers; runner total {}, persisted total {}. Enumeration is incomplete/non-authoritative; not reusable.",
+            counts.self_skipped, summary.run + summary.skipped, counts.total()
+        ));
+    }
+    (lines, !matched)
 }
 
 /// A backtick fence longer than any backtick run inside the output, so tool
@@ -928,15 +1006,185 @@ mod tests {
                     started_offset_ms: None,
                 },
             ],
-            selection: Some("filtered".into()),
+            selection: Some("full".into()),
             deferred_count: 0,
             phases: None,
             execution_warmth: None,
             cell_origin: None,
             build_jobs: None,
+            persisted_counts: crate::execution::cache::ObservationTestCounts {
+                passed: 2,
+                failed: 1,
+                ..Default::default()
+            },
             test_total: 3,
             test_offset: 0,
         }
+    }
+
+    fn counts_page(observation: &CheckResultObservationProjection) -> String {
+        let query = parse_query(&[
+            param("suite", "rust-tests"),
+            param("environment", "env-1"),
+            param("status", "failed"),
+            param("name", "crate"),
+            param("limit", "2"),
+        ])
+        .unwrap();
+        render_observation(
+            "cairn",
+            "main",
+            "target-commit",
+            &query,
+            observation,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn historical_summary_mismatch_keeps_independent_counts_and_revokes_page_authority() {
+        let mut observation = cached_observation();
+        observation.reusable = true;
+        observation.output_tail =
+            "Summary [ 144.635s] 13587 tests run: 13586 passed, 1 failed, 51 skipped".into();
+        observation.persisted_counts = crate::execution::cache::ObservationTestCounts {
+            passed: 13565,
+            failed: 1,
+            skipped: 44,
+            deferred: 0,
+            self_skipped: 21,
+        };
+        // Only one filtered row on the page, not the comparison denominator.
+        observation.tests.retain(|test| test.status == "failed");
+        observation.test_total = 1;
+        let body = counts_page(&observation);
+        for expected in [
+            "Runner-reported (nextest Summary): 13638 total; 13586 passed, 1 failed, 51 skipped",
+            "Persisted outcomes (global): 13610 total; 13565 passed, 1 failed, 44 skipped",
+            "Self-skips: 21",
+            "MISMATCH after 21 self-skip",
+            "- Complete: false",
+            "- Reusable: false",
+            "Recorded authority (overridden by count mismatch): complete=true, reusable=true",
+            "0 passed, 1 failed, 0 skipped on this page",
+            "Total: 1 (matching current filters)",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?}: {body}");
+        }
+        assert!(
+            observation.complete,
+            "rendering never mutates the historical row"
+        );
+    }
+
+    #[test]
+    fn matching_summary_accounts_for_self_skip_transfers_not_page_counts() {
+        let mut observation = cached_observation();
+        observation.output_tail =
+            "Summary [ 1.000s] 13587 tests run: 13586 passed, 1 failed, 51 skipped".into();
+        observation.persisted_counts = crate::execution::cache::ObservationTestCounts {
+            passed: 13565,
+            failed: 1,
+            skipped: 72,
+            deferred: 0,
+            self_skipped: 21,
+        };
+        let body = counts_page(&observation);
+        assert!(body.contains("Count reconciliation: matched after self-skip"));
+        assert!(!body.contains("MISMATCH"));
+        assert!(body.contains("- Complete: true"));
+        assert!(body.contains("1 passed, 1 failed, 0 skipped on this page"));
+        assert!(body.contains("Persisted outcomes (global): 13638 total"));
+        assert!(body.contains("Total: 3 (matching current filters)"));
+    }
+
+    #[test]
+    fn filtered_selection_shows_both_counts_without_treating_unselected_skips_as_missing() {
+        let mut observation = cached_observation();
+        observation.selection = Some("filtered".into());
+        observation.reusable = true;
+        observation.output_tail =
+            "Summary [ 1.000s] 3 tests run: 2 passed, 1 failed, 100 skipped".into();
+        let body = counts_page(&observation);
+        assert!(body.contains("Runner-reported (nextest Summary): 103 total"));
+        assert!(body.contains("Persisted outcomes (global): 3 total"));
+        assert!(body.contains("Count reconciliation: unavailable (filtered selection"));
+        assert!(body.contains("- Complete: true"));
+        assert!(body.contains("- Reusable: true"));
+        assert!(!body.contains("MISMATCH"));
+    }
+
+    #[test]
+    fn no_summary_uses_global_persisted_counts_with_unavailable_runner_witness() {
+        let observation = cached_observation();
+        let body = counts_page(&observation);
+        assert!(body.contains("Persisted outcomes (global): 3 total; 2 passed, 1 failed"));
+        assert!(body.contains("Runner witness unavailable"));
+        assert!(body.contains("Count reconciliation: unavailable"));
+        assert!(!body.contains("Runner-reported"));
+    }
+
+    #[test]
+    fn multiple_or_composed_passes_do_not_borrow_the_last_summary() {
+        let mut observation = cached_observation();
+        let summary = "Summary [ 1.000s] 2 tests run: 1 passed, 1 failed, 1 skipped";
+        observation.output_tail =
+            format!("{summary}\nSummary [ 2.000s] 3 tests run: 3 passed, 0 skipped");
+        let body = counts_page(&observation);
+        assert!(body.contains("Runner witness unavailable"));
+        assert!(!body.contains("Count reconciliation: matched"));
+        observation.output_tail = summary.into();
+        observation.selection = Some(crate::execution::check_parsers::FAST_TIER_SELECTION.into());
+        let body = counts_page(&observation);
+        assert!(body.contains("composed fast tier"));
+        assert!(!body.contains("Runner-reported"));
+    }
+
+    #[test]
+    fn multiple_recorded_passes_make_a_lone_retained_summary_ambiguous() {
+        let mut observation = cached_observation();
+        observation.output_tail =
+            "Summary [ 1.000s] 3 tests run: 2 passed, 1 failed, 0 skipped".into();
+        observation.phases = Some(
+            serde_json::from_value(serde_json::json!({
+                "origin": "executor", "setupMs": 0, "compileMs": 0, "testMs": 1, "publishMs": 0,
+                "passes": [
+                    {"name": "local", "wallMs": 1, "compileMs": 0, "testMs": 1},
+                    {"name": "global", "wallMs": 1, "compileMs": 0, "testMs": 1}
+                ]
+            }))
+            .unwrap(),
+        );
+        let body = counts_page(&observation);
+        assert!(body.contains("multiple test passes"));
+        assert!(!body.contains("Count reconciliation: matched"));
+    }
+
+    #[test]
+    fn single_pass_timeouts_reconcile_as_failed_outcomes_not_deferrals() {
+        let mut observation = cached_observation();
+        observation.output_tail =
+            "Summary [ 1.000s] 3 tests run: 2 passed, 1 timed out, 0 skipped".into();
+        let body = counts_page(&observation);
+        assert!(body.contains("0 failed, 0 skipped, 1 timed out"));
+        assert!(body.contains("Count reconciliation: matched"));
+        observation.persisted_counts.failed = 0;
+        observation.persisted_counts.deferred = 1;
+        assert!(counts_page(&observation).contains("MISMATCH"));
+    }
+
+    #[test]
+    fn duplicate_retained_summary_is_one_witness_and_status_mismatch_is_not_hidden_by_total() {
+        let mut observation = cached_observation();
+        let summary = "Summary [ 1.000s] 3 tests run: 2 passed, 1 failed, 0 skipped";
+        observation.output_tail = format!("{summary}\n…\n{summary}");
+        assert!(counts_page(&observation).contains("Count reconciliation: matched"));
+        observation.persisted_counts.passed = 1;
+        observation.persisted_counts.failed = 2;
+        let body = counts_page(&observation);
+        assert!(body.contains("MISMATCH"));
+        assert!(body.contains("runner total 3, persisted total 3"));
     }
 
     #[test]

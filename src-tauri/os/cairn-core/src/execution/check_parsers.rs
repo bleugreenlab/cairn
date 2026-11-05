@@ -155,7 +155,7 @@ pub struct ParsedCheckResult {
     /// identifier.
     pub(crate) failures: Vec<CheckFailure>,
     /// A compact, summary-first rendering of the verdict written by the check
-    /// itself (`rust-lint` today). The stored output excerpt leads with it, so a
+    /// itself, including nextest's independent Summary witness. The stored output excerpt leads with it, so a
     /// red's cause survives however much chatter the run printed after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) report: Option<String>,
@@ -583,6 +583,7 @@ pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCh
         Some(ParserKind::Tsc) => parse_tsc(&clean),
         None => parse_bun_test(&clean).or_else(|| parse_vitest_summary(&clean)),
     });
+    let parsed = parsed.map(|parsed| reconcile_nextest_summary(parsed, &clean));
     let Some((declaring_parser, reason)) = declared_unverified(&clean) else {
         return parsed;
     };
@@ -610,6 +611,53 @@ pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCh
             lint_findings: None,
         },
     })
+}
+
+/// The independent reporter must agree with a whole-run artifact even when an
+/// older producer incorrectly claimed its enumeration was complete.
+fn reconcile_nextest_summary(mut parsed: ParsedCheckResult, output: &str) -> ParsedCheckResult {
+    if parsed.parser != "nextest" || parsed.selection != "full" {
+        return parsed;
+    }
+    let witness = format!("{output}\n{}", parsed.report.as_deref().unwrap_or(""));
+    let Some(summary) = nextest_summary_counts(&witness) else {
+        if strip_ansi(&witness)
+            .lines()
+            .any(|line| line.trim_start().starts_with("Summary ["))
+        {
+            parsed.complete = false;
+            parsed.report = Some(head_chars(
+                &format!(
+                    "nextest Summary witness is ambiguous or unsupported\n{}",
+                    parsed.report.as_deref().unwrap_or("")
+                ),
+                REPORT_CHARS,
+            ));
+        }
+        return parsed;
+    };
+    let self_skipped = parsed
+        .tests
+        .iter()
+        .filter(|test| test.status == "skipped" && test.skip_reason.is_some())
+        .count();
+    let matched = parsed.passed.checked_add(self_skipped) == Some(summary.passed)
+        && parsed.failed == summary.failed + summary.timed_out
+        && parsed.skipped.checked_sub(self_skipped) == Some(summary.skipped)
+        && parsed.deferred == 0;
+    if !matched {
+        parsed.complete = false;
+        let diagnostic = format!(
+            "nextest Summary/enumeration mismatch: runner {} passed, {} failed, {} skipped, {} timed out; persisted enumeration {} passed, {} failed, {} skipped, {} deferred; {} self-skip pass-to-skip transfers",
+            summary.passed, summary.failed, summary.skipped, summary.timed_out,
+            parsed.passed, parsed.failed, parsed.skipped, parsed.deferred, self_skipped
+        );
+        parsed.report = Some(head_chars(
+            &format!("{diagnostic}\n{}", parsed.report.as_deref().unwrap_or("")),
+            REPORT_CHARS,
+        ));
+    }
+    parsed
 }
 
 /// The runner a structured result names and its `unverified` declaration, when
@@ -678,7 +726,44 @@ fn parse_structured_artifact(clean: &str) -> Option<ParsedCheckResult> {
 /// A canonical per-test result. Every count is derived from the rows, so a
 /// writer cannot claim a tally its rows do not carry.
 fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<ParsedCheckResult> {
-    let tests: Vec<CheckTestResult> = serde_json::from_value(value.get("tests")?.clone()).ok()?;
+    let rows: Vec<CheckTestResult> = serde_json::from_value(value.get("tests")?.clone()).ok()?;
+    let mut tests: Vec<CheckTestResult> = Vec::with_capacity(rows.len());
+    let mut indices = std::collections::HashMap::<String, usize>::new();
+    let mut invalid = Vec::new();
+    for row in rows {
+        if row.id.trim().is_empty()
+            || !matches!(
+                row.status.as_str(),
+                "passed" | "failed" | "skipped" | "deferred"
+            )
+        {
+            invalid.push(format!("invalid terminal row: {} ({})", row.id, row.status));
+            continue;
+        }
+        if let Some(index) = indices.get(&row.id).copied() {
+            invalid.push(format!("duplicate test identity: {}", row.id));
+            // Preserve a named failure for diagnosis rather than letting a
+            // first pass hide it behind the database's unique key.
+            if row.status == "failed" {
+                tests[index] = row;
+            }
+        } else {
+            indices.insert(row.id.clone(), tests.len());
+            tests.push(row);
+        }
+    }
+    let complete = value
+        .get("complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && invalid.is_empty();
+    let report = value.get("report").and_then(|v| v.as_str()).unwrap_or("");
+    let report = [invalid.join("\n"), report.to_string()]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = (!report.is_empty()).then(|| head_chars(&report, REPORT_CHARS));
     let passed = tests.iter().filter(|test| test.status == "passed").count();
     let failed = tests.iter().filter(|test| test.status == "failed").count();
     let skipped = tests.iter().filter(|test| test.status == "skipped").count();
@@ -701,10 +786,7 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         .collect();
     Some(ParsedCheckResult {
         schema_version: 1,
-        complete: value
-            .get("complete")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        complete,
         selection: value
             .get("selection")
             .and_then(|v| v.as_str())
@@ -721,7 +803,7 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         skipped,
         suite_failures: 0,
         deferred,
-        report: None,
+        report,
         phases: CheckPhases::from_artifact(value),
         failures,
         unverified: None,
@@ -1356,6 +1438,69 @@ pub(crate) fn extract_running_tests(output: &str) -> Vec<String> {
 static COUNT_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());
 static COUNT_FAILED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+failed").unwrap());
 static COUNT_SKIPPED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+skipped").unwrap());
+
+/// Independent human-reporter counts, before declared self-skips reclassify passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NextestSummaryCounts {
+    pub(crate) run: usize,
+    pub(crate) passed: usize,
+    pub(crate) failed: usize,
+    pub(crate) skipped: usize,
+    pub(crate) timed_out: usize,
+}
+
+static NEXTEST_SUMMARY_ROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Summary\s+\[[^\]]*\]\s+(\d+)\s+tests?\s+run:\s*(.*)$").unwrap());
+static NEXTEST_SUMMARY_QUALIFIER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\([^)]*\)").unwrap());
+
+/// One unambiguous Summary witness. The retained report may repeat the same
+/// line in the tail; different summaries belong to different passes and cannot
+/// silently stand in for the whole lane.
+pub(crate) fn nextest_summary_counts(output: &str) -> Option<NextestSummaryCounts> {
+    let clean = strip_ansi(output);
+    let summaries: std::collections::HashSet<_> = clean
+        .lines()
+        .map(str::trim)
+        .filter(|line| NEXTEST_SUMMARY_ROW.is_match(line))
+        .collect();
+    if summaries.len() != 1 {
+        return None;
+    }
+    let captures = NEXTEST_SUMMARY_ROW.captures(summaries.into_iter().next()?)?;
+    let mut counts = NextestSummaryCounts {
+        run: captures[1].parse().ok()?,
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        timed_out: 0,
+    };
+    let tallies = NEXTEST_SUMMARY_QUALIFIER.replace_all(&captures[2], "");
+    let mut labels = std::collections::HashSet::new();
+    for part in tallies.split(',') {
+        let (count, label) = part.trim().split_once(' ')?;
+        let count: usize = count.parse().ok()?;
+        let label = label.trim();
+        if !labels.insert(label) {
+            return None;
+        }
+        match label {
+            "passed" => counts.passed = count,
+            "failed" | "exec failed" | "aborted" => {
+                counts.failed = counts.failed.checked_add(count)?;
+            }
+            "timed out" => counts.timed_out = count,
+            "skipped" => counts.skipped = count,
+            _ => return None,
+        }
+    }
+    (counts.run
+        == counts
+            .passed
+            .checked_add(counts.failed)?
+            .checked_add(counts.timed_out)?)
+    .then_some(counts)
+}
 
 fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
     // `Summary [   0.093s] 4 tests run: 2 passed, 2 failed, 1 skipped` is the
@@ -2106,6 +2251,86 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
             let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{json}\n");
             assert_eq!(parse_check_output("bun run test:api", &output), None);
         }
+    }
+
+    #[test]
+    fn nextest_summary_witness_is_unambiguous_and_normalizes_outcomes() {
+        let line = "Summary [ 0.1s] 4 tests run: 1 passed (1 slow), 1 failed, 1 exec failed, 1 timed out, 2 skipped";
+        assert_eq!(
+            nextest_summary_counts(&format!("{line}\n{line}")),
+            Some(NextestSummaryCounts {
+                run: 4,
+                passed: 1,
+                failed: 2,
+                timed_out: 1,
+                skipped: 2,
+            })
+        );
+        assert!(
+            nextest_summary_counts(&format!("{line}\nSummary [ 1s] 1 test run: 1 passed"))
+                .is_none()
+        );
+        assert!(nextest_summary_counts("Summary [ 1s] 1 test run: 1 unknown").is_none());
+        assert!(nextest_summary_counts("Summary [ 1s] 2 tests run: 1 passed").is_none());
+    }
+
+    #[test]
+    fn structured_duplicate_identity_cannot_hide_a_failure_or_claim_completeness() {
+        let value = serde_json::json!({
+            "schemaVersion": 1, "parser": "nextest", "complete": true, "selection": "full",
+            "tests": [
+                {"id": "crate::binary$same", "status": "passed"},
+                {"id": "crate::binary$same", "status": "failed", "failureMessage": "second binary failed"}
+            ]
+        });
+        let parsed = parse_check_output(
+            "bun run test:rust",
+            &format!("{RESULT_ARTIFACT_JSON_MARKER}{value}"),
+        )
+        .unwrap();
+        assert!(!parsed.complete);
+        assert_eq!(parsed.tests.len(), 1);
+        assert_eq!(parsed.failed, 1);
+        assert_eq!(parsed.failures[0].name, "crate::binary$same");
+        assert!(parsed
+            .report
+            .unwrap()
+            .contains("duplicate test identity: crate::binary$same"));
+    }
+
+    #[test]
+    fn nextest_artifact_report_survives_and_self_skip_transfers_reconcile() {
+        let summary = "Summary [ 1s] 2 tests run: 2 passed, 1 skipped";
+        let value = serde_json::json!({
+            "schemaVersion": 1, "parser": "nextest", "complete": true, "selection": "full",
+            "report": summary,
+            "tests": [
+                {"id": "c::c$pass", "status": "passed"},
+                {"id": "c::c$self_skip", "status": "skipped", "skipReason": "environment"},
+                {"id": "c::c$ignored", "status": "skipped"}
+            ]
+        });
+        let parsed = parse_check_output(
+            "bun run test:rust",
+            &format!("{summary}\n{RESULT_ARTIFACT_JSON_MARKER}{value}"),
+        )
+        .unwrap();
+        assert!(parsed.complete);
+        assert_eq!(parsed.report.as_deref(), Some(summary));
+        assert_eq!((parsed.passed, parsed.skipped), (1, 2));
+
+        let mut shorter = value.clone();
+        shorter["tests"].as_array_mut().unwrap().pop();
+        let parsed = parse_check_output(
+            "bun run test:rust",
+            &format!("{summary}\n{RESULT_ARTIFACT_JSON_MARKER}{shorter}"),
+        )
+        .unwrap();
+        assert!(!parsed.complete);
+        assert!(parsed
+            .report
+            .unwrap()
+            .contains("Summary/enumeration mismatch"));
     }
 
     #[test]
