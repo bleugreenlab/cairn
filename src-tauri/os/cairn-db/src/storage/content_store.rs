@@ -73,6 +73,12 @@ pub enum ContentStoreError {
 /// the store itself never interprets the bytes.
 #[async_trait]
 pub trait ContentStore: Send + Sync {
+    /// The filesystem archive to reconnect when a catalogued object is missing.
+    /// Remote and in-memory stores have no local root.
+    fn local_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Store `bytes` under `hash`. Idempotent: content-addressed, so re-putting an
     /// existing key is a no-op (this is what makes cross-member dedup free).
     async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), ContentStoreError>;

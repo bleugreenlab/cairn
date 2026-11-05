@@ -11,10 +11,10 @@ use super::common::{
     resolve_issue_id, visible_job_node_segment, ResourceActionRun, ResourceArtifact, ResourceJob,
 };
 use super::transcript::{
-    format_raw_transcript, format_transcript_digest_with, get_nth_run_id, grep_transcript_content,
-    load_job_events_ordered, parse_raw_transcript_format, read_single_event,
-    reconstruct_turn_events, render_single_event, transcript_from_rows, turn_event_rows,
-    DigestCoordinate, DigestMeta, EventRow, RawTranscriptFormat, StoredEvent,
+    finish_turn_rows, format_raw_transcript, format_transcript_digest_with, gather_single_event,
+    gather_turn_rows, get_nth_run_id, grep_transcript_content, load_job_events_ordered,
+    parse_raw_transcript_format, render_single_event, transcript_from_rows, DigestCoordinate,
+    DigestMeta, EventRow, RawTranscriptFormat, FIRST_JOB_SESSION,
 };
 use crate::mcp::handlers::search::{GrepPayload, GrepWindow};
 use cairn_models::continuation::DigestOptions;
@@ -2188,24 +2188,16 @@ async fn render_pr_publish_history(
 /// session is addressable by the turn URI; turns from rotated successor sessions
 /// are intentionally absent and render with appearance-order numbering and no
 /// drill-down link.
+fn primary_session_turns_sql() -> String {
+    format!("SELECT id, sequence FROM turns WHERE session_id = ({FIRST_JOB_SESSION})")
+}
+
 async fn load_primary_session_turn_sequences(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> HashMap<String, i32> {
     let mut map = HashMap::new();
-    if let Ok(mut rows) = conn
-        .query(
-            "
-            SELECT id, sequence
-            FROM turns
-            WHERE session_id = (
-                SELECT session_id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC LIMIT 1
-            )
-            ",
-            (job_id,),
-        )
-        .await
-    {
+    if let Ok(mut rows) = conn.query(&primary_session_turns_sql(), (job_id,)).await {
         while let Ok(Some(row)) = rows.next().await {
             if let (Ok(id), Ok(seq)) = (row.text(0), row.i64(1)) {
                 map.insert(id, seq as i32);
@@ -2495,6 +2487,7 @@ async fn load_node_chat_turn(
     turn_seq: i32,
 ) -> Result<Vec<EventRow>, String> {
     let label = node_name.to_owned();
+    let hot_only = crate::storage::events::history::HistoryReader::new(db).is_hot_only();
     let read = read_node_rows(
         db,
         project_key,
@@ -2502,14 +2495,15 @@ async fn load_node_chat_turn(
         exec_seq,
         node_name,
         move |conn, job| {
-            Box::pin(async move { job_turn_rows(conn, &job.id, &label, turn_seq).await })
+            Box::pin(async move {
+                let turn_id = job_turn_id(conn, &job.id, &label, turn_seq).await?;
+                let hot = gather_turn_rows(conn, &turn_id, hot_only).await?;
+                Ok::<_, String>((turn_id, hot))
+            })
         },
     );
-    let events = read.await?.1?;
-
-    // Reconstruct after the read has released: it takes its own short read and
-    // may fetch from the content store.
-    let event_rows = reconstruct_turn_events(db, events).await;
+    let (turn_id, hot) = read.await?.1?;
+    let event_rows = finish_turn_rows(db, &turn_id, hot).await?;
 
     if event_rows.is_empty() {
         return Err(format!(
@@ -2520,17 +2514,17 @@ async fn load_node_chat_turn(
     Ok(event_rows)
 }
 
-/// The stored events of turn `turn_seq` in a job's primary session. Statements
-/// only. `Err` is the message for a job with no session or no such turn.
-async fn job_turn_rows(
+/// The id of turn `turn_seq` in a job's primary session. Statements only. `Err`
+/// is the message for a job with no session or no such turn.
+async fn job_turn_id(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     label: &str,
     turn_seq: i32,
-) -> Result<Vec<crate::models::Event>, String> {
+) -> Result<String, String> {
     use super::transcript::{chat_turn_target, ChatTurnTarget};
     match chat_turn_target(conn, job_id, turn_seq, false).await? {
-        ChatTurnTarget::Turn(turn_id) => Ok(turn_event_rows(conn, &turn_id).await),
+        ChatTurnTarget::Turn(turn_id) => Ok(turn_id),
         ChatTurnTarget::NoSession => Err("No session found for this node.".into()),
         _ => Err(format!("Turn {} not found for node '{}'", turn_seq, label)),
     }
@@ -3200,6 +3194,7 @@ async fn load_task_chat_turn(
     task_name: &str,
     turn_seq: i32,
 ) -> Result<Vec<EventRow>, String> {
+    let hot_only = crate::storage::events::history::HistoryReader::new(db).is_hot_only();
     let read = read_task_rows(
         db,
         project_key,
@@ -3208,19 +3203,27 @@ async fn load_task_chat_turn(
         node_name,
         task_name,
         move |conn, _parent_job, task_job| {
-            Box::pin(async move { task_turn_rows(conn, &task_job.id, turn_seq).await })
+            Box::pin(async move {
+                let turn = task_turn_id(conn, &task_job.id, turn_seq).await;
+                let hot = match &turn {
+                    TaskTurn::Found(id) => gather_turn_rows(conn, id, hot_only).await,
+                    _ => Ok(None),
+                };
+                (turn, hot)
+            })
         },
     );
-    let events = match read.await? {
-        (_, _, TaskTurnRows::Events(events)) => events,
-        (_, _, TaskTurnRows::NoSession) => return Err("No session found for this task.".to_string()),
-        (_, _, TaskTurnRows::Ambiguous) => {
+    let (turn, hot) = read.await?.2;
+    let turn_id = match turn {
+        TaskTurn::Found(turn_id) => turn_id,
+        TaskTurn::NoSession => return Err("No session found for this task.".to_string()),
+        TaskTurn::Ambiguous => {
             return Err(format!(
                 "Task turn URI is ambiguous for task '{}' in node '{}' of issue {}/{} because runs span multiple sessions",
                 task_name, node_name, project_key, number
             ))
         }
-        (_, _, TaskTurnRows::TurnMissing) => {
+        TaskTurn::TurnMissing => {
             return Err(format!(
                 "Turn {} not found for task '{}' in node '{}' of issue {}/{}",
                 turn_seq, task_name, node_name, project_key, number
@@ -3228,9 +3231,7 @@ async fn load_task_chat_turn(
         }
     };
 
-    // Reconstruct after the read has released: it takes its own short read and
-    // may fetch from the content store.
-    let event_rows = reconstruct_turn_events(db, events).await;
+    let event_rows = finish_turn_rows(db, &turn_id, hot?).await?;
 
     if event_rows.is_empty() {
         return Err(format!(
@@ -3242,29 +3243,27 @@ async fn load_task_chat_turn(
 }
 
 /// What a task turn URI resolves to.
-enum TaskTurnRows {
+enum TaskTurn {
     NoSession,
     /// The task's runs span more than one session, so a turn number names no
     /// single turn.
     Ambiguous,
     TurnMissing,
-    Events(Vec<crate::models::Event>),
+    Found(String),
 }
 
-/// The stored events of turn `turn_seq` in a task's session. Statements only.
-async fn task_turn_rows(
+/// The id of turn `turn_seq` in a task's session. Statements only.
+async fn task_turn_id(
     conn: &cairn_db::storage::TrackedConnection,
     task_job_id: &str,
     turn_seq: i32,
-) -> TaskTurnRows {
+) -> TaskTurn {
     use super::transcript::{chat_turn_target, ChatTurnTarget};
     match chat_turn_target(conn, task_job_id, turn_seq, true).await {
-        Ok(ChatTurnTarget::Turn(turn_id)) => {
-            TaskTurnRows::Events(turn_event_rows(conn, &turn_id).await)
-        }
-        Ok(ChatTurnTarget::NoSession) => TaskTurnRows::NoSession,
-        Ok(ChatTurnTarget::Ambiguous) => TaskTurnRows::Ambiguous,
-        _ => TaskTurnRows::TurnMissing,
+        Ok(ChatTurnTarget::Turn(turn_id)) => TaskTurn::Found(turn_id),
+        Ok(ChatTurnTarget::NoSession) => TaskTurn::NoSession,
+        Ok(ChatTurnTarget::Ambiguous) => TaskTurn::Ambiguous,
+        _ => TaskTurn::TurnMissing,
     }
 }
 
@@ -3441,6 +3440,7 @@ pub(super) async fn read_node_chat_event(
     run_seq: i32,
     event_seq: i32,
 ) -> String {
+    let hot_only = crate::storage::events::history::HistoryReader::new(db).is_hot_only();
     let read = read_node_rows(
         db,
         project_key,
@@ -3448,32 +3448,23 @@ pub(super) async fn read_node_chat_event(
         exec_seq,
         node_name,
         move |conn, job| {
-            Box::pin(async move { job_event_row(conn, &job.id, run_seq, event_seq).await })
+            Box::pin(async move {
+                let run_id = get_nth_run_id(conn, &job.id, run_seq).await;
+                let hot = match &run_id {
+                    Some(id) => gather_single_event(conn, id, event_seq, hot_only).await,
+                    None => Ok(None),
+                };
+                (run_id, hot)
+            })
         },
     );
-    let stored = match read.await {
-        Ok((_, Some(Ok(stored)))) => stored,
-        Ok((_, Some(Err(missing)))) => return missing,
-        Ok((_, None)) => return format!("Run {} not found for node '{}'", run_seq, node_name),
+    let (run_id, hot) = match read.await {
+        Ok((_, (Some(run_id), hot))) => (run_id, hot),
+        Ok((_, (None, _))) => return format!("Run {} not found for node '{}'", run_seq, node_name),
         Err(error) => return error,
     };
 
-    // Rendered after the read has released: reconstruction takes its own short
-    // read and may fetch from the content store.
-    render_single_event(db, stored).await
-}
-
-/// The stored event `event_seq` of a job's `run_seq`th run (1-indexed).
-/// Statements only. `None` when the job has no such run; `Some(Err)` is the
-/// event's not-found message.
-async fn job_event_row(
-    conn: &cairn_db::storage::TrackedConnection,
-    job_id: &str,
-    run_seq: i32,
-    event_seq: i32,
-) -> Option<Result<StoredEvent, String>> {
-    let run_id = get_nth_run_id(conn, job_id, run_seq).await?;
-    Some(read_single_event(conn, &run_id, event_seq).await)
+    render_single_event(db, &run_id, event_seq, hot).await
 }
 
 #[cfg(test)]
@@ -4036,6 +4027,7 @@ pub(super) async fn read_task_chat_event(
     run_seq: i32,
     event_seq: i32,
 ) -> String {
+    let hot_only = crate::storage::events::history::HistoryReader::new(db).is_hot_only();
     let read = read_task_rows(
         db,
         project_key,
@@ -4044,13 +4036,19 @@ pub(super) async fn read_task_chat_event(
         node_name,
         task_name,
         move |conn, _parent_job, task_job| {
-            Box::pin(async move { job_event_row(conn, &task_job.id, run_seq, event_seq).await })
+            Box::pin(async move {
+                let run_id = get_nth_run_id(conn, &task_job.id, run_seq).await;
+                let hot = match &run_id {
+                    Some(id) => gather_single_event(conn, id, event_seq, hot_only).await,
+                    None => Ok(None),
+                };
+                (run_id, hot)
+            })
         },
     );
-    let stored = match read.await {
-        Ok((_, _, Some(Ok(stored)))) => stored,
-        Ok((_, _, Some(Err(missing)))) => return missing,
-        Ok((_, _, None)) => {
+    let (run_id, hot) = match read.await {
+        Ok((_, _, (Some(run_id), hot))) => (run_id, hot),
+        Ok((_, _, (None, _))) => {
             return format!(
                 "Run {} not found for task '{}' in node '{}'",
                 run_seq, task_name, node_name
@@ -4059,7 +4057,7 @@ pub(super) async fn read_task_chat_event(
         Err(error) => return error,
     };
 
-    render_single_event(db, stored).await
+    render_single_event(db, &run_id, event_seq, hot).await
 }
 
 #[cfg(test)]
@@ -4246,6 +4244,225 @@ mod stuck_resolution_tests {
             "{text}"
         );
         assert!(!text.contains("failed"), "{text}");
+    }
+}
+
+/// Every transcript resource reads the same through a pack as it reads hot.
+#[cfg(test)]
+mod history_parity_tests {
+    use super::*;
+    use crate::storage::history_pack::testing::{
+        evict_all, publish_for_test, read_both, seed_fixture_execution,
+    };
+
+    /// Give the fixture execution an issue, a node and a delegated task, so
+    /// resource URIs resolve to it.
+    async fn seed_node_and_task(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+               VALUES ('issue-1', 'p', 7, 'An issue', 1, 1);
+             UPDATE executions SET issue_id = 'issue-1', seq = 1 WHERE id = 'exec-1';
+             UPDATE jobs SET issue_id = 'issue-1', node_name = 'builder', uri_segment = 'builder'
+               WHERE id = 'job-1';
+             INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, node_name,
+                               uri_segment, status, created_at, updated_at)
+               VALUES ('job-task', 'exec-1', 'job-1', 'issue-1', 'p', 'review', 'review',
+                       'complete', 30, 30);
+             INSERT INTO sessions (id, job_id, status, created_at, updated_at)
+               VALUES ('sess-task', 'job-task', 'active', 30, 30);
+             INSERT INTO runs (id, project_id, job_id, session_id, status, created_at, updated_at)
+               VALUES ('run-task', 'p', 'job-task', 'sess-task', 'exited', 30, 30);
+             INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES ('turn-task', 'sess-task', 'run-task', 'job-task', 1, 'complete', 30, 30);
+             INSERT INTO events (id, run_id, session_id, turn_id, sequence, timestamp, event_type,
+                                 data, created_at)
+               VALUES ('task-1', 'run-task', 'sess-task', 'turn-task', 1, 30, 'user',
+                       '{\"eventType\":\"user\",\"content\":\"the delegated task\"}', 30),
+                      ('task-2', 'run-task', 'sess-task', 'turn-task', 2, 31, 'assistant',
+                       '{\"eventType\":\"assistant\",\"content\":\"task done\"}', 31);",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn json_format() -> Vec<QueryParam> {
+        vec![QueryParam {
+            key: "format".to_string(),
+            value: "json".to_string(),
+        }]
+    }
+
+    /// Every transcript resource of the fixture node and its task, rendered.
+    async fn every_resource(db: &LocalDb) -> Vec<(&'static str, String)> {
+        let (key, number, exec) = ("proj", 7, 1);
+        let json = json_format();
+        vec![
+            (
+                "chat",
+                read_node_chat(db, key, number, exec, "builder", &[]).await,
+            ),
+            (
+                "chat/raw",
+                read_node_chat_raw(db, key, number, exec, "builder", &[]).await,
+            ),
+            (
+                "chat/raw json",
+                read_node_chat_raw(db, key, number, exec, "builder", &json).await,
+            ),
+            (
+                "chat/turn/1",
+                read_node_chat_turn(db, key, number, exec, "builder", 1).await,
+            ),
+            (
+                "chat/1/2 assistant",
+                read_node_chat_event(db, key, number, exec, "builder", 1, 2).await,
+            ),
+            // A tool result that does not carry its tool's name, so this also
+            // reads the run's assistant events to resolve it.
+            (
+                "chat/1/4 tool result",
+                read_node_chat_event(db, key, number, exec, "builder", 1, 4).await,
+            ),
+            (
+                "chat/1/99 missing",
+                read_node_chat_event(db, key, number, exec, "builder", 1, 99).await,
+            ),
+            (
+                "task chat",
+                read_task_chat(db, key, number, exec, "builder", "review", &[]).await,
+            ),
+            (
+                "task chat/raw",
+                read_task_chat_raw(db, key, number, exec, "builder", "review", &[]).await,
+            ),
+            (
+                "task chat/raw json",
+                read_task_chat_raw(db, key, number, exec, "builder", "review", &json).await,
+            ),
+            (
+                "task chat/turn/1",
+                read_task_chat_turn(db, key, number, exec, "builder", "review", 1).await,
+            ),
+            (
+                "task chat/1/2",
+                read_task_chat_event(db, key, number, exec, "builder", "review", 1, 2).await,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn turn_session_runlists_keep_job_indexed_plans() {
+        let db = crate::storage::migrated_test_db("node-session-runlist-plans").await;
+        let primary = primary_session_turns_sql();
+        for sql in [FIRST_JOB_SESSION, primary.as_str()] {
+            let plan = crate::storage::query_plan(&db, sql, vec!["job".into()]).await;
+            assert!(
+                plan.contains("SEARCH runs") && plan.contains("job_id"),
+                "{plan}"
+            );
+            assert!(!plan.contains("SCAN runs"), "{plan}");
+        }
+    }
+
+    #[tokio::test]
+    async fn node_and_task_turn_detail_keep_the_resolving_checkout() {
+        let db = crate::storage::migrated_test_db("node-hot-checkouts").await;
+        seed_fixture_execution(&db, "node-hot-checkouts").await;
+        seed_node_and_task(&db).await;
+        for cataloged in [false, true] {
+            if cataloged {
+                publish_for_test(&db, "exec-1").await;
+            }
+            for task in [false, true] {
+                let statements = db.read_statement_count();
+                let before = db.read_checkout_count();
+                let turn = if task {
+                    read_task_chat_turn(&db, "proj", 7, 1, "builder", "review", 1).await
+                } else {
+                    read_node_chat_turn(&db, "proj", 7, 1, "builder", 1).await
+                };
+                assert!(
+                    turn.contains(if task {
+                        "task done"
+                    } else {
+                        "the restored body"
+                    }),
+                    "{turn}"
+                );
+                assert_eq!(
+                    db.read_checkout_count() - before,
+                    1,
+                    "turn task={task}, catalog={cataloged}"
+                );
+                assert_eq!(
+                    db.read_statement_count() - statements,
+                    if task { 8 } else { 7 },
+                    "metadata + session + turn + events, unchanged main shape"
+                );
+                let statements = db.read_statement_count();
+                let before = db.read_checkout_count();
+                let detail = if task {
+                    read_task_chat_event(&db, "proj", 7, 1, "builder", "review", 1, 2).await
+                } else {
+                    read_node_chat_event(&db, "proj", 7, 1, "builder", 1, 2).await
+                };
+                assert!(
+                    detail.contains(if task {
+                        "task done"
+                    } else {
+                        "the restored body"
+                    }),
+                    "{detail}"
+                );
+                assert_eq!(
+                    db.read_checkout_count() - before,
+                    1,
+                    "detail task={task}, catalog={cataloged}"
+                );
+                assert_eq!(
+                    db.read_statement_count() - statements,
+                    if task { 7 } else { 6 },
+                    "metadata + run ordinal + event, unchanged main shape"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_transcript_resource_reads_the_same_through_a_pack() {
+        let db = crate::storage::migrated_test_db("resource-parity.db").await;
+        seed_fixture_execution(&db, "resource-parity").await;
+        seed_node_and_task(&db).await;
+        publish_for_test(&db, "exec-1").await;
+
+        let (hot, forced) = read_both(&db, || every_resource(&db)).await;
+        assert_eq!(hot, forced);
+
+        // The reads are about something: the archived body restored, the tool
+        // name resolved, the task's own transcript.
+        let body = |name: &str| &hot.iter().find(|(label, _)| *label == name).unwrap().1;
+        assert!(
+            body("chat/raw").contains("the restored body"),
+            "{}",
+            body("chat/raw")
+        );
+        assert!(body("chat/1/2 assistant").contains("the restored body"));
+        assert!(
+            body("chat/1/4 tool result").contains("**Tool Result (mcp__cairn__read):**"),
+            "{}",
+            body("chat/1/4 tool result")
+        );
+        assert_eq!(
+            body("chat/1/99 missing"),
+            "Event with sequence 99 not found"
+        );
+        assert!(body("task chat/raw").contains("the delegated task"));
+        assert!(body("task chat/1/2").contains("task done"));
+
+        // With the hot rows gone, only the pack can answer.
+        evict_all(&db).await;
+        let evicted = every_resource(&db).await;
+        assert_eq!(hot, evicted);
     }
 }
 

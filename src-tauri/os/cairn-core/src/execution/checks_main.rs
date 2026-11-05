@@ -66,7 +66,9 @@ use cairn_common::executor_protocol::{CheckSelectorSource, ExecutorSelector};
 use regex::Regex;
 
 use crate::config::project_settings::CheckCommand;
-use crate::execution::check_parsers::is_test_runner_command;
+use crate::execution::check_parsers::{
+    is_test_runner_command, plan_audit_status_gates, PLAN_AUDIT_EXIT_CODE,
+};
 use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
     execute_check_contract, host_ended_compile, load_checks_contract_at_commit_detailed,
@@ -1174,7 +1176,7 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
                         check: lane.check.clone(),
                         platform: lane.platform.clone(),
                         tip: Some(context.commit.to_string()),
-                        summary: verdict_clause(&row, lane.verdict),
+                        summary: headline_clause(&row, lane.verdict),
                         row: Some((row.reference.clone(), row.commit.clone())),
                         at_unix_ms: now_ms(),
                     },
@@ -1677,7 +1679,12 @@ fn row_is_news(kind: LaneVerdict, row: &CadenceRow, comparison: &Comparison) -> 
                 && diff.newly_green.is_empty()
                 && diff.first_red.is_empty()
                 && diff.removed.is_empty()
-                && diff.red_now_skipped == 0)
+                && diff.red_now_skipped == 0
+                && diff.audit_newly_red.is_empty()
+                && diff.audit_newly_green.is_empty()
+                // An audit that stopped or started judging moved no finding, but
+                // a row saying nothing about it would read as clean.
+                && audit_state(row) == audit_state(previous))
         }
     }
 }
@@ -1921,9 +1928,55 @@ pub(crate) struct CadenceRow {
     /// stamp, when the lane's timeline started there (`phase_origin =
     /// 'executor'`). `None` when the timeline started anywhere else.
     pub(crate) lane_started_at_ms: Option<i64>,
+    /// `None` for a lane that carries no audit, such as a row recorded before
+    /// the audit existed.
+    pub(crate) plan_audit: Option<RowAudit>,
+}
+
+/// A row's plan audit as stored: its state and its findings by identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RowAudit {
+    pub(crate) evaluated: bool,
+    /// Why it was not evaluated.
+    pub(crate) note: Option<String>,
+    pub(crate) findings: BTreeMap<String, AuditFinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuditFinding {
+    pub(crate) status: String,
+    pub(crate) issue: Option<String>,
+    pub(crate) excerpt: Option<String>,
+}
+
+impl RowAudit {
+    /// Whether this finding holds this row red.
+    pub(crate) fn gates(&self, finding: &str) -> bool {
+        self.findings
+            .get(finding)
+            .is_some_and(|finding| plan_audit_status_gates(&finding.status))
+    }
+
+    fn gating(&self) -> impl Iterator<Item = (&String, &AuditFinding)> {
+        self.findings
+            .iter()
+            .filter(|(_, finding)| plan_audit_status_gates(&finding.status))
+    }
 }
 
 impl CadenceRow {
+    fn audit_gating(&self) -> usize {
+        self.plan_audit
+            .as_ref()
+            .map_or(0, |audit| audit.gating().count())
+    }
+
+    /// Whether this row's nonzero exit is the plan audit's own, on a run that was
+    /// otherwise clean: a named red, not a runner that failed outside any test.
+    fn exit_is_plan_audits(&self) -> bool {
+        self.exit_code == i64::from(PLAN_AUDIT_EXIT_CODE) && self.audit_gating() > 0
+    }
+
     fn count(&self, wanted: fn(&TestOutcome) -> bool) -> usize {
         self.tests
             .values()
@@ -2005,7 +2058,7 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
             "the per-test enumeration is incomplete, so tests that did not report are unobserved"
                 .to_string(),
         )
-    } else if !row.verdict_passed && row.failed() == 0 {
+    } else if !row.verdict_passed && row.failed() == 0 && !row.exit_is_plan_audits() {
         Some(format!(
             "the suite exited {} with no failing test: the runner failed outside any test (a test target that did not compile, a crash, or a hang), so the {} tests that did report are not the whole suite",
             row.exit_code,
@@ -2064,7 +2117,7 @@ fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
 /// the stored `failure_kind` so a row stored before the classifier knew this
 /// shape still reads as the death it was.
 fn host_ended_compile_cause(row: &CadenceRow) -> Option<String> {
-    if row.verdict_passed || row.failed() > 0 {
+    if row.verdict_passed || row.failed() > 0 || row.exit_is_plan_audits() {
         return None;
     }
     let ended = host_ended_compile(&row.output_tail)?;
@@ -2087,7 +2140,7 @@ fn host_ended_compile_cause(row: &CadenceRow) -> Option<String> {
 /// for, read from its tail with the same matcher the store's classifier and
 /// the executor's GitHub probe use. Such a run never reached the tree.
 fn credential_fetch_cause(row: &CadenceRow) -> Option<String> {
-    if row.verdict_passed || row.failed() > 0 {
+    if row.verdict_passed || row.failed() > 0 || row.exit_is_plan_audits() {
         return None;
     }
     let failure = cairn_common::git_credential::credential_failure(&row.output_tail)?;
@@ -2189,7 +2242,8 @@ async fn load_row(
             "SELECT id, COALESCE(public_handle, id), commit_sha, COALESCE(verdict_platform, ''),
                     executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence,
                     selection,
-                    CASE WHEN phase_origin = 'executor' THEN executor_started_at_unix_ms END
+                    CASE WHEN phase_origin = 'executor' THEN executor_started_at_unix_ms END,
+                    plan_audit_state, plan_audit_note
                FROM check_result_observations WHERE id = ?1",
             (observation_id.to_string(),),
             |row| {
@@ -2207,6 +2261,8 @@ async fn load_row(
                     row.text(10)?,
                     row.opt_text(11)?,
                     row.opt_i64(12)?,
+                    row.opt_text(13)?,
+                    row.opt_text(14)?,
                 ))
             },
         )
@@ -2227,7 +2283,36 @@ async fn load_row(
         cadence,
         selection,
         lane_started_at_ms,
+        plan_audit_state,
+        plan_audit_note,
     ) = head;
+    let plan_audit = match plan_audit_state {
+        None => None,
+        Some(state) => Some(RowAudit {
+            evaluated: state == "evaluated",
+            note: plan_audit_note,
+            findings: db
+                .query_all(
+                    "SELECT finding_id, status, issue, excerpt
+                       FROM check_audit_findings WHERE observation_id = ?1",
+                    (id.clone(),),
+                    |row| {
+                        Ok((
+                            row.text(0)?,
+                            AuditFinding {
+                                status: row.text(1)?,
+                                issue: row.opt_text(2)?,
+                                excerpt: row.opt_text(3)?,
+                            },
+                        ))
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .collect(),
+        }),
+    };
     let tests = db
         .query_all(
             "SELECT test_id, status, failure_excerpt, started_offset_ms, duration_ms
@@ -2272,6 +2357,7 @@ async fn load_row(
         tests,
         output_tail: tail,
         lane_started_at_ms,
+        plan_audit,
     })
 }
 
@@ -3294,10 +3380,27 @@ fn verdict_clause(row: &CadenceRow, kind: LaneVerdict) -> String {
     }
 }
 
+/// A complete row's headline: the plan audit leads a red it gates, so a green
+/// test tally never fronts one, and follows the tests when it could not judge
+/// them, because their verdict stands without it.
+fn headline_clause(row: &CadenceRow, kind: LaneVerdict) -> String {
+    let verdict = verdict_clause(row, kind);
+    match &row.plan_audit {
+        Some(audit) if !audit.evaluated => format!(
+            "{verdict}; plan audit: not evaluated ({})",
+            audit.note.as_deref().unwrap_or("no reason recorded")
+        ),
+        Some(_) if row.audit_gating() > 0 => {
+            format!("plan audit: {} gating; {verdict}", row.audit_gating())
+        }
+        _ => verdict,
+    }
+}
+
 /// An attempt's outcome as the project overview's clause.
 fn outcome_summary(kind: LaneVerdict, verdict: &CadenceVerdict) -> String {
     match verdict {
-        CadenceVerdict::Complete(row) => verdict_clause(row, kind),
+        CadenceVerdict::Complete(row) => headline_clause(row, kind),
         CadenceVerdict::NoVerdict { .. } => "did not complete (no-verdict)".to_string(),
         CadenceVerdict::Death { .. } => "did not complete (death)".to_string(),
         CadenceVerdict::Cancelled { .. } => "cancelled by restart".to_string(),
@@ -3656,6 +3759,50 @@ struct RowDiff<'a> {
     /// that did not read as the host. Counted in `still_red` too; these are
     /// the ones it lists.
     shared_still_red: Vec<SharedRed<'a>>,
+    /// Plan-audit findings by the same three questions, over `failed` and
+    /// `stale` rows. Empty unless both rows evaluated their audit: a row that
+    /// judged nothing cannot have moved a finding either way.
+    audit_newly_red: Vec<&'a str>,
+    audit_newly_green: Vec<&'a str>,
+    audit_still_red: usize,
+}
+
+/// What a row said of its audit: `None` for no audit, else whether it judged.
+fn audit_state(row: &CadenceRow) -> Option<bool> {
+    row.plan_audit.as_ref().map(|audit| audit.evaluated)
+}
+
+/// Fill `diff`'s audit fields. Against no row at all (a baseline) every gating
+/// finding is newly red, as every failure is.
+fn diff_audit<'a>(
+    diff: &mut RowDiff<'a>,
+    current: &'a CadenceRow,
+    previous: Option<&'a CadenceRow>,
+) {
+    let Some(audit) = current.plan_audit.as_ref().filter(|audit| audit.evaluated) else {
+        return;
+    };
+    let before = match previous {
+        None => None,
+        Some(previous) => match previous.plan_audit.as_ref().filter(|audit| audit.evaluated) {
+            Some(before) => Some(before),
+            None => return,
+        },
+    };
+    for (finding, _) in audit.gating() {
+        if before.is_some_and(|before| before.gates(finding)) {
+            diff.audit_still_red += 1;
+        } else {
+            diff.audit_newly_red.push(finding);
+        }
+    }
+    if let Some(before) = before {
+        diff.audit_newly_green = before
+            .gating()
+            .map(|(finding, _)| finding.as_str())
+            .filter(|finding| !audit.gates(finding))
+            .collect();
+    }
 }
 
 /// Failures that share one host condition's error, red at the compared row
@@ -3816,6 +3963,7 @@ fn row_diff<'a>(current: &'a CadenceRow, comparison: &'a Comparison) -> RowDiff<
     }
     diff.newly_red = sorted_groups(newly_red);
     diff.first_red = sorted_groups(first_red);
+    diff_audit(&mut diff, current, previous);
     diff
 }
 
@@ -4216,7 +4364,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     let diff = row_diff(row, report.comparison);
     let newly_red = group_size(&diff.newly_red);
     let first_red = group_size(&diff.first_red);
-    let mut headline = verdict_clause(row, LaneVerdict::PerTest);
+    let mut headline = headline_clause(row, LaneVerdict::PerTest);
     if !diff.host_conditions.is_empty() {
         let conditions: Vec<String> = diff
             .host_conditions
@@ -4244,6 +4392,13 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     if !diff.removed.is_empty() {
         movement.push_str(&format!(" · {} removed", diff.removed.len()));
     }
+    if diff.audit_newly_red.len() + diff.audit_newly_green.len() > 0 {
+        movement.push_str(&format!(
+            " · plan audit: {} newly red, {} newly green",
+            diff.audit_newly_red.len(),
+            diff.audit_newly_green.len()
+        ));
+    }
     out.push_str(&format!(
         "**Main cadence · {} · {} on `{}` · `{}`: {headline} — {movement}**\n\n",
         report.check,
@@ -4255,6 +4410,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     render_basis(out, report, row);
     render_peer(out, report, row, newly_red + first_red);
     render_host_conditions(out, row, &diff.host_conditions, previous, neighbour);
+    render_plan_audit(out, row, &diff);
     if newly_red > 0 {
         let title = match cross_host {
             Some(other) => format!("RED HERE, NOT RED ON `{other}`"),
@@ -4338,6 +4494,47 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     }
     if previous.is_some() {
         render_bracket(out, "Merges since the compared row", report.bracket);
+    }
+}
+
+/// The audit's section of a report: every gating finding by name, however many,
+/// because the identity is what a reader acts on.
+fn render_plan_audit(out: &mut String, row: &CadenceRow, diff: &RowDiff<'_>) {
+    let Some(audit) = &row.plan_audit else {
+        return;
+    };
+    if !audit.evaluated {
+        out.push_str(&format!(
+            "\n**Plan audit: not evaluated** ({}). The tests' verdict stands without it. This row is not a clean audit, and it moved no finding either way.\n",
+            audit.note.as_deref().unwrap_or("no reason recorded")
+        ));
+        return;
+    }
+    let gating = row.audit_gating();
+    if gating > 0 {
+        out.push_str(&format!(
+            "\n**PLAN AUDIT: {gating} gating finding{}** ({} newly red, {} still red). A finding is a statement that walks a wide row; its identity is file, rule, table and statement hash.\n",
+            plural(gating),
+            diff.audit_newly_red.len(),
+            diff.audit_still_red
+        ));
+        for (finding, detail) in audit.gating() {
+            out.push_str(&format!("- `{finding}` ({})", detail.status));
+            if let Some(issue) = &detail.issue {
+                out.push_str(&format!(", {issue}"));
+            }
+            out.push('\n');
+            if let Some(excerpt) = &detail.excerpt {
+                out.push_str(&format!("```\n{excerpt}\n```\n"));
+            }
+        }
+    }
+    if !diff.audit_newly_green.is_empty() {
+        out.push_str(&format!(
+            "\n**PLAN AUDIT NEWLY GREEN: {}**\n",
+            diff.audit_newly_green.len()
+        ));
+        render_tests(out, "", &diff.audit_newly_green);
     }
 }
 
@@ -4573,7 +4770,44 @@ mod tests {
                 .collect(),
             output_tail: String::new(),
             lane_started_at_ms: None,
+            plan_audit: None,
         }
+    }
+
+    /// `row` carrying an evaluated audit with these findings, as `(id, status)`.
+    /// A gating finding on an otherwise clean row exits as the runner would.
+    fn audited(mut row: CadenceRow, findings: &[(&str, &str)]) -> CadenceRow {
+        row.plan_audit = Some(RowAudit {
+            evaluated: true,
+            note: None,
+            findings: findings
+                .iter()
+                .map(|(id, status)| {
+                    (
+                        id.to_string(),
+                        AuditFinding {
+                            status: status.to_string(),
+                            issue: None,
+                            excerpt: None,
+                        },
+                    )
+                })
+                .collect(),
+        });
+        if row.verdict_passed && row.audit_gating() > 0 {
+            row.verdict_passed = false;
+            row.exit_code = i64::from(PLAN_AUDIT_EXIT_CODE);
+        }
+        row
+    }
+
+    fn not_evaluated(mut row: CadenceRow) -> CadenceRow {
+        row.plan_audit = Some(RowAudit {
+            evaluated: false,
+            note: Some("no test explained a statement".to_string()),
+            findings: BTreeMap::new(),
+        });
+        row
     }
 
     fn failed(excerpt: &str) -> TestOutcome {
@@ -4617,6 +4851,178 @@ mod tests {
             now_ms: 10 * HOUR,
             rearmed: None,
         })
+    }
+
+    const WIDE: &str = "os/x/src/a.rs|wide-scan|events|0123456789abcdef";
+    const OTHER_WIDE: &str = "os/x/src/b.rs|wide-scan|events|fedcba9876543210";
+
+    fn all_passed(id: &str, ran_at_ms: i64) -> CadenceRow {
+        row(
+            id,
+            "bbbbbbbbbbbbbbbbbbbb",
+            ran_at_ms,
+            &[("t", TestOutcome::Passed)],
+        )
+    }
+
+    /// An audit red on a tree whose tests all passed is a complete red, through
+    /// every reader that would otherwise take "nonzero with no failing test" for
+    /// a runner that failed outside any test or a host that ended the compile.
+    #[test]
+    fn a_gating_audit_on_a_green_tree_is_a_complete_red() {
+        let mut gating = audited(all_passed("a", HOUR), &[(WIDE, "failed")]);
+        gating.output_tail = KILLED_RMCP_TAIL.to_string();
+        assert!(host_ended_compile_cause(&gating).is_none());
+        assert!(credential_fetch_cause(&gating).is_none());
+        assert!(matches!(classify_row(gating), CadenceVerdict::Complete(_)));
+
+        let stale = audited(all_passed("a", HOUR), &[(WIDE, "stale")]);
+        assert!(matches!(classify_row(stale), CadenceVerdict::Complete(_)));
+
+        // Allowlisted and report-only rows do not gate, so they explain no red.
+        let mut quiet = audited(all_passed("a", HOUR), &[(WIDE, "allowlisted")]);
+        quiet.verdict_passed = false;
+        quiet.exit_code = 1;
+        assert!(matches!(
+            classify_row(quiet),
+            CadenceVerdict::NoVerdict { .. }
+        ));
+
+        // The audit explains only its own exit: a run that died some other way
+        // beside it is still a runner failure.
+        let mut died = audited(all_passed("a", HOUR), &[(WIDE, "failed")]);
+        died.exit_code = 101;
+        assert!(matches!(
+            classify_row(died),
+            CadenceVerdict::NoVerdict { .. }
+        ));
+    }
+
+    #[test]
+    fn the_headline_leads_with_a_gating_audit() {
+        let previous = audited(all_passed("a", HOUR), &[]);
+        let current = audited(
+            all_passed("b", 2 * HOUR),
+            &[(WIDE, "failed"), (OTHER_WIDE, "stale")],
+        );
+        let verdict = CadenceVerdict::Complete(current);
+        let bracket = Bracket::default();
+        let text = report(&verdict, &same(&previous), &bracket);
+        assert!(
+            text.contains(": plan audit: 2 gating; all 1 passed — 0 newly red, 0 newly green · plan audit: 2 newly red, 0 newly green**"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("`{WIDE}` (failed)")), "{text}");
+        assert!(text.contains(&format!("`{OTHER_WIDE}` (stale)")), "{text}");
+    }
+
+    /// The identities are the body, with no cap on how many.
+    #[test]
+    fn every_gating_finding_is_named() {
+        let ids: Vec<String> = (0..40)
+            .map(|n| format!("file|wide-scan|t|{n:016x}"))
+            .collect();
+        let findings: Vec<(&str, &str)> = ids.iter().map(|id| (id.as_str(), "failed")).collect();
+        let verdict = CadenceVerdict::Complete(audited(all_passed("b", 2 * HOUR), &findings));
+        let text = report(&verdict, &Comparison::Baseline, &Bracket::default());
+        for id in &ids {
+            assert!(text.contains(id.as_str()), "{id} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn a_not_evaluated_audit_follows_the_tests_and_is_never_clean() {
+        let verdict = CadenceVerdict::Complete(not_evaluated(all_passed("b", 2 * HOUR)));
+        let text = report(&verdict, &Comparison::Baseline, &Bracket::default());
+        assert!(
+            text.contains(
+                ": all 1 passed; plan audit: not evaluated (no test explained a statement) —"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("**Plan audit: not evaluated**"), "{text}");
+        let CadenceVerdict::Complete(row) = &verdict else {
+            unreachable!()
+        };
+        assert!(matches!(
+            classify_row(row.clone()),
+            CadenceVerdict::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn findings_diff_by_identity_between_two_evaluated_rows() {
+        let previous = audited(all_passed("a", HOUR), &[(WIDE, "failed")]);
+        let moved = audited(
+            all_passed("b", 2 * HOUR),
+            &[(WIDE, "failed"), (OTHER_WIDE, "failed")],
+        );
+        let comparison = same(&previous);
+        let diff = row_diff(&moved, &comparison);
+        assert_eq!(diff.audit_newly_red, [OTHER_WIDE]);
+        assert_eq!(diff.audit_still_red, 1);
+        assert!(diff.audit_newly_green.is_empty());
+
+        let cleared = audited(all_passed("b", 2 * HOUR), &[(WIDE, "allowlisted")]);
+        let diff = row_diff(&cleared, &comparison);
+        assert_eq!(diff.audit_newly_green, [WIDE]);
+        assert!(diff.audit_newly_red.is_empty());
+        assert!(row_is_news(LaneVerdict::PerTest, &cleared, &comparison));
+
+        // Inside the silence bound, which would make any later row news.
+        let unmoved = audited(all_passed("b", HOUR + 1), &[(WIDE, "failed")]);
+        assert!(!row_is_news(LaneVerdict::PerTest, &unmoved, &comparison));
+    }
+
+    /// A row that judged nothing moved nothing: not green from a clean row's red,
+    /// not red for what the next row finds. Each side is still news once, so the
+    /// gap is never silent.
+    #[test]
+    fn a_not_evaluated_row_produces_no_movement_on_either_side() {
+        let red = audited(all_passed("a", HOUR), &[(WIDE, "failed")]);
+        let unjudged = not_evaluated(all_passed("b", 2 * HOUR));
+        let comparison = same(&red);
+        let diff = row_diff(&unjudged, &comparison);
+        assert!(diff.audit_newly_green.is_empty() && diff.audit_newly_red.is_empty());
+        assert!(row_is_news(LaneVerdict::PerTest, &unjudged, &comparison));
+
+        let comparison = same(&unjudged);
+        let diff = row_diff(&red, &comparison);
+        assert!(diff.audit_newly_green.is_empty() && diff.audit_newly_red.is_empty());
+        assert_eq!(diff.audit_still_red, 0);
+        assert!(row_is_news(LaneVerdict::PerTest, &red, &comparison));
+
+        let clean = audited(all_passed("c", 3 * HOUR), &[]);
+        let diff = row_diff(&clean, &comparison);
+        assert!(diff.audit_newly_green.is_empty() && diff.audit_newly_red.is_empty());
+    }
+
+    /// A test red beside an audit red counts its own tests, and neither hides the
+    /// other.
+    #[test]
+    fn a_test_red_beside_an_audit_red_counts_its_tests() {
+        let previous = audited(all_passed("a", HOUR), &[]);
+        let current = audited(
+            row(
+                "b",
+                "bbbbbbbbbbbbbbbbbbbb",
+                2 * HOUR,
+                &[("t", failed("boom")), ("u", TestOutcome::Passed)],
+            ),
+            &[(WIDE, "failed")],
+        );
+        assert_eq!(current.exit_code, 100, "the tests' own exit stands");
+        let verdict = classify_row(current);
+        assert!(matches!(verdict, CadenceVerdict::Complete(_)));
+        let text = report(&verdict, &same(&previous), &Bracket::default());
+        assert!(
+            text.contains(": plan audit: 1 gating; 1 failed —"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Totals") && text.contains("2 ran · 1 passed · 1 failed"),
+            "{text}"
+        );
     }
 
     fn macos_lane() -> CadenceLane {

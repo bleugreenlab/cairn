@@ -212,7 +212,10 @@ async fn delegated_result_text(
             packet.title
         );
     };
-    let result = task_result(db, job_id, &packet.output_contract.artifact_name()).await;
+    let result = match task_result(db, job_id, &packet.output_contract.artifact_name()).await {
+        Ok(result) => result,
+        Err(error) => return format!("Cannot read result for task '{}': {error}", packet.title),
+    };
     let home = crate::jobs::queries::home_uri_for_job(db, job_id)
         .await
         .ok()

@@ -765,9 +765,12 @@ fn start_stateless_now(
         return Ok(false);
     }
     super::start_ordinary_session_now(orch, prepared, identity_override)?;
-    super::start_prepared_turn(orch, &prepared.turn_id, &prepared.run_id, &prepared.run_id)?;
-    orch.process_state
-        .set_current_turn_id(&prepared.run_id, Some(&prepared.turn_id));
+    super::start_prepared_turn_and_publish(
+        orch,
+        &prepared.turn_id,
+        &prepared.run_id,
+        &prepared.run_id,
+    )?;
     Ok(true)
 }
 
@@ -1384,14 +1387,12 @@ fn start_leased_inner(
     drop(claim);
     match result {
         Ok(()) => {
-            super::start_prepared_turn(
+            super::start_prepared_turn_and_publish(
                 orch,
                 &snapshot.turn_id,
                 &snapshot.run_id,
                 &snapshot.run_id,
             )?;
-            orch.process_state
-                .set_current_turn_id(&snapshot.run_id, Some(&snapshot.turn_id));
             crate::orchestrator::lifecycle::notify_watchdog_successor_started(
                 owning,
                 &snapshot.run_id,
@@ -1973,6 +1974,7 @@ mod tests {
         assert_eq!(next_private_heartbeat_delay(&Ok(false)), None);
     }
 
+    use super::run_db;
     use crate::backends::{AgentBackend, ResolvedTools, SessionConfig};
     use crate::db::DbState;
     use crate::orchestrator::Orchestrator;
@@ -2030,6 +2032,248 @@ mod tests {
         fn supports_warm_processes(&self) -> bool {
             true
         }
+    }
+
+    /// One real Codex reader [`ProviderFirstBackend`] started, with the provider's
+    /// end of its notification channel.
+    struct StartedReader {
+        provider: crossbeam_channel::Sender<serde_json::Value>,
+        reader: std::thread::JoinHandle<()>,
+        markers_before_session_start_returned: i64,
+    }
+
+    /// Starts a launch the way a Codex session does when the provider is as early
+    /// as it can be: the process is registered under the launch's real identity,
+    /// the real reader is running, and `turn/started` is on its channel before
+    /// `start_session` returns, so before the launch persists or publishes its
+    /// turn. It then gives the reader time to read that notification and records
+    /// whether a marker appeared, which would mean the reader admitted the turn
+    /// ahead of publication.
+    struct ProviderFirstBackend(Arc<Mutex<Vec<StartedReader>>>);
+
+    impl AgentBackend for ProviderFirstBackend {
+        fn name(&self) -> &str {
+            "Codex"
+        }
+        fn is_available(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
+            Ok(Vec::new())
+        }
+        fn serves(
+            &self,
+            _: &crate::orchestrator::Orchestrator,
+            _: Option<&str>,
+        ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+            Vec::new()
+        }
+        fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
+            ResolvedTools {
+                allowed: Vec::new(),
+                disallowed: Vec::new(),
+            }
+        }
+        fn start_session(
+            &self,
+            config: SessionConfig,
+            orch: &Orchestrator,
+            _admitted: crate::backends::Admitted,
+        ) -> Result<(), String> {
+            let run_id = config.run_id;
+            let session_id = config.session_start.session_id().to_string();
+            let db = orch.db.local.clone();
+            let job_id = run_db({
+                let db = db.clone();
+                let run_id = run_id.clone();
+                async move {
+                    db.query_opt_text("SELECT job_id FROM runs WHERE id = ?1", (run_id,))
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            })?
+            .ok_or("the launch's run has no job")?;
+            orch.process_state
+                .register_process(
+                    run_id.clone(),
+                    crate::agent_process::process::RunHandle::test_handle(
+                        Some(&session_id),
+                        Some(&job_id),
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+
+            let (provider, notifications) = crossbeam_channel::unbounded();
+            let reader = {
+                let orch = orch.clone();
+                let run_id = run_id.clone();
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    crate::backends::codex::CodexBackend::reader_thread_app_server(
+                        &orch,
+                        &orch.services.emitter,
+                        &run_id,
+                        Some(session_id),
+                        notifications,
+                        Arc::new(
+                            cairn_models::codex::app_server::AppServerClient::for_test_scripted(
+                                vec![],
+                                Arc::new(Mutex::new(Vec::new())),
+                            ),
+                        ),
+                        Arc::new(Mutex::new(None)),
+                        None,
+                        "codex".into(),
+                        db,
+                        None,
+                    )
+                })
+            };
+            provider
+                .send(serde_json::json!({
+                    "method": "turn/started",
+                    "params": {"turn": {"id": format!("provider-{run_id}")}},
+                }))
+                .map_err(|error| error.to_string())?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !provider.is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let markers = run_db(async move {
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'system:codex_goal_turn_started'",
+                    (run_id,),
+                )
+                .await
+                .map_err(|error| error.to_string())
+            })?
+            .unwrap_or_default();
+            self.0.lock().unwrap().push(StartedReader {
+                provider,
+                reader,
+                markers_before_session_start_returned: markers,
+            });
+            Ok(())
+        }
+        fn supports_resume(&self) -> bool {
+            true
+        }
+        fn supports_warm_processes(&self) -> bool {
+            true
+        }
+    }
+
+    /// A launch shaped like the specimens' fresh Review nodes: a delegated
+    /// `pr-review` job whose prompt opens with the `create-pr` handoff, holding a
+    /// `pending` initial turn bound to its run, as enqueue leaves it.
+    async fn queue_review_launch(
+        orch: &Orchestrator,
+        template: &crate::storage::PreparedOrdinaryLaunch,
+        n: u32,
+    ) {
+        let prompt = "The create-pr artifact you are reviewing follows. Review this change.";
+        orch.db.local.execute_script(format!("\
+            INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,node_name,uri_segment,agent_config_id,parent_job_id,status,current_session_id,created_at,updated_at) VALUES('j{n}','e','review{n}','i','p','Review','review{n}','pr-review','j','running','s{n}',1,1);\
+            INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('s{n}','j{n}','codex','open',1,1,1);\
+            INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,start_mode,created_at,updated_at) VALUES('r{n}','p','i','j{n}','s{n}','starting','fresh',1,1);\
+            INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('t{n}','s{n}','r{n}','j{n}',1,'pending','initial',1,1);\
+            INSERT INTO events(id,run_id,turn_id,sequence,event_type,data,timestamp,created_at) VALUES('ev{n}','r{n}','t{n}',1,'user:launch','{{\"eventType\":\"user:launch\",\"content\":\"{prompt}\",\"isError\":false}}',1,1);\
+            INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at) VALUES('req{n}','private-runtime','lane','ordinary:r{n}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{n},'queued',NULL,0,NULL,1,1);"
+        )).await.unwrap();
+        let mut launch = template.clone();
+        launch.request_id = format!("req{n}");
+        launch.job_id = format!("j{n}");
+        launch.run_id = format!("r{n}");
+        launch.session_id = format!("s{n}");
+        launch.turn_id = format!("t{n}");
+        launch.prompt = prompt.to_string();
+        launch.model = "gpt-5.6-sol".to_string();
+        launch.reason = crate::models::TurnStartReason::Initial;
+        launch.session_start = crate::storage::PreparedSessionStart::New {
+            session_id: format!("s{n}"),
+        };
+        crate::storage::persist_prepared_ordinary_launch(&orch.db.local, launch)
+            .await
+            .unwrap();
+    }
+
+    /// The provider's first turn on launch `n` bound to its one launch turn, once,
+    /// and the launch is healthy.
+    async fn assert_first_provider_turn_bound(orch: &Orchestrator, n: u32) {
+        for (sql, expected) in [
+            (
+                format!("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE run_id='r{n}' AND event_type='system:codex_goal_turn_started'"),
+                "1".to_string(),
+            ),
+            (
+                format!("SELECT turn_id FROM events WHERE run_id='r{n}' AND event_type='system:codex_goal_turn_started'"),
+                format!("t{n}"),
+            ),
+            (
+                format!("SELECT json_extract(data,'$.providerTurnId') FROM events WHERE run_id='r{n}' AND event_type='system:codex_goal_turn_started'"),
+                format!("provider-r{n}"),
+            ),
+            (format!("SELECT state FROM turns WHERE id='t{n}'"), "running".to_string()),
+            (format!("SELECT run_id FROM turns WHERE id='t{n}'"), format!("r{n}")),
+            (
+                format!("SELECT CAST(COUNT(*) AS TEXT) FROM turns WHERE job_id='j{n}'"),
+                "1".to_string(),
+            ),
+            (format!("SELECT current_turn_id FROM jobs WHERE id='j{n}'"), format!("t{n}")),
+            (format!("SELECT COALESCE(exit_reason,'none') FROM runs WHERE id='r{n}'"), "none".to_string()),
+            (
+                format!("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE run_id='r{n}' AND event_type='system:error'"),
+                "0".to_string(),
+            ),
+        ] {
+            assert_eq!(text(orch, &sql).await, expected, "{sql}");
+        }
+    }
+
+    /// The provider's `turn/started` can arrive before `start_session` returns.
+    /// Driving two launches in a row through one orchestrator keeps process state
+    /// left by the first from passing for the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_providers_first_turn_binds_to_the_launch_turn_on_consecutive_fresh_launches() {
+        let (orch, _, template) = lifecycle_fixture("ordinary-codex-provider-first.db").await;
+        set_ceiling(&orch, 4);
+        let readers = Arc::new(Mutex::new(Vec::new()));
+        let started = readers.clone();
+        let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+            &orch,
+            move || Box::new(ProviderFirstBackend(started.clone())),
+        );
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET state='released' WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+
+        for n in [2, 3] {
+            queue_review_launch(&orch, &template, n).await;
+            promote_until_started(&orch, &format!("r{n}")).await;
+            let StartedReader {
+                provider,
+                reader,
+                markers_before_session_start_returned,
+            } = readers
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("the launch started its reader");
+            assert_eq!(
+                markers_before_session_start_returned, 0,
+                "launch {n}: the reader must not admit the turn before it is published"
+            );
+            drop(provider);
+            reader.join().unwrap();
+            assert_first_provider_turn_bound(&orch, n).await;
+        }
+        assert_first_provider_turn_bound(&orch, 2).await;
     }
 
     /// Registers its process (moving the admission claim onto the live handle)

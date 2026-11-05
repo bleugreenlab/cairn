@@ -6959,6 +6959,13 @@ pub struct LearnedResourceEstimate {
 /// new control, so attach must be version-gated rather than silently time out.
 /// The shared sampler also reports incomplete RSS as absent live resident bytes,
 /// without invalidating independently measured CPU or storage windows.
+///
+/// cairn/5997 does not move the number. A cell's records no longer make their
+/// authority directory, so a write caught by a build volume leaving fails where it
+/// used to rebuild the build root under the mount point. No frame, variant or
+/// field changes: the work still ends as the existing `BuildVolumeLost`, and a
+/// runner talking to an older executor gets nothing wrong, since that executor's
+/// stray tree is on its own disk and never crosses the boundary.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 165;
 
 /// The version `build.rs` derived from the paragraphs above

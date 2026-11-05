@@ -22,12 +22,14 @@
 //! statement with its caller's `Location`. The first sighting of a
 //! `(call site, SQL)` pair runs `EXPLAIN` on the caller's own connection,
 //! inside its transaction, which is safe because `EXPLAIN` executes nothing.
-//! The pair is never explained again. A finding is logged once, as a WARN for
-//! a gating rule and an INFO for `range-past-blob`, under
-//! [`LOG_TARGET`]. When [`PLAN_AUDIT_LOG_ENV`] names a file, as the Rust test
-//! runner arranges for every test process, each sighting is also appended
-//! there as JSON lines for the runner's suite-wide ledger. Production and the
-//! suite run the same code; only the file differs.
+//! The pair is never explained again. A finding is logged once under
+//! [`LOG_TARGET`]: as a WARN for a gating rule, unless the checked-in
+//! [`allowlist`] names that statement, and as an INFO otherwise, an allowlisted
+//! line naming the issue behind it. When [`PLAN_AUDIT_LOG_ENV`] names a file, as
+//! the Rust test runner arranges for every test process, each sighting is also
+//! appended there as JSON lines for the runner's suite-wide ledger
+//! (`scripts/lib/plan-audit.ts`). Production and the suite run the same code;
+//! only the file differs.
 //!
 //! A database is audited only once its migration ledger has reached the head of
 //! the private or team chain. A test that builds a toy `events` table without
@@ -41,6 +43,8 @@
 //! is not seen at all; the test sink records those call sites as `raw` so the
 //! runner can rank what the audit cannot yet see.
 
+mod allowlist;
+mod candidates;
 mod classify;
 mod registry;
 
@@ -53,8 +57,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+pub use allowlist::{allowlist, entry_for, parse_allowlist, AllowEntry, AllowKind};
+pub use candidates::{low_cardinality_seeks, Candidate, IndexCatalog, LOW_CARDINALITY_SEEK};
 pub use classify::{
-    classify, explain, Classified, Finding, Instr, Listing, Object, Rule, SchemaView, WideLayout,
+    classify, explain, Classified, Finding, Instr, Listing, Object, RangeSeek, Rule, SchemaView,
+    WideLayout,
 };
 pub use registry::{
     wide_row_table, AuditedTrigger, WideRowTable, AUDITED_TRIGGERS, WIDE_ROW_TABLES,
@@ -91,6 +98,8 @@ pub(crate) struct PlanAudit {
     seen: Mutex<Seen>,
     eligibility: AtomicU8,
     schema: Mutex<Option<Arc<SchemaView>>>,
+    /// Loaded only when the test log is set; see [`candidates`].
+    index_catalog: Mutex<Option<Arc<IndexCatalog>>>,
 }
 
 #[derive(Default)]
@@ -121,6 +130,7 @@ impl PlanAudit {
             seen: Mutex::new(Seen::default()),
             eligibility: AtomicU8::new(ELIGIBILITY_UNKNOWN),
             schema: Mutex::new(None),
+            index_catalog: Mutex::new(None),
         }
     }
 
@@ -184,6 +194,10 @@ impl PlanAudit {
             .schema
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .index_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Explain `sighting` on `conn`, classify it, and report what it shows.
@@ -195,7 +209,10 @@ impl PlanAudit {
             return;
         }
         match self.explain_and_classify(conn, &sighting.sql).await {
-            Ok(classified) => report(&sighting, &classified),
+            Ok(classified) => {
+                let candidates = self.candidates(conn, &sighting.sql, &classified).await;
+                report(&sighting, &classified, &candidates);
+            }
             Err(error) => log::debug!(
                 target: LOG_TARGET,
                 "plan audit: {}:{} not explained: {error}",
@@ -203,6 +220,43 @@ impl PlanAudit {
                 sighting.at.line()
             ),
         }
+    }
+
+    /// The `low-cardinality-seek` measurement: test runs only, and only for a
+    /// statement with a range seek to measure. A catalog that will not load
+    /// costs the count, never the statement.
+    async fn candidates(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        classified: &Classified,
+    ) -> Vec<Candidate> {
+        if test_log().is_none() || classified.range_seeks.is_empty() {
+            return Vec::new();
+        }
+        let cached = self
+            .index_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let catalog = match cached {
+            Some(catalog) => catalog,
+            None => match IndexCatalog::load(conn).await {
+                Ok(catalog) => {
+                    let catalog = Arc::new(catalog);
+                    *self
+                        .index_catalog
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(catalog.clone());
+                    catalog
+                }
+                Err(error) => {
+                    log::debug!(target: LOG_TARGET, "plan audit: index catalog not read: {error}");
+                    return Vec::new();
+                }
+            },
+        };
+        low_cardinality_seeks(classified, &catalog, sql)
     }
 
     async fn eligible(&self, conn: &Connection) -> bool {
@@ -294,39 +348,62 @@ pub(crate) fn is_schema_change(sql: &str) -> bool {
 #[cfg(test)]
 pub(crate) static REPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-fn report(sighting: &Sighting, classified: &Classified) {
+/// The level a finding logs at: WARN only for a gating finding nothing accepts,
+/// which is what a day of production logs is read for. An accepted one stays at
+/// INFO so that read can still count it.
+fn finding_level(rule: Rule, accepted: Option<&AllowEntry>) -> log::Level {
+    if rule.gating() && accepted.is_none() {
+        log::Level::Warn
+    } else {
+        log::Level::Info
+    }
+}
+
+fn report(sighting: &Sighting, classified: &Classified, candidates: &[Candidate]) {
+    let sink = test_log();
+    if classified.findings.is_empty() && sink.is_none() {
+        return;
+    }
     let (file, line) = (sighting.at.file(), sighting.at.line());
+    let statement = statement_hash(&sighting.sql);
     for finding in &classified.findings {
         #[cfg(test)]
         REPORTED
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(format!("{file}:{line} {}", finding.subject()));
-        let level = if finding.rule.gating() {
-            log::Level::Warn
-        } else {
-            log::Level::Info
-        };
+        let accepted = entry_for(allowlist(), file, finding.rule, &finding.table, &statement);
+        let standing = accepted
+            .map(|entry| format!(" (allowlisted, {})", entry.issue))
+            .unwrap_or_default();
         log::log!(
             target: LOG_TARGET,
-            level,
-            "plan audit: {file}:{line} {}: {}",
+            finding_level(finding.rule, accepted),
+            "plan audit: {file}:{line} {}{standing}: {}",
             finding.subject(),
             finding.excerpt.replace('\n', " | ")
         );
     }
-    if let Some(log) = test_log() {
-        append(log, &sighting_lines(sighting, classified));
+    if let Some(log) = sink {
+        append(
+            log,
+            &sighting_lines(sighting, &statement, classified, candidates),
+        );
     }
 }
 
 /// The JSON lines one sighting adds to the test log: a `seen` line naming
 /// every table the statement opens, which is what lets the runner call an
 /// allowlist entry stale only when its statement was explained and came back
-/// clean, then one `finding` line per finding.
-fn sighting_lines(sighting: &Sighting, classified: &Classified) -> String {
+/// clean, then one `finding` line per finding and one `candidate` line per
+/// [`Candidate`].
+fn sighting_lines(
+    sighting: &Sighting,
+    statement: &str,
+    classified: &Classified,
+    candidates: &[Candidate],
+) -> String {
     let (file, line) = (sighting.at.file(), sighting.at.line());
-    let statement = statement_hash(&sighting.sql);
     let mut lines = serde_json::json!({
         "kind": "seen",
         "file": file,
@@ -348,7 +425,27 @@ fn sighting_lines(sighting: &Sighting, classified: &Classified) -> String {
                 "gating": finding.rule.gating(),
                 "table": finding.table,
                 "column": finding.column,
+                "index": finding.index,
                 "excerpt": finding.excerpt,
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+    }
+    for candidate in candidates {
+        lines.push_str(
+            &serde_json::json!({
+                "kind": "candidate",
+                "file": file,
+                "line": line,
+                "statement": statement,
+                "sql_head": sql_head(&sighting.sql),
+                "rule": LOW_CARDINALITY_SEEK,
+                "table": candidate.table,
+                "index": candidate.index,
+                "leading": candidate.leading,
+                "column": candidate.column,
+                "better_index": candidate.better_index,
             })
             .to_string(),
         );

@@ -26,29 +26,34 @@ pub const EVENT_COLUMNS: &str = "id, run_id, session_id, sequence, timestamp, ev
 pub const EVENT_COLUMN_COUNT: usize = 22;
 
 pub fn event_from_row(row: &Row) -> DbResult<Event> {
+    event_from_row_at(row, 0)
+}
+
+/// Decode the canonical event projection following a caller's metadata prefix.
+pub fn event_from_row_at(row: &Row, offset: usize) -> DbResult<Event> {
     Ok(Event {
-        id: row.text(0)?,
-        run_id: row.text(1)?,
-        session_id: row.opt_text(2)?,
-        sequence: row.i64(3)? as i32,
-        timestamp: row.i64(4)?,
-        event_type: row.text(5)?,
-        data: row.text(6)?,
-        parent_tool_use_id: row.opt_text(7)?,
-        created_at: row.i64(8)?,
-        input_tokens: row.opt_i64(9)?.map(|value| value as i32),
-        cache_read_tokens: row.opt_i64(10)?.map(|value| value as i32),
-        cache_create_tokens: row.opt_i64(11)?.map(|value| value as i32),
-        output_tokens: row.opt_i64(12)?.map(|value| value as i32),
-        turn_id: row.opt_text(13)?,
-        thinking_tokens: row.opt_i64(14)?.map(|value| value as i32),
-        storage_mode: row.opt_text(15)?,
-        content_commit: row.opt_text(16)?,
-        content_render_sha: row.opt_text(17)?,
-        data_blob: row.opt_blob(18)?,
-        codec: row.opt_text(19)?,
-        content_change_id: row.opt_text(20)?,
-        cost_usd: row.opt_f64(21)?,
+        id: row.text(offset)?,
+        run_id: row.text(offset + 1)?,
+        session_id: row.opt_text(offset + 2)?,
+        sequence: row.i64(offset + 3)? as i32,
+        timestamp: row.i64(offset + 4)?,
+        event_type: row.text(offset + 5)?,
+        data: row.text(offset + 6)?,
+        parent_tool_use_id: row.opt_text(offset + 7)?,
+        created_at: row.i64(offset + 8)?,
+        input_tokens: row.opt_i64(offset + 9)?.map(|value| value as i32),
+        cache_read_tokens: row.opt_i64(offset + 10)?.map(|value| value as i32),
+        cache_create_tokens: row.opt_i64(offset + 11)?.map(|value| value as i32),
+        output_tokens: row.opt_i64(offset + 12)?.map(|value| value as i32),
+        turn_id: row.opt_text(offset + 13)?,
+        thinking_tokens: row.opt_i64(offset + 14)?.map(|value| value as i32),
+        storage_mode: row.opt_text(offset + 15)?,
+        content_commit: row.opt_text(offset + 16)?,
+        content_render_sha: row.opt_text(offset + 17)?,
+        data_blob: row.opt_blob(offset + 18)?,
+        codec: row.opt_text(offset + 19)?,
+        content_change_id: row.opt_text(offset + 20)?,
+        cost_usd: row.opt_f64(offset + 21)?,
         read_segments: None,
     })
 }

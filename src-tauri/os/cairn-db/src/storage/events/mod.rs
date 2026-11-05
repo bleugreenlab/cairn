@@ -16,6 +16,7 @@
 
 pub mod columns;
 pub mod encoding;
+pub mod history;
 pub mod reconstruct;
 
 // Exposed under `test-utils` (not just `cfg(test)`) so the unfenced integration

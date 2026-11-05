@@ -63,6 +63,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cairn_db::storage::census::refuse_live_directory;
 use cairn_db::storage::retention::{
     quantile, run_pass, run_rules, Eviction, EvictorBudget, EvictorState, PassEnd,
 };
@@ -72,9 +73,6 @@ use rand::RngCore;
 use serde_json::{json, Value as Json};
 
 type Res<T> = Result<T, String>;
-
-/// Data directories a live Cairn keeps its database in, relative to `$HOME`.
-const LIVE_DIRS: &[&str] = &[".cairn", "Library/Application Support/com.cairn.desktop"];
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -125,28 +123,7 @@ fn check_path(path: &str) -> Res<()> {
             "{path} must end in .db: Turso derives the logical log's name from the extension"
         ));
     }
-    let Some(home) = std::env::var_os("HOME") else {
-        return Ok(());
-    };
-    let dir = Path::new(path)
-        .parent()
-        .map(|p| {
-            if p.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                p
-            }
-        })
-        .and_then(|p| std::fs::canonicalize(p).ok());
-    for live in LIVE_DIRS {
-        let live = std::fs::canonicalize(PathBuf::from(&home).join(live)).ok();
-        if live.is_some() && dir == live {
-            return Err(format!(
-                "{path} is in a live Cairn data directory; clone it first (see the module docs)"
-            ));
-        }
-    }
-    Ok(())
+    refuse_live_directory(Path::new(path))
 }
 
 async fn open(path: &str) -> Res<(LocalDb, f64)> {

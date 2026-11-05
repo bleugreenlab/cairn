@@ -707,3 +707,44 @@ fn tables_over_their_budget_are_summarised() {
     assert_eq!(summary["over_budget"][0]["table"], "events");
     assert_eq!(summary["largest"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn a_clone_tool_refuses_a_live_directory_and_its_archive() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let cairn = home.join(".cairn");
+    std::fs::create_dir_all(cairn.join("archive/objects")).unwrap();
+    std::fs::create_dir_all(cairn.join("scratch/node")).unwrap();
+    let moved = temp.path().join("moved-home");
+    std::fs::create_dir_all(&moved).unwrap();
+    let elsewhere = temp.path().join("Builds");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let live = live_directories(Some(home.clone()), None, None).unwrap();
+
+    let refused = |path: PathBuf| live_directory_refusal(&path, &live).is_err();
+    assert!(refused(cairn.join("cairn.db")), "the data directory");
+    assert!(refused(cairn.join("archive/cairn.db")), "the archive");
+    assert!(
+        refused(cairn.join("archive/objects/cairn.db")),
+        "beneath the archive"
+    );
+    assert!(
+        refused(elsewhere.join("missing/cairn.db")),
+        "an unresolvable directory fails closed"
+    );
+    assert!(!refused(cairn.join("scratch/node/cairn.db")), "scratch");
+    assert!(!refused(elsewhere.join("cairn.db")), "another volume");
+
+    // A sealed process's HOME has moved; its ceilings still name the live home.
+    let ceilings = std::env::join_paths([&cairn]).unwrap();
+    let sealed = live_directories(Some(moved), None, Some(ceilings)).unwrap();
+    assert!(live_directory_refusal(&cairn.join("cairn.db"), &sealed).is_err());
+
+    let explicit = live_directories(Some(temp.path().into()), Some(cairn.clone()), None).unwrap();
+    assert!(live_directory_refusal(&cairn.join("cairn.db"), &explicit).is_err());
+
+    assert!(
+        live_directories(None, None, None).is_err(),
+        "no HOME fails closed"
+    );
+}

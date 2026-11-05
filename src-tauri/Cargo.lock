@@ -1147,6 +1147,7 @@ name = "cairn-db"
 version = "0.13.7"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "cairn-codec",
  "cairn-common",
  "cairn-domain",
@@ -1163,6 +1164,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "turso",
  "unigram",
  "uuid",

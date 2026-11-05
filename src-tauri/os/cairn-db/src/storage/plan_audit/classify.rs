@@ -23,7 +23,7 @@ use super::registry::WideRowTable;
 /// How many instructions an excerpt may carry.
 const EXCERPT_LINES: usize = 12;
 
-/// One row of an `EXPLAIN` listing. p5 is not kept: no rule reads it.
+/// One row of an `EXPLAIN` listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instr {
     pub addr: i64,
@@ -32,6 +32,7 @@ pub struct Instr {
     pub p2: i64,
     pub p3: i64,
     pub p4: String,
+    pub p5: i64,
     pub comment: String,
 }
 
@@ -44,6 +45,7 @@ impl Instr {
             p2: int(row, 3)?,
             p3: int(row, 4)?,
             p4: text(row, 5)?,
+            p5: int(row, 6)?,
             comment: text(row, 7)?,
         })
     }
@@ -147,6 +149,13 @@ impl Object {
     pub fn table(&self) -> &str {
         match self {
             Self::Table(table) | Self::Index { table, .. } => table,
+        }
+    }
+
+    /// The object's own name: its table's, or its index's.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Table(name) | Self::Index { name, .. } => name,
         }
     }
 }
@@ -257,6 +266,18 @@ impl SchemaView {
     pub fn wide(&self, table: &str) -> Option<&WideLayout> {
         self.wide.get(table)
     }
+
+    /// What sits at root page `root` of this database.
+    pub fn object_at_root(&self, root: i64) -> Option<&Object> {
+        self.by_root.get(&root)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_root_for_test(root: i64, table: &str) -> Self {
+        let mut view = Self::default();
+        view.by_root.insert(root, Object::Table(table.to_string()));
+        view
+    }
 }
 
 fn is_unique_index_sql(sql: &str) -> bool {
@@ -309,6 +330,8 @@ pub struct Finding {
     pub table: String,
     /// The column read past the blob, for `range-past-blob`.
     pub column: Option<String>,
+    /// The index the walk or seek goes through, when it goes through one.
+    pub index: Option<String>,
     /// The flagged instructions with two either side, at most twelve lines.
     pub excerpt: String,
 }
@@ -323,6 +346,13 @@ impl Finding {
     }
 }
 
+/// A range over an index, from a seek the loop steps away from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeSeek {
+    pub index: String,
+    pub table: String,
+}
+
 /// The classifier's verdict on one listing.
 #[derive(Debug, Clone, Default)]
 pub struct Classified {
@@ -330,6 +360,9 @@ pub struct Classified {
     /// Every table the statement opens, directly or through an index, in any
     /// program. What the runner's staleness check calls "seen".
     pub tables: BTreeSet<String>,
+    /// Every stepped seek through an index that is not a point read, on any
+    /// table, wide or not.
+    pub range_seeks: Vec<RangeSeek>,
     /// An `Open` the schema view could not resolve. The caller refreshes the
     /// view and classifies again; a second miss stands.
     pub unresolved: bool,
@@ -499,11 +532,13 @@ fn classify_program(
     // how `max(rowid)` compiles; only a stepped cursor walks the table.
     for (at, cursor, object) in walks.iter().filter(|(_, cursor, _)| steps.contains(cursor)) {
         let table = object.table();
+        let index = index_name(object);
         if subprogram {
             out.push(Finding {
                 rule: Rule::TriggerScan,
                 table: table.to_string(),
                 column: None,
+                index,
                 excerpt: format!(
                     "-- {} subprogram\n{}",
                     subprogram_kind(program),
@@ -524,6 +559,7 @@ fn classify_program(
                 rule: Rule::WideScan,
                 table: table.to_string(),
                 column: None,
+                index,
                 excerpt: excerpt(program, *at, None),
             });
         }
@@ -534,6 +570,15 @@ fn classify_program(
             continue;
         }
         let table = object.table();
+        if let Some(index) = index_name(object) {
+            let seek = RangeSeek {
+                index,
+                table: table.to_string(),
+            };
+            if !out.range_seeks.contains(&seek) {
+                out.range_seeks.push(seek);
+            }
+        }
         let Some(layout) = schema.wide(table) else {
             continue;
         };
@@ -556,9 +601,17 @@ fn classify_program(
                 rule: Rule::RangePastBlob,
                 table: table.to_string(),
                 column: layout.columns.get(position).cloned(),
+                index: index_name(object),
                 excerpt: excerpt(program, *at, Some(read.at)),
             });
         }
+    }
+}
+
+fn index_name(object: &Object) -> Option<String> {
+    match object {
+        Object::Table(_) => None,
+        Object::Index { name, .. } => Some(name.clone()),
     }
 }
 

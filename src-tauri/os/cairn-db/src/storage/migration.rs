@@ -543,6 +543,7 @@ impl MigrationRunner {
         }
 
         db.plan_audit().schema_changed();
+        db.initialize_history_capability().await?;
         Ok(applied)
     }
 

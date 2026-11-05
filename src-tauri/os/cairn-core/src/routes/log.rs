@@ -22,7 +22,8 @@ use serde_json::Value;
 
 use super::{FactRegistry, Presence, RouteFact, SourceSpec};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{FactRow, NewFact};
+use crate::storage::events::history::{EventFilter, HistoryReader, HotRow};
+use crate::storage::{FactRow, NewFact, RowExt};
 
 /// Longest stored scalar, matching the firing journal's snapshot bound.
 const MAX_STORED_CHARS: usize = crate::storage::SNAPSHOT_CHARS;
@@ -263,6 +264,51 @@ pub fn stored_fact(row: &FactRow) -> Result<RouteFact, String> {
     })
 }
 
+fn thread_stream_hot_sql(guard_job: bool) -> String {
+    let from = if guard_job {
+        "events e JOIN runs r ON r.id = e.run_id WHERE e.rowid = ?1 AND r.job_id = ?2"
+    } else {
+        "events e WHERE e.rowid = ?1"
+    };
+    format!("SELECT {} FROM {from}", HotRow::columns(Some("e")))
+}
+
+/// Locate a hot fact directly before falling back to archived run membership.
+async fn thread_stream_run_ids(
+    db: &crate::storage::LocalDb,
+    rowid: i64,
+    job_id: Option<&str>,
+) -> crate::storage::DbResult<Vec<String>> {
+    if let Some(job_id) = job_id {
+        let hot = db
+            .query_opt(
+                "SELECT e.run_id FROM events e JOIN runs r ON r.id = e.run_id
+                 WHERE e.rowid = ?1 AND r.job_id = ?2",
+                (rowid, job_id.to_owned()),
+                |row| row.text(0),
+            )
+            .await?;
+        if let Some(run_id) = hot {
+            return Ok(vec![run_id]);
+        }
+        db.query_all(
+            "SELECT id FROM runs WHERE job_id = ?1",
+            (job_id.to_owned(),),
+            |row| row.text(0),
+        )
+        .await
+    } else {
+        // Legacy facts need a durable run locator before their hot rows can
+        // be evicted. This lookup reads no body and cannot locate evicted rows.
+        db.query_all(
+            "SELECT run_id FROM events WHERE rowid = ?1",
+            (rowid,),
+            |row| row.text(0),
+        )
+        .await
+    }
+}
+
 /// Restore a row's hydrated fields from the canonical record it points at.
 /// One arm per source that declares a hydrated field; every other source's row
 /// already is its whole fact.
@@ -282,25 +328,52 @@ pub async fn hydrate(orch: &Orchestrator, row: &FactRow) -> Result<Hydrated, Str
             .ok_or_else(|| format!("thread_stream row {} has no project", row.id))?
             .to_owned();
         let db = orch.db.for_project(&project).await;
-        let (data, created_at) = db
-            .query_opt(
-                "SELECT data, created_at FROM events WHERE rowid = ?1",
-                (rowid,),
-                |row| {
-                    Ok((
-                        crate::storage::RowExt::text(row, 0)?,
-                        crate::storage::RowExt::i64(row, 1)?,
-                    ))
-                },
-            )
+        let job_id = fact.fields.get("jobId").and_then(Value::as_str);
+        let mut binds = vec![cairn_db::turso::Value::Integer(rowid)];
+        if let Some(job_id) = job_id {
+            binds.push(job_id.to_owned().into());
+        }
+        let selected = db
+            .query_all(thread_stream_hot_sql(job_id.is_some()), binds, |row| {
+                HotRow::from_row_at(row, 0)
+            })
             .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("transcript event {rowid} no longer exists"))?;
-        let text = crate::channels::router::assistant_text(&data)
+            .map_err(|error| error.to_string())?;
+        let mut history = HistoryReader::new(&db);
+        let mut event = None;
+        if !selected.is_empty() {
+            event = history
+                .hydrate_selected_hot_rows(selected, EventFilter::default())
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .next()
+                .map(|row| row.event);
+        } else if !history.is_hot_only() {
+            let run_ids = thread_stream_run_ids(&db, rowid, job_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            history
+                .prime_runs(&run_ids)
+                .await
+                .map_err(|error| error.to_string())?;
+            for run_id in run_ids {
+                if let Some(found) = history
+                    .run_event_by_rowid(&run_id, rowid)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    event = Some(found.event);
+                    break;
+                }
+            }
+        }
+        let event = event.ok_or_else(|| format!("transcript event {rowid} no longer exists"))?;
+        let text = crate::channels::router::assistant_text(&event.data)
             .ok_or_else(|| format!("transcript event {rowid} carries no assistant text"))?;
         fact.fields.insert("text".into(), Value::String(text));
         // Transcript `created_at` is whole seconds.
-        occurred_at_ms = Some(created_at.saturating_mul(1000));
+        occurred_at_ms = Some(event.created_at.saturating_mul(1000));
     }
     if row.source == "github_comment" {
         let field = |name: &str| {
@@ -366,6 +439,280 @@ pub(crate) fn clauses_need_hydration<'c>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::events::history::HistorySource;
+    use crate::storage::history_pack::testing::{
+        evict_all, publish_for_test, read_both, seed_fixture_execution,
+    };
+    use crate::storage::quarantine::{
+        quarantine, QuarantineSet, HISTORY_PACK_SINK, TRANSCRIPT_EVENT_SINK, WITHHELD_PREFIX,
+    };
+    use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::Arc;
+
+    fn stream_test_orchestrator(db: LocalDb) -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let config = root.join("config");
+        std::fs::create_dir_all(config.join("agents")).unwrap();
+        std::fs::create_dir_all(config.join("recipes")).unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(db), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config,
+        )
+        .build()
+    }
+
+    async fn stream_fact(db: &LocalDb, event_id: &str, job: Option<&str>) -> FactRow {
+        let rowid = db
+            .query_opt(
+                "SELECT rowid FROM events WHERE id = ?1",
+                (event_id.to_owned(),),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fields = serde_json::json!({"project": "proj", "thread": "general"});
+        if let Some(job) = job {
+            fields["jobId"] = job.into();
+        }
+        FactRow {
+            id: 1,
+            project_id: Some("p".into()),
+            source: "thread_stream".into(),
+            identity: format!("cairn://p/proj/general:event:{rowid}"),
+            record_ref: format!("cairn://p/proj/general:event:{rowid}"),
+            record_id: Some(rowid.to_string()),
+            fields_json: fields.to_string(),
+            summary: None,
+            presence: "away".into(),
+            actor_job_id: None,
+            origin_principal_json: None,
+            origin_appearance_json: None,
+            route_provenance: None,
+            minted_at: 1,
+            indexed_at: None,
+            route_state: "pending".into(),
+            route_note: None,
+            wakes_json: None,
+        }
+    }
+
+    struct StreamQuarantine(tempfile::TempDir);
+
+    impl StreamQuarantine {
+        fn new(sink: &str, event_id: &str) -> Self {
+            let source = tempfile::tempdir().unwrap();
+            quarantine().install_for(
+                source.path(),
+                QuarantineSet::from_entries([(
+                    sink.to_owned(),
+                    event_id.to_owned(),
+                    "route-incident".to_owned(),
+                )]),
+            );
+            Self(source)
+        }
+    }
+
+    impl Drop for StreamQuarantine {
+        fn drop(&mut self) {
+            quarantine().install_for(self.0.path(), QuarantineSet::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_stream_hot_locator_selects_only_the_last_run() {
+        let db = crate::storage::migrated_test_db("route-hydrate-last-run").await;
+        seed_fixture_execution(&db, "route-hydrate-last-run").await;
+        for number in 3..=50 {
+            db.execute(
+                "INSERT INTO runs(id, project_id, job_id, session_id, status, created_at, updated_at)
+                 VALUES(?1, 'p', 'job-1', 'sess-2', 'exited', ?2, ?2)",
+                (format!("run-{number}"), i64::from(number)),
+            )
+            .await
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+             VALUES('last-run-event', 'run-50', 'sess-2', 1, 50, 'assistant',
+                    '{\"content\":\"last run prose\"}', 50)",
+            (),
+        )
+        .await
+        .unwrap();
+        let fact = stream_fact(&db, "last-run-event", Some("job-1")).await;
+        let rowid = fact.record_id.as_ref().unwrap().parse().unwrap();
+        let selected = thread_stream_run_ids(&db, rowid, Some("job-1"))
+            .await
+            .unwrap();
+        assert_eq!(selected, vec!["run-50"]);
+        let orch = stream_test_orchestrator(db);
+        for cataloged in [false, true] {
+            if cataloged {
+                publish_for_test(&orch.db.local, "exec-1").await;
+            }
+            let before = (
+                orch.db.local.read_statement_count(),
+                orch.db.local.read_checkout_count(),
+            );
+            assert_eq!(
+                hydrate(&orch, &fact).await.unwrap().fact.fields["text"],
+                "last run prose"
+            );
+            assert_eq!(
+                (
+                    orch.db.local.read_statement_count() - before.0,
+                    orch.db.local.read_checkout_count() - before.1
+                ),
+                (1, 1),
+                "50-run latest event, cataloged={cataloged}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_stream_hot_locator_plan_starts_at_the_rowid() {
+        let db = crate::storage::migrated_test_db("route-hydrate-plan").await;
+        for guarded in [false, true] {
+            let mut binds = vec![1i64.into()];
+            if guarded {
+                binds.push("job".into());
+            }
+            let plan =
+                crate::storage::query_plan(&db, &thread_stream_hot_sql(guarded), binds).await;
+            assert!(
+                plan.contains("SEARCH e") && plan.contains("rowid"),
+                "{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN e") && !plan.contains("SCAN r"),
+                "{plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_stream_hydration_matches_hot_forced_and_evicted_pack() {
+        let db = crate::storage::migrated_test_db("route-hydrate-parity").await;
+        let events = seed_fixture_execution(&db, "route-hydrate-parity").await;
+        let first = stream_fact(&db, &events.restored, Some("job-1")).await;
+        let second = stream_fact(&db, &events.second_run, Some("job-1")).await;
+        publish_for_test(&db, "exec-1").await;
+        let orch = stream_test_orchestrator(db);
+        for (fact, text, occurred) in [
+            (&first, "the restored body", 10_000),
+            (&second, "second run", 20_000),
+        ] {
+            let (hot, pack) = read_both(&orch.db.local, || async {
+                hydrate(&orch, fact).await.unwrap()
+            })
+            .await;
+            assert_eq!(hot.fact.fields, pack.fact.fields);
+            assert_eq!(hot.fact.fields["text"], text);
+            assert_eq!(hot.occurred_at_ms, Some(occurred));
+            assert_eq!(hot.occurred_at_ms, pack.occurred_at_ms);
+        }
+        evict_all(&orch.db.local).await;
+        for (fact, text, occurred) in [
+            (&first, "the restored body", 10_000),
+            (&second, "second run", 20_000),
+        ] {
+            let hydrated = hydrate(&orch, fact).await.unwrap();
+            assert_eq!(hydrated.fact.fields["text"], text);
+            assert_eq!(hydrated.occurred_at_ms, Some(occurred));
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_stream_hydration_withholds_hot_and_post_pack_transcript() {
+        let db = crate::storage::migrated_test_db("route-hydrate-withheld").await;
+        let events = seed_fixture_execution(&db, "route-hydrate-withheld").await;
+        let fact = stream_fact(&db, &events.restored, Some("job-1")).await;
+        publish_for_test(&db, "exec-1").await;
+        let orch = stream_test_orchestrator(db);
+        let _guard = StreamQuarantine::new(TRANSCRIPT_EVENT_SINK, &events.restored);
+        let (hot, pack) = read_both(&orch.db.local, || async {
+            hydrate(&orch, &fact).await.unwrap()
+        })
+        .await;
+        assert_eq!(hot.fact.fields, pack.fact.fields);
+        for hydrated in [hot, pack] {
+            let text = hydrated.fact.fields["text"].as_str().unwrap();
+            assert!(text.contains(WITHHELD_PREFIX), "{text}");
+            assert!(!text.contains("the restored body"), "{text}");
+            assert_eq!(hydrated.occurred_at_ms, Some(10_000));
+        }
+        evict_all(&orch.db.local).await;
+        let hydrated = hydrate(&orch, &fact).await.unwrap();
+        assert!(hydrated.fact.fields["text"]
+            .as_str()
+            .unwrap()
+            .contains(WITHHELD_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn thread_stream_hydration_withholds_a_pack_copy_quarantined_after_packing() {
+        let db = crate::storage::migrated_test_db("route-hydrate-pack-key").await;
+        let events = seed_fixture_execution(&db, "route-hydrate-pack-key").await;
+        let fact = stream_fact(&db, &events.second_run, Some("job-1")).await;
+        publish_for_test(&db, "exec-1").await;
+        let orch = stream_test_orchestrator(db);
+        let _guard = StreamQuarantine::new(HISTORY_PACK_SINK, &events.second_run);
+        orch.db
+            .local
+            .set_history_source_override(Some(HistorySource::Pack));
+        let hydrated = hydrate(&orch, &fact).await.unwrap();
+        let text = hydrated.fact.fields["text"].as_str().unwrap();
+        assert!(text.contains(WITHHELD_PREFIX), "{text}");
+        assert!(!text.contains("second run"), "{text}");
+        assert_eq!(hydrated.occurred_at_ms, Some(20_000));
+        orch.db.local.set_history_source_override(None);
+    }
+
+    #[tokio::test]
+    async fn thread_stream_hydration_keeps_legacy_hot_facts_but_guards_known_job() {
+        let db = crate::storage::migrated_test_db("route-hydrate-legacy").await;
+        let events = seed_fixture_execution(&db, "route-hydrate-legacy").await;
+        let legacy = stream_fact(&db, &events.restored, None).await;
+        let wrong = stream_fact(&db, &events.restored, Some("different-job")).await;
+        let orch = stream_test_orchestrator(db);
+        let hydrated = hydrate(&orch, &legacy).await.unwrap();
+        assert_eq!(hydrated.fact.fields["text"], "the restored body");
+        assert_eq!(hydrated.occurred_at_ms, Some(10_000));
+        assert!(hydrate(&orch, &wrong)
+            .await
+            .err()
+            .unwrap()
+            .contains("no longer exists"));
+    }
+
+    #[tokio::test]
+    async fn thread_stream_hydration_reports_offline_catalog_without_hot_fallback() {
+        let db = crate::storage::migrated_test_db("route-hydrate-offline").await;
+        let events = seed_fixture_execution(&db, "route-hydrate-offline").await;
+        let known = stream_fact(&db, &events.restored, Some("job-1")).await;
+        let legacy = stream_fact(&db, &events.restored, None).await;
+        publish_for_test(&db, "exec-1").await;
+        db.execute("UPDATE history_tier SET evicted_at = 5", ())
+            .await
+            .unwrap();
+        db.mark_history_evicted();
+        let root = db.path().with_extension("archive");
+        std::fs::rename(&root, root.with_extension("unplugged")).unwrap();
+        let orch = stream_test_orchestrator(db);
+        for fact in [&known, &legacy] {
+            let error = hydrate(&orch, fact).await.err().unwrap();
+            assert_eq!(error, format!("archive offline: {}", root.display()));
+        }
+    }
 
     #[test]
     fn stored_fields_drop_hydrated_and_unregistered_fields_and_bound_the_rest() {

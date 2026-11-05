@@ -2087,6 +2087,20 @@ impl SealedCheckCoordinate {
     }
 }
 
+/// One plan-audit row of an observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckAuditFindingRow {
+    pub finding_id: String,
+    pub status: String,
+    pub rule: String,
+    pub table_name: String,
+    pub file: String,
+    pub statement: String,
+    pub issue: Option<String>,
+    pub known_shape: Option<String>,
+    pub excerpt: Option<String>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct FreshCheckObservationWrite {
@@ -2139,6 +2153,12 @@ pub(crate) struct FreshCheckObservationWrite {
     /// Tests the fast tier terminated at its per-test budget. Each one is also a
     /// `deferred` row in `tests`, persisted to `check_deferred_tests`.
     pub deferred_count: i64,
+    /// The plan audit's state and, when it did not judge the run, why. `None`
+    /// for a lane that carries no audit.
+    pub plan_audit_state: Option<String>,
+    pub plan_audit_note: Option<String>,
+    /// Persisted to `check_audit_findings`.
+    pub audit_findings: Vec<CheckAuditFindingRow>,
     /// Where the lane's wall clock went, when its runner measured it.
     pub phases: Option<CheckPhases>,
     /// The executor's `ExecutionWarmth`: what the cell held when the command
@@ -2648,6 +2668,8 @@ pub(crate) fn record_fresh_check_observation(
                     "failureSignature": observation.failure_signature,
                     "placementFacts": observation.placement_facts,
                     "substrateShape": observation.substrate_shape,
+                    "planAuditState": observation.plan_audit_state,
+                    "planAuditNote": observation.plan_audit_note,
                 })
                 .to_string();
                 let mut existing = conn
@@ -2687,7 +2709,9 @@ pub(crate) fn record_fresh_check_observation(
                            AND build_jobs_json IS json_extract(?31,'$.buildJobsJson')
                            AND failure_signature IS json_extract(?31,'$.failureSignature')
                            AND placement_facts IS json_extract(?31,'$.placementFacts')
-                           AND substrate_shape IS json_extract(?31,'$.substrateShape')",
+                           AND substrate_shape IS json_extract(?31,'$.substrateShape')
+                           AND plan_audit_state IS json_extract(?31,'$.planAuditState')
+                           AND plan_audit_note IS json_extract(?31,'$.planAuditNote')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -2751,7 +2775,8 @@ pub(crate) fn record_fresh_check_observation(
                         phase_publish_ms, phase_origin, compiled_units, phase_passes_json,
                         execution_warmth, cell_origin_kind, cell_origin_distance_files,
                         cell_origin_distance_crates, build_jobs, build_jobs_json,
-                        failure_signature, placement_facts, substrate_shape
+                        failure_signature, placement_facts, substrate_shape,
+                        plan_audit_state, plan_audit_note
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
@@ -2777,7 +2802,9 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.buildJobsJson'),
                               json_extract(?31,'$.failureSignature'),
                               json_extract(?31,'$.placementFacts'),
-                              json_extract(?31,'$.substrateShape'))
+                              json_extract(?31,'$.substrateShape'),
+                              json_extract(?31,'$.planAuditState'),
+                              json_extract(?31,'$.planAuditNote'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -2823,6 +2850,20 @@ pub(crate) fn record_fresh_check_observation(
                             test.duration_ms, test.attempt_count, test.failure_excerpt.as_deref(),
                             test.skip_reason.as_deref(), test.declaration_source.as_deref(),
                             i64::from(test.flaky), test.started_offset_ms],
+                    ).await?;
+                }
+                for finding in &observation.audit_findings {
+                    conn.execute(
+                        "INSERT INTO check_audit_findings (
+                            observation_id, finding_id, status, rule, table_name, file,
+                            statement, issue, known_shape, excerpt
+                         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                         ON CONFLICT(observation_id, finding_id) DO NOTHING",
+                        params![observation.id.as_str(), finding.finding_id.as_str(),
+                            finding.status.as_str(), finding.rule.as_str(),
+                            finding.table_name.as_str(), finding.file.as_str(),
+                            finding.statement.as_str(), finding.issue.as_deref(),
+                            finding.known_shape.as_deref(), finding.excerpt.as_deref()],
                     ).await?;
                 }
                 let answers = result_answers_the_lane(
@@ -3696,6 +3737,9 @@ mod tests {
             substrate_shape: None,
             selection: None,
             deferred_count: 0,
+            plan_audit_state: None,
+            plan_audit_note: None,
+            audit_findings: Vec::new(),
             phases: None,
             execution_warmth: None,
             cell_origin: None,
@@ -3884,6 +3928,50 @@ mod tests {
             (read.phases, read.execution_warmth, read.cell_origin),
             (None, None, None)
         );
+    }
+
+    /// A consumer that acts without a person reads the audit half from the row,
+    /// so neither its state nor its findings may exist only as rendered text.
+    #[tokio::test]
+    async fn an_audited_observation_keeps_its_state_and_findings_queryable() {
+        let db = cache_db().await;
+        let mut write = observation("obs-audit", "commit-audit", "env-audit");
+        write.plan_audit_state = Some("not-evaluated".to_string());
+        write.plan_audit_note = Some("the allowlist did not parse".to_string());
+        write.audit_findings.push(CheckAuditFindingRow {
+            finding_id: "a.rs|wide-scan|events|aa".to_string(),
+            status: "failed".to_string(),
+            rule: "wide-scan".to_string(),
+            table_name: "events".to_string(),
+            file: "a.rs".to_string(),
+            statement: "aa".to_string(),
+            issue: None,
+            known_shape: None,
+            excerpt: Some("Rewind; Next".to_string()),
+        });
+        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+        record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+
+        let state = db
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM check_result_observations WHERE id='obs-audit'
+                 AND plan_audit_state='not-evaluated'
+                 AND plan_audit_note='the allowlist did not parse'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, Some(1));
+        let findings = db
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM check_audit_findings WHERE observation_id='obs-audit'
+                 AND finding_id='a.rs|wide-scan|events|aa' AND status='failed'
+                 AND excerpt='Rewind; Next'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(findings, Some(1));
     }
 
     /// A fast-tier observation persists its deferrals beside, never inside,

@@ -422,10 +422,17 @@ impl VoiceServiceHandle {
 
     pub async fn status(&self) -> VoiceResult<VoiceStatus> {
         let manifest = self.0.installer.manifest().await?;
-        let (engine, capabilities) = if let Some(path) = &self.0.engine_override {
+        let (engine, capabilities, probe_failure) = if let Some(path) = &self.0.engine_override {
             match super::installer::probe_engine(path, &self.0.app_version).await {
-                Ok(capabilities) => (ComponentState::Installed, Some(capabilities)),
-                Err(_) => (ComponentState::Incompatible, None),
+                Ok(capabilities) => (ComponentState::Installed, Some(capabilities), None),
+                Err(error) => (
+                    ComponentState::Incompatible,
+                    None,
+                    Some(VoiceFailure {
+                        code: error.code().into(),
+                        message: error.to_string(),
+                    }),
+                ),
             }
         } else {
             let state =
@@ -437,12 +444,14 @@ impl VoiceServiceHandle {
                 }
                 _ => None,
             };
-            (state, capabilities)
+            (state, capabilities, None)
         };
         // Only while the engine is not usable: a refused handoff leaves the
         // current engine in place, and nothing would ever clear its failure.
         let engine_failure = if engine == ComponentState::Installed {
             None
+        } else if probe_failure.is_some() {
+            probe_failure
         } else {
             self.0.engine_failure.lock().await.clone()
         };
@@ -1233,6 +1242,25 @@ mod tests {
             }
         });
         (format!("http://{address}"), requested)
+    }
+
+    #[tokio::test]
+    async fn missing_engine_override_reports_probe_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-voice-engine");
+        let error = super::super::installer::probe_engine(&missing, APP_VERSION)
+            .await
+            .unwrap_err();
+        let harness = Harness::start(directory, Default::default(), Some(missing));
+        let status = harness.voice().status().await.unwrap();
+
+        assert_eq!(status.engine, ComponentState::Incompatible);
+        let failure = status
+            .engine_failure
+            .expect("the probe's error reaches status");
+        assert_eq!(failure.code, "install_failed");
+        assert_eq!(failure.message, error.to_string());
+        assert!(failure.message.contains("engine identity probe failed:"));
     }
 
     #[tokio::test]

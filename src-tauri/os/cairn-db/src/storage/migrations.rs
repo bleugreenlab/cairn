@@ -2186,6 +2186,9 @@ pub enum PrivateReason {
     /// inference inventory): written by its operator, durable, and rebuilt
     /// from nowhere, but about this install's hardware, so never synced.
     HostConfiguration,
+    /// Names objects in this machine's file archive, and is what makes them
+    /// reachable. Never cleared: losing it strands the archive's contents.
+    HostArchive,
     /// Private today, but its lean is to be shared; the move is DEFERRED to a
     /// named owner. Recorded as an owned, documented exception, never an
     /// anonymous allowlist line.
@@ -2356,6 +2359,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("check_observation_relabels", TableScope::ProjectScoped),
     ("check_test_results", TableScope::ProjectScoped),
     ("check_deferred_tests", TableScope::ProjectScoped),
+    ("check_audit_findings", TableScope::ProjectScoped),
     ("compile_facts", TableScope::ProjectScoped),
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
@@ -2715,7 +2719,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // the table is not clearable runner state.
     (
         "archival_progress",
-        TableScope::Private(PrivateReason::RunnerTransient),
+        TableScope::Private(PrivateReason::HostArchive),
+    ),
+    // The catalog of history packs in this machine's archive, and the runs each
+    // covers. The store cannot be enumerated, so these rows are the only list.
+    (
+        "history_tier",
+        TableScope::Private(PrivateReason::HostArchive),
+    ),
+    (
+        "history_tier_runs",
+        TableScope::Private(PrivateReason::HostArchive),
     ),
     (
         "delegated_packet_backfill_state",
@@ -3078,6 +3092,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "check_deferred_tests",
+        id_columns: &["observation_id"],
+    },
+    RekeyTableManifest {
+        table: "check_audit_findings",
         id_columns: &["observation_id"],
     },
     RekeyTableManifest {

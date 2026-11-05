@@ -119,6 +119,81 @@ pub fn default_archive_dir() -> PathBuf {
     cairn_common::paths::cairn_home().join("archive")
 }
 
+/// Data directories a live Cairn keeps its database in, relative to `$HOME`.
+const LIVE_DIRS: &[&str] = &[
+    ".cairn",
+    ".cairn-dev",
+    "Library/Application Support/com.cairn.desktop",
+];
+
+/// Names a sealed test process's seal root (`cairn_common::test_seal`).
+const SEALED_ENV: &str = "CAIRN_TEST_SEALED";
+
+/// Every directory a live Cairn could keep its database in, as this process
+/// can name them. A test binary has sealed its `HOME` away by the time it
+/// asks, so its seal's git ceilings, which list the homes it moved away from,
+/// are read too. No `HOME` means nothing can be judged, so it is an error.
+fn live_directories(
+    home: Option<PathBuf>,
+    cairn_home: Option<PathBuf>,
+    git_ceilings: Option<std::ffi::OsString>,
+) -> Result<Vec<PathBuf>, String> {
+    let home = home.filter(|home| !home.as_os_str().is_empty()).ok_or(
+        "HOME is unset, so whether this path is a live Cairn data directory cannot be judged",
+    )?;
+    let mut live: Vec<PathBuf> = LIVE_DIRS.iter().map(|dir| home.join(dir)).collect();
+    live.extend(cairn_home.filter(|path| !path.as_os_str().is_empty()));
+    if let Some(ceilings) = git_ceilings {
+        live.extend(std::env::split_paths(&ceilings));
+    }
+    Ok(live)
+}
+
+/// Why `path` may not be opened given these live directories: its parent is one
+/// of them, it sits in one's archive, or its parent cannot be resolved. A
+/// directory that does not exist cannot hold what `path` might be.
+fn live_directory_refusal(path: &Path, live: &[PathBuf]) -> Result<(), String> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let dir = std::fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "{}: cannot resolve its directory, so it may be a live Cairn data directory: {error}",
+            path.display()
+        )
+    })?;
+    for live in live
+        .iter()
+        .filter_map(|dir| std::fs::canonicalize(dir).ok())
+    {
+        if dir == live {
+            return Err(format!(
+                "{} is in a live Cairn data directory; clone it first",
+                path.display()
+            ));
+        }
+        if dir.starts_with(live.join("archive")) {
+            return Err(format!("{} is in a live Cairn archive", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a database a clone-only tool must not open: one in a live Cairn data
+/// directory or its archive. Fails closed when that cannot be judged. Deeper
+/// paths such as `~/.cairn/scratch/...` hold no live database and pass.
+pub fn refuse_live_directory(path: &Path) -> Result<(), String> {
+    let live = live_directories(
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from),
+        std::env::var_os("CAIRN_HOME").map(PathBuf::from),
+        std::env::var_os(SEALED_ENV).and_then(|_| std::env::var_os("GIT_CEILING_DIRECTORIES")),
+    )?;
+    live_directory_refusal(path, &live)
+}
+
 /// A column, as the payload estimate needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {

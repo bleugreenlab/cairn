@@ -330,7 +330,7 @@ impl CodexBackend {
     /// this thread.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    fn reader_thread_app_server(
+    pub(crate) fn reader_thread_app_server(
         orch: &Orchestrator,
         emitter: &Arc<dyn crate::services::EventEmitter>,
         run_id: &str,
@@ -961,6 +961,96 @@ mod tests {
             .to_string();
         let notice = host.standing_token_refusal().expect("the refusal stands");
         assert!(notice.contains(&refusal), "{notice}");
+    }
+
+    /// The interleaving that crashed fresh launches while the transport published
+    /// a launch turn before persisting it: the provider's first turn reaches the
+    /// real reader while the published turn is not yet started. The identity
+    /// checks must still refuse it, and the rejection must survive the process
+    /// saying exactly why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_turn_against_an_unstarted_launch_turn_is_refused_and_says_why() {
+        for (bound_run, expected, blameless) in [
+            (
+                "NULL",
+                "Codex provider turn conflicts with active Cairn turn t: run disagrees (turn: none, launch: r)",
+                ["session disagrees", "job disagrees", "neither running"],
+            ),
+            (
+                "'r'",
+                "Codex provider turn conflicts with active Cairn turn t: turn is pending, neither running nor terminal",
+                ["session disagrees", "job disagrees", "run disagrees"],
+            ),
+        ] {
+            let db = Arc::new(crate::storage::migrated_test_db("codex-unstarted-launch-turn").await);
+            db.execute_script(format!(
+                "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+                 INSERT INTO jobs(id,project_id,status,node_name,created_at,updated_at) VALUES('j','p','running','Review',1,1);
+                 INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('s','j','codex','open',1,1,1);
+                 INSERT INTO runs(id,project_id,job_id,status,session_id,start_mode,created_at,updated_at) VALUES('r','p','j','live','s','fresh',1,1);
+                 INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('t','s',{bound_run},'j',1,'pending','initial',1,1);
+                 UPDATE jobs SET current_turn_id='t',current_session_id='s' WHERE id='j';"
+            ))
+            .await
+            .unwrap();
+            let orch = scripted_test_orchestrator(db.clone());
+            orch.process_state
+                .register_process("r".into(), RunHandle::test_handle(Some("s"), Some("j")))
+                .unwrap();
+            orch.process_state.set_current_turn_id("r", Some("t"));
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(json!({"method":"turn/started","params":{"turn":{"id":"p1"}}}))
+                .unwrap();
+            drop(tx);
+
+            CodexBackend::reader_thread_app_server(
+                &orch,
+                &orch.services.emitter,
+                "r",
+                Some("s".into()),
+                rx,
+                Arc::new(AppServerClient::for_test_scripted(
+                    vec![],
+                    Arc::new(Mutex::new(Vec::new())),
+                )),
+                Arc::new(Mutex::new(None)),
+                None,
+                "codex".into(),
+                db.clone(),
+                None,
+            );
+
+            let error = db
+                .query_opt_text(
+                    "SELECT json_extract(data,'$.content') FROM events WHERE event_type='system:error'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .expect("the rejection is stored as the run's error");
+            assert!(error.contains(expected), "{error}");
+            for field in blameless {
+                assert!(!error.contains(field), "{error}");
+            }
+            assert_eq!(
+                db.query_opt_text("SELECT exit_reason FROM runs WHERE id='r'", ())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(crate::orchestrator::lifecycle::WATCHDOG_ARM_FAILED_EXIT_REASON)
+            );
+            assert_eq!(
+                db.query_opt_i64(
+                    "SELECT COUNT(*) FROM events WHERE event_type='system:codex_goal_turn_started'",
+                    (),
+                )
+                .await
+                .unwrap(),
+                Some(0),
+                "a refused turn binds nothing"
+            );
+        }
     }
 
     #[tokio::test]

@@ -7,8 +7,8 @@ use crate::execution::cache::{
 };
 use crate::execution::check_parsers::{
     anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
-    is_lint_parser, is_test_runner_parser, report_excerpt, ParsedCheckResult, VerdictFacts,
-    MAX_FAILURE_NAMES,
+    is_lint_parser, is_test_runner_parser, join_failure_names, report_excerpt, ParsedCheckResult,
+    VerdictFacts, MAX_FAILURE_NAMES, PLAN_AUDIT_FAILURE_PREFIX,
 };
 use crate::execution::checks::{
     check_input_hashes, head_verdicts, head_verdicts_conn, load_checks_contract_at_commit,
@@ -663,6 +663,7 @@ pub(crate) fn test_status(
         declared_unverified: None,
         progress: None,
         base_attribution: None,
+        plan_audit_note: None,
     }
 }
 
@@ -750,6 +751,10 @@ pub struct NodeCheckStatus {
     /// `None` for legacy rows and runners with no separate collection phase.
     pub(crate) suite_failures: Option<usize>,
     pub(crate) failure_names: Vec<String>,
+    /// Why the lane's plan audit did not judge the run, when it did not. The
+    /// lane's own verdict stands; this says the audit half has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_audit_note: Option<String>,
     pub(crate) output_tail: Option<String>,
     /// Terminal classification of a FAILING check, so a surface renders the real
     /// death or evidence domain rather than an opaque red. `None` for a pass, an
@@ -1003,6 +1008,7 @@ fn unsupported_lanes<'a>(
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         }
     })
 }
@@ -1736,6 +1742,7 @@ fn assemble_statuses(
                 declared_unverified: None,
                 progress,
                 base_attribution: None,
+                plan_audit_note: None,
             }
         })
         .collect()
@@ -1943,6 +1950,9 @@ fn status_from_row(
         executor,
         verified_on: None,
         notice: None,
+        plan_audit_note: parsed
+            .as_ref()
+            .and_then(ParsedCheckResult::plan_audit_not_evaluated),
         declared_unverified: parsed.and_then(|p| p.unverified),
         progress: None,
         base_attribution: None,
@@ -2057,6 +2067,9 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
             }
         }
         _ => {}
+    }
+    if let Some(note) = &status.plan_audit_note {
+        parts.push(format!("plan audit: not evaluated ({note})"));
     }
     if let Some(machine) = &status.executor {
         parts.push(format!("on {machine}"));
@@ -2380,8 +2393,24 @@ pub(crate) fn format_check_wake_body(
         if let Some(note) = newer_attempt_note(lane) {
             out.push_str(&format!("\n- {}: {note}", lane.row.check_name));
         }
+        if let Some(note) = plan_audit_not_evaluated(lane.row.target_results_json.as_deref()) {
+            out.push_str(&format!(
+                "\n- {}: plan audit: not evaluated ({note})",
+                lane.row.check_name
+            ));
+        }
     }
     Some(out)
+}
+
+/// Why a stored result's plan audit did not judge its run, when it did not. A
+/// wake reads every lane's row, and a Rust lane's result is large, so one that
+/// cannot say so is not parsed.
+fn plan_audit_not_evaluated(target_results_json: Option<&str>) -> Option<String> {
+    let json = target_results_json.filter(|json| json.contains("\"not-evaluated\""))?;
+    serde_json::from_str::<ParsedCheckResult>(json)
+        .ok()?
+        .plan_audit_not_evaluated()
 }
 
 /// What a lane that ended without a verdict says for itself in a wake body:
@@ -2461,7 +2490,7 @@ fn wake_failure_detail(
             }
             header
         }
-        None if named => format!("{annotation}: {}", join_capped(&names, MAX_FAILURE_NAMES)),
+        None if named => format!("{annotation}: {}", join_failure_names(&names)),
         None => annotation,
     };
     let report = parsed
@@ -2535,8 +2564,18 @@ pub(crate) fn failed_annotation(
     // assertion tally that would read "0 of 881 failed".
     let suites = suite_failures.unwrap_or(0);
     let mut segments = Vec::new();
-    if failed == 0 && passed == 0 && suites == 0 {
+    let audit = names
+        .iter()
+        .filter(|name| name.starts_with(PLAN_AUDIT_FAILURE_PREFIX))
+        .count();
+    if failed == 0 && passed == 0 && suites == 0 && audit == 0 {
         return Some("check failed before reporting test failures — unverified".to_string());
+    }
+    if audit > 0 {
+        segments.push(format!("plan audit: {audit} gating"));
+        if failed == 0 && suites == 0 {
+            segments.push(format!("all {passed} passed"));
+        }
     }
     if failed > 0 {
         segments.push(format!("{failed} of {} failed", failed + passed));
@@ -2592,6 +2631,7 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
             .collect(),
         unverified: None,
         lint_findings: None,
+        plan_audit: None,
     };
     format_failure_names(&parsed)
 }
@@ -3181,6 +3221,7 @@ mod tests {
                 .collect(),
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         })
         .unwrap()
     }
@@ -3837,6 +3878,7 @@ mod tests {
             failures: vec![],
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         };
         tsc.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
         let status = status_from_row(
@@ -3877,6 +3919,7 @@ mod tests {
                     .collect(),
                 unverified: None,
                 lint_findings: None,
+                plan_audit: None,
             })
             .unwrap(),
         );
@@ -4057,6 +4100,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -4125,6 +4169,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -4221,6 +4266,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -4266,6 +4312,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -4320,6 +4367,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -4405,6 +4453,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -4508,11 +4557,82 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            plan_audit_note: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
             Some("failed to spawn")
         );
+    }
+
+    /// A lane's annotation says a gating audit is the red it is, not a tally that
+    /// reads "0 of N failed", with its test reds beside it when it has them.
+    #[test]
+    fn a_gating_audit_leads_the_lanes_annotation() {
+        let mut status = with_tests(lane("rust-tests", NodeCheckState::Failed), "full", 4800);
+        status.failure_names = vec![
+            "plan-audit a.rs|wide-scan|events|aa".to_string(),
+            "plan-audit b.rs|wide-scan|events|bb".to_string(),
+        ];
+        let annotation = format_status_annotation(&status).unwrap();
+        assert!(
+            annotation.starts_with("plan audit: 2 gating, all 4800 passed"),
+            "{annotation}"
+        );
+        assert!(!annotation.contains("0 of"), "{annotation}");
+
+        status.failed = Some(1);
+        status.failure_names.push("t0".to_string());
+        let annotation = format_status_annotation(&status).unwrap();
+        assert!(
+            annotation.starts_with("plan audit: 2 gating, 1 of 4801 failed"),
+            "{annotation}"
+        );
+    }
+
+    #[test]
+    fn an_unjudged_audit_rides_beside_the_lanes_own_verdict() {
+        let mut status = with_tests(lane("rust-tests", NodeCheckState::Passed), "full", 12);
+        status.plan_audit_note = Some("the allowlist did not parse".to_string());
+        let annotation = format_status_annotation(&status).unwrap();
+        assert!(annotation.starts_with("12 tests"), "{annotation}");
+        assert!(
+            annotation.contains("plan audit: not evaluated (the allowlist did not parse)"),
+            "{annotation}"
+        );
+    }
+
+    /// A wake reads each lane's stored result for the audit's state, and a narrow
+    /// lane that ran no test adds nothing to it.
+    #[test]
+    fn a_wake_says_when_an_audit_went_unjudged_unless_no_test_ran() {
+        let row = |selection: &str, ran_no_test: bool| {
+            let mut parsed: ParsedCheckResult = serde_json::from_str(&parsed_json(3, &[])).unwrap();
+            parsed.plan_audit = Some(
+                serde_json::from_value(serde_json::json!({
+                    "state": "not-evaluated", "note": "why", "selection": selection,
+                    "ranNoTest": ran_no_test, "rows": [],
+                }))
+                .unwrap(),
+            );
+            CheckResultCacheEntry {
+                target_results_json: Some(serde_json::to_string(&parsed).unwrap()),
+                ..verdict_row("rust-tests", true)
+            }
+        };
+        let line = "- rust-tests: plan audit: not evaluated (why)";
+        for (selection, ran_no_test, said) in [
+            ("filtered", true, false),
+            ("filtered", false, true),
+            ("full", true, true),
+        ] {
+            let body = wake([row(selection, ran_no_test)]).unwrap();
+            assert_eq!(
+                body.contains(line),
+                said,
+                "{selection}, ran_no_test {ran_no_test}:\n{body}"
+            );
+        }
     }
 
     fn lane(name: &str, state: NodeCheckState) -> NodeCheckStatus {

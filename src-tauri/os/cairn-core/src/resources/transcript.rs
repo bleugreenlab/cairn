@@ -13,6 +13,9 @@ use cairn_models::continuation::{
 };
 use serde::Serialize;
 
+use crate::storage::events::history::{
+    gather_hot_page, sort_chat_order, EventFilter, HistoryReader, HistoryRow, HotPage, HotRow,
+};
 use crate::storage::RowExt;
 
 /// A loaded transcript event with the turn and timestamp coordinates the digest
@@ -64,6 +67,19 @@ pub(crate) async fn era_source_digest(
     // legacy first-pass spans and pathological tool output.
     digest.truncate(digest.floor_char_boundary(96_000));
     Ok(digest)
+}
+
+impl From<crate::models::Event> for EventRow {
+    fn from(event: crate::models::Event) -> Self {
+        EventRow {
+            run_id: event.run_id,
+            sequence: event.sequence,
+            event_type: event.event_type,
+            data: event.data,
+            turn_id: event.turn_id,
+            created_at: event.created_at,
+        }
+    }
 }
 
 impl EventRow {
@@ -204,12 +220,7 @@ async fn load_job_events_paged(
     let ordered_run_ids: Vec<String> = db
         .read(move |conn| {
             Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC",
-                        (job.as_str(),),
-                    )
-                    .await?;
+                let mut rows = conn.query(JOB_RUNS, (job.as_str(),)).await?;
                 let mut ids = Vec::new();
                 while let Some(row) = rows.next().await? {
                     if let Ok(run_id) = row.text(0) {
@@ -221,130 +232,116 @@ async fn load_job_events_paged(
         })
         .await?;
 
-    let page_limit = i64::try_from(page_rows.max(1)).unwrap_or(i64::MAX);
+    let mut reader = HistoryReader::new(db);
+    reader.prime_runs(&ordered_run_ids).await?;
+    let page_limit = page_rows.max(1);
     let mut ordered = Vec::new();
     for run_id in ordered_run_ids {
-        let mut run_events: Vec<(i64, crate::models::Event)> = Vec::new();
+        let mut run_events: Vec<HistoryRow> = Vec::new();
         let mut after_rowid = i64::MIN;
         loop {
-            let page = read_event_page(db, &run_id, after_rowid, page_limit).await?;
+            let page = reader
+                .run_events_page(&run_id, after_rowid, page_limit, EventFilter::default())
+                .await?;
             let Some(last_rowid) = page.last_rowid else {
                 break;
             };
             after_rowid = last_rowid;
-            let (rowids, events): (Vec<i64>, Vec<crate::models::Event>) =
-                page.events.into_iter().unzip();
-            // Reconstruction preserves length and order, and takes its own
-            // short read for coordinates, packs and blobs.
-            let events = crate::storage::reconstruct_events(db, events).await;
-            run_events.extend(rowids.into_iter().zip(events));
+            let exhausted = page.fetched < page_limit;
+            run_events.extend(page.rows);
             after_page();
-            if page.fetched < page_limit {
+            if exhausted {
                 break;
             }
         }
         // `(created_at, rowid)` is unique, so this is exactly the order the
         // single unpaged `ORDER BY created_at, rowid` produced.
-        run_events.sort_by_key(|(rowid, event)| (event.created_at, *rowid));
-        ordered.extend(run_events.into_iter().map(|(_, event)| EventRow {
-            run_id: event.run_id,
-            sequence: event.sequence,
-            event_type: event.event_type,
-            data: event.data,
-            turn_id: event.turn_id,
-            created_at: event.created_at,
-        }));
+        sort_chat_order(&mut run_events);
+        ordered.extend(run_events.into_iter().map(|row| EventRow::from(row.event)));
     }
     Ok(ordered)
 }
 
-/// One keyset page of a run's events, in rowid order.
-struct EventPage {
-    /// Rows the statement returned, including any that failed to parse, so a
-    /// short page still means the run is exhausted.
-    fetched: i64,
-    /// The highest rowid returned; `None` when the page was empty.
-    last_rowid: Option<i64>,
-    events: Vec<(i64, crate::models::Event)>,
+pub(super) const JOB_RUNS: &str =
+    "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC, rowid ASC";
+pub(super) const NTH_JOB_RUN: &str =
+    "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC, rowid ASC LIMIT 1 OFFSET ?2";
+
+fn turn_rows_sql() -> String {
+    format!(
+        "SELECT {} FROM events WHERE turn_id = ?1 ORDER BY sequence ASC, rowid ASC",
+        HotRow::columns(None)
+    )
 }
 
-async fn read_event_page(
-    db: &crate::storage::LocalDb,
-    run_id: &str,
-    after_rowid: i64,
-    limit: i64,
-) -> crate::storage::DbResult<EventPage> {
-    // Select full event rows (archival columns included) so archived rows
-    // reconstruct before formatting. Keyed on `(run_id, rowid)`, which is the
-    // order `idx_events_run_id` already holds its entries in.
-    let sql = format!(
-        "SELECT {}, rowid FROM events WHERE run_id = ?1 AND rowid > ?2 ORDER BY rowid ASC LIMIT ?3",
-        crate::runs::queries::EVENT_COLUMNS
-    );
-    let run_id = run_id.to_string();
-    db.read(move |conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(&sql, params![run_id.as_str(), after_rowid, limit])
-                .await?;
-            let mut page = EventPage {
-                fetched: 0,
-                last_rowid: None,
-                events: Vec::new(),
-            };
-            while let Some(row) = rows.next().await? {
-                let rowid = row.i64(crate::runs::queries::EVENT_COLUMN_COUNT)?;
-                page.fetched += 1;
-                page.last_rowid = Some(rowid);
-                if let Ok(event) = crate::runs::queries::event_from_row(&row) {
-                    page.events.push((rowid, event));
-                }
-            }
-            Ok(page)
-        })
-    })
-    .await
-}
-
-/// A turn's event rows in sequence order, as stored. Statements only: hand the
-/// rows to [`reconstruct_turn_events`] once the read has released.
-pub(super) async fn turn_event_rows(
+/// Gather inside an existing resolving read, never reconstruct under its hold.
+/// A potentially packed database leaves source selection to the reader after release.
+pub(super) async fn gather_turn_rows(
     conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
-) -> Vec<crate::models::Event> {
-    let columns = crate::runs::queries::EVENT_COLUMNS;
-    let sql = format!("SELECT {columns} FROM events WHERE turn_id = ?1 ORDER BY sequence ASC");
-    let mut events: Vec<crate::models::Event> = Vec::new();
-    if let Ok(mut rows) = conn.query(&sql, (turn_id,)).await {
-        while let Ok(Some(row)) = rows.next().await {
-            if let Ok(event) = crate::runs::queries::event_from_row(&row) {
-                events.push(event);
-            }
-        }
+    hot_only: bool,
+) -> Result<Option<HotPage>, String> {
+    if !hot_only {
+        return Ok(None);
     }
-    events
+    gather_hot_page(conn, &turn_rows_sql(), vec![turn_id.to_string().into()])
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
-/// Reconstruct the rows [`turn_event_rows`] read into [`EventRow`]s. Takes `db`
-/// rather than a connection because reconstruction takes its own short read and
-/// then fetches from the content store, neither of which may happen inside the
-/// caller's read.
-pub(super) async fn reconstruct_turn_events(
+pub(super) async fn finish_turn_rows(
     db: &crate::storage::LocalDb,
-    events: Vec<crate::models::Event>,
-) -> Vec<EventRow> {
-    crate::storage::reconstruct_events(db, events)
+    turn_id: &str,
+    hot: Option<HotPage>,
+) -> Result<Vec<EventRow>, String> {
+    match hot {
+        Some(page) => Ok(page
+            .reconstruct(db, EventFilter::default())
+            .await
+            .rows
+            .into_iter()
+            .map(|row| EventRow::from(row.event))
+            .collect()),
+        None => turn_event_rows(db, turn_id).await,
+    }
+}
+
+pub(super) async fn gather_single_event(
+    conn: &cairn_db::storage::TrackedConnection,
+    run_id: &str,
+    event_seq: i32,
+    hot_only: bool,
+) -> Result<Option<HotPage>, String> {
+    if !hot_only {
+        return Ok(None);
+    }
+    gather_hot_page(
+        conn,
+        &crate::storage::events::history::statements::run_sequence(),
+        vec![run_id.to_string().into(), i64::from(event_seq).into()],
+    )
+    .await
+    .map(Some)
+    .map_err(|error| error.to_string())
+}
+
+/// A turn's events in sequence order, reconstructed. Takes `db` rather than a
+/// connection because the read takes its own short reads and may fetch from the
+/// content store, neither of which may happen inside the caller's read.
+pub(super) async fn turn_event_rows(
+    db: &crate::storage::LocalDb,
+    turn_id: &str,
+) -> Result<Vec<EventRow>, String> {
+    let page = HistoryReader::new(db)
+        .turn_events(turn_id)
         .await
+        .map_err(|error| error.to_string())?;
+    Ok(page
+        .rows
         .into_iter()
-        .map(|event| EventRow {
-            run_id: event.run_id,
-            sequence: event.sequence,
-            event_type: event.event_type,
-            data: event.data,
-            turn_id: event.turn_id,
-            created_at: event.created_at,
-        })
-        .collect()
+        .map(|row| EventRow::from(row.event))
+        .collect())
 }
 
 /// Get the Nth run for a job (1-indexed), numbered by `created_at` with `rowid`
@@ -360,105 +357,53 @@ pub(super) async fn get_nth_run_id(
     }
 
     let mut rows = conn
-        .query(
-            "
-            SELECT id
-            FROM runs
-            WHERE job_id = ?1
-            ORDER BY created_at ASC, rowid ASC
-            LIMIT 1 OFFSET ?2
-            ",
-            params![job_id, (run_seq - 1) as i64],
-        )
+        .query(NTH_JOB_RUN, params![job_id, (run_seq - 1) as i64])
         .await
         .ok()?;
 
     rows.next().await.ok().flatten()?.text(0).ok()
 }
 
-/// One event row as stored, with the change-preview columns read beside it.
-pub(super) struct StoredEvent {
-    event: crate::models::Event,
-    preview_status: Option<String>,
-    preview_applied: Option<i64>,
-}
-
-/// The event at `event_seq` in a run, as stored. Statements only: render it
-/// with [`render_single_event`] once the read has released. `Err` is the
-/// not-found message.
-pub(super) async fn read_single_event(
-    conn: &cairn_db::storage::TrackedConnection,
-    run_id: &str,
-    event_seq: i32,
-) -> Result<StoredEvent, String> {
-    let not_found = || format!("Event with sequence {} not found", event_seq);
-    let columns = crate::runs::queries::EVENT_COLUMNS;
-    let sql = format!(
-        "SELECT {columns}, change_preview_status, change_applied_at
-         FROM events WHERE run_id = ?1 AND sequence = ?2 LIMIT 1"
-    );
-    let mut rows = conn
-        .query(&sql, params![run_id, event_seq as i64])
-        .await
-        .map_err(|_| not_found())?;
-    let Ok(Some(row)) = rows.next().await else {
-        return Err(not_found());
-    };
-    // change_preview_* ride just past EVENT_COLUMNS; key off EVENT_COLUMN_COUNT so
-    // adding an event column shifts them in lockstep rather than reading the wrong
-    // slot.
-    let preview_status = row
-        .opt_text(crate::runs::queries::EVENT_COLUMN_COUNT)
-        .ok()
-        .flatten();
-    let preview_applied = row
-        .opt_i64(crate::runs::queries::EVENT_COLUMN_COUNT + 1)
-        .ok()
-        .flatten();
-    let event = crate::runs::queries::event_from_row(&row).map_err(|_| not_found())?;
-    Ok(StoredEvent {
-        event,
-        preview_status,
-        preview_applied,
-    })
-}
-
-/// Render an event [`read_single_event`] read, with full content. The event is
-/// reconstructed first (its own short read, then any content-store fetch); a
-/// tool result that does not carry its tool's name then takes a second short
-/// read to find it, since the name lives on the reconstructed body.
+/// Render the event at `event_seq` in a run, with full content, or the message
+/// for one that cannot be read. A tool result that does not carry its tool's
+/// name then reads the run's assistant events to find it, since the name lives
+/// on their reconstructed bodies. Call once the caller's read has released.
 pub(super) async fn render_single_event(
     db: &crate::storage::LocalDb,
-    stored: StoredEvent,
+    run_id: &str,
+    event_seq: i32,
+    hot: Result<Option<HotPage>, String>,
 ) -> String {
-    let StoredEvent {
-        event,
-        preview_status,
-        preview_applied,
-    } = stored;
-    let mut events = crate::storage::reconstruct_events(db, vec![event]).await;
-    let event = events.remove(0);
-    let resolved_tool_name = match unresolved_tool_use_id(&event.event_type, &event.data) {
-        Some(tool_use_id) => {
-            let run_id = event.run_id.clone();
-            db.read(move |conn| {
-                Box::pin(async move {
-                    crate::storage::DbResult::Ok(
-                        resolve_tool_name(conn, &run_id, &tool_use_id).await,
-                    )
-                })
-            })
+    let mut reader = HistoryReader::new(db);
+    let selected = match hot {
+        Ok(Some(page)) => Ok(page
+            .reconstruct(db, EventFilter::default())
             .await
-            .ok()
-            .flatten()
+            .rows
+            .into_iter()
+            .next()),
+        Ok(None) => {
+            reader
+                .run_event_by_sequence(run_id, i64::from(event_seq))
+                .await
         }
+        Err(error) => return error,
+    };
+    let row = match selected {
+        Ok(Some(row)) => row,
+        Ok(None) => return format!("Event with sequence {} not found", event_seq),
+        Err(error) => return error.to_string(),
+    };
+    let HistoryRow { event, extras, .. } = row;
+    let resolved_tool_name = match unresolved_tool_use_id(&event.event_type, &event.data) {
+        Some(tool_use_id) => resolve_tool_name(&mut reader, run_id, &tool_use_id).await,
         None => None,
     };
     format_single_event(
         &event.event_type,
         &event.data,
-        preview_status,
-        preview_applied,
+        extras.change_preview_status,
+        extras.change_applied_at,
         resolved_tool_name.as_deref(),
     )
 }
@@ -491,45 +436,33 @@ fn tool_use_id_from_event(event_data: &serde_json::Value) -> Option<&str> {
 }
 
 async fn resolve_tool_name(
-    conn: &cairn_db::storage::TrackedConnection,
+    reader: &mut HistoryReader<'_>,
     run_id: &str,
     tool_use_id: &str,
 ) -> Option<String> {
-    let mut rows = conn
-        .query(
-            "
-            SELECT data
-            FROM events
-            WHERE run_id = ?1 AND event_type = 'assistant'
-            ORDER BY created_at ASC, rowid ASC
-            ",
-            params![run_id],
-        )
+    let row = reader
+        .find_run_event(run_id, EventFilter::types(&["assistant"]), |row| {
+            matching_tool_name(&row.event.data, tool_use_id).is_some()
+        })
         .await
-        .ok()?;
+        .ok()??;
+    matching_tool_name(&row.event.data, tool_use_id).flatten()
+}
 
-    while let Ok(Some(row)) = rows.next().await {
-        let Ok(data) = row.text(0) else { continue };
-        let Ok(event_data) = serde_json::from_str::<serde_json::Value>(&data) else {
-            continue;
-        };
-        let Some(tool_uses) = event_data
-            .get("toolUses")
-            .and_then(|value| value.as_array())
-        else {
-            continue;
-        };
-
-        for tool in tool_uses {
-            let id = tool.get("id").and_then(|value| value.as_str());
-            let name = tool.get("name").and_then(|value| value.as_str());
-            if id == Some(tool_use_id) {
-                return name.filter(|value| !value.is_empty()).map(str::to_string);
-            }
-        }
-    }
-
-    None
+/// Distinguish an unmatched id from a matching tool with no usable name:
+/// either matching shape terminates the search, as the original cursor did.
+fn matching_tool_name(data: &str, tool_use_id: &str) -> Option<Option<String>> {
+    let data: serde_json::Value = serde_json::from_str(data).ok()?;
+    let tools = data.get("toolUses")?.as_array()?;
+    tools
+        .iter()
+        .find(|tool| tool.get("id").and_then(serde_json::Value::as_str) == Some(tool_use_id))
+        .map(|tool| {
+            tool.get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// Format a single event with full content (no truncation)
@@ -1731,8 +1664,14 @@ pub(super) enum ChatTurnTarget {
     Turn(String),
 }
 
+pub(super) const FIRST_JOB_SESSION: &str =
+    "SELECT session_id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC, rowid ASC LIMIT 1";
+const TASK_RUN_SESSIONS: &str =
+    "SELECT DISTINCT session_id FROM runs WHERE job_id = ?1 AND session_id IS NOT NULL LIMIT 2";
+const CHAT_TURN_ID: &str = "SELECT id FROM turns WHERE session_id = ?1 AND sequence = ?2 LIMIT 1";
+
 pub(super) async fn chat_turn_target(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     turn_seq: i32,
     task: bool,
@@ -1741,9 +1680,9 @@ pub(super) async fn chat_turn_target(
         return Ok(ChatTurnTarget::Missing);
     }
     let sql = if task {
-        "SELECT DISTINCT session_id FROM runs WHERE job_id = ?1 AND session_id IS NOT NULL LIMIT 2"
+        TASK_RUN_SESSIONS
     } else {
-        "SELECT session_id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC, rowid ASC LIMIT 1"
+        FIRST_JOB_SESSION
     };
     let mut sessions = conn
         .query(sql, (job_id,))
@@ -1760,10 +1699,7 @@ pub(super) async fn chat_turn_target(
         return Ok(ChatTurnTarget::Ambiguous);
     }
     let mut turns = conn
-        .query(
-            "SELECT id FROM turns WHERE session_id = ?1 AND sequence = ?2 LIMIT 1",
-            params![session.as_str(), turn_seq as i64],
-        )
+        .query(CHAT_TURN_ID, params![session.as_str(), turn_seq as i64])
         .await
         .map_err(|e| e.to_string())?;
     Ok(match turns.next().await.map_err(|e| e.to_string())? {
@@ -2297,6 +2233,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hot_job_transcript_keeps_main_one_runlist_plus_pages_cost() {
+        use crate::storage::history_pack::testing::{publish_for_test, seed_fixture_execution};
+        let db = crate::storage::migrated_test_db("core-job-hot-cost").await;
+        seed_fixture_execution(&db, "core-job-hot-cost").await;
+        // Coordinate/blob resolution has its own inherited SQL cost; this pin
+        // isolates the transcript's run list and event-selection statements.
+        db.execute(
+            "UPDATE events SET storage_mode = 'full' WHERE storage_mode = 'gitcoord'",
+            (),
+        )
+        .await
+        .unwrap();
+        for cataloged in [false, true] {
+            if cataloged {
+                publish_for_test(&db, "exec-1").await;
+            }
+            let before = (db.read_statement_count(), db.read_checkout_count());
+            let events = load_job_events_paged(&db, "job-1", 512, &mut || {})
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 8);
+            assert_eq!(
+                (
+                    db.read_statement_count() - before.0,
+                    db.read_checkout_count() - before.1
+                ),
+                (3, 3),
+                "one run list plus one page per run; cataloged={cataloged}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_name_stops_at_first_chronological_matching_page() {
+        use crate::storage::history_pack::testing::{
+            evict_all, publish_for_test, seed_fixture_execution,
+        };
+        let db = crate::storage::migrated_test_db("core-tool-early-stop").await;
+        seed_fixture_execution(&db, "core-tool-early-stop").await;
+        db.write(|conn| Box::pin(async move {
+            for n in 0..1200i64 {
+                // Reversed timestamps distinguish chat order from insertion order.
+                let created = 2000 - n;
+                let data = serde_json::json!({"toolUses": [
+                    {"id": "needle", "name": format!("tool-{n}")}
+                ]}).to_string();
+                let blob = crate::storage::compress(data.as_bytes()).unwrap();
+                conn.execute("INSERT INTO events(id,run_id,session_id,sequence,timestamp,event_type,data,created_at,storage_mode,data_blob,codec)
+                    VALUES(?1,'run-1','sess-1',?2,?3,'assistant','{}',?3,'zstd',?4,'zstd_v1')",
+                    params![format!("tool-page-{n}"), n + 100, created, blob]).await?;
+            }
+            Ok(())
+        })).await.unwrap();
+        for cataloged in [false, true] {
+            if cataloged {
+                publish_for_test(&db, "exec-1").await;
+            }
+            let before = (db.read_statement_count(), db.read_checkout_count());
+            let found = resolve_tool_name(&mut HistoryReader::new(&db), "run-1", "needle").await;
+            assert_eq!(found.as_deref(), Some("tool-1199"));
+            assert_eq!(
+                (
+                    db.read_statement_count() - before.0,
+                    db.read_checkout_count() - before.1
+                ),
+                (1, 1),
+                "later assistant pages must not be read"
+            );
+            let before = db.read_statement_count();
+            assert_eq!(
+                resolve_tool_name(&mut HistoryReader::new(&db), "run-1", "absent").await,
+                None
+            );
+            assert_eq!(
+                db.read_statement_count() - before,
+                3,
+                "missing names scan all three bounded pages"
+            );
+        }
+        evict_all(&db).await;
+        assert_eq!(
+            resolve_tool_name(&mut HistoryReader::new(&db), "run-1", "needle")
+                .await
+                .as_deref(),
+            Some("tool-1199")
+        );
+    }
+
+    #[tokio::test]
+    async fn core_transcript_runlist_plans_stay_job_indexed() {
+        let db = crate::storage::migrated_test_db("core-runlist-plans").await;
+        for (sql, binds) in [
+            (JOB_RUNS, vec!["job".into()]),
+            (NTH_JOB_RUN, vec!["job".into(), 255i64.into()]),
+            (FIRST_JOB_SESSION, vec!["job".into()]),
+            (TASK_RUN_SESSIONS, vec!["job".into()]),
+        ] {
+            let plan = crate::storage::query_plan(&db, sql, binds).await;
+            assert!(
+                plan.contains("SEARCH runs") && plan.contains("job_id"),
+                "{sql}: {plan}"
+            );
+            assert!(!plan.contains("SCAN runs"), "{sql}: {plan}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_turn_target_preserves_session_semantics_and_tracks_every_statement() {
+        use crate::storage::history_pack::testing::seed_fixture_execution;
+        let db = crate::storage::migrated_test_db("chat-turn-target-tracked").await;
+        seed_fixture_execution(&db, "chat-turn-target-tracked").await;
+
+        async fn check(
+            db: &LocalDb,
+            job: &str,
+            ordinal: i32,
+            task: bool,
+            expected: &str,
+            queries: usize,
+        ) {
+            let statements = db.statement_count();
+            let checkouts = db.read_checkout_count();
+            let job = job.to_owned();
+            let target = super::super::common::read_resource(db, move |conn| {
+                Box::pin(async move { chat_turn_target(conn, &job, ordinal, task).await })
+            })
+            .await
+            .unwrap();
+            let actual = match target {
+                ChatTurnTarget::NoSession => "no-session".to_string(),
+                ChatTurnTarget::Ambiguous => "ambiguous".to_string(),
+                ChatTurnTarget::Missing => "missing".to_string(),
+                ChatTurnTarget::Turn(id) => id,
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(db.statement_count() - statements, queries);
+            assert_eq!(db.read_checkout_count() - checkouts, 1);
+        }
+
+        check(&db, "job-1", 0, true, "missing", 0).await;
+        check(&db, "absent-job", 1, true, "no-session", 1).await;
+        check(&db, "job-1", 1, true, "ambiguous", 1).await;
+        check(&db, "job-1", 1, false, "turn-1", 2).await;
+        check(&db, "job-1", 2, false, "missing", 2).await;
+
+        db.execute("UPDATE runs SET session_id='sess-1' WHERE id='run-2'", ())
+            .await
+            .unwrap();
+        check(&db, "job-1", 1, true, "turn-1", 2).await;
+        db.execute("UPDATE runs SET session_id=NULL WHERE id='run-2'", ())
+            .await
+            .unwrap();
+        check(&db, "job-1", 1, true, "turn-1", 2).await;
+        db.execute("UPDATE runs SET session_id=NULL WHERE id='run-1'", ())
+            .await
+            .unwrap();
+        check(&db, "job-1", 1, true, "no-session", 1).await;
+
+        let plan =
+            crate::storage::query_plan(&db, CHAT_TURN_ID, vec!["sess-1".into(), 1i64.into()]).await;
+        assert!(
+            plan.contains("SEARCH turns") && plan.contains("idx_turns_session_sequence"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN turns"), "{plan}");
+    }
+
+    #[tokio::test]
     async fn load_turn_events_reconstructs_archived_zstd() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.keep().join("transcript-archival.db");
@@ -2330,16 +2434,8 @@ mod tests {
         .await
         .unwrap();
 
-        let events = db
-            .read(|conn| {
-                Box::pin(async move {
-                    crate::storage::DbResult::Ok(turn_event_rows(conn, "turn-1").await)
-                })
-            })
-            .await
-            .unwrap();
+        let rows = turn_event_rows(&db, "turn-1").await.unwrap();
         assert_eq!(db.live_connections(), 0);
-        let rows = reconstruct_turn_events(&db, events).await;
         assert_eq!(rows.len(), 1);
         // The stub `data` was reconstructed back to the original event JSON.
         assert_eq!(rows[0].data, original);
@@ -2452,20 +2548,55 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = db
-            .read(|conn| {
-                Box::pin(async move {
-                    crate::storage::DbResult::Ok(read_single_event(conn, "run-1", 2).await)
-                })
-            })
-            .await
-            .unwrap()
-            .unwrap();
+        let rendered = render_single_event(&db, "run-1", 2, Ok(None)).await;
         assert_eq!(db.live_connections(), 0);
-        let rendered = render_single_event(&db, stored).await;
 
         assert!(rendered.contains("**Tool Result (read):**"));
         assert!(rendered.contains("body"));
+        assert_eq!(
+            render_single_event(&db, "run-1", 9, Ok(None)).await,
+            "Event with sequence 9 not found"
+        );
+    }
+
+    /// The name lookup reads reconstructed bodies, so a tool result still finds
+    /// its tool's name after the assistant event that called it was archived.
+    #[tokio::test]
+    async fn a_tool_name_resolves_from_an_archived_assistant_event() {
+        let db = LocalDb::open_migrated_for_test(
+            tempfile::tempdir().unwrap().keep().join("tool-name.db"),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO runs (id, created_at, updated_at) VALUES ('run-1', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let body = serde_json::json!({
+            "toolUses": [{ "id": "toolu_1", "name": "read", "input": {} }]
+        })
+        .to_string();
+        db.execute(
+            "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at,
+                                 storage_mode, data_blob, codec)
+             VALUES ('event-1', 'run-1', 1, 1, 'assistant', '{\"_archived\":true}', 1,
+                     'zstd', ?1, 'zstd_v1')",
+            (crate::storage::compress(body.as_bytes()).unwrap(),),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
+             VALUES ('event-2', 'run-1', 2, 2, 'tool_result', ?1, 2)",
+            (serde_json::json!({ "toolUseId": "toolu_1", "toolResult": "body" }).to_string(),),
+        )
+        .await
+        .unwrap();
+
+        let rendered = render_single_event(&db, "run-1", 2, Ok(None)).await;
+        assert!(rendered.contains("**Tool Result (read):**"), "{rendered}");
     }
 
     fn digest_ev(seq: i32, turn: &str, kind: &str, data: serde_json::Value) -> EventRow {

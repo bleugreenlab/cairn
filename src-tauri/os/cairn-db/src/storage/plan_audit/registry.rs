@@ -195,6 +195,11 @@ pub const AUDITED_TRIGGERS: &[AuditedTrigger] = &[
         "check_deferred_tests",
         IMMUTABLE,
     ),
+    trigger(
+        "check_audit_findings_immutable",
+        "check_audit_findings",
+        IMMUTABLE,
+    ),
     trigger("execution_queue_immutable", "execution_queue", IMMUTABLE),
     trigger(
         "merge_attempt_events_immutable",

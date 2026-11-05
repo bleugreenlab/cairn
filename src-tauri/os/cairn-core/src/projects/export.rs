@@ -70,7 +70,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use cairn_db::turso::{Row, Value};
 use serde_json::{json, Map, Value as Json};
 
@@ -81,7 +80,9 @@ use super::migrate::{
     CHANNEL_KEY_ADDRESSED, COPY_ORDER,
 };
 use crate::models::Event;
-use crate::storage::events::columns::{event_from_row, EVENT_COLUMNS, EVENT_COLUMN_COUNT};
+use crate::storage::events::columns::event_from_row;
+use crate::storage::history_pack::encode::{event_columns_object, finish_event_object, json_value};
+use crate::storage::history_pack::write::event_column_order;
 use crate::storage::{
     reconstruct_events_reporting, DbError, LocalDb, Reconstruction, RowExt, TrackedConnection,
     RECONSTRUCT_BATCH_BYTES, RECONSTRUCT_BATCH_ROWS,
@@ -203,6 +204,14 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
     (
         "queue_lane_turns",
         "when each execution-queue lane last started work on this runner's queue; a lane spans projects (the shared lane spans every one), and a destination with no row simply serves the lane as never served",
+    ),
+    (
+        "history_tier",
+        "this machine's archive catalog: it names pack objects in the local file store; history travels as event rows",
+    ),
+    (
+        "history_tier_runs",
+        "this machine's archive catalog, by run: it names pack objects in the local file store; history travels as event rows",
     ),
     (
         "search_outbox",
@@ -592,18 +601,6 @@ fn is_timestamp_column(name: &str) -> bool {
         || name.contains("_at_")
         || name.ends_with("_ts")
         || name.starts_with("ts_")
-}
-
-fn json_value(value: &Value) -> Json {
-    match value {
-        Value::Null => Json::Null,
-        Value::Integer(n) => Json::from(*n),
-        Value::Real(n) => serde_json::Number::from_f64(*n)
-            .map(Json::Number)
-            .unwrap_or(Json::Null),
-        Value::Text(text) => Json::String(text.clone()),
-        Value::Blob(bytes) => Json::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1283,9 +1280,8 @@ fn or_terms(predicate: &str) -> Option<Vec<&str>> {
 /// Batches `events` rows through the transcript reader and writes each as its
 /// reconstructed content.
 struct EventWriter {
-    /// Every `events` column, in select order: the canonical [`EVENT_COLUMNS`]
-    /// projection first (so [`event_from_row`] parses the prefix), then any
-    /// column it does not name.
+    /// Every `events` column, in the order [`event_column_order`] gives, so
+    /// [`event_from_row`] parses the prefix.
     columns: Vec<String>,
     /// For each entry of `columns`, its index in the table's own column list,
     /// which is what the timestamp tallies are keyed by.
@@ -1296,16 +1292,7 @@ struct EventWriter {
 
 impl EventWriter {
     fn new(table_columns: &[Column]) -> Self {
-        let mut columns: Vec<String> = EVENT_COLUMNS
-            .split(',')
-            .map(|name| name.trim().to_string())
-            .collect();
-        debug_assert_eq!(columns.len(), EVENT_COLUMN_COUNT);
-        for column in table_columns {
-            if !columns.contains(&column.name) {
-                columns.push(column.name.clone());
-            }
-        }
+        let columns = event_column_order(table_columns.iter().map(|column| column.name.as_str()));
         let table_index = columns
             .iter()
             .map(|name| {
@@ -1339,18 +1326,15 @@ impl EventWriter {
         tallies: &mut [Option<TimestampTally>],
     ) -> Result<(Map<String, Json>, Event), String> {
         let event = event_from_row(row).map_err(|error| error.to_string())?;
-        let mut object = Map::with_capacity(self.columns.len() + 2);
-        for (index, name) in self.columns.iter().enumerate() {
+        let mut values = Vec::with_capacity(self.columns.len());
+        for index in 0..self.columns.len() {
             let value = row.get_value(index).map_err(|error| error.to_string())?;
             if let Some(Some(tally)) = tallies.get_mut(self.table_index[index]) {
                 tally.observe(&value);
             }
-            // `data` and `data_blob` are filled from the reader's output.
-            if name != "data" && name != "data_blob" {
-                object.insert(name.clone(), json_value(&value));
-            }
+            values.push(value);
         }
-        Ok((object, event))
+        Ok((event_columns_object(&self.columns, &values), event))
     }
 
     fn push(&mut self, (object, event): (Map<String, Json>, Event)) {
@@ -1380,46 +1364,11 @@ impl EventWriter {
             objects.into_iter().zip(stored).zip(reconstructed)
         {
             tally.record(outcome);
-            object.insert("data".to_string(), Json::String(event.data));
-            object.insert("data_blob".to_string(), Json::Null);
-            object.insert(
-                "reconstruction".to_string(),
-                Json::String(outcome_label(outcome).to_string()),
-            );
-            if outcome.is_unresolved() {
-                object.insert("unresolved".to_string(), Json::Bool(true));
-                object.insert("stored".to_string(), stored_form(&stored));
-            }
+            finish_event_object(&mut object, &stored, event.data, outcome);
             sink.push(&Json::Object(object)).await?;
         }
         Ok(count)
     }
-}
-
-fn outcome_label(outcome: Reconstruction) -> &'static str {
-    match outcome {
-        Reconstruction::Stored => "stored_plain",
-        Reconstruction::Restored => "restored",
-        Reconstruction::Degraded => "degraded",
-        Reconstruction::Undecodable => "undecodable",
-        Reconstruction::Withheld => "withheld",
-    }
-}
-
-/// The archival columns of an unresolved row exactly as stored, so whatever the
-/// reader could not resolve is still in the record for someone who can.
-fn stored_form(event: &Event) -> Json {
-    json!({
-        "storage_mode": event.storage_mode,
-        "content_commit": event.content_commit,
-        "content_render_sha": event.content_render_sha,
-        "codec": event.codec,
-        "data": event.data,
-        "data_blob": event
-            .data_blob
-            .as_ref()
-            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
-    })
 }
 
 #[cfg(all(test, feature = "test-utils"))]
@@ -1723,6 +1672,124 @@ mod tests {
         let issues = read_jsonl(&out.path().join("issues.jsonl"));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0]["id"], "issue-delete");
+    }
+
+    /// An `events` row is encoded by one function, so a pack's row is the
+    /// export's row byte for byte, with the pack's `rowid` beside it. Holds
+    /// across every outcome: stored, restored, degraded, undecodable, withheld.
+    #[tokio::test]
+    async fn an_event_row_is_the_same_bytes_in_the_export_and_in_a_pack() {
+        use crate::storage::history_pack::testing::seed_fixture_execution;
+        use crate::storage::history_pack::write::pack_execution;
+        use crate::storage::history_pack::{HistoryPack, Section};
+
+        let db = crate::storage::migrated_test_db("export-pack-parity.db").await;
+        let fixture = seed_fixture_execution(&db, "export-parity").await;
+        // Keep a restored row alongside its separately quarantined copy.
+        db.execute(
+            "INSERT INTO events(id, run_id, session_id, turn_id, sequence, timestamp,
+                                event_type, data, storage_mode, data_blob, codec, created_at)
+             SELECT 'export-parity-visible-restored', run_id, session_id, turn_id, 7, 14,
+                    event_type, data, storage_mode, data_blob, codec, 14
+             FROM events WHERE id = ?1",
+            vec![Value::Text(fixture.restored.clone())],
+        )
+        .await
+        .unwrap();
+        use crate::storage::quarantine::{quarantine, QuarantineSet, TRANSCRIPT_EVENT_SINK};
+        struct ClearQuarantine(std::path::PathBuf);
+        impl Drop for ClearQuarantine {
+            fn drop(&mut self) {
+                quarantine().install_for(&self.0, QuarantineSet::default());
+            }
+        }
+        let guard = ClearQuarantine("export-pack-parity-quarantine".into());
+        quarantine().install_for(
+            &guard.0,
+            QuarantineSet::from_entries([(
+                TRANSCRIPT_EVENT_SINK.to_string(),
+                fixture.restored.clone(),
+                "export-incident".to_string(),
+            )]),
+        );
+
+        let rowids = db
+            .query_all("SELECT rowid FROM events ORDER BY rowid", (), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap();
+        let plan = export_plan().unwrap();
+        let planned = plan.iter().find(|entry| entry.table == "events").unwrap();
+        let table = ResolvedTable {
+            planned,
+            label: "private",
+            columns: read_columns(&db, "events").await.unwrap(),
+            queries: vec![(
+                "run_id IN (SELECT id FROM runs WHERE project_id = ?1)".to_string(),
+                vec![Value::Text("p".to_string())],
+            )],
+            membership: Membership {
+                rows: rowids.iter().map(|rowid| (*rowid, 0)).collect(),
+                selected_at_ms: 0,
+                longest: Duration::ZERO,
+            },
+        };
+        let out = tempfile::tempdir().unwrap();
+        let mut hook = no_op_hook();
+        let mut paging = Paging {
+            rows: RECONSTRUCT_BATCH_ROWS,
+            after_page: &mut hook,
+        };
+        let mut tally = EventTally::default();
+        export_table(&db, &db, &table, out.path(), &mut tally, &mut paging)
+            .await
+            .unwrap();
+        assert_eq!(tally.rows, 9);
+        assert_eq!(tally.withheld, 1);
+        assert_eq!(tally.restored, 1);
+        assert_eq!(tally.degraded, 1);
+        assert_eq!(tally.undecodable, 1);
+
+        let exported = std::fs::read_to_string(out.path().join("events.jsonl")).unwrap();
+        let exported: HashMap<String, &str> = exported
+            .lines()
+            .map(|line| {
+                let row: Json = serde_json::from_str(line).unwrap();
+                (row["id"].as_str().unwrap().to_string(), line)
+            })
+            .collect();
+
+        let built = pack_execution(&db, "exec-1").await.unwrap();
+        let pack = HistoryPack::open(built.bytes).unwrap();
+        let mut compared = 0;
+        for run in ["run-1", "run-2"] {
+            for row in pack.rows(Section::Events, run) {
+                let mut row = row.unwrap();
+                assert!(row.remove("rowid").is_some());
+                let id = row["id"].as_str().unwrap().to_string();
+                assert_eq!(
+                    serde_json::to_string(&row).unwrap(),
+                    exported[&id],
+                    "{id} differs between the pack and the export"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 9);
+        assert!(exported.contains_key(&fixture.undecodable));
+        let withheld: Json = serde_json::from_str(exported[&fixture.restored]).unwrap();
+        assert_eq!(withheld["reconstruction"], "withheld");
+        assert!(withheld["data_blob"].is_null());
+        assert!(withheld.get("stored").is_none());
+        assert!(!withheld["data"]
+            .as_str()
+            .unwrap()
+            .contains("the restored body"));
+        assert!(withheld["data"]
+            .as_str()
+            .unwrap()
+            .contains("export-incident"));
     }
 
     /// The point of paging: between any two pages the export holds no

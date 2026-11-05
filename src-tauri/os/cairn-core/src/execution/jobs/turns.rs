@@ -53,6 +53,69 @@ mod codex_goal_admission_tests {
         .unwrap()
     }
 
+    #[test]
+    fn a_rejection_names_every_identity_field_that_disagrees_and_only_those() {
+        let launch = ["s", "j", "r"];
+        for (stored, expected) in [
+            ([Some("s"), Some("j"), Some("r")], None),
+            (
+                [Some("other"), Some("j"), Some("r")],
+                Some("session disagrees (turn: other, launch: s)"),
+            ),
+            (
+                [Some("s"), Some("other"), Some("r")],
+                Some("job disagrees (turn: other, launch: j)"),
+            ),
+            (
+                [Some("s"), Some("j"), Some("other")],
+                Some("run disagrees (turn: other, launch: r)"),
+            ),
+            (
+                [Some("s"), Some("j"), None],
+                Some("run disagrees (turn: none, launch: r)"),
+            ),
+            (
+                [Some("a"), None, Some("b")],
+                Some(
+                    "session disagrees (turn: a, launch: s); job disagrees (turn: none, launch: j); run disagrees (turn: b, launch: r)",
+                ),
+            ),
+        ] {
+            assert_eq!(
+                launch_identity_disagreements("turn", stored, launch).as_deref(),
+                expected,
+                "{stored:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replaying_a_provider_turn_against_another_run_names_the_marker_field() {
+        let db = seeded_db().await;
+        let orch = test_orchestrator(db.clone());
+        admit_codex_goal_turn(&orch, db.clone(), "r", "s", "j", "provider", Some("t0")).unwrap();
+
+        let error = admit_codex_goal_turn(
+            &orch,
+            db.clone(),
+            "another-run",
+            "s",
+            "j",
+            "provider",
+            Some("t0"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("provider turn provider is already bound")
+                && error.contains("through turn t0")
+                && error.contains("run disagrees (marker: r, launch: another-run)"),
+            "{error}"
+        );
+        assert!(!error.contains("session disagrees"), "{error}");
+        assert!(!error.contains("job disagrees"), "{error}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn provider_turn_started_admits_the_active_launch_turn() {
         let db = seeded_db().await;
@@ -224,7 +287,7 @@ pub(crate) const TURN_AWAITS_LAUNCH_SQL: &str =
 /// waits in admission queues as steering instead of launching the same turn
 /// again. The reservation already is the start, so a reserved turn only
 /// follows its prompt to `run_id`.
-pub(crate) fn start_prepared_turn(
+fn start_prepared_turn(
     orch: &Orchestrator,
     turn_id: &str,
     launch_run_id: &str,
@@ -1290,6 +1353,51 @@ pub(crate) fn create_followup_turn(
     Ok(turn_id)
 }
 
+/// Start a prepared launch's turn on `run_id`, then publish it as that process's
+/// current turn.
+///
+/// The order is the constraint: Codex's reader admits the provider's first
+/// `TurnStarted` against the published turn and accepts only a turn already
+/// running on its run, so a turn published first crashes a healthy launch. The
+/// caller holds the job launch lock, which the reader takes before it reads the
+/// published turn, so the reader sees neither half of this alone.
+pub(super) fn start_prepared_turn_and_publish(
+    orch: &Orchestrator,
+    turn_id: &str,
+    launch_run_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    start_prepared_turn(orch, turn_id, launch_run_id, run_id)?;
+    orch.process_state
+        .set_current_turn_id(run_id, Some(turn_id));
+    Ok(())
+}
+
+/// Every identity field on which a stored `record` disagrees with the active
+/// launch, as a rejection reports it, or `None` when all agree. Both sides are
+/// `[session, job, run]`. A rejection outlives the process that raised it, and
+/// these ids are all it has to name the field; they carry no prompt text or
+/// credentials.
+fn launch_identity_disagreements(
+    record: &str,
+    stored: [Option<&str>; 3],
+    launch: [&str; 3],
+) -> Option<String> {
+    let disagreements: Vec<String> = ["session", "job", "run"]
+        .into_iter()
+        .zip(stored)
+        .zip(launch)
+        .filter(|((_, stored), launch)| *stored != Some(*launch))
+        .map(|((field, stored), launch)| {
+            format!(
+                "{field} disagrees ({record}: {}, launch: {launch})",
+                stored.unwrap_or("none")
+            )
+        })
+        .collect();
+    (!disagreements.is_empty()).then(|| disagreements.join("; "))
+}
+
 /// Durably bind one provider-created Codex turn to exactly one Cairn turn.
 /// The event marker and successor start share a transaction, so notification
 /// replay after a host restart returns the original turn instead of minting one.
@@ -1338,13 +1446,21 @@ pub(crate) fn admit_codex_goal_turn(
                         let turn_id = row
                             .opt_text(0)?
                             .ok_or_else(|| db_internal("Codex goal turn marker has no Cairn turn"))?;
-                        if row.text(1)? != run_id
-                            || row.opt_text(2)?.as_deref() != Some(session_id.as_str())
-                            || row.opt_text(3)?.as_deref() != Some(job_id.as_str())
-                        {
-                            return Err(db_internal(
-                                "Codex provider turn identity is already bound to another Cairn run",
-                            ));
+                        let marker_run = row.text(1)?;
+                        let marker_session = row.opt_text(2)?;
+                        let marker_job = row.opt_text(3)?;
+                        if let Some(disagreements) = launch_identity_disagreements(
+                            "marker",
+                            [
+                                marker_session.as_deref(),
+                                marker_job.as_deref(),
+                                Some(marker_run.as_str()),
+                            ],
+                            [session_id.as_str(), job_id.as_str(), run_id.as_str()],
+                        ) {
+                            return Err(db_internal(format!(
+                                "Codex provider turn {provider_turn_id} is already bound to another Cairn run through turn {turn_id}: {disagreements}"
+                            )));
                         }
                         return Ok(CodexGoalTurnAdmission::Admitted(turn_id));
                     }
@@ -1359,14 +1475,24 @@ pub(crate) fn admit_codex_goal_turn(
                         let row = rows
                             .next()
                             .await?
-                            .ok_or_else(|| db_internal("active Cairn turn not found"))?;
-                        if row.text(0)? != session_id
-                            || row.opt_text(1)?.as_deref() != Some(job_id.as_str())
-                            || row.opt_text(2)?.as_deref() != Some(run_id.as_str())
-                        {
-                            return Err(db_internal(
-                                "Codex provider turn conflicts with active Cairn turn",
-                            ));
+                            .ok_or_else(|| {
+                                db_internal(format!("active Cairn turn {current_turn_id} not found"))
+                            })?;
+                        let turn_session = row.text(0)?;
+                        let turn_job = row.opt_text(1)?;
+                        let turn_run = row.opt_text(2)?;
+                        if let Some(disagreements) = launch_identity_disagreements(
+                            "turn",
+                            [
+                                Some(turn_session.as_str()),
+                                turn_job.as_deref(),
+                                turn_run.as_deref(),
+                            ],
+                            [session_id.as_str(), job_id.as_str(), run_id.as_str()],
+                        ) {
+                            return Err(db_internal(format!(
+                                "Codex provider turn conflicts with active Cairn turn {current_turn_id}: {disagreements}"
+                            )));
                         }
                         let state = row.text(3)?;
                         if state != "running" {
@@ -1410,9 +1536,9 @@ pub(crate) fn admit_codex_goal_turn(
                                 .await?;
                                 new_turn_id
                             } else {
-                                return Err(db_internal(
-                                    "Codex provider turn conflicts with active Cairn turn",
-                                ));
+                                return Err(db_internal(format!(
+                                    "Codex provider turn conflicts with active Cairn turn {current_turn_id}: turn is {state}, neither running nor terminal"
+                                )));
                             }
                         } else {
                             current_turn_id

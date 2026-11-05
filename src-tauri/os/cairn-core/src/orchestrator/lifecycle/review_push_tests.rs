@@ -124,6 +124,7 @@ fn waited_on_lanes(
                 declared_unverified: None,
                 progress: None,
                 base_attribution: None,
+                plan_audit_note: None,
             },
         )
         .collect();

@@ -52,6 +52,9 @@ pub const TRANSCRIPT_EVENT_SINK: &str = "transcript_event";
 /// content hash.
 pub const ARCHIVAL_BLOB_SINK: &str = "archival_blob";
 
+/// The sink key of an event's copy inside a history pack, located by event id.
+pub const HISTORY_PACK_SINK: &str = "history_pack";
+
 /// What a reader sees in place of a withheld record.
 ///
 /// Deliberately shaped like the archival reconstruction stub next door: a
@@ -362,20 +365,48 @@ pub fn withhold_quarantined(events: &mut [crate::models::Event]) {
 /// Both answers come from one snapshot of the set, so a caller that labels what
 /// it was handed can never label an event the substitution skipped.
 pub fn withhold_quarantined_reporting(events: &mut [crate::models::Event]) -> Vec<Option<String>> {
+    withhold_reporting_under(events, &[TRANSCRIPT_EVENT_SINK])
+}
+
+/// [`withhold_quarantined_reporting`] for events served from a history pack:
+/// withheld when quarantined as a transcript event or as a pack record. A
+/// pack holds its own copy of each event, and the inventory reports that copy
+/// under [`HISTORY_PACK_SINK`], so a quarantine recorded against either copy
+/// must withhold the read. Gating a row already stored as its withholding
+/// notice is idempotent: the notice rebuilds to itself.
+pub fn withhold_pack_rows_reporting(events: &mut [crate::models::Event]) -> Vec<Option<String>> {
+    withhold_reporting_under(events, &[TRANSCRIPT_EVENT_SINK, HISTORY_PACK_SINK])
+}
+
+fn withhold_reporting_under(
+    events: &mut [crate::models::Event],
+    sinks: &[&str],
+) -> Vec<Option<String>> {
     let mut withheld = vec![None; events.len()];
-    withhold_each(events, |index, incident| {
+    withhold_each_under(events, sinks, |index, incident| {
         withheld[index] = Some(incident.to_string())
     });
     withheld
 }
 
-fn withhold_each(events: &mut [crate::models::Event], mut on_withheld: impl FnMut(usize, &str)) {
+fn withhold_each(events: &mut [crate::models::Event], on_withheld: impl FnMut(usize, &str)) {
+    withhold_each_under(events, &[TRANSCRIPT_EVENT_SINK], on_withheld)
+}
+
+fn withhold_each_under(
+    events: &mut [crate::models::Event],
+    sinks: &[&str],
+    mut on_withheld: impl FnMut(usize, &str),
+) {
     let set = quarantine().snapshot();
     if set.is_empty() {
         return;
     }
     for (index, event) in events.iter_mut().enumerate() {
-        let Some(incident) = set.withheld_by(TRANSCRIPT_EVENT_SINK, &event.id) else {
+        let Some(incident) = sinks
+            .iter()
+            .find_map(|sink| set.withheld_by(sink, &event.id))
+        else {
             continue;
         };
         event.data = withheld_event_data(&event.data, incident);

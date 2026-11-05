@@ -1,4 +1,5 @@
 use crate::models::JobStatus;
+use crate::storage::events::history::{EventFilter, HistoryError, HistoryReader};
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::protocol::CallbackResponse;
 
@@ -108,7 +109,11 @@ pub(super) enum TaskResult {
 
 /// Read a delegated child's result. `artifact_name` is the artifact its
 /// contract owes; a child that never had a run reads from its job alone.
-pub(super) async fn task_result(db: &LocalDb, job_id: &str, artifact_name: &str) -> TaskResult {
+pub(super) async fn task_result(
+    db: &LocalDb,
+    job_id: &str,
+    artifact_name: &str,
+) -> Result<TaskResult, HistoryError> {
     let (job_status, abandoned) = db
         .query_opt(
             "SELECT status, return_abandoned_at IS NOT NULL FROM jobs WHERE id = ?1",
@@ -141,18 +146,18 @@ pub(super) async fn task_result(db: &LocalDb, job_id: &str, artifact_name: &str)
     let last_message = || async {
         match run_id.as_deref() {
             Some(run_id) => latest_nonempty_assistant_content(db, run_id).await,
-            None => None,
+            None => Ok(None),
         }
     };
 
-    match (outcome, artifact) {
+    Ok(match (outcome, artifact) {
         (TaskOutcome::Succeeded, Some(content)) => TaskResult::Returned { content },
         (TaskOutcome::Succeeded, None) => TaskResult::EndedWithoutReturn {
-            last_message: last_message().await,
+            last_message: last_message().await?,
             asked: false,
         },
         (TaskOutcome::Failed, None) if abandoned => TaskResult::EndedWithoutReturn {
-            last_message: last_message().await,
+            last_message: last_message().await?,
             asked: true,
         },
         (TaskOutcome::Failed, partial) => TaskResult::Failed { partial },
@@ -162,7 +167,7 @@ pub(super) async fn task_result(db: &LocalDb, job_id: &str, artifact_name: &str)
             run_status,
             partial,
         },
-    }
+    })
 }
 
 /// The text a parent receives for one delegated child. `title` is the task's
@@ -231,7 +236,15 @@ pub(super) async fn build_task_callback_response(
     title: &str,
     artifact_name: &str,
 ) -> CallbackResponse {
-    let result = task_result(db, job_id, artifact_name).await;
+    let result = match task_result(db, job_id, artifact_name).await {
+        Ok(result) => result,
+        Err(error) => {
+            return CallbackResponse {
+                result: format!("Cannot read result for task '{title}': {error}"),
+                ..Default::default()
+            };
+        }
+    };
     let home = crate::jobs::queries::home_uri_for_job(db, job_id)
         .await
         .ok()
@@ -348,35 +361,23 @@ async fn latest_nonempty_artifact_content(
     })
 }
 
-async fn latest_nonempty_assistant_content(db: &LocalDb, run_id: &str) -> Option<String> {
-    let run_id = run_id.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "
-                    SELECT data FROM events
-                    WHERE run_id = ?1 AND event_type = 'assistant'
-                    ORDER BY sequence DESC
-                    LIMIT 20
-                    ",
-                    (run_id.as_str(),),
-                )
-                .await?;
-            let mut data = Vec::new();
-            while let Some(row) = rows.next().await? {
-                data.push(row.text(0)?);
-            }
-            Ok(data)
-        })
-    })
-    .await
-    .ok()
-    .and_then(|rows| {
-        rows.into_iter()
-            .filter_map(|data_json| parse_nonempty_assistant_content(&data_json))
-            .next()
-    })
+async fn latest_nonempty_assistant_content(
+    db: &LocalDb,
+    run_id: &str,
+) -> Result<Option<String>, HistoryError> {
+    let page = HistoryReader::new(db)
+        .run_events_window(
+            run_id,
+            i64::MAX,
+            i64::MIN,
+            20,
+            EventFilter::types(&["assistant"]),
+        )
+        .await?;
+    Ok(page
+        .rows
+        .into_iter()
+        .find_map(|row| parse_nonempty_assistant_content(&row.event.data)))
 }
 
 #[cfg(test)]
@@ -442,7 +443,10 @@ mod outcome_tests {
 
 #[cfg(test)]
 mod callback_response_tests {
-    use super::{build_task_callback_response, render_task_result, task_result, TaskResult};
+    use super::{
+        build_task_callback_response, latest_nonempty_assistant_content, render_task_result,
+        task_result, TaskResult,
+    };
     use crate::storage::LocalDb;
 
     const TASK_URI: &str = "cairn://p/cairn/7/1/builder/task/probe";
@@ -580,7 +584,7 @@ mod callback_response_tests {
             .unwrap();
         say(&db, "Let me check X").await;
         assert_eq!(
-            task_result(&db, "j-task", "return").await,
+            task_result(&db, "j-task", "return").await.unwrap(),
             TaskResult::EndedWithoutReturn {
                 last_message: Some("Let me check X".to_string()),
                 asked: false,
@@ -621,6 +625,231 @@ mod callback_response_tests {
             response.artifact_uri.as_deref(),
             Some("cairn://p/cairn/7/1/builder/task/probe/artifact")
         );
+    }
+
+    async fn fallback_child() -> LocalDb {
+        let db = warm_completed_child().await;
+        db.execute_script(
+            "DELETE FROM artifacts WHERE job_id = 'j-task';
+             INSERT INTO executions(id, recipe_id, project_id, issue_id, status, started_at)
+               VALUES ('exec-task', 'recipe', 'p1', 'i1', 'complete', 1);
+             UPDATE jobs SET execution_id = 'exec-task' WHERE id = 'j-task';",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn delegated_last_assistant_keeps_main_one_statement_one_checkout() {
+        use crate::storage::history_pack::testing::publish_for_test;
+        let db = fallback_child().await;
+        say(&db, "last assistant").await;
+        for cataloged in [false, true] {
+            if cataloged {
+                publish_for_test(&db, "exec-task").await;
+            }
+            let before = (db.read_statement_count(), db.read_checkout_count());
+            assert_eq!(
+                latest_nonempty_assistant_content(&db, "r-task")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("last assistant")
+            );
+            assert_eq!(
+                (
+                    db.read_statement_count() - before.0,
+                    db.read_checkout_count() - before.1
+                ),
+                (1, 1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_keeps_only_the_last_twenty_assistant_rows_across_sources() {
+        use crate::storage::events::{compress, CODEC_ZSTD_V1};
+        use crate::storage::history_pack::testing::{evict_all, publish_for_test, read_both};
+
+        for boundary in [Some("the twentieth assistant"), None] {
+            let db = fallback_child().await;
+            for sequence in 1..=52 {
+                let event_type = if sequence <= 21 {
+                    "assistant"
+                } else {
+                    "system:status"
+                };
+                let content = match sequence {
+                    1 => "outside the window",
+                    2 => boundary.unwrap_or(" "),
+                    3..=21 => " ",
+                    _ => "not an assistant",
+                };
+                let body = serde_json::json!({
+                    "eventType": event_type, "content": content, "isError": false
+                })
+                .to_string();
+                let (data, blob, storage_mode, codec) = if sequence == 2 {
+                    (
+                        "{\"_archived\":true}".to_string(),
+                        Some(compress(body.as_bytes()).unwrap()),
+                        Some("zstd"),
+                        Some(CODEC_ZSTD_V1),
+                    )
+                } else {
+                    (
+                        if sequence == 21 {
+                            // The event index requires JSON, but the transcript parser
+                            // rejects a non-string content field.
+                            serde_json::json!({"eventType": "assistant", "content": 42, "isError": false})
+                                .to_string()
+                        } else {
+                            body
+                        },
+                        None,
+                        None,
+                        None,
+                    )
+                };
+                db.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data,
+                                        created_at, storage_mode, data_blob, codec)
+                     VALUES (?1, 'r-task', ?2, ?3, ?4, ?5, ?3, ?6, ?7, ?8)",
+                    cairn_db::turso::params![
+                        format!("window-{sequence}"),
+                        sequence,
+                        100 - sequence,
+                        event_type,
+                        data,
+                        storage_mode,
+                        blob,
+                        codec
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            publish_for_test(&db, "exec-task").await;
+            let (hot, pack) = read_both(&db, || async {
+                task_result(&db, "j-task", "return").await.unwrap()
+            })
+            .await;
+            let expected = TaskResult::EndedWithoutReturn {
+                last_message: boundary.map(str::to_string),
+                asked: false,
+            };
+            assert_eq!(hot, expected);
+            assert_eq!(pack, expected);
+            evict_all(&db).await;
+            assert_eq!(
+                task_result(&db, "j-task", "return").await.unwrap(),
+                expected
+            );
+        }
+    }
+
+    struct Quarantined(std::path::PathBuf);
+
+    impl Drop for Quarantined {
+        fn drop(&mut self) {
+            crate::storage::quarantine::quarantine().install_for(
+                &self.0,
+                crate::storage::quarantine::QuarantineSet::default(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_regates_quarantine_after_packing() {
+        use crate::storage::history_pack::testing::{publish_for_test, read_both};
+        use crate::storage::quarantine::{
+            quarantine, QuarantineSet, TRANSCRIPT_EVENT_SINK, WITHHELD_PREFIX,
+        };
+
+        let db = fallback_child().await;
+        say(&db, "must not escape").await;
+        let event_id = format!("{}-said", db.path().display());
+        db.execute(
+            "UPDATE events SET id = ?1 WHERE id = 'said'",
+            (event_id.clone(),),
+        )
+        .await
+        .unwrap();
+        publish_for_test(&db, "exec-task").await;
+        let source = db.path().with_extension("quarantine-test");
+        quarantine().install_for(
+            &source,
+            QuarantineSet::from_entries([(
+                TRANSCRIPT_EVENT_SINK.to_string(),
+                event_id,
+                "delegated-fallback".to_string(),
+            )]),
+        );
+        let _guard = Quarantined(source);
+        let (hot, pack) = read_both(&db, || async {
+            task_result(&db, "j-task", "return").await.unwrap()
+        })
+        .await;
+        assert_eq!(hot, pack);
+        let TaskResult::EndedWithoutReturn {
+            last_message: Some(message),
+            ..
+        } = pack
+        else {
+            panic!("expected the withheld last-message notice");
+        };
+        assert!(message.contains(WITHHELD_PREFIX), "{message}");
+        assert!(!message.contains("must not escape"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn fallback_archive_errors_are_not_empty_task_results() {
+        use crate::storage::events::history::{HistoryError, HistorySource};
+        use crate::storage::history_pack::testing::publish_for_test;
+
+        let db = fallback_child().await;
+        say(&db, "hot content must not mask an unavailable pack").await;
+        publish_for_test(&db, "exec-task").await;
+        db.set_history_source_override(Some(HistorySource::Pack));
+        // A lost file is an offline local archive, not a reason to read hot.
+        db.execute(
+            "UPDATE history_tier SET content_hash = ?1 WHERE execution_id = 'exec-task'",
+            ("0".repeat(64),),
+        )
+        .await
+        .unwrap();
+        let error = task_result(&db, "j-task", "return").await.unwrap_err();
+        assert!(matches!(error, HistoryError::Offline { .. }), "{error}");
+        let response = respond(&db).await;
+        assert!(
+            response.result.starts_with("Cannot read result for task"),
+            "{}",
+            response.result
+        );
+        assert!(
+            response.result.contains("archive offline"),
+            "{}",
+            response.result
+        );
+        assert!(
+            !response.result.contains("last message"),
+            "{}",
+            response.result
+        );
+        assert!(
+            !response.result.contains("hot content"),
+            "{}",
+            response.result
+        );
+        assert!(response.artifact_uri.is_none());
+
+        let root = db.path().with_extension("archive");
+        std::fs::rename(&root, root.with_extension("unplugged")).unwrap();
+        assert!(matches!(
+            task_result(&db, "j-task", "return").await.unwrap_err(),
+            HistoryError::Offline { .. }
+        ));
     }
 
     /// A child that said nothing is named as having said nothing.

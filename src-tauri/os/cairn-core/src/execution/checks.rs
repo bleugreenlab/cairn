@@ -6429,8 +6429,14 @@ fn classify_check_failure(
     // corruption produced, and the scans below must still see that output so
     // the uncached retry fires. A lint result only adds names to a red; it never
     // decides how the red is classified.
+    //
+    // So is the plan audit's own red on a clean run: a named finding, not a
+    // runner that failed outside any test.
     if parsed.is_some_and(|result| {
-        result.parser != RUST_LINT_PARSER && (result.failed > 0 || result.suite_failures > 0)
+        result.parser != RUST_LINT_PARSER
+            && (result.failed > 0
+                || result.suite_failures > 0
+                || result.exit_is_plan_audits(exit_code))
     }) {
         return None;
     }
@@ -9604,6 +9610,16 @@ fn check_reuse_decision(
     if parsed.undeclared_skips > 0 {
         return reject("test result contains undeclared skips");
     }
+    // A whole suite always explains statements, so its unjudged audit is a
+    // breakdown worth a fresh run. A narrower selection can honestly reach no
+    // statement at all, and reusing it repeats that row's own "not evaluated".
+    if parsed
+        .plan_audit
+        .as_ref()
+        .is_some_and(|audit| !audit.evaluated() && audit.selection == "full")
+    {
+        return reject("the plan audit did not evaluate this whole-suite run");
+    }
     if parsed
         .tests
         .iter()
@@ -9736,6 +9752,7 @@ fn fresh_observation_write(
 ) -> FreshCheckObservationWrite {
     let provenance = observed_on.attestation();
     let coordinator_ran = observed_on.is_coordinator();
+    let plan_audit = parsed.and_then(|result| result.plan_audit.as_ref());
     let tests = parsed
         .map(|result| {
             result
@@ -9854,6 +9871,27 @@ fn fresh_observation_write(
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
         selection: parsed.map(|result| result.selection.clone()),
         deferred_count: parsed.map(|result| result.deferred as i64).unwrap_or(0),
+        plan_audit_state: plan_audit.map(|audit| audit.state.clone()),
+        plan_audit_note: plan_audit.and_then(|audit| audit.note.clone()),
+        audit_findings: plan_audit
+            .map(|audit| {
+                audit
+                    .rows
+                    .iter()
+                    .map(|row| crate::execution::cache::CheckAuditFindingRow {
+                        finding_id: row.id.clone(),
+                        status: row.status.clone(),
+                        rule: row.rule.clone(),
+                        table_name: row.table.clone(),
+                        file: row.file.clone(),
+                        statement: row.statement.clone(),
+                        issue: row.issue.clone(),
+                        known_shape: row.known_shape.clone(),
+                        excerpt: row.excerpt.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         phases: parsed.and_then(|result| result.phases.clone()),
         execution_warmth: provenance
             .and_then(|meta| meta.warmth)
@@ -11777,7 +11815,17 @@ fn summary_annotation(o: &CheckOutcome) -> Option<String> {
                 // as "0 of 882 failed" — a red check pointing at nothing. Count
                 // each separately.
                 let mut segments = Vec::new();
-                if p.failed > 0 || (p.suite_failures == 0 && p.undeclared_skips == 0) {
+                // The audit leads a red it is the whole of, ahead of a test
+                // tally that passed.
+                let audit = p.plan_audit_gating();
+                if audit > 0 {
+                    segments.push(format!("plan audit: {audit} gating"));
+                    if p.failed == 0 {
+                        segments.push(format!("all {} passed", p.tests_run()));
+                    }
+                }
+                if p.failed > 0 || (p.suite_failures == 0 && p.undeclared_skips == 0 && audit == 0)
+                {
                     segments.push(format!("{} of {} failed", p.failed, p.tests_run()));
                 }
                 if p.undeclared_skips > 0 {
@@ -11885,13 +11933,14 @@ fn attributed_failures(
     attribution: &crate::execution::checks_base::BaseAttribution,
 ) -> Option<String> {
     let parsed = o.parsed.as_ref()?;
+    let names: Vec<String> = parsed.failures.iter().map(|f| f.name.clone()).collect();
     let tally = crate::execution::checks_status::failed_annotation(
         None,
         Some(o.duration_ms),
         Some(parsed.passed),
         Some(parsed.failed),
         Some(parsed.suite_failures),
-        &[],
+        &names,
     )?;
     let mut out = format!("{tally}; {}", attribution.charge_clause());
     for line in attribution.bucket_lines() {
@@ -17252,6 +17301,7 @@ cairn-common = { path = "../cairn-common" }
                 })
                 .collect(),
             lint_findings: None,
+            plan_audit: None,
         }
     }
 
@@ -17532,6 +17582,116 @@ cairn-common = { path = "../cairn-common" }
             s.starts_with("\u{2717} rust-tests (236 undeclared skips, exit 1)"),
             "got: {s}"
         );
+    }
+
+    fn audit_block(
+        state: &str,
+        selection: &str,
+        gating: usize,
+    ) -> crate::execution::check_parsers::ParsedPlanAudit {
+        let rows: Vec<_> = (0..gating)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("a.rs|wide-scan|events|{index}"), "status": "failed",
+                    "file": "a.rs", "rule": "wide-scan", "table": "events",
+                    "statement": index.to_string(), "lines": [1], "columns": [],
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "state": state, "selection": selection, "explained": 3, "rows": rows,
+        }))
+        .unwrap()
+    }
+
+    /// A runner that exits 1 for its audit on a tree whose tests all passed has
+    /// named its red, so it is no "runner failed outside any test". Any other
+    /// exit stays the runner's own, however many findings sit beside it.
+    #[test]
+    fn a_gating_audit_on_a_green_run_is_an_ordinary_named_failure() {
+        use crate::execution::check_parsers::PLAN_AUDIT_EXIT_CODE;
+        let mut parse = runner_parse("nextest", 4800, 0);
+        parse.plan_audit = Some(audit_block("evaluated", "full", 2));
+        assert!(classify_check_failure(
+            "bun run test:rust:full",
+            Some(PLAN_AUDIT_EXIT_CODE),
+            false,
+            false,
+            Some(&parse),
+            "",
+        )
+        .is_none());
+        assert!(parse.exit_is_plan_audits(Some(PLAN_AUDIT_EXIT_CODE)));
+        assert!(!parse.exit_is_plan_audits(Some(101)));
+
+        let o = parsed_outcome("rust-tests", false, Some(1), parse, false);
+        let s = format_check_summary(&[o], &HashMap::new());
+        assert!(
+            s.starts_with("\u{2717} rust-tests (plan audit: 2 gating, all 4800 passed, exit 1)"),
+            "got: {s}"
+        );
+    }
+
+    /// A write wave's attributed detail line counts the audit too, not only the
+    /// tests: a tally read without the failure names leaves an all-passed lane
+    /// with nothing to say before its charge clause.
+    #[test]
+    fn an_attributed_summary_leads_with_a_gating_audit() {
+        use crate::execution::check_parsers::CheckFailure;
+        use crate::execution::checks_base::partition;
+
+        const FINDING: &str = "plan-audit a.rs|wide-scan|events|0";
+        let summary = |passed, tests: &[&str]| {
+            let mut parse = runner_parse("nextest", passed, tests.len());
+            parse.plan_audit = Some(audit_block("evaluated", "full", 1));
+            parse.failures = tests
+                .iter()
+                .chain([&FINDING])
+                .map(|name| CheckFailure {
+                    name: name.to_string(),
+                    message: None,
+                })
+                .collect();
+            let names: Vec<String> = parse.failures.iter().map(|f| f.name.clone()).collect();
+            let attributions = HashMap::from([(
+                "rust-tests".to_string(),
+                partition("4a52d52e0000", &names, None),
+            )]);
+            let o = parsed_outcome("rust-tests", false, Some(1), parse, false);
+            format_check_summary(&[o], &attributions)
+        };
+
+        let clean = summary(4800, &[]);
+        assert!(
+            clean.contains("\u{2014} plan audit: 1 gating, all 4800 passed; "),
+            "{clean}"
+        );
+        assert!(!clean.contains("\u{2014} ;"), "{clean}");
+
+        let beside_tests = summary(38, &["t0", "t1"]);
+        assert!(
+            beside_tests.contains("\u{2014} plan audit: 1 gating, 2 of 40 failed; "),
+            "{beside_tests}"
+        );
+    }
+
+    /// A whole suite always explains statements, so its unjudged audit is worth
+    /// a fresh run. A narrower selection can honestly reach none.
+    #[test]
+    fn only_a_whole_suites_unjudged_audit_refuses_reuse() {
+        let result = |state: &str, selection: &str| {
+            let mut parse = runner_parse("nextest", 10, 0);
+            parse.complete = true;
+            parse.selection = selection.to_string();
+            parse.plan_audit = Some(audit_block(state, selection, 0));
+            parse
+        };
+        let reusable = |parse: &ParsedCheckResult| {
+            check_reuse_decision("bun run test:rust:full", None, Some(parse)).reusable
+        };
+        assert!(!reusable(&result("not-evaluated", "full")));
+        assert!(reusable(&result("not-evaluated", "filtered")));
+        assert!(reusable(&result("evaluated", "full")));
     }
 
     #[test]
@@ -20922,6 +21082,9 @@ cairn-common = { path = "../cairn-common" }
             substrate_shape: None,
             selection: None,
             deferred_count: 0,
+            plan_audit_state: None,
+            plan_audit_note: None,
+            audit_findings: Vec::new(),
             phases: None,
             execution_warmth: None,
             cell_origin: None,
@@ -24296,6 +24459,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             failures: Vec::new(),
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         }
     }
 
@@ -25279,6 +25443,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             failures: Vec::new(),
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         }
     }
 
@@ -25593,6 +25758,7 @@ mod executor_base_content_tests {
                 tree,
                 baseline: None,
             }),
+            plan_audit: None,
         };
         let command = "bun run check:lint";
         assert!(check_reuse_decision(command, None, Some(&eslint(Some(Vec::new())))).reusable);

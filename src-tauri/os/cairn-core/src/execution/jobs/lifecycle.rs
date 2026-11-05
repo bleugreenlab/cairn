@@ -46,9 +46,7 @@ pub(super) fn deliver_prepared_warm_continuation(
 ) -> Result<(), String> {
     let turn_id = launch.turn_id.as_str();
     orch.process_state.transition_to_active(run_id);
-    super::start_prepared_turn(orch, turn_id, &launch.run_id, run_id)?;
-    orch.process_state
-        .set_current_turn_id(run_id, Some(turn_id));
+    super::start_prepared_turn_and_publish(orch, turn_id, &launch.run_id, run_id)?;
 
     let project_key = run_db({
         let db = owning_db.clone();
@@ -1383,19 +1381,36 @@ pub(crate) fn import_project_store_locked(
     crate::jj::ensure_project_store(jj, store, repo_path)
 }
 
+/// The run that already owns `job_id`'s launch: its latest run is non-terminal and
+/// the job has an active turn, so a second initial turn could only be refused. A
+/// live run alone is not enough, because a warm process stays `live` with no
+/// active turn between turns, and a start against it still owes one.
+fn run_owning_launch(db: &Arc<LocalDb>, job_id: &str) -> Result<Option<String>, String> {
+    let live_run = run_db({
+        let db = db.clone();
+        let job_id = job_id.to_string();
+        async move { super::live_run_for_job(&db, &job_id).await }
+    })?;
+    let Some(run_id) = live_run else {
+        return Ok(None);
+    };
+    Ok(load_active_turn_for_continue(db.clone(), job_id.to_string())?.map(|_| run_id))
+}
+
 /// Prepare a job for execution: resolve its durable branch coordinate, create the
 /// run record and scratch residence, and store the initial user event. Returns a
 /// [`PreparedJob`] with everything the host layer needs to
-/// call `start_agent_session`.
+/// call `start_agent_session`, or says another launch already owns the job.
 ///
 /// The job status must already be set to `"running"` by the caller before this is
 /// invoked (Tauri does this synchronously so the UI sees the change immediately).
-pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, String> {
+pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, String> {
     // The cold-start funnel inserts a run exactly the way the resume funnel does,
-    // so it takes the same per-job launch lock (CAIRN-3283). Admission control
-    // for a cold start is the durable compare-and-set claim on `jobs.status` in
-    // the transport's `start_job_background`; this lock is what keeps that claim
-    // from interleaving with a concurrent resume of the same job.
+    // so it takes the same per-job launch lock (CAIRN-3283). The transport's
+    // compare-and-set on `jobs.status` admits only starts of a job not yet running;
+    // advancement dispatches a job already running, so a duplicate can arrive here
+    // past it. This lock and the recheck below keep a cold start from interleaving
+    // with a second start or a concurrent resume of the same job.
     let launch_lock = orch.job_launch_lock(job_id);
     let _launch_guard = launch_lock
         .lock()
@@ -1414,6 +1429,13 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         }
     })?
     .clone();
+    // A start can pass the transport's duplicate check while the launch it
+    // duplicates is still preparing, then wait here for this lock. Preparing again
+    // would be refused at the initial turn, and that refusal reads as a failed
+    // start, which fails the job and the launch that won.
+    if let Some(run_id) = run_owning_launch(&owning_db, job_id)? {
+        return Ok(JobPreparation::AlreadyLaunching { run_id });
+    }
     // ---- Load job -------------------------------------------------------
     let job = run_db(load_job(
         owning_db.clone(),
@@ -1710,7 +1732,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         crate::messages::system::JobEvent::Started,
     );
 
-    Ok(PreparedJob {
+    Ok(JobPreparation::Prepared(Box::new(PreparedJob {
         job_id: job_id.to_string(),
         project_id: job.project_id,
         run_id,
@@ -1727,7 +1749,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         // command marks it otherwise (the transport's `start_job` handler).
         origin: crate::storage::LaunchOrigin::Background,
         launch_claim: Some(launch_claim),
-    })
+    })))
 }
 
 /// A job's launch prompt as composed from its resolved inputs, recording which
@@ -10032,6 +10054,138 @@ mod tests {
 
     // ---- Continuity across executions -----------------------------------
     //
+    /// A real project with a claimed job about to prepare for the first time, as
+    /// advancement dispatches it: already `running`, with no run yet.
+    async fn job_about_to_prepare(name: &str) -> Option<(TempDir, Orchestrator)> {
+        jj_bin()?;
+        let project = TempDir::new().unwrap();
+        init_project(project.path());
+        let repo = project.path().to_string_lossy().replace('\'', "''");
+        let snapshot = serde_json::json!({
+            "recipe": {
+                "id": "review", "name": "Review", "trigger": "manual",
+                "nodes": [{"id":"a","name":"Review","nodeType":"agent","position":{"x":0,"y":0}}],
+                "edges": []
+            },
+            "agents":{}, "skills":{}, "tools":{},
+            "triggerContext":{"projectId":"p","issueId":"i","triggerType":"manual"},
+            "createdAt":0
+        })
+        .to_string()
+        .replace('\'', "''");
+        let db = migrated_test_db(name).await;
+        db.execute_script(format!(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','default','P','p','{repo}',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,snapshot) VALUES('e','review','i','p','running',1,1,'{snapshot}');
+             INSERT INTO jobs(id,execution_id,recipe_node_id,project_id,issue_id,status,uri_segment,node_name,created_at,updated_at) VALUES('j','e','a','p','i','running','a','Review',1,1);"
+        ))
+        .await
+        .unwrap();
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        let state = Arc::new(DbState::new(
+            Arc::new(db),
+            Arc::new(SearchIndex::open_or_create(config_dir.join("search.db")).unwrap()),
+        ));
+        let mut services = TestServicesBuilder::new().build();
+        services.git = Arc::new(crate::services::RealGitClient);
+        Some((
+            project,
+            Orchestrator::builder(state, Arc::new(services), config_dir).build(),
+        ))
+    }
+
+    fn prepared(preparation: super::super::JobPreparation) -> Box<super::super::PreparedJob> {
+        match preparation {
+            super::super::JobPreparation::Prepared(prepared) => prepared,
+            super::super::JobPreparation::AlreadyLaunching { run_id } => {
+                panic!("expected a prepared launch; run {run_id} already owns it")
+            }
+        }
+    }
+
+    /// A second start that waited on the launch lock behind the first's
+    /// preparation finds that launch and does nothing. Preparing again would be
+    /// refused at the initial turn, and failing that start fails the winner.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_duplicate_start_behind_a_prepared_launch_leaves_it_alone() {
+        let Some((_project, orch)) = job_about_to_prepare("prepare-duplicate-start").await else {
+            return;
+        };
+        let db = orch.db.local.clone();
+
+        let winner = prepared(super::prepare_job(&orch, "j").unwrap());
+        match super::prepare_job(&orch, "j").unwrap() {
+            super::super::JobPreparation::AlreadyLaunching { run_id } => {
+                assert_eq!(run_id, winner.run_id);
+            }
+            super::super::JobPreparation::Prepared(prepared) => {
+                panic!("a second launch was prepared as run {}", prepared.run_id)
+            }
+        }
+
+        for (sql, expected) in [
+            ("SELECT COUNT(*) FROM runs WHERE job_id='j'", 1),
+            (
+                "SELECT COUNT(*) FROM turns WHERE job_id='j' AND state='pending'",
+                1,
+            ),
+            ("SELECT COUNT(*) FROM turns WHERE job_id='j'", 1),
+            (
+                "SELECT COUNT(*) FROM events WHERE event_type='system:error'",
+                0,
+            ),
+        ] {
+            assert_eq!(
+                db.query_opt_i64(sql, ()).await.unwrap(),
+                Some(expected),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            db.query_opt_text("SELECT status FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("running")
+        );
+    }
+
+    /// A warm process keeps its run `live` with no turn active. That run does not
+    /// own a launch, so a start against it still prepares one, and admission
+    /// decides later whether the warm process serves it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_start_against_a_warm_run_still_prepares_a_launch() {
+        let Some((_project, orch)) = job_about_to_prepare("prepare-warm-run").await else {
+            return;
+        };
+        let db = orch.db.local.clone();
+        let first = prepared(super::prepare_job(&orch, "j").unwrap());
+        let warm_run = first.run_id.clone();
+        drop(first);
+        db.execute_script(
+            "UPDATE runs SET status='live' WHERE job_id='j';
+             UPDATE turns SET state='complete' WHERE job_id='j';",
+        )
+        .await
+        .unwrap();
+
+        let second = prepared(super::prepare_job(&orch, "j").unwrap());
+
+        assert_ne!(second.run_id, warm_run);
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM turns WHERE job_id='j' AND state='pending'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+    }
+
     // The specimen: execution 1 commits real work and then dies for a reason
     // that has nothing to do with that work, and execution 2 is started on the
     // same issue. These drive the actual composition `prepare_job` drives — a

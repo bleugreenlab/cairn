@@ -1,0 +1,342 @@
+# Gating plan-audit findings that production and the Rust suite both accept.
+#
+# `cairn_db::storage::plan_audit` flags a statement that walks a wide row. A
+# flagged statement listed here logs at INFO in production, naming its issue,
+# and reads as `allowlisted` in the suite's ledger. Anything else that gates logs
+# a WARN and fails the `rust-tests` lane as a named finding.
+#
+# One stanza per statement. Identity is (file, rule, table, statement), with no
+# line number, so unrelated edits that shift a line never touch this file:
+#
+# - `file` is the call site's `Location::file()` verbatim, so it has no
+#   `src-tauri/` prefix.
+# - `rule` is a gating rule: `wide-scan` or `trigger-scan`.
+# - `statement` is the 16-hex hash the audit logs, of the statement's text with
+#   whitespace collapsed. Editing the SQL changes the hash, so an edited
+#   statement fails as new and is acknowledged again. A failing run prints a
+#   ready-to-paste stanza.
+# - `kind` says what `issue` is. `debt`: that issue owes this entry's removal.
+#   `deliberate`: that issue records the ruling, for a bulk scan by design or a
+#   statement only test code defines.
+# - `issue` is a `cairn://p/cairn/NNNN` URI, and `reason` says why in a sentence.
+#
+# A whole-suite run that explains a listed statement and finds it clean fails the
+# entry as stale. An entry whose statement no test reached is reported as unseen
+# and does not fail, and rewriting a statement changes its hash, which leaves its
+# old entry unseen rather than stale: a PR that rewrites a listed statement removes
+# its entry itself. A branch's fast tier cannot call an entry stale, so an entry
+# left behind first shows as main's whole-suite red.
+#
+# Flat `key = "value"` lines only: the runner parses this without a TOML library
+# (`scripts/lib/plan-audit.ts`), because a runner dependency it could not load
+# would cost the lane its verdict. The `plan-audit` lane parses it both ways.
+
+# SELECT e.run_id FROM events e LEFT JOIN token_rollup_runs w ON w.run_id = e.run_
+[[allow]]
+file = "os/cairn-analytics/src/queries.rs"
+rule = "wide-scan"
+table = "events"
+statement = "1c743583be722f9c"
+kind = "debt"
+issue = "cairn://p/cairn/6130"
+reason = "The rollup's needing-fold read walks every event, inside its write transaction on the second run."
+
+# SELECT execution_id FROM execution_history WHERE pack IS NOT NULL LIMIT ?1
+[[allow]]
+file = "os/cairn-core/src/archival/offload.rs"
+rule = "wide-scan"
+table = "execution_history"
+statement = "801eaa8195cd54c5"
+kind = "debt"
+issue = "cairn://p/cairn/6132"
+reason = "The offload pass finds packs by scanning, which steps past more NULL rows as it succeeds."
+
+# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
+[[allow]]
+file = "os/cairn-core/src/companion_projection.rs"
+rule = "wide-scan"
+table = "executions"
+statement = "16d4103a3a75a1f2"
+kind = "debt"
+issue = "cairn://p/cairn/6129"
+reason = "The active-graph CTE walks executions on each projection read."
+
+# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
+[[allow]]
+file = "os/cairn-core/src/companion_projection.rs"
+rule = "wide-scan"
+table = "executions"
+statement = "2617d17ae5e7266b"
+kind = "debt"
+issue = "cairn://p/cairn/6129"
+reason = "The active-graph CTE walks executions on each projection read."
+
+# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
+[[allow]]
+file = "os/cairn-core/src/companion_projection.rs"
+rule = "wide-scan"
+table = "executions"
+statement = "79f4acf9cda6fb69"
+kind = "debt"
+issue = "cairn://p/cairn/6129"
+reason = "The active-graph CTE walks executions on each projection read."
+
+# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
+[[allow]]
+file = "os/cairn-core/src/companion_projection.rs"
+rule = "wide-scan"
+table = "executions"
+statement = "fb660d0c205bbc7f"
+kind = "debt"
+issue = "cairn://p/cairn/6129"
+reason = "The active-graph CTE walks executions on each projection read."
+
+# SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at FRO
+[[allow]]
+file = "os/cairn-core/src/embeddings/resources.rs"
+rule = "wide-scan"
+table = "artifacts"
+statement = "89a3c6a9d16e96e9"
+kind = "debt"
+issue = "cairn://p/cairn/6131"
+reason = "The embedding pass reads every artifact to keep those newer than a bound it applies in Rust."
+
+# DELETE FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)
+[[allow]]
+file = "os/cairn-core/src/jobs/cleanup.rs"
+rule = "trigger-scan"
+table = "codex_watchdog_lifecycle"
+statement = "0a2b272216017cd4"
+kind = "debt"
+issue = "cairn://p/cairn/6039"
+reason = "A session delete cascades through session_id, which leads no index until the table has been evicted down."
+
+# DELETE FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE thread_id = ?1)
+[[allow]]
+file = "os/cairn-core/src/jobs/cleanup.rs"
+rule = "trigger-scan"
+table = "codex_watchdog_lifecycle"
+statement = "3a9321f0984daf59"
+kind = "debt"
+issue = "cairn://p/cairn/6039"
+reason = "A session delete cascades through session_id, which leads no index until the table has been evicted down."
+
+# SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_jso
+[[allow]]
+file = "os/cairn-core/src/mcp/handlers/durable_suspend.rs"
+rule = "wide-scan"
+table = "agent_waits"
+statement = "0d49e84f6fbf10d8"
+kind = "debt"
+issue = "cairn://p/cairn/6126"
+reason = "Reconcile and the stale-resolving sweep read pending waits by walking the table."
+
+# SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_jso
+[[allow]]
+file = "os/cairn-core/src/mcp/handlers/durable_suspend.rs"
+rule = "wide-scan"
+table = "agent_waits"
+statement = "385a34434e18d55e"
+kind = "debt"
+issue = "cairn://p/cairn/6126"
+reason = "Reconcile and the stale-resolving sweep read pending waits by walking the table."
+
+# SELECT id FROM agent_waits WHERE state='pending' AND created_at<=?1-?2 AND json_
+[[allow]]
+file = "os/cairn-core/src/mcp/handlers/mcp_continuation.rs"
+rule = "wide-scan"
+table = "agent_waits"
+statement = "c2b8a1768735f45b"
+kind = "deliberate"
+issue = "cairn://p/cairn/5866"
+reason = "REFERENCE_DUE_SQL is defined only by a test, the reference the keyed scheduler query is compared against."
+
+# SELECT COUNT(*) FROM delegated_packets WHERE parent_job_id = ?1 AND status NOT I
+[[allow]]
+file = "os/cairn-core/src/messages/delivery.rs"
+rule = "wide-scan"
+table = "delegated_packets"
+statement = "6aa0bc16f2d369a2"
+kind = "debt"
+issue = "cairn://p/cairn/6127"
+reason = "The dependency-wait hold counts packets by a parent_job_id that leads no index."
+
+# SELECT id, data FROM artifacts
+[[allow]]
+file = "os/cairn-core/src/security/remediation/inventory.rs"
+rule = "wide-scan"
+table = "artifacts"
+statement = "849cf2f2353a72d0"
+kind = "deliberate"
+issue = "cairn://p/cairn/5989"
+reason = "The security inventory reads every row of the table by design."
+
+# SELECT input_hash, output_tail FROM check_result_cache
+[[allow]]
+file = "os/cairn-core/src/security/remediation/inventory.rs"
+rule = "wide-scan"
+table = "check_result_cache"
+statement = "28894186baa5554c"
+kind = "deliberate"
+issue = "cairn://p/cairn/5989"
+reason = "The security inventory reads every row of the table by design."
+
+# SELECT id, data, data_blob, codec, storage_mode, content_commit FROM events
+[[allow]]
+file = "os/cairn-core/src/security/remediation/inventory.rs"
+rule = "wide-scan"
+table = "events"
+statement = "66a5adb1a4c938b6"
+kind = "deliberate"
+issue = "cairn://p/cairn/5989"
+reason = "The security inventory reads every row of the table by design."
+
+# SELECT id, data FROM message_stream_chunks
+[[allow]]
+file = "os/cairn-core/src/security/remediation/inventory.rs"
+rule = "wide-scan"
+table = "message_stream_chunks"
+statement = "28847cc652d16539"
+kind = "deliberate"
+issue = "cairn://p/cairn/5989"
+reason = "The security inventory reads every row of the table by design."
+
+# DELETE FROM sessions WHERE id = ?1
+[[allow]]
+file = "os/cairn-core/src/sessions/queries.rs"
+rule = "trigger-scan"
+table = "codex_watchdog_lifecycle"
+statement = "26f4d1b707e574e9"
+kind = "debt"
+issue = "cairn://p/cairn/6039"
+reason = "A session delete cascades through session_id, which leads no index until the table has been evicted down."
+
+# SELECT rowid, "id", "job_id", "artifact_type", "schema_version", "data", "versio
+[[allow]]
+file = "os/cairn-db/src/storage/reclaim.rs"
+rule = "wide-scan"
+table = "artifacts"
+statement = "f88b4b8f0063701f"
+kind = "deliberate"
+issue = "cairn://p/cairn/5986"
+reason = "The offline reclaim copy reads every row in rowid pages. An added artifacts column changes this hash."
+
+# SELECT p.run_id FROM prepared_ordinary_launches p JOIN runtime_admission_request
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "prepared_ordinary_launches"
+statement = "560b54f51842e56e"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT c.run_id FROM prepared_runtime_calls c JOIN runtime_admission_requests r
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "01a9ead903d443e7"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT p.run_id FROM prepared_ordinary_launches p JOIN runtime_admission_request
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "39e17acacee0cd45"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT r.request_id,r.workspace_key,r.resource_lane,p.turn_id FROM runtime_admis
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "6a1cf4a272afe62c"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# WITH ranked AS ( SELECT r.*, ROW_NUMBER() OVER ( PARTITION BY r.workspace_key,r.
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "a6a3b09b5a084ccb"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT r.request_id,r.workspace_key,p.run_id,p.turn_id FROM runtime_admission_re
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "b1fc64b0593465c8"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT workspace_key,resource_lane,claim_json FROM runtime_admission_requests WH
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "c21e093723017164"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT p.request_id,r.workspace_key FROM prepared_ordinary_launches p JOIN runti
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "c6280a511064ccc4"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT workspace_key,resource_lane,claim_json FROM runtime_admission_requests WH
+[[allow]]
+file = "os/cairn-db/src/storage/runtime_admission.rs"
+rule = "wide-scan"
+table = "runtime_admission_requests"
+statement = "ed58b8b25720b9a6"
+kind = "debt"
+issue = "cairn://p/cairn/5864"
+reason = "An admission-claim read joins through the prepared-launch tables' wide rows."
+
+# SELECT a.id, 'artifact', j.project_id, j.issue_id, a.job_id, a.artifact_type, CO
+[[allow]]
+file = "os/cairn-db/src/storage/search_index.rs"
+rule = "wide-scan"
+table = "artifacts"
+statement = "f8f112353342ea5d"
+kind = "deliberate"
+issue = "cairn://p/cairn/5989"
+reason = "A search reindex reads every artifact by design."
+
+# SELECT e.id, e.recipe_id, e.issue_id, e.project_id, e.status, e.started_at, e.co
+[[allow]]
+file = "os/cairn-workflow/src/queries.rs"
+rule = "wide-scan"
+table = "executions"
+statement = "334e96ac44d0e32e"
+kind = "debt"
+issue = "cairn://p/cairn/6128"
+reason = "The execution listing and its count walk the table."
+
+# SELECT COUNT(*) FROM executions e LEFT JOIN issues i ON i.id = e.issue_id LEFT J
+[[allow]]
+file = "os/cairn-workflow/src/queries.rs"
+rule = "wide-scan"
+table = "executions"
+statement = "fdda2e144e643cd7"
+kind = "debt"
+issue = "cairn://p/cairn/6128"
+reason = "The execution listing and its count walk the table."

@@ -42,10 +42,12 @@
 //!   cargo run --release -p cairn-db --example db_census -- tables <clone>/cairn.db 1793332400
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-use cairn_db::storage::census::{payload_expr, quote_identifier as quote, Column};
+use cairn_db::storage::census::{
+    payload_expr, quote_identifier as quote, refuse_live_directory, Column,
+};
 use cairn_db::storage::reclaim::{copy_compacted, verify, CopyProgress, ReclaimLimits};
 use cairn_db::storage::retention::retention_for;
 use cairn_db::storage::{census, db_set_paths, DrainBudget, LocalDb, TrackedConnection};
@@ -66,9 +68,6 @@ const FOLD_BYTES: u64 = 16 * 1024 * 1024;
 const RESOLVED_ISSUE: &[&str] = &["merged", "closed", "complete", "failed"];
 /// Resolution-age windows (days) the hot-window projection is reported for.
 const WINDOWS: &[i64] = &[7, 14, 30, 60, 90];
-
-/// Data directories a live Cairn keeps its database in, relative to `$HOME`.
-const LIVE_DIRS: &[&str] = &[".cairn", "Library/Application Support/com.cairn.desktop"];
 
 /// Columns tried, in order, as a table's creation time. A row's age only
 /// measures growth when the column is stamped once, at insert.
@@ -153,28 +152,7 @@ async fn main() {
 /// Refuse a path inside a live Cairn data directory. A path that does not end
 /// in `.db` is refused by `LocalDb::open` itself.
 fn check_path(path: &str) -> Res<()> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Ok(());
-    };
-    let dir = Path::new(path)
-        .parent()
-        .map(|p| {
-            if p.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                p
-            }
-        })
-        .and_then(|p| std::fs::canonicalize(p).ok());
-    for live in LIVE_DIRS {
-        let live = std::fs::canonicalize(PathBuf::from(&home).join(live)).ok();
-        if live.is_some() && dir == live {
-            return Err(format!(
-                "{path} is in a live Cairn data directory; clone it first (see the module docs)"
-            ));
-        }
-    }
-    Ok(())
+    refuse_live_directory(Path::new(path))
 }
 
 fn parse(arg: &str) -> i64 {

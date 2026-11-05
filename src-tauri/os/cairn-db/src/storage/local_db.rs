@@ -745,6 +745,14 @@ pub struct LocalDb {
     connections_created: AtomicUsize,
     /// [`READ_STATEMENT_BOUND`] outside tests, which shorten it.
     read_bound: Duration,
+    /// Forces the history read seam's source for tests and the clone harness.
+    /// Not compiled into a production build, so no production path can reach it.
+    #[cfg(any(test, feature = "test-utils"))]
+    history_source_override: Mutex<Option<crate::storage::events::history::HistorySource>>,
+    /// Schema capability, established at open and after migrations, never on read.
+    history_catalog_present: AtomicBool,
+    /// Monotonic for this handle: eviction must raise this after committing.
+    history_evicted: AtomicBool,
 }
 
 impl std::fmt::Debug for LocalDb {
@@ -808,8 +816,13 @@ impl LocalDb {
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
             read_bound: READ_STATEMENT_BOUND,
+            #[cfg(any(test, feature = "test-utils"))]
+            history_source_override: Mutex::new(None),
+            history_catalog_present: AtomicBool::new(false),
+            history_evicted: AtomicBool::new(false),
         };
         db.configure().await?;
+        db.initialize_history_capability().await?;
         Ok(db)
     }
 
@@ -870,8 +883,13 @@ impl LocalDb {
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
             read_bound: READ_STATEMENT_BOUND,
+            #[cfg(any(test, feature = "test-utils"))]
+            history_source_override: Mutex::new(None),
+            history_catalog_present: AtomicBool::new(false),
+            history_evicted: AtomicBool::new(false),
         };
         db.configure().await?;
+        db.initialize_history_capability().await?;
         Ok(db)
     }
 
@@ -928,8 +946,13 @@ impl LocalDb {
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
             read_bound: READ_STATEMENT_BOUND,
+            #[cfg(any(test, feature = "test-utils"))]
+            history_source_override: Mutex::new(None),
+            history_catalog_present: AtomicBool::new(false),
+            history_evicted: AtomicBool::new(false),
         };
         db.configure().await?;
+        db.initialize_history_capability().await?;
         Ok(db)
     }
 
@@ -970,6 +993,76 @@ impl LocalDb {
         store: Arc<dyn ContentStore>,
     ) -> Result<(), Arc<dyn ContentStore>> {
         self.private_content_store.set(store)
+    }
+
+    /// Whether any history has been evicted. Loaded at initialization, never
+    /// queried by readers. False includes storeless team replicas.
+    pub fn has_evicted_history(&self) -> bool {
+        self.history_evicted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_history_catalog(&self) -> bool {
+        self.history_catalog_present.load(Ordering::Acquire)
+    }
+
+    /// Raise the monotonic eviction fact before the first eviction transaction
+    /// can commit. A failed transaction may leave a conservative true value.
+    /// Eviction must also quiesce or revalidate in-flight cached-Hot readers
+    /// across source selection and body fetch; this flag alone is not a lock.
+    /// Clearing the fact requires reopening the database.
+    pub fn mark_history_evicted(&self) {
+        self.history_evicted.store(true, Ordering::Release);
+    }
+
+    /// Initialization only. A fresh database acquires its capability after
+    /// migrations; an existing private database loads its eviction fact once at
+    /// open. Content-store availability cannot identify a storeless team schema.
+    pub(crate) async fn initialize_history_capability(&self) -> DbResult<()> {
+        if self.has_history_catalog() {
+            return Ok(());
+        }
+        let present = self.query_one(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'history_tier')",
+            (),
+            |row| Ok(row.get::<i64>(0)? != 0),
+        ).await?;
+        if present {
+            let evicted = self
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM history_tier WHERE evicted_at IS NOT NULL)",
+                    (),
+                    |row| Ok(row.get::<i64>(0)? != 0),
+                )
+                .await?;
+            if evicted {
+                self.mark_history_evicted();
+            }
+            self.history_catalog_present.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Force the history read seam's source on this handle, or clear it.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_history_source_override(
+        &self,
+        source: Option<crate::storage::events::history::HistorySource>,
+    ) {
+        *self
+            .history_source_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source;
+    }
+
+    /// The source forced by [`Self::set_history_source_override`], if any.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn history_source_override(
+        &self,
+    ) -> Option<crate::storage::events::history::HistorySource> {
+        *self
+            .history_source_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Whether a checkpoint attempt is still running inside the engine. A
@@ -1280,6 +1373,10 @@ impl LocalDb {
             None => self.open_connection().await?,
         };
         if kind == HolderKind::PooledRead {
+            #[cfg(any(test, feature = "test-utils"))]
+            self.gate
+                .read_checkout_count
+                .fetch_add(1, Ordering::Relaxed);
             conn.set_query_timeout(self.read_bound)?;
             holder.arm(conn.clone());
         } else {
@@ -1350,6 +1447,27 @@ impl LocalDb {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn read_transaction_count(&self) -> usize {
         self.read_transaction_count.load(Ordering::Relaxed)
+    }
+
+    /// Application statement submissions through tracked connections. Counts
+    /// query, execute and prepare once, and execute_batch once per script.
+    /// Excludes pool setup/transaction SQL and plan-audit EXPLAIN. Prepared
+    /// executions through the returned engine Statement are not counted again.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn statement_count(&self) -> usize {
+        self.gate.statement_count.load(Ordering::Relaxed)
+    }
+
+    /// All pooled read checkouts, including the autocommit query helpers.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn read_checkout_count(&self) -> usize {
+        self.gate.read_checkout_count.load(Ordering::Relaxed)
+    }
+
+    /// Query/prepare submissions, with the same exclusions as statement_count.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn read_statement_count(&self) -> usize {
+        self.gate.read_statement_count.load(Ordering::Relaxed)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1458,6 +1576,13 @@ impl LocalDb {
                     if let Some(audit) = conn_ref.plan_audit(caller, sql) {
                         audit.await;
                     }
+                    #[cfg(any(test, feature = "test-utils"))]
+                    {
+                        self.gate.statement_count.fetch_add(1, Ordering::Relaxed);
+                        self.gate
+                            .read_statement_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let mut rows = conn_ref.conn.query(sql, params).await?;
                     let mut out = Vec::new();
                     while let Some(row) = rows.next().await? {
@@ -1529,6 +1654,13 @@ impl LocalDb {
                 let result: DbResult<Option<T>> = async move {
                     if let Some(audit) = conn_ref.plan_audit(caller, sql) {
                         audit.await;
+                    }
+                    #[cfg(any(test, feature = "test-utils"))]
+                    {
+                        self.gate.statement_count.fetch_add(1, Ordering::Relaxed);
+                        self.gate
+                            .read_statement_count
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     let mut rows = conn_ref.conn.query(sql, params).await?;
                     rows.next().await?.map(|row| map(&row)).transpose()
@@ -1657,6 +1789,11 @@ impl LocalDb {
                     if let Some(audit) = conn.plan_audit(caller, &sql) {
                         audit.await;
                     }
+                    #[cfg(any(test, feature = "test-utils"))]
+                    conn.slot
+                        .gate
+                        .statement_count
+                        .fetch_add(1, Ordering::Relaxed);
                     Ok(conn.conn.execute(&sql, params).await?)
                 })
             })
@@ -1683,6 +1820,11 @@ impl LocalDb {
             self.transaction_with_begin(caller, &holder, self.concurrent_begin(), move |conn| {
                 let sql = sql.clone();
                 Box::pin(async move {
+                    #[cfg(any(test, feature = "test-utils"))]
+                    conn.slot
+                        .gate
+                        .statement_count
+                        .fetch_add(1, Ordering::Relaxed);
                     conn.conn.execute_batch(&sql).await?;
                     Ok(())
                 })
@@ -1781,6 +1923,8 @@ impl LocalDb {
             let conn = self
                 .checkout(caller, HolderKind::PooledWrite, &holder)
                 .await?;
+            #[cfg(any(test, feature = "test-utils"))]
+            self.gate.statement_count.fetch_add(1, Ordering::Relaxed);
             let result = conn.conn.execute_batch(sql).await;
             if result.is_ok() {
                 self.release(conn);
@@ -2094,6 +2238,12 @@ pub(super) struct ConnectionGate {
     /// because the gate is the one object every connection to the database
     /// reaches.
     plan_audit: PlanAudit,
+    #[cfg(any(test, feature = "test-utils"))]
+    statement_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-utils"))]
+    read_statement_count: AtomicUsize,
+    #[cfg(any(test, feature = "test-utils"))]
+    read_checkout_count: AtomicUsize,
     state: Mutex<GateState>,
     /// Woken when the gate reopens, releasing everyone waiting to be admitted.
     reopened: Notify,
@@ -2128,6 +2278,12 @@ impl ConnectionGate {
     fn new() -> Self {
         Self {
             plan_audit: PlanAudit::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            statement_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            read_statement_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            read_checkout_count: AtomicUsize::new(0),
             state: Mutex::new(GateState::default()),
             reopened: Notify::new(),
             drained: Notify::new(),
@@ -2346,6 +2502,16 @@ impl TrackedConnection {
         sql: impl AsRef<str>,
         params: impl IntoParams,
     ) -> impl Future<Output = turso::Result<TrackedRows>> + Captures<&'_ ()> {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.slot
+            .gate
+            .statement_count
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "test-utils"))]
+        self.slot
+            .gate
+            .read_statement_count
+            .fetch_add(1, Ordering::Relaxed);
         let at = Location::caller();
         self.slot.holder.set_statement(at, sql.as_ref());
         let audit = self.plan_audit(at, sql.as_ref());
@@ -2371,6 +2537,11 @@ impl TrackedConnection {
         sql: impl AsRef<str>,
         params: impl IntoParams,
     ) -> impl Future<Output = turso::Result<u64>> + Captures<&'_ ()> {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.slot
+            .gate
+            .statement_count
+            .fetch_add(1, Ordering::Relaxed);
         let at = Location::caller();
         self.slot.holder.set_statement(at, sql.as_ref());
         let audit = self.plan_audit(at, sql.as_ref());
@@ -2394,6 +2565,16 @@ impl TrackedConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> impl Future<Output = turso::Result<turso::Statement>> + Captures<&'_ ()> {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.slot
+            .gate
+            .statement_count
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "test-utils"))]
+        self.slot
+            .gate
+            .read_statement_count
+            .fetch_add(1, Ordering::Relaxed);
         let at = Location::caller();
         self.slot.holder.set_statement(at, sql.as_ref());
         let audit = self.plan_audit(at, sql.as_ref());
@@ -2415,6 +2596,11 @@ impl TrackedConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> impl Future<Output = turso::Result<()>> + Captures<&'_ ()> {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.slot
+            .gate
+            .statement_count
+            .fetch_add(1, Ordering::Relaxed);
         self.slot
             .holder
             .set_statement(Location::caller(), sql.as_ref());
@@ -3994,6 +4180,10 @@ mod tests {
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
             read_bound: READ_STATEMENT_BOUND,
+            #[cfg(any(test, feature = "test-utils"))]
+            history_source_override: Mutex::new(None),
+            history_catalog_present: AtomicBool::new(false),
+            history_evicted: AtomicBool::new(false),
         };
         db.configure().await?;
         MigrationRunner::new(TEST_SCHEMA.to_vec()).run(&db).await?;

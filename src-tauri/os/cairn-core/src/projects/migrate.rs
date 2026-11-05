@@ -434,6 +434,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("check_test_results", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_observation_relabels", "project_id = ?1 OR observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_deferred_tests", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
+    delete_only("check_audit_findings", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("compile_facts", "project_id = ?1"),
     delete_only("check_result_commit_aliases", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_result_cache", "project_id = ?1 OR source_observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
@@ -2791,15 +2792,18 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_failed_shared_half_leaves_a_team_delete_re_runnable() {
         let fixture = team_project_fixture("team-delete-partial").await;
+        // Its indexes too: the re-run's cascade has to seek as the real table does.
         let todos_ddl = fixture
             .team
-            .query_opt_text(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'todos'",
+            .query_all(
+                "SELECT sql FROM sqlite_master WHERE tbl_name = 'todos' AND sql IS NOT NULL
+                 ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END",
                 (),
+                |row| row.text(0),
             )
             .await
-            .unwrap()
-            .expect("the team lineage has a todos table");
+            .unwrap();
+        assert!(!todos_ddl.is_empty(), "the team lineage has a todos table");
         exclusive_ddl(&fixture.team, "DROP TABLE todos").await;
 
         let error = crate::projects::crud::delete_routed(&fixture.dbs, &fixture.project_id)
@@ -2828,7 +2832,9 @@ pub(super) mod tests {
             "the route must survive so the key is not released early"
         );
 
-        exclusive_ddl(&fixture.team, &todos_ddl).await;
+        for ddl in &todos_ddl {
+            exclusive_ddl(&fixture.team, ddl).await;
+        }
         crate::projects::crud::delete_routed(&fixture.dbs, &fixture.project_id)
             .await
             .expect("re-running delete finishes the half that failed");

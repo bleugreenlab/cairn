@@ -497,6 +497,7 @@ mod tests {
             failures: vec![],
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         };
         assert_eq!(
             card_check_verdict(true, Some(&empty.verdict_facts())),
@@ -938,6 +939,7 @@ mod tests {
                 failures: vec![],
                 unverified: None,
                 lint_findings: None,
+                plan_audit: None,
             };
             Some(serde_json::to_string(&parsed).unwrap())
         };

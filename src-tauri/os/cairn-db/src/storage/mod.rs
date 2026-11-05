@@ -22,6 +22,7 @@ pub mod checkpoint_probe;
 pub mod authority;
 pub mod content_store;
 pub mod events;
+pub mod history_pack;
 pub mod migration_files;
 pub mod pack_catalog;
 pub mod plan_audit;

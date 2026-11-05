@@ -850,6 +850,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
         declared_unverified: None,
         progress: None,
         base_attribution: None,
+        plan_audit_note: None,
     }];
     let snapshot = ChecksSnapshot {
         settlement: classify(&statuses, HeadTurn::Idle, false),
@@ -931,6 +932,7 @@ fn a_verdictless_subscribe_time_reading_is_confirmed_rather_than_fired_on() {
         declared_unverified: None,
         progress: None,
         base_attribution: None,
+        plan_audit_note: None,
     };
 
     // What a node caught between its turn completing and its wave arming looks
@@ -993,6 +995,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
         declared_unverified: None,
         progress: None,
         base_attribution: None,
+        plan_audit_note: None,
     };
     let statuses = vec![
         lane("rust-lint", NodeCheckState::Pending),

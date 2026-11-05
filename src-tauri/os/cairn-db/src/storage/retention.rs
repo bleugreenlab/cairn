@@ -210,6 +210,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     tiered("tool_invocations").budget(256),
     tiered("tool_invocation_runs"),
     tiered("turn_embeddings").budget(1_024),
+    // Evicted with its execution but not packed: a rebuildable cache, as every
+    // history pack's manifest states.
     tiered("session_skyline_cache").budget(768),
     keep(
         "execution_history",
@@ -352,6 +354,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     .budget(256),
     owned("check_test_results", "check_result_observations").budget(1_100),
     owned("check_deferred_tests", "check_result_observations"),
+    owned("check_audit_findings", "check_result_observations"),
     owned("check_result_commit_aliases", "check_result_observations"),
     owned("check_observation_relabels", "check_result_observations"),
     undecided(
@@ -542,6 +545,14 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("app_boot_state", MARKER),
     keep("archival_backfill_state", MARKER),
     keep("archival_progress", "one row per maintenance pass"),
+    keep(
+        "history_tier",
+        "the catalog of history packs: the only list of them, and what sends reads to one",
+    ),
+    keep(
+        "history_tier_runs",
+        "the catalog of history packs, by run: the read seam's source lookup",
+    ),
     keep("delegated_packet_backfill_state", MARKER),
     keep("attention_push_retirement_backfill", MARKER),
     keep("embedding_state", MARKER),

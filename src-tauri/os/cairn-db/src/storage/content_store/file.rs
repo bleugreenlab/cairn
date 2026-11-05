@@ -108,6 +108,10 @@ impl FileContentStore {
 
 #[async_trait]
 impl ContentStore for FileContentStore {
+    fn local_root(&self) -> Option<&Path> {
+        Some(&self.root)
+    }
+
     async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), ContentStoreError> {
         let root = self.root.clone();
         let hash = hash.to_string();

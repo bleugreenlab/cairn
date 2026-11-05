@@ -14,6 +14,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 sha2 = "0.10"
+# A stored blob column's encoding in the shared row encoder (history_pack::encode).
+base64 = "0.22"
 async-trait = "0.1"
 thiserror = "2"
 log = "0.4"
@@ -48,6 +50,8 @@ cairn-common = { path = "../cairn-common" }
 cairn-platform = { path = "../cairn-platform" }
 # The gix + zstd event-codec/object substrate; storage/events re-exports it.
 cairn-codec = { path = "../cairn-codec" }
+# Parses the plan audit's compiled-in allowlist (storage/plan_audit/allowlist.rs).
+toml = "0.8"
 # Mints and matches the feed acknowledgement token. Agents copy that token out of
 # a rendered page and back into a mutation, so its form is a cost and a
 # transcription-fidelity question, not merely a uniqueness one.

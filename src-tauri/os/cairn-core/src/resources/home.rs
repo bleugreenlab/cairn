@@ -1,8 +1,10 @@
 use super::common::{lookup_project_by_key, read_resource};
 use crate::storage::events::columns::PROSE_SHAPE;
+use crate::storage::events::history::{EventFilter, HistoryReader, HotRow};
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
 use serde::Serialize;
+use std::collections::HashMap;
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 
@@ -32,10 +34,10 @@ pub(crate) async fn read_project_home(db: &LocalDb, key: &str, params: &[QueryPa
     };
     let (requested_key, limit, before, json) =
         (key.to_owned(), query.limit, query.before, query.json);
-    let payload = match read_resource(db, move |conn| {
+    let candidates = match read_resource(db, move |conn| {
         Box::pin(async move {
             let project = lookup_project_by_key(conn, &requested_key).await?;
-            query_project_home(conn, &project.project_id, &requested_key, limit, before)
+            home_candidates(conn, &project.project_id, &requested_key, limit, before)
                 .await
                 .map_err(|e| format!("Failed to read project home: {e}"))
         })
@@ -44,6 +46,10 @@ pub(crate) async fn read_project_home(db: &LocalDb, key: &str, params: &[QueryPa
     {
         Ok(v) => v,
         Err(e) => return e,
+    };
+    let payload = match hydrate_home_candidates(db, key, limit, candidates).await {
+        Ok(v) => v,
+        Err(e) => return format!("Failed to read project home: {e}"),
     };
     if json {
         serde_json::to_string(&payload)
@@ -95,36 +101,66 @@ fn parse_params(params: &[QueryParam]) -> Result<HomeQuery, String> {
         json,
     })
 }
+/// Select one bounded hot-candidate page, then hydrate transcript bodies through
+/// the history seam with no candidate read held open. Like project export, this
+/// still discovers candidates from hot rows: C2 must add catalog-backed thread
+/// enumeration before evicting thread/history rows.
 pub async fn query_project_home(
-    conn: &cairn_db::storage::TrackedConnection,
+    db: &LocalDb,
     project_id: &str,
     key: &str,
     limit: usize,
     before: Option<(i64, String)>,
 ) -> cairn_db::storage::DbResult<HomePayload> {
-    let (at, id) = before
-        .map(|(a, i)| (Some(a), Some(i)))
-        .unwrap_or((None, None));
-    let mut rows = conn
-        .query(
-            &home_sql(),
-            cairn_db::turso::params![project_id, key, at, id, limit as i64],
-        )
+    let project_id = project_id.to_owned();
+    let requested_key = key.to_owned();
+    let candidates = db
+        .read(move |conn| {
+            Box::pin(async move {
+                home_candidates(conn, &project_id, &requested_key, limit, before).await
+            })
+        })
         .await?;
-    let mut entries = Vec::new();
-    while let Some(r) = rows.next().await? {
-        let Some(body) = home_entry_body(&r) else {
+    hydrate_home_candidates(db, key, limit, candidates).await
+}
+
+async fn hydrate_home_candidates(
+    db: &LocalDb,
+    key: &str,
+    limit: usize,
+    candidates: Vec<HomeCandidate>,
+) -> cairn_db::storage::DbResult<HomePayload> {
+    let mut selected = Vec::with_capacity(candidates.len());
+    let mut hot_rows = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let is_event = candidate.event.is_some();
+        if let Some(row) = candidate.event {
+            hot_rows.push(row);
+        }
+        selected.push((candidate.entry, is_event));
+    }
+    // The database read is closed before reconstruction or archive access.
+    let mut bodies: HashMap<_, _> = HistoryReader::new(db)
+        .hydrate_selected_hot_rows(hot_rows, EventFilter::default())
+        .await?
+        .into_iter()
+        .map(|row| (row.event.id, row.event.data))
+        .collect();
+    let mut entries = Vec::with_capacity(selected.len());
+    for (mut entry, is_event) in selected {
+        let data = if is_event {
+            let Some(body) = bodies.remove(&entry.id) else {
+                continue;
+            };
+            body
+        } else {
+            entry.body
+        };
+        let Some(body) = home_entry_body(data) else {
             continue;
         };
-        entries.push(HomeEntry {
-            at: r.i64(0)?,
-            id: r.text(1)?,
-            kind: r.text(2)?,
-            author: r.text(3)?,
-            target: r.opt_text(4)?,
-            body,
-            source: r.text(6)?,
-        });
+        entry.body = body;
+        entries.push(entry);
     }
     let next_cursor = (entries.len() == limit)
         .then(|| entries.last().map(|e| format!("{}:{}", e.at, e.id)))
@@ -136,18 +172,49 @@ pub async fn query_project_home(
     })
 }
 
-fn home_entry_body(row: &cairn_db::turso::Row) -> Option<String> {
-    let inline = row.text(5).ok()?;
-    let body = match (
-        row.opt_blob(7).ok().flatten(),
-        row.opt_text(8).ok().flatten(),
-    ) {
-        (Some(blob), Some(codec)) => crate::storage::decompress(&codec, &blob)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .unwrap_or(inline),
-        _ => inline,
-    };
+struct HomeCandidate {
+    entry: HomeEntry,
+    event: Option<HotRow>,
+}
+
+async fn home_candidates(
+    conn: &cairn_db::storage::TrackedConnection,
+    project_id: &str,
+    key: &str,
+    limit: usize,
+    before: Option<(i64, String)>,
+) -> cairn_db::storage::DbResult<Vec<HomeCandidate>> {
+    let (at, id) = before
+        .map(|(a, i)| (Some(a), Some(i)))
+        .unwrap_or((None, None));
+    let mut rows = conn
+        .query(
+            &home_sql(),
+            cairn_db::turso::params![project_id, key, at, id, limit as i64],
+        )
+        .await?;
+    let mut candidates = Vec::new();
+    while let Some(r) = rows.next().await? {
+        candidates.push(HomeCandidate {
+            entry: HomeEntry {
+                at: r.i64(0)?,
+                id: r.text(1)?,
+                kind: r.text(2)?,
+                author: r.text(3)?,
+                target: r.opt_text(4)?,
+                body: r.opt_text(5)?.unwrap_or_default(),
+                source: r.text(6)?,
+            },
+            event: r
+                .opt_text(7)?
+                .map(|_| HotRow::from_row_at(&r, 9))
+                .transpose()?,
+        });
+    }
+    Ok(candidates)
+}
+
+fn home_entry_body(body: String) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -166,8 +233,9 @@ fn home_entry_body(row: &cairn_db::turso::Row) -> Option<String> {
 /// off the size of the corpus:
 ///
 /// - **The candidate walk selects keys, never bodies.** Each branch picks its
-///   own newest `?5` rows as `(created_at, id)` and joins back to the row only
-///   for the ones that survive. Carrying `e.data` through the sort instead --
+///   own newest `?5` rows as `(created_at, id)`. Only the global top-N joins back
+///   to full message and event rows, within the same statement. Carrying
+///   `e.data` through the sort instead --
 ///   which is what selecting the body inline does -- materializes every
 ///   candidate body in the sorter to return fifty of them, and event bodies are
 ///   the largest column in the database.
@@ -188,6 +256,7 @@ fn home_entry_body(row: &cairn_db::turso::Row) -> Option<String> {
 /// across a page boundary to prove it.
 fn home_sql() -> String {
     let prose = PROSE_SHAPE;
+    let hot_columns = HotRow::columns(Some("e"));
     format!(
         r#"
 WITH thread_runs AS (
@@ -197,9 +266,9 @@ WITH thread_runs AS (
 ), home_entries AS (
  SELECT * FROM (
   SELECT pick.at at,pick.id id,'say' kind,'cairn://p/'||?2||'/'||tr.thread_name author,NULL target,
-  e.data body,'cairn://p/'||?2||'/'||tr.thread_name||'/chat/turn/'||pick.seq source,e.data_blob data_blob,e.codec codec
+  'cairn://p/'||?2||'/'||tr.thread_name||'/chat/turn/'||pick.seq source,pick.run_id run_id,pick.event_rowid event_rowid
   FROM (
-   SELECT e.created_at at,e.id id,e.run_id run_id,tu.sequence seq
+   SELECT e.created_at at,e.id id,e.run_id run_id,tu.sequence seq,e.rowid event_rowid
    FROM thread_runs tr
    CROSS JOIN events e INDEXED BY idx_events_home_prose ON e.run_id=tr.run_id AND e.event_type='assistant'
    JOIN turns tu ON tu.id=e.turn_id
@@ -207,16 +276,15 @@ WITH thread_runs AS (
    AND (?3 IS NULL OR e.created_at<?3 OR (e.created_at=?3 AND e.id<?4))
    ORDER BY e.created_at DESC,e.id DESC LIMIT ?5
   ) pick
-  JOIN events e ON e.id=pick.id
   JOIN thread_runs tr ON tr.run_id=pick.run_id
   ORDER BY pick.at DESC,pick.id DESC LIMIT ?5
  )
  UNION ALL
  SELECT * FROM (
   SELECT pick.at,pick.id,'say','operator',NULL,
-  e.data,'cairn://p/'||?2||'/'||tr.thread_name||'/chat/turn/'||pick.seq,e.data_blob,e.codec
+  'cairn://p/'||?2||'/'||tr.thread_name||'/chat/turn/'||pick.seq,pick.run_id,pick.event_rowid
   FROM (
-   SELECT e.created_at at,e.id id,e.run_id run_id,tu.sequence seq
+   SELECT e.created_at at,e.id id,e.run_id run_id,tu.sequence seq,e.rowid event_rowid
    FROM thread_runs tr
    CROSS JOIN events e INDEXED BY idx_events_home_prose ON e.run_id=tr.run_id AND e.event_type='user'
    JOIN turns tu ON tu.id=e.turn_id AND tu.start_reason IN ('initial','follow_up')
@@ -225,14 +293,13 @@ WITH thread_runs AS (
    AND (?3 IS NULL OR e.created_at<?3 OR (e.created_at=?3 AND e.id<?4))
    ORDER BY e.created_at DESC,e.id DESC LIMIT ?5
   ) pick
-  JOIN events e ON e.id=pick.id
   JOIN thread_runs tr ON tr.run_id=pick.run_id
   ORDER BY pick.at DESC,pick.id DESC LIMIT ?5
  )
  UNION ALL
  SELECT * FROM (
   SELECT pick.at,pick.id,'message',m.sender_name,
-  CASE WHEN recipient.thread_name IS NULL THEN NULL ELSE 'cairn://p/'||?2||'/'||recipient.thread_name END,m.content,
+  CASE WHEN recipient.thread_name IS NULL THEN NULL ELSE 'cairn://p/'||?2||'/'||recipient.thread_name END,
   CASE WHEN sender.thread_name IS NOT NULL THEN 'cairn://p/'||?2||'/'||sender.thread_name||'/messages' ELSE 'cairn://p/'||?2||'/'||recipient.thread_name||'/messages' END,NULL,NULL
   FROM (
    SELECT m.created_at at,m.id id FROM messages m
@@ -249,7 +316,7 @@ WITH thread_runs AS (
  )
  UNION ALL
  SELECT * FROM (
-  SELECT pick.at,pick.id,'message',m.sender_name,'cairn://p/'||?2||'/'||t.name,m.content,'cairn://p/'||?2||'/'||t.name||'/messages',NULL,NULL
+  SELECT pick.at,pick.id,'message',m.sender_name,'cairn://p/'||?2||'/'||t.name,'cairn://p/'||?2||'/'||t.name||'/messages',NULL,NULL
   FROM (
    SELECT m.created_at at,m.id id FROM messages m
    JOIN threads t ON t.id=m.channel_id AND t.project_id=?1
@@ -263,7 +330,7 @@ WITH thread_runs AS (
  )
  UNION ALL
  SELECT * FROM (
-  SELECT pick.at,pick.id,'message',m.sender_name,NULL,m.content,'cairn://p/'||?2||'/messages',NULL,NULL
+  SELECT pick.at,pick.id,'message',m.sender_name,NULL,'cairn://p/'||?2||'/messages',NULL,NULL
   FROM (
    SELECT m.created_at at,m.id id FROM messages m INDEXED BY idx_messages_channel
    WHERE m.channel_type='project' AND m.channel_id=?1 AND trim(m.content)!=''
@@ -273,9 +340,15 @@ WITH thread_runs AS (
   JOIN messages m ON m.id=pick.id
   ORDER BY pick.at DESC,pick.id DESC LIMIT ?5
  )
+), selected_keys AS (
+ SELECT * FROM home_entries ORDER BY at DESC,id DESC LIMIT ?5
 )
-SELECT at,id,kind,author,target,body,source,data_blob,codec FROM home_entries
-ORDER BY at DESC,id DESC LIMIT ?5"#
+SELECT pick.at,pick.id,pick.kind,pick.author,pick.target,m.content,pick.source,
+       pick.run_id,pick.event_rowid,{hot_columns}
+FROM selected_keys pick
+LEFT JOIN events e ON e.rowid=pick.event_rowid
+LEFT JOIN messages m ON pick.event_rowid IS NULL AND m.id=pick.id
+ORDER BY pick.at DESC,pick.id DESC"#
     )
 }
 fn render(p: &HomePayload) -> String {
@@ -319,12 +392,9 @@ mod tests {
         let page = |before: Option<(i64, String)>| {
             let db = &db;
             async move {
-                db.read(move |conn| {
-                    let before = before.clone();
-                    Box::pin(async move { query_project_home(conn, "p", "proj", 2, before).await })
-                })
-                .await
-                .unwrap()
+                query_project_home(db, "p", "proj", 2, before)
+                    .await
+                    .unwrap()
             }
         };
         let first = page(None).await;
@@ -389,12 +459,13 @@ mod tests {
             Ok(())
         })}).await.unwrap();
 
-        let payload = db
-            .read(|conn| {
-                Box::pin(async move { query_project_home(conn, "p", "proj", 20, None).await })
-            })
+        let statements = db.read_statement_count();
+        let checkouts = db.read_checkout_count();
+        let payload = query_project_home(&db, "p", "proj", 20, None)
             .await
             .unwrap();
+        assert_eq!(db.read_statement_count() - statements, 1);
+        assert_eq!(db.read_checkout_count() - checkouts, 1);
 
         assert_eq!(
             payload
@@ -412,6 +483,336 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn hot_candidate_hydration_stays_one_statement_and_checkout_up_to_512() {
+        use cairn_db::storage::history_pack::testing::{publish_for_test, seed_fixture_execution};
+
+        let db = migrated_test_db("home-hot-read-count").await;
+        seed_fixture_execution(&db, "home-hot-read-count").await;
+        db.execute_script(
+            "INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES ('t','p','general',1,1);
+             UPDATE jobs SET thread_id='t',uri_segment='thread' WHERE id='job-1';
+             UPDATE turns SET start_reason='initial';",
+        ).await.unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                for i in 0..512 {
+                    let run = if i % 2 == 0 { "run-1" } else { "run-2" };
+                    let turn = if i % 2 == 0 { "turn-1" } else { "turn-2" };
+                    let kind = if i % 2 == 0 { "assistant" } else { "user" };
+                    conn.execute(
+                        "INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at,turn_id)
+                         VALUES (?1,?2,?3,?4,?5,?6,?4,?7)",
+                        cairn_db::turso::params![
+                            format!("home-count-{i}"), run, 100 + i, 1_000 + i, kind,
+                            format!(r#"{{"content":"entry {i}"}}"#), turn,
+                        ],
+                    ).await?;
+                }
+                Ok(())
+            })
+        }).await.unwrap();
+
+        // Publishing maps the selected runs but does not evict them. Neither
+        // an empty catalog nor a populated, un-evicted one may add source reads.
+        for catalogued in [false, true] {
+            if catalogued {
+                publish_for_test(&db, "exec-1").await;
+            }
+            for limit in [1, 50, 200, 512] {
+                let statements = db.read_statement_count();
+                let checkouts = db.read_checkout_count();
+                let transactions = db.read_transaction_count();
+                let page = query_project_home(&db, "p", "proj", limit, None)
+                    .await
+                    .unwrap();
+                assert_eq!(page.entries.len(), limit);
+                assert_eq!(page.entries[0].body, "entry 511");
+                assert_eq!(
+                    page.entries.last().unwrap().body,
+                    format!("entry {}", 512 - limit)
+                );
+                assert_eq!(
+                    db.read_statement_count() - statements,
+                    1,
+                    "catalogued={catalogued}, candidates={limit}: one candidate-and-body statement",
+                );
+                assert_eq!(
+                    db.read_checkout_count() - checkouts,
+                    1,
+                    "catalogued={catalogued}, candidates={limit}: one pooled read",
+                );
+                assert_eq!(db.read_transaction_count() - transactions, 1);
+                assert_eq!(db.live_connections(), 0);
+            }
+            // The resource's project lookup shares the candidate checkout,
+            // matching the original two statements within one read.
+            let statements = db.read_statement_count();
+            let checkouts = db.read_checkout_count();
+            let rendered = read_project_home(&db, "proj", &[]).await;
+            assert!(rendered.contains("entry 511"));
+            assert_eq!(db.read_statement_count() - statements, 2);
+            assert_eq!(db.read_checkout_count() - checkouts, 1);
+
+            // An empty candidate selection does not prime any source either.
+            let statements = db.read_statement_count();
+            let checkouts = db.read_checkout_count();
+            let page = query_project_home(&db, "p", "proj", 512, Some((0, String::new())))
+                .await
+                .unwrap();
+            assert!(page.entries.is_empty());
+            assert!(page.next_cursor.is_none());
+            assert_eq!(db.read_statement_count() - statements, 1);
+            assert_eq!(db.read_checkout_count() - checkouts, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn storeless_team_home_hydration_never_queries_the_private_history_catalog() {
+        use cairn_db::storage::events::history::HistorySource;
+        use cairn_db::storage::{MigrationRunner, TEAM_MIGRATIONS};
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("team-home.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        // Home's required prose index is currently private-only (cairn/6154).
+        // Supply that prerequisite to isolate history hydration on a storeless
+        // team schema; this fixture does not verify team bootstrap indexes.
+        db.execute(
+            format!(
+                "CREATE INDEX idx_events_home_prose ON events(run_id,event_type,created_at,id,turn_id) WHERE {}",
+                PROSE_SHAPE.replace("e.", ""),
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute_script(
+            "INSERT INTO teams(id,name,created_at,updated_at) VALUES ('team','Team',1,1);
+             INSERT INTO projects(id,team_id,name,key,repo_path,created_at,updated_at)
+               VALUES ('p','team','Project','proj','/tmp/team-home',1,1);
+             INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES ('t','p','general',1,1);
+             INSERT INTO jobs(id,project_id,thread_id,status,uri_segment,created_at,updated_at)
+               VALUES ('j','p','t','complete','thread',1,1);
+             INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES ('r','j','exited',1,1);
+             INSERT INTO turns(id,session_id,run_id,sequence,start_reason,created_at,updated_at)
+               VALUES ('tu','s','r',1,'initial',1,1);
+             INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at,turn_id)
+               VALUES ('team-home-event','r',1,1,'assistant','{\"content\":\"team prose\"}',1,'tu');",
+        ).await.unwrap();
+        assert!(db.content_store().is_none());
+        for source in [None, Some(HistorySource::Pack)] {
+            db.set_history_source_override(source);
+            let statements = db.read_statement_count();
+            let checkouts = db.read_checkout_count();
+            let page = query_project_home(&db, "p", "proj", 20, None)
+                .await
+                .unwrap();
+            assert_eq!(page.entries.len(), 1);
+            assert_eq!(page.entries[0].body, "team prose");
+            assert_eq!(db.read_statement_count() - statements, 1);
+            assert_eq!(db.read_checkout_count() - checkouts, 1);
+            assert_eq!(db.live_connections(), 0);
+        }
+        db.set_history_source_override(None);
+    }
+
+    async fn packed_home_fixture(
+        name: &str,
+    ) -> (
+        LocalDb,
+        cairn_db::storage::history_pack::testing::FixtureEvents,
+    ) {
+        use cairn_db::storage::history_pack::testing::{publish_for_test, seed_fixture_execution};
+
+        let db = migrated_test_db(name).await;
+        let events = seed_fixture_execution(&db, name).await;
+        db.execute_script(
+            "INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES ('t','p','general',1,1);
+             UPDATE jobs SET thread_id='t',uri_segment='thread' WHERE id='job-1';
+             UPDATE turns SET start_reason='initial';
+             INSERT INTO messages(id,channel_type,channel_id,sender_name,content,created_at)
+               VALUES ('home-message','thread','t','someone','a thread message',15);",
+        )
+        .await
+        .unwrap();
+        publish_for_test(&db, "exec-1").await;
+        (db, events)
+    }
+
+    #[tokio::test]
+    async fn reconstructed_home_pages_match_forced_pack_hydration() {
+        use cairn_db::storage::events::history::HistorySource;
+        use cairn_db::storage::history_pack::testing::read_both;
+
+        let (db, events) = packed_home_fixture("home-pack-parity").await;
+        let (hot, pack) = read_both(&db, || async {
+            let first = query_project_home(&db, "p", "proj", 2, None).await.unwrap();
+            let (at, id) = first.next_cursor.as_ref().unwrap().split_once(':').unwrap();
+            let second = query_project_home(
+                &db,
+                "p",
+                "proj",
+                2,
+                Some((at.parse().unwrap(), id.to_owned())),
+            )
+            .await
+            .unwrap();
+            (first, second)
+        })
+        .await;
+        assert_eq!(
+            serde_json::to_value(&hot).unwrap(),
+            serde_json::to_value(&pack).unwrap()
+        );
+        let entries: Vec<_> = hot.0.entries.iter().chain(&hot.1.entries).collect();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == events.restored)
+                .unwrap()
+                .body,
+            "the restored body",
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "home-message")
+                .unwrap()
+                .body,
+            "a thread message",
+        );
+        assert_eq!(db.live_connections(), 0);
+
+        // Keep a renderable hot candidate but change its body: a forced pack read
+        // must serve the packed text, not accidentally hydrate from the hot row.
+        db.execute(
+            "UPDATE events SET data='{\"content\":\"hot changed\"}' WHERE id=?1",
+            (events.second_run.as_str(),),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            query_project_home(&db, "p", "proj", 1, None)
+                .await
+                .unwrap()
+                .entries[0]
+                .body,
+            "hot changed",
+        );
+        db.set_history_source_override(Some(HistorySource::Pack));
+        let packed = query_project_home(&db, "p", "proj", 1, None).await.unwrap();
+        db.set_history_source_override(None);
+        assert_eq!(packed.entries[0].body, "second run");
+        assert_eq!(db.live_connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn evicted_home_candidates_use_pack_but_unmapped_candidates_keep_selected_hot_rows() {
+        let (db, _) = packed_home_fixture("home-mixed-eviction").await;
+        let expected = query_project_home(&db, "p", "proj", 20, None)
+            .await
+            .unwrap();
+        db.execute_script(
+            "UPDATE events SET data='{\"content\":\"changed hot prose\"}' WHERE event_type IN ('assistant','user') AND turn_id IS NOT NULL;
+             UPDATE history_tier SET evicted_at=5;
+             INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES ('hot-run','job-1','exited',30,30);
+             INSERT INTO turns(id,session_id,run_id,sequence,start_reason,created_at,updated_at)
+               VALUES ('hot-turn','hot-session','hot-run',1,'initial',30,30);
+             INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at,turn_id)
+               VALUES ('unmapped-hot-event','hot-run',1,30,'assistant','{\"content\":\"unmapped hot prose\"}',30,'hot-turn');",
+        ).await.unwrap();
+        db.mark_history_evicted();
+
+        let statements = db.read_statement_count();
+        let checkouts = db.read_checkout_count();
+        let actual = query_project_home(&db, "p", "proj", 20, None)
+            .await
+            .unwrap();
+        assert_eq!(actual.entries[0].id, "unmapped-hot-event");
+        assert_eq!(actual.entries[0].body, "unmapped hot prose");
+        assert_eq!(
+            serde_json::to_value(&actual.entries[1..]).unwrap(),
+            serde_json::to_value(&expected.entries).unwrap(),
+        );
+        assert_eq!(
+            db.read_statement_count() - statements,
+            2,
+            "one candidate/body statement and one batched source lookup; no hot row seeks"
+        );
+        assert_eq!(db.read_checkout_count() - checkouts, 2);
+        assert_eq!(db.live_connections(), 0);
+    }
+
+    struct HomeQuarantine(std::path::PathBuf);
+
+    impl Drop for HomeQuarantine {
+        fn drop(&mut self) {
+            use cairn_db::storage::quarantine::{quarantine, QuarantineSet};
+            quarantine().install_for(&self.0, QuarantineSet::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn home_withholds_quarantined_live_and_archived_prose_after_packing() {
+        use cairn_db::storage::history_pack::testing::read_both;
+        use cairn_db::storage::quarantine::{
+            quarantine, withheld_notice, QuarantineSet, TRANSCRIPT_EVENT_SINK,
+        };
+
+        let (db, events) = packed_home_fixture("home-quarantine").await;
+        let guard = HomeQuarantine(std::path::PathBuf::from("home-quarantine-test"));
+        // Install after packing, so the pack contains the original text and
+        // only the read-time gate can prevent it from reaching Home.
+        quarantine().install_for(
+            &guard.0,
+            QuarantineSet::from_entries(
+                [events.plain, events.restored, events.second_run]
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            TRANSCRIPT_EVENT_SINK.to_string(),
+                            id,
+                            "home-incident".to_string(),
+                        )
+                    }),
+            ),
+        );
+        let (hot, pack) = read_both(&db, || async {
+            query_project_home(&db, "p", "proj", 20, None)
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(
+            serde_json::to_value(&hot).unwrap(),
+            serde_json::to_value(&pack).unwrap()
+        );
+        assert_eq!(hot.entries.len(), 4);
+        for entry in &hot.entries {
+            assert_eq!(
+                entry.body,
+                if entry.kind == "say" {
+                    withheld_notice("home-incident")
+                } else {
+                    "a thread message".to_string()
+                },
+            );
+        }
+        let rendered = read_project_home(&db, "proj", &[]).await;
+        assert!(rendered.contains(&withheld_notice("home-incident")));
+        assert!(!rendered.contains("the restored body"));
+        assert!(!rendered.contains("second run"));
+        assert!(!rendered.contains("the task"));
+        assert_eq!(db.live_connections(), 0);
     }
 
     /// The prose predicate must answer "not prose" for a body that is not JSON,
@@ -534,11 +935,7 @@ mod tests {
         let noisy = seed_home_cost_corpus("home-cost-noisy.db", NOISE).await;
 
         let page = |db: &'static LocalDb| async move {
-            db.read(|conn| {
-                Box::pin(async move { query_project_home(conn, "p", "proj", 20, None).await })
-            })
-            .await
-            .unwrap()
+            query_project_home(db, "p", "proj", 20, None).await.unwrap()
         };
         let quiet: &'static LocalDb = Box::leak(Box::new(quiet));
         let noisy: &'static LocalDb = Box::leak(Box::new(noisy));
@@ -609,10 +1006,7 @@ mod tests {
         .await
         .unwrap();
 
-        let payload = db
-            .read(|conn| {
-                Box::pin(async move { query_project_home(conn, "p", "proj", 20, None).await })
-            })
+        let payload = query_project_home(&db, "p", "proj", 20, None)
             .await
             .unwrap();
         let seen: Vec<_> = payload
@@ -673,10 +1067,7 @@ mod tests {
         .await
         .unwrap();
 
-        let payload = db
-            .read(|conn| {
-                Box::pin(async move { query_project_home(conn, "p", "proj", 20, None).await })
-            })
+        let payload = query_project_home(&db, "p", "proj", 20, None)
             .await
             .unwrap();
         assert_eq!(
@@ -728,12 +1119,9 @@ mod tests {
         let page = |before: Option<(i64, String)>| {
             let db = &db;
             async move {
-                db.read(move |conn| {
-                    let before = before.clone();
-                    Box::pin(async move { query_project_home(conn, "p", "proj", 50, before).await })
-                })
-                .await
-                .unwrap()
+                query_project_home(db, "p", "proj", 50, before)
+                    .await
+                    .unwrap()
             }
         };
 
@@ -1060,12 +1448,9 @@ mod tests {
         let page = |before: Option<(i64, String)>| {
             let db = &db;
             async move {
-                db.read(move |conn| {
-                    let before = before.clone();
-                    Box::pin(async move { query_project_home(conn, "p", "proj", 2, before).await })
-                })
-                .await
-                .unwrap()
+                query_project_home(db, "p", "proj", 2, before)
+                    .await
+                    .unwrap()
             }
         };
 

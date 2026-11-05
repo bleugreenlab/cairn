@@ -575,6 +575,36 @@ pub(crate) async fn prepare_session_for_test(
     prepare_session(db, job_id.to_string(), job, now).await
 }
 
+/// The job's latest run while it is non-terminal. A warm process counts: its run
+/// stays `live` between turns.
+pub async fn live_run_for_job(db: &LocalDb, job_id: &str) -> Result<Option<String>, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, status FROM runs WHERE job_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let status = row
+                .text(1)?
+                .parse::<RunStatus>()
+                .unwrap_or(RunStatus::Crashed);
+            if status.is_terminal() {
+                return Ok(None);
+            }
+            Ok(Some(row.text(0)?))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 pub(super) struct RunInsert {
     pub(super) run_id: String,
     pub(super) issue_id: Option<String>,

@@ -106,6 +106,7 @@ pub(crate) use lifecycle::{
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
+pub use persistence::live_run_for_job;
 pub(crate) use persistence::load_job_conn;
 pub(crate) use slash_commands::resolve_skill_slash_command;
 pub(crate) use snapshots::queued_user_transcript_event;
@@ -141,7 +142,7 @@ pub(crate) use turns::{
     abandon_pending_retry_if_head_matches, claim_retry_successor_if_head_matches,
     claim_retry_turn_start, consecutive_retry_turn_count,
 };
-pub(crate) use turns::{start_prepared_turn, start_turn, TURN_AWAITS_LAUNCH_SQL};
+pub(crate) use turns::{start_turn, TURN_AWAITS_LAUNCH_SQL};
 
 use config_loading::*;
 use inputs::*;
@@ -477,6 +478,15 @@ pub struct PreparedJob {
     /// dropping it early re-opens the job to a concurrent resume that would
     /// launch a second process against this same session (CAIRN-3283).
     pub launch_claim: Option<crate::orchestrator::JobLaunchClaim>,
+}
+
+/// What [`prepare_job`] did with a start.
+pub enum JobPreparation {
+    /// This start owns the launch; the host starts its session.
+    Prepared(Box<PreparedJob>),
+    /// Another launch of this job already holds the run and active turn this
+    /// start would have created. Nothing was prepared and nothing failed.
+    AlreadyLaunching { run_id: String },
 }
 
 fn run_start_mode(session_start: &crate::backends::SessionStart) -> &'static str {

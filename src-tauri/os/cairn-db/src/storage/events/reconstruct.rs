@@ -197,21 +197,46 @@ pub async fn reconstruct_events_reporting(
     db: &LocalDb,
     events: Vec<Event>,
 ) -> Vec<(Event, Reconstruction)> {
-    let reported = if events.iter().any(is_archived) {
-        let coords = load_coords(
+    let gathered = gather(db, &events).await;
+    finish_gathered(gathered, events)
+}
+
+/// Everything outside a batch's rows that reconstructing it needs: the
+/// coordinates, range packs and blobs its archived events point at. Built by
+/// [`gather`], spent by [`finish_gathered`]. Plain bytes and paths, so it can
+/// cross to a blocking thread.
+pub struct Gathered(Option<Coords>);
+
+/// The async half of [`reconstruct_events_reporting`]: one short read for the
+/// coordinates, then any store fetch, with nothing held open after. Gathers
+/// nothing when no event in the batch is archived.
+pub async fn gather(db: &LocalDb, events: &[Event]) -> Gathered {
+    if !events.iter().any(is_archived) {
+        return Gathered(None);
+    }
+    Gathered(Some(
+        load_coords(
             db,
-            &events,
+            events,
             content_store(db),
             has_local_blobs(db),
             db.private_route_db().map(Arc::as_ref),
         )
-        .await;
-        finish_reporting(coords, events)
-    } else {
-        events
+        .await,
+    ))
+}
+
+/// The synchronous half of [`reconstruct_events_reporting`]: reconstruct each
+/// event from what [`gather`] fetched for this same batch, then apply the
+/// quarantine gate. Does CPU work only, so a caller may run it on a blocking
+/// thread.
+pub fn finish_gathered(gathered: Gathered, events: Vec<Event>) -> Vec<(Event, Reconstruction)> {
+    let reported = match gathered.0 {
+        Some(coords) => finish_reporting(coords, events),
+        None => events
             .into_iter()
             .map(|event| (event, Reconstruction::Stored))
-            .collect()
+            .collect(),
     };
     let (mut events, outcomes): (Vec<Event>, Vec<Reconstruction>) = reported.into_iter().unzip();
     // The quarantine gate runs last here exactly as in `withheld`, for the same
@@ -249,6 +274,10 @@ async fn load_coords(
 ) -> Coords {
     let run_ids = gitcoord_run_ids(events);
     let hashes = blobbed_hashes(events);
+    // Inline zstd bodies need decoding but no database or content-store context.
+    if run_ids.is_empty() && hashes.is_empty() {
+        return Coords::default();
+    }
     let rows = db
         .read(move |conn| {
             Box::pin(async move {
@@ -1781,7 +1810,20 @@ mod tests {
                 Some(CODEC_ZSTD_V1),
             ),
         ];
+        let before = (
+            db.read_statement_count(),
+            db.read_checkout_count(),
+            db.read_transaction_count(),
+        );
         let reported = reconstruct_events_reporting(&db, events).await;
+        assert_eq!(
+            (
+                db.read_statement_count(),
+                db.read_checkout_count(),
+                db.read_transaction_count()
+            ),
+            before
+        );
         assert_eq!(
             outcomes(&reported),
             [Reconstruction::Stored, Reconstruction::Restored]
@@ -1847,7 +1889,20 @@ mod tests {
             Some(b"not a zstd frame".to_vec()),
             Some(CODEC_ZSTD_V1),
         );
+        let before = (
+            db.read_statement_count(),
+            db.read_checkout_count(),
+            db.read_transaction_count(),
+        );
         let reported = reconstruct_events_reporting(&db, vec![event]).await;
+        assert_eq!(
+            (
+                db.read_statement_count(),
+                db.read_checkout_count(),
+                db.read_transaction_count()
+            ),
+            before
+        );
         assert_eq!(outcomes(&reported), [Reconstruction::Undecodable]);
         assert_eq!(reported[0].0.data, "{\"_archived\":true}");
     }
@@ -1877,7 +1932,20 @@ mod tests {
                 "incident-1".to_string(),
             )]),
         );
+        let before = (
+            db.read_statement_count(),
+            db.read_checkout_count(),
+            db.read_transaction_count(),
+        );
         let reported = reconstruct_events_reporting(&db, vec![event]).await;
+        assert_eq!(
+            (
+                db.read_statement_count(),
+                db.read_checkout_count(),
+                db.read_transaction_count()
+            ),
+            before
+        );
         quarantine().install_for(source, QuarantineSet::default());
         assert_eq!(outcomes(&reported), [Reconstruction::Withheld]);
         assert!(!reported[0].0.data.contains("sk-secret"));

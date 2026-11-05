@@ -91,6 +91,8 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
+use crate::storage::events::history::{EventFilter, HistoryReader, HotRow};
+
 use super::embedder::{Corpus, Embed, EmbedFailure, Purpose};
 use super::space::{Reconciled, SpaceKeeper, Trigger};
 use super::turns::{gate_wait, install_boundary, REJECTED_PAUSE_SECS};
@@ -699,7 +701,7 @@ async fn run_steps(db: &LocalDb, run_id: &str) -> DbResult<Vec<Step>> {
         .collect();
     let mut restored_errors = std::collections::HashSet::new();
     let mut restored_prose = std::collections::HashSet::new();
-    for event in load_events(db, &archived).await? {
+    for event in load_events(db, &mut HistoryReader::new(db), &archived).await? {
         let is_error = serde_json::from_str::<serde_json::Value>(&event.data)
             .ok()
             .and_then(|data| data.get("isError").and_then(|flag| flag.as_bool()))
@@ -722,46 +724,62 @@ async fn run_steps(db: &LocalDb, run_id: &str) -> DbResult<Vec<Step>> {
         .collect())
 }
 
-/// The events `ids` names, restored from the archive where they are archived.
-/// An archived event whose stored form does not decode is left out: its
-/// `data` is still the storage stub, not anything the agent wrote.
-async fn load_events(db: &LocalDb, ids: &[String]) -> DbResult<Vec<crate::models::Event>> {
-    use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
-    let mut events = Vec::new();
+/// The sample's id locator and hot bodies are one indexed statement per page.
+/// Source selection is primed once across all selected runs, after release.
+fn vibe_events_sql(count: usize) -> String {
+    let placeholders = (1..=count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {} FROM events WHERE id IN ({placeholders})",
+        HotRow::columns(None)
+    )
+}
+
+async fn load_events(
+    db: &LocalDb,
+    reader: &mut HistoryReader<'_>,
+    ids: &[String],
+) -> DbResult<Vec<crate::models::Event>> {
+    let mut selected = Vec::new();
     for page in ids.chunks(256) {
-        let placeholders = (1..=page.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
         let values: Vec<Value> = page.iter().map(|id| Value::Text(id.clone())).collect();
-        let loaded = db
-            .query_all(
-                format!("SELECT {EVENT_COLUMNS} FROM events WHERE id IN ({placeholders})"),
-                values,
-                event_from_row,
-            )
-            .await?;
-        events.extend(
-            crate::storage::reconstruct_events_reporting(db, loaded)
-                .await
-                .into_iter()
-                .filter(|(_, outcome)| *outcome != crate::storage::Reconstruction::Undecodable)
-                .map(|(event, _)| event),
+        selected.extend(
+            db.query_all(vibe_events_sql(page.len()), values, |row| {
+                HotRow::from_row_at(row, 0)
+            })
+            .await?,
         );
     }
-    Ok(events)
+    let rows = reader
+        .hydrate_selected_hot_rows(selected, EventFilter::default())
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.reconstruction != crate::storage::Reconstruction::Undecodable)
+        .map(|row| row.event)
+        .collect())
 }
 
 /// The embeddable text of each of `ids` that has any.
+///
+/// A sample names its events by id alone, so each event's run is looked up from
+/// its hot row. An event with no hot row leaves the sample, whether it was
+/// deleted or evicted, which is what the sample already does with an event it
+/// cannot read.
 async fn load_texts(db: &LocalDb, ids: &[String]) -> DbResult<HashMap<String, String>> {
-    Ok(load_events(db, ids)
-        .await?
-        .into_iter()
-        .filter_map(|event| {
-            let text = extract_embeddable_text(&event.data)?.trim().to_string();
-            (!text.is_empty()).then_some((event.id, text))
-        })
-        .collect())
+    let mut texts = HashMap::new();
+    let mut history = HistoryReader::new(db);
+    for event in load_events(db, &mut history, ids).await? {
+        if let Some(text) = extract_embeddable_text(&event.data) {
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                texts.insert(event.id, text);
+            }
+        }
+    }
+    Ok(texts)
 }
 
 // ===== storage =====
@@ -1212,6 +1230,97 @@ mod tests {
             keeper.vibe_progress(),
             Some(VibeAxesProgress::NotEnoughHistory { counts, .. }) if counts == ClassCounts::default()
         ));
+    }
+
+    #[tokio::test]
+    async fn vibe_id_lookup_cost_is_one_statement_per_256_ids() {
+        use crate::storage::history_pack::testing::{publish_for_test, seed_fixture_execution};
+        let db = crate::storage::migrated_test_db("vibe-hot-id-cost").await;
+        seed_fixture_execution(&db, "vibe-hot-id-cost").await;
+        let ids: Vec<String> = (0..513).map(|n| format!("vibe-hot-{n}")).collect();
+        for (n, id) in ids.iter().enumerate() {
+            db.execute(
+                "INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at)
+                VALUES(?1,?2,?3,1,'assistant','{\"content\":\"text\"}',1)",
+                params![
+                    id.as_str(),
+                    if n % 2 == 0 { "run-1" } else { "run-2" },
+                    n as i64 + 100
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        for cataloged in [false, true] {
+            if cataloged {
+                publish_for_test(&db, "exec-1").await;
+            }
+            let before = (db.read_statement_count(), db.read_checkout_count());
+            assert_eq!(load_texts(&db, &ids).await.unwrap().len(), 513);
+            assert_eq!(
+                (
+                    db.read_statement_count() - before.0,
+                    db.read_checkout_count() - before.1
+                ),
+                (3, 3)
+            );
+            let before = (db.read_statement_count(), db.read_checkout_count());
+            assert!(load_texts(&db, &[]).await.unwrap().is_empty());
+            assert_eq!(
+                (
+                    db.read_statement_count() - before.0,
+                    db.read_checkout_count() - before.1
+                ),
+                (0, 0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vibe_selected_ids_keep_pack_and_quarantine_parity() {
+        use crate::storage::history_pack::testing::{
+            publish_for_test, read_both, seed_fixture_execution,
+        };
+        use crate::storage::quarantine::{quarantine, QuarantineSet, TRANSCRIPT_EVENT_SINK};
+        let db = crate::storage::migrated_test_db("vibe-selected-parity").await;
+        let events = seed_fixture_execution(&db, "vibe-selected-parity").await;
+        let ids = vec![events.restored.clone(), events.second_run];
+        publish_for_test(&db, "exec-1").await;
+        let (hot, pack) = read_both(&db, || load_texts(&db, &ids)).await;
+        let hot = hot.unwrap();
+        assert_eq!(hot, pack.unwrap());
+        assert_eq!(hot[&events.restored], "the restored body");
+        let source = tempfile::tempdir().unwrap();
+        quarantine().install_for(
+            source.path(),
+            QuarantineSet::from_entries([(
+                TRANSCRIPT_EVENT_SINK.to_string(),
+                events.restored.clone(),
+                "vibe-test".to_string(),
+            )]),
+        );
+        let (hot, pack) = read_both(&db, || load_texts(&db, &ids)).await;
+        quarantine().install_for(source.path(), QuarantineSet::default());
+        let hot = hot.unwrap();
+        assert_eq!(hot, pack.unwrap());
+        assert!(!hot.values().any(|text| text.contains("the restored body")));
+    }
+
+    #[tokio::test]
+    async fn vibe_metadata_and_body_id_plan_uses_primary_key_at_production_size() {
+        let db = crate::storage::migrated_test_db("vibe-id-plan").await;
+        let binds = (0..256)
+            .map(|n| Value::Text(format!("event-{n}")))
+            .collect();
+        let plan = crate::storage::query_plan(&db, &vibe_events_sql(256), binds).await;
+        assert!(
+            plan.contains("SEARCH events") && plan.contains("sqlite_autoindex_events"),
+            "{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN events") && !plan.contains("TEMP B-TREE"),
+            "{plan}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

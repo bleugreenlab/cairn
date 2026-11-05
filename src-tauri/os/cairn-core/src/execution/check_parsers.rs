@@ -175,6 +175,133 @@ pub struct ParsedCheckResult {
     /// on a branch, the base it subtracted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lint_findings: Option<LintFindings>,
+    /// The plan audit's one judgment of the lane (`scripts/lib/plan-audit.ts`).
+    /// `None` for a lane that carries no audit. Its rows that gate also appear
+    /// in `failures`, named [`PLAN_AUDIT_FAILURE_PREFIX`] and their identity, so
+    /// a branch's attribution reads them like tests; no test count includes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plan_audit: Option<ParsedPlanAudit>,
+}
+
+/// What a plan-audit failure's name opens with. The rest is its row's `id`.
+pub(crate) const PLAN_AUDIT_FAILURE_PREFIX: &str = "plan-audit ";
+
+/// The exit a runner leaves with when the audit gates on an otherwise clean
+/// run (`auditExitCode`). Any other nonzero exit is the run's own, so a gating
+/// audit never explains it.
+pub(crate) const PLAN_AUDIT_EXIT_CODE: i32 = 1;
+
+/// See [`ParsedCheckResult::plan_audit`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ParsedPlanAudit {
+    /// `evaluated` or `not-evaluated`.
+    pub(crate) state: String,
+    /// Why it was not evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+    /// No test ran, so there was nothing to judge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) ran_no_test: bool,
+    /// `full`, `filtered` or `empty`.
+    #[serde(default = "unknown_selection")]
+    pub(crate) selection: String,
+    #[serde(default)]
+    pub(crate) explained: usize,
+    #[serde(default)]
+    pub(crate) rows: Vec<PlanAuditRow>,
+    /// The measurements nothing here reads, carried so a reused row renders what
+    /// the row it reuses said.
+    #[serde(flatten)]
+    pub(crate) measurements: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ParsedPlanAudit {
+    pub(crate) fn evaluated(&self) -> bool {
+        self.state == "evaluated"
+    }
+
+    /// Whether a reader is told this run went unjudged. Only a narrow selection that
+    /// ran no test goes unsaid. Silence from tests that did run cannot tell a run that
+    /// reached no statement from a hook that stopped capturing, so `tls-sole-loader`,
+    /// whose one test touches no database, says so on every head.
+    pub(crate) fn tells_it_went_unjudged(&self) -> bool {
+        !self.evaluated() && (!self.ran_no_test || self.selection == "full")
+    }
+
+    pub(crate) fn gating(&self) -> impl Iterator<Item = &PlanAuditRow> {
+        self.rows.iter().filter(|row| row.gates())
+    }
+}
+
+/// One `(file, rule, table, statement)` identity's standing in a run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanAuditRow {
+    pub(crate) id: String,
+    /// `failed`, `allowlisted`, `reported` or `stale`.
+    pub(crate) status: String,
+    pub(crate) file: String,
+    pub(crate) rule: String,
+    pub(crate) table: String,
+    pub(crate) statement: String,
+    #[serde(default)]
+    pub(crate) lines: Vec<i64>,
+    #[serde(default)]
+    pub(crate) columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sql_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) issue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) known_shape: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) excerpt: Option<String>,
+}
+
+impl PlanAuditRow {
+    pub(crate) fn gates(&self) -> bool {
+        plan_audit_status_gates(&self.status)
+    }
+
+    fn failure(&self) -> CheckFailure {
+        let lines = self
+            .lines
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let site = format!("{}:{lines}", self.file);
+        let message = if self.status == "stale" {
+            format!(
+                "allowlist entry is stale: {} on {} was explained at {site} and came back clean; remove it{}",
+                self.rule,
+                self.table,
+                self.issue
+                    .as_deref()
+                    .map(|issue| format!(" ({issue})"))
+                    .unwrap_or_default()
+            )
+        } else {
+            format!(
+                "{} on {} at {site}: {}",
+                self.rule,
+                self.table,
+                self.sql_head.as_deref().unwrap_or("")
+            )
+        };
+        CheckFailure {
+            name: format!("{PLAN_AUDIT_FAILURE_PREFIX}{}", self.id),
+            message: Some(cap_chars(&message, MESSAGE_CHARS)),
+        }
+    }
+}
+
+/// Whether a stored finding's status turns a lane red.
+pub(crate) fn plan_audit_status_gates(status: &str) -> bool {
+    matches!(status, "failed" | "stale")
 }
 
 /// See [`ParsedCheckResult::lint_findings`] and `scripts/lib/eslint-lint-result.ts`.
@@ -213,6 +340,32 @@ impl ParsedCheckResult {
     /// The linted tree's whole finding set, when this result recorded one.
     pub(crate) fn lint_tree_findings(&self) -> Option<&[String]> {
         self.lint_findings.as_ref()?.tree.as_deref()
+    }
+
+    /// How many of the plan audit's rows gate.
+    pub(crate) fn plan_audit_gating(&self) -> usize {
+        self.plan_audit
+            .as_ref()
+            .map_or(0, |audit| audit.gating().count())
+    }
+
+    /// Whether `exit` is the plan audit's own red: a clean run the audit turned
+    /// nonzero, as opposed to a run that failed some other way beside it.
+    pub(crate) fn exit_is_plan_audits(&self, exit: Option<i32>) -> bool {
+        exit == Some(PLAN_AUDIT_EXIT_CODE) && self.plan_audit_gating() > 0
+    }
+
+    /// Why the plan audit did not judge this run, when it did not.
+    pub(crate) fn plan_audit_not_evaluated(&self) -> Option<String> {
+        self.plan_audit
+            .as_ref()
+            .filter(|audit| audit.tells_it_went_unjudged())
+            .map(|audit| {
+                audit
+                    .note
+                    .clone()
+                    .unwrap_or_else(|| "no reason recorded".to_string())
+            })
     }
 }
 
@@ -609,6 +762,7 @@ pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCh
             phases: None,
             unverified: Some(reason),
             lint_findings: None,
+            plan_audit: None,
         },
     })
 }
@@ -773,6 +927,10 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         .iter()
         .filter(|test| test.status == "deferred")
         .count();
+    // A block this core cannot read is the lane carrying no audit, never a red.
+    let plan_audit: Option<ParsedPlanAudit> = value
+        .get("planAudit")
+        .and_then(|audit| serde_json::from_value(audit.clone()).ok());
     let failures = tests
         .iter()
         .filter(|test| test.status == "failed")
@@ -783,8 +941,15 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
                 .clone()
                 .map(|message| cap_chars(first_line(&message), MESSAGE_CHARS)),
         })
+        .chain(
+            plan_audit
+                .iter()
+                .flat_map(ParsedPlanAudit::gating)
+                .map(PlanAuditRow::failure),
+        )
         .collect();
     Some(ParsedCheckResult {
+        plan_audit,
         schema_version: 1,
         complete,
         selection: value
@@ -876,6 +1041,7 @@ fn parse_lint_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         report,
         unverified: None,
         lint_findings,
+        plan_audit: None,
     })
 }
 
@@ -921,6 +1087,7 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
         failures,
         unverified: None,
         lint_findings: None,
+        plan_audit: None,
     })
 }
 
@@ -1063,6 +1230,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         failures,
         unverified: None,
         lint_findings: None,
+        plan_audit: None,
     })
 }
 
@@ -1166,6 +1334,7 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
         failures,
         unverified: None,
         lint_findings: None,
+        plan_audit: None,
     })
 }
 
@@ -1315,6 +1484,7 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
         failures,
         unverified: None,
         lint_findings: None,
+        plan_audit: None,
     })
 }
 
@@ -1548,6 +1718,7 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         failures,
         unverified: None,
         lint_findings: None,
+        plan_audit: None,
     })
 }
 
@@ -1648,12 +1819,38 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         failures,
         unverified: None,
         lint_findings: None,
+        plan_audit: None,
     })
 }
 
 // ---------------------------------------------------------------------------
 // Shared rendering helpers (pure) used by both surfaces.
 // ---------------------------------------------------------------------------
+
+/// The failure names a line shows, and how many it leaves out: every plan-audit
+/// identity, then tests up to [`MAX_FAILURE_NAMES`]. Audit rows follow the tests in
+/// `failures`, and a line is the only place a branch's finding is named, so a lane
+/// with five red tests must not lose it to the cap.
+pub(crate) fn shown_failure_names<S: AsRef<str>>(names: &[S]) -> (Vec<&str>, usize) {
+    let (audit, tests): (Vec<&str>, Vec<&str>) = names
+        .iter()
+        .map(AsRef::as_ref)
+        .partition(|name| name.starts_with(PLAN_AUDIT_FAILURE_PREFIX));
+    let shown = audit
+        .iter()
+        .chain(tests.iter().take(MAX_FAILURE_NAMES))
+        .copied()
+        .collect();
+    (shown, tests.len().saturating_sub(MAX_FAILURE_NAMES))
+}
+
+/// [`shown_failure_names`] on one line, with what it left out counted.
+pub(crate) fn join_failure_names<S: AsRef<str>>(names: &[S]) -> String {
+    match shown_failure_names(names) {
+        (shown, 0) => shown.join(", "),
+        (shown, more) => format!("{}, +{more} more", shown.join(", ")),
+    }
+}
 
 /// Render the one-line "what failed" fragment for a failing check:
 /// `3 failed: a, b, c +N more`. `None` when the parse carries no failing names
@@ -1662,20 +1859,20 @@ pub(crate) fn format_failure_names(parsed: &ParsedCheckResult) -> Option<String>
     if parsed.failures.is_empty() {
         return None;
     }
-    let shown: Vec<&str> = parsed
+    let names: Vec<&str> = parsed.failures.iter().map(|f| f.name.as_str()).collect();
+    let names = join_failure_names(&names);
+    let audit = parsed
         .failures
         .iter()
-        .take(MAX_FAILURE_NAMES)
-        .map(|f| f.name.as_str())
-        .collect();
-    let more = parsed.failures.len().saturating_sub(shown.len());
-    let names = if more > 0 {
-        format!("{}, +{more} more", shown.join(", "))
-    } else {
-        shown.join(", ")
+        .filter(|failure| failure.name.starts_with(PLAN_AUDIT_FAILURE_PREFIX))
+        .count();
+    let tests = parsed.failed.max(parsed.failures.len() - audit);
+    let count = match (tests, audit) {
+        (tests, 0) => format!("{tests} failed"),
+        (0, audit) => format!("plan audit: {audit} gating"),
+        (tests, audit) => format!("{tests} failed, plan audit: {audit} gating"),
     };
-    let count = parsed.failed.max(parsed.failures.len());
-    Some(format!("{count} failed: {names}"))
+    Some(format!("{count}: {names}"))
 }
 
 /// Build the bounded failure-detail excerpt for a failing check. When the parse
@@ -2352,6 +2549,120 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
         );
     }
 
+    const AUDITED_ARTIFACT: &str = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[{"id":"c::passes","status":"passed","attempts":1,"retried":false,"flaky":false}],"planAudit":{"state":"evaluated","selection":"full","explained":9,"rows":[{"id":"a.rs|wide-scan|events|aa","status":"failed","file":"a.rs","rule":"wide-scan","table":"events","statement":"aa","lines":[3,7],"columns":["data"],"sqlHead":"SELECT * FROM events"},{"id":"b.rs|wide-scan|events|bb","status":"stale","file":"b.rs","rule":"wide-scan","table":"events","statement":"bb","lines":[4],"columns":[],"issue":"cairn://p/cairn/1"},{"id":"c.rs|wide-scan|events|cc","status":"allowlisted","file":"c.rs","rule":"wide-scan","table":"events","statement":"cc","lines":[5],"columns":[],"issue":"cairn://p/cairn/2","kind":"debt"},{"id":"d.rs|range-past-blob|events|dd","status":"reported","file":"d.rs","rule":"range-past-blob","table":"events","statement":"dd","lines":[6],"columns":[]}],"unseen":["e.rs|wide-scan|events|ee"],"rawSites":{"total":1,"top":[]}}}"#;
+
+    /// Gating rows read like failures to a branch's attribution, and no test
+    /// count moves: the run still passed its one test.
+    #[test]
+    fn a_plan_audit_block_names_what_gates_and_leaves_the_test_counts_alone() {
+        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{AUDITED_ARTIFACT}\n");
+        let parsed = parse_check_output("bun run test:rust:full", &output).unwrap();
+        assert_eq!(
+            (parsed.passed, parsed.failed, parsed.tests_run()),
+            (1, 0, 1)
+        );
+        assert_eq!(parsed.plan_audit_gating(), 2);
+        let names: Vec<_> = parsed.failures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "plan-audit a.rs|wide-scan|events|aa",
+                "plan-audit b.rs|wide-scan|events|bb"
+            ]
+        );
+        let failure = &parsed.failures[0];
+        assert_eq!(
+            failure.message.as_deref(),
+            Some("wide-scan on events at a.rs:3,7: SELECT * FROM events")
+        );
+        assert!(parsed.failures[1]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("allowlist entry is stale:")));
+        assert!(format_failure_names(&parsed)
+            .unwrap()
+            .starts_with("plan audit: 2 gating: "));
+    }
+
+    /// A reused row renders what the row it reuses said, measurements included.
+    #[test]
+    fn a_plan_audit_block_survives_the_stored_round_trip_whole() {
+        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{AUDITED_ARTIFACT}\n");
+        let parsed = parse_check_output("bun run test:rust:full", &output).unwrap();
+        let stored = serde_json::to_string(&parsed).unwrap();
+        let reread: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
+        assert_eq!(reread.plan_audit, parsed.plan_audit);
+        let audit = reread.plan_audit.unwrap();
+        assert_eq!(audit.measurements["unseen"][0], "e.rs|wide-scan|events|ee");
+        assert_eq!(audit.rows[2].kind.as_deref(), Some("debt"));
+    }
+
+    fn unjudged(selection: &str, ran_no_test: bool) -> ParsedCheckResult {
+        let artifact = serde_json::json!({
+            "schemaVersion": 1, "parser": "nextest", "complete": true, "selection": selection,
+            "undeclaredSkips": 0,
+            "tests": [{"id": "c::t", "status": "passed", "attempts": 1, "retried": false, "flaky": false}],
+            "planAudit": {
+                "state": "not-evaluated", "note": "why", "selection": selection,
+                "ranNoTest": ran_no_test, "rows": [],
+            },
+        });
+        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{artifact}\n");
+        parse_check_output("bun run test:rust", &output).unwrap()
+    }
+
+    /// A narrow selection that ran no test stays stored and is not news. Anything
+    /// else that kept the audit from judging is said, at any selection.
+    #[test]
+    fn only_a_narrow_selection_that_ran_no_test_goes_unsaid() {
+        let said = |selection, ran_no_test| {
+            unjudged(selection, ran_no_test)
+                .plan_audit_not_evaluated()
+                .is_some()
+        };
+        assert!(!said("filtered", true));
+        assert!(said("filtered", false));
+        assert!(said("full", true));
+        assert!(said("full", false));
+
+        let stored = unjudged("filtered", true);
+        assert_eq!(
+            stored.plan_audit.as_ref().unwrap().state,
+            "not-evaluated",
+            "the row keeps its state for a consumer that reads it with the selection"
+        );
+        let reread: ParsedCheckResult =
+            serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+        assert!(reread.plan_audit.unwrap().ran_no_test);
+    }
+
+    /// Audit rows follow the tests in `failures`, so a cap counted over the whole
+    /// list would never reach them.
+    #[test]
+    fn every_plan_audit_name_outlives_the_cap() {
+        let mut names: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+        names.extend(["plan-audit a".to_string(), "plan-audit b".to_string()]);
+        assert_eq!(
+            join_failure_names(&names),
+            "plan-audit a, plan-audit b, t0, t1, t2, t3, t4, +3 more"
+        );
+        assert_eq!(
+            join_failure_names(&["t0", "plan-audit a"]),
+            "plan-audit a, t0"
+        );
+    }
+
+    /// A block a core cannot read is the lane carrying no audit, never a red.
+    #[test]
+    fn an_unreadable_plan_audit_block_is_no_audit() {
+        let artifact = AUDITED_ARTIFACT.replace("\"state\":\"evaluated\",", "");
+        let output = format!("{RESULT_ARTIFACT_JSON_MARKER}{artifact}\n");
+        let parsed = parse_check_output("bun run test:rust:full", &output).unwrap();
+        assert_eq!(parsed.plan_audit, None);
+        assert!(parsed.failures.is_empty());
+        assert_eq!(parsed.passed, 1);
+    }
+
     /// A fast-tier artifact, shaped as `scripts/test-rust-nextest.ts tiered`
     /// writes it: one related test run in full, one budget-sized pass, one
     /// genuine failure that happened before the budget, and two deferrals.
@@ -2773,6 +3084,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                 })
                 .collect(),
             lint_findings: None,
+            plan_audit: None,
         };
         let s = format_failure_names(&parsed).unwrap();
         assert!(s.starts_with("8 failed: f0, f1, f2, f3, f4"));
@@ -2799,6 +3111,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             failures: vec![],
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         };
         assert!(format_failure_names(&parsed).is_none());
     }
@@ -2982,6 +3295,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             }],
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         };
         let e = format_failure_excerpt(Some(&with_msgs), "RAW TAIL");
         assert_eq!(e, "suite test: AssertionError: boom");
@@ -3007,6 +3321,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             }],
             unverified: None,
             lint_findings: None,
+            plan_audit: None,
         };
         assert_eq!(
             format_failure_excerpt(Some(&no_msgs), "panic at src/lib.rs"),

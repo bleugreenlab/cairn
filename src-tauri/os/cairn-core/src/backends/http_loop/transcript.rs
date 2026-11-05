@@ -12,7 +12,7 @@
 use crate::agent_process::stdin::MessageContent;
 use crate::agent_process::stream::TranscriptEvent;
 use crate::orchestrator::Orchestrator;
-use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
+use crate::storage::events::history::{EventFilter, HistoryReader};
 use crate::storage::run_db_blocking;
 
 /// One prior transcript row, decoded.
@@ -55,30 +55,25 @@ pub(in crate::backends) fn load_prior_rows(
     let project_key = project_key.to_string();
     run_db_blocking(|| async move {
         let session_db = crate::projects::crud::owning_db(&orch.db, &project_id).await?;
-        let rows = session_db
-            .query_all(
-                format!(
-                    "SELECT {EVENT_COLUMNS} FROM events
-                     WHERE session_id = ?1
-                       AND run_id != ?2
-                       AND (event_type IN ('user', 'assistant', 'tool_result')
-                            OR event_type = ?3)
-                     ORDER BY created_at ASC, rowid ASC"
-                ),
-                (
-                    session_id.clone(),
-                    current_run_id.clone(),
+        // A session resumed after its issue was resolved and reopened has
+        // archived rows whose `data` is only a stub; the seam restores them.
+        let rows = HistoryReader::new(&session_db)
+            .session_events(
+                &session_id,
+                Some(&current_run_id),
+                EventFilter::types(&[
+                    "user",
+                    "assistant",
+                    "tool_result",
                     crate::transcripts::LAUNCH_EVENT_TYPE,
-                ),
-                event_from_row,
+                ]),
             )
             .await
-            .map_err(|error| error.to_string())?;
-        // A session resumed after its issue was resolved and reopened has
-        // archived rows whose `data` is only a stub; restore them first.
-        let rows = crate::storage::reconstruct_events(&session_db, rows).await;
+            .map_err(|error| error.to_string())?
+            .rows;
         let mut out = Vec::new();
-        for stored in rows {
+        for row in rows {
+            let stored = row.event;
             let event_type = stored.event_type;
             let Ok(event) = serde_json::from_str::<TranscriptEvent>(&stored.data) else {
                 continue;
@@ -116,6 +111,7 @@ mod tests {
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, SearchIndex};
+    use cairn_db::turso::params;
     use cairn_session::agent_process::stream::TranscriptJson;
     use std::sync::Arc;
 
@@ -216,5 +212,94 @@ mod tests {
         };
         assert_eq!(event_type, "tool_result");
         assert_eq!(event.tool_result.as_deref(), Some("tool output"));
+    }
+
+    /// What a replay carries, row by row, for comparing two replays.
+    fn shape(rows: &[ReplayRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                ReplayRow::User(content) => format!("user {content:?}"),
+                ReplayRow::Event { event_type, event } => {
+                    format!("{event_type} {:?} {:?}", event.content, event.tool_result)
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn replay_session_hot_cost_is_one_statement_even_across_reconstruction_batches() {
+        use crate::storage::history_pack::testing::{publish_for_test, seed_fixture_execution};
+        let db = crate::storage::migrated_test_db("replay-hot-cost").await;
+        seed_fixture_execution(&db, "replay-hot-cost").await;
+        db.write(|conn| Box::pin(async move {
+            for n in 0..1030i64 {
+                conn.execute("INSERT INTO events(id,run_id,session_id,sequence,timestamp,event_type,data,created_at)
+                    VALUES(?1,'run-1','sess-1',?2,1,'assistant','{\"content\":\"replay\"}',1)",
+                    params![format!("replay-hot-{n}"), n + 100]).await?;
+            }
+            Ok(())
+        })).await.unwrap();
+        for cataloged in [false, true] {
+            if cataloged {
+                publish_for_test(&db, "exec-1").await;
+            }
+            let before = (db.read_statement_count(), db.read_checkout_count());
+            let rows = HistoryReader::new(&db)
+                .session_events(
+                    "sess-1",
+                    Some("other-run"),
+                    EventFilter::types(&[
+                        "user",
+                        "assistant",
+                        "tool_result",
+                        crate::transcripts::LAUNCH_EVENT_TYPE,
+                    ]),
+                )
+                .await
+                .unwrap()
+                .rows;
+            assert!(rows.len() >= 1030);
+            assert_eq!(
+                (
+                    db.read_statement_count() - before.0,
+                    db.read_checkout_count() - before.1
+                ),
+                (1, 1)
+            );
+        }
+    }
+
+    /// A replay rebuilds the same conversation from a pack as from hot rows,
+    /// leaving out the current run and every type it does not replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replay_reads_the_same_through_a_pack() {
+        use crate::storage::history_pack::testing::{
+            evict_all, publish_for_test, read_both, seed_fixture_execution,
+        };
+        let db = crate::storage::migrated_test_db("http-replay-pack.db").await;
+        seed_fixture_execution(&db, "http-replay-pack").await;
+        publish_for_test(&db, "exec-1").await;
+        let orch = test_orchestrator(db);
+        let local = orch.db.local.clone();
+
+        let replay = |current_run: &'static str| {
+            load_prior_rows(&orch, "sess-1", current_run, "p", "proj")
+                .map(|rows| shape(&rows))
+                .unwrap()
+        };
+        let (hot, forced) = read_both(&local, || async { replay("run-9") }).await;
+        assert_eq!(hot, forced);
+        assert!(
+            hot.iter().any(|row| row.contains("the restored body")),
+            "{hot:?}"
+        );
+        assert!(
+            hot.iter().all(|row| !row.contains("system:")),
+            "a type the replay leaves out: {hot:?}"
+        );
+        assert!(replay("run-1").is_empty(), "the current run is left out");
+
+        evict_all(&local).await;
+        assert_eq!(hot, replay("run-9"), "only the pack can answer now");
     }
 }

@@ -42,7 +42,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::execution::cache::{CheckResultCacheEntry, OBSERVED_INFRA_FAILURE_BOUND};
-use crate::execution::check_parsers::{ParsedCheckResult, MAX_FAILURE_NAMES};
+use crate::execution::check_parsers::{
+    shown_failure_names, ParsedCheckResult, PLAN_AUDIT_FAILURE_PREFIX,
+};
 use crate::execution::checks::CheckOutcome;
 use crate::execution::checks_main::{
     first_parent_ancestry, nearest_row_on_chain, rates_on_chain, CadenceRow, ExecutorNames,
@@ -115,16 +117,48 @@ pub(crate) fn partition(
         uncovered: Vec::new(),
     };
     for name in failures {
-        let bucket = match main_row.and_then(|row| row.tests.get(name)) {
-            Some(TestOutcome::Failed(_)) => &mut attribution.red_on_main,
-            Some(TestOutcome::Passed) => &mut attribution.branch,
-            // A test main skipped was not observed there, any more than a
-            // test main does not have.
-            Some(TestOutcome::Skipped) | None => &mut attribution.uncovered,
+        let standing = match name.strip_prefix(PLAN_AUDIT_FAILURE_PREFIX) {
+            Some(finding) => main_row.and_then(|row| audit_standing(row, finding)),
+            None => main_row
+                .and_then(|row| row.tests.get(name))
+                .and_then(|outcome| {
+                    match outcome {
+                        TestOutcome::Failed(_) => Some(MainStanding::Red),
+                        TestOutcome::Passed => Some(MainStanding::NotRed),
+                        // A test main skipped was not observed there, any more than
+                        // a test main does not have.
+                        TestOutcome::Skipped => None,
+                    }
+                }),
+        };
+        let bucket = match standing {
+            Some(MainStanding::Red) => &mut attribution.red_on_main,
+            Some(MainStanding::NotRed) => &mut attribution.branch,
+            None => &mut attribution.uncovered,
         };
         bucket.push(name.clone());
     }
     attribution
+}
+
+/// What main's row says of one failure a branch names. `None`: it did not
+/// observe it.
+enum MainStanding {
+    Red,
+    NotRed,
+}
+
+/// A plan-audit finding's standing on main's row. A row that evaluated its audit
+/// observed every statement its run explained, so a finding it does not hold in
+/// red is the branch's, whether absent or allowlisted there. A row that did not
+/// evaluate one observed nothing.
+fn audit_standing(row: &CadenceRow, finding: &str) -> Option<MainStanding> {
+    let audit = row.plan_audit.as_ref().filter(|audit| audit.evaluated)?;
+    Some(if audit.gates(finding) {
+        MainStanding::Red
+    } else {
+        MainStanding::NotRed
+    })
 }
 
 fn short(commit: &str) -> &str {
@@ -204,9 +238,9 @@ impl BaseAttribution {
         let mut lines = Vec::new();
         if let Some(row) = &self.main_row {
             if !self.red_on_main.is_empty() {
-                let shown =
-                    self.red_on_main[..self.red_on_main.len().min(MAX_FAILURE_NAMES)].join(", ");
-                let more = match self.red_on_main.len().saturating_sub(MAX_FAILURE_NAMES) {
+                let (shown, capped) = shown_failure_names(&self.red_on_main);
+                let shown = shown.join(", ");
+                let more = match capped {
                     0 => String::new(),
                     more => format!(", +{more} more, every one red on {}", row.observation),
                 };
@@ -647,7 +681,134 @@ pub(crate) mod tests {
                 .collect::<BTreeMap<_, _>>(),
             output_tail: String::new(),
             lane_started_at_ms: None,
+            plan_audit: None,
         }
+    }
+
+    /// A finding `failed` on main's row is the base's, one absent from it or
+    /// merely allowlisted there is the branch's, and a row that did not judge its
+    /// audit observed none of them.
+    #[test]
+    fn a_plan_audit_failure_is_read_against_mains_audit() {
+        use crate::execution::checks_main::{AuditFinding, RowAudit};
+        let audited = |evaluated: bool| {
+            let mut row = main_row("4a52d52e0000", &[("t", "passed")]);
+            row.plan_audit = Some(RowAudit {
+                evaluated,
+                note: None,
+                findings: [
+                    ("red", "failed"),
+                    ("expired", "stale"),
+                    ("known", "allowlisted"),
+                ]
+                .into_iter()
+                .map(|(id, status)| {
+                    (
+                        id.to_string(),
+                        AuditFinding {
+                            status: status.to_string(),
+                            issue: None,
+                            excerpt: None,
+                        },
+                    )
+                })
+                .collect(),
+            });
+            row
+        };
+        let failures = names(&[
+            "plan-audit red",
+            "plan-audit expired",
+            "plan-audit known",
+            "plan-audit new",
+            "t",
+        ]);
+
+        let attribution = partition("4a52d52e0000", &failures, Some(&audited(true)));
+        assert_eq!(
+            attribution.red_on_main,
+            names(&["plan-audit red", "plan-audit expired"])
+        );
+        assert_eq!(
+            attribution.branch,
+            names(&["plan-audit known", "plan-audit new", "t"])
+        );
+        assert!(attribution.uncovered.is_empty());
+
+        for row in [audited(false), main_row("4a52d52e0000", &[("t", "passed")])] {
+            let attribution = partition("4a52d52e0000", &failures, Some(&row));
+            assert!(attribution.red_on_main.is_empty());
+            assert_eq!(attribution.branch, names(&["t"]));
+            assert_eq!(attribution.uncovered.len(), 4);
+        }
+    }
+
+    /// A gating audit on a tree whose tests all passed is a complete red with
+    /// something to attribute, on the stored row and on a fresh outcome alike.
+    #[test]
+    fn a_gating_audit_on_an_all_passed_tree_is_attributed() {
+        let parsed: ParsedCheckResult = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "complete": true, "selection": "full",
+            "parser": "nextest", "passed": 5, "failed": 0, "skipped": 0,
+            "failures": [{"name": "plan-audit a.rs|wide-scan|events|aa"}],
+        }))
+        .unwrap();
+        assert_eq!(
+            complete_red_failures(false, false, None, Some(&parsed)),
+            Some(vec!["plan-audit a.rs|wide-scan|events|aa".to_string()])
+        );
+    }
+
+    /// Only the base's reds are capped, and an audit finding is named past that
+    /// cap though it follows the tests in the list.
+    #[test]
+    fn the_bases_capped_reds_still_name_every_audit_finding() {
+        use crate::execution::checks_main::{AuditFinding, RowAudit};
+
+        let mut row = main_row(
+            "4a52d52e0000",
+            &[
+                ("t0", "failed"),
+                ("t1", "failed"),
+                ("t2", "failed"),
+                ("t3", "failed"),
+                ("t4", "failed"),
+                ("t5", "failed"),
+                ("t6", "failed"),
+                ("t7", "failed"),
+            ],
+        );
+        row.plan_audit = Some(RowAudit {
+            evaluated: true,
+            note: None,
+            findings: [(
+                "late".to_string(),
+                AuditFinding {
+                    status: "failed".to_string(),
+                    issue: None,
+                    excerpt: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let failures = names(&[
+            "t0",
+            "t1",
+            "t2",
+            "t3",
+            "t4",
+            "t5",
+            "t6",
+            "t7",
+            "plan-audit late",
+        ]);
+        let lines = partition("4a52d52e0000", &failures, Some(&row)).bucket_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("plan-audit late, t0, t1, t2, t3, t4, +3 more, every one red on"),
+            "{lines:?}"
+        );
     }
 
     fn names(tests: &[&str]) -> Vec<String> {

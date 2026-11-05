@@ -11,6 +11,7 @@ use cairn_core::internal::execution::advancement::{
 };
 use cairn_core::internal::execution::jobs::{
     continue_job_impl, prepare_job, promote_private_lanes_for_test, start_prepared_job_session,
+    JobPreparation,
 };
 use cairn_core::internal::orchestrator::lifecycle::{finalize_run, stop_job};
 use cairn_core::internal::orchestrator::wakes::{
@@ -225,7 +226,7 @@ async fn fixture() -> (TempDir, Arc<LocalDb>, Orchestrator, RecordedProcesses) {
         "triggerContext":{"projectId":"project","issueId":"issue","triggerType":"manual"},
         "createdAt":0
     }).to_string().replace('\'', "''");
-    db.execute_script(&format!("
+    db.execute_script(format!("
         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
           VALUES('project','default','Hold','hold','{root}',1,1);
         INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
@@ -508,8 +509,10 @@ async fn held_recipe_node_dispatches_dependents_only_after_resumed_work_complete
         text(&db, "SELECT status FROM jobs WHERE id=?1", "b").await,
         "running"
     );
-    let prepared = prepare_job(&orch, "b").unwrap();
-    start_prepared_job_session(&orch, prepared, None).unwrap();
+    let JobPreparation::Prepared(prepared) = prepare_job(&orch, "b").unwrap() else {
+        panic!("nothing else owns b's launch");
+    };
+    start_prepared_job_session(&orch, *prepared, None).unwrap();
     await_admission(&orch, "b", "active").await;
     assert_eq!(recorder.spawn_count(), 2);
 }
