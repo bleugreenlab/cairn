@@ -1626,7 +1626,7 @@ async fn store_artifact(
 /// A node that only ever writes one name increments exactly as a per-job chain
 /// did.
 async fn insert_next_artifact_version(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     artifact_type: &str,
     output_name: &str,

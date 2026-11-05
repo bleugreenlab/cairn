@@ -28,7 +28,7 @@
 //! run and the write and main cadences are never held by it, so a mislabelled
 //! red can always be re-run by hand and can never silence the main cadence.
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 use sha2::{Digest, Sha256};
 
 use crate::execution::cache::{CheckResultCacheEntry, SuppressedCheck, SuppressedScope};
@@ -159,7 +159,7 @@ pub(crate) fn short_signature(signature: &str) -> &str {
 /// latest wave only re-stamped it: that wave was held, under facts the record
 /// does not otherwise keep.
 pub(crate) async fn lane_trip_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     check_name: &str,
     input_hash: &str,
@@ -301,7 +301,7 @@ pub(crate) struct ReviewFailureFacts {
 /// observation records one. Review only, like the breaker: a manual re-test
 /// under different machines must not stand in for the review lane's record.
 pub(crate) async fn newest_review_failure_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     check_name: &str,
     input_hash: &str,
@@ -374,7 +374,7 @@ pub(crate) async fn newest_review_failure_conn(
 /// complete a tripped group, which is the next wave's answer while the fleet
 /// stays as it was.
 pub(crate) async fn held_lane_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     check_name: &str,
     input_hash: &str,

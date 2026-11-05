@@ -935,7 +935,7 @@ pub(crate) enum ConnRelease {
 /// too, so a patch and a release that overlap conflict and one retries
 /// against the other's committed result.
 pub(crate) async fn release_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_id: &str,
     now: i64,
     cause: &ReleaseCause,
@@ -1166,7 +1166,7 @@ pub(crate) fn wake_message_id(domain: &str, id: &str) -> String {
 /// Whether the wake with this message id was already delivered. Check it in
 /// the same transaction as [`send_wake_conn`].
 pub(crate) async fn wake_already_sent_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     message_id: &str,
 ) -> DbResult<bool> {
     Ok(crate::storage::query_opt_text_conn(
@@ -1181,7 +1181,7 @@ pub(crate) async fn wake_already_sent_conn(
 /// The run a wake to `recipient` addresses: its newest. `None` while the
 /// recipient has never run, which leaves the wake owed.
 pub(crate) async fn recipient_run_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     recipient: &str,
 ) -> DbResult<Option<String>> {
     crate::storage::query_opt_text_conn(
@@ -1194,7 +1194,7 @@ pub(crate) async fn recipient_run_conn(
 
 /// Insert the wake's message and its steering push.
 pub(crate) async fn send_wake_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     recipient: &str,
     recipient_run: &str,
     content: &str,
@@ -1351,7 +1351,7 @@ enum TenetRecipient {
 /// `None` when the tenet row is gone (its unanswered proposal was deleted with
 /// its thread), so the caller falls back to the filing thread.
 async fn tenet_proposer_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     clause: &TriggerClause,
 ) -> DbResult<Option<TenetRecipient>> {
     let Some(Ok((project, number))) = clause
@@ -1387,7 +1387,7 @@ async fn tenet_proposer_session_conn(
 /// its question back), so its exits are to ask again or to drop the work;
 /// releasing the execution around the operator is not offered.
 async fn foreclosure_message(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution: &HeldExecution,
     issue_id: &str,
     rendered: &str,

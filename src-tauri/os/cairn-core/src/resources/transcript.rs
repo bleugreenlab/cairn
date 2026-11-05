@@ -309,7 +309,7 @@ async fn read_event_page(
 /// A turn's event rows in sequence order, as stored. Statements only: hand the
 /// rows to [`reconstruct_turn_events`] once the read has released.
 pub(super) async fn turn_event_rows(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
 ) -> Vec<crate::models::Event> {
     let columns = crate::runs::queries::EVENT_COLUMNS;
@@ -351,7 +351,7 @@ pub(super) async fn reconstruct_turn_events(
 /// breaking same-second ties — the numbering the transcript window's run
 /// ordinals use, so a row's URI and its position agree.
 pub(super) async fn get_nth_run_id(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     run_seq: i32,
 ) -> Option<String> {
@@ -387,7 +387,7 @@ pub(super) struct StoredEvent {
 /// with [`render_single_event`] once the read has released. `Err` is the
 /// not-found message.
 pub(super) async fn read_single_event(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
     event_seq: i32,
 ) -> Result<StoredEvent, String> {
@@ -491,7 +491,7 @@ fn tool_use_id_from_event(event_data: &serde_json::Value) -> Option<&str> {
 }
 
 async fn resolve_tool_name(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
     tool_use_id: &str,
 ) -> Option<String> {

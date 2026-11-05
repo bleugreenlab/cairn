@@ -778,6 +778,53 @@ async fn a_helper_statement_is_attributed_to_the_helpers_caller() {
     );
 }
 
+#[tokio::test]
+async fn a_multi_row_helper_is_audited_at_its_caller() {
+    use crate::storage::{QueryConn, QueryRows};
+
+    #[track_caller]
+    fn forward<'a, C: QueryConn + ?Sized>(
+        conn: &'a C,
+        sql: &'a str,
+    ) -> impl std::future::Future<Output = crate::storage::DbResult<QueryRows>> + Send + 'a {
+        conn.query_rows(sql, ())
+    }
+
+    let (_temp, db) = private_db().await;
+    let conn = db.connect().await.unwrap();
+    let line = line!() + 1;
+    let mut rows = forward(&conn, PENDING_ORDINARY_LAUNCHES).await.unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    let prefix = format!("{}:{line} ", file!());
+    assert!(
+        REPORTED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|report| report.starts_with(&prefix)
+                && report.ends_with("wide-scan on prepared_ordinary_launches")),
+        "expected a report at {prefix}"
+    );
+}
+
+#[tokio::test]
+async fn fixed_sql_helpers_name_their_statement_instead_of_a_raw_borrow() {
+    let (_temp, db) = private_db().await;
+    let conn = db.connect().await.unwrap();
+    assert!(crate::lineage::thread_status_conn(&conn, "missing")
+        .await
+        .unwrap()
+        .is_none());
+    let held = db.overdue_holders(std::time::Duration::ZERO, std::time::Duration::ZERO);
+    assert_eq!(held.len(), 1);
+    assert!(held[0].statement.contains("lineage.rs:"), "{held:?}");
+    assert!(
+        held[0].statement.contains("SELECT status FROM threads"),
+        "{held:?}"
+    );
+    assert!(!held[0].statement.contains("raw connection"), "{held:?}");
+}
+
 /// A database that has not reached a lineage head plans its own toy schema,
 /// not production's, and is not audited.
 #[tokio::test]

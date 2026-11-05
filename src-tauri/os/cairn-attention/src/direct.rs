@@ -19,7 +19,7 @@ pub fn direct_wake_for_urgency(urgency: DeliveryUrgency) -> crate::push::Wake {
 /// delivery: the message row stores the frozen body, and the push row is what the
 /// idle/event drain sees and stamps.
 pub async fn insert_system_direct_push_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     recipient_job_id: &str,
     recipient_run_id: &str,
     content: &str,
@@ -37,7 +37,7 @@ pub async fn insert_system_direct_push_conn(
 }
 
 pub async fn insert_system_direct_push_with_key_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     recipient_job_id: &str,
     recipient_run_id: &str,
     content: &str,
@@ -61,7 +61,7 @@ pub async fn insert_system_direct_push_with_key_conn(
 /// for a caller whose message row is its own durable delivery record: the push
 /// can be dismissed (deleted) while pending, the message row is not.
 pub async fn insert_system_direct_push_with_message_id_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     recipient_job_id: &str,
     recipient_run_id: &str,
     content: &str,

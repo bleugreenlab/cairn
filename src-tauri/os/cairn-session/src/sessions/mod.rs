@@ -71,7 +71,7 @@ pub async fn get(db: &LocalDb, session_id: &str) -> Result<Session, String> {
 }
 
 pub async fn create_with_id_and_lineage_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     id: &str,
     job_id: Option<&str>,
     chat_id: Option<&str>,
@@ -109,7 +109,7 @@ pub async fn create_with_id_and_lineage_conn(
 }
 
 pub async fn load_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     session_id: &str,
 ) -> DbResult<Option<Session>> {
     let mut rows = conn
@@ -221,6 +221,71 @@ pub async fn account_assignments(db: &LocalDb) -> Result<Vec<(String, i64)>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_helpers_keep_session_sql_visible() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open_migrated_for_test(dir.path().join("sessions.db"))
+            .await
+            .unwrap();
+        db.execute_batch(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+             VALUES ('workspace', 'Test', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'workspace', 'Test', 'test', '/tmp/test', 1, 1);
+             INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+             VALUES ('job', 'project', 'running', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let conn = db.connect().await.unwrap();
+        let parent =
+            create_with_id_and_lineage_conn(&conn, "parent", Some("job"), None, "codex", None, 1)
+                .await
+                .unwrap();
+        assert_eq!(parent.id, "parent");
+        let holders = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(holders.len(), 1);
+        let statement = &holders[0].statement;
+        assert!(statement.starts_with(concat!(file!(), ":")), "{statement}");
+        assert!(
+            statement.contains("SELECT id, job_id, chat_id"),
+            "{statement}"
+        );
+        assert!(!statement.contains("raw connection"), "{statement}");
+
+        conn.execute(
+            "UPDATE sessions SET channel_cursor_rowid = 42 WHERE id = 'parent'",
+            (),
+        )
+        .await
+        .unwrap();
+        let child = create_with_id_and_lineage_conn(
+            &conn,
+            "child",
+            Some("job"),
+            None,
+            "codex",
+            Some("parent"),
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(child.sequence, 2);
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT channel_cursor_rowid FROM sessions WHERE id = 'child'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(42)
+        );
+        assert!(load_session_conn(&conn, "absent").await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn a_missing_session_reads_as_not_found() {

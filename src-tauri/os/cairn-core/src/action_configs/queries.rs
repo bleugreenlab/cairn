@@ -42,7 +42,7 @@ fn action_config_from_row(row: &cairn_db::turso::Row) -> DbResult<ActionConfig> 
 }
 
 async fn load_action_config_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     id: &str,
 ) -> DbResult<Option<ActionConfig>> {
     let mut rows = conn

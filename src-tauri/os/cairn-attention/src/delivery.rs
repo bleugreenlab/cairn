@@ -228,6 +228,10 @@ pub async fn job_belongs_to_issue(
 /// Returns the recipients that received a push, so a `wake`/`interrupt` caller
 /// can wake each through `delivery::nudge_job_for_urgency` (CAIRN-1889). Passive
 /// callers ignore the list.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "watcher routing and push delivery fields are independent parts of this boundary"
+)]
 pub async fn push_to_issue_watchers(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
     db: &LocalDb,
@@ -446,7 +450,7 @@ async fn job_id_for_child_uri(db: &LocalDb, child_uri: &str) -> Option<String> {
 /// with that `uri_segment` under it. `None` when either does not resolve. The one
 /// resolver behind every node/task URI attention reads through.
 async fn job_id_for_node_coordinates(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -858,7 +862,7 @@ async fn catchup_chat_line(db: &LocalDb, content_ref: &str, child_job_id: &str) 
 ///
 /// [`reconstruct_events`]: cairn_db::storage::events::reconstruct_events
 async fn newest_assistant_prose(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     scan: i64,
 ) -> crate::storage::DbResult<Vec<crate::models::Event>> {
@@ -921,7 +925,7 @@ async fn newest_assistant_prose(
 /// rather than a hint, so a team database reads the turn's own events instead:
 /// still bounded by the turn, at the cost of opening its rows.
 async fn prose_walk_index(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
 ) -> crate::storage::DbResult<&'static str> {
     let mut rows = conn
         .query(

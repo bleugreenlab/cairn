@@ -360,7 +360,7 @@ fn parse_diff_request(params: &[QueryParam]) -> Result<DiffRequest<'_>, String> 
 }
 
 async fn load_diff_coords(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<DiffCoords, String> {
     let mut rows = conn
@@ -498,7 +498,7 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
 
 /// An execution's archived range endpoints.
 async fn load_archived_range(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> Option<(String, String)> {
     let mut rows = conn

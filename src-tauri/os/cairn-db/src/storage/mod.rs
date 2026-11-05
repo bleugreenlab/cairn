@@ -71,7 +71,7 @@ pub use route_firings::{
 };
 pub use row::{
     next_i64, next_opt_text, next_text, query_opt_i64_conn, query_opt_text_conn, query_text_conn,
-    FromDbRow, QueryConn, RowExt,
+    FromDbRow, QueryConn, QueryRows, RowExt,
 };
 pub use runtime_admission::{
     admission_status, advance_team_mirror_phase, awaiting_launch_run_for_session,

@@ -17,7 +17,7 @@ pub fn db_internal(message: impl Into<String>) -> DbError {
 }
 
 pub async fn load_job_by_id_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<DbJob>> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1 LIMIT 1");
@@ -32,7 +32,7 @@ pub async fn load_job_by_id_conn(
 /// the review-readiness quiescence predicate, which needs each job's status and
 /// DAG-readiness coordinates.
 pub async fn load_jobs_for_issue_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Vec<DbJob>> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE issue_id = ?1");

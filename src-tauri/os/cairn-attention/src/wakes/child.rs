@@ -81,7 +81,7 @@ pub async fn coordinating_job_for_child_issue(
 /// projection, and `parent_wake::load_parent_job` — so the rule is stated once.
 pub async fn coordinating_job_for_child(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     child_issue_id: &str,
 ) -> DbResult<Option<String>> {
     let Some((spawning_job_id, parent_issue_id, parent_thread_id)) =
@@ -228,7 +228,7 @@ pub async fn coordinated_child_issue_uris_for_job(
 /// A child issue's parent edge: `(spawning job, parent issue, parent thread)`.
 /// `None` when the issue row itself is gone.
 async fn parent_edge(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Option<(Option<String>, Option<String>, Option<String>)>> {
     let mut rows = conn
@@ -263,7 +263,7 @@ async fn parent_edge(
 /// agree about supersession (CAIRN-4665).
 async fn validated_spawning_job(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     spawning_job_id: &str,
     parent_issue_id: &str,
 ) -> DbResult<Option<String>> {
@@ -289,7 +289,7 @@ async fn validated_spawning_job(
 }
 
 async fn job_parent_id(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<(Option<String>, Option<String>)> {
     let mut rows = conn
@@ -320,7 +320,7 @@ async fn job_parent_id(
 /// succession across executions, and `rowid DESC` makes a same-second tie
 /// deterministic rather than insertion-ordered.
 async fn coordinating_job_for_issue(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn

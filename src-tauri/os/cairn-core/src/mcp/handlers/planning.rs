@@ -648,7 +648,7 @@ pub fn withdrawn_question_notice(cause: Option<WithdrawalCause>) -> String {
 /// answer is refused with `cause` rather than recorded. Reports whether this
 /// call withdrew it (an answered or already-withdrawn row is left alone).
 pub(crate) async fn withdraw_prompt_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     prompt_id: &str,
     cause: WithdrawalCause,
     now: i64,
@@ -667,7 +667,7 @@ pub(crate) async fn withdraw_prompt_conn(
 /// Withdraw every pending question raised on one of `job_id`'s turns. A
 /// question owned by an MCP wait has no turn and is left to that wait.
 pub(crate) async fn withdraw_job_prompts_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     cause: WithdrawalCause,
     now: i64,
@@ -693,7 +693,7 @@ fn withdrawal_cause_text(cause: WithdrawalCause) -> DbResult<String> {
 /// The withdrawal recorded on a question: `None` when it is not withdrawn,
 /// `Some(None)` when it is but the cause cannot be read.
 async fn prompt_withdrawal_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     prompt_id: &str,
 ) -> DbResult<Option<Option<WithdrawalCause>>> {
     let mut rows = conn
@@ -1039,7 +1039,7 @@ pub(crate) async fn answer_prompt_id_domain(
 
 /// A prompt's questions, as stored when it was asked.
 pub(crate) async fn load_prompt_questions_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     prompt_id: &str,
 ) -> DbResult<Vec<Question>> {
     let mut rows = conn
@@ -1377,7 +1377,7 @@ fn question_has_inline_waiter(
 /// ask never yields its turn, so a yielded one was yielded by something else; a
 /// successor means that something has already moved on.
 async fn turn_held_by_another_wait_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
 ) -> DbResult<bool> {
     let mut rows = conn
@@ -1605,7 +1605,7 @@ async fn lookup_prompt_for_node_question(
 }
 
 async fn record_prompt_response_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     prompt_id: &str,
     answers: &PromptAnswers,
     rendered: &str,

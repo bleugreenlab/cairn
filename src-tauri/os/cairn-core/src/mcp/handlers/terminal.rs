@@ -1743,7 +1743,7 @@ async fn insert_terminal_resource(
 /// definitively exited row is reclaimable; recovering and closing rows still own
 /// their process or teardown fence.
 async fn terminal_slug_live_for_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     slug: &str,
 ) -> DbResult<bool> {
@@ -1762,7 +1762,7 @@ async fn terminal_slug_live_for_job(
 }
 
 async fn terminal_slug_live_for_project(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     slug: &str,
 ) -> DbResult<bool> {

@@ -4,7 +4,7 @@
 //! conclusion and its event commit together. Its dedupe key names the
 //! conclusion, so concluding the same thing twice inserts one event.
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 use super::{cap_chars, stable_id, BACKOFF_SECS, EVENT_TEXT_CHARS, MAX_ATTEMPTS};
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -33,7 +33,10 @@ impl NewEvent {
 
 /// Insert `event` unless its conclusion already has one. Reports whether this
 /// call inserted it.
-pub async fn insert_event_conn(conn: &Connection, event: &NewEvent) -> DbResult<bool> {
+pub async fn insert_event_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    event: &NewEvent,
+) -> DbResult<bool> {
     let changed = conn
         .execute(
             "INSERT OR IGNORE INTO tenet_evidence_events
@@ -68,7 +71,7 @@ fn resolution_name(resolution: Resolution) -> &'static str {
 /// The dedupe key carries `resolution_generation`, which `unresolve` bumps:
 /// resolution instants cannot tell two resolutions apart, the counter can.
 pub async fn issue_event_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     resolution: Resolution,
     device_id: &str,
@@ -158,7 +161,7 @@ fn issue_snapshot(header: &str, description: &str, pull_request: &str) -> String
 /// Snapshot an issue's terminal resolution as an event, inside the resolving
 /// write.
 pub async fn insert_issue_event_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     resolution: Resolution,
     device_id: &str,
@@ -173,7 +176,7 @@ pub async fn insert_issue_event_conn(
 /// The event for an era whose generated summary just landed, read from the
 /// database holding the era. `None` when the era's job has no home address.
 pub async fn era_event_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     seq: i32,
     summary: &str,

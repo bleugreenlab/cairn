@@ -25,7 +25,8 @@
 
 use std::collections::HashSet;
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::storage::TrackedConnection;
+use cairn_db::turso::params;
 use sha2::{Digest, Sha256};
 
 use crate::models::{DelegatedStatus, DelegatedWorkPacket};
@@ -138,7 +139,7 @@ fn decode(row: &cairn_db::turso::Row) -> DbResult<(i64, DelegatedWorkPacket)> {
 }
 
 async fn insert_row(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     seq: i64,
     packet: &DelegatedWorkPacket,
@@ -175,24 +176,32 @@ async fn insert_row(
         .await?)
 }
 
-async fn query_rows(
-    conn: &Connection,
-    sql: &str,
-    params: impl cairn_db::turso::IntoParams,
-) -> DbResult<Vec<(i64, DelegatedWorkPacket)>> {
-    let mut rows = conn.query(sql, params).await?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await? {
-        out.push(decode(&row)?);
+#[track_caller]
+fn query_rows<'a, C, P>(
+    conn: &'a C,
+    sql: &'a str,
+    params: P,
+) -> impl std::future::Future<Output = DbResult<Vec<(i64, DelegatedWorkPacket)>>> + Send + 'a
+where
+    C: cairn_db::storage::QueryConn + ?Sized,
+    P: cairn_db::turso::IntoParams + Send + 'a,
+{
+    let rows = conn.query_rows(sql, params);
+    async move {
+        let mut rows = rows.await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(decode(&row)?);
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// The packets still inline in `execution_id`'s snapshot, in array order.
 ///
 /// The same on-read migration a snapshot load applies is applied to each.
 pub async fn inline_packets(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Vec<DelegatedWorkPacket>> {
     let mut rows = conn
@@ -217,7 +226,10 @@ pub async fn inline_packets(
 
 /// Every packet of `execution_id`, in creation order, table rows shadowing
 /// inline packets with the same id.
-pub async fn list(conn: &Connection, execution_id: &str) -> DbResult<Vec<DelegatedWorkPacket>> {
+pub async fn list(
+    conn: &TrackedConnection,
+    execution_id: &str,
+) -> DbResult<Vec<DelegatedWorkPacket>> {
     let mut packets = query_rows(
         conn,
         &format!("{SELECT} WHERE execution_id = ?1"),
@@ -246,7 +258,7 @@ pub async fn list_db(db: &LocalDb, execution_id: &str) -> DbResult<Vec<Delegated
 }
 
 async fn stored(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     packet_id: &str,
 ) -> DbResult<Option<DelegatedWorkPacket>> {
@@ -263,7 +275,7 @@ async fn stored(
 
 /// One packet by id, from the table or, failing that, the snapshot.
 pub async fn get(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     packet_id: &str,
 ) -> DbResult<Option<DelegatedWorkPacket>> {
@@ -290,7 +302,7 @@ pub async fn get_db(
 /// The packet whose child is `job_id`: what a child's completion resumes its
 /// parent through.
 pub async fn find_by_result_job(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     job_id: &str,
 ) -> DbResult<Option<DelegatedWorkPacket>> {
@@ -333,7 +345,7 @@ pub async fn find_by_result_job_db(
 
 /// The packet that materialized recipe node `node_id`, if a delegation did.
 pub async fn find_by_node(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     node_id: &str,
 ) -> DbResult<Option<DelegatedWorkPacket>> {
@@ -363,7 +375,7 @@ pub async fn find_by_node(
 
 /// Append a new packet after every packet `execution_id` already has.
 pub async fn insert(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     packet: &DelegatedWorkPacket,
 ) -> DbResult<()> {
@@ -417,7 +429,11 @@ pub struct PacketChange {
 
 /// Copy a packet that is only inline into the table, at its array index.
 /// `false` when the packet is in neither.
-async fn ensure_stored(conn: &Connection, execution_id: &str, packet_id: &str) -> DbResult<bool> {
+async fn ensure_stored(
+    conn: &TrackedConnection,
+    execution_id: &str,
+    packet_id: &str,
+) -> DbResult<bool> {
     if stored(conn, execution_id, packet_id).await?.is_some() {
         return Ok(true);
     }
@@ -435,7 +451,7 @@ async fn ensure_stored(conn: &Connection, execution_id: &str, packet_id: &str) -
 /// Field by field, so concurrent writers of different fields cannot undo one
 /// another, which is what the inline `json_set` patch existed to guarantee.
 pub async fn update(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     packet_id: &str,
     change: &PacketChange,

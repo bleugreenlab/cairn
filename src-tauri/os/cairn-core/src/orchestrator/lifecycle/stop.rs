@@ -729,7 +729,7 @@ fn child_run_ids_for_run(orch: &Orchestrator, run_id: &str) -> Vec<String> {
 }
 
 pub(crate) async fn find_descendant_job_ids(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Vec<String>> {
     let mut all_descendants = Vec::new();
@@ -763,7 +763,7 @@ pub(crate) async fn find_descendant_job_ids(
 }
 
 async fn get_running_runs_for_jobs(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_ids: &[String],
 ) -> DbResult<Vec<String>> {
     let mut run_ids = Vec::new();

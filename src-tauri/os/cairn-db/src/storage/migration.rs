@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use super::{DbError, DbResult, LocalDb, RowExt};
-use turso::Connection;
+use super::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
 
 /// Outcome of reading every `PRAGMA integrity_check` row.
 #[derive(Debug, PartialEq, Eq)]
@@ -33,7 +32,7 @@ fn classify_integrity(rows: Vec<String>) -> IntegrityStatus {
     IntegrityStatus::IndexDrift(drifted)
 }
 
-async fn read_integrity_check(conn: &Connection) -> DbResult<IntegrityStatus> {
+async fn read_integrity_check(conn: &TrackedConnection) -> DbResult<IntegrityStatus> {
     let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
@@ -52,7 +51,7 @@ async fn read_integrity_check(conn: &Connection) -> DbResult<IntegrityStatus> {
 /// Auto-created UNIQUE/PRIMARY KEY indexes have no stored `CREATE INDEX` SQL, so
 /// they cannot safely be dropped and recreated this way. Treat them as
 /// unrecoverable instead of silently skipping a named integrity failure.
-async fn rebuild_indexes(conn: &Connection, names: &[String]) -> DbResult<()> {
+async fn rebuild_indexes(conn: &TrackedConnection, names: &[String]) -> DbResult<()> {
     for name in names {
         let mut rows = conn
             .query(
@@ -235,7 +234,7 @@ impl RebuildCheck {
     }
 }
 
-async fn count_rows(conn: &Connection, table: &str) -> DbResult<i64> {
+async fn count_rows(conn: &TrackedConnection, table: &str) -> DbResult<i64> {
     let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
     let mut rows = conn.query(&sql, ()).await?;
     rows.next()
@@ -781,7 +780,7 @@ mod tests {
         LocalDb::open(path).await.unwrap()
     }
 
-    async fn index_sql(conn: &Connection, name: &str) -> DbResult<Option<String>> {
+    async fn index_sql(conn: &TrackedConnection, name: &str) -> DbResult<Option<String>> {
         let mut rows = conn
             .query(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",

@@ -140,7 +140,7 @@ fn page_row(row: &cairn_db::turso::Row) -> DbResult<PageRow> {
 
 /// The owner of the page at `address`, or why there is none.
 async fn resolve_owner_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     address: &PageAddress,
 ) -> DbResult<Result<PageOwner, String>> {
     match address.thread_name() {
@@ -169,7 +169,7 @@ async fn resolve_owner_conn(
 
 /// The newest version of `name` in the owner's chain, or exactly `version`.
 async fn page_row_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     owner: &PageOwner,
     name: &str,
     version: Option<i32>,
@@ -328,7 +328,7 @@ pub(crate) struct PageWriter {
 /// writes it: a thread's own jobs (its sessions and their tasks all carry its
 /// id), or, for a draft, the issue node's own job and the tasks it spawned.
 async fn may_write_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     owner: &PageOwner,
     writer: &PageWriter,
 ) -> DbResult<bool> {
@@ -380,7 +380,7 @@ struct StoredPage {
 /// A refusal returns before a thread session is minted, so an invalid write
 /// leaves nothing behind.
 async fn store_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     address: &PageAddress,
     writer: &PageWriter,
     payload: &Value,

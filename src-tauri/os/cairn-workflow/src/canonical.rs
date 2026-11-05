@@ -37,7 +37,8 @@
 //! here — a crash between the two steps costs at most one turn of an agent
 //! whose work is already unable to land.
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::storage::TrackedConnection;
+use cairn_db::turso::params;
 
 use crate::models::ExecutionLifecycle;
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -140,7 +141,7 @@ struct Lineage {
 ///
 /// A job with no execution — a thread session, a chat, a workflow agent — is
 /// `Clear`. Fencing those would fence the entire thread system on migration day.
-pub async fn fence_for_job_conn(conn: &Connection, job_id: &str) -> DbResult<Fence> {
+pub async fn fence_for_job_conn(conn: &TrackedConnection, job_id: &str) -> DbResult<Fence> {
     let mut rows = conn
         .query(
             "SELECT e.id, e.issue_id, e.seq, e.lifecycle
@@ -166,7 +167,7 @@ pub async fn fence_for_job_conn(conn: &Connection, job_id: &str) -> DbResult<Fen
 
 /// Whether a RUN's effects may land. Same question as [`fence_for_job_conn`],
 /// asked from the coordinate a tool call carries.
-pub async fn fence_for_run_conn(conn: &Connection, run_id: &str) -> DbResult<Fence> {
+pub async fn fence_for_run_conn(conn: &TrackedConnection, run_id: &str) -> DbResult<Fence> {
     let mut rows = conn
         .query(
             "SELECT e.id, e.issue_id, e.seq, e.lifecycle
@@ -192,7 +193,7 @@ pub async fn fence_for_run_conn(conn: &Connection, run_id: &str) -> DbResult<Fen
     .await
 }
 
-async fn fence_for(conn: &Connection, lineage: Lineage) -> DbResult<Fence> {
+async fn fence_for(conn: &TrackedConnection, lineage: Lineage) -> DbResult<Fence> {
     if !lineage.lifecycle.is_fenced() {
         return Ok(Fence::Clear);
     }
@@ -210,7 +211,7 @@ async fn fence_for(conn: &Connection, lineage: Lineage) -> DbResult<Fence> {
 
 /// The issue's canonical execution and the node URI of its root job.
 async fn canonical_successor(
-    conn: &Connection,
+    conn: &TrackedConnection,
     issue_id: &str,
     excluding_execution_id: &str,
 ) -> DbResult<Option<CanonicalSuccessor>> {
@@ -264,7 +265,10 @@ async fn canonical_successor(
 /// webhook, a schedule, a `job_ended` trigger or a skill call has not, and must
 /// not be able to cancel a running builder and its sub-tasks as a side effect of
 /// firing.
-pub async fn issue_has_canonical_execution(conn: &Connection, issue_id: &str) -> DbResult<bool> {
+pub async fn issue_has_canonical_execution(
+    conn: &TrackedConnection,
+    issue_id: &str,
+) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM executions
@@ -359,7 +363,7 @@ pub struct Supersession {
 ///
 /// A per-issue maximum, so it must be read inside the same transaction that
 /// inserts the execution — which is what the caller does.
-pub async fn next_seq_conn(conn: &Connection, issue_id: &str) -> DbResult<i32> {
+pub async fn next_seq_conn(conn: &TrackedConnection, issue_id: &str) -> DbResult<i32> {
     let mut rows = conn
         .query(
             "SELECT COALESCE(MAX(seq), 0) FROM executions WHERE issue_id = ?1",
@@ -389,7 +393,7 @@ pub async fn next_seq_conn(conn: &Connection, issue_id: &str) -> DbResult<i32> {
 /// superseded executions. That is correct, and harmless: `lifecycle` is a column
 /// the recompute does not write.
 pub async fn supersede_canonical_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     issue_id: &str,
     successor_execution_id: &str,
     actor: &SupersessionActor,
@@ -452,7 +456,7 @@ pub async fn supersede_canonical_conn(
 /// Cancel one execution's live jobs, close their sessions, terminalize their
 /// live turns, and return the frozen job ids.
 async fn freeze_execution_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     now: i64,
 ) -> DbResult<Vec<String>> {

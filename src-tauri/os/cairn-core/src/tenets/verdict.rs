@@ -17,7 +17,7 @@
 //!   (a later filing of the same plan, a re-gate, or a filing racing the
 //!   answer).
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 use super::read::answerer_label;
 use super::{tenet_uri, TenetRow, TenetStatus, Verdict, TENET_GATE_FACT};
@@ -71,7 +71,7 @@ fn decision_comment_id(tenet_id: &str, issue_id: &str) -> String {
 /// already there, inside the caller's transaction. Returns whether it wrote.
 /// A tenet without an approval in force has no decision to deliver.
 pub(crate) async fn ensure_decision_comment_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     tenet: &TenetRow,
     issue_id: &str,
     now: i64,
@@ -147,7 +147,10 @@ struct Gated {
     exec_seq: Option<i64>,
 }
 
-async fn gated_conn(conn: &Connection, uri: &str) -> DbResult<Vec<Gated>> {
+async fn gated_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    uri: &str,
+) -> DbResult<Vec<Gated>> {
     let mut rows = conn
         .query(
             "SELECT e.issue_id, e.seq FROM execution_gates g
@@ -254,7 +257,7 @@ fn verdict_message(
 /// address yet) does not fail the verdict: the operator's answer stands, and
 /// the thread reads it from the tenet when it next runs.
 pub(super) async fn deliver_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     tenet: &TenetRow,
     superseded: Option<i64>,
     now: i64,

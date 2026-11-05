@@ -287,7 +287,7 @@ fn mcp_input_value(stored: &str) -> serde_json::Value {
 }
 
 pub(crate) async fn record_and_claim_answer_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     prompt_id: &str,
     answers: &PromptAnswers,
     now_ms: i64,

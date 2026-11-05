@@ -81,7 +81,10 @@ pub(crate) async fn get_message_by_id_async(db: &LocalDb, id: &str) -> DbResult<
     .await
 }
 
-async fn load_message_by_id(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Message> {
+async fn load_message_by_id(
+    conn: &cairn_db::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<Message> {
     let sql = format!("SELECT {} FROM messages WHERE id = ?1", MESSAGE_COLUMNS);
     let mut rows = conn.query(&sql, params![id]).await?;
 
@@ -94,7 +97,7 @@ async fn load_message_by_id(conn: &cairn_db::turso::Connection, id: &str) -> DbR
 
 /// Where a cursor message sits in its channel's order: `(created_at, rowid)`.
 async fn cursor_position(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     id: &str,
 ) -> DbResult<Option<(i64, i64)>> {
     let mut rows = conn

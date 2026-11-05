@@ -237,7 +237,7 @@ pub async fn try_accumulate(
 }
 
 async fn load_accumulator_state(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     recipe_id: &str,
     group_key: &str,
     scope_key: &str,

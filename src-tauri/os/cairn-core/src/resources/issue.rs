@@ -25,7 +25,10 @@ struct IssuePrSummary {
 }
 
 /// The canonical URI of a thread, from its id.
-async fn thread_uri_for_id(conn: &cairn_db::turso::Connection, thread_id: &str) -> Option<String> {
+async fn thread_uri_for_id(
+    conn: &cairn_db::storage::TrackedConnection,
+    thread_id: &str,
+) -> Option<String> {
     let mut rows = conn
         .query(
             "SELECT p.key, t.name
@@ -45,7 +48,7 @@ async fn thread_uri_for_id(conn: &cairn_db::turso::Connection, thread_id: &str) 
 }
 
 async fn render_family_block(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     parent_issue_id: Option<&str>,
     parent_thread_id: Option<&str>,
@@ -107,7 +110,7 @@ async fn render_family_block(
 }
 
 async fn render_possibly_related_block(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> String {
     let mut rows = match conn
@@ -194,7 +197,7 @@ pub(super) async fn read_issue(
 /// authorship that line names, and everything after it. Statements, and the
 /// formatting of the rows they return, only; it runs inside the read.
 async fn render_issue_parts(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i32,
 ) -> Result<(String, Option<crate::issues::crud::IssueAuthorship>, String), String> {
@@ -621,7 +624,7 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
 
 /// Statements, and the formatting of the rows they return, only.
 async fn render_issue_executions(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i32,
 ) -> Result<String, String> {
@@ -849,7 +852,7 @@ pub(super) async fn read_issue_comment(
 
 /// An execution's id, frozen snapshot, and whether it is live. Statements only.
 async fn execution_snapshot_row(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i32,
     exec_seq: i32,

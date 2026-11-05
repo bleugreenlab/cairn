@@ -121,7 +121,7 @@ pub(crate) enum RelinquishOutcome {
 }
 
 pub(crate) async fn relinquish_to_inner_wait(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
     tool_use_id: &str,
 ) -> DbResult<RelinquishOutcome> {
@@ -198,7 +198,7 @@ pub(crate) struct ParkedWaits {
 
 /// The active (pending or resolving) suspensions a parked turn holds.
 async fn active_waits_of_turn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     turn_id: &str,
 ) -> DbResult<Vec<(Record, String, bool)>> {
@@ -370,7 +370,7 @@ async fn claim_timed_waits(
 /// again, so the batch's own result reaches the agent. Matches only a row that
 /// the transfer itself retired, so it cannot reopen one resolved any other way.
 pub(crate) async fn reclaim_from_inner_wait(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
     tool_use_id: &str,
 ) -> DbResult<bool> {

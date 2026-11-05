@@ -24,7 +24,7 @@ fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> {
 }
 
 pub(crate) async fn load_job_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<DbJob>> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1");
@@ -218,7 +218,7 @@ pub(super) async fn count_existing_branched_jobs(
 /// chases the chain to the durable root, so the rule is depth-proof for nested
 /// coordinators. Unresolvable bases stay NULL (never guessed).
 async fn resolve_pack_anchor_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job: &DbJob,
     base_commit: Option<&str>,
 ) -> DbResult<Option<String>> {
@@ -240,7 +240,7 @@ async fn resolve_pack_anchor_conn(
 /// The inherited anchor for an explicit parent job: its `pack_anchor`, else its
 /// `base_commit`.
 async fn parent_pack_anchor_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     parent_job_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -259,7 +259,7 @@ async fn parent_pack_anchor_conn(
 /// The inherited anchor for a child-issue execution, found by the parent's
 /// integration branch.
 async fn parent_pack_anchor_by_branch_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     branch: &str,
 ) -> DbResult<Option<String>> {
@@ -315,7 +315,7 @@ pub(super) async fn update_job_coordinate(
 }
 
 pub(super) async fn load_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     session_id: &str,
 ) -> DbResult<Option<Session>> {
     let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1");
@@ -430,7 +430,7 @@ pub(super) struct LastProviderRequest {
 }
 
 pub(super) async fn insert_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     session_id: &str,
     job_id: Option<&str>,
     chat_id: Option<&str>,
@@ -450,7 +450,7 @@ pub(super) async fn insert_session_conn(
 }
 
 async fn resolve_prepare_session_start_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job: &DbJob,
     session: &Session,
     job_backend: &str,

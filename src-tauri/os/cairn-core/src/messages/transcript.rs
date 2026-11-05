@@ -288,7 +288,7 @@ pub(crate) fn insert_operator_compact_event_sync(
 /// be a lie outright if the transaction then failed; the rotation seam emits
 /// once, after its commit.
 pub(crate) async fn insert_session_boundary_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
     session_id: Option<&str>,
     turn_id: Option<&str>,
@@ -739,7 +739,10 @@ async fn insert_system_event(
     Ok(sequence)
 }
 
-async fn next_event_sequence(conn: &cairn_db::turso::Connection, run_id: &str) -> DbResult<i32> {
+async fn next_event_sequence(
+    conn: &cairn_db::storage::TrackedConnection,
+    run_id: &str,
+) -> DbResult<i32> {
     let mut rows = conn
         .query(
             "SELECT MAX(sequence) FROM events WHERE run_id = ?1",

@@ -474,19 +474,19 @@ impl From<&UpdateTurnChangeset<'_>> for OwnedTurnChangeset {
     }
 }
 
-async fn load_one_turn_by_query(
-    db: &LocalDb,
+#[track_caller]
+fn load_one_turn_by_query<'a>(
+    db: &'a LocalDb,
     sql: &'static str,
     value: &str,
-) -> Result<Option<Turn>, String> {
+) -> impl std::future::Future<Output = Result<Option<Turn>, String>> + Send + 'a {
     let value = value.to_string();
-    db.query_opt(sql, params![value.as_str()], turn_from_row)
-        .await
-        .map_err(|e| e.to_string())
+    let result = db.query_opt(sql, params![value.as_str()], turn_from_row);
+    async move { result.await.map_err(|e| e.to_string()) }
 }
 
 async fn create_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     new_turn: &NewTurnData,
 ) -> DbResult<Turn> {
     if let Some(job_id) = new_turn.job_id.as_deref() {
@@ -558,7 +558,7 @@ async fn create_turn_conn(
 }
 
 async fn create_successor_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
     session_id: &str,
     job_id: &str,
@@ -599,7 +599,7 @@ async fn create_successor_turn_conn(
 }
 
 async fn ensure_resume_successor_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     predecessor_id: Option<&str>,
     job_id: Option<&str>,
     session_id: Option<&str>,
@@ -628,7 +628,7 @@ async fn ensure_resume_successor_conn(
 }
 
 async fn load_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
 ) -> DbResult<Option<Turn>> {
     let mut rows = conn
@@ -648,7 +648,7 @@ async fn load_turn_conn(
 }
 
 async fn load_successor_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     predecessor_id: &str,
 ) -> DbResult<Option<Turn>> {
     let mut rows = conn
@@ -669,7 +669,10 @@ async fn load_successor_turn_conn(
         .transpose()
 }
 
-async fn next_sequence_conn(conn: &cairn_db::turso::Connection, session_id: &str) -> DbResult<i32> {
+async fn next_sequence_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    session_id: &str,
+) -> DbResult<i32> {
     let mut rows = conn
         .query(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM turns WHERE session_id = ?1",
@@ -683,13 +686,22 @@ async fn next_sequence_conn(conn: &cairn_db::turso::Connection, session_id: &str
         .ok_or_else(|| DbError::internal("failed to compute next turn sequence"))
 }
 
-async fn count_conn(conn: &cairn_db::turso::Connection, sql: &str, value: &str) -> DbResult<i64> {
-    let mut rows = conn.query(sql, params![value]).await?;
-    rows.next()
-        .await?
-        .map(|row| row.i64(0))
-        .transpose()?
-        .ok_or_else(|| DbError::internal("count query returned no rows"))
+#[track_caller]
+fn count_conn<'a, C>(
+    conn: &'a C,
+    sql: &'a str,
+    value: &'a str,
+) -> impl std::future::Future<Output = DbResult<i64>> + Send + 'a
+where
+    C: cairn_db::storage::QueryConn + ?Sized,
+{
+    let row = conn.query_first_row(sql, params![value]);
+    async move {
+        row.await?
+            .map(|row| row.i64(0))
+            .transpose()?
+            .ok_or_else(|| DbError::internal("count query returned no rows"))
+    }
 }
 
 pub fn turn_from_row(row: &cairn_db::turso::Row) -> DbResult<Turn> {

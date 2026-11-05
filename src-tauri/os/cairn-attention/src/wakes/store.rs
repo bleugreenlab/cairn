@@ -12,7 +12,7 @@ struct DerivedThreadScope {
 }
 
 pub async fn seed_default_job_subscriptions_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp();
@@ -30,7 +30,7 @@ pub async fn seed_default_job_subscriptions_conn(
 }
 
 pub async fn rebuild_derived_thread_subscriptions_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     triggers: &[std::collections::BTreeMap<String, serde_json::Value>],
 ) -> DbResult<()> {
@@ -302,7 +302,7 @@ pub async fn peek_pending_suppressed_for_job(
 }
 
 async fn select_pending_suppressed(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Vec<SuppressedWake>> {
     let mut rows = conn

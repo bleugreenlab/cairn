@@ -78,7 +78,7 @@ struct GoalFacts {
 }
 
 async fn goal_facts_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<GoalFacts>> {
     let mut rows = conn
@@ -303,7 +303,7 @@ mod tests {
 
     async fn goal_env(job_status: &str, backend: &str) -> (Orchestrator, Arc<LocalDb>) {
         let db = Arc::new(migrated_test_db("goal-intent").await);
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
                VALUES('p','w','P','p','/tmp/p',1,1);

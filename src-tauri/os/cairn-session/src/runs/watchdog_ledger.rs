@@ -3,7 +3,8 @@
 //! The current lease is the coordination primitive. Lifecycle rows are evidence:
 //! callers must never derive ownership from the append-only history.
 
-use cairn_db::turso::{params, Connection, Row};
+use cairn_db::storage::TrackedConnection;
+use cairn_db::turso::{params, Row};
 use serde::{Deserialize, Serialize};
 
 use cairn_db::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -680,7 +681,10 @@ pub async fn append_watchdog_lifecycle(db: &LocalDb, event: NewWatchdogLifecycle
     .await
 }
 
-async fn insert_lifecycle_conn(conn: &Connection, event: NewWatchdogLifecycle) -> DbResult<()> {
+async fn insert_lifecycle_conn(
+    conn: &TrackedConnection,
+    event: NewWatchdogLifecycle,
+) -> DbResult<()> {
     let details_json = event
         .details
         .map(|details| serde_json::to_string(&details))

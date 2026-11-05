@@ -1,7 +1,7 @@
 use super::*;
 
 async fn execution_issue_id_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Option<String>> {
     crate::storage::query_opt_text_conn(
@@ -22,7 +22,7 @@ async fn execution_issue_id_conn(
 /// is no `Ready` resting state — for an agent job the host then spawns the backend;
 /// executor/checkpoint jobs are handled inline by `reduce_dag`.
 pub async fn transition_job_to_running_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job: &DbJob,
 ) -> DbResult<()> {
     let from: JobStatus = job

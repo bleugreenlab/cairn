@@ -12,7 +12,7 @@ pub async fn coordinating_job_for_child_issue(
 }
 
 pub(crate) async fn coordinating_job_for_child(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     child_issue_id: &str,
 ) -> crate::storage::DbResult<Option<String>> {
     cairn_attention::wakes::coordinating_job_for_child(

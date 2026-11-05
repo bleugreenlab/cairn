@@ -15,7 +15,7 @@
 //! The judgment is the proposing thread's, as a withdrawal is, and it is made
 //! once: a second dismissal of the same row is refused with the first quoted.
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 use crate::services::EventEmitter;
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -64,7 +64,10 @@ fn canonical(uri: &str) -> String {
         .unwrap_or_else(|| uri.to_string())
 }
 
-async fn evidence_conn(conn: &Connection, tenet_id: &str) -> DbResult<Vec<EvidenceRow>> {
+async fn evidence_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    tenet_id: &str,
+) -> DbResult<Vec<EvidenceRow>> {
     let mut rows = conn
         .query(
             "SELECT id, source_uri, sign, consumed_by_wake, dismissed_at, dismissed_by_thread_id,
@@ -90,7 +93,10 @@ async fn evidence_conn(conn: &Connection, tenet_id: &str) -> DbResult<Vec<Eviden
 }
 
 /// `project/name` of a thread, or its id when the row is gone.
-async fn thread_label_conn(conn: &Connection, thread_id: &str) -> DbResult<String> {
+async fn thread_label_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    thread_id: &str,
+) -> DbResult<String> {
     let mut rows = conn
         .query(
             "SELECT p.key, t.name FROM threads t JOIN projects p ON p.id = t.project_id

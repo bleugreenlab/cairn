@@ -9970,7 +9970,7 @@ pub(crate) fn reusable_verdict_for_plan(
 /// It reads on a connection the caller already holds, so a projection asking
 /// it for every check makes all of its reads in one transaction.
 pub(crate) async fn reusable_verdict_for_check_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     name: &str,
     check: &CheckCommand,
@@ -10037,7 +10037,7 @@ fn reusable_verdict(
 /// that fails reads as no reuse, which runs the check rather than trusting a
 /// verdict that could not be read.
 async fn reusable_verdict_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     check_name: &str,
     input_hash: &str,
@@ -10126,7 +10126,7 @@ pub(crate) fn head_verdicts(
 
 /// [`head_verdicts`] on a connection the caller already holds.
 pub(crate) async fn head_verdicts_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     checks: &HashMap<String, CheckCommand>,
     head: crate::execution::cache::HeadVerdictKeys<'_>,

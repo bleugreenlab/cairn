@@ -407,7 +407,7 @@ async fn lookup_project_context(
 /// unparseable snapshot — the walk continues, preserving the older behavior for
 /// rows that predate the distinction.
 async fn owning_node_job_for_run(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -456,7 +456,7 @@ async fn owning_node_job_for_run(
 /// snapshot, rather than authored as a node of the recipe. `true` when it cannot
 /// be decided, so an undecidable job is walked past exactly as it always was.
 async fn is_delegated_task_node(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: Option<&str>,
     recipe_node_id: Option<&str>,
 ) -> DbResult<bool> {
@@ -499,7 +499,7 @@ async fn is_delegated_task_node(
 /// live in another database (an agent filing into a team replica, CAIRN-2181)
 /// resolves to `None`, leaving the issue unparented rather than failing.
 async fn owning_thread_for_run(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     run_id: &str,
 ) -> DbResult<Option<String>> {

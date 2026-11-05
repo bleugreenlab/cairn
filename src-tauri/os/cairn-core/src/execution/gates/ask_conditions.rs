@@ -529,7 +529,7 @@ enum Delivery {
 }
 
 async fn stamp_delivered_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     id: &str,
     now: i64,
 ) -> DbResult<()> {
@@ -614,7 +614,7 @@ mod tests {
     /// whose plan is pending, its job stored `running`.
     async fn pending_plan(env: &Env, issue: &str, number: i32) {
         env.db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                    VALUES('e-{issue}', 'recipe', '{issue}', 'p', 'running', 1, 1);
                  INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status, uri_segment, created_at, updated_at)

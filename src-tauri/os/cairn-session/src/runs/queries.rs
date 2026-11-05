@@ -6,8 +6,9 @@ use crate::transcripts::stream_store::{
     read_active_stream,
 };
 use cairn_db::error::CairnError;
+use cairn_db::storage::TrackedConnection;
 use cairn_db::storage::{DbResult, LocalDb, RowExt};
-use cairn_db::turso::{params, Connection, Row, Value};
+use cairn_db::turso::{params, Row, Value};
 use cairn_domain::{Event, Prompt, Run, RunStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -1997,7 +1998,7 @@ async fn reconcile_stale_runs_db(
 /// - [`StaleRunSettlement::Reaped`]: `running -> interrupted` and
 ///   `pending -> failed`, with no end reason.
 pub async fn settle_stale_run(
-    conn: &Connection,
+    conn: &TrackedConnection,
     run_id: &str,
     exit_reason: &str,
     settlement: StaleRunSettlement,
@@ -2137,7 +2138,7 @@ pub async fn settle_stale_run(
 
 /// Whether `turn_id` owns an active durable row for a `run` call held open on
 /// its socket (`agent_waits.hold = 'inline'`).
-async fn owns_held_call(conn: &Connection, turn_id: &str) -> DbResult<bool> {
+async fn owns_held_call(conn: &TrackedConnection, turn_id: &str) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM agent_waits

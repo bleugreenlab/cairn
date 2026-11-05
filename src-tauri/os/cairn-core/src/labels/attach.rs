@@ -13,7 +13,7 @@ use crate::storage::{DbResult, RowExt};
 /// keeps prose and slug spellings of the same label ("Needs Review",
 /// "needs-review") on one row instead of minting near-duplicates.
 async fn find_label_ref(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     workspace_id: &str,
     value: &str,
 ) -> Result<Option<Label>, String> {
@@ -54,7 +54,7 @@ async fn find_label_ref(
 /// so a name the vocabulary has not seen yet is a new label rather than a failed
 /// write. Returns the label and whether this call minted it.
 async fn resolve_or_create_label_ref(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     workspace_id: &str,
     label_ref: &str,
     now: i64,
@@ -80,7 +80,7 @@ async fn resolve_or_create_label_ref(
 }
 
 pub(crate) async fn list_labels_for_issue(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Vec<Label>> {
     let mut rows = conn
@@ -139,7 +139,7 @@ pub(crate) async fn list_labels_for_issues(
 /// Returns the labels minted along the way so callers that notify the UI can
 /// refresh the vocabulary, not just the issue's chips.
 pub(crate) async fn replace_issue_labels(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     refs: &[String],
     now: i64,
@@ -177,7 +177,7 @@ pub(crate) async fn replace_issue_labels(
 
 /// Add labels without disturbing labels already attached to the issue.
 pub(crate) async fn add_issue_labels(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     refs: &[String],
     now: i64,
@@ -208,7 +208,7 @@ mod tests {
         db
     }
 
-    async fn seed_issue(conn: &cairn_db::turso::Connection, issue_id: &str, number: i32) {
+    async fn seed_issue(conn: &cairn_db::storage::TrackedConnection, issue_id: &str, number: i32) {
         conn.execute(
             "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-labels', 'default', 'Labels', 'LBL', '/tmp/lbl', 1, 1)",
             (),
@@ -223,7 +223,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_label(conn: &cairn_db::turso::Connection, name: &str) -> String {
+    async fn seed_label(conn: &cairn_db::storage::TrackedConnection, name: &str) -> String {
         create_label_conn(
             conn,
             DEFAULT_WORKSPACE_ID,
@@ -239,7 +239,7 @@ mod tests {
     }
 
     async fn label_ids_for_issue(
-        conn: &cairn_db::turso::Connection,
+        conn: &cairn_db::storage::TrackedConnection,
         issue_id: &str,
     ) -> Vec<String> {
         list_labels_for_issue(conn, issue_id)

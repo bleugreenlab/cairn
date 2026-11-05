@@ -64,7 +64,10 @@ pub struct JobStatusChange {
     pub cause: ChangeCause,
 }
 
-async fn has_active_run_conn(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<bool> {
+async fn has_active_run_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM runs
@@ -274,7 +277,10 @@ impl TurnFacts {
     }
 }
 
-pub async fn turn_facts(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<TurnFacts> {
+pub async fn turn_facts(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<TurnFacts> {
     let mut rows = conn
         .query(
             "SELECT
@@ -325,7 +331,7 @@ pub async fn turn_facts(conn: &cairn_db::turso::Connection, job_id: &str) -> DbR
 /// or `None` when no run exists yet. The turn-less completion path for an
 /// ephemeral call derives from this (a call establishes no DB turn).
 async fn latest_run_status_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -364,7 +370,7 @@ fn is_terminal_run_status_str(status: &str) -> bool {
 /// is unnamed (a command checkpoint, whose seeded artifact has a NULL
 /// `output_name`).
 async fn artifact_fact(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     required_name: Option<&str>,
 ) -> DbResult<Option<bool>> {
@@ -395,7 +401,10 @@ async fn artifact_fact(
 /// Whether the job was given up on for its missing output
 /// (`jobs.return_abandoned_at`): re-prompted once, it ended a later work turn
 /// that had seen the re-prompt without producing the output either.
-async fn output_abandoned_fact(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<bool> {
+async fn output_abandoned_fact(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT return_abandoned_at IS NOT NULL FROM jobs WHERE id = ?1",
@@ -416,7 +425,7 @@ async fn output_abandoned_fact(conn: &cairn_db::turso::Connection, job_id: &str)
 /// reads `turn_failed`. Used by `mark_job_failed` and the no-recovery checkpoint
 /// rejection path — cases where the job has no recovery edge and must go terminal.
 pub async fn force_fail_job_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp();
@@ -491,7 +500,7 @@ pub async fn force_fail_job_turn_conn(
 
 /// Whether an issue is merged or closed: resolved, and so taking no more work.
 pub async fn issue_is_terminal_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<bool> {
     let mut rows = conn
@@ -529,7 +538,7 @@ impl NodeJobFacts {
 
 #[allow(clippy::too_many_arguments)]
 async fn node_job_facts_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     execution_id: &str,
     snapshot: &crate::models::ExecutionSnapshot,
@@ -604,7 +613,7 @@ async fn node_job_facts_conn(
 /// - a standalone workflow owes its own persisted `output_contract`'s artifact;
 /// - anything else (a legacy node-less top-level job) owes nothing.
 async fn node_less_required_artifact_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     let row = {
@@ -666,7 +675,7 @@ async fn node_less_required_artifact_conn(
 /// completes on its artifact alone. A job that owes nothing settles from its
 /// turn outcome, keeping a Complete or Failed it already holds.
 async fn node_less_terminal_status_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     current: &JobStatus,
 ) -> DbResult<JobStatus> {
@@ -729,7 +738,7 @@ async fn node_less_terminal_status_conn(
 /// execution is not superseded, and it is either node-less or the newest job
 /// of a node still in its snapshot.
 pub async fn is_resolution_cancel_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<bool> {
     let row = {
@@ -789,7 +798,7 @@ pub async fn is_resolution_cancel_conn(
 /// keeps Complete and Failed and cancels everything else. That keeps today's
 /// Complete rule exactly, output contract and User confirm gate included.
 pub async fn derive_terminal_issue_status_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     execution_id: Option<&str>,
     recipe_node_id: Option<&str>,
@@ -826,7 +835,7 @@ pub async fn derive_terminal_issue_status_conn(
 /// Derive a node-backed job's status from its facts, ignoring the sticky
 /// overrides (`Cancelled`) that [`recompute_job_status_conn`] applies first.
 pub async fn derive_node_job_status_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     execution_id: &str,
     node_id: &str,
@@ -866,7 +875,7 @@ pub async fn derive_node_job_status_conn(
 /// Call this after the issue's own status has been recomputed off its
 /// resolution, or the sweep would still read the issue as resolved.
 pub async fn rederive_after_reopen_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
     let candidates = {
@@ -913,7 +922,7 @@ pub async fn rederive_after_reopen_conn(
 }
 
 async fn execution_issue_id_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -926,7 +935,7 @@ async fn execution_issue_id_conn(
 }
 
 async fn load_sweep_jobs(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Vec<SweepJob>> {
     let mut rows = conn
@@ -970,7 +979,7 @@ async fn load_sweep_jobs(
 /// the cancel was meant to end and give the operator no reason when refused.
 /// The reason is the issue's resolution when it has one.
 pub async fn write_job_status(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     from: &JobStatus,
     to: &JobStatus,
@@ -1101,7 +1110,7 @@ fn topo_order(node_ids: &[&str], control: &[(String, String)]) -> Vec<String> {
 /// Recompute one job's status from its facts without writing. The execution
 /// sweep computes the recipe-backed branch's same facts in bulk.
 pub async fn recompute_job_status_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<JobStatus> {
     let jobs_one = {
@@ -1251,7 +1260,7 @@ pub async fn recompute_job_status_conn(
 }
 
 async fn upstream_failed_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     node_id: &str,
     snapshot: &crate::models::ExecutionSnapshot,
@@ -1309,7 +1318,7 @@ pub struct RecomputeOutcome {
 /// DAG claim guard (no launch on a resolved issue is real work), and each change
 /// carries [`ChangeCause::IssueResolved`] so it is published quietly.
 pub async fn recompute_execution_jobs_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     claimed_launch_job_ids: &HashSet<String>,
 ) -> DbResult<RecomputeOutcome> {
@@ -1328,7 +1337,7 @@ pub async fn recompute_execution_jobs_conn(
 /// a cancelled job are never settled. Every other job in the execution derives
 /// exactly as [`recompute_execution_jobs_conn`] derives it.
 pub async fn sweep_execution_jobs_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     claimed_launch_job_ids: &HashSet<String>,
     settle_job_ids: &HashSet<String>,
@@ -1590,7 +1599,7 @@ pub async fn sweep_execution_jobs_conn(
 /// An execution's issue and project. `executions.project_id` is nullable on
 /// older rows, so the issue supplies it.
 async fn execution_placement_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<(Option<String>, Option<String>)> {
     let mut rows = conn
@@ -1629,7 +1638,7 @@ async fn execution_placement_conn(
 /// non-terminal outcome (a live turn, or a crash whose interrupted turn must
 /// stay resumable so re-dispatch can replay).
 pub async fn reduce_delegated_child_job_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<JobStatus>> {
     let row = {
@@ -2087,7 +2096,7 @@ fn sweep_execution_jobs(
 
 #[cfg(any(test, feature = "test-utils"))]
 pub async fn artifact_fact_for_test(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     required_name: Option<&str>,
 ) -> DbResult<Option<bool>> {

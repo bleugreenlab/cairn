@@ -331,7 +331,7 @@ pub(crate) enum ParentEdge {
 }
 
 pub(crate) async fn resolve_parent_edge(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     parent_uri: &str,
 ) -> DbResult<ParentEdge> {
@@ -891,7 +891,7 @@ pub async fn unresolve(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), 
 /// The reopen's caller announces every job on the issue once the write
 /// commits, these among them.
 async fn continue_sessions_for_issue_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     lifted: &[String],
 ) -> DbResult<()> {
@@ -942,7 +942,7 @@ async fn continue_sessions_for_issue_conn(
 /// whatever the job's status, returning the ids it closed: a resolved issue's
 /// work takes no turns until a reopen continues it.
 async fn close_sessions_for_issue_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     reason: SessionCloseReason,
     now: i64,

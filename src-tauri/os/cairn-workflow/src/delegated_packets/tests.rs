@@ -77,7 +77,7 @@ fn inline(packets: &[DelegatedWorkPacket]) -> serde_json::Value {
 
 async fn read<T: Send + 'static>(
     db: &LocalDb,
-    f: impl for<'a> Fn(&'a Connection) -> futures_boxed::Boxed<'a, T> + Send + Sync + 'static,
+    f: impl for<'a> Fn(&'a TrackedConnection) -> futures_boxed::Boxed<'a, T> + Send + Sync + 'static,
 ) -> T {
     let f = std::sync::Arc::new(f);
     db.read(move |conn| {

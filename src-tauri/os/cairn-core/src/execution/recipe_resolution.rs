@@ -614,7 +614,7 @@ pub(crate) async fn record_resolution(
 /// for an execution created before resolutions were recorded, or by the
 /// composer.
 pub(crate) async fn resolution_block(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_id: &str,
 ) -> String {
     use crate::storage::RowExt;
@@ -663,7 +663,7 @@ pub(crate) async fn resolution_block(
 }
 
 async fn stored_resolution_line(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_id: &str,
 ) -> Option<String> {
     use crate::storage::RowExt;

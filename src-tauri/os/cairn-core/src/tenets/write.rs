@@ -6,7 +6,7 @@
 //! own conflict check rather than by a second read outside it.
 
 use cairn_common::identity::PrincipalRef;
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 use super::read::row_conn;
 use super::{
@@ -101,7 +101,11 @@ pub struct NewTenet {
 /// Take the project's next tenet number. Must run in the same write
 /// transaction as the INSERT that uses it, which is what keeps numbers unique
 /// and gapless under concurrent proposals.
-pub async fn allocate_number_conn(conn: &Connection, project_id: &str, now: i64) -> DbResult<i64> {
+pub async fn allocate_number_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    project_id: &str,
+    now: i64,
+) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "SELECT next_tenet_number FROM projects WHERE id = ?1",
@@ -123,7 +127,10 @@ pub async fn allocate_number_conn(conn: &Connection, project_id: &str, now: i64)
 
 /// Insert `tenet` under the project's next number, returning its id and
 /// number. The caller owns the transaction.
-pub async fn insert_conn(conn: &Connection, tenet: &NewTenet) -> DbResult<(String, i64)> {
+pub async fn insert_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    tenet: &NewTenet,
+) -> DbResult<(String, i64)> {
     let number = allocate_number_conn(conn, &tenet.project_id, tenet.now).await?;
     let id = cairn_common::ids::mint_child(&tenet.project_id);
     conn.execute(
@@ -476,7 +483,7 @@ pub async fn answer(
 /// Its unanswered and withdrawn proposals carry no decision; they are deleted
 /// with it. The caller announces the removal after its transaction commits.
 pub(crate) async fn release_deleted_thread_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     thread_id: &str,
 ) -> DbResult<ReleasedTenets> {
     let mut rows = conn

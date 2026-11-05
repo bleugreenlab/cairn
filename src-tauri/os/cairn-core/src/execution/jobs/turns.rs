@@ -144,7 +144,7 @@ mod codex_goal_admission_tests {
 }
 
 async fn claim_retry_turn_start_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     turn_id: &str,
     run_id: &str,
 ) -> DbResult<bool> {
@@ -279,7 +279,7 @@ pub(crate) fn start_prepared_turn(
 }
 
 async fn supersede_pending_retry_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     turn_id: &str,
 ) -> DbResult<bool> {
     let now = chrono::Utc::now().timestamp() as i32;
@@ -677,7 +677,7 @@ mod capacity_retry_tests {
 }
 
 async fn claim_retry_successor_if_head_matches_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
     session_id: &str,
     expected_head_turn_id: &str,
@@ -720,7 +720,7 @@ async fn claim_retry_successor_if_head_matches_conn(
 }
 
 async fn consecutive_retry_turn_count_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     head_turn_id: &str,
 ) -> DbResult<u32> {
     let mut count = 0;
@@ -893,7 +893,7 @@ pub(crate) fn abandon_pending_retry_if_head_matches(
 }
 
 async fn next_turn_sequence_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     session_id: &str,
 ) -> DbResult<i32> {
     let mut rows = conn
@@ -912,7 +912,7 @@ async fn next_turn_sequence_conn(
 }
 
 async fn get_head_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<TurnHead>> {
     let mut rows = conn
@@ -956,7 +956,7 @@ async fn get_head_turn_conn(
 /// wait's to create. Anything deciding whether it may mint a successor must ask
 /// this first (CAIRN-4721).
 async fn durable_wait_owns_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
     turn_id: &str,
 ) -> DbResult<bool> {
@@ -978,7 +978,7 @@ async fn durable_wait_owns_turn_conn(
 }
 
 async fn create_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     turn_id: &str,
     session_id: &str,
     job_id: &str,
@@ -1129,7 +1129,7 @@ pub(super) fn create_initial_turn(
 /// projection treat the review as post-completion housekeeping rather than the
 /// job's latest work.
 async fn followup_start_reason_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
     user_initiated: bool,
 ) -> DbResult<TurnStartReason> {
@@ -1166,7 +1166,7 @@ async fn followup_start_reason_conn(
 }
 
 async fn create_successor_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     turn_id: &str,
     session_id: &str,
     job_id: &str,

@@ -1968,7 +1968,7 @@ async fn upsert_merge_request_for_pr(
 }
 
 async fn validate_merge_request_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
     project_id: &str,
     source_branch: &str,

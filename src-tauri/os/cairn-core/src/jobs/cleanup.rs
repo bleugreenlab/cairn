@@ -31,7 +31,7 @@ impl JobOwner {
 /// The owner column comes from a closed enum, never user input. Pointer cycles are
 /// broken before leaves are removed in immediate-foreign-key order.
 pub(crate) async fn delete_owned_jobs(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     owner: JobOwner,
     owner_id: &str,
 ) -> DbResult<()> {

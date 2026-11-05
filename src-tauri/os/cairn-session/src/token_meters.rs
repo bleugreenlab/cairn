@@ -36,8 +36,9 @@ use cairn_tokenize::Family;
 use tiktoken_rs::{o200k_base, CoreBPE};
 
 use crate::agent_process::process::AgentProcessState;
+use cairn_db::storage::TrackedConnection;
 use cairn_db::storage::{DbResult, RowExt};
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 pub struct ClaudeTokenMeter;
 pub struct O200kTokenMeter;
@@ -619,7 +620,7 @@ pub fn meter_for_process(
 /// the live process registry is intentionally not in scope. Backend identity is
 /// canonical on `sessions`; the requested model is retained on the owning job.
 pub async fn meter_for_run_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     run_id: &str,
 ) -> DbResult<&'static dyn TokenMeter> {
     let mut rows = conn

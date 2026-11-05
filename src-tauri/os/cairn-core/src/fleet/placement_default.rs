@@ -19,7 +19,7 @@
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::executor_protocol::{ExecutorSelector, EXECUTOR_PLATFORMS};
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 /// What the orientation block adds to the default's line, so an agent knows
 /// what inherits it, what does not, and what it is for.
@@ -42,7 +42,10 @@ pub(crate) enum DefaultOwner {
 impl DefaultOwner {
     /// The owner of `job_id`'s default: its thread when the job is a thread's
     /// session, the job itself otherwise.
-    pub(crate) async fn for_job_conn(conn: &Connection, job_id: &str) -> DbResult<Self> {
+    pub(crate) async fn for_job_conn(
+        conn: &cairn_db::storage::TrackedConnection,
+        job_id: &str,
+    ) -> DbResult<Self> {
         let mut rows = conn
             .query(
                 &format!(
@@ -376,7 +379,7 @@ const DEFAULT_COLUMNS: &str =
 
 /// `owner`'s default as stored, cleared or not.
 pub(crate) async fn load_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     owner: &DefaultOwner,
 ) -> DbResult<Option<PlacementDefault>> {
     let (column, owner_id) = owner.column();

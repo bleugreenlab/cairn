@@ -50,7 +50,7 @@ struct ExecutionJobRow {
 /// `running` or `complete`. Pending, failed, and blocked jobs are archivable:
 /// each is flipped to `cancelled` with its transcript and branch coordinate preserved.
 pub async fn reconcile_removed_nodes_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     removed_node_ids: &HashSet<String>,
 ) -> DbResult<RemovedNodesReconcile> {
@@ -204,7 +204,7 @@ impl From<crate::transitions::status::Resolution> for SessionCloseReason {
 /// start, because the closed session refuses its delivery, and nothing else
 /// would close the session. The orphan-draft sweep confirms its drafts.
 pub async fn close_job_sessions_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     reason: SessionCloseReason,
     now: i64,
@@ -256,7 +256,7 @@ pub async fn close_job_sessions_conn(
 /// a terminal issue resolution, which stops the issue's live work and closes
 /// with the resolution's own reason (`issues::status`).
 pub async fn cancel_job_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     now: i64,
     reason: SessionCloseReason,
@@ -337,7 +337,7 @@ mod tests {
     }
 
     async fn seed_project_issue_execution(
-        conn: &cairn_db::turso::Connection,
+        conn: &cairn_db::storage::TrackedConnection,
         snapshot: &ExecutionSnapshot,
     ) {
         conn.execute(
@@ -372,7 +372,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     async fn seed_job(
-        conn: &cairn_db::turso::Connection,
+        conn: &cairn_db::storage::TrackedConnection,
         id: &str,
         node_id: &str,
         status: &str,
@@ -398,7 +398,7 @@ mod tests {
         }
     }
 
-    async fn job_exists(conn: &cairn_db::turso::Connection, id: &str) -> bool {
+    async fn job_exists(conn: &cairn_db::storage::TrackedConnection, id: &str) -> bool {
         let mut rows = conn
             .query("SELECT 1 FROM jobs WHERE id = ?1", params![id])
             .await
@@ -406,7 +406,7 @@ mod tests {
         rows.next().await.unwrap().is_some()
     }
 
-    async fn session_exists(conn: &cairn_db::turso::Connection, job_id: &str) -> bool {
+    async fn session_exists(conn: &cairn_db::storage::TrackedConnection, job_id: &str) -> bool {
         let mut rows = conn
             .query("SELECT 1 FROM sessions WHERE job_id = ?1", params![job_id])
             .await
@@ -414,7 +414,7 @@ mod tests {
         rows.next().await.unwrap().is_some()
     }
 
-    async fn job_status(conn: &cairn_db::turso::Connection, id: &str) -> Option<String> {
+    async fn job_status(conn: &cairn_db::storage::TrackedConnection, id: &str) -> Option<String> {
         let mut rows = conn
             .query("SELECT status FROM jobs WHERE id = ?1", params![id])
             .await
@@ -422,7 +422,7 @@ mod tests {
         rows.next().await.unwrap().map(|row| row.text(0).unwrap())
     }
 
-    async fn run_exists(conn: &cairn_db::turso::Connection, run_id: &str) -> bool {
+    async fn run_exists(conn: &cairn_db::storage::TrackedConnection, run_id: &str) -> bool {
         let mut rows = conn
             .query("SELECT 1 FROM runs WHERE id = ?1", params![run_id])
             .await
@@ -780,7 +780,10 @@ mod tests {
         .unwrap();
     }
 
-    async fn session_state(conn: &cairn_db::turso::Connection, session_id: &str) -> String {
+    async fn session_state(
+        conn: &cairn_db::storage::TrackedConnection,
+        session_id: &str,
+    ) -> String {
         let mut rows = conn
             .query(
                 "SELECT status || ':' || COALESCE(terminal_reason, '') || ':' || (closed_at IS NOT NULL)

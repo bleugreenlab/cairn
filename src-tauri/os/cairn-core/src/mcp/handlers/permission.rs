@@ -974,7 +974,7 @@ fn hand_back_successor(hand_back: &HandBack) -> &HostWaitSuccessor {
 /// open on its socket (`agent_waits.hold`) keeps its turn running, not
 /// yielded, so it holds nothing here.
 async fn turn_held_by_another_wait(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
     request_id: &str,
 ) -> DbResult<bool> {
@@ -3399,7 +3399,7 @@ pub(super) async fn issue_id_for_run(db: &LocalDb, run_id: &str) -> DbResult<Opt
 }
 
 async fn issue_id_for_run_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -3428,7 +3428,7 @@ pub async fn recompute_issue_status_for_issue(db: &LocalDb, issue_id: &str) -> D
 }
 
 pub(super) async fn yield_turn_for_host(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
     reason: TurnYieldReason,
 ) -> DbResult<bool> {

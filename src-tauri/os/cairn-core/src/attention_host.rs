@@ -5,23 +5,35 @@ use crate::orchestrator::Orchestrator;
 use async_trait::async_trait;
 use cairn_attention::runtime::{AttentionHost, AttentionRuntime, RecipientHost};
 use cairn_attention::wakes::conditions::{ConditionOutcome, WakeCondition};
+use cairn_db::storage::DbResult;
 use cairn_db::storage::LocalDb;
 use cairn_db::turso::params;
-use cairn_db::{storage::DbResult, turso::Connection};
 use std::sync::Arc;
 
 pub(crate) struct CoreRecipients;
 #[async_trait]
 impl cairn_attention::runtime::RecipientHost for CoreRecipients {
-    async fn ensure_thread_session(&self, conn: &Connection, thread_id: &str) -> DbResult<String> {
+    async fn ensure_thread_session(
+        &self,
+        conn: &cairn_db::storage::TrackedConnection,
+        thread_id: &str,
+    ) -> DbResult<String> {
         crate::threads::ensure_thread_session_conn(conn, thread_id, None).await
     }
-    async fn job_is_fenced(&self, conn: &Connection, job_id: &str) -> DbResult<bool> {
+    async fn job_is_fenced(
+        &self,
+        conn: &cairn_db::storage::TrackedConnection,
+        job_id: &str,
+    ) -> DbResult<bool> {
         crate::execution::canonical::fence_for_job_conn(conn, job_id)
             .await
             .map(|fence| fence.is_superseded())
     }
-    async fn job_issue_is_resolved(&self, conn: &Connection, job_id: &str) -> DbResult<bool> {
+    async fn job_issue_is_resolved(
+        &self,
+        conn: &cairn_db::storage::TrackedConnection,
+        job_id: &str,
+    ) -> DbResult<bool> {
         let mut rows = conn
             .query(
                 "SELECT 1 FROM jobs j JOIN issues i ON i.id = j.issue_id
@@ -43,13 +55,25 @@ pub(crate) fn runtime(orch: &Orchestrator) -> AttentionRuntime {
 struct CoreAttentionHost(Orchestrator);
 #[async_trait]
 impl RecipientHost for CoreAttentionHost {
-    async fn ensure_thread_session(&self, conn: &Connection, thread_id: &str) -> DbResult<String> {
+    async fn ensure_thread_session(
+        &self,
+        conn: &cairn_db::storage::TrackedConnection,
+        thread_id: &str,
+    ) -> DbResult<String> {
         CoreRecipients.ensure_thread_session(conn, thread_id).await
     }
-    async fn job_is_fenced(&self, conn: &Connection, job_id: &str) -> DbResult<bool> {
+    async fn job_is_fenced(
+        &self,
+        conn: &cairn_db::storage::TrackedConnection,
+        job_id: &str,
+    ) -> DbResult<bool> {
         CoreRecipients.job_is_fenced(conn, job_id).await
     }
-    async fn job_issue_is_resolved(&self, conn: &Connection, job_id: &str) -> DbResult<bool> {
+    async fn job_issue_is_resolved(
+        &self,
+        conn: &cairn_db::storage::TrackedConnection,
+        job_id: &str,
+    ) -> DbResult<bool> {
         CoreRecipients.job_issue_is_resolved(conn, job_id).await
     }
 }

@@ -1,7 +1,7 @@
 //! Host-boundary witnesses against the real migrated schemas.
 use crate::{push, runtime::*, storage::*, wakes::*};
 use async_trait::async_trait;
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 use cairn_domain::{DeliveryUrgency, Message};
 use conditions::{ConditionOutcome, WakeCondition};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,11 @@ struct Host {
 }
 #[async_trait]
 impl RecipientHost for Host {
-    async fn ensure_thread_session(&self, conn: &Connection, thread_id: &str) -> DbResult<String> {
+    async fn ensure_thread_session(
+        &self,
+        conn: &TrackedConnection,
+        thread_id: &str,
+    ) -> DbResult<String> {
         // A real write through the supplied connection witnesses that host work
         // rolls back with attention's transaction, not an independent commit.
         conn.execute(
@@ -23,10 +27,10 @@ impl RecipientHost for Host {
         .await?;
         Ok("job".into())
     }
-    async fn job_is_fenced(&self, _: &Connection, job_id: &str) -> DbResult<bool> {
+    async fn job_is_fenced(&self, _: &TrackedConnection, job_id: &str) -> DbResult<bool> {
         Ok(job_id == "fenced")
     }
-    async fn job_issue_is_resolved(&self, _: &Connection, job_id: &str) -> DbResult<bool> {
+    async fn job_issue_is_resolved(&self, _: &TrackedConnection, job_id: &str) -> DbResult<bool> {
         match job_id {
             "unreadable" => Err(cairn_db::storage::DbError::internal("issue read failed")),
             other => Ok(other == "resolved"),

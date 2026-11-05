@@ -27,7 +27,7 @@
 //! thread with no run) leaves every row unconsumed, so the next sweep retries.
 
 use crate::messages::queued::DeliveryUrgency;
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 use super::worker::EvidenceDeps;
 use super::{stable_id, utc_date, HALF_LIFE_DAYS, WAKE_SETTLE_SECS, WAKE_THRESHOLD};
@@ -85,7 +85,7 @@ fn wake_id(tenet_id: &str, rows: &[Contradiction]) -> String {
 /// dismissed, oldest first. The predicate is spelled as the
 /// `tenet_evidence_unconsumed` partial index spells it.
 pub(super) async fn unconsumed_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     tenet_id: &str,
 ) -> DbResult<Vec<Contradiction>> {
     let mut rows = conn
@@ -115,7 +115,7 @@ pub(super) async fn unconsumed_conn(
 /// unconsumed; otherwise the write fails, rolling back with it, rather than
 /// let one message claim rows another wake counted.
 async fn consume_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     rows: &[Contradiction],
     wake: &str,
     now: i64,
@@ -220,7 +220,7 @@ pub async fn fire(
 }
 
 async fn fire_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     tenet_id: &str,
     device: &str,
     now: i64,

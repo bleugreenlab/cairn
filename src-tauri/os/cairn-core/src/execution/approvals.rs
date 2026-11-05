@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 
-use cairn_db::turso::{Connection, Value as SqlValue};
+use cairn_db::turso::Value as SqlValue;
 
 use crate::execution::gates::authoring::gate_vocabulary;
 use crate::routes::TriggerClause;
@@ -178,7 +178,7 @@ fn scoped_statements(scope: &ApprovalScope) -> Vec<(String, Vec<SqlValue>)> {
 /// Every pending approval in `scope`, at most one per job (its newest pending
 /// chain), each with its open deferral and its last re-surfacing cause.
 pub async fn pending_approvals_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     scope: &ApprovalScope,
 ) -> DbResult<Vec<PendingApproval>> {
     let mut newest: HashMap<String, (i64, i64, PendingApproval)> = HashMap::new();
@@ -260,7 +260,7 @@ pub async fn pending_approvals(
 
 /// The pending approval on one job, if there is one.
 pub async fn pending_approval_for_job_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<PendingApproval>> {
     Ok(
@@ -271,7 +271,10 @@ pub async fn pending_approval_for_job_conn(
     )
 }
 
-async fn attach_conditions(conn: &Connection, approvals: &mut [PendingApproval]) -> DbResult<()> {
+async fn attach_conditions(
+    conn: &crate::storage::TrackedConnection,
+    approvals: &mut [PendingApproval],
+) -> DbResult<()> {
     if approvals.is_empty() {
         return Ok(());
     }

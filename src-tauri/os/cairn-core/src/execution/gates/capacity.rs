@@ -726,7 +726,7 @@ struct IssueThread {
 }
 
 async fn thread_of_issue_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Option<IssueThread>> {
     let mut rows = conn.query(THREAD_OF_ISSUE_SQL, params![issue_id]).await?;
@@ -742,7 +742,7 @@ async fn thread_of_issue_conn(
 
 /// A thread's open children, by issue number: `(number, issue id)`.
 async fn open_thread_children_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     thread_id: &str,
 ) -> DbResult<Vec<(i64, String)>> {
     let mut rows = conn

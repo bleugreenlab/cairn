@@ -6,7 +6,7 @@
 use crate::execution::check_parsers::CheckPhases;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_db::turso::{params, Connection, Value};
+use cairn_db::turso::{params, Value};
 use std::sync::Arc;
 
 /// The PRIMARY KEY index of `check_result_cache`: `(project_id, check_name,
@@ -99,7 +99,7 @@ pub(crate) struct CheckResultIdentity {
 /// [`CHECK_RESULT_CACHE_KEY_INDEX`]. It reads on a connection the caller
 /// already holds, so a projection's lookups share one transaction.
 pub(crate) async fn list_check_results_for_inputs_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     head: HeadVerdictKeys<'_>,
 ) -> DbResult<Vec<crate::execution::checks_status::LaneRow>> {
@@ -592,7 +592,7 @@ fn reusable_check_result_sql(platforms: usize, executors: Option<usize>) -> Stri
 
 /// [`get_reusable_check_result`] on a connection the caller already holds.
 pub(crate) async fn get_reusable_check_result_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     lookup: ReusableCheckLookup<'_>,
 ) -> DbResult<Option<ReusableCheckResult>> {
     if !lookup.is_answerable() {
@@ -990,7 +990,7 @@ impl CheckResultCacheWrite {
 /// One read for every live counter, so a decision that spans several repair
 /// domains is taken from a single snapshot rather than assembled from several.
 async fn read_infra_scope_rows(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     check_name: &str,
     input_hash: &str,
@@ -1074,7 +1074,7 @@ impl SuppressedCheck {
 /// The suppression bounding a triple: a spent counter in some repair domain,
 /// else, for a review lane, a tripped lane breaker.
 async fn bounding_suppression(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     check_name: &str,
     input_hash: &str,
@@ -2465,7 +2465,7 @@ struct ProjectedVerdict {
 }
 
 async fn projected_verdict(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     observation: &FreshCheckObservationWrite,
     input_hash: &str,
 ) -> DbResult<Option<ProjectedVerdict>> {
@@ -2494,7 +2494,7 @@ async fn projected_verdict(
 
 /// Whether the hot projection row `observation` would replace holds an answer.
 async fn projection_holds_an_answer(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     observation: &FreshCheckObservationWrite,
 ) -> DbResult<bool> {
     Ok(
@@ -2515,7 +2515,7 @@ async fn projection_holds_an_answer(
 /// still projects it; one a later observation has since displaced there is
 /// classified by its exit verdict and failure kind alone.
 async fn alias_names_an_answer(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     observation: &FreshCheckObservationWrite,
 ) -> DbResult<bool> {
     let mut rows = conn
@@ -3153,7 +3153,7 @@ pub(crate) fn get_check_result_observation_by_handle(
 /// The public handle a verdict citation names, read on a connection the caller
 /// already holds.
 pub(crate) async fn get_check_observation_public_handle_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
     observation_id: &str,
 ) -> DbResult<Option<String>> {

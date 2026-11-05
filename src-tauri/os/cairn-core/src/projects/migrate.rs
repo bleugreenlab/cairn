@@ -1,5 +1,5 @@
 use cairn_common::ids::rekey_to_team;
-use cairn_db::turso::{Connection, Value};
+use cairn_db::turso::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
@@ -47,7 +47,10 @@ pub(crate) async fn sweep_project_channel_surfaces(
         .await
 }
 
-async fn sweep_channel_surfaces(conn: &Connection, project_key: &str) -> Result<(), DbError> {
+async fn sweep_channel_surfaces(
+    conn: &cairn_db::storage::TrackedConnection,
+    project_key: &str,
+) -> Result<(), DbError> {
     for spec in CHANNEL_KEY_ADDRESSED {
         let sql = format!("DELETE FROM {} WHERE {}", spec.table, spec.sweep_where_sql);
         conn.execute(&sql, (project_key,))
@@ -1344,7 +1347,7 @@ async fn sweep_source(db: &LocalDb, project_id: &str) -> Result<(), DbError> {
 /// Delete every private-lineage row the project owns. Always runs against the
 /// per-install database, whichever database owns the project row.
 async fn sweep_private_half(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     owner_ids: &OwnerIds,
     channel_project_key: Option<&str>,
@@ -1384,7 +1387,10 @@ async fn sweep_private_half(
 
 /// Delete every shared-lineage row the project owns, ending with the project
 /// row itself. Runs against whichever database owns the project.
-async fn sweep_shared_half(conn: &Connection, project_id: &str) -> Result<(), DbError> {
+async fn sweep_shared_half(
+    conn: &cairn_db::storage::TrackedConnection,
+    project_id: &str,
+) -> Result<(), DbError> {
     conn.execute("UPDATE jobs SET current_turn_id = NULL, resume_session_id = NULL, turn_end_check_attempt_id = NULL WHERE project_id = ?1", (project_id,)).await?;
     conn.execute("UPDATE turns SET predecessor_id = NULL WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR run_id IN (SELECT id FROM runs WHERE project_id = ?1)", (project_id,)).await?;
     conn.execute("UPDATE sessions SET replaced_by_id = NULL, parent_session_id = NULL WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1)", (project_id,)).await?;

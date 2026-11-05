@@ -142,7 +142,10 @@ pub(crate) async fn resolve_thread_model(
     Ok(resolved)
 }
 
-async fn get_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Option<Thread>> {
+async fn get_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<Option<Thread>> {
     let sql = format!("SELECT {COLUMNS} FROM threads WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
     rows.next().await?.map(|row| from_row(&row)).transpose()
@@ -220,7 +223,7 @@ const PLACEHOLDER_PREFIX: &str = "thread-";
 /// by name at any time, and stepping over what is actually present keeps that
 /// from turning into a hard collision later.
 async fn allocate_placeholder_name(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     now: i64,
 ) -> DbResult<String> {
@@ -509,7 +512,7 @@ mod tests {
     }
 
     async fn seed_project(db: &LocalDb, id: &str) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT OR IGNORE INTO projects
              (id, workspace_id, name, key, repo_path, created_at, updated_at)
              VALUES ('{id}', 'default', '{id}', '{id}', '/tmp/{id}', 1, 1);"
@@ -710,7 +713,7 @@ mod tests {
 
         let sessions = db
             .query_one(
-                &format!(
+                format!(
                     "SELECT COUNT(*) FROM sessions s JOIN jobs j ON j.id = s.job_id
                      WHERE j.thread_id IS NOT NULL AND {}",
                     crate::threads::SESSION_JOB_SHAPE
@@ -931,7 +934,7 @@ mod tests {
         // unambiguous while the thread has never spawned anything.
         let stamped: (Option<String>, String) = db
             .query_one(
-                &format!(
+                format!(
                     "SELECT j.model, s.backend FROM jobs j
                      JOIN sessions s ON s.job_id = j.id
                      WHERE j.thread_id = ?1 AND {}",
@@ -978,7 +981,7 @@ mod tests {
         };
         let session_model = || async {
             db.query_one(
-                &format!(
+                format!(
                     "SELECT j.model FROM jobs j WHERE j.thread_id = ?1 AND {}",
                     crate::threads::SESSION_JOB_SHAPE
                 ),
@@ -1044,7 +1047,7 @@ mod tests {
         // A task the session spawned carries the thread's id as well; the model
         // change must address the session by its shape, never "a job of this
         // thread".
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO jobs(id, thread_id, parent_job_id, project_id, node_name, uri_segment,
                               status, model, created_at, updated_at)
              VALUES ('task-1', '{}', (SELECT id FROM jobs WHERE thread_id = '{}' AND parent_job_id IS NULL),
@@ -1089,7 +1092,7 @@ mod tests {
         assert_eq!(updated.thread.jurisdiction, thread.jurisdiction);
         let session_model = db
             .query_one(
-                &format!(
+                format!(
                     "SELECT j.model FROM jobs j WHERE j.thread_id = ?1 AND {}",
                     crate::threads::SESSION_JOB_SHAPE
                 ),
@@ -1123,7 +1126,7 @@ mod tests {
         seed_project(&db, "project-a").await;
         let thread = create(&db, input("project-a", "roadmap")).await.unwrap();
 
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO comments(id, thread_id, content, source, created_at)
              VALUES ('comment-1', '{}', 'hello', 'user', 1);
              INSERT INTO messages(id, channel_type, channel_id, sender_name, content, created_at)
@@ -1170,7 +1173,7 @@ mod tests {
             "threads",
         ] {
             let count = db
-                .query_one(&format!("SELECT COUNT(*) FROM {table}"), (), |row| {
+                .query_one(format!("SELECT COUNT(*) FROM {table}"), (), |row| {
                     row.i64(0)
                 })
                 .await

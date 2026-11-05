@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 
 use cairn_common::identity::PrincipalRef;
 use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
-use cairn_db::turso::{Connection, Value as SqlValue};
+use cairn_db::turso::Value as SqlValue;
 use serde_json::Value;
 
 use super::vocabulary::{GateOutcome, GateVocabulary};
@@ -567,42 +567,46 @@ pub(super) fn census_rows_sql(filter: &str) -> String {
     format!("{CENSUS_ROW_SQL}{filter} ORDER BY e.issue_id, e.seq, e.id")
 }
 
-async fn census_rows(
-    conn: &Connection,
-    sql: &str,
+#[track_caller]
+fn census_rows<'a, C: cairn_db::storage::QueryConn + ?Sized>(
+    conn: &'a C,
+    sql: &'a str,
     bound: Vec<SqlValue>,
-) -> DbResult<Vec<CensusRow>> {
-    let mut rows = conn.query(sql, bound).await?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let wont_start = if row.i64(5)? != 0 {
-            let key = row.opt_text(8)?;
-            let number = row.opt_i64(9)?;
-            let merged = row.opt_i64(10)?.is_some();
-            let resolved = merged || row.opt_i64(11)?.is_some();
-            let issue = match (resolved, key.as_deref(), number) {
-                (true, Some(key), Some(number)) => Some((key, number, merged)),
-                _ => None,
+) -> impl std::future::Future<Output = DbResult<Vec<CensusRow>>> + Send + 'a {
+    let rows = conn.query_rows(sql, bound);
+    async move {
+        let mut rows = rows.await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let wont_start = if row.i64(5)? != 0 {
+                let key = row.opt_text(8)?;
+                let number = row.opt_i64(9)?;
+                let merged = row.opt_i64(10)?.is_some();
+                let resolved = merged || row.opt_i64(11)?.is_some();
+                let issue = match (resolved, key.as_deref(), number) {
+                    (true, Some(key), Some(number)) => Some((key, number, merged)),
+                    _ => None,
+                };
+                Some(wont_start_reason(row.i64(6)? != 0, row.opt_i64(7)?, issue))
+            } else {
+                None
             };
-            Some(wont_start_reason(row.i64(6)? != 0, row.opt_i64(7)?, issue))
-        } else {
-            None
-        };
-        out.push(CensusRow {
-            id: row.text(0)?,
-            issue_id: row.opt_text(1)?,
-            seq: row.opt_i64(2)?,
-            released_at: row.opt_i64(3)?,
-            release_override_json: row.opt_text(4)?,
-            wont_start,
-        });
+            out.push(CensusRow {
+                id: row.text(0)?,
+                issue_id: row.opt_text(1)?,
+                seq: row.opt_i64(2)?,
+                released_at: row.opt_i64(3)?,
+                release_override_json: row.opt_text(4)?,
+                wont_start,
+            });
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// Render `rows` against their gates, keeping only those with a census.
 async fn render_rows(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     rows: Vec<CensusRow>,
 ) -> DbResult<Vec<(CensusRow, ExecutionGateCensus)>> {
     let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
@@ -636,7 +640,7 @@ pub(super) fn executions_census_sql(n: usize) -> String {
 /// The census of each execution in `execution_ids` that has one. Two queries
 /// per [`IN_LIST_CHUNK`] executions, however many a list shows.
 pub async fn census_for_executions_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_ids: &[String],
 ) -> DbResult<HashMap<String, ExecutionGateCensus>> {
     let mut out = HashMap::new();
@@ -683,9 +687,8 @@ pub(super) fn project_gated_sql() -> String {
     )
 }
 
-/// Gated, unreleased executions selected by `sql` (built by
-/// [`gated_unreleased_rows_sql`]) over `bound`, in issue then execution order,
-/// paired with their issue id. Both kinds come back — those waiting to start
+/// Gated, unreleased census rows paired with their issue id.
+/// Both kinds come back — those waiting to start
 /// (`census.held`) and those that never will (`census.wont_start`) — for the
 /// caller to list apart.
 ///
@@ -693,11 +696,9 @@ pub(super) fn project_gated_sql() -> String {
 /// derives `held` for both kinds (see `cairn_workflow::transitions::outcome`),
 /// and only the shared predicate tells them apart.
 async fn gated_unreleased_rows(
-    conn: &Connection,
-    sql: &str,
-    bound: Vec<SqlValue>,
+    conn: &crate::storage::TrackedConnection,
+    rows: Vec<CensusRow>,
 ) -> DbResult<Vec<(String, HeldExecution)>> {
-    let rows = census_rows(conn, sql, bound).await?;
     Ok(render_rows(conn, rows)
         .await?
         .into_iter()
@@ -740,15 +741,15 @@ impl IssueGatedExecutions {
 /// Every gated, unreleased execution on each of `issue_ids`, grouped by issue
 /// and split into waiting and won't-start.
 pub async fn gated_executions_for_issues_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     issue_ids: &[String],
 ) -> DbResult<HashMap<String, IssueGatedExecutions>> {
     let mut grouped = HashMap::<String, IssueGatedExecutions>::new();
     // Each issue lands in exactly one chunk, so its executions keep their seq
     // order across the split.
     for chunk in issue_ids.chunks(IN_LIST_CHUNK) {
-        let gated =
-            gated_unreleased_rows(conn, &issues_gated_sql(chunk.len()), bound_ids(chunk)).await?;
+        let rows = census_rows(conn, &issues_gated_sql(chunk.len()), bound_ids(chunk)).await?;
+        let gated = gated_unreleased_rows(conn, rows).await?;
         for (issue_id, execution) in gated {
             grouped.entry(issue_id).or_default().push(execution);
         }
@@ -771,15 +772,16 @@ pub struct ProjectHeldExecution {
 /// closed issue's are left out: the issue's own resolution already ended that
 /// work, and the issue's own surfaces say so.
 pub async fn held_executions_for_project_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     project_id: &str,
 ) -> DbResult<Vec<ProjectHeldExecution>> {
-    let held = gated_unreleased_rows(
+    let rows = census_rows(
         conn,
         &project_gated_sql(),
         vec![SqlValue::Text(project_id.to_string())],
     )
     .await?;
+    let held = gated_unreleased_rows(conn, rows).await?;
     if held.is_empty() {
         return Ok(Vec::new());
     }
@@ -873,6 +875,36 @@ mod tests {
     use super::test_support::{hold_execution, HELD_SUMMARY};
     use super::*;
     use crate::storage::LocalDb;
+
+    #[tokio::test]
+    async fn census_rows_preserves_caller_statement_identity() {
+        use std::time::Duration;
+
+        let db = crate::storage::migrated_test_db("census-tracking.db").await;
+        let conn = db.connect().await.unwrap();
+        let sql = "SELECT ?1, 'i', 2, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL";
+        let line = line!() + 1;
+        let rows = census_rows(&conn, sql, vec![SqlValue::Text("e".into())])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "e");
+        assert_eq!(rows[0].issue_id.as_deref(), Some("i"));
+        assert_eq!(rows[0].seq, Some(2));
+        assert!(rows[0].released_at.is_none());
+        assert!(rows[0].wont_start.is_none());
+        let holders = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(&*holders[0].statement, format!("{}:{line} {sql}", file!()));
+
+        let raw_rows = census_rows(&*conn, sql, vec![SqlValue::Text("raw".into())])
+            .await
+            .unwrap();
+        assert_eq!(raw_rows[0].id, "raw");
+        assert!(census_rows(&conn, "SELECT missing_column", vec![])
+            .await
+            .is_err());
+    }
 
     async fn issue_with_two_executions() -> LocalDb {
         let db = crate::storage::migrated_test_db("gate-census.db").await;

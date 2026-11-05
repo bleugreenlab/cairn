@@ -5210,7 +5210,7 @@ async fn load_job_by_id(db: &LocalDb, job_id: &str) -> Result<Option<MergedJob>,
 }
 
 async fn load_job_by_id_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<MergedJob>> {
     let mut rows = conn
@@ -5351,7 +5351,7 @@ async fn latest_complete_implementation_job(
 }
 
 async fn load_execution_snapshot_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<ExecutionSnapshot> {
     let mut rows = conn

@@ -135,7 +135,7 @@ pub(super) async fn lookup_run_context(
 }
 
 async fn lookup_run_context_by_id(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     run_id: &str,
 ) -> DbResult<Option<ParentRunContext>> {
     // The parent's own identity and project, nothing about an issue coordinate:

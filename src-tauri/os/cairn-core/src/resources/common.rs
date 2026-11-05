@@ -274,7 +274,7 @@ fn resource_artifact_from_row(row: &cairn_db::turso::Row) -> DbResult<ResourceAr
 }
 
 pub(super) async fn lookup_project_by_key(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
 ) -> Result<ProjectContext, String> {
     let key = cairn_common::uri::canonical_project(project_key);
@@ -301,7 +301,7 @@ pub(super) async fn lookup_project_by_key(
 }
 
 pub(super) async fn issue_id_for_number(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     number: i32,
 ) -> Option<String> {
@@ -317,7 +317,7 @@ pub(super) async fn issue_id_for_number(
 }
 
 pub(super) async fn resolve_issue_id(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i32,
 ) -> Result<(ProjectContext, String), String> {
@@ -329,7 +329,7 @@ pub(super) async fn resolve_issue_id(
 }
 
 pub(super) async fn visible_job_node_segment(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job: &ResourceJob,
 ) -> String {
     if let Some(segment) = job
@@ -850,7 +850,7 @@ fn schema_example_payload(
 
 /// Get todo progress string like "3/5 todos"
 pub(super) async fn get_todo_progress(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Option<String> {
     let mut rows = conn
@@ -895,7 +895,7 @@ pub(crate) fn node_job_not_found_message(
 }
 
 pub(super) async fn find_job_by_id(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Option<ResourceJob> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1 LIMIT 1");
@@ -949,7 +949,7 @@ pub(super) fn load_task_job<'s>(
 /// and every collection built on it (tasks, questions, todos) works from a
 /// thread without knowing a thread exists.
 pub(crate) async fn find_node_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i32,
     exec_seq: i32,
@@ -982,7 +982,7 @@ pub(crate) async fn find_node_job(
 
 /// The bookmark a node's work lives on, or `None` when it has no branch yet.
 pub(crate) async fn node_branch(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<Option<String>, String> {
     let mut rows = conn
@@ -1005,7 +1005,7 @@ pub(crate) async fn node_branch(
 
 /// A task's parent job and the task's own job. Statements only.
 pub(super) async fn find_task_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i32,
     exec_seq: i32,
@@ -1026,7 +1026,10 @@ pub(super) async fn find_task_job(
 /// (a delegated task, a call, a child workflow) owns its output at its own
 /// address; counting it toward the parent presents the child's output as the
 /// parent's work product.
-pub(super) async fn has_artifact_for_job(conn: &cairn_db::turso::Connection, job_id: &str) -> bool {
+pub(super) async fn has_artifact_for_job(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> bool {
     match conn
         .query(
             "SELECT id FROM artifacts WHERE job_id = ?1 LIMIT 1",
@@ -1040,7 +1043,10 @@ pub(super) async fn has_artifact_for_job(conn: &cairn_db::turso::Connection, job
 }
 
 /// Check if a job has any terminals
-pub(super) async fn has_terminal_for_job(conn: &cairn_db::turso::Connection, job_id: &str) -> bool {
+pub(super) async fn has_terminal_for_job(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> bool {
     match conn
         .query(
             "SELECT id FROM job_terminals WHERE job_id = ?1 LIMIT 1",
@@ -1054,7 +1060,7 @@ pub(super) async fn has_terminal_for_job(conn: &cairn_db::turso::Connection, job
 }
 
 pub(super) async fn get_direct_artifact_for_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Option<ResourceArtifact> {
     // Most recently written name wins. `version` is per-name, so ordering by it
@@ -1083,7 +1089,7 @@ pub(super) async fn get_direct_artifact_for_job(
 /// whichever name was written most recently. Only the job's own rows count
 /// (see [`has_artifact_for_job`]).
 pub(super) async fn get_named_artifact_for_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     output_name: &str,
 ) -> Option<ResourceArtifact> {
@@ -1112,7 +1118,7 @@ pub(super) async fn get_named_artifact_for_job(
 /// highest version). A single-artifact node yields exactly one entry — the same
 /// artifact [`get_direct_artifact_for_job`] would surface.
 pub(super) async fn list_named_artifacts_for_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Vec<ResourceArtifact> {
     let sql = format!(
@@ -1143,7 +1149,7 @@ pub(super) async fn list_named_artifacts_for_job(
 }
 
 async fn find_task_by_name(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     parent_job_id: &str,
     task_name: &str,
 ) -> Result<ResourceJob, String> {
@@ -1175,7 +1181,7 @@ async fn find_task_by_name(
 
 /// Get the execution_id for a given exec_seq (1-based index stored in seq column)
 async fn get_execution_id_for_seq(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     exec_seq: i32,
 ) -> Option<String> {
@@ -1196,7 +1202,7 @@ async fn get_execution_id_for_seq(
 }
 
 pub(super) async fn find_job_by_node_name(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     node_name: &str,
     exec_seq: i32,
@@ -1237,7 +1243,7 @@ pub(super) async fn find_job_by_node_name(
 /// `get_execution_id_for_seq`, so action nodes resolve through the exact key the
 /// node-tree emits and `blocked_node_artifact_uri` uses (CAIRN-1222).
 pub(super) async fn find_action_run_by_node_name(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     node_name: &str,
     exec_seq: i32,

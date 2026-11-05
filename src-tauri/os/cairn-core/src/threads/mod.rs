@@ -35,7 +35,7 @@ use crate::storage::LocalDb;
 /// only a number vacated by the thread cutover can resolve through
 /// `threads.migrated_from_number`.
 pub(crate) async fn resolve_parent_thread_uri_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     uri: &str,
 ) -> crate::storage::DbResult<Option<(String, String, String)>> {
     use cairn_common::uri::{parse_uri, CairnResource};
@@ -146,7 +146,7 @@ pub use cairn_db::lineage::SESSION_JOB_SHAPE;
 /// must outlive a session — a reading position, most of all — keys on this
 /// rather than on the session job or on the name.
 pub(crate) async fn thread_id_by_name_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     name: &str,
 ) -> crate::storage::DbResult<Option<String>> {
@@ -185,7 +185,7 @@ pub(crate) async fn thread_id_by_name(
 /// The one answer to "which job runs this thread's session", addressed the way
 /// a URI addresses a thread.
 pub(crate) async fn session_job_id_by_name_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     thread_name: &str,
 ) -> crate::storage::DbResult<Option<String>> {
@@ -230,7 +230,7 @@ fn arc_output_contract() -> String {
 /// The thread a `(project key, thread name)` coordinate names, or the error a
 /// write to it reports when either does not resolve.
 pub(crate) async fn thread_id_for_coordinate_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     name: &str,
 ) -> crate::storage::DbResult<String> {
@@ -263,7 +263,7 @@ pub(crate) async fn thread_id_for_coordinate_conn(
 
 /// The thread's live session job, if it has one.
 async fn live_session_job_id_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     thread_id: &str,
 ) -> crate::storage::DbResult<Option<String>> {
     let mut existing = conn
@@ -290,7 +290,7 @@ async fn live_session_job_id_conn(
 /// write would mint one, or the error that write would report (no such project
 /// or thread, or a closed thread with no session to resume).
 pub(crate) async fn planned_thread_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     name: &str,
 ) -> crate::storage::DbResult<Option<String>> {
@@ -344,7 +344,7 @@ pub(crate) async fn planned_thread_session_conn(
 /// session of the thread, so the `(thread, segment)` pair this keys on is unique
 /// and the `LIMIT 1` below is belt-and-braces rather than a tiebreak that picks.
 pub(crate) async fn task_job_id_by_name_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     thread_name: &str,
     task_segment: &str,
@@ -394,7 +394,7 @@ pub(crate) async fn task_job_id_by_name_conn(
 /// refused at `messages::delivery::append_thread_message`; both check the thread
 /// directly rather than relying on this one.
 pub(crate) async fn ensure_thread_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     thread_id: &str,
     model: Option<&crate::models::ModelSelection>,
 ) -> crate::storage::DbResult<String> {

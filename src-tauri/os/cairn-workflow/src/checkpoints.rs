@@ -54,7 +54,7 @@ pub async fn validate_confirmable(db: &LocalDb, job_id: &str) -> Result<DbJob, S
 }
 
 async fn load_job_by_id_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<DbJob>> {
     let mut rows = conn
@@ -82,7 +82,7 @@ async fn load_job_by_id_conn(
 /// name (task jobs, standalone checkpoint nodes, legacy/unnamed contracts) falls
 /// back to the latest artifact overall.
 pub async fn confirm_latest_artifact_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Artifact> {
     let now = chrono::Utc::now().timestamp() as i32;
@@ -158,7 +158,7 @@ pub async fn confirm_latest_artifact_conn(
 /// `None` for jobs with no recipe node (task jobs), no `context-out` contract,
 /// or an unnamed/legacy contract.
 async fn resolve_terminal_artifact_name_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     let (node_id, execution_id) = {
@@ -185,7 +185,7 @@ async fn resolve_terminal_artifact_name_conn(
 /// `confirmed` flag is the gate the projection reads. Used when a standalone
 /// checkpoint node arms, so approve has a row to flip.
 pub async fn ensure_checkpoint_artifact_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<()> {
     let exists = {
@@ -216,7 +216,7 @@ mod confirmable_tests {
     use super::*;
 
     async fn seed_job(db: &LocalDb, status: &str) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
              INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
              INSERT INTO issues (id,project_id,number,title,status,attention,created_at,updated_at) VALUES ('i','p',1,'T','active','none',1,1);

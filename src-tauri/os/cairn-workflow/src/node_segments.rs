@@ -54,19 +54,26 @@ pub fn task_segment_base(
         .unwrap_or_else(|| "task".to_string())
 }
 
-async fn existing_segments(
-    conn: &cairn_db::turso::Connection,
-    sql: &str,
-    bind: &str,
-) -> DbResult<HashSet<String>> {
-    let mut rows = conn.query(sql, params![bind]).await?;
-    let mut reserved = HashSet::new();
-    while let Some(row) = rows.next().await? {
-        if let Some(segment) = row.opt_text(0)? {
-            reserved.insert(segment);
+#[track_caller]
+fn existing_segments<'a, C>(
+    conn: &'a C,
+    sql: &'a str,
+    bind: &'a str,
+) -> impl std::future::Future<Output = DbResult<HashSet<String>>> + Send + 'a
+where
+    C: cairn_db::storage::QueryConn + ?Sized,
+{
+    let rows = conn.query_rows(sql, params![bind]);
+    async move {
+        let mut rows = rows.await?;
+        let mut reserved = HashSet::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(segment) = row.opt_text(0)? {
+                reserved.insert(segment);
+            }
         }
+        Ok(reserved)
     }
-    Ok(reserved)
 }
 
 /// Allocate a top-level node segment for an execution, deduped across **both**
@@ -76,7 +83,7 @@ async fn existing_segments(
 /// both claim `pr` — the second gets `pr-2`. Used by both job creation and
 /// action_run creation so the namespace stays single-owner.
 pub async fn allocate_top_level_segment(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
     execution_id: &str,
     base_segment: &str,
@@ -137,7 +144,7 @@ pub async fn allocate_top_level_segment(
 /// Uniqueness therefore has to be scoped the way the address is: across every
 /// task of every session of that thread.
 pub async fn allocate_child_task_segment(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     parent_job_id: &str,
     base_segment: &str,
 ) -> DbResult<String> {
@@ -164,7 +171,7 @@ pub async fn allocate_child_task_segment(
 }
 
 pub async fn allocate_project_job_segment(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     base_segment: &str,
 ) -> DbResult<String> {

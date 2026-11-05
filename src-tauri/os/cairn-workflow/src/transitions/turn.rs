@@ -130,7 +130,7 @@ pub async fn yield_turn(
 /// the wait can be recorded atomically with the yielded head. Returns whether the
 /// turn was running; the caller decides whether any other state is acceptable.
 pub async fn yield_running_turn_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
     reason: TurnYieldReason,
     now: i64,

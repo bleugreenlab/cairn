@@ -175,7 +175,7 @@ pub async fn transition_job_readiness(
 }
 
 async fn issue_id_for_execution_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> crate::storage::DbResult<Option<String>> {
     let mut rows = conn

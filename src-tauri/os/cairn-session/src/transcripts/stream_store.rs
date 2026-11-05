@@ -972,17 +972,19 @@ pub async fn next_sequence_conn(conn: &TrackedConnection, run_id: &str) -> DbRes
     Ok(std::cmp::max(event_max, stream_max) + 1)
 }
 
-async fn max_sequence_conn(
-    conn: &TrackedConnection,
-    sql: &'static str,
-    run_id: &str,
-) -> DbResult<i32> {
-    let mut rows = conn.query(sql, params![run_id]).await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| DbError::Row("missing max sequence row".to_string()))?;
-    Ok(row.opt_i64(0)?.map(|value| value as i32).unwrap_or(-1))
+#[track_caller]
+fn max_sequence_conn<'a, C: cairn_db::storage::QueryConn + ?Sized>(
+    conn: &'a C,
+    sql: &'a str,
+    run_id: &'a str,
+) -> impl std::future::Future<Output = DbResult<i32>> + Send + 'a {
+    let row = conn.query_first_row(sql, params![run_id]);
+    async move {
+        let row = row
+            .await?
+            .ok_or_else(|| DbError::Row("missing max sequence row".to_string()))?;
+        Ok(row.opt_i64(0)?.map(|value| value as i32).unwrap_or(-1))
+    }
 }
 
 async fn load_stream_conn(conn: &TrackedConnection, stream_id: &str) -> DbResult<DbMessageStream> {
@@ -1352,6 +1354,34 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    #[tokio::test]
+    async fn max_sequence_sql_keeps_its_call_site() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("max-sequence.db"))
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+        const SQL: &str = "SELECT 7 WHERE ?1 = 'run'";
+        let line = line!() + 1;
+        let result = max_sequence_conn(&conn, SQL, "run");
+        assert_eq!(result.await.unwrap(), 7);
+        let holders = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(&*holders[0].statement, format!("{}:{line} {SQL}", file!()));
+        assert_eq!(
+            max_sequence_conn(&conn, "SELECT NULL WHERE ?1 = 'run'", "run")
+                .await
+                .unwrap(),
+            -1
+        );
+        assert!(matches!(
+            max_sequence_conn(&conn, SQL, "other").await,
+            Err(DbError::Row(message)) if message == "missing max sequence row"
+        ));
+    }
 
     /// CAIRN-3290: the slot `open_stream` reserves belongs to the message that is
     /// still streaming. An event written while it is open must take the NEXT

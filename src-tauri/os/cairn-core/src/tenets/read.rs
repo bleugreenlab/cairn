@@ -85,7 +85,7 @@ pub(super) fn decode(row: &cairn_db::turso::Row) -> DbResult<TenetRow> {
 
 /// The row for tenet `number` in `project_id`, read on the caller's connection.
 pub(crate) async fn row_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     number: i64,
 ) -> DbResult<Option<TenetRow>> {
@@ -112,7 +112,7 @@ pub(crate) enum TenetLookup {
 
 /// Look up tenet `number` of the project keyed `project_key`.
 pub(crate) async fn lookup_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i64,
 ) -> DbResult<TenetLookup> {

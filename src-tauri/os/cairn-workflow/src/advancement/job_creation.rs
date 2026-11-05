@@ -43,7 +43,7 @@ pub fn create_jobs_for_execution(db: Arc<LocalDb>, execution_id: &str) -> Result
 /// an execution with `released_at` set and no jobs is exactly what the status
 /// projection reads as `complete`.
 pub async fn create_jobs_for_execution_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Vec<Job>> {
     let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
@@ -57,7 +57,7 @@ pub async fn create_jobs_for_execution_conn(
 }
 
 pub async fn create_jobs_for_new_nodes_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     new_node_ids: &HashSet<String>,
     snapshot: &ExecutionSnapshot,
@@ -183,7 +183,7 @@ fn find_parent_agent_job_id(
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_job_for_node_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     issue_id: &str,
     project_id: &str,
@@ -357,7 +357,7 @@ async fn insert_job_for_node_conn(
 }
 
 async fn base_branch_for_issue_job(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     issue_id: &str,
 ) -> DbResult<Option<String>> {
@@ -372,7 +372,7 @@ async fn base_branch_for_issue_job(
 }
 
 async fn default_branch_for_project(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
 ) -> DbResult<String> {
     let mut rows = conn
@@ -415,7 +415,7 @@ fn backend_for_job_session(
 }
 
 async fn load_session_backend_sequence_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     session_id: &str,
 ) -> DbResult<(String, i32)> {
     let mut rows = conn
@@ -432,7 +432,7 @@ async fn load_session_backend_sequence_conn(
 }
 
 async fn insert_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     session_id: &str,
     job_id: Option<&str>,
     backend: &str,

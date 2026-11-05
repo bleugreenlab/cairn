@@ -24,7 +24,7 @@ fn comment_from_row(row: &cairn_db::turso::Row) -> DbResult<Comment> {
 /// Next 1-based per-issue comment sequence. Computed inside the caller's write
 /// transaction so the local single-writer DB assigns gap-free, stable seqs.
 pub(crate) async fn next_issue_comment_seq(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<i64> {
     let mut rows = conn
@@ -82,7 +82,7 @@ pub async fn owning_db_for_comment(
     crate::execution::routing::routing_db_for_id(dbs, comment_id).await
 }
 
-async fn load_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Comment> {
+async fn load_conn(conn: &cairn_db::storage::TrackedConnection, id: &str) -> DbResult<Comment> {
     let sql = format!("SELECT {COMMENT_COLUMNS} FROM comments WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
     rows.next()
@@ -156,7 +156,7 @@ pub async fn create(
 /// caller's write transaction, returning that seq. The caller announces the
 /// insert after its transaction commits.
 pub(crate) async fn insert_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     id: &str,
     issue_id: &str,
     content: &str,

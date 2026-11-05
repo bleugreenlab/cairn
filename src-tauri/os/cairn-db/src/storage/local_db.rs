@@ -5120,7 +5120,45 @@ mod tests {
         assert!(db.overdue_holders(threshold, Duration::ZERO).is_empty());
     }
 
-    /// A helper typed `&turso::Connection`, which every resource helper is.
+    #[tokio::test]
+    async fn generic_query_rows_preserve_the_caller_and_in_flight_guard() {
+        use crate::storage::QueryConn;
+
+        #[track_caller]
+        fn forward<'a, C: QueryConn + ?Sized>(
+            conn: &'a C,
+            sql: &'a str,
+        ) -> impl Future<Output = DbResult<crate::storage::QueryRows>> + Send + 'a {
+            conn.query_rows(sql, ())
+        }
+
+        let db = test_db().await.unwrap();
+        let conn = db.connect().await.unwrap();
+        let line = line!() + 1;
+        let pending = forward(&conn, "SELECT 7 AS value UNION ALL SELECT 8");
+        assert_eq!(
+            &*conn.slot.holder.statement(),
+            format!("{}:{line} SELECT 7 AS value UNION ALL SELECT 8", file!())
+        );
+        assert!(conn.slot.holder.activity().executing);
+        let mut rows = pending.await.unwrap();
+        assert_eq!(rows.column_names(), vec!["value".to_string()]);
+        assert_eq!(rows.next().await.unwrap().unwrap().i64(0).unwrap(), 7);
+        assert!(conn.slot.holder.activity().executing);
+        drop(rows);
+        assert!(!conn.slot.holder.activity().executing);
+
+        let line = line!() + 1;
+        let pending = crate::storage::query_opt_i64_conn(&conn, "SELECT 9", ());
+        assert_eq!(
+            &*conn.slot.holder.statement(),
+            format!("{}:{line} SELECT 9", file!())
+        );
+        drop(pending);
+        assert!(!conn.slot.holder.activity().executing);
+    }
+
+    /// A deliberately raw helper for the Deref regression tests.
     async fn count_counters(conn: &Connection) -> i64 {
         let mut rows = conn
             .query("SELECT COUNT(*) FROM counters", ())

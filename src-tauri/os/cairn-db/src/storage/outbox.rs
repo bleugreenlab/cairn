@@ -7,8 +7,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::storage::{DbResult, LocalDb, RowExt};
-use crate::turso::{params, Connection};
+use crate::storage::{DbResult, LocalDb, RowExt, TrackedConnection};
+use crate::turso::params;
 
 /// A pending outbox entry ready for processing.
 #[derive(Debug, Clone)]
@@ -85,7 +85,7 @@ async fn mark_done_async(db: &LocalDb, id: &str) -> DbResult<()> {
     .await
 }
 
-async fn mark_done_conn(conn: &Connection, id: &str) -> DbResult<()> {
+async fn mark_done_conn(conn: &TrackedConnection, id: &str) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp() as i32;
     conn.execute(
         "UPDATE effect_outbox
@@ -120,7 +120,7 @@ pub async fn mark_failed_async(db: &LocalDb, id: &str, error: &str) -> DbResult<
     .await
 }
 
-async fn mark_failed_conn(conn: &Connection, id: &str, error: &str) -> DbResult<()> {
+async fn mark_failed_conn(conn: &TrackedConnection, id: &str, error: &str) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp() as i32;
     conn.execute(
         "UPDATE effect_outbox
@@ -191,7 +191,7 @@ pub async fn insert_pending_with_payload_async(
 }
 
 async fn insert_pending_with_payload_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     kind: &str,
     dedupe_key: &str,
     payload_json: &str,

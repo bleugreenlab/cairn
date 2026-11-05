@@ -390,7 +390,7 @@ fn activity_preview(text: &str) -> String {
 /// `data`, so they are excluded rather than reconstructed — a summary read must
 /// stay cheap, and a completed/archived node has its artifact to read instead.
 async fn latest_assistant_preview(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Option<String> {
     let mut rows = conn
@@ -439,7 +439,7 @@ struct NodeActivity {
 /// node stays terse. Counts and timing come from one cheap aggregate that needs
 /// no event-body reconstruction.
 async fn load_node_activity(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Option<NodeActivity> {
     let mut rows = conn
@@ -1073,7 +1073,7 @@ impl NodeQuestionRow {
 }
 
 async fn load_node_questions(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Vec<NodeQuestionRow> {
     let mut questions = Vec::new();
@@ -1373,7 +1373,7 @@ fn format_resolution_receipt(receipt: &cairn_db::models::ResolutionReceipt) -> S
 }
 
 async fn load_node_permissions(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Vec<NodePermissionRow> {
     let mut requests = Vec::new();
@@ -1721,7 +1721,10 @@ struct NodePrRow {
     repo_path: String,
 }
 
-async fn load_node_pr_row(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<NodePrRow> {
+async fn load_node_pr_row(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> Option<NodePrRow> {
     let mut rows = conn
         .query(
             "
@@ -2173,7 +2176,7 @@ async fn render_pr_publish_history(
 /// are intentionally absent and render with appearance-order numbering and no
 /// drill-down link.
 async fn load_primary_session_turn_sequences(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> HashMap<String, i32> {
     let mut map = HashMap::new();
@@ -2507,7 +2510,7 @@ async fn load_node_chat_turn(
 /// The stored events of turn `turn_seq` in a job's primary session. Statements
 /// only. `Err` is the message for a job with no session or no such turn.
 async fn job_turn_rows(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     label: &str,
     turn_seq: i32,
@@ -3286,7 +3289,7 @@ enum TaskTurnRows {
 
 /// The stored events of turn `turn_seq` in a task's session. Statements only.
 async fn task_turn_rows(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     task_job_id: &str,
     turn_seq: i32,
 ) -> TaskTurnRows {
@@ -3545,7 +3548,7 @@ pub(super) async fn read_node_chat_event(
 /// Statements only. `None` when the job has no such run; `Some(Err)` is the
 /// event's not-found message.
 async fn job_event_row(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     run_seq: i32,
     event_seq: i32,

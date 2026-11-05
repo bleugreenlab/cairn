@@ -25,7 +25,7 @@ use crate::messages::queued::DeliveryUrgency;
 use crate::models::DelegationOrigin;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, RowExt};
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 
 /// What a turn end did about a task's missing `return`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +93,10 @@ struct WorkTurn {
     sequence: i64,
 }
 
-async fn latest_work_turn(conn: &Connection, job_id: &str) -> DbResult<Option<WorkTurn>> {
+async fn latest_work_turn(
+    conn: &crate::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<Option<WorkTurn>> {
     let mut rows = conn
         .query(
             "SELECT t.id, t.state,
@@ -119,19 +122,28 @@ async fn latest_work_turn(conn: &Connection, job_id: &str) -> DbResult<Option<Wo
     }))
 }
 
-async fn exists(
-    conn: &Connection,
-    sql: &str,
-    args: impl cairn_db::turso::IntoParams,
-) -> DbResult<bool> {
-    let mut rows = conn.query(sql, args).await?;
-    Ok(rows.next().await?.is_some())
+#[track_caller]
+fn exists<'a, C, P>(
+    conn: &'a C,
+    sql: &'a str,
+    args: P,
+) -> impl std::future::Future<Output = DbResult<bool>> + Send + 'a
+where
+    C: cairn_db::storage::QueryConn + ?Sized,
+    P: cairn_db::turso::IntoParams + Send + 'a,
+{
+    let row = conn.query_first_row(sql, args);
+    async move { Ok(row.await?.is_some()) }
 }
 
 /// Whether the latest work turn saw the re-prompt: it is the turn the
 /// re-prompt's push was delivered into, or a later one. An undelivered push
 /// was never seen, whatever turns have ended since it was queued.
-async fn reprompt_seen_by(conn: &Connection, job_id: &str, latest: &WorkTurn) -> DbResult<bool> {
+async fn reprompt_seen_by(
+    conn: &crate::storage::TrackedConnection,
+    job_id: &str,
+    latest: &WorkTurn,
+) -> DbResult<bool> {
     let message_id =
         crate::messages::delivery::system_direct_once_message_id(&reprompt_idempotency_key(job_id));
     let key = crate::orchestrator::attention_push::direct_push_key(&message_id, None);
@@ -160,7 +172,11 @@ async fn reprompt_seen_by(conn: &Connection, job_id: &str, latest: &WorkTurn) ->
     })
 }
 
-async fn settle_conn(conn: &Connection, job_id: &str, run_id: &str) -> DbResult<MissingReturn> {
+async fn settle_conn(
+    conn: &crate::storage::TrackedConnection,
+    job_id: &str,
+    run_id: &str,
+) -> DbResult<MissingReturn> {
     let mut rows = conn
         .query(
             "SELECT status, execution_id, return_followup_turn_id, return_abandoned_at IS NOT NULL
@@ -271,5 +287,27 @@ async fn settle_conn(conn: &Connection, job_id: &str, run_id: &str) -> DbResult<
                 MissingReturn::Abandoned
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn exists_preserves_caller_statement_identity() {
+        let db = crate::storage::migrated_test_db("return-tracking.db").await;
+        let conn = db.connect().await.unwrap();
+        let sql = "SELECT 1 WHERE ?1 = 'present'";
+        let line = line!() + 1;
+        assert!(exists(&conn, sql, params!["present"]).await.unwrap());
+        let holders = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(&*holders[0].statement, format!("{}:{line} {sql}", file!()));
+
+        assert!(!exists(&conn, sql, params!["absent"]).await.unwrap());
+        assert!(exists(&*conn, sql, params!["present"]).await.unwrap());
+        assert!(exists(&conn, "SELECT missing_column", ()).await.is_err());
     }
 }

@@ -967,7 +967,7 @@ pub async fn stamp_delivered(db: &LocalDb, push_ids: &[String], event_id: &str) 
 /// guard makes a duplicate stamp a no-op. Returns the number of rows newly
 /// stamped.
 pub async fn stamp_delivered_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     push_ids: &[String],
     event_id: &str,
 ) -> DbResult<usize> {
@@ -1069,7 +1069,7 @@ pub enum TurnDelivery {
 /// says so with [`TurnDelivery::NeverSent`]. Returns the number of pushes put
 /// back on the pending queue.
 pub async fn revert_turn_deliveries_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
     delivery: TurnDelivery,
 ) -> DbResult<usize> {
@@ -1093,7 +1093,10 @@ pub async fn revert_turn_deliveries_conn(
     Ok(restored)
 }
 
-async fn turn_run_went_live(conn: &cairn_db::turso::Connection, turn_id: &str) -> DbResult<bool> {
+async fn turn_run_went_live(
+    conn: &cairn_db::storage::TrackedConnection,
+    turn_id: &str,
+) -> DbResult<bool> {
     let mut reached_process = conn
         .query(
             "SELECT 1 FROM turns t JOIN runs r ON r.id = t.run_id
@@ -1110,7 +1113,7 @@ async fn turn_run_went_live(conn: &cairn_db::turso::Connection, turn_id: &str) -
 /// This never fails the enclosing write. The revert is owed, but losing it costs
 /// one wake, while failing the write would leave the run unsettled.
 pub async fn return_withdrawn_delivery_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     withdrawn: &cairn_db::storage::WithdrawnAdmission,
 ) {
     let Some(turn_id) = withdrawn.turn_id.as_deref() else {
@@ -1232,7 +1235,7 @@ pub(crate) const JOB_CHAT_TURNS_SQL: &str =
 /// Runs on a caller-supplied connection so the catch-up cursor advance can
 /// compute the delivery-time tail inside the stamp transaction.
 pub(crate) async fn count_job_chat_turns(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<i64> {
     let mut rows = conn.query(JOB_CHAT_TURNS_SQL, params![job_id]).await?;
@@ -1260,7 +1263,7 @@ pub(crate) async fn count_job_chat_turns(
 /// carrying event rolls back the advance too, and catch-up redelivers against the
 /// old cursor.
 pub async fn advance_read_cursors_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     push_ids: &[String],
 ) -> DbResult<()> {
     let now = now_ts();
@@ -2136,14 +2139,62 @@ pub async fn has_open_pr_for_issue(db: &LocalDb, issue_id: &str) -> DbResult<boo
     .await
 }
 
-async fn exists(conn: &cairn_db::turso::Connection, sql: &str, issue_id: &str) -> DbResult<bool> {
-    let mut rows = conn.query(sql, params![issue_id]).await?;
-    Ok(rows.next().await?.is_some())
+#[track_caller]
+fn exists<'a, C: cairn_db::storage::QueryConn + ?Sized>(
+    conn: &'a C,
+    sql: &'a str,
+    issue_id: &'a str,
+) -> impl std::future::Future<Output = DbResult<bool>> + Send + 'a {
+    let row = conn.query_first_row(sql, params![issue_id]);
+    async move { Ok(row.await?.is_some()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn caller_sql_keeps_its_call_site_through_exists() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("exists.db")).await.unwrap();
+        let conn = db.connect().await.unwrap();
+        const SQL: &str = "SELECT 1 WHERE ?1 = 'issue'";
+        let line = line!() + 1;
+        let found = exists(&conn, SQL, "issue");
+        assert!(found.await.unwrap());
+        let holders = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(
+            &*holders[0].statement,
+            format!("{}:{line} SELECT 1 WHERE ?1 = 'issue'", file!())
+        );
+        assert!(!exists(&conn, "SELECT 1 WHERE ?1 = 'issue'", "other")
+            .await
+            .unwrap());
+        assert!(exists(&conn, "SELECT missing_column", "issue")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_sql_names_the_chat_turn_count_helper() {
+        use std::time::Duration;
+
+        let db = migrated_db().await;
+        let conn = db.connect().await.unwrap();
+        assert_eq!(count_job_chat_turns(&conn, "absent").await.unwrap(), 0);
+        let holders = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(holders.len(), 1);
+        let statement = &holders[0].statement;
+        assert!(statement.starts_with(concat!(file!(), ":")), "{statement}");
+        assert!(
+            statement.contains("SELECT COUNT(*) FROM turns WHERE job_id = ?1"),
+            "{statement}"
+        );
+        assert!(!statement.contains("raw connection"), "{statement}");
+    }
 
     #[test]
     fn operator_direct_key_preserves_delivery_and_reactivation_ids() {

@@ -71,7 +71,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use cairn_db::turso::{Connection, Row, Value};
+use cairn_db::turso::{Row, Value};
 use serde_json::{json, Map, Value as Json};
 
 use futures_util::future::BoxFuture;
@@ -612,7 +612,10 @@ struct Column {
     declared: String,
 }
 
-async fn table_columns(conn: &Connection, table: &str) -> Result<Vec<Column>, DbError> {
+async fn table_columns(
+    conn: &cairn_db::storage::TrackedConnection,
+    table: &str,
+) -> Result<Vec<Column>, DbError> {
     let mut rows = conn
         .query(&format!("PRAGMA table_info({table})"), ())
         .await?;

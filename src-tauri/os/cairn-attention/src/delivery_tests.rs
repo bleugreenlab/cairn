@@ -11,7 +11,7 @@ use crate::storage::*;
 use crate::wakes::conditions::{ConditionOutcome, WakeCondition};
 use async_trait::async_trait;
 use cairn_db::storage::events::event_fixture::{assistant_read, assistant_text, user_text};
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 use cairn_domain::{DeliveryUrgency, Message};
 use std::sync::Arc;
 
@@ -23,13 +23,13 @@ struct Host {
 }
 #[async_trait]
 impl RecipientHost for Host {
-    async fn ensure_thread_session(&self, _: &Connection, _: &str) -> DbResult<String> {
+    async fn ensure_thread_session(&self, _: &TrackedConnection, _: &str) -> DbResult<String> {
         panic!("rendering never opens a thread session")
     }
-    async fn job_is_fenced(&self, _: &Connection, _: &str) -> DbResult<bool> {
+    async fn job_is_fenced(&self, _: &TrackedConnection, _: &str) -> DbResult<bool> {
         Ok(false)
     }
-    async fn job_issue_is_resolved(&self, _: &Connection, _: &str) -> DbResult<bool> {
+    async fn job_issue_is_resolved(&self, _: &TrackedConnection, _: &str) -> DbResult<bool> {
         Ok(false)
     }
 }

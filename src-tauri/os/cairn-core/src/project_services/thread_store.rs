@@ -87,7 +87,7 @@ pub(crate) async fn resolve_owner(
 }
 
 async fn latest_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     thread_id: &str,
     name: &str,
 ) -> DbResult<Option<ThreadServiceRow>> {
@@ -328,7 +328,7 @@ fn not_the_owner(uri: &str) -> String {
 /// Whether `writer` is one of the thread's own jobs. A service job is never
 /// one: it names its owner in `service_thread_id`, not `thread_id`.
 async fn may_write_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     thread_id: &str,
     writer: &ServiceWriter,
 ) -> DbResult<bool> {
@@ -355,7 +355,7 @@ struct WriteRequest {
 }
 
 async fn write_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     request: &WriteRequest,
 ) -> DbResult<Result<WrittenVersion, String>> {
     if !may_write_conn(conn, &request.thread_id, &request.writer).await? {

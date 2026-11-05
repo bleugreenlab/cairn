@@ -559,7 +559,10 @@ fn era_fold_end(
 
 /// The session the job is on right now. Composition is measured against it, and
 /// the generation it produces is pending until the job leaves it.
-async fn current_session_id(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
+async fn current_session_id(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> Option<String> {
     let mut rows = conn
         .query(
             "SELECT current_session_id FROM jobs WHERE id = ?1 LIMIT 1",
@@ -894,7 +897,10 @@ async fn thread_store_census(thread_id: Option<String>, now: i64) -> String {
 }
 
 /// The thread a session job belongs to. Statements only.
-async fn job_thread_id(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
+async fn job_thread_id(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> Option<String> {
     let mut rows = conn
         .query("SELECT thread_id FROM jobs WHERE id = ?1", params![job_id])
         .await
@@ -1932,7 +1938,7 @@ impl NodeCoordinates {
 /// they resolve, so a job Cairn cannot address is a composition failure rather
 /// than a seed full of dead links.
 async fn node_coordinates(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Option<NodeCoordinates> {
     let base_uri = crate::jobs::queries::home_uri_for_job_conn(conn, job_id)
@@ -2036,7 +2042,7 @@ fn render_branches(branches: &[BranchStatus], now: i64) -> String {
 }
 
 async fn load_branches(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<Vec<BranchStatus>, String> {
     let mut rows = conn
@@ -2305,7 +2311,7 @@ fn render_children(children: &[ChildStatus], now: i64) -> String {
 /// facet that cannot be read is left off the line, which is what the renderer
 /// does for a facet that simply does not exist.
 async fn load_children(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<Vec<ChildStatus>, String> {
     let mut children: Vec<ChildStatus> = Vec::new();
@@ -2771,7 +2777,7 @@ fn render_working_documents(
 }
 
 async fn artifact_names(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<Vec<String>, String> {
     let mut rows = conn
@@ -3597,7 +3603,7 @@ mod tests {
     /// before `now`; with `deferred_until` the reader deferred it on issue 22.
     async fn child_with_pending_plan(db: &LocalDb, now: i64, age: i64, deferred: bool) {
         let written = now - age;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
                VALUES ('i-plan','p',23,'Plan the backoff','active','none',1,1,'t-thread');
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -3759,7 +3765,7 @@ mod tests {
         for n in 0..count {
             let issue = format!("i-many-{n}");
             let number = 100 + n;
-            db.execute_script(&format!(
+            db.execute_script(format!(
                 "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
                    VALUES ('{issue}','p',{number},'Lease renewal backoff for executor {number}, with the retry curve still unsettled','active','none',1,1,'t-thread');
                  INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -4608,7 +4614,7 @@ mod tests {
     async fn node_fixture(name: &str, turns: i64, body: &str, addressed: bool) -> LocalDb {
         let db = migrated_test_db(name).await;
         let issue = if addressed { "'i-node'" } else { "NULL" };
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
                VALUES ('p','default','P','prj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)

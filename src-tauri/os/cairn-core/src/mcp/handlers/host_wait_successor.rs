@@ -194,7 +194,7 @@ pub(super) async fn emit_successor_turn_events(
 /// It never starts the turn, and never fails for a busy job or an open
 /// predecessor, so it can run inside the transaction that records the answer.
 pub(crate) async fn ensure_host_wait_successor_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
     predecessor_turn_id: &str,
     kind: HostWaitKind,
@@ -565,7 +565,7 @@ pub(crate) async fn record_resume_error(
 }
 
 pub(super) async fn run_turn_context(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
 ) -> DbResult<Option<(String, String)>> {
     let mut rows = conn
@@ -589,7 +589,7 @@ pub(super) async fn run_turn_context(
 /// has. Errors for an open predecessor or a busy job: callers that must not
 /// fail classify those first ([`ensure_host_wait_successor_conn`]).
 pub(super) async fn ensure_successor_turn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     session_id: &str,
     job_id: &str,
     predecessor_turn_id: &str,
@@ -671,7 +671,7 @@ pub(super) async fn ensure_successor_turn(
 }
 
 async fn select_turn_state(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
 ) -> DbResult<TurnState> {
     let mut rows = conn
@@ -688,7 +688,10 @@ async fn select_turn_state(
     state.parse().map_err(DbError::Row)
 }
 
-async fn count_active_job_turns(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<i64> {
+async fn count_active_job_turns(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "
@@ -707,7 +710,10 @@ async fn count_active_job_turns(conn: &cairn_db::turso::Connection, job_id: &str
     row.i64(0)
 }
 
-async fn next_turn_sequence(conn: &cairn_db::turso::Connection, session_id: &str) -> DbResult<i64> {
+async fn next_turn_sequence(
+    conn: &cairn_db::storage::TrackedConnection,
+    session_id: &str,
+) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "SELECT MAX(sequence) FROM turns WHERE session_id = ?1",
@@ -722,7 +728,7 @@ async fn next_turn_sequence(conn: &cairn_db::turso::Connection, session_id: &str
 }
 
 async fn start_turn_for_run(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     turn_id: &str,
     run_id: &str,
 ) -> DbResult<bool> {

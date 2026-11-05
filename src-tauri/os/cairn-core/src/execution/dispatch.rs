@@ -385,10 +385,10 @@ fn load_job_ended_dispatch_context(
                     None => None,
                 };
 
-                let project_key = match query_one_text(
+                let project_key = match crate::storage::query_opt_text_conn(
                     conn,
                     "SELECT key FROM projects WHERE id = ?1",
-                    project_id.as_str(),
+                    (project_id.as_str(),),
                 )
                 .await?
                 {
@@ -401,11 +401,13 @@ fn load_job_ended_dispatch_context(
                     .unwrap_or((None, None));
 
                 let issue_number = match issue_id.as_deref() {
-                    Some(issue_id) => {
-                        query_one_i64(conn, "SELECT number FROM issues WHERE id = ?1", issue_id)
-                            .await?
-                            .map(|value| value as i32)
-                    }
+                    Some(issue_id) => crate::storage::query_opt_i64_conn(
+                        conn,
+                        "SELECT number FROM issues WHERE id = ?1",
+                        (issue_id,),
+                    )
+                    .await?
+                    .map(|value| value as i32),
                     None => None,
                 };
 
@@ -445,7 +447,7 @@ fn load_execution_dispatch_context(
 }
 
 async fn load_execution_dispatch_context_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<ExecutionDispatchContext> {
     let mut rows = conn
@@ -485,7 +487,7 @@ async fn load_execution_dispatch_context_conn(
 }
 
 async fn load_job_event_context_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<(Option<String>, Option<String>)>> {
     let mut rows = conn
@@ -500,30 +502,6 @@ async fn load_job_event_context_conn(
         return Ok(None);
     };
     Ok(Some((row.opt_text(0)?, row.opt_text(1)?)))
-}
-
-async fn query_one_text(
-    conn: &cairn_db::turso::Connection,
-    sql: &'static str,
-    id: &str,
-) -> DbResult<Option<String>> {
-    let mut rows = conn.query(sql, params![id]).await?;
-    match rows.next().await? {
-        Some(row) => row.opt_text(0),
-        None => Ok(None),
-    }
-}
-
-async fn query_one_i64(
-    conn: &cairn_db::turso::Connection,
-    sql: &'static str,
-    id: &str,
-) -> DbResult<Option<i64>> {
-    let mut rows = conn.query(sql, params![id]).await?;
-    match rows.next().await? {
-        Some(row) => row.opt_i64(0),
-        None => Ok(None),
-    }
 }
 
 fn run_dispatch_db<T, Fut>(future: Fut) -> Result<T, String>

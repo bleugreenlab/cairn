@@ -437,7 +437,7 @@ enum PackRow {
 impl CoordRows {
     /// Statements only: this runs inside a pooled read.
     async fn load(
-        conn: &turso::Connection,
+        conn: &crate::storage::TrackedConnection,
         run_ids: &[String],
         hashes: &[String],
         local_blobs: bool,
@@ -568,7 +568,7 @@ impl ReconstructCtx {
     }
 }
 
-async fn load_run_row(conn: &turso::Connection, run_id: &str) -> Option<RunRow> {
+async fn load_run_row(conn: &crate::storage::TrackedConnection, run_id: &str) -> Option<RunRow> {
     let mut rows = conn
         .query(
             "SELECT j.execution_id, p.id, p.key, p.repo_path
@@ -612,7 +612,10 @@ async fn load_private_local_repo_path(private_db: &LocalDb, project_key: &str) -
 /// the read has released. A private row archived before the file store existed
 /// still carries its pack inline until the offload pass moves it, and inline
 /// wins while both are set, so the row reads the same in either state.
-async fn load_pack_row(conn: &turso::Connection, execution_id: &str) -> Option<PackRow> {
+async fn load_pack_row(
+    conn: &crate::storage::TrackedConnection,
+    execution_id: &str,
+) -> Option<PackRow> {
     let mut rows = conn
         .query(
             "SELECT pack, pack_idx, pack_hash FROM execution_history WHERE execution_id = ?1 LIMIT 1",
@@ -726,7 +729,7 @@ async fn resolve_blob(
 
 /// Read one content-addressed blob's compressed bytes from the private
 /// `archival_blobs` table.
-async fn load_blob_local(conn: &turso::Connection, hash: &str) -> Option<Vec<u8>> {
+async fn load_blob_local(conn: &crate::storage::TrackedConnection, hash: &str) -> Option<Vec<u8>> {
     let mut rows = conn
         .query(
             "SELECT content FROM archival_blobs WHERE hash = ?1 LIMIT 1",

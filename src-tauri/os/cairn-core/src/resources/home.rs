@@ -96,7 +96,7 @@ fn parse_params(params: &[QueryParam]) -> Result<HomeQuery, String> {
     })
 }
 pub async fn query_project_home(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     key: &str,
     limit: usize,
@@ -742,7 +742,7 @@ mod tests {
                 let blocks = "{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\"}]}";
                 let mut at = 0i64;
                 let mut batch: Vec<String> = Vec::with_capacity(500);
-                let mut flush = |batch: &mut Vec<String>| {
+                let flush = |batch: &mut Vec<String>| {
                     let sql = format!(
                         "INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at,turn_id) VALUES {}",
                         batch.join(",")
@@ -793,7 +793,7 @@ mod tests {
 
                 // Messages: mostly direct, only a small share touching a thread run.
                 let mut batch: Vec<String> = Vec::with_capacity(500);
-                let mut flush_messages = |batch: &mut Vec<String>| {
+                let flush_messages = |batch: &mut Vec<String>| {
                     let sql = format!(
                         "INSERT INTO messages(id,channel_type,channel_id,sender_name,sender_run_id,recipient_run_id,content,created_at) VALUES {}",
                         batch.join(",")

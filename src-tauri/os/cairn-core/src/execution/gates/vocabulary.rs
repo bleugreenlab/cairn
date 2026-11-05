@@ -604,7 +604,10 @@ async fn deleted_target(ctx: &GateContext<'_>, clause: &TriggerClause) -> DbResu
 }
 
 /// Whether the project `issue_uri` names has a row in this database.
-async fn project_present(conn: &cairn_db::turso::Connection, issue_uri: &str) -> DbResult<bool> {
+async fn project_present(
+    conn: &crate::storage::TrackedConnection,
+    issue_uri: &str,
+) -> DbResult<bool> {
     let Some(cairn_common::uri::CairnResource::Issue { project, .. }) =
         cairn_common::uri::parse_uri(issue_uri)
     else {

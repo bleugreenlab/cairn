@@ -114,7 +114,7 @@ fn map_path(params: &[QueryParam]) -> Result<String, String> {
 }
 
 async fn load_activity(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     now: i64,
 ) -> Vec<Activity> {

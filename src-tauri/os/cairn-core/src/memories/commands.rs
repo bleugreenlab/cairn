@@ -426,7 +426,7 @@ const REFLECTION_ACTIVITY_THRESHOLD: i64 = 50;
 /// Counting across all of the job's runs (rather than one run's session) keeps
 /// the measure from being deflated by session rotation over a long job.
 async fn job_activity_exceeds_threshold(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     threshold: i64,
 ) -> Result<bool, DbError> {
@@ -481,7 +481,7 @@ pub(crate) fn memory_review_idle_state_for_job(
 }
 
 async fn memory_review_idle_state_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<Option<MemoryReviewIdleState>, DbError> {
     let mut rows = conn
@@ -521,7 +521,7 @@ async fn memory_review_idle_state_conn(
 }
 
 async fn terminal_output_artifact_name_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     parent_job_id: Option<&str>,
     recipe_node_id: Option<&str>,
     execution_id: Option<&str>,
@@ -552,7 +552,7 @@ async fn terminal_output_artifact_name_conn(
 }
 
 async fn output_artifact_present_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     terminal_name: Option<&str>,
 ) -> Result<bool, DbError> {

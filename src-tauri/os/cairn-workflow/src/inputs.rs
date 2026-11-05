@@ -11,7 +11,7 @@ fn db_error(context: &str, error: DbError) -> String {
 }
 
 pub async fn load_execution_snapshot_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Option<ExecutionSnapshot>> {
     let mut rows = conn
@@ -35,7 +35,7 @@ pub async fn load_execution_snapshot_conn(
 }
 
 async fn require_execution_snapshot_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<ExecutionSnapshot> {
     load_execution_snapshot_conn(conn, execution_id)
@@ -138,7 +138,7 @@ pub async fn find_job_downstream_artifact_schema(
 }
 
 async fn resolve_job_inputs_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job: &DbJob,
 ) -> DbResult<Vec<ResolvedInput>> {
     let Some(node_id) = job.recipe_node_id.as_deref() else {
@@ -303,7 +303,7 @@ async fn resolve_job_inputs_conn(
 /// `output_name`). When the ArtifactNode has no producer but carries inline
 /// literal `content`, it is a static input document (the collapsed Context node).
 async fn load_artifact_node_input_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     rnode_map: &HashMap<&str, &RecipeNode>,
     all_edges: &[DbRecipeEdge],
@@ -363,7 +363,7 @@ async fn load_artifact_node_input_conn(
 }
 
 async fn build_trigger_context_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     snapshot: &ExecutionSnapshot,
     job: &DbJob,
 ) -> DbResult<ResolvedInput> {
@@ -435,7 +435,7 @@ async fn build_trigger_context_conn(
 }
 
 async fn load_issue_by_project_key_number_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     issue_number: i32,
 ) -> DbResult<Option<(String, String, Option<String>)>> {
@@ -456,7 +456,7 @@ async fn load_issue_by_project_key_number_conn(
 
 /// Load an issue title and description for prompt context.
 async fn load_issue_title_description_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Option<(String, Option<String>)>> {
     let mut rows = conn
@@ -518,7 +518,7 @@ struct StoredArtifact {
 /// legacy unnamed row, or a producer with no home URI) has nothing to point at,
 /// so it contributes nothing rather than a pointer that resolves nowhere.
 async fn artifact_input_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     producer_job_id: &str,
     stored: StoredArtifact,
     delivery: InputDelivery,
@@ -555,7 +555,7 @@ async fn artifact_input_conn(
 /// consumer's terminal input in place of the real terminal artifact (e.g.
 /// `create-pr`).
 async fn load_artifact_for_edge_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     output_name: &str,
     exclude_from_fallback: &[String],
@@ -603,7 +603,7 @@ async fn load_artifact_for_edge_conn(
 }
 
 async fn load_last_assistant_message_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -632,7 +632,7 @@ async fn load_last_assistant_message_conn(
 }
 
 pub async fn find_downstream_artifact_schema_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     node_id: &str,
     execution_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
@@ -657,7 +657,7 @@ pub async fn find_downstream_artifact_schema_conn(
 /// another agent), the node's own inline `outputSchema` is the contract. Splitting
 /// the snapshot load out lets the recompute sweep reuse its loaded snapshot.
 pub async fn find_downstream_artifact_schema_with_snapshot_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     snapshot: &ExecutionSnapshot,
     node_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
@@ -694,7 +694,7 @@ pub async fn find_downstream_artifact_schema_with_snapshot_conn(
 /// with no `schema` (a pure literal-content input document) is not a terminal
 /// contract.
 async fn resolve_ctx_out_target_schema(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     node_map: &HashMap<&str, &RecipeNode>,
     target_node_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
@@ -774,7 +774,7 @@ fn legacy_own_output_schema(
 /// to validate ctx-self writes; they are NOT the terminal contract and never gate
 /// the job. ArtifactNodes with no schema are skipped (nothing to validate).
 pub async fn resolve_ctx_self_schemas_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     node_id: &str,
     execution_id: &str,
 ) -> DbResult<Vec<OutputSchemaInfo>> {
@@ -869,7 +869,7 @@ pub fn is_long_running_node(
 /// node gets the standing-node framing; the fact itself is derived in exactly one
 /// place.
 pub async fn is_long_running_node_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     node_id: &str,
     execution_id: &str,
     requires_output: bool,
@@ -935,7 +935,7 @@ pub fn node_ships_a_pr(snapshot: &ExecutionSnapshot, node_id: &str) -> bool {
 /// Load the execution snapshot and derive whether `node_id` ships a PR (see
 /// [`node_ships_a_pr`]).
 pub async fn node_ships_a_pr_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     node_id: &str,
     execution_id: &str,
 ) -> DbResult<bool> {
@@ -949,7 +949,7 @@ pub async fn node_ships_a_pr_conn(
 /// Returns an empty string when the node has no upstream Instruction node, so
 /// injection is purely additive.
 pub async fn resolve_instruction_prompt_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     node_id: &str,
     execution_id: &str,
 ) -> DbResult<String> {
@@ -1002,7 +1002,7 @@ fn instruction_prompt_from_snapshot(snapshot: &ExecutionSnapshot, node_id: &str)
 }
 
 async fn load_action_config_schema_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     action_config_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
     let mut rows = conn

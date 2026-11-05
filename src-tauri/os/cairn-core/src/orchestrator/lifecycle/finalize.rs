@@ -455,7 +455,7 @@ fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str
 /// now that the review is done, with the reason the job's issue records. A job
 /// whose issue is not resolved keeps its sessions.
 async fn close_resolved_sessions_after_memory_review_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
     now: i64,
 ) -> crate::storage::DbResult<()> {

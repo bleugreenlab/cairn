@@ -61,7 +61,10 @@ fn memory_from_row_inner(row: &cairn_db::turso::Row) -> DbResult<Memory> {
     })
 }
 
-async fn load_memory_conn(conn: &cairn_db::turso::Connection, memory_id: &str) -> DbResult<Memory> {
+async fn load_memory_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    memory_id: &str,
+) -> DbResult<Memory> {
     let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1 LIMIT 1");
     let mut rows = conn.query(&sql, params![memory_id]).await?;
 
@@ -392,7 +395,7 @@ pub(crate) async fn record_triage_issue_batch(
 /// read and a later write, and an update keyed only by memory id would apply a
 /// decision to a memory a newer batch had taken in between.
 async fn claimed_batch_memories_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Vec<Memory>> {
     let sql = format!(
@@ -430,7 +433,7 @@ pub(crate) async fn claimed_batch_memories_for_issue(
 /// projects by key. Every project reference on its way into a memory row passes
 /// through here so an id is what actually gets stored.
 async fn project_id_for_reference_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     reference: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -569,7 +572,7 @@ struct DeferRescopeTarget {
 /// reconcile sweep then retries and re-warns forever (CAIRN-3289). Parking is the
 /// explicit, terminal, human-visible alternative.
 async fn defer_rescope_target(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     memory: &Memory,
 ) -> DbResult<Option<DeferRescopeTarget>> {
     let Some(scope) = memory.deferred_scope.clone() else {

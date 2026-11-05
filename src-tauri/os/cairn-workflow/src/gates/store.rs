@@ -27,7 +27,8 @@
 //! `execution::gates::vocabulary`.
 
 use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
-use cairn_db::turso::{params, Connection, Value};
+use cairn_db::storage::TrackedConnection;
+use cairn_db::turso::{params, Value};
 
 use crate::models::ExecutionGate;
 use crate::storage::{DbResult, RowExt};
@@ -56,7 +57,7 @@ fn gate_from_row(row: &cairn_db::turso::Row) -> DbResult<ExecutionGate> {
 /// `seq` is the index in `predicates`, so authored order survives into every
 /// later listing regardless of how rows come back off disk.
 pub async fn insert_gates_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     predicates: &[String],
     now: i64,
@@ -84,7 +85,7 @@ pub async fn insert_gates_conn(
 
 /// This execution's gates in authored order.
 pub async fn list_gates_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
 ) -> DbResult<Vec<ExecutionGate>> {
     let sql = format!(
@@ -112,7 +113,7 @@ fn gates_for_executions_sql(n: usize) -> String {
 /// in authored order within each. One query per [`IN_LIST_CHUNK`] executions;
 /// an execution with no gates is simply absent from the map.
 pub async fn list_gates_for_executions_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_ids: &[String],
 ) -> DbResult<std::collections::HashMap<String, Vec<ExecutionGate>>> {
     let mut grouped = std::collections::HashMap::<String, Vec<ExecutionGate>>::new();
@@ -143,7 +144,7 @@ pub async fn list_gates_for_executions_conn(
 /// already-latched gate. `last_outcome` always reflects the newest resolution,
 /// because that is what a census renders.
 pub async fn record_outcome_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     gate_id: &str,
     outcome: &str,
     satisfied_at: Option<i64>,
@@ -166,7 +167,7 @@ pub async fn record_outcome_conn(
 /// once — which is what lets the foreclosure wake be sent from the same place
 /// without a second dedupe mechanism.
 pub async fn latch_foreclosure_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     gate_id: &str,
     foreclosed_at: i64,
     reason: &str,
@@ -200,7 +201,7 @@ pub async fn latch_foreclosure_conn(
 /// attempts on one issue. Nor is one whose issue has already been merged or
 /// closed: that work was resolved without it.
 pub async fn release_execution_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     released_at: i64,
     override_json: Option<&str>,
@@ -232,7 +233,10 @@ pub async fn release_execution_conn(
 /// Capacity gates are not counted. They are level conditions re-decided inside
 /// the release itself, never latched in advance, so they cannot authorize or
 /// refuse a release from here.
-pub async fn gate_counts_conn(conn: &Connection, execution_id: &str) -> DbResult<(i64, i64)> {
+pub async fn gate_counts_conn(
+    conn: &TrackedConnection,
+    execution_id: &str,
+) -> DbResult<(i64, i64)> {
     let mut rows = conn
         .query(
             concat!(
@@ -253,7 +257,7 @@ pub async fn gate_counts_conn(conn: &Connection, execution_id: &str) -> DbResult
 /// Remove one gate. Only meaningful while its execution is held; the caller
 /// enforces that, in the same transaction, because removing a gate from a
 /// released execution would rewrite why it started.
-pub async fn delete_gate_conn(conn: &Connection, gate_id: &str) -> DbResult<()> {
+pub async fn delete_gate_conn(conn: &TrackedConnection, gate_id: &str) -> DbResult<()> {
     conn.execute(
         "DELETE FROM execution_gates WHERE id = ?1",
         params![gate_id],
@@ -264,7 +268,7 @@ pub async fn delete_gate_conn(conn: &Connection, gate_id: &str) -> DbResult<()> 
 
 /// Rewrite a surviving gate's authored position after a gate patch, so `seq`
 /// stays the order the author's latest list gave.
-pub async fn set_gate_seq_conn(conn: &Connection, gate_id: &str, seq: i64) -> DbResult<()> {
+pub async fn set_gate_seq_conn(conn: &TrackedConnection, gate_id: &str, seq: i64) -> DbResult<()> {
     conn.execute(
         "UPDATE execution_gates SET seq = ?2 WHERE id = ?1",
         params![gate_id, seq],
@@ -290,7 +294,7 @@ const LAST_QUEUE_KEY_SQL: &str =
 
 /// The key a capacity row filed at `now` takes: its second's, or one past the
 /// newest key in this database when that is later, so every key is unique.
-async fn mint_queue_key_conn(conn: &Connection, now: i64) -> DbResult<i64> {
+async fn mint_queue_key_conn(conn: &TrackedConnection, now: i64) -> DbResult<i64> {
     let last = match conn.query(LAST_QUEUE_KEY_SQL, ()).await?.next().await? {
         Some(row) => row.opt_i64(0)?,
         None => None,
@@ -306,7 +310,7 @@ async fn mint_queue_key_conn(conn: &Connection, now: i64) -> DbResult<i64> {
 /// facts and touches neither, so a re-decided hold keeps its place. Returns
 /// whether anything changed.
 pub async fn hold_capacity_gate_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     predicate_json: &str,
     seq: i64,
@@ -361,7 +365,7 @@ pub async fn hold_capacity_gate_conn(
 /// permutes keys its set already holds, and the operator's fleet move writes
 /// one it chose free in this database, so keys stay unique either way.
 pub async fn set_gate_queue_key_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     gate_id: &str,
     queue_key: i64,
 ) -> DbResult<()> {
@@ -382,7 +386,11 @@ pub async fn set_gate_queue_key_conn(
 /// whole column; a fresh mint still lands past the newest key. Touches only
 /// `execution_gates`, through `idx_execution_gates_queue_key`. Returns how
 /// many rows moved.
-pub async fn shift_queue_keys_conn(conn: &Connection, at_most: i64, by: i64) -> DbResult<u64> {
+pub async fn shift_queue_keys_conn(
+    conn: &TrackedConnection,
+    at_most: i64,
+    by: i64,
+) -> DbResult<u64> {
     Ok(conn
         .execute(SHIFT_QUEUE_KEYS_SQL, params![at_most, by])
         .await?)
@@ -399,7 +407,7 @@ pub const SHIFT_QUEUE_KEYS_SQL: &str =
 /// stay, so a census still knows the row for the cap it is. Returns whether
 /// anything changed.
 pub async fn clear_capacity_gate_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     predicate_json: &str,
 ) -> DbResult<bool> {
@@ -417,7 +425,7 @@ pub async fn clear_capacity_gate_conn(
 /// Latch every capacity gate of an execution being released, in the release's
 /// own transaction: from here on its caps are history, not holds.
 pub async fn latch_capacity_gates_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     execution_id: &str,
     now: i64,
 ) -> DbResult<()> {
@@ -436,7 +444,11 @@ pub async fn latch_capacity_gates_conn(
 }
 
 /// Rewrite a capacity gate's facts, as its place in line moves.
-pub async fn set_gate_detail_conn(conn: &Connection, gate_id: &str, detail: &str) -> DbResult<()> {
+pub async fn set_gate_detail_conn(
+    conn: &TrackedConnection,
+    gate_id: &str,
+    detail: &str,
+) -> DbResult<()> {
     conn.execute(
         "UPDATE execution_gates SET detail = ?2 WHERE id = ?1",
         params![gate_id, detail],
@@ -478,7 +490,7 @@ pub const BLOCKING_CAPACITY_GATES_SQL: &str = concat!(
 /// and is not waiting on an authored gate of its own (such an execution has no
 /// place in line until its own gates clear).
 pub async fn list_blocking_capacity_gates_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
 ) -> DbResult<Vec<BlockingCapacityGate>> {
     let mut rows = conn.query(BLOCKING_CAPACITY_GATES_SQL, ()).await?;
     let mut gates = Vec::new();
@@ -638,7 +650,7 @@ pub const WAITING_GATE_PREDICATES_SQL: &str = concat!(
 /// longer hold anything, so it contributes no edge, and neither does an
 /// execution that will never start.
 pub async fn list_waiting_gate_predicates_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     excluding: Option<&str>,
 ) -> DbResult<Vec<(String, String)>> {
     let mut rows = conn

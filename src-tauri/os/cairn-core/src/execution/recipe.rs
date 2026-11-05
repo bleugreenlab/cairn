@@ -1502,7 +1502,7 @@ pub(crate) fn stop_superseded_agents(
 }
 
 async fn insert_execution_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution: &NewExecution,
 ) -> crate::storage::DbResult<()> {
     conn.execute(

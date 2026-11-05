@@ -1508,7 +1508,7 @@ pub async fn awaiting_launch_run_for_session(
 
 /// A team replica carries no admission table (the rows are runner-local), so a
 /// settle write against one has nothing to withdraw.
-async fn has_admission_table(conn: &crate::turso::Connection) -> DbResult<bool> {
+async fn has_admission_table(conn: &crate::storage::TrackedConnection) -> DbResult<bool> {
     let mut table = conn
         .query(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_admission_requests'",
@@ -1528,7 +1528,7 @@ async fn has_admission_table(conn: &crate::turso::Connection) -> DbResult<bool> 
 /// (`on_call_run_finalized` in cairn-core), which the caller runs after its
 /// write commits.
 pub async fn withdraw_queued_call_admission(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     run_id: &str,
     detail: &str,
     now: i64,
@@ -1610,7 +1610,7 @@ pub struct WithdrawnAdmission {
 /// process claim. A team replica carries no admission table (the rows are
 /// runner-local), so there this is a no-op.
 pub async fn withdraw_queued_ordinary_admission(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     run_id: &str,
     detail: &str,
     now: i64,

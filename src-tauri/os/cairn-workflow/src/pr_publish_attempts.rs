@@ -5,7 +5,8 @@ use crate::advancement::{load_nodes_from_execution, run_advancement_db};
 use crate::effects::types::{EffectContext, EffectSource, WorkflowEffect};
 use crate::runtime::{WorkflowOwner, WorkflowRuntime};
 use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_db::turso::{params, Connection};
+use cairn_db::storage::TrackedConnection;
+use cairn_db::turso::params;
 
 pub const PR_PUBLISH_MAX_ATTEMPTS: i64 = 5;
 
@@ -59,7 +60,7 @@ pub async fn publish_attempt_count(db: &LocalDb, id: &str) -> Result<i64, String
 }
 
 pub async fn settle_publish_attempt_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     id: &str,
     outcome: &str,
     detail: &str,
@@ -87,7 +88,10 @@ pub async fn settle_publish_attempt(
     .map_err(|e| e.to_string())
 }
 
-pub(crate) async fn insert_attempt(conn: &Connection, a: &PublishAttemptRow) -> DbResult<()> {
+pub(crate) async fn insert_attempt(
+    conn: &TrackedConnection,
+    a: &PublishAttemptRow,
+) -> DbResult<()> {
     conn.execute(
         "INSERT INTO pr_publish_attempts(id,action_run_id,cycle,attempt,input_revision,started_at)
         VALUES(?1,?2,?3,?4,?5,?6)",
@@ -156,7 +160,7 @@ async fn action_fields(db: &LocalDb, id: &str) -> Result<(String, String, String
     .map_err(|e| e.to_string())
 }
 
-async fn is_live_conn(conn: &Connection, execution: &str) -> DbResult<bool> {
+async fn is_live_conn(conn: &TrackedConnection, execution: &str) -> DbResult<bool> {
     let mut rows = conn
         .query(
             concat!(

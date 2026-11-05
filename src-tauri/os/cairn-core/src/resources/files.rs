@@ -105,7 +105,7 @@ type IssueFileChangeRow = (
     Option<String>,
     String,
 );
-async fn issue_has_jobs(conn: &cairn_db::turso::Connection, issue_id: &str) -> bool {
+async fn issue_has_jobs(conn: &cairn_db::storage::TrackedConnection, issue_id: &str) -> bool {
     match conn
         .query(
             "SELECT id FROM jobs WHERE issue_id = ?1 LIMIT 1",
@@ -119,7 +119,7 @@ async fn issue_has_jobs(conn: &cairn_db::turso::Connection, issue_id: &str) -> b
 }
 
 async fn load_issue_file_changes_with_agents(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> Vec<IssueFileChangeRow> {
     let mut results = Vec::new();
@@ -170,7 +170,7 @@ async fn load_issue_file_changes_with_agents(
 }
 
 async fn load_issue_file_changes(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> Vec<FileChangeRow> {
     let mut results = Vec::new();
@@ -210,7 +210,7 @@ async fn load_issue_file_changes(
 }
 
 pub(super) async fn load_job_file_changes(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Vec<FileChangeRow> {
     let mut results = Vec::new();

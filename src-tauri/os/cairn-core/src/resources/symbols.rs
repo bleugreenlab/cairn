@@ -147,7 +147,7 @@ async fn latest_run_id_for_job(
 }
 
 async fn project_repo_path(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
 ) -> Result<Option<String>, String> {
     let key = cairn_common::uri::canonical_project(project_key);

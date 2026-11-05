@@ -337,7 +337,7 @@ async fn rotate_session(
 /// write commits.
 // Callers own teardown: lifecycle rotations stop first; provider changes stop after commit.
 pub(crate) async fn rotate_session_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     source: &Session,
     job_id: &str,
     backend: &str,

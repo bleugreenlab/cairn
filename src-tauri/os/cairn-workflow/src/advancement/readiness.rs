@@ -1,7 +1,7 @@
 use super::*;
 
 async fn condition_edge_satisfied_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     edge: &DbRecipeEdge,
 ) -> DbResult<bool> {
@@ -25,7 +25,7 @@ async fn condition_edge_satisfied_conn(
 }
 
 pub async fn is_action_node_ready_with_snapshot_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     node_id: &str,
     all_edges: &[DbRecipeEdge],
@@ -112,7 +112,10 @@ pub async fn is_action_node_ready_with_snapshot_conn(
     Ok(true)
 }
 
-pub async fn is_job_ready_conn(conn: &cairn_db::turso::Connection, job: &DbJob) -> DbResult<bool> {
+pub async fn is_job_ready_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job: &DbJob,
+) -> DbResult<bool> {
     // A merged or closed issue takes no more work, so nothing on it is ever
     // claimable — however its DAG reads. Without this a `pending` row left on a
     // resolved issue is launched by the next advance of its execution.
@@ -174,7 +177,10 @@ pub async fn issue_settled(db: &LocalDb, issue_id: &str) -> Result<bool, String>
     .map_err(|e| e.to_string())
 }
 
-async fn issue_settled_conn(conn: &cairn_db::turso::Connection, issue_id: &str) -> DbResult<bool> {
+async fn issue_settled_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    issue_id: &str,
+) -> DbResult<bool> {
     // A transient action_run (the pr action opening the PR, or any other action
     // node mid-run) is imminent work. `blocked` (open-PR human gate), `complete`,
     // and `failed` are settled.
@@ -234,7 +240,7 @@ fn node_map(nodes: &[DbRecipeNode]) -> HashMap<&str, &DbRecipeNode> {
 }
 
 async fn find_ready_nodes_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     node_types: &[&str],
     completed_table: &str,
@@ -463,7 +469,7 @@ mod tests {
         }
     }
 
-    async fn seed(conn: &cairn_db::turso::Connection) {
+    async fn seed(conn: &cairn_db::storage::TrackedConnection) {
         conn.execute(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)",
             (),

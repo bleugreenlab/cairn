@@ -498,7 +498,10 @@ impl NodeRebaseRows {
     }
 }
 
-async fn load_project_id(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
+async fn load_project_id(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> Option<String> {
     let mut rows = conn
         .query(
             "SELECT project_id FROM jobs WHERE id = ?1 LIMIT 1",
@@ -761,7 +764,7 @@ fn render_conflicted_name(assessment: &crate::jj::ConflictedNameAssessment) -> S
 }
 
 async fn load_repo_path(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<String, String> {
     let mut rows = conn

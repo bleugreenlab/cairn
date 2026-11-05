@@ -81,7 +81,7 @@ pub fn get_execution_node_statuses(
 /// `blocked` when it routed nowhere (the same status a blocked checkpoint
 /// shows), `complete` once it routed.
 pub async fn node_statuses_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<HashMap<String, String>> {
     let mut rows = conn

@@ -1,7 +1,7 @@
 //! Provider-owned pauses. The yielded head owns the wait; the row owns its clock.
 
 use cairn_common::ids;
-use cairn_db::turso::{params, Connection, Row};
+use cairn_db::turso::{params, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::execution::jobs::{continue_job_impl, ResumeContext};
@@ -102,7 +102,10 @@ fn from_row(row: &Row) -> DbResult<ProviderLimitHold> {
     })
 }
 
-async fn load_conn(conn: &Connection, id: &str) -> DbResult<Option<ProviderLimitHold>> {
+async fn load_conn(
+    conn: &crate::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<Option<ProviderLimitHold>> {
     let mut rows = conn
         .query(
             &format!("SELECT {COLUMNS} FROM provider_limit_holds WHERE id=?1"),
@@ -231,7 +234,7 @@ pub async fn load_active_provider_limit_holds(
     db: &LocalDb,
 ) -> Result<Vec<ProviderLimitHold>, String> {
     db.query_all(
-        &format!("SELECT {COLUMNS} FROM provider_limit_holds WHERE state='active'"),
+        format!("SELECT {COLUMNS} FROM provider_limit_holds WHERE state='active'"),
         (),
         from_row,
     )
@@ -246,7 +249,12 @@ pub async fn cancel_provider_limit_holds_for_job(db: &LocalDb, job_id: &str) -> 
     ).await.map(|_| ()).map_err(|error| error.to_string())
 }
 
-async fn set_state_conn(conn: &Connection, id: &str, state: &str, now: i64) -> DbResult<()> {
+async fn set_state_conn(
+    conn: &crate::storage::TrackedConnection,
+    id: &str,
+    state: &str,
+    now: i64,
+) -> DbResult<()> {
     conn.execute(
         "UPDATE provider_limit_holds SET state=?1, updated_at=?2 WHERE id=?3 AND state='active'",
         params![state, now, id],

@@ -50,7 +50,7 @@ pub fn canonicalize_issue_uri(value: &str) -> Result<String, String> {
 }
 
 pub async fn resolve_issue_uri(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     uri: &str,
 ) -> DbResult<Option<IssueRef>> {
     let canonical = canonicalize_issue_uri(uri).map_err(DbError::Row)?;
@@ -77,7 +77,10 @@ pub async fn resolve_issue_uri(
         .transpose()
 }
 
-pub async fn issue_uri_for_id(conn: &crate::turso::Connection, issue_id: &str) -> DbResult<String> {
+pub async fn issue_uri_for_id(
+    conn: &crate::storage::TrackedConnection,
+    issue_id: &str,
+) -> DbResult<String> {
     let mut rows = conn
         .query(
             "
@@ -166,7 +169,7 @@ pub async fn issue_key_for_messages(db: &LocalDb, issue_id: &str) -> DbResult<St
 /// the project default at the caller; filesystem residence is never part of
 /// branch authority.
 pub async fn resolve_parent_branch(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     child_issue_id: &str,
 ) -> DbResult<Option<String>> {
     let mut parent_rows = conn
@@ -239,7 +242,7 @@ pub async fn resolve_parent_branch(
 /// is a bounded linear walk up from the proposed parent; a self-parent is caught
 /// on the first iteration.
 pub async fn validate_no_parent_cycle(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     child_issue_id: &str,
     proposed_parent_id: &str,
 ) -> Result<(), String> {
@@ -283,7 +286,7 @@ mod tests {
     }
 
     async fn seed_issue(
-        conn: &crate::turso::Connection,
+        conn: &crate::storage::TrackedConnection,
         project_id: &str,
         id: &str,
         number: i32,
@@ -298,7 +301,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_project(conn: &crate::turso::Connection, id: &str, key: &str) {
+    async fn seed_project(conn: &crate::storage::TrackedConnection, id: &str, key: &str) {
         conn.execute(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
             params![format!("w-{id}"), format!("Workspace {key}")],

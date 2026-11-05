@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::config::slugify_resource_segment;
 use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_db::turso::{params, Connection, Row, Value};
+use cairn_db::turso::{params, Row, Value};
 
 #[derive(Debug, Clone)]
 pub struct ResourceEmbeddingRecord {
@@ -83,7 +83,7 @@ pub async fn get_event_vibes_for_session_lineage_async(
 }
 
 async fn upsert_resource_embedding_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     uri: &str,
     embedding_bytes: &[u8],
     model: &str,
@@ -209,7 +209,7 @@ pub async fn upsert_event_vibe_async(
 }
 
 async fn upsert_event_vibe_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     event_id: &str,
     session_id: Option<&str>,
     css_color: &str,

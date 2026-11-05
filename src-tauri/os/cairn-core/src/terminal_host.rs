@@ -1261,7 +1261,7 @@ async fn load_job_terminals(db: Arc<LocalDb>, job_id: String) -> Result<Vec<JobT
 }
 
 async fn slug_exists(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: Option<&str>,
     project_id: Option<&str>,
     slug: &str,

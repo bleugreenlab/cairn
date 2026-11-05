@@ -338,7 +338,7 @@ struct Executed {
 }
 
 async fn execute_statements(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     statements: Vec<WriteStatement>,
 ) -> crate::storage::DbResult<Executed> {
     let mut executed = Executed {
@@ -526,7 +526,7 @@ async fn read_legacy_state(db: &LocalDb, with_rows: bool) -> crate::storage::DbR
     db.read(move |conn| {
         Box::pin(async move {
             async fn table_exists(
-                conn: &cairn_db::turso::Connection,
+                conn: &cairn_db::storage::TrackedConnection,
                 name: &str,
             ) -> crate::storage::DbResult<bool> {
                 let mut rows = conn

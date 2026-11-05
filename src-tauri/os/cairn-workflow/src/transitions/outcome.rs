@@ -28,7 +28,7 @@ pub struct StatusWrite {
 }
 
 pub async fn recompute_execution_status_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<()> {
     // FIRST, before any job count: an execution filed with `after:` gates and
@@ -174,7 +174,7 @@ pub async fn recompute_execution_status_conn(
 }
 
 pub async fn recompute_job_owner_attention_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     issue_id: Option<&str>,
 ) -> DbResult<()> {
@@ -200,7 +200,7 @@ pub async fn recompute_job_owner_attention_conn(
 /// Project human attention for a first-class thread. Rest is silent; only a
 /// pending question, permission request, or approval asks for attention.
 pub async fn recompute_thread_attention_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     thread_id: &str,
 ) -> DbResult<()> {
     let attention = if count(
@@ -253,7 +253,7 @@ pub async fn recompute_thread_attention_conn(
 /// projection last *ran*, which after a startup sweep is boot time for every
 /// issue the sweep touched.
 pub async fn recompute_issue_status_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<StatusWrite> {
     let Some((progress, attention)) = issue_progress_attention(conn, issue_id).await? else {
@@ -343,7 +343,7 @@ pub async fn recompute_issue_status_conn(
 /// value the model cannot parse must read as "different" so the projection
 /// repairs it.
 async fn stored_projection(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Option<(String, String, String)>> {
     let mut rows = conn
@@ -362,7 +362,7 @@ async fn stored_projection(
 }
 
 async fn issue_progress_attention(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Option<(IssueProgress, IssueAttention)>> {
     let mut issue_rows = conn
@@ -492,7 +492,7 @@ async fn issue_progress_attention(
 }
 
 async fn issue_completed_at(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<Option<i64>> {
     crate::storage::query_opt_i64_conn(
@@ -503,21 +503,33 @@ async fn issue_completed_at(
     .await
 }
 
-async fn count(conn: &cairn_db::turso::Connection, sql: &'static str, id: &str) -> DbResult<i64> {
-    let mut rows = conn.query(sql, (id,)).await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| DbError::internal("missing count row"))?;
-    row.i64(0)
+#[track_caller]
+fn count<'a, C>(
+    conn: &'a C,
+    sql: &'a str,
+    id: &'a str,
+) -> impl std::future::Future<Output = DbResult<i64>> + Send + 'a
+where
+    C: cairn_db::storage::QueryConn + ?Sized,
+{
+    let row = conn.query_first_row(sql, (id,));
+    async move {
+        row.await?
+            .ok_or_else(|| DbError::internal("missing count row"))?
+            .i64(0)
+    }
 }
 
-async fn issue_count(
-    conn: &cairn_db::turso::Connection,
-    issue_id: &str,
-    sql: &'static str,
-) -> DbResult<i64> {
-    count(conn, sql, issue_id).await
+#[track_caller]
+fn issue_count<'a, C>(
+    conn: &'a C,
+    issue_id: &'a str,
+    sql: &'a str,
+) -> impl std::future::Future<Output = DbResult<i64>> + Send + 'a
+where
+    C: cairn_db::storage::QueryConn + ?Sized,
+{
+    count(conn, sql, issue_id)
 }
 
 #[cfg(test)]
@@ -529,8 +541,47 @@ mod tests {
         crate::storage::migrated_test_db("outcome-projection.db").await
     }
 
+    #[test]
+    fn caller_sql_count_helpers_preserve_the_statement_site() {
+        use cairn_db::storage::{QueryConn, QueryRows};
+        use std::future::Future;
+        use std::panic::Location;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct QuerySite(Mutex<Option<&'static Location<'static>>>);
+
+        impl QueryConn for QuerySite {
+            #[track_caller]
+            fn query_rows<'a, P>(
+                &'a self,
+                _sql: &'a str,
+                _params: P,
+            ) -> impl Future<Output = DbResult<QueryRows>> + Send + 'a
+            where
+                P: cairn_db::turso::IntoParams + Send + 'a,
+            {
+                *self.0.lock().unwrap() = Some(Location::caller());
+                std::future::ready(Err(DbError::internal("site probe")))
+            }
+        }
+
+        let conn = QuerySite::default();
+        let direct_line = line!() + 1;
+        let direct = count(&conn, "SELECT COUNT(*) FROM jobs WHERE id = ?1", "j");
+        let site = conn.0.lock().unwrap().unwrap();
+        assert_eq!((site.file(), site.line()), (file!(), direct_line));
+        drop(direct);
+
+        let forwarded_line = line!() + 1;
+        let forwarded = issue_count(&conn, "i", "SELECT COUNT(*) FROM issues WHERE id = ?1");
+        let site = conn.0.lock().unwrap().unwrap();
+        assert_eq!((site.file(), site.line()), (file!(), forwarded_line));
+        drop(forwarded);
+    }
+
     async fn seed_completed_issue_with_pr(db: &LocalDb, pr_status: &str) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at)
               VALUES('w', 'W', 1, 1);
@@ -577,7 +628,7 @@ mod tests {
 
     /// Seed a project plus an issue carrying a running execution and one job.
     async fn seed_issue_with_job(db: &LocalDb, job_status: &str) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at)
               VALUES('w', 'W', 1, 1);

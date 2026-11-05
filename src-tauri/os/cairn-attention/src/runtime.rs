@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use cairn_db::storage::LocalDb;
-use cairn_db::{storage::DbResult, turso::Connection};
+use cairn_db::storage::{DbResult, TrackedConnection};
 use cairn_domain::DeliveryUrgency;
 use std::sync::Arc;
 
@@ -11,12 +11,17 @@ use std::sync::Arc;
 pub trait RecipientHost: Send + Sync {
     /// Use this connection for all writes so session creation shares the caller's
     /// commit or rollback. Do not open another write transaction here.
-    async fn ensure_thread_session(&self, conn: &Connection, thread_id: &str) -> DbResult<String>;
+    async fn ensure_thread_session(
+        &self,
+        conn: &TrackedConnection,
+        thread_id: &str,
+    ) -> DbResult<String>;
     /// Return the application's canonical execution fence using this connection.
-    async fn job_is_fenced(&self, conn: &Connection, job_id: &str) -> DbResult<bool>;
+    async fn job_is_fenced(&self, conn: &TrackedConnection, job_id: &str) -> DbResult<bool>;
     /// Whether the job belongs to a merged or closed issue, using this
     /// connection. Thread-owned jobs answer `false`: dormancy governs them.
-    async fn job_issue_is_resolved(&self, conn: &Connection, job_id: &str) -> DbResult<bool>;
+    async fn job_issue_is_resolved(&self, conn: &TrackedConnection, job_id: &str)
+        -> DbResult<bool>;
 }
 
 /// Execution and publication supplied by the application. Durable attention

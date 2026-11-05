@@ -16,7 +16,7 @@ use crate::turso::params;
 /// generation is stamped when it is created, so a grandchild reads an already
 /// stamped parent.
 pub async fn inherited_thread_id_conn(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     parent_job_id: &str,
 ) -> crate::storage::DbResult<Option<String>> {
     let mut rows = conn
@@ -36,7 +36,7 @@ pub async fn inherited_thread_id_conn(
 /// The eligibility question every dormancy boundary asks, resolved from the one
 /// column that answers it.
 pub async fn thread_status_conn(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     thread_id: &str,
 ) -> crate::storage::DbResult<Option<crate::models::ThreadStatus>> {
     let mut rows = conn
@@ -113,7 +113,7 @@ pub async fn home_uri_for_job(db: &LocalDb, job_id: &str) -> Result<Option<Strin
 /// Connection-level variant of [`home_uri_for_job`] for callers already inside
 /// a caller-owned transaction.
 pub async fn home_uri_for_job_conn(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<Option<String>, DbError> {
     let mut rows = conn

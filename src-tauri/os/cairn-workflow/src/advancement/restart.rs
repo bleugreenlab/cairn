@@ -36,7 +36,7 @@ pub struct RestartNodeOutcome {
 /// Connection-level restart: validate, archive the prior attempt, create a fresh
 /// job — all in one transaction so a partial restart is never observable.
 async fn restart_node_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
     recipe_node_id: &str,
 ) -> DbResult<RestartNodeOutcome> {
@@ -80,7 +80,7 @@ async fn restart_node_conn(
 /// the single predicate in `execution::canonical` stays the only reader of the
 /// lifecycle columns.
 async fn canonical_fence_for_execution(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<crate::canonical::Fence> {
     let mut rows = conn
@@ -182,7 +182,7 @@ mod tests {
     }
 
     async fn seed_project_issue_execution(
-        conn: &cairn_db::turso::Connection,
+        conn: &cairn_db::storage::TrackedConnection,
         snap: &ExecutionSnapshot,
     ) {
         conn.execute(
@@ -217,7 +217,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     async fn seed_job(
-        conn: &cairn_db::turso::Connection,
+        conn: &cairn_db::storage::TrackedConnection,
         id: &str,
         node_id: &str,
         status: &str,
@@ -250,7 +250,7 @@ mod tests {
         }
     }
 
-    async fn job_status(conn: &cairn_db::turso::Connection, id: &str) -> Option<String> {
+    async fn job_status(conn: &cairn_db::storage::TrackedConnection, id: &str) -> Option<String> {
         let mut rows = conn
             .query("SELECT status FROM jobs WHERE id = ?1", params![id])
             .await
@@ -259,7 +259,7 @@ mod tests {
     }
 
     async fn jobs_for_node(
-        conn: &cairn_db::turso::Connection,
+        conn: &cairn_db::storage::TrackedConnection,
         node_id: &str,
     ) -> Vec<(String, String)> {
         let mut rows = conn

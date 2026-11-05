@@ -125,7 +125,7 @@ pub fn db_job_from_row(row: &turso::Row) -> DbResult<DbJob> {
 /// are already safe — a cancelled row never matches — and intentionally stay as
 /// they are.
 pub async fn load_live_job_by_execution_node_conn(
-    conn: &turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_id: &str,
     recipe_node_id: &str,
 ) -> DbResult<Option<DbJob>> {
@@ -148,7 +148,7 @@ pub async fn load_live_job_by_execution_node_conn(
 /// Kept out of [`JOB_COLUMNS`]: only selection reads it, and every other job
 /// load would otherwise carry the whole record.
 pub async fn load_job_selection_conn(
-    conn: &turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -162,7 +162,7 @@ pub async fn load_job_selection_conn(
 
 /// Store (or clear) a job's selection record.
 pub async fn set_job_selection_conn(
-    conn: &turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
     selection: Option<&str>,
 ) -> DbResult<()> {
@@ -177,7 +177,7 @@ pub async fn set_job_selection_conn(
 /// The selection record of a recipe node's live attempt within an execution,
 /// the same attempt [`load_live_job_by_execution_node_conn`] resolves to.
 pub async fn load_node_selection_conn(
-    conn: &turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     execution_id: &str,
     recipe_node_id: &str,
 ) -> DbResult<Option<String>> {

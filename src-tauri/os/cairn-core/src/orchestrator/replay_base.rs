@@ -203,7 +203,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// The pull request is filtered to an OPEN one: a merged or closed pull request
 /// states where work already went, not where this branch is going.
 pub(crate) async fn load_base_candidates(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<BaseCandidates> {
     let mut rows = conn

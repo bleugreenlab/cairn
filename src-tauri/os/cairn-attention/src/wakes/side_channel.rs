@@ -120,7 +120,7 @@ pub async fn claim_pending_live_side_channel_for_job_async(
 }
 
 async fn select_pending_live_side_channel(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
     cutoff: i64,
 ) -> DbResult<Vec<SuppressedWake>> {

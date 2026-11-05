@@ -11,7 +11,7 @@ use crate::error::CairnError;
 use crate::models::{ExecutionSnapshot, Job, RecipeNode, RecipeSnapshot, Turn};
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
-use cairn_db::turso::{params, Connection, Value};
+use cairn_db::turso::{params, Value};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -157,7 +157,7 @@ pub(crate) fn pending_dispatch_description(parent_segment: Option<&str>) -> Stri
 /// Read-only by construction. Resolving a thread that has never run returns
 /// `Ok(None)` rather than minting a session; only a write may do that.
 pub(crate) async fn job_id_for_node_coordinate_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     number: i32,
     exec_seq: i32,
@@ -401,7 +401,7 @@ struct JobViewRow {
 /// of statements however many jobs an issue has: one per [`IN_LIST_CHUNK`]
 /// jobs, then one recipe-graph read per execution that one of them needs.
 async fn job_views_conn(
-    conn: &Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_ids: &[String],
 ) -> Result<HashMap<String, JobView>, DbError> {
     let mut job_rows = Vec::with_capacity(job_ids.len());

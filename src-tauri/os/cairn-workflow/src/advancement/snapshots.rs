@@ -1,7 +1,7 @@
 use super::*;
 
 pub async fn load_execution_snapshot_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     execution_id: &str,
 ) -> DbResult<ExecutionSnapshot> {
     let mut rows = conn

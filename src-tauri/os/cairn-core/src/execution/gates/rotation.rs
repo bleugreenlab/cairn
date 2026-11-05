@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 use cairn_workflow::gates::store::QUEUE_KEY_SCALE;
 
 use crate::storage::DbResult;
@@ -172,7 +172,7 @@ pub(crate) fn release_order(entries: &[Entry<'_>], turns: &LaneTurns) -> Vec<usi
 
 /// Issue `issue_id`'s lane, or [`SHARED_LANE`] for an issue-less execution.
 pub(crate) async fn lane_of_issue_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     issue_id: Option<&str>,
 ) -> DbResult<String> {
     let Some(issue_id) = issue_id else {
@@ -190,7 +190,7 @@ pub(crate) async fn lane_of_issue_conn(
 /// start's own transaction, after the start is certain: a release that lost
 /// its guarded update must record nothing.
 pub(crate) async fn record_turn_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     issue_id: Option<&str>,
     execution_id: &str,
     turn: i64,
@@ -216,7 +216,7 @@ pub(crate) async fn record_turn_conn(
 /// The stamps this database holds for `lanes`, one primary-key search each,
 /// merged into `turns`.
 pub(crate) async fn read_lane_turns_conn<'a>(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     lanes: impl IntoIterator<Item = &'a str>,
     turns: &mut LaneTurns,
 ) -> DbResult<()> {
@@ -231,7 +231,9 @@ pub(crate) async fn read_lane_turns_conn<'a>(
 }
 
 /// The newest stamp this database holds.
-pub(crate) async fn newest_turn_conn(conn: &Connection) -> DbResult<Option<i64>> {
+pub(crate) async fn newest_turn_conn(
+    conn: &crate::storage::TrackedConnection,
+) -> DbResult<Option<i64>> {
     crate::storage::query_opt_i64_conn(conn, NEWEST_TURN_SQL, ()).await
 }
 

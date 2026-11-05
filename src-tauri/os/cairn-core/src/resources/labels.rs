@@ -7,7 +7,7 @@ use super::common::{read_resource, storage_error};
 use crate::labels::crud::{get_label_conn, list_labels_conn, DEFAULT_WORKSPACE_ID};
 use crate::storage::{LocalDb, RowExt};
 
-async fn usage_count(conn: &cairn_db::turso::Connection, label_id: &str) -> i64 {
+async fn usage_count(conn: &cairn_db::storage::TrackedConnection, label_id: &str) -> i64 {
     match conn
         .query(
             "SELECT COUNT(*) FROM issue_labels WHERE label_id = ?1",

@@ -1533,7 +1533,7 @@ fn compose_user_message(prompt: &str, messaging: &str) -> String {
 }
 
 async fn issue_key(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_key: &str,
     issue_id: &str,
 ) -> DbResult<Option<String>> {
@@ -1552,7 +1552,7 @@ async fn issue_key(
 }
 
 async fn find_peer_agents(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_key: &str,
     issue_id: &str,
     current_run_id: &str,
@@ -1808,7 +1808,7 @@ pub(crate) async fn dismiss_channel_message_for_job(
 /// cursor and to exclude every run from the recipient's own job across resumes.
 /// Returns `(None, None)` for legacy runs missing either relation.
 async fn session_and_job_id_for_run(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     run_id: &str,
 ) -> DbResult<(Option<String>, Option<String>)> {
     let mut rows = conn
@@ -1843,7 +1843,7 @@ async fn read_channel_cursor(
 /// keeps the cursor monotonic so a stale/concurrent build can never rewind it
 /// and re-surface already-injected messages.
 async fn advance_channel_cursor(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     session_id: &str,
     rowid: i64,
 ) -> DbResult<()> {

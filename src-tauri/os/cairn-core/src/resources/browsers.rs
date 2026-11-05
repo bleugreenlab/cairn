@@ -189,7 +189,7 @@ pub(crate) async fn resolve_browser_target(
 /// through the shared resolver, so a thread session's browser resolves to the
 /// session job exactly as a node's resolves to the node job.
 async fn find_node_job_id(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,
@@ -207,7 +207,7 @@ async fn find_node_job_id(
 }
 
 async fn find_task_job_id(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,

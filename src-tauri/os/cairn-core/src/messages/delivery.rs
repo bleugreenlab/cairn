@@ -637,7 +637,7 @@ pub(crate) async fn node_uri_for_job(db: &LocalDb, job_id: &str) -> Option<Strin
 }
 
 async fn node_uri_for_job_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Result<Option<String>, DbError> {
     crate::jobs::queries::home_uri_for_job_conn(conn, job_id).await
@@ -649,7 +649,7 @@ pub(crate) fn system_direct_once_message_id(idempotency_key: &str) -> String {
 }
 
 pub(crate) async fn insert_system_direct_push_once_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     recipient_job_id: &str,
     recipient_run_id: &str,
     content: &str,

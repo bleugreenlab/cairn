@@ -407,7 +407,7 @@ async fn table_document(
 
 /// One index as `[unique] [partial] index NAME (TERMS) [WHERE PREDICATE]`.
 async fn render_index(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     name: &str,
     sql: Option<String>,
 ) -> DbResult<String> {

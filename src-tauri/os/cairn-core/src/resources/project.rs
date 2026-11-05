@@ -27,7 +27,7 @@ struct ProjectIssueStats {
 }
 
 async fn load_project_issue_stats(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
 ) -> ProjectIssueStats {
     let mut rows = match conn
@@ -60,7 +60,7 @@ async fn load_project_issue_stats(
 }
 
 async fn load_recent_project_issue_summaries(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     limit: i64,
 ) -> Vec<(i32, String, String, Option<String>, i32)> {
@@ -333,7 +333,7 @@ fn issue_filter_clause(query: &ProjectIssuesQuery) -> String {
 /// same filter clause. `limit`/`offset` push down to SQL so the producer can
 /// report a truthful `[N of M issues]` header and a paging continue URI.
 async fn load_project_issue_summaries(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     project_id: &str,
     query: &ProjectIssuesQuery,
 ) -> Result<(Vec<ProjectIssueSummary>, usize), String> {
@@ -2168,7 +2168,7 @@ mod project_issues_query_tests {
         db
     }
 
-    async fn seed_project(conn: &cairn_db::turso::Connection) {
+    async fn seed_project(conn: &cairn_db::storage::TrackedConnection) {
         conn.execute(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-labels', 'default', 'Labels', 'LBL', '/tmp/lbl', 1, 1)",
             (),
@@ -2178,7 +2178,7 @@ mod project_issues_query_tests {
     }
 
     async fn seed_issue(
-        conn: &cairn_db::turso::Connection,
+        conn: &cairn_db::storage::TrackedConnection,
         issue_id: &str,
         number: i32,
         title: &str,
@@ -2191,7 +2191,7 @@ mod project_issues_query_tests {
         .unwrap();
     }
 
-    async fn seed_label(conn: &cairn_db::turso::Connection, name: &str) {
+    async fn seed_label(conn: &cairn_db::storage::TrackedConnection, name: &str) {
         create_label_conn(
             conn,
             DEFAULT_WORKSPACE_ID,

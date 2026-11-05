@@ -1,8 +1,9 @@
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 
 use turso::{params::IntoParams, Connection, Row, Rows, Value};
 
-use super::{DbError, DbResult, TrackedConnection};
+use super::{DbError, DbResult, TrackedConnection, TrackedRows};
 
 pub trait FromDbRow: Sized {
     fn from_row(row: &Row) -> DbResult<Self>;
@@ -121,15 +122,48 @@ pub async fn next_i64(rows: &mut Rows, idx: usize) -> DbResult<Option<i64>> {
     rows.next().await?.map(|row| row.i64(idx)).transpose()
 }
 
-/// A connection the single-value helpers below can run on: the engine's own,
-/// or a [`TrackedConnection`], which records the statement's call site for the
-/// stall line and hands it to the plan audit.
+/// Rows from either connection kind. The tracked variant keeps the statement
+/// in flight until these rows are dropped.
+pub enum QueryRows {
+    Raw(Rows),
+    Tracked(TrackedRows),
+}
+
+impl Deref for QueryRows {
+    type Target = Rows;
+
+    fn deref(&self) -> &Rows {
+        match self {
+            Self::Raw(rows) => rows,
+            Self::Tracked(rows) => rows,
+        }
+    }
+}
+
+impl DerefMut for QueryRows {
+    fn deref_mut(&mut self) -> &mut Rows {
+        match self {
+            Self::Raw(rows) => rows,
+            Self::Tracked(rows) => rows,
+        }
+    }
+}
+
+/// A connection a caller-SQL helper can query without erasing tracking.
 ///
-/// The helpers take their SQL from the caller, so the statement's identity is
-/// the caller's line. They and this method are `#[track_caller]` functions
-/// returning futures rather than `async fn`s, which is what carries that line
-/// down to `TrackedConnection::query`.
+/// Helpers and these methods are `#[track_caller]` functions returning futures,
+/// not `async fn`s: constructing the query before the future carries the
+/// caller's statement identity down to `TrackedConnection::query`.
 pub trait QueryConn: Sync {
+    #[track_caller]
+    fn query_rows<'a, P>(
+        &'a self,
+        sql: &'a str,
+        params: P,
+    ) -> impl Future<Output = DbResult<QueryRows>> + Send + 'a
+    where
+        P: IntoParams + Send + 'a;
+
     /// Run `sql` and return its first row, if any.
     #[track_caller]
     fn query_first_row<'a, P>(
@@ -138,36 +172,40 @@ pub trait QueryConn: Sync {
         params: P,
     ) -> impl Future<Output = DbResult<Option<Row>>> + Send + 'a
     where
-        P: IntoParams + Send + 'a;
+        P: IntoParams + Send + 'a,
+    {
+        let rows = self.query_rows(sql, params);
+        async move { Ok(rows.await?.next().await?) }
+    }
 }
 
 impl QueryConn for Connection {
     #[track_caller]
-    fn query_first_row<'a, P>(
+    fn query_rows<'a, P>(
         &'a self,
         sql: &'a str,
         params: P,
-    ) -> impl Future<Output = DbResult<Option<Row>>> + Send + 'a
+    ) -> impl Future<Output = DbResult<QueryRows>> + Send + 'a
     where
         P: IntoParams + Send + 'a,
     {
         let rows = self.query(sql, params);
-        async move { Ok(rows.await?.next().await?) }
+        async move { Ok(QueryRows::Raw(rows.await?)) }
     }
 }
 
 impl QueryConn for TrackedConnection {
     #[track_caller]
-    fn query_first_row<'a, P>(
+    fn query_rows<'a, P>(
         &'a self,
         sql: &'a str,
         params: P,
-    ) -> impl Future<Output = DbResult<Option<Row>>> + Send + 'a
+    ) -> impl Future<Output = DbResult<QueryRows>> + Send + 'a
     where
         P: IntoParams + Send + 'a,
     {
         let rows = self.query(sql, params);
-        async move { Ok(rows.await?.next().await?) }
+        async move { Ok(QueryRows::Tracked(rows.await?)) }
     }
 }
 

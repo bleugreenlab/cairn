@@ -45,7 +45,7 @@ pub(crate) async fn goal_objective_for_job(
 }
 
 pub(crate) async fn base_goal_objective_for_job_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     if is_standing_thread_job_conn(conn, job_id).await? {
@@ -73,7 +73,7 @@ pub(crate) async fn base_goal_objective_for_job_conn(
 }
 
 pub(crate) async fn is_standing_thread_job_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<bool> {
     let mut rows = conn
@@ -317,7 +317,7 @@ pub async fn get_todos_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<TodoIte
 }
 
 pub(crate) async fn get_todos_for_job_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<Vec<TodoItem>> {
     let mut rows = conn

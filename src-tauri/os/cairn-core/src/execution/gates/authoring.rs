@@ -16,7 +16,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use cairn_db::turso::Connection;
 use serde_json::Value;
 
 use super::vocabulary::{GateContext, GateOutcome, GateVocabulary};
@@ -284,7 +283,7 @@ fn cycle_refusal(path: &[String]) -> String {
 /// check of each other, and it is accepted rather than locked against. A
 /// project this host cannot see is a dead end for the walk, not an error.
 pub async fn refuse_cycles_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     dbs: &crate::db::DbState,
     own_db: &std::sync::Arc<crate::storage::LocalDb>,
     issue_id: &str,
@@ -380,7 +379,7 @@ pub async fn refuse_cycles_conn(
 /// "Issue X waits on issue Y" for every unsatisfied gate of every held
 /// execution in one database, keyed by X's canonical URI.
 async fn waiting_edges_conn(
-    conn: &Connection,
+    conn: &crate::storage::TrackedConnection,
     excluding: Option<&str>,
 ) -> DbResult<HashMap<String, Vec<String>>> {
     let mut issue_uris: HashMap<String, Option<String>> = HashMap::new();
@@ -419,7 +418,10 @@ pub struct HoldState {
     pub issue_resolved: bool,
 }
 
-async fn hold_state_conn(conn: &Connection, execution_id: &str) -> DbResult<HoldState> {
+async fn hold_state_conn(
+    conn: &crate::storage::TrackedConnection,
+    execution_id: &str,
+) -> DbResult<HoldState> {
     let mut rows = conn
         .query(
             "SELECT e.released_at, e.lifecycle = 'superseded',
@@ -677,6 +679,31 @@ pub(crate) async fn replace_gates_observed(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn hold_state_records_its_own_statement_identity() {
+        use std::time::Duration;
+
+        let db = crate::storage::migrated_test_db("authoring-tracking.db").await;
+        let conn = db.connect().await.unwrap();
+        let caller_line = line!() + 1;
+        let error = hold_state_conn(&conn, "missing").await.err().unwrap();
+        assert!(
+            matches!(error, DbError::Internal(message) if message == "execution missing not found")
+        );
+        let holders = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(holders.len(), 1);
+        let statement = &*holders[0].statement;
+        assert!(
+            statement.starts_with(&format!("{}:", file!())),
+            "{statement}"
+        );
+        assert!(
+            !statement.starts_with(&format!("{}:{caller_line} ", file!())),
+            "{statement}"
+        );
+        assert!(statement.contains("SELECT e.released_at"), "{statement}");
+    }
 
     fn clause(value: Value) -> TriggerClause {
         parse_after(Some(&json!([value])), "payload.after")

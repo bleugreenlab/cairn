@@ -5,7 +5,7 @@ use crate::turso::params;
 /// reaches `complete`. Callers must own that exact job-status transition; run,
 /// turn, and session boundaries are not completion signals.
 pub async fn complete_in_progress_todos_conn(
-    conn: &crate::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     job_id: &str,
     now: i64,
 ) -> DbResult<()> {

@@ -17,7 +17,7 @@ use cairn_common::read::{
     ActionSpec, Affordance, AffordanceSpec, KeyInfo, NaturalUnit, SegmentKind,
 };
 use cairn_common::uri::{build_db_row_uri, build_db_table_uri, CairnResource};
-use cairn_db::turso::{Connection, Value};
+use cairn_db::turso::Value;
 
 use super::common::{affordance_spec_for_kind, find_query_value, render_affordance};
 use super::read::{
@@ -66,7 +66,10 @@ pub(crate) struct TableShape {
 
 impl TableShape {
     /// `None` when the table does not exist (`table_info` reports no columns).
-    pub(crate) async fn load(conn: &Connection, table: &str) -> DbResult<Option<Self>> {
+    pub(crate) async fn load(
+        conn: &cairn_db::storage::TrackedConnection,
+        table: &str,
+    ) -> DbResult<Option<Self>> {
         let mut rows = conn
             .query(
                 &format!("PRAGMA table_info({})", quote_identifier(table)),
@@ -734,7 +737,6 @@ fn key_columns(shape: &TableShape) -> Vec<&Column> {
 /// for the conflict, so an upsert row names every column an insert must,
 /// even when its key exists. That is refused here by name rather than left to
 /// the engine's constraint error.
-
 pub(crate) fn upsert_sql(
     shape: &TableShape,
     columns: &[(String, Value)],
@@ -926,21 +928,29 @@ struct FetchedRows {
     rows: Vec<Vec<Value>>,
 }
 
-async fn fetch(conn: &Connection, sql: &str, values: Vec<Value>) -> DbResult<FetchedRows> {
-    let mut rows = conn.query(sql, values).await?;
-    let columns = rows.column_names();
-    let mut fetched = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let mut values = Vec::with_capacity(row.column_count());
-        for index in 0..row.column_count() {
-            values.push(row.get_value(index)?);
+#[track_caller]
+fn fetch<'a, C: cairn_db::storage::QueryConn + ?Sized>(
+    conn: &'a C,
+    sql: &'a str,
+    values: Vec<Value>,
+) -> impl std::future::Future<Output = DbResult<FetchedRows>> + Send + 'a {
+    let rows = conn.query_rows(sql, values);
+    async move {
+        let mut rows = rows.await?;
+        let columns = rows.column_names();
+        let mut fetched = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let mut values = Vec::with_capacity(row.column_count());
+            for index in 0..row.column_count() {
+                values.push(row.get_value(index)?);
+            }
+            fetched.push(values);
         }
-        fetched.push(values);
+        Ok(FetchedRows {
+            columns,
+            rows: fetched,
+        })
     }
-    Ok(FetchedRows {
-        columns,
-        rows: fetched,
-    })
 }
 
 /// One database store as the row engine sees it.
@@ -1507,6 +1517,60 @@ pub(crate) fn table_affordance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fetch_preserves_caller_attribution_and_consumes_tracked_rows() {
+        use cairn_db::storage::{QueryConn, QueryRows, TrackedConnection};
+        use std::future::Future;
+        use std::panic::Location;
+        use std::sync::OnceLock;
+
+        struct Probe<'c> {
+            conn: &'c TrackedConnection,
+            site: OnceLock<&'static Location<'static>>,
+        }
+
+        impl QueryConn for Probe<'_> {
+            #[track_caller]
+            fn query_rows<'a, P>(
+                &'a self,
+                sql: &'a str,
+                params: P,
+            ) -> impl Future<Output = DbResult<QueryRows>> + Send + 'a
+            where
+                P: cairn_db::turso::IntoParams + Send + 'a,
+            {
+                self.site.set(Location::caller()).unwrap();
+                self.conn.query_rows(sql, params)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("fetch.db")).await.unwrap();
+        db.read(|conn| {
+            Box::pin(async move {
+                let probe = Probe {
+                    conn,
+                    site: OnceLock::new(),
+                };
+                const SQL: &str = "SELECT ?1 AS n UNION ALL SELECT NULL";
+                let line = line!() + 1;
+                let pending = fetch(&probe, SQL, vec![Value::Integer(7)]);
+                let site = probe.site.get().unwrap();
+                assert_eq!((site.file(), site.line()), (file!(), line));
+
+                let fetched = pending.await?;
+                assert_eq!(fetched.columns, vec!["n"]);
+                assert_eq!(
+                    fetched.rows,
+                    vec![vec![Value::Integer(7)], vec![Value::Null]]
+                );
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
 
     fn column(
         name: &str,
