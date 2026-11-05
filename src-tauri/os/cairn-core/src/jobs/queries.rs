@@ -802,14 +802,13 @@ pub(crate) fn live_agent_census_sql() -> String {
                COALESCE(t.name, i.title, j.node_name, j.uri_segment),
                root.execution_id, e.seq, root.uri_segment, homes.path,
                COALESCE(j.current_session_id, homes.head_session),
-               homes.head_state, homes.prompt, homes.permission, tb.number
+               homes.head_state, homes.prompt, homes.permission
           FROM homes JOIN jobs j ON j.id = homes.id
           JOIN jobs root ON root.id = homes.ancestor_id
           LEFT JOIN issues i ON i.id = COALESCE(j.issue_id, root.issue_id)
           LEFT JOIN threads t ON t.id = COALESCE(j.thread_id, root.thread_id)
           JOIN projects p ON p.id = COALESCE(i.project_id, t.project_id, j.project_id, root.project_id)
           LEFT JOIN executions e ON e.id = root.execution_id
-          LEFT JOIN thread_branches tb ON tb.job_id = root.id
          WHERE {root} AND p.id IN (SELECT value FROM json_each(?1))
          ORDER BY p.id, j.id"
     )
@@ -824,9 +823,7 @@ async fn live_agent_census_db(
         serde_json::to_string(&projects).map_err(|e| CairnError::Internal(e.to_string()))?;
     let sql = live_agent_census_sql();
     db.query_all(sql, params![projects.as_str()], move |row| {
-        use cairn_common::uri::{
-            build_job_base_uri, build_thread_branch_uri, build_thread_task_uri, build_thread_uri,
-        };
+        use cairn_common::uri::{build_job_base_uri, build_thread_task_uri, build_thread_uri};
         let project_key = row.text(2)?;
         let issue_number = row.opt_i64(4)?.map(|n| n as i32);
         let thread_name = row.opt_text(6)?;
@@ -834,9 +831,7 @@ async fn live_agent_census_db(
         let path = row.text(11)?;
         let exec_seq = row.opt_i64(9)?.map(|n| n as i32);
         let base = if let Some(name) = thread_name.as_deref() {
-            if let Some(number) = row.opt_i64(16)? {
-                Some(build_thread_branch_uri(&project_key, name, number as i32))
-            } else if node_segment.as_deref() == Some("thread") {
+            if node_segment.as_deref() == Some("thread") {
                 Some(build_thread_uri(&project_key, name))
             } else {
                 node_segment
@@ -2627,10 +2622,8 @@ mod tests {
         );
         db.execute_script(
             "INSERT INTO jobs(id, thread_id, project_id, parent_job_id, status, created_at, updated_at, uri_segment)
-             VALUES ('branch-job', 'th', 'p', NULL, 'running', 1, 1, 'builder'),
+             VALUES ('branch-job', 'th', 'p', NULL, 'running', 1, 1, 'branch-3'),
                     ('branch-task', 'th', 'p', 'branch-job', 'running', 1, 1, 'inspect');
-             INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
-             VALUES ('branch', 'th', 3, 'accumulating', 'branch-ref', 'branch-job', 1, 1);
              INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
              VALUES ('branch-turn', 'branch-session', 'branch-job', 1, 'pending', 'initial', 1, 1),
                     ('branch-task-turn', 'branch-task-session', 'branch-task', 1, 'running', 'initial', 1, 1);",
@@ -2644,7 +2637,7 @@ mod tests {
                 .find(|a| a.job_id == "branch-job")
                 .unwrap()
                 .uri,
-            "cairn://p/cairn/roadmap/branches/3"
+            "cairn://p/cairn/roadmap/task/branch-3"
         );
         assert_eq!(
             census
@@ -2652,7 +2645,7 @@ mod tests {
                 .find(|a| a.job_id == "branch-task")
                 .unwrap()
                 .uri,
-            "cairn://p/cairn/roadmap/branches/3/task/inspect"
+            "cairn://p/cairn/roadmap/task/branch-3/task/inspect"
         );
     }
 
