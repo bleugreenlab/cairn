@@ -145,10 +145,24 @@ struct SearchFields {
     created_at: Field,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct IndexInterleave {
+    snapshot_loaded: tokio::sync::Notify,
+    resume_snapshot: tokio::sync::Notify,
+    incremental_waiting: tokio::sync::Notify,
+    incremental_acquired: AtomicBool,
+}
+
 pub struct SearchIndex {
     index: Index,
     reader: IndexReader,
     writer: Mutex<IndexWriter<TantivyDocument>>,
+    // Serialize source reads through commit and acknowledgement: a stale
+    // snapshot must never overwrite a newer, already-acknowledged outbox drain.
+    operation_gate: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    interleave: Mutex<Option<std::sync::Arc<IndexInterleave>>>,
     fields: SearchFields,
     needs_rebuild: AtomicBool,
 }
@@ -213,6 +227,9 @@ impl SearchIndex {
             index,
             reader,
             writer: Mutex::new(writer),
+            operation_gate: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            interleave: Mutex::new(None),
             fields,
             needs_rebuild: AtomicBool::new(needs_rebuild),
         })
@@ -223,6 +240,7 @@ impl SearchIndex {
     }
 
     pub async fn rebuild(&self, db: &LocalDb) -> DbResult<usize> {
+        let _operation = self.operation_gate.lock().await;
         let mut snapshot = load_rebuild_snapshot(db).await?;
         // Events are indexed separately so archived rows reconstruct from git
         // coordinates before their text is indexed (a SQL json_extract over a
@@ -256,6 +274,7 @@ impl SearchIndex {
     /// are URI-keyed and URIs are project-encoded, so one index serves all
     /// databases without collision.
     pub async fn rebuild_many(&self, dbs: &[std::sync::Arc<LocalDb>]) -> DbResult<usize> {
+        let _operation = self.operation_gate.lock().await;
         let mut all_documents = Vec::new();
         // (database index, that database's drained outbox ids) — marked applied
         // only after the rebuild commits.
@@ -287,7 +306,111 @@ impl SearchIndex {
         Ok(indexed_count)
     }
 
+    /// Replace only these projects from an authoritative replica snapshot.
+    /// Other databases' documents survive. Used after physical sync, where
+    /// receiver-side outbox triggers do not run.
+    pub async fn replace_projects(&self, db: &LocalDb, project_ids: &[String]) -> DbResult<usize> {
+        let _operation = self.operation_gate.lock().await;
+        if project_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut snapshot = load_rebuild_snapshot(db).await?;
+        snapshot.documents.extend(load_event_documents(db).await?);
+        snapshot
+            .documents
+            .retain(|document| project_ids.contains(&document.project_id));
+        let count = snapshot.documents.len();
+        #[cfg(test)]
+        {
+            let hook = self.interleave.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook.snapshot_loaded.notify_one();
+                hook.resume_snapshot.notified().await;
+            }
+        }
+        {
+            let mut writer = self.writer.lock().map_err(|error| {
+                DbError::Search(format!("search writer lock poisoned: {error}"))
+            })?;
+            for project in project_ids {
+                writer.delete_term(Term::from_field_text(self.fields.project_id, project));
+            }
+            for document in snapshot.documents {
+                writer.add_document(self.tantivy_document(document))?;
+            }
+            writer.commit()?;
+        }
+        self.reader.reload()?;
+        mark_applied(db, &snapshot.pending_outbox_ids).await?;
+        Ok(count)
+    }
+
     pub async fn apply_pending(&self, db: &LocalDb) -> DbResult<usize> {
+        self.apply_pending_scoped(db, None).await
+    }
+
+    /// Ingest only rows this database is authoritative for. Retained copies in
+    /// another scope must not replace an owning replica's documents.
+    pub async fn apply_pending_in_projects(
+        &self,
+        db: &LocalDb,
+        project_ids: &[String],
+    ) -> DbResult<usize> {
+        self.apply_pending_scoped(db, Some(project_ids)).await
+    }
+
+    fn indexed_source_project(&self, entry: &SearchOutboxEntry) -> DbResult<Option<String>> {
+        let query = self.exact_filter_query(
+            self.fields.source_key,
+            &source_key(&entry.content_type, &entry.source_id),
+        );
+        let searcher = self.reader.searcher();
+        let docs = searcher.search(query.as_ref(), &TopDocs::with_limit(1).order_by_score())?;
+        docs.first()
+            .map(|(_, address)| {
+                let document = searcher.doc::<TantivyDocument>(*address)?;
+                doc_text(&document, self.fields.project_id)
+            })
+            .transpose()
+    }
+
+    async fn apply_pending_scoped(
+        &self,
+        db: &LocalDb,
+        project_ids: Option<&[String]>,
+    ) -> DbResult<usize> {
+        #[cfg(test)]
+        let hook = self.interleave.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook.incremental_waiting.notify_one();
+        }
+        let _operation = self.operation_gate.lock().await;
+        #[cfg(test)]
+        if let Some(hook) = &hook {
+            hook.incremental_acquired.store(true, Ordering::SeqCst);
+        }
+        self.apply_pending_locked(db, project_ids).await
+    }
+
+    /// Query-time ingestion must not queue behind a replica snapshot rebuild.
+    /// The regular background drain will apply any outbox left for later.
+    pub async fn try_apply_pending_in_projects(
+        &self,
+        db: &LocalDb,
+        project_ids: &[String],
+    ) -> DbResult<usize> {
+        let Ok(_operation) = self.operation_gate.try_lock() else {
+            return Ok(0);
+        };
+        self.apply_pending_locked(db, Some(project_ids)).await
+    }
+
+    async fn apply_pending_locked(
+        &self,
+        db: &LocalDb,
+        project_ids: Option<&[String]>,
+    ) -> DbResult<usize> {
         let entries = self.pending_entries(db).await?;
         if entries.is_empty() {
             return Ok(0);
@@ -322,6 +445,21 @@ impl SearchIndex {
             } else {
                 None
             };
+            if let Some(projects) = project_ids {
+                let project = match document.as_ref() {
+                    Some(document) => Some(document.project_id.clone()),
+                    // A deleted row can no longer name its project. Consult
+                    // its stored index identity before authorizing the delete.
+                    None => self.indexed_source_project(&entry)?,
+                };
+                if project
+                    .as_ref()
+                    .is_none_or(|project| !projects.contains(project))
+                {
+                    skipped_ids.push(entry.id);
+                    continue;
+                }
+            }
             prepared.push((entry, document));
         }
 
@@ -356,6 +494,30 @@ impl SearchIndex {
         query: &str,
         filters: Option<SearchFilters>,
     ) -> DbResult<Vec<SearchIndexHit>> {
+        self.search_scoped(query, filters, None)
+    }
+
+    /// Restrict retrieval before TopDocs, not after truncation. An empty
+    /// authority must never mean an unrestricted index read. Include the empty
+    /// project id explicitly only for the private DB's workspace posts.
+    pub fn search_in_projects(
+        &self,
+        query: &str,
+        filters: Option<SearchFilters>,
+        project_ids: &[String],
+    ) -> DbResult<Vec<SearchIndexHit>> {
+        if project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.search_scoped(query, filters, Some(project_ids))
+    }
+
+    fn search_scoped(
+        &self,
+        query: &str,
+        filters: Option<SearchFilters>,
+        project_ids: Option<&[String]>,
+    ) -> DbResult<Vec<SearchIndexHit>> {
         let query = query.trim();
         if query.is_empty() {
             return Ok(Vec::new());
@@ -383,7 +545,7 @@ impl SearchIndex {
             return Ok(Vec::new());
         };
         let snippet_query = text_query.box_clone();
-        let search_query = self.filtered_query(text_query, &filters);
+        let search_query = self.filtered_query(text_query, &filters, project_ids);
         let searcher = self.reader.searcher();
         let mut snippet_generator =
             SnippetGenerator::create(&searcher, snippet_query.as_ref(), self.fields.body)?;
@@ -529,8 +691,21 @@ impl SearchIndex {
         &self,
         text_query: Box<dyn Query>,
         filters: &SearchFilters,
+        project_ids: Option<&[String]>,
     ) -> Box<dyn Query> {
         let mut clauses = vec![(Occur::Must, text_query)];
+        if let Some(project_ids) = project_ids {
+            let allowed = project_ids
+                .iter()
+                .map(|id| {
+                    (
+                        Occur::Should,
+                        self.exact_filter_query(self.fields.project_id, id),
+                    )
+                })
+                .collect();
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(allowed))));
+        }
 
         if let Some(ref project_id) = filters.project_id {
             clauses.push((
@@ -1016,7 +1191,21 @@ async fn load_rebuild_snapshot(db: &LocalDb) -> DbResult<SearchRebuildSnapshot> 
     db.read(|conn| {
         Box::pin(async move {
             let mut documents = Vec::new();
-            for sql in rebuild_source_queries() {
+            // Posts are private-lineage sources, not team replica tables.
+            // Missing shared tables still fail; only these deliberate absences
+            // are skipped.
+            let mut private_sources = std::collections::HashSet::new();
+            let mut schema = conn.query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('posts', 'post_comments')", ()
+            ).await?;
+            while let Some(row) = schema.next().await? {
+                private_sources.insert(row.text(0)?);
+            }
+            for (source, sql) in ["issues", "comments", "artifacts", "messages", "posts", "post_comments"]
+                .into_iter().zip(rebuild_source_queries()) {
+                if matches!(source, "posts" | "post_comments") && !private_sources.contains(source) {
+                    continue;
+                }
                 let mut rows = conn.query(sql, ()).await?;
                 while let Some(row) = rows.next().await? {
                     if let Some(document) = row_to_search_document(&row)? {
@@ -1259,6 +1448,64 @@ mod tests {
             })
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_incremental_ingestion_are_serialized() {
+        let db = std::sync::Arc::new(migrated_db().await.unwrap());
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+             VALUES ('issue-1', 'project-1', 1, 'Antecedent', '', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let directory = tempdir().unwrap();
+        let index = std::sync::Arc::new(SearchIndex::open_or_create(directory.path()).unwrap());
+        index.rebuild(&db).await.unwrap();
+        let hook = std::sync::Arc::new(IndexInterleave::default());
+        *index.interleave.lock().unwrap() = Some(hook.clone());
+        let snapshot = {
+            let (index, db) = (index.clone(), db.clone());
+            tokio::spawn(async move {
+                index
+                    .replace_projects(&db, &["project-1".into()])
+                    .await
+                    .unwrap();
+            })
+        };
+        // Hold snapshot A after its source read, before its index replacement.
+        hook.snapshot_loaded.notified().await;
+        db.execute_script("UPDATE issues SET title='Subsequent', updated_at=2 WHERE id='issue-1';")
+            .await
+            .unwrap();
+        let incremental = {
+            let (index, db) = (index.clone(), db.clone());
+            tokio::spawn(async move {
+                index.apply_pending(&db).await.unwrap();
+            })
+        };
+        hook.incremental_waiting.notified().await;
+        // Query ingestion skips the busy gate and the reader remains usable.
+        assert_eq!(
+            index
+                .try_apply_pending_in_projects(&db, &["project-1".into()])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(index.search("Antecedent", None).unwrap()[0].id, "issue-1");
+        // No sleeps: the competing task signalled immediately before acquiring
+        // the gate, and cannot reach its source read until A finishes.
+        assert!(!hook.incremental_acquired.load(Ordering::SeqCst));
+        hook.resume_snapshot.notify_one();
+        snapshot.await.unwrap();
+        incremental.await.unwrap();
+        assert!(index.search("Antecedent", None).unwrap().is_empty());
+        assert_eq!(index.search("Subsequent", None).unwrap()[0].id, "issue-1");
+        assert!(index.pending_entries(&db).await.unwrap().is_empty());
     }
 
     #[tokio::test]

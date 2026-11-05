@@ -261,6 +261,18 @@ WITH thread_runs AS (
   JOIN threads t ON t.id=m.channel_id
   ORDER BY pick.at DESC,pick.id DESC LIMIT ?5
  )
+ UNION ALL
+ SELECT * FROM (
+  SELECT pick.at,pick.id,'message',m.sender_name,NULL,m.content,'cairn://p/'||?2||'/messages',NULL,NULL
+  FROM (
+   SELECT m.created_at at,m.id id FROM messages m INDEXED BY idx_messages_channel
+   WHERE m.channel_type='project' AND m.channel_id=?1 AND trim(m.content)!=''
+   AND (?3 IS NULL OR m.created_at<?3 OR (m.created_at=?3 AND m.id<?4))
+   ORDER BY m.created_at DESC,m.id DESC LIMIT ?5
+  ) pick
+  JOIN messages m ON m.id=pick.id
+  ORDER BY pick.at DESC,pick.id DESC LIMIT ?5
+ )
 )
 SELECT at,id,kind,author,target,body,source,data_blob,codec FROM home_entries
 ORDER BY at DESC,id DESC LIMIT ?5"#
@@ -285,6 +297,73 @@ fn render(p: &HomePayload) -> String {
 mod tests {
     use super::*;
     use crate::storage::migrated_test_db;
+
+    #[tokio::test]
+    async fn project_messages_are_scoped_and_paginate_with_thread_entries() {
+        let db = migrated_test_db("home-project-messages.db").await;
+        seed_project_with_thread(&db).await;
+        db.execute_script(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES ('q','default','Other','other','/tmp/other',1,1);
+             INSERT INTO messages(id,channel_type,channel_id,sender_name,content,created_at)
+             VALUES ('pm30','project','p','operator','project newest',30),
+                    ('pm25','project','p','teammate','project equal timestamp',25),
+                    ('pm20','project','p','operator','project older',20),
+                    ('tm25','thread','t','general','thread equal timestamp',25),
+                    ('foreign','project','q','operator','other project',100),
+                    ('wrong-kind','issue','p','operator','not a project channel',90),
+                    ('blank','project','p','operator','   ',80);",
+        )
+        .await
+        .unwrap();
+        let page = |before: Option<(i64, String)>| {
+            let db = &db;
+            async move {
+                db.read(move |conn| {
+                    let before = before.clone();
+                    Box::pin(async move { query_project_home(conn, "p", "proj", 2, before).await })
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let first = page(None).await;
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pm30", "tm25"]
+        );
+        let message = &first.entries[0];
+        assert_eq!(message.kind, "message");
+        assert_eq!(message.author, "operator");
+        assert_eq!(message.body, "project newest");
+        assert_eq!(message.source, "cairn://p/proj/messages");
+        assert_eq!(message.target, None);
+        let (at, id) = first.next_cursor.as_ref().unwrap().split_once(':').unwrap();
+        let second = page(Some((at.parse().unwrap(), id.to_string()))).await;
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pm25", "pm20"]
+        );
+        let (at, id) = second
+            .next_cursor
+            .as_ref()
+            .unwrap()
+            .split_once(':')
+            .unwrap();
+        assert!(page(Some((at.parse().unwrap(), id.to_string())))
+            .await
+            .entries
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn includes_live_and_archived_transcript_prose_once() {
         let db = migrated_test_db("home-archived-transcript.db").await;

@@ -32,6 +32,8 @@ export interface ActionDefinition {
   description?: string;
   keywords?: readonly string[];
   editable?: true;
+  /** Reserve this app action before editor handlers, including in editable fields. */
+  reserveBeforeTarget?: true;
   /** @deprecated Sequences now encode prefixes explicitly. */
   isGPrefixAction?: false;
 }

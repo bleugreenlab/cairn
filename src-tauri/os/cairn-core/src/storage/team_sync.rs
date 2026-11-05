@@ -27,8 +27,9 @@
 //!
 //! Pulled frames replay as physical WAL pages, so receiver-side triggers do NOT
 //! re-fire and derived state (the FTS/search outbox) is not rebuilt by a pull.
-//! Rebuilding search over pulled rows is a deferred slice; this loop stays purely
-//! push/pull plus the generic `db-change` emit.
+//! The injected reconciler marks search snapshots dirty without rebuilding.
+//! Reads request rate-limited background refreshes; warm reads use the last
+//! committed index while the refresh runs.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;

@@ -139,6 +139,10 @@ pub(crate) fn pending_dispatch_description(parent_segment: Option<&str>) -> Stri
     }
 }
 
+fn address_root_predicate(alias: &str) -> String {
+    format!("({alias}.parent_job_id IS NULL OR {alias}.agent_config_id = 'workflow')")
+}
+
 /// Resolve the job a node coordinate addresses — the inverse of
 /// [`home_uri_for_job_conn`], and owner-aware in exactly the same way.
 ///
@@ -176,10 +180,13 @@ pub(crate) async fn job_id_for_node_coordinate_conn(
     }
 
     let key = cairn_common::uri::canonical_project(project_key);
+    let node_root = address_root_predicate("j");
+    let task_root = address_root_predicate("parent");
     let mut rows = match task_name {
         None => {
             conn.query(
-                "SELECT j.id
+                &format!(
+                    "SELECT j.id
                  FROM jobs j
                  JOIN issues i ON j.issue_id = i.id
                  JOIN projects p ON i.project_id = p.id
@@ -188,25 +195,28 @@ pub(crate) async fn job_id_for_node_coordinate_conn(
                    -- Top-level nodes have no parent; a workflow is a child job
                    -- (for the delegation tree) yet is addressable as a node by
                    -- its segment, so its own sub-resources resolve.
-                   AND (j.parent_job_id IS NULL OR j.agent_config_id = 'workflow')
+                   AND {node_root}
                    AND j.uri_segment = ?4
-                 LIMIT 1",
+                 LIMIT 1"
+                ),
                 params![key.as_str(), number, exec_seq, node_id],
             )
             .await?
         }
         Some(task) => {
             conn.query(
-                "SELECT child.id
+                &format!(
+                    "SELECT child.id
                  FROM jobs parent
                  JOIN jobs child ON child.parent_job_id = parent.id
                  JOIN issues i ON parent.issue_id = i.id
                  JOIN projects p ON i.project_id = p.id
                  JOIN executions e ON parent.execution_id = e.id
                  WHERE p.key = ?1 AND i.number = ?2 AND e.seq = ?3
-                   AND parent.parent_job_id IS NULL AND parent.uri_segment = ?4
+                   AND {task_root} AND parent.uri_segment = ?4
                    AND child.uri_segment = ?5
-                 LIMIT 1",
+                 LIMIT 1"
+                ),
                 params![key.as_str(), number, exec_seq, node_id, task],
             )
             .await?
@@ -679,6 +689,205 @@ pub(crate) fn derive_node_activity(
     }
 }
 
+// Shared SQL facts for batched activity reads. Keep the fallback tied to job
+// identity, not the newest execution or maximum sequence across sessions.
+pub(crate) const JOB_HEAD_JOIN_SQL: &str = "LEFT JOIN turns ht ON ht.id = COALESCE(
+    j.current_turn_id,
+    (SELECT t.id FROM turns t WHERE t.job_id = j.id
+     ORDER BY t.created_at DESC, t.sequence DESC LIMIT 1)
+)";
+pub(crate) const JOB_PENDING_PROMPT_SQL: &str = "EXISTS (
+    SELECT 1 FROM prompts p WHERE p.turn_id = j.current_turn_id
+    AND p.response IS NULL AND p.withdrawn_at IS NULL
+)";
+pub(crate) const JOB_PENDING_PERMISSION_SQL: &str = "EXISTS (
+    SELECT 1 FROM permission_requests pr
+    LEFT JOIN runs r ON pr.run_id = r.id
+    WHERE COALESCE(pr.job_id, r.job_id) = j.id AND pr.status = 'pending'
+)";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveAgentEntry {
+    pub job_id: String,
+    pub project_id: String,
+    pub project_key: String,
+    pub team_id: Option<String>,
+    pub uri: String,
+    pub owner_title: String,
+    pub issue_id: Option<String>,
+    pub issue_number: Option<i32>,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+    pub execution_id: Option<String>,
+    pub exec_seq: Option<i32>,
+    pub node: String,
+    pub task: Option<String>,
+    pub session_id: Option<String>,
+    pub activity: NodeActivity,
+}
+
+/// One compact snapshot per runner, one batched statement per open database.
+/// All executions participate. No owner-list or per-job transcript reads.
+pub async fn live_agent_census(
+    dbs: &crate::db::DbState,
+) -> Result<Vec<LiveAgentEntry>, CairnError> {
+    let mut out = Vec::new();
+    for (team_id, db) in dbs.navigation_dbs().await {
+        match live_agent_census_db(&db, team_id.clone()).await {
+            Ok(rows) => {
+                dbs.record_navigation_failure("census", team_id.as_deref(), None)
+                    .await;
+                out.extend(rows);
+            }
+            Err(error) => {
+                dbs.record_navigation_failure(
+                    "census",
+                    team_id.as_deref(),
+                    Some(error.to_string()),
+                )
+                .await;
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.team_id
+            .cmp(&b.team_id)
+            .then(a.project_id.cmp(&b.project_id))
+            .then(a.uri.cmp(&b.uri))
+            .then(a.job_id.cmp(&b.job_id))
+    });
+    Ok(out)
+}
+
+// Scan durable activity sources once, not once per historical job. Only live
+// candidates pay for head resolution and ancestor traversal; ancestors may be
+// terminal because their still-live children retain their canonical coordinates.
+pub(crate) fn live_agent_census_sql() -> String {
+    let ancestor_root = address_root_predicate("ancestor");
+    let root = address_root_predicate("root");
+    format!(
+        "WITH RECURSIVE
+        open_prompts AS MATERIALIZED (
+            SELECT DISTINCT turn_id FROM prompts
+             WHERE response IS NULL AND withdrawn_at IS NULL
+        ),
+        pending_permissions AS MATERIALIZED (
+            SELECT DISTINCT COALESCE(pr.job_id, r.job_id) AS job_id
+              FROM permission_requests pr LEFT JOIN runs r ON r.id = pr.run_id
+             WHERE pr.status = 'pending'
+        ),
+        candidate_ids AS (
+            SELECT job_id FROM turns WHERE state IN ('pending', 'running')
+            UNION
+            SELECT ht.job_id FROM open_prompts op JOIN turns ht ON ht.id = op.turn_id
+            UNION
+            SELECT job_id FROM pending_permissions
+        ),
+        activity AS MATERIALIZED (
+            SELECT j.id, ht.state AS head_state,
+                   CASE WHEN j.current_turn_id IN (SELECT turn_id FROM open_prompts) THEN 1 ELSE 0 END AS prompt,
+                   CASE WHEN j.id IN (SELECT job_id FROM pending_permissions) THEN 1 ELSE 0 END AS permission,
+                   ht.session_id AS head_session
+              FROM candidate_ids c JOIN jobs j ON j.id = c.job_id
+              {JOB_HEAD_JOIN_SQL}
+             WHERE j.status NOT IN ('complete', 'cancelled', 'failed')
+               AND COALESCE(j.agent_config_id, '') NOT IN ('service', 'action')
+        ),
+        homes(id, ancestor_id, path, head_state, prompt, permission, head_session) AS (
+            SELECT id, id, '', head_state, prompt, permission, head_session FROM activity
+             WHERE head_state IN ('pending', 'running') OR prompt OR permission
+            UNION ALL
+            SELECT homes.id, ancestor.parent_job_id,
+                   '/task/' || ancestor.uri_segment || homes.path,
+                   homes.head_state, homes.prompt, homes.permission, homes.head_session
+              FROM homes JOIN jobs ancestor ON ancestor.id = homes.ancestor_id
+             WHERE NOT COALESCE({ancestor_root}, 0) AND ancestor.uri_segment IS NOT NULL
+        )
+        SELECT j.id, p.id, p.key, i.id, i.number, t.id, t.name,
+               COALESCE(t.name, i.title, j.node_name, j.uri_segment),
+               root.execution_id, e.seq, root.uri_segment, homes.path,
+               COALESCE(j.current_session_id, homes.head_session),
+               homes.head_state, homes.prompt, homes.permission, tb.number
+          FROM homes JOIN jobs j ON j.id = homes.id
+          JOIN jobs root ON root.id = homes.ancestor_id
+          LEFT JOIN issues i ON i.id = COALESCE(j.issue_id, root.issue_id)
+          LEFT JOIN threads t ON t.id = COALESCE(j.thread_id, root.thread_id)
+          JOIN projects p ON p.id = COALESCE(i.project_id, t.project_id, j.project_id, root.project_id)
+          LEFT JOIN executions e ON e.id = root.execution_id
+          LEFT JOIN thread_branches tb ON tb.job_id = root.id
+         WHERE {root} AND p.id IN (SELECT value FROM json_each(?1))
+         ORDER BY p.id, j.id"
+    )
+}
+
+async fn live_agent_census_db(
+    db: &LocalDb,
+    team_id: Option<String>,
+) -> Result<Vec<LiveAgentEntry>, CairnError> {
+    let projects = crate::navigation::project_authority(db, team_id.as_deref()).await?;
+    let projects =
+        serde_json::to_string(&projects).map_err(|e| CairnError::Internal(e.to_string()))?;
+    let sql = live_agent_census_sql();
+    db.query_all(sql, params![projects.as_str()], move |row| {
+        use cairn_common::uri::{
+            build_job_base_uri, build_thread_branch_uri, build_thread_task_uri, build_thread_uri,
+        };
+        let project_key = row.text(2)?;
+        let issue_number = row.opt_i64(4)?.map(|n| n as i32);
+        let thread_name = row.opt_text(6)?;
+        let node_segment = row.opt_text(10)?;
+        let path = row.text(11)?;
+        let exec_seq = row.opt_i64(9)?.map(|n| n as i32);
+        let base = if let Some(name) = thread_name.as_deref() {
+            if let Some(number) = row.opt_i64(16)? {
+                Some(build_thread_branch_uri(&project_key, name, number as i32))
+            } else if node_segment.as_deref() == Some("thread") {
+                Some(build_thread_uri(&project_key, name))
+            } else {
+                node_segment
+                    .as_deref()
+                    .map(|seg| build_thread_task_uri(&project_key, name, seg))
+            }
+        } else {
+            match (issue_number, exec_seq, node_segment.as_deref()) {
+                (Some(number), Some(seq), Some(seg)) => {
+                    Some(build_job_base_uri(&project_key, number, seq, seg, None))
+                }
+                _ => None,
+            }
+        };
+        let Some(base) = base else {
+            return Ok(None);
+        };
+        Ok(Some(LiveAgentEntry {
+            job_id: row.text(0)?,
+            project_id: row.text(1)?,
+            project_key,
+            team_id: team_id.clone(),
+            uri: format!("{base}{path}"),
+            owner_title: row.text(7)?,
+            issue_id: row.opt_text(3)?,
+            issue_number,
+            thread_id: row.opt_text(5)?,
+            node: thread_name.clone().or(node_segment).unwrap_or_default(),
+            thread_name,
+            execution_id: row.opt_text(8)?,
+            exec_seq,
+            task: path.strip_prefix("/task/").map(str::to_string),
+            session_id: row.opt_text(12)?,
+            activity: derive_node_activity(
+                row.opt_text(13)?.as_deref(),
+                row.i64(14)? != 0,
+                row.i64(15)? != 0,
+            ),
+        }))
+    })
+    .await
+    .map(|rows| rows.into_iter().flatten().collect())
+    .map_err(Into::into)
+}
+
 /// Which jobs a batch of live-activity indicators covers.
 ///
 /// Activity is a property of a job's head turn, not of whatever owns the job, so
@@ -729,24 +938,10 @@ pub async fn node_status_indicators(
                         ht.predecessor_id, ht.state, ht.yield_reason, ht.end_reason,
                         ht.start_reason, ht.created_at, ht.started_at, ht.ended_at, ht.updated_at,
                         j.id,
-                        EXISTS (
-                            SELECT 1 FROM prompts p
-                             WHERE p.turn_id = j.current_turn_id
-                               AND p.response IS NULL
-                               AND p.withdrawn_at IS NULL
-                        ) AS has_pending_prompt,
-                        EXISTS (
-                            SELECT 1 FROM permission_requests pr
-                             LEFT JOIN runs r ON pr.run_id = r.id
-                             WHERE COALESCE(pr.job_id, r.job_id) = j.id
-                               AND pr.status = 'pending'
-                        ) AS has_pending_permission
+                        {JOB_PENDING_PROMPT_SQL} AS has_pending_prompt,
+                        {JOB_PENDING_PERMISSION_SQL} AS has_pending_permission
                      FROM jobs j
-                     LEFT JOIN turns ht ON ht.id = COALESCE(
-                         j.current_turn_id,
-                         (SELECT t.id FROM turns t WHERE t.job_id = j.id
-                          ORDER BY t.created_at DESC, t.sequence DESC LIMIT 1)
-                     )
+                     {JOB_HEAD_JOIN_SQL}
                      WHERE {predicate}"
                     ),
                     params![owner_id.as_str()],
@@ -2048,6 +2243,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_agent_census_plan_starts_from_candidates_not_all_jobs() {
+        let db = test_db().await;
+        let plan = db
+            .query_all(
+                format!("EXPLAIN QUERY PLAN {}", super::live_agent_census_sql()),
+                params!["[]"],
+                |row| row.text(3),
+            )
+            .await
+            .unwrap();
+        println!("live census plan: {plan:#?}");
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN jobs")),
+            "census must not resolve heads or expand homes for all historical jobs: {plan:?}"
+        );
+        assert_eq!(
+            plan.iter()
+                .filter(|step| step.as_str() == "SCAN turns")
+                .count(),
+            1,
+            "scan potential live turns once, not once per ancestor or projection: {plan:?}"
+        );
+        assert_eq!(
+            plan.iter()
+                .filter(|step| step.contains("idx_permission_requests_status"))
+                .count(),
+            1,
+            "materialize pending permissions once, not once per job: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH ancestor USING INDEX sqlite_autoindex_jobs")),
+            "candidate ancestors must use primary-key lookups: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn batched_indicators_classify_every_job_in_the_execution() {
         let db = test_db().await;
         exec(
@@ -2203,6 +2435,105 @@ mod tests {
         assert_eq!(by_job["j-none"], NodeActivity::Idle);
         assert_eq!(by_job["task-1"], NodeActivity::Running);
         assert_eq!(by_job["j-reseed"], NodeActivity::Running);
+
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        assert_eq!(census.len(), 5);
+        for agent in &census {
+            assert_eq!(agent.activity, by_job[&agent.job_id]);
+        }
+        let task = census.iter().find(|a| a.job_id == "task-1").unwrap();
+        assert_eq!(task.uri, "cairn://p/t/1/1/run/task/task");
+        assert_eq!(task.session_id.as_deref(), Some("s-task"));
+        assert_eq!(task.node, "run");
+        assert_eq!(task.task.as_deref(), Some("task"));
+
+        db.execute_script(
+            "UPDATE executions SET lifecycle = 'parallel' WHERE id = 'e';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('new-exec', 'r', 'i', 'p', 'complete', 10, 2);
+             INSERT INTO jobs(id, execution_id, parent_job_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('nested', 'e', 'task-1', 'i', 'p', 'Nested', 'running', 1, 1, 'deep');
+             INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('nested-turn', 'nested-session', 'nested', 1, 'pending', 'initial', 1, 1);
+             UPDATE jobs SET status = 'blocked' WHERE id = 'j-idle';"
+        ).await.unwrap();
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        assert_eq!(
+            census.len(),
+            6,
+            "newest execution must not hide older live jobs"
+        );
+        assert_eq!(
+            census.iter().find(|a| a.job_id == "nested").unwrap().uri,
+            "cairn://p/t/1/1/run/task/task/task/deep"
+        );
+        assert!(
+            !census.iter().any(|a| a.job_id == "j-idle"),
+            "artifact gate alone is idle"
+        );
+
+        db.execute_script(
+            "UPDATE prompts SET withdrawn_at = 2 WHERE id = 'pr-1';
+             UPDATE permission_requests SET status = 'allowed' WHERE id = 'perm-1';",
+        )
+        .await
+        .unwrap();
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        assert!(!census
+            .iter()
+            .any(|a| a.job_id == "j-prompt" || a.job_id == "j-perm"));
+
+        // Terminal job state overrides stale activity only in the census.
+        db.execute_script(
+            "UPDATE prompts SET withdrawn_at = NULL WHERE id = 'pr-1';
+             UPDATE permission_requests SET status = 'pending' WHERE id = 'perm-1';
+             UPDATE jobs SET status = 'complete' WHERE id = 'j-perm';
+             UPDATE jobs SET status = 'cancelled' WHERE id IN ('j-prompt', 'task-1');
+             UPDATE jobs SET status = 'failed' WHERE id = 'j-reseed';",
+        )
+        .await
+        .unwrap();
+        let indicators = node_status_indicators(&db, NodeStatusScope::Execution("e"))
+            .await
+            .unwrap();
+        let by_job: HashMap<_, _> = indicators
+            .into_iter()
+            .map(|indicator| (indicator.job_id, indicator.activity))
+            .collect();
+        assert_eq!(by_job["j-perm"], NodeActivity::AwaitingInput);
+        assert_eq!(by_job["j-prompt"], NodeActivity::AwaitingInput);
+        assert_eq!(by_job["task-1"], NodeActivity::Running);
+        assert_eq!(by_job["j-reseed"], NodeActivity::Running);
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        assert_eq!(
+            census.iter().map(|a| a.job_id.as_str()).collect::<Vec<_>>(),
+            vec!["j-run", "nested"],
+            "terminal jobs must not survive stale waits or running heads; a live child still has its terminal parent's coordinate"
+        );
+        db.execute_script(
+            "INSERT INTO jobs(id, execution_id, parent_job_id, issue_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment)
+             VALUES ('wf', 'e', 'nested', 'i', 'p', 'Workflow', 'workflow', 'running', 1, 1, 'workflow-helper'),
+                    ('wf-leaf', 'e', 'wf', 'i', 'p', 'Leaf', NULL, 'running', 1, 1, 'leaf');
+             INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('wf-turn', 'wf-session', 'wf', 1, 'running', 'initial', 1, 1),
+                    ('wf-leaf-turn', 'wf-leaf-session', 'wf-leaf', 1, 'running', 'initial', 1, 1),
+                    ('stale-idle-turn', 'stale-idle-session', 'j-idle', 1, 'running', 'initial', 0, 0);
+             UPDATE jobs SET current_session_id = 'current-wf-session' WHERE id = 'wf';",
+        )
+        .await
+        .unwrap();
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        let workflow = census.iter().find(|a| a.job_id == "wf").unwrap();
+        assert_eq!(workflow.uri, "cairn://p/t/1/1/workflow-helper");
+        assert_eq!(workflow.session_id.as_deref(), Some("current-wf-session"));
+        assert_eq!(
+            census.iter().find(|a| a.job_id == "wf-leaf").unwrap().uri,
+            "cairn://p/t/1/1/workflow-helper/task/leaf"
+        );
+        assert!(
+            !census.iter().any(|a| a.job_id == "j-idle"),
+            "a historical running turn is only a candidate, not the head"
+        );
     }
 
     /// A thread's live activity is its own to report: its session job carries no
@@ -2284,6 +2615,51 @@ mod tests {
             "a running head turn is live activity even though the job status is idle"
         );
         assert_eq!(by_job["j-task"], NodeActivity::Idle);
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        assert_eq!(census.len(), 1);
+        assert_eq!(census[0].uri, "cairn://p/cairn/roadmap");
+        assert_eq!(census[0].thread_name.as_deref(), Some("roadmap"));
+        assert_eq!(census[0].execution_id, None);
+        db.execute_script(
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('task-live', 'task-session', 'j-task', 1, 'running', 'initial', 1, 1);
+             UPDATE jobs SET status = 'running' WHERE id = 'j-task';"
+        ).await.unwrap();
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        assert_eq!(census.len(), 2);
+        assert_eq!(
+            census.iter().find(|a| a.job_id == "j-task").unwrap().uri,
+            "cairn://p/cairn/roadmap/task/survey"
+        );
+        db.execute_script(
+            "INSERT INTO jobs(id, thread_id, project_id, parent_job_id, status, created_at, updated_at, uri_segment)
+             VALUES ('branch-job', 'th', 'p', NULL, 'running', 1, 1, 'builder'),
+                    ('branch-task', 'th', 'p', 'branch-job', 'running', 1, 1, 'inspect');
+             INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
+             VALUES ('branch', 'th', 3, 'accumulating', 'branch-ref', 'branch-job', 1, 1);
+             INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('branch-turn', 'branch-session', 'branch-job', 1, 'pending', 'initial', 1, 1),
+                    ('branch-task-turn', 'branch-task-session', 'branch-task', 1, 'running', 'initial', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let census = super::live_agent_census_db(&db, None).await.unwrap();
+        assert_eq!(
+            census
+                .iter()
+                .find(|a| a.job_id == "branch-job")
+                .unwrap()
+                .uri,
+            "cairn://p/cairn/roadmap/branches/3"
+        );
+        assert_eq!(
+            census
+                .iter()
+                .find(|a| a.job_id == "branch-task")
+                .unwrap()
+                .uri,
+            "cairn://p/cairn/roadmap/branches/3/task/inspect"
+        );
     }
 
     /// Every thread in the project gets exactly one row, and a thread reads as

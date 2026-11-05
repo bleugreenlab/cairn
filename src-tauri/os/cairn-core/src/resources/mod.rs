@@ -78,7 +78,7 @@ pub(crate) use thread_seed::{
 #[cfg(test)]
 pub(crate) use threads::read_thread_queue;
 pub(crate) use threads::{delegate_thread_descendant, retired_surface};
-pub(crate) use transcript::era_source_digest;
+pub(crate) use transcript::{era_source_digest, navigation_passage_event_id};
 
 /// One job's transcript exactly as `.../chat/raw?format=json` serves it: every
 /// event reconstructed and passed through the quarantine gate. For offline

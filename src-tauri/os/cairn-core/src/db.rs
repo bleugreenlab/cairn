@@ -76,6 +76,262 @@ impl Drop for TeamSyncHandle {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationAvailability {
+    pub refreshing: bool,
+    pub failures: Vec<NavigationFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationFailure {
+    pub lane: String,
+    pub team_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Default)]
+struct NavigationHealth {
+    failures: std::collections::BTreeMap<(String, Option<String>), String>,
+    snapshot_failures: std::collections::BTreeMap<String, String>,
+    refreshing: std::collections::BTreeSet<String>,
+    emitter: Option<Arc<dyn EventEmitter>>,
+}
+
+impl NavigationHealth {
+    fn snapshot(&self) -> NavigationAvailability {
+        let mut failures = self.failures.clone();
+        for (team, message) in &self.snapshot_failures {
+            failures.insert(("content".into(), Some(team.clone())), message.clone());
+        }
+        NavigationAvailability {
+            refreshing: !self.refreshing.is_empty(),
+            failures: failures
+                .into_iter()
+                .map(|((lane, team_id), message)| NavigationFailure {
+                    lane,
+                    team_id,
+                    message,
+                })
+                .collect(),
+        }
+    }
+
+    fn emit_if_changed(&self, before: NavigationAvailability) {
+        if self.snapshot() != before {
+            if let Some(emitter) = &self.emitter {
+                let _ = emitter.emit(
+                    "db-change",
+                    serde_json::json!({
+                        "table": "navigation_availability", "action": "update"
+                    }),
+                );
+            }
+        }
+    }
+}
+
+const REPLICA_SEARCH_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct ReplicaRefreshState {
+    generation: u64,
+    requested: u64,
+    last_started: Option<tokio::time::Instant>,
+    applied: Option<u64>,
+    running: bool,
+    task: Option<tokio::task::AbortHandle>,
+}
+
+struct ReplicaSearchSnapshot {
+    db: std::sync::Weak<LocalDb>,
+    state: Mutex<ReplicaRefreshState>,
+    done: tokio::sync::Notify,
+}
+
+impl Drop for ReplicaSearchSnapshot {
+    fn drop(&mut self) {
+        if let Some(task) = self.state.get_mut().task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ReplicaRefreshInterleave {
+    started: tokio::sync::Notify,
+    scheduled: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    runs: std::sync::atomic::AtomicUsize,
+}
+
+struct ReplicaSearch {
+    index: Arc<SearchIndex>,
+    snapshots: Mutex<HashMap<TeamId, Arc<ReplicaSearchSnapshot>>>,
+    #[cfg(test)]
+    interleave: Mutex<Option<Arc<ReplicaRefreshInterleave>>>,
+    health: Arc<Mutex<NavigationHealth>>,
+}
+
+impl ReplicaSearch {
+    async fn request(&self, team: &str, db: Arc<LocalDb>, dirty: bool, wait_for_initial: bool) {
+        let snapshot = {
+            let mut snapshots = self.snapshots.lock().await;
+            let entry = snapshots.entry(team.to_owned()).or_insert_with(|| {
+                Arc::new(ReplicaSearchSnapshot {
+                    db: Arc::downgrade(&db),
+                    state: Mutex::new(ReplicaRefreshState::default()),
+                    done: tokio::sync::Notify::new(),
+                })
+            });
+            if !entry.db.upgrade().is_some_and(|old| Arc::ptr_eq(&old, &db)) {
+                let mut old = entry.state.lock().await;
+                old.running = false;
+                if let Some(task) = old.task.take() {
+                    task.abort();
+                }
+                entry.done.notify_waiters();
+                drop(old);
+                *entry = Arc::new(ReplicaSearchSnapshot {
+                    db: Arc::downgrade(&db),
+                    state: Mutex::new(ReplicaRefreshState::default()),
+                    done: tokio::sync::Notify::new(),
+                });
+            }
+            entry.clone()
+        };
+        let initial_attempt;
+        {
+            let mut state = snapshot.state.lock().await;
+            initial_attempt = state.last_started.is_none();
+            if dirty {
+                state.generation = state.generation.wrapping_add(1);
+                return;
+            }
+            state.requested = state.generation;
+            if !state.running && state.applied != Some(state.generation) {
+                state.running = true;
+                let mut health = self.health.lock().await;
+                let before = health.snapshot();
+                health.refreshing.insert(team.to_owned());
+                health.emit_if_changed(before);
+                drop(health);
+                let index = self.index.clone();
+                let health = self.health.clone();
+                let team = team.to_owned();
+                // The task holds a weak snapshot reference, so dropping the
+                // owning database state aborts it rather than creating a cycle.
+                let weak = Arc::downgrade(&snapshot);
+                #[cfg(test)]
+                let interleave = self.interleave.lock().await.clone();
+                let task = tokio::spawn(async move {
+                    loop {
+                        let Some(snapshot) = weak.upgrade() else {
+                            return;
+                        };
+                        let deadline = snapshot
+                            .state
+                            .lock()
+                            .await
+                            .last_started
+                            .map(|started| started + REPLICA_SEARCH_REFRESH_INTERVAL);
+                        drop(snapshot);
+                        #[cfg(test)]
+                        if let Some(hook) = &interleave {
+                            hook.scheduled.notify_one();
+                        }
+                        if let Some(deadline) = deadline {
+                            tokio::time::sleep_until(deadline).await;
+                        }
+                        let Some(snapshot) = weak.upgrade() else {
+                            return;
+                        };
+                        let generation = {
+                            let mut state = snapshot.state.lock().await;
+                            state.last_started = Some(tokio::time::Instant::now());
+                            state.generation
+                        };
+                        drop(snapshot);
+                        #[cfg(test)]
+                        if let Some(hook) = &interleave {
+                            hook.runs.fetch_add(1, Ordering::SeqCst);
+                            hook.started.notify_one();
+                            hook.resume.notified().await;
+                        }
+                        let result = async {
+                            let projects =
+                                crate::navigation::project_authority(&db, Some(&team)).await?;
+                            index.replace_projects(&db, &projects).await
+                        }
+                        .await;
+                        let Some(snapshot) = weak.upgrade() else {
+                            return;
+                        };
+                        let mut state = snapshot.state.lock().await;
+                        let mut health = health.lock().await;
+                        let before = health.snapshot();
+                        match result {
+                            Ok(_) => {
+                                state.applied = Some(generation);
+                                health.snapshot_failures.remove(&team);
+                            }
+                            Err(error) => {
+                                health
+                                    .snapshot_failures
+                                    .insert(team.clone(), error.to_string());
+                                state.running = false;
+                            }
+                        }
+                        if !state.running || state.requested <= generation {
+                            state.running = false;
+                            health.refreshing.remove(&team);
+                            health.emit_if_changed(before);
+                            snapshot.done.notify_waiters();
+                            break;
+                        }
+                        health.emit_if_changed(before);
+                    }
+                });
+                state.task = Some(task.abort_handle());
+            }
+        }
+        if wait_for_initial && initial_attempt {
+            loop {
+                let notified = snapshot.done.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let state = snapshot.state.lock().await;
+                if state.applied.is_some() || !state.running {
+                    break;
+                }
+                drop(state);
+                notified.await;
+            }
+        }
+    }
+
+    async fn forget(&self, team: &str) {
+        if let Some(snapshot) = self.snapshots.lock().await.remove(team) {
+            let mut state = snapshot.state.lock().await;
+            state.running = false;
+            if let Some(task) = state.task.take() {
+                task.abort();
+            }
+            snapshot.done.notify_waiters();
+        }
+        let mut health = self.health.lock().await;
+        let before = health.snapshot();
+        health.refreshing.remove(team);
+        health.snapshot_failures.remove(team);
+        health
+            .failures
+            .retain(|(_, scope), _| scope.as_deref() != Some(team));
+        health.emit_if_changed(before);
+    }
+}
+
 /// Runtime database state and the project -> database router.
 ///
 /// Cairn stores each project WHOLLY in exactly one database: the private
@@ -92,6 +348,8 @@ pub struct DbState {
     /// `Arc` so the per-team pull task's route reconciler shares this cache.
     routes: Arc<RwLock<RouteMap>>,
     pub search_index: Arc<SearchIndex>,
+    replica_search: Arc<ReplicaSearch>,
+    navigation_health: Arc<Mutex<NavigationHealth>>,
     /// The per-team sync runtime, set once by the host via `enable_team_sync`.
     /// `None` until enabled (and forever, for a host that never enables it).
     sync_runtime: RwLock<Option<SyncRuntime>>,
@@ -196,11 +454,21 @@ pub async fn install_private_archive(local: &LocalDb, config_dir: &std::path::Pa
 
 impl DbState {
     pub fn new(local: Arc<LocalDb>, search_index: Arc<SearchIndex>) -> Self {
+        let navigation_health = Arc::new(Mutex::new(NavigationHealth::default()));
+        let replica_search = Arc::new(ReplicaSearch {
+            index: search_index.clone(),
+            snapshots: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            interleave: Mutex::new(None),
+            health: navigation_health.clone(),
+        });
         Self {
             local,
             teams: RwLock::new(HashMap::new()),
             routes: Arc::new(RwLock::new(HashMap::new())),
             search_index,
+            replica_search,
+            navigation_health,
             sync_runtime: RwLock::new(None),
             sync_tasks: RwLock::new(HashMap::new()),
             team_sync_authorized: AtomicBool::new(true),
@@ -508,6 +776,7 @@ impl DbState {
             team_db: db.clone(),
             routes: self.routes.clone(),
             team_id: team_id.clone(),
+            search: self.replica_search.clone(),
         });
         let push = tokio::spawn(run_push_task(db.clone(), runtime.cadence.clone()));
         let pull = tokio::spawn(run_pull_task(
@@ -525,6 +794,7 @@ impl DbState {
     /// host could build the runtime). With no team open this is fully inert — the
     /// dormancy guarantee for local-only installs.
     pub async fn enable_team_sync(&self, runtime: SyncRuntime) {
+        self.navigation_health.lock().await.emitter = Some(runtime.emitter.clone());
         *self.sync_runtime.write().await = Some(runtime.clone());
         if !self.team_sync_authorized.load(Ordering::Acquire) {
             return;
@@ -573,6 +843,7 @@ impl DbState {
     async fn close_team(&self, team_id: &str) {
         self.sync_tasks.write().await.remove(team_id);
         self.teams.write().await.remove(team_id);
+        self.replica_search.forget(team_id).await;
     }
 
     /// Insert or update a team's row in the private `teams` registry — the
@@ -713,22 +984,76 @@ impl DbState {
     /// Every open database: the private one plus each opened team replica. The
     /// search-index drain iterates this so locally-originated writes in any
     /// database get indexed.
+    /// Open read authorities, in deterministic order. The team id belongs to the
+    /// handle, not to a row supplied by a search index or a caller. Signed-out
+    /// replicas intentionally remain locally readable; revoked memberships are
+    /// removed by `forget_team`.
+    pub async fn navigation_dbs(&self) -> Vec<(Option<TeamId>, Arc<LocalDb>)> {
+        let teams = self.teams.read().await;
+        let mut entries: Vec<_> = teams
+            .iter()
+            .map(|(id, db)| (Some(id.clone()), db.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.insert(0, (None, self.local.clone()));
+        entries
+    }
+
     pub async fn all_dbs(&self) -> Vec<Arc<LocalDb>> {
         let mut dbs = vec![self.local.clone()];
         dbs.extend(self.teams.read().await.values().cloned());
         dbs
     }
 
-    /// Drains the pending search outbox of EVERY open database into the single
-    /// URI-keyed index. Documents are project-encoded in their URI, so one index
-    /// serves all databases without key collision. The bar this slice meets is
-    /// that team outboxes DRAIN (locally-originated writes index) rather than
-    /// accumulate; indexing pull-arrived rows on a receiving replica, whose
-    /// triggers never fired, is a deferred follow-up.
+    /// Physical WAL pulls bypass outbox triggers. Only cold hydration waits;
+    /// subsequent reads schedule dirty work and use the last committed reader.
+    pub(crate) async fn refresh_navigation_search(&self) -> DbResult<()> {
+        for (team, db) in self.navigation_dbs().await {
+            if let Some(team) = team {
+                self.replica_search.request(&team, db, false, true).await;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn navigation_availability(&self) -> NavigationAvailability {
+        self.navigation_health.lock().await.snapshot()
+    }
+
+    pub async fn record_navigation_failure(
+        &self,
+        lane: &str,
+        team_id: Option<&str>,
+        error: Option<String>,
+    ) {
+        let mut health = self.navigation_health.lock().await;
+        let before = health.snapshot();
+        let key = (lane.to_owned(), team_id.map(str::to_owned));
+        match error {
+            Some(message) => {
+                health.failures.insert(key, message);
+            }
+            None => {
+                health.failures.remove(&key);
+            }
+        }
+        health.emit_if_changed(before);
+    }
+
+    /// Drain locally-originated outboxes from every open database. Physical pull
+    /// replay is handled separately by `refresh_navigation_search`.
     pub(crate) async fn apply_pending_search(&self) -> DbResult<usize> {
         let mut total = 0;
-        for db in self.all_dbs().await {
-            total += self.search_index.apply_pending(&db).await?;
+        for (team_id, db) in self.navigation_dbs().await {
+            let mut projects =
+                crate::navigation::project_authority(&db, team_id.as_deref()).await?;
+            if team_id.is_none() {
+                projects.push(String::new());
+            }
+            total += self
+                .search_index
+                .apply_pending_in_projects(&db, &projects)
+                .await?;
         }
         Ok(total)
     }
@@ -1030,11 +1355,15 @@ struct TeamRouteReconciler {
     team_db: Arc<LocalDb>,
     routes: Arc<RwLock<RouteMap>>,
     team_id: TeamId,
+    search: Arc<ReplicaSearch>,
 }
 
 #[async_trait::async_trait]
 impl RouteReconcile for TeamRouteReconciler {
     async fn reconcile(&self) -> Result<TeamSyncScope, String> {
+        self.search
+            .request(&self.team_id, self.team_db.clone(), true, false)
+            .await;
         let project_ids =
             reconcile_team_routes(&self.local, &self.team_db, &self.routes, &self.team_id)
                 .await
@@ -1158,6 +1487,371 @@ pub struct StartupRecovery {
 mod tests {
     use super::*;
     use crate::storage::SearchIndex;
+
+    #[tokio::test]
+    async fn navigation_search_refreshes_pull_only_rows_and_deletions_in_background() {
+        let dbs = db_state("replica-index").await;
+        let replica = Arc::new(migrated_team_db("replica-source.db").await);
+        replica.execute_script(
+            "INSERT INTO teams(id, name, created_at, updated_at)
+             VALUES ('team', 'Team', 1, 1);
+             INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('tp', 'team', 'Team project', 'team-project', '/tmp/team', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, description, status, created_at, updated_at)
+             VALUES ('ti', 'tp', 1, 'Pulled issue', 'walonlyvocabulary', 'closed', 1, 1);
+             DELETE FROM search_outbox;"
+        ).await.unwrap();
+        dbs.register_team_db_for_test("team".into(), replica.clone())
+            .await;
+        let results = crate::search::search_content_across(&dbs, "walonlyvocabulary", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "cold replica loads rows with no pending outbox"
+        );
+        assert_eq!(results[0].uri, "cairn://p/team-project/1");
+        replica.execute_script(
+            "UPDATE issues SET description = 'newpullvocabulary', updated_at = 2 WHERE id = 'ti';
+             DELETE FROM search_outbox;"
+        ).await.unwrap();
+        dbs.replica_search
+            .request("team", replica.clone(), true, false)
+            .await;
+        // Skip the production interval only in this update/deletion fixture.
+        let snapshot = dbs
+            .replica_search
+            .snapshots
+            .lock()
+            .await
+            .get("team")
+            .unwrap()
+            .clone();
+        snapshot.state.lock().await.last_started = None;
+        dbs.replica_search
+            .request("team", replica.clone(), false, false)
+            .await;
+        wait_for_replica(&dbs, "team").await;
+        assert!(
+            crate::search::search_content_across(&dbs, "walonlyvocabulary", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::search::search_content_across(&dbs, "newpullvocabulary", None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        replica
+            .execute_script("DELETE FROM issues WHERE id = 'ti'; DELETE FROM search_outbox;")
+            .await
+            .unwrap();
+        dbs.replica_search
+            .request("team", replica.clone(), true, false)
+            .await;
+        // Skip the production interval only in this update/deletion fixture.
+        let snapshot = dbs
+            .replica_search
+            .snapshots
+            .lock()
+            .await
+            .get("team")
+            .unwrap()
+            .clone();
+        snapshot.state.lock().await.last_started = None;
+        dbs.replica_search
+            .request("team", replica.clone(), false, false)
+            .await;
+        wait_for_replica(&dbs, "team").await;
+        assert!(
+            crate::search::search_content_across(&dbs, "newpullvocabulary", None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_refresh_coalesces_pulls_and_warm_reads_do_not_wait() {
+        let dbs = db_state("coalesced-index").await;
+        let replica = Arc::new(migrated_team_db("coalesced-source.db").await);
+        replica
+            .execute_script(
+                "INSERT INTO teams(id,name,created_at,updated_at) VALUES ('team','Team',1,1);
+             INSERT INTO projects(id,team_id,name,key,repo_path,created_at,updated_at)
+             VALUES ('tp','team','Project','team-project','/tmp/team',1,1);
+             INSERT INTO issues(id,project_id,number,title,description,created_at,updated_at)
+             VALUES ('ti','tp',1,'Pulled issue','antecedentvocabulary',1,1);
+             DELETE FROM search_outbox;",
+            )
+            .await
+            .unwrap();
+        dbs.register_team_db_for_test("team".into(), replica.clone())
+            .await;
+        assert_eq!(
+            crate::search::search_content_across(&dbs, "antecedentvocabulary", None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let hook = Arc::new(ReplicaRefreshInterleave::default());
+        *dbs.replica_search.interleave.lock().await = Some(hook.clone());
+        replica
+            .execute_script(
+                "UPDATE issues SET description='subsequentvocabulary',updated_at=2 WHERE id='ti';
+             DELETE FROM search_outbox;",
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            dbs.replica_search
+                .request("team", replica.clone(), true, false)
+                .await;
+        }
+        assert_eq!(
+            hook.runs.load(Ordering::SeqCst),
+            0,
+            "pulls without reads must not rebuild"
+        );
+        assert!(!dbs.navigation_availability().await.refreshing);
+
+        // Exercise the real warm-read path before pausing the clock. The
+        // scheduled worker cannot acquire its source until the hook releases it.
+        let rows = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::search::search_content_across(&dbs, "antecedentvocabulary", None, None),
+        )
+        .await
+        .expect("warm query must not wait for refresh")
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        hook.scheduled.notified().await;
+        assert!(dbs.navigation_availability().await.refreshing);
+        assert_eq!(
+            hook.runs.load(Ordering::SeqCst),
+            0,
+            "minimum interval separates snapshots"
+        );
+        tokio::time::pause();
+        tokio::time::advance(REPLICA_SEARCH_REFRESH_INTERVAL).await;
+        hook.started.notified().await;
+        tokio::time::resume();
+
+        for _ in 0..10 {
+            dbs.replica_search
+                .request("team", replica.clone(), true, false)
+                .await;
+        }
+        // One read during the snapshot demands one follow-up, not ten pulls.
+        dbs.replica_search
+            .request("team", replica.clone(), false, false)
+            .await;
+        hook.resume.notify_one();
+        hook.scheduled.notified().await;
+        assert_eq!(hook.runs.load(Ordering::SeqCst), 1);
+        tokio::time::pause();
+        tokio::time::advance(REPLICA_SEARCH_REFRESH_INTERVAL).await;
+        hook.started.notified().await;
+        tokio::time::resume();
+        assert_eq!(hook.runs.load(Ordering::SeqCst), 2);
+        // A final pull without another read must stay dirty after this pass.
+        dbs.replica_search
+            .request("team", replica.clone(), true, false)
+            .await;
+        hook.resume.notify_one();
+        wait_for_replica(&dbs, "team").await;
+        assert!(!dbs.navigation_availability().await.refreshing);
+        let snapshot = dbs
+            .replica_search
+            .snapshots
+            .lock()
+            .await
+            .get("team")
+            .unwrap()
+            .clone();
+        let state = snapshot.state.lock().await;
+        assert!(
+            state.applied.unwrap() < state.generation,
+            "unrequested pull remains dirty"
+        );
+        assert_eq!(
+            state.applied,
+            Some(state.requested),
+            "racing generations are not acknowledged early"
+        );
+        assert_eq!(
+            hook.runs.load(Ordering::SeqCst),
+            2,
+            "no third rebuild without another read"
+        );
+        assert_eq!(
+            dbs.search_index
+                .search("subsequentvocabulary", None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_database_failures_retain_private_rows_and_recover() {
+        let dbs = db_state("partial-index").await;
+        dbs.local.execute_script(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES ('p','default','Private','private','/tmp/private',1,1);
+             INSERT INTO issues(id,project_id,number,title,description,created_at,updated_at)
+             VALUES ('pi','p',1,'Private vocabulary','privatevocabulary',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+             VALUES ('pe','r','pi','p','running',1,1);
+             INSERT INTO jobs(id,execution_id,issue_id,project_id,node_name,uri_segment,status,created_at,updated_at)
+             VALUES ('pj','pe','pi','p','Builder','builder','running',1,1);
+             INSERT INTO turns(id,job_id,session_id,sequence,state,start_reason,created_at,updated_at)
+             VALUES ('pt','pj','ps',1,'running','initial',1,1);"
+        ).await.unwrap();
+        // A handle whose schema cannot be read models one broken replica, not
+        // a revoked authority that would simply be absent from navigation_dbs.
+        let bad = Arc::new(
+            LocalDb::open(tempfile::tempdir().unwrap().keep().join("bad.db"))
+                .await
+                .unwrap(),
+        );
+        dbs.register_team_db_for_test("team".into(), bad).await;
+        let metadata = crate::navigation::search_navigation_metadata(&dbs, "vocabulary", None)
+            .await
+            .unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].id, "pi");
+        let content = crate::search::search_content_across(&dbs, "privatevocabulary", None, None)
+            .await
+            .unwrap();
+        assert_eq!(content.len(), 1);
+        let census = crate::jobs::queries::live_agent_census(&dbs).await.unwrap();
+        assert_eq!(census.len(), 1);
+        assert_eq!(census[0].job_id, "pj");
+        let status = dbs.navigation_availability().await;
+        assert!(!status.refreshing);
+        for lane in ["metadata", "content", "census"] {
+            assert!(
+                status
+                    .failures
+                    .iter()
+                    .any(|f| f.lane == lane && f.team_id.as_deref() == Some("team")),
+                "{lane} must report partial availability"
+            );
+        }
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::search::search_content_across(&dbs, "privatevocabulary", None, None),
+        )
+        .await
+        .expect("failed initial team snapshot must not block private reads during retry throttle")
+        .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(dbs
+            .navigation_availability()
+            .await
+            .failures
+            .iter()
+            .any(|f| f.lane == "content" && f.team_id.as_deref() == Some("team")));
+        dbs.register_team_db_for_test(
+            "team".into(),
+            Arc::new(migrated_team_db("recovered.db").await),
+        )
+        .await;
+        crate::navigation::search_navigation_metadata(&dbs, "vocabulary", None)
+            .await
+            .unwrap();
+        crate::search::search_content_across(&dbs, "privatevocabulary", None, None)
+            .await
+            .unwrap();
+        crate::jobs::queries::live_agent_census(&dbs).await.unwrap();
+        assert_eq!(
+            dbs.navigation_availability().await,
+            NavigationAvailability::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_forget_cancels_refresh_and_wakes_initial_reader() {
+        let dbs = Arc::new(db_state("cancel-index").await);
+        let replica = Arc::new(migrated_team_db("cancel-source.db").await);
+        let hook = Arc::new(ReplicaRefreshInterleave::default());
+        *dbs.replica_search.interleave.lock().await = Some(hook.clone());
+        let cold = {
+            let dbs = dbs.clone();
+            tokio::spawn(async move {
+                dbs.replica_search
+                    .request("team", replica, false, true)
+                    .await;
+            })
+        };
+        hook.started.notified().await;
+        assert!(dbs.navigation_availability().await.refreshing);
+        dbs.replica_search.forget("team").await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), cold)
+            .await
+            .expect("forgotten replica must wake its initial reader")
+            .unwrap();
+        assert_eq!(
+            dbs.navigation_availability().await,
+            NavigationAvailability::default()
+        );
+        assert!(dbs.replica_search.snapshots.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn navigation_availability_emits_only_changed_public_snapshots() {
+        let dbs = db_state("availability-index").await;
+        let emitter = Arc::new(crate::services::testing::CapturingEmitter::new());
+        dbs.navigation_health.lock().await.emitter = Some(emitter.clone());
+        for _ in 0..3 {
+            dbs.record_navigation_failure("metadata", Some("team"), Some("Unavailable".into()))
+                .await;
+        }
+        assert_eq!(emitter.captured().len(), 1);
+        dbs.record_navigation_failure("content", None, None).await;
+        assert_eq!(emitter.captured().len(), 1);
+        dbs.record_navigation_failure("metadata", Some("team"), None)
+            .await;
+        assert_eq!(emitter.captured().len(), 2);
+        assert_eq!(
+            dbs.navigation_availability().await,
+            NavigationAvailability::default()
+        );
+        assert!(emitter
+            .events_named("db-change")
+            .iter()
+            .all(|e| e["table"] == "navigation_availability"));
+    }
+
+    async fn wait_for_replica(dbs: &DbState, team: &str) {
+        let snapshot = dbs
+            .replica_search
+            .snapshots
+            .lock()
+            .await
+            .get(team)
+            .unwrap()
+            .clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notified = snapshot.done.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !snapshot.state.lock().await.running {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("replica refresh finished");
+    }
 
     async fn db_state(name: &str) -> DbState {
         let local = Arc::new(crate::storage::migrated_test_db(name).await);

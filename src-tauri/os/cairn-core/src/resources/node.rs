@@ -4,8 +4,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::mcp::handlers::durable_suspend::{stuck_resolutions, StuckPhase, StuckResolution};
 
-use cairn_db::turso::params;
-
 use super::common::{
     find_action_run_by_node_name, find_job_by_node_name, find_node_job, find_query_value,
     find_task_job, get_direct_artifact_for_job, get_named_artifact_for_job, has_artifact_for_job,
@@ -2530,61 +2528,12 @@ async fn job_turn_rows(
     label: &str,
     turn_seq: i32,
 ) -> Result<Vec<crate::models::Event>, String> {
-    // Get session_id from the job's first run
-    let session_id: Option<String> = match conn
-        .query(
-            "
-            SELECT session_id
-            FROM runs
-            WHERE job_id = ?1
-            ORDER BY created_at ASC
-            LIMIT 1
-            ",
-            (job_id,),
-        )
-        .await
-    {
-        Ok(mut rows) => rows
-            .next()
-            .await
-            .ok()
-            .flatten()
-            .and_then(|row| row.opt_text(0).ok().flatten()),
-        Err(_) => None,
-    };
-
-    let session_id = match session_id {
-        Some(id) => id,
-        None => return Err("No session found for this node.".to_string()),
-    };
-
-    // Find turn by (session_id, sequence = turn_seq)
-    let turn_id = match conn
-        .query(
-            "
-            SELECT id
-            FROM turns
-            WHERE session_id = ?1 AND sequence = ?2
-            LIMIT 1
-            ",
-            params![session_id.as_str(), turn_seq as i64],
-        )
-        .await
-    {
-        Ok(mut rows) => match rows
-            .next()
-            .await
-            .ok()
-            .flatten()
-            .and_then(|row| row.text(0).ok())
-        {
-            Some(id) => id,
-            None => return Err(format!("Turn {} not found for node '{}'", turn_seq, label)),
-        },
-        Err(_) => return Err(format!("Turn {} not found for node '{}'", turn_seq, label)),
-    };
-
-    Ok(turn_event_rows(conn, &turn_id).await)
+    use super::transcript::{chat_turn_target, ChatTurnTarget};
+    match chat_turn_target(conn, job_id, turn_seq, false).await? {
+        ChatTurnTarget::Turn(turn_id) => Ok(turn_event_rows(conn, &turn_id).await),
+        ChatTurnTarget::NoSession => Err("No session found for this node.".into()),
+        _ => Err(format!("Turn {} not found for node '{}'", turn_seq, label)),
+    }
 }
 
 /// Render a stored artifact JSON payload as readable markdown.
@@ -3308,59 +3257,14 @@ async fn task_turn_rows(
     task_job_id: &str,
     turn_seq: i32,
 ) -> TaskTurnRows {
-    // Task turn URIs are only unambiguous when all runs share one session.
-    let mut run_session_ids: Vec<Option<String>> = Vec::new();
-    if let Ok(mut rows) = conn
-        .query(
-            "
-            SELECT session_id
-            FROM runs
-            WHERE job_id = ?1
-            ORDER BY created_at ASC
-            ",
-            (task_job_id,),
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            if let Ok(session_id) = row.opt_text(0) {
-                run_session_ids.push(session_id);
-            }
+    use super::transcript::{chat_turn_target, ChatTurnTarget};
+    match chat_turn_target(conn, task_job_id, turn_seq, true).await {
+        Ok(ChatTurnTarget::Turn(turn_id)) => {
+            TaskTurnRows::Events(turn_event_rows(conn, &turn_id).await)
         }
-    }
-
-    let mut session_ids = run_session_ids.into_iter().flatten();
-    let Some(session_id) = session_ids.next() else {
-        return TaskTurnRows::NoSession;
-    };
-    if session_ids.any(|id| id != session_id) {
-        return TaskTurnRows::Ambiguous;
-    }
-
-    // Find turn by (session_id, sequence = turn_seq)
-    let turn_id = match conn
-        .query(
-            "
-            SELECT id
-            FROM turns
-            WHERE session_id = ?1 AND sequence = ?2
-            LIMIT 1
-            ",
-            params![session_id.as_str(), turn_seq as i64],
-        )
-        .await
-    {
-        Ok(mut rows) => rows
-            .next()
-            .await
-            .ok()
-            .flatten()
-            .and_then(|row| row.text(0).ok()),
-        Err(_) => None,
-    };
-    match turn_id {
-        Some(turn_id) => TaskTurnRows::Events(turn_event_rows(conn, &turn_id).await),
-        None => TaskTurnRows::TurnMissing,
+        Ok(ChatTurnTarget::NoSession) => TaskTurnRows::NoSession,
+        Ok(ChatTurnTarget::Ambiguous) => TaskTurnRows::Ambiguous,
+        _ => TaskTurnRows::TurnMissing,
     }
 }
 

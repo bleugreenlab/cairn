@@ -334,6 +334,7 @@ export const actionManifest = [
   },
   {
     id: "palette.open",
+    reserveBeforeTarget: true,
     label: "Open command palette",
     category: "actions",
     contexts: ["global"],

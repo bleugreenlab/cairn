@@ -187,6 +187,70 @@ fn task_segment(nav: Option<&JobNav>) -> Option<&str> {
     nav.and_then(|nav| nav.task_segment.as_deref())
 }
 
+/// Runner-wide content retrieval. Scope each index query before its limit and
+/// enrich against the same authority that supplied its projects. Closed replicas
+/// may leave index documents behind, but cannot authorize a result.
+pub async fn search_content_across(
+    dbs: &crate::db::DbState,
+    query: &str,
+    filters: Option<SearchFilters>,
+    semantic: Option<SemanticLane<'_>>,
+) -> Result<Vec<SearchResult>, String> {
+    let limit = filters
+        .as_ref()
+        .and_then(|f| f.limit)
+        .unwrap_or(50)
+        .min(MAX_INDEX_LIMIT);
+    dbs.refresh_navigation_search()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for (team_id, db) in dbs.navigation_dbs().await {
+        let result: Result<Vec<SearchResult>, String> = async {
+            let mut projects = crate::navigation::project_authority(&db, team_id.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
+            if team_id.is_none() {
+                projects.push(String::new());
+            }
+            let lane = semantic.as_ref().map(|lane| SemanticLane {
+                search: lane.search,
+                embedder: lane.embedder,
+                vectors: lane.vectors,
+            });
+            search_content_scoped(
+                &db,
+                &dbs.search_index,
+                query,
+                filters.clone(),
+                lane,
+                Some(&projects),
+            )
+            .await
+        }
+        .await;
+        dbs.record_navigation_failure(
+            "content",
+            team_id.as_deref(),
+            result.as_ref().err().cloned(),
+        )
+        .await;
+        if let Ok(rows) = result {
+            out.extend(rows);
+        }
+    }
+    out.sort_by(|a, b| {
+        b.rank
+            .total_cmp(&a.rank)
+            .then(b.created_at.cmp(&a.created_at))
+            .then(a.project_id.cmp(&b.project_id))
+            .then(a.uri.cmp(&b.uri))
+            .then(a.id.cmp(&b.id))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
 /// Search content, fusing the text index with the semantic lane when one is
 /// supplied and can answer.
 pub async fn search_content(
@@ -196,10 +260,22 @@ pub async fn search_content(
     filters: Option<SearchFilters>,
     semantic: Option<SemanticLane<'_>>,
 ) -> Result<Vec<SearchResult>, String> {
-    index
-        .apply_pending(db)
-        .await
-        .map_err(|error| format!("Search index update failed: {error}"))?;
+    search_content_scoped(db, index, query, filters, semantic, None).await
+}
+
+async fn search_content_scoped(
+    db: &LocalDb,
+    index: &SearchIndex,
+    query: &str,
+    filters: Option<SearchFilters>,
+    semantic: Option<SemanticLane<'_>>,
+    projects: Option<&[String]>,
+) -> Result<Vec<SearchResult>, String> {
+    match projects {
+        Some(projects) => index.try_apply_pending_in_projects(db, projects).await,
+        None => index.apply_pending(db).await,
+    }
+    .map_err(|error| format!("Search index update failed: {error}"))?;
 
     let filters = filters.unwrap_or_default();
     let limit = filters.limit.unwrap_or(50).min(MAX_INDEX_LIMIT);
@@ -209,9 +285,11 @@ pub async fn search_content(
         ..filters.clone()
     };
 
-    let hits = index
-        .search(query, Some(candidates))
-        .map_err(|error| format!("Search failed: {error}"))?;
+    let hits = match projects {
+        Some(projects) => index.search_in_projects(query, Some(candidates), projects),
+        None => index.search(query, Some(candidates)),
+    }
+    .map_err(|error| format!("Search failed: {error}"))?;
 
     // The semantic lane runs only when the text index found SOMETHING, and
     // only when transcripts are in scope at all.
@@ -225,13 +303,16 @@ pub async fn search_content(
     // question about work that happened matches something, while a nonsense
     // string or an identifier that appears nowhere matches nothing. Silence is
     // then the honest answer, and it is the answer search already gave.
-    let vector_hits = match semantic {
+    let mut vector_hits = match semantic {
         Some(lane) if semantic_applies(&filters) && !hits.is_empty() => {
             semantic_hits(db, &lane, query, &filters, depth).await
         }
         _ => Vec::new(),
     };
 
+    if let Some(projects) = projects {
+        vector_hits.retain(|hit| projects.contains(&hit.project_id));
+    }
     let enrichment = Enrichment::load(db, &hits, &vector_hits).await?;
     let mut text_lane = enrichment.rank(hits);
     if vector_hits.is_empty() {
@@ -436,6 +517,7 @@ struct Enrichment {
     issue_info: HashMap<String, (i32, String)>,
     job_nav: HashMap<String, JobNav>,
     event_locations: HashMap<String, EventLocation>,
+    post_comment_parents: HashMap<String, i64>,
 }
 
 impl Enrichment {
@@ -450,6 +532,15 @@ impl Enrichment {
     ) -> Result<Self, String> {
         let all = || text_hits.iter().chain(vector_hits.iter());
         Ok(Enrichment {
+            post_comment_parents: load_post_comment_parents(
+                db,
+                unique(
+                    all()
+                        .filter(|hit| hit.content_type == SearchContentType::PostComment)
+                        .map(|hit| Some(&hit.id)),
+                ),
+            )
+            .await?,
             project_keys: load_project_keys(db, unique(all().map(|hit| Some(&hit.project_id))))
                 .await?,
             issue_info: load_issue_info(db, unique(all().map(|hit| hit.issue_id.as_ref()))).await?,
@@ -519,7 +610,9 @@ impl Enrichment {
         let nav = hit.job_id.as_ref().and_then(|id| self.job_nav.get(id));
         let uri = match hit.content_type {
             SearchContentType::Post => format!("cairn://posts/{}", hit.id),
-            SearchContentType::PostComment => "cairn://posts".to_string(),
+            SearchContentType::PostComment => {
+                format!("cairn://posts/{}", self.post_comment_parents.get(&hit.id)?)
+            }
             _ => build_uri(
                 project_key
                     .as_deref()
@@ -790,6 +883,23 @@ where
         .await
         .map(|rows| rows.into_iter().collect())
         .map_err(storage_error)
+}
+
+async fn load_post_comment_parents(
+    db: &LocalDb,
+    ids: Vec<String>,
+) -> Result<HashMap<String, i64>, String> {
+    load_by_ids(
+        db,
+        &ids,
+        |placeholders| {
+            format!(
+                "SELECT CAST(id AS TEXT), post_id FROM post_comments WHERE id IN ({placeholders})"
+            )
+        },
+        |row| Ok((row.text(0)?, row.i64(1)?)),
+    )
+    .await
 }
 
 async fn load_project_keys(
@@ -1570,7 +1680,7 @@ mod tests {
                 .iter()
                 .find(|result| result.content_type == SearchContentType::PostComment)
                 .map(|result| result.uri.as_str()),
-            Some("cairn://posts")
+            Some("cairn://posts/41")
         );
     }
 

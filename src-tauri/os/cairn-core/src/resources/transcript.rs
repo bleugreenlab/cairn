@@ -1723,6 +1723,87 @@ fn content_of(data: &serde_json::Value) -> &str {
         .unwrap_or_default()
 }
 
+/// Canonical session/turn addressing shared by resource reads and navigation.
+pub(super) enum ChatTurnTarget {
+    NoSession,
+    Ambiguous,
+    Missing,
+    Turn(String),
+}
+
+pub(super) async fn chat_turn_target(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    turn_seq: i32,
+    task: bool,
+) -> Result<ChatTurnTarget, String> {
+    if turn_seq < 1 {
+        return Ok(ChatTurnTarget::Missing);
+    }
+    let sql = if task {
+        "SELECT DISTINCT session_id FROM runs WHERE job_id = ?1 AND session_id IS NOT NULL LIMIT 2"
+    } else {
+        "SELECT session_id FROM runs WHERE job_id = ?1 ORDER BY created_at ASC, rowid ASC LIMIT 1"
+    };
+    let mut sessions = conn
+        .query(sql, (job_id,))
+        .await
+        .map_err(|e| e.to_string())?;
+    let session = match sessions.next().await.map_err(|e| e.to_string())? {
+        Some(row) => row.opt_text(0).map_err(|e| e.to_string())?,
+        None => None,
+    };
+    let Some(session) = session else {
+        return Ok(ChatTurnTarget::NoSession);
+    };
+    if task && sessions.next().await.map_err(|e| e.to_string())?.is_some() {
+        return Ok(ChatTurnTarget::Ambiguous);
+    }
+    let mut turns = conn
+        .query(
+            "SELECT id FROM turns WHERE session_id = ?1 AND sequence = ?2 LIMIT 1",
+            params![session.as_str(), turn_seq as i64],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(match turns.next().await.map_err(|e| e.to_string())? {
+        Some(row) => ChatTurnTarget::Turn(row.text(0).map_err(|e| e.to_string())?),
+        None => ChatTurnTarget::Missing,
+    })
+}
+
+/// IDs only: archives retain these coordinates even when bodies are offloaded.
+pub(crate) async fn navigation_passage_event_id(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    turn: Option<i32>,
+    event: Option<(i32, i32)>,
+    task: bool,
+) -> Result<Option<String>, String> {
+    let job_id = job_id.to_string();
+    super::common::read_resource(db, move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = if let Some(turn) = turn {
+                let target = chat_turn_target(conn, &job_id, turn, task).await?;
+                let turn_id = match target {
+                    ChatTurnTarget::Turn(id) => id,
+                    ChatTurnTarget::Ambiguous => return Err("Task turn URI spans multiple sessions".into()),
+                    _ => return Ok(None),
+                };
+                conn.query("SELECT id FROM events WHERE turn_id = ?1 ORDER BY sequence ASC, id ASC LIMIT 1",
+                    (turn_id,)).await.map_err(|e| e.to_string())?
+            } else if let Some((run_seq, event_seq)) = event {
+                let Some(run_id) = get_nth_run_id(conn, &job_id, run_seq).await else { return Ok(None); };
+                conn.query("SELECT id FROM events WHERE run_id = ?1 AND sequence = ?2 LIMIT 1",
+                    params![run_id, event_seq as i64]).await.map_err(|e| e.to_string())?
+            } else { return Ok(None); };
+            rows.next().await.map_err(|e| e.to_string())?
+                .map(|row| row.text(0).map_err(|e| e.to_string())).transpose()
+        })
+    }).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
