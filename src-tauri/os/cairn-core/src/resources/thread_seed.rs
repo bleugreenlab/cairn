@@ -2090,17 +2090,24 @@ const CHILDREN_SQL: &str = "SELECT child.id, p.key, child.number, child.title, c
       WHERE child.parent_thread_id = ?1
       ORDER BY child.number ASC";
 
-/// The newest execution's top-level nodes. An older execution's nodes describe
-/// an attempt that has been superseded, which would read as live work.
-const CHILD_NODES_SQL: &str = "SELECT child.id, COALESCE(j.node_name, j.uri_segment), j.status
+/// The newest execution's current top-level node attempts. Older executions
+/// and replaced jobs describe superseded work, not a live status or failure.
+/// CROSS JOIN keeps the child-driven order even with the current-attempt
+/// predicate; the execution lookup must use its covering facts, not its snapshot.
+const CHILD_NODES_SQL: &str = "SELECT child.id, COALESCE(j.node_name, j.uri_segment), j.status, j.id
        FROM issues child INDEXED BY idx_issues_parent_thread_id
-       JOIN jobs j ON j.issue_id = child.id
-       JOIN executions e ON e.id = j.execution_id
+       CROSS JOIN jobs j INDEXED BY idx_jobs_issue_id ON j.issue_id = child.id
+       CROSS JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = j.execution_id
       WHERE child.parent_thread_id = ?1
         AND child.status NOT IN ('merged', 'closed')
         AND j.parent_job_id IS NULL
         AND e.seq = (SELECT MAX(latest.seq) FROM executions latest
                       WHERE latest.issue_id = child.id)
+        AND j.id = (SELECT latest.id FROM jobs latest
+                     WHERE latest.execution_id = j.execution_id
+                       AND COALESCE(latest.recipe_node_id, latest.uri_segment, latest.node_name, latest.id)
+                         = COALESCE(j.recipe_node_id, j.uri_segment, j.node_name, j.id)
+                     ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1)
       ORDER BY j.created_at ASC";
 
 /// Oldest first, so the last write per child is its newest pull request. A
@@ -2196,6 +2203,8 @@ struct ChildStatus {
     status: String,
     /// The newest execution's top-level nodes, in creation order.
     nodes: Vec<(String, String)>,
+    /// Failed current nodes remain visible when history drops its detail block.
+    failures: Vec<String>,
     pr: Option<(i64, String)>,
     /// The newest verdict per check name across this child's jobs.
     checks: Vec<(String, String)>,
@@ -2288,8 +2297,13 @@ impl ChildStatus {
             .first()
             .map(|approval| format!(" · awaiting {}", approval.who()))
             .unwrap_or_default();
+        let failure = if self.failures.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", self.failures.join(" · "))
+        };
         format!(
-            "- `{}` **{}**{held}{awaiting} · {}\n",
+            "- `{}` **{}**{held}{awaiting} · {}{failure}\n",
             self.uri,
             self.status,
             one_line(&self.title)
@@ -2465,6 +2479,7 @@ async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<Chil
             title,
             status,
             nodes: Vec::new(),
+            failures: Vec::new(),
             pr: None,
             checks: Vec::new(),
             unanswered_questions: 0,
@@ -2543,15 +2558,38 @@ async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<Chil
     // field empty rather than failing the census, and a row missing a field
     // the line needs is skipped.
     let nodes = thread_rows(db, CHILD_NODES_SQL, thread_id, |row| {
-        Ok(match (row.text(0), row.opt_text(1), row.text(2)) {
-            (Ok(issue_id), Ok(Some(name)), Ok(status)) => Some((issue_id, name, status)),
-            _ => None,
-        })
+        Ok(
+            match (row.text(0), row.opt_text(1), row.text(2), row.text(3)) {
+                (Ok(issue_id), Ok(Some(name)), Ok(status), Ok(job_id)) => {
+                    Some((issue_id, name, status, job_id))
+                }
+                _ => None,
+            },
+        )
     })
     .await
     .unwrap_or_default();
-    for (issue_id, name, status) in nodes {
+    for (issue_id, name, status, job_id) in nodes {
         if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+            if status == "failed" {
+                // The node rows have released their connection. Read only this
+                // failed job's bounded evidence on a separate short pooled read,
+                // never an issue-wide scan of snapshot-carrying executions.
+                let reason = read_resource(db, move |conn| {
+                    Box::pin(async move {
+                        cairn_attention::delivery::job_failure_reason_conn(conn, &job_id)
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .await
+                .ok()
+                .flatten();
+                child.failures.push(match reason {
+                    Some(reason) => format!("{name} Failed: {reason}"),
+                    None => format!("{name} Failed"),
+                });
+            }
             child.nodes.push((name, status));
         }
     }
@@ -3819,6 +3857,117 @@ mod tests {
             .expect("a children section");
         let eras = seed.content.find("## Eras").expect("an eras section");
         assert!(arc < children && children < eras);
+    }
+
+    #[tokio::test]
+    async fn failed_projection_census_keeps_the_current_node_and_reason_in_history() {
+        let db = thread_fixture("thread-seed-failed-projection.db").await;
+        make_open_child_live(&db).await;
+        db.execute_script(
+            "UPDATE issues SET status = 'failed' WHERE id = 'i-open';
+             UPDATE executions SET status = 'failed' WHERE id = 'e-open';
+             UPDATE jobs SET status = 'failed' WHERE id = 'job-open-review';
+             INSERT INTO runs(id, job_id, issue_id, status, error_message, created_at, updated_at)
+               VALUES ('run-review-failed','job-open-review','i-open','crashed',
+                       'Review backend refused the session',30,30);
+             UPDATE merge_requests SET status = 'closed' WHERE id = 'mr-open';",
+        )
+        .await
+        .unwrap();
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        assert!(seed.content.contains("**failed**"), "{}", seed.content);
+        assert!(
+            seed.content
+                .contains("review Failed: Review backend refused the session"),
+            "{}",
+            seed.content
+        );
+        assert!(
+            !seed.content.contains("builder Failed"),
+            "stale attempt leaked: {}",
+            seed.content
+        );
+        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let collapsed = collapsed_census(&children, "cairn://p/prj/platform", usize::MAX);
+        assert!(
+            collapsed.contains("review Failed: Review backend refused the session"),
+            "{collapsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_projection_census_ignores_replaced_jobs_in_the_current_execution() {
+        let db = thread_fixture("thread-seed-replaced-failure.db").await;
+        make_open_child_live(&db).await;
+        db.execute_script(
+            "UPDATE jobs SET status = 'failed', recipe_node_id = 'review-node' WHERE id = 'job-open-review';
+             INSERT INTO runs(id, job_id, issue_id, status, error_message, created_at, updated_at)
+               VALUES ('run-review-old','job-open-review','i-open','crashed',
+                       'Superseded review failure',30,30);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, recipe_node_id, uri_segment, node_name, created_at, updated_at)
+               VALUES ('job-review-retry','e-open','i-open','p','running','review-node','review-2','review',4,4);",
+        )
+        .await
+        .unwrap();
+
+        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let child = children
+            .iter()
+            .find(|child| child.uri == OPEN_CHILD)
+            .unwrap();
+        assert_eq!(
+            child.nodes,
+            vec![
+                ("builder".into(), "complete".into()),
+                ("review".into(), "running".into()),
+            ]
+        );
+        assert!(child.failures.is_empty(), "{child:?}");
+        assert!(!render_children(&children, NOW).contains("Superseded review failure"));
+        assert_eq!(db.live_connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_projection_census_keeps_status_without_detail_and_bounds_recorded_reasons() {
+        let db = thread_fixture("thread-seed-bounded-failure.db").await;
+        make_open_child_live(&db).await;
+        db.execute(
+            "UPDATE jobs SET status = 'failed' WHERE id = 'job-open-review'",
+            (),
+        )
+        .await
+        .unwrap();
+        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let child = children
+            .iter()
+            .find(|child| child.uri == OPEN_CHILD)
+            .unwrap();
+        assert_eq!(child.failures, vec!["review Failed"]);
+        assert_eq!(db.live_connections(), 0);
+
+        let reason = "Backend refused the session.\n".repeat(200);
+        db.execute(
+            "INSERT INTO runs(id, job_id, issue_id, status, error_message, created_at, updated_at)
+               VALUES ('run-review-bounded','job-open-review','i-open','crashed',?1,30,30)",
+            params![reason.clone()],
+        )
+        .await
+        .unwrap();
+        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let child = children
+            .iter()
+            .find(|child| child.uri == OPEN_CHILD)
+            .unwrap();
+        assert_eq!(
+            child.failures,
+            vec![format!(
+                "review Failed: {}",
+                cairn_attention::delivery::one_line_excerpt(&reason)
+            )]
+        );
+        assert!(!child.failures[0].contains('\n'));
+        assert!(child.failures[0].len() < reason.len());
+        assert_eq!(db.live_connections(), 0);
     }
 
     /// The part of a composed seed the budget governs. The authored arc is

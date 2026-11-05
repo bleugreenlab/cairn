@@ -48,7 +48,7 @@ impl AttentionHost for Host {
         Ok(self.db.clone())
     }
     fn nudge(&self, _: &str, _: DeliveryUrgency) -> Result<(), String> {
-        panic!("rendering never nudges")
+        Ok(())
     }
     async fn message(&self, _: &LocalDb, _: &str) -> Option<Message> {
         None
@@ -580,4 +580,448 @@ async fn catchup_and_review_statements_stay_on_their_indexes() {
             );
         }
     }
+}
+
+fn failed_event() -> crate::events::AttentionEvent {
+    crate::events::AttentionEvent {
+        issue_id: "issue-1".into(),
+        issue_uri: "cairn://p/proj/2".into(),
+        fact: crate::events::AttentionFact::Resolved {
+            final_status: cairn_domain::IssueStatus::Failed,
+        },
+        attention: cairn_domain::IssueAttention::None,
+        status: cairn_domain::IssueStatus::Failed,
+        updated_at: 10,
+        route_provenance: None,
+    }
+}
+
+async fn failure_fixture(name: &str) -> (AttentionRuntime, Arc<LocalDb>) {
+    let (runtime, db) = fixture(name).await;
+    db.execute_script(
+        "UPDATE issues SET parent_issue_id='parent',parent_job_id='watcher' WHERE id='issue-1';
+         UPDATE jobs SET current_session_id='watcher-session' WHERE id='watcher';
+         UPDATE jobs SET status='failed' WHERE id='child-job';
+         UPDATE runs SET status='crashed',error_message='Provider connection lost' WHERE id='run-1';"
+    ).await.unwrap();
+    (runtime, db)
+}
+
+#[tokio::test]
+async fn failed_resolution_restart_recovers_once_before_and_after_delivery() {
+    let (runtime, db) = failure_fixture("failed-resolution-restart").await;
+    use crate::delivery::rearm_failed_resolutions;
+    let rolled_back: DbResult<()> = db
+        .write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1'",
+                    (),
+                )
+                .await?;
+                Err(DbError::Row("simulated crash before commit".into()))
+            })
+        })
+        .await;
+    assert!(rolled_back.is_err());
+    assert_eq!(
+        rearm_failed_resolutions(&runtime, &db).await.unwrap(),
+        0,
+        "no failure notice before the settlement commits"
+    );
+    db.execute(
+        "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    // Drop all runtime state and reopen the migrated database: the resolution
+    // committed, but its normal post-commit emit never ran.
+    let path = db.path().to_path_buf();
+    drop(runtime);
+    drop(db);
+    let db = Arc::new(LocalDb::open_migrated_for_test(path).await.unwrap());
+    let runtime = AttentionRuntime::new(db.clone(), Arc::new(Host { db: db.clone() }));
+    assert_eq!(rearm_failed_resolutions(&runtime, &db).await.unwrap(), 1);
+    let pending = crate::push::list_pending(&db, "watcher").await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key, "resolved:cairn://p/proj/2");
+    assert_eq!(rearm_failed_resolutions(&runtime, &db).await.unwrap(), 0);
+    assert_eq!(
+        crate::push::list_pending(&db, "watcher").await.unwrap()[0].id,
+        pending[0].id
+    );
+    crate::push::stamp_delivered(&db, &[pending[0].id.clone()], "carrying-event")
+        .await
+        .unwrap();
+    assert_eq!(
+        rearm_failed_resolutions(&runtime, &db).await.unwrap(),
+        0,
+        "delivered history must suppress replay too"
+    );
+    assert!(crate::push::list_pending(&db, "watcher")
+        .await
+        .unwrap()
+        .is_empty());
+    db.execute(
+        "UPDATE issues SET resolution_generation=resolution_generation+1 WHERE id='issue-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rearm_failed_resolutions(&runtime, &db).await.unwrap(),
+        1,
+        "an older generation must not silence a genuinely new resolution in the same second"
+    );
+}
+
+#[tokio::test]
+async fn failed_resolution_normal_emitter_races_startup_without_duplicate() {
+    let (runtime, db) = failure_fixture("failed-resolution-concurrent").await;
+    db.execute(
+        "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    let event = failed_event();
+    let (normal, boot, other_boot) = tokio::join!(
+        crate::delivery::create_resolved_push_async(&runtime, &event),
+        crate::delivery::rearm_failed_resolutions(&runtime, &db),
+        crate::delivery::rearm_failed_resolutions(&runtime, &db),
+    );
+    assert_eq!(
+        normal.unwrap() + boot.unwrap() + other_boot.unwrap(),
+        1,
+        "only one racing creator owns the durable fact and wake"
+    );
+    let rows = crate::push::list_pending(&db, "watcher").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    crate::push::stamp_delivered(&db, &[rows[0].id.clone()], "carrying-event")
+        .await
+        .unwrap();
+    let (normal, boot) = tokio::join!(
+        crate::delivery::create_resolved_push_async(&runtime, &event),
+        crate::delivery::rearm_failed_resolutions(&runtime, &db),
+    );
+    assert_eq!(normal.unwrap() + boot.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn failed_resolution_quiet_generation_survives_rearm_but_not_reresolution() {
+    let (runtime, db) = failure_fixture("failed-resolution-quiet").await;
+    db.execute(
+        "UPDATE issues SET status='failed',completed_at=10,
+        quiet_failure_generation=resolution_generation WHERE id='issue-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            crate::delivery::rearm_failed_resolutions(&runtime, &db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::delivery::create_resolved_push_async(&runtime, &failed_event())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    db.execute(
+        "UPDATE issues SET resolution_generation=resolution_generation+1 WHERE id='issue-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::delivery::rearm_failed_resolutions(&runtime, &db)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_resolution_reason_names_own_failure_not_inherited_descendant() {
+    let (runtime, db) = failure_fixture("failed-resolution-own-reason").await;
+    db.execute_script(
+        "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1';
+         INSERT INTO jobs(id,project_id,issue_id,execution_id,uri_segment,status,created_at,updated_at)
+         VALUES('review','p','issue-1','exec-1','review','failed',2,20);
+         INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,failure_reason,created_at,updated_at)
+         VALUES('failed-work','sess','child-job',1,'failed','retry','Launch failed before run allocation',10,10);"
+    ).await.unwrap();
+    let rendered = render_push_resolved(
+        &runtime,
+        &push("resolved:cairn://p/proj/2", "cairn://p/proj/2"),
+    )
+    .await;
+    assert!(rendered.contains(NODE), "{rendered}");
+    assert!(
+        rendered.contains("Launch failed before run allocation"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("/review"), "{rendered}");
+    let long = "測試 detail\n".repeat(100);
+    db.execute(
+        "UPDATE turns SET failure_reason=?1 WHERE id='failed-work'",
+        (long,),
+    )
+    .await
+    .unwrap();
+    let reason = db
+        .read(|conn| {
+            Box::pin(
+                async move { crate::delivery::job_failure_reason_conn(conn, "child-job").await },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reason.chars().count() <= CATCHUP_DIGEST_CHARS + 1);
+    assert!(!reason.contains('\n'));
+    db.execute_script(
+        "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+         VALUES('retry-success','sess','child-job',2,'complete','retry',11,11);
+         INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+         VALUES('failed-memory','sess','child-job',3,'failed','memory_review',12,12);",
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.read(|conn| Box::pin(async move {
+            crate::delivery::job_failure_reason_conn(conn, "child-job").await
+        }))
+        .await
+        .unwrap()
+        .is_none(),
+        "successful retry and failed memory review are not own failures"
+    );
+}
+
+#[tokio::test]
+async fn failed_resolution_stale_event_cannot_announce_reopened_issue() {
+    let (runtime, db) = failure_fixture("failed-resolution-stale").await;
+    assert_eq!(
+        crate::delivery::create_resolved_push_async(&runtime, &failed_event())
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(crate::push::list_pending(&db, "watcher")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn failed_resolution_rearm_preserves_mute_and_self_exclusion() {
+    let (runtime, db) = failure_fixture("failed-resolution-mute").await;
+    crate::wakes::mute(
+        &db,
+        "watcher",
+        "issue",
+        Some("cairn://p/proj/2"),
+        None,
+        None,
+        None,
+        "agent",
+    )
+    .await
+    .unwrap();
+    crate::wakes::subscribe(
+        &db,
+        "child-job",
+        "issue",
+        Some("cairn://p/proj/2"),
+        None,
+        "agent",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::delivery::rearm_failed_resolutions(&runtime, &db)
+            .await
+            .unwrap(),
+        1
+    );
+    let pending = crate::push::list_pending(&db, "watcher").await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].wake, Wake::Passive);
+    assert!(crate::push::list_pending(&db, "child-job")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn failed_resolution_rearm_does_not_manufacture_stop_blocked_or_success_notices() {
+    let (runtime, db) = failure_fixture("failed-resolution-control-states").await;
+    for (issue, job) in [
+        ("active", "cancelled"),
+        ("active", "blocked"),
+        ("active", "pending"),
+        ("closed", "complete"),
+        ("merged", "complete"),
+    ] {
+        db.execute("UPDATE issues SET status=?1 WHERE id='issue-1'", (issue,))
+            .await
+            .unwrap();
+        db.execute("UPDATE jobs SET status=?1 WHERE id='child-job'", (job,))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::delivery::rearm_failed_resolutions(&runtime, &db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(crate::push::list_pending(&db, "watcher")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn failed_resolution_action_reason_and_new_job_attempt_are_authoritative() {
+    let (runtime, db) = failure_fixture("failed-resolution-action").await;
+    db.execute_script(
+        "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1';
+         UPDATE jobs SET recipe_node_id='builder-node' WHERE id='child-job';
+         INSERT INTO jobs(id,project_id,issue_id,execution_id,recipe_node_id,uri_segment,status,created_at,updated_at)
+         VALUES('successful-retry','p','issue-1','exec-1','builder-node','builder-2','complete',20,20);
+         INSERT INTO action_runs(id,execution_id,recipe_node_id,action_config_id,issue_id,project_id,status,
+             uri_segment,error_message,created_at,completed_at)
+         VALUES('pr-failure','exec-1','pr-node','builtin:pr','issue-1','p','failed',
+             'create-pr','GitHub rejected publication',21,22);"
+    ).await.unwrap();
+    let rendered = render_push_resolved(
+        &runtime,
+        &push("resolved:cairn://p/proj/2", "cairn://p/proj/2"),
+    )
+    .await;
+    assert!(
+        rendered.contains("cairn://p/proj/2/1/create-pr"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("GitHub rejected publication"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Provider connection lost"), "{rendered}");
+    db.execute_script(
+        "INSERT INTO action_runs(id,execution_id,recipe_node_id,action_config_id,issue_id,project_id,status,
+             uri_segment,created_at,completed_at)
+         VALUES('pr-retry','exec-1','pr-node','builtin:pr','issue-1','p','completed','create-pr-2',23,24);"
+    ).await.unwrap();
+    assert!(
+        db.read(|conn| Box::pin(async move {
+            crate::delivery::issue_failure_conn(conn, "issue-1").await
+        }))
+        .await
+        .unwrap()
+        .is_none(),
+        "an older failed action cannot replace a successful retry"
+    );
+}
+
+#[tokio::test]
+async fn failed_resolution_abandoned_output_reason_is_not_blocked_missing_output() {
+    let (runtime, db) = failure_fixture("failed-resolution-abandonment").await;
+    db.execute_script(
+        "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1';
+         INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+         VALUES('work-complete','sess','child-job',1,'complete','initial',10,10);
+         UPDATE jobs SET status='blocked',return_abandoned_at=11 WHERE id='child-job';",
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.read(|conn| Box::pin(async move {
+            crate::delivery::job_failure_reason_conn(conn, "child-job").await
+        }))
+        .await
+        .unwrap()
+        .is_none(),
+        "Blocked missing output is not failure evidence"
+    );
+    db.execute("UPDATE jobs SET status='failed' WHERE id='child-job'", ())
+        .await
+        .unwrap();
+    let rendered = render_push_resolved(
+        &runtime,
+        &push("resolved:cairn://p/proj/2", "cairn://p/proj/2"),
+    )
+    .await;
+    assert!(rendered.contains(NODE), "{rendered}");
+    assert!(
+        rendered.contains("Required output was not produced after the return was abandoned"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Provider connection lost"), "{rendered}");
+    db.execute("UPDATE jobs SET status='complete' WHERE id='child-job'", ())
+        .await
+        .unwrap();
+    assert!(
+        db.read(|conn| Box::pin(async move {
+            crate::delivery::job_failure_reason_conn(conn, "child-job").await
+        }))
+        .await
+        .unwrap()
+        .is_none(),
+        "a later projection with output is no longer a failed abandonment"
+    );
+}
+
+#[tokio::test]
+async fn failed_resolution_inherited_branch_producer_is_not_a_delegated_task() {
+    let (runtime, db) = failure_fixture("failed-resolution-inherited").await;
+    db.execute_script(
+        "UPDATE issues SET status='failed',completed_at=10 WHERE id='issue-1';
+         INSERT INTO jobs(id,project_id,issue_id,execution_id,recipe_node_id,uri_segment,status,created_at,updated_at)
+         VALUES('source','p','issue-1','exec-1','planner','planner','complete',1,1);
+         UPDATE jobs SET parent_job_id='source',recipe_node_id='builder' WHERE id='child-job';
+         UPDATE executions SET snapshot='{\"recipe\":{\"nodes\":[{\"id\":\"planner\"},{\"id\":\"builder\"}]}}'
+         WHERE id='exec-1';
+         INSERT INTO jobs(id,project_id,issue_id,execution_id,parent_job_id,uri_segment,status,created_at,updated_at)
+         VALUES('delegated','p','issue-1','exec-1','child-job','task','failed',2,20);
+         INSERT INTO runs(id,project_id,job_id,issue_id,status,error_message,created_at,updated_at)
+         VALUES('task-run','p','delegated','issue-1','crashed','Unrelated delegated task failure',20,20);"
+    ).await.unwrap();
+    let rendered = render_push_resolved(
+        &runtime,
+        &push("resolved:cairn://p/proj/2", "cairn://p/proj/2"),
+    )
+    .await;
+    assert!(rendered.contains(NODE), "{rendered}");
+    assert!(rendered.contains("Provider connection lost"), "{rendered}");
+    assert!(
+        !rendered.contains("Unrelated delegated task failure"),
+        "{rendered}"
+    );
+    db.execute_script(
+        "INSERT INTO jobs(id,project_id,issue_id,execution_id,recipe_node_id,parent_job_id,uri_segment,status,created_at,updated_at)
+         VALUES('inherited-retry','p','issue-1','exec-1','builder','source','builder-2','complete',30,30);"
+    ).await.unwrap();
+    assert!(
+        db.read(|conn| Box::pin(async move {
+            crate::delivery::issue_failure_conn(conn, "issue-1").await
+        }))
+        .await
+        .unwrap()
+        .is_none(),
+        "the newer inherited-branch attempt supersedes the older failure"
+    );
 }

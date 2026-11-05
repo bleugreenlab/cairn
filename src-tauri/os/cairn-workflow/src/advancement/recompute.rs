@@ -30,6 +30,9 @@ pub enum ChangeCause {
     /// settled. These edges drive lifecycle messages, wakes, `JobEnded`, review
     /// re-evaluation, and DAG advancement.
     Derived,
+    /// This unstarted node cannot run because a required dependency failed.
+    /// Its status is real, but it is not another independent failure event.
+    InheritedFailure,
     /// The job's issue is merged or closed, and the job settled to the outcome
     /// it had already recorded (see [`settle_for_terminal_issue`]). Nothing new
     /// happened to the work, so the change is published as a db-change only:
@@ -577,6 +580,21 @@ async fn node_job_facts_conn(
     // living doc's confirm flag must never resolve the job's gate.
     let artifact = artifact_fact(conn, job_id, required_artifact_name.as_deref()).await?;
     let output_abandoned = output_abandoned_fact(conn, job_id).await?;
+    let run_failed_without_turn = if turn.work_state.is_none() {
+        let mut rows = conn.query(
+            "SELECT status IN ('failed', 'crashed') AND COALESCE(exit_reason, '') != 'user_stop'
+             FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (job_id,),
+        ).await?;
+        rows.next()
+            .await?
+            .map(|row| row.i64(0))
+            .transpose()?
+            .unwrap_or(0)
+            != 0
+    } else {
+        false
+    };
     let facts = JobFacts {
         dag_ready,
         upstream_failed,
@@ -584,7 +602,7 @@ async fn node_job_facts_conn(
         // Interrupt/cancel is a user-initiated pause, NOT a failure: the job
         // rests resumable (derives Pending) and never cascades to downstream.
         // Only a genuine agent/process failure terminalizes.
-        turn_failed: matches!(turn.work_state, Some(TurnState::Failed)),
+        turn_failed: matches!(turn.work_state, Some(TurnState::Failed)) || run_failed_without_turn,
         turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
         checkpoint: gate_for(node, confirm_policy),
         resolution: if artifact.unwrap_or(false) {
@@ -602,6 +620,32 @@ async fn node_job_facts_conn(
         turn,
         required_artifact_name,
     })
+}
+
+/// Own failure is the ordinary projection with dependency failure disabled.
+/// This includes an abandoned output contract, but never an inherited failure
+/// or a missing-output Blocked gate.
+pub(super) async fn node_failed_on_own_facts_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+    execution_id: &str,
+    snapshot: &crate::models::ExecutionSnapshot,
+    node_id: &str,
+    all_edges_db: &[DbRecipeEdge],
+    node_map_db: &HashMap<&str, &DbRecipeNode>,
+) -> DbResult<bool> {
+    let gathered = node_job_facts_conn(
+        conn,
+        job_id,
+        execution_id,
+        snapshot,
+        node_id,
+        all_edges_db,
+        node_map_db,
+        false,
+    )
+    .await?;
+    Ok(derive_job_status(&gathered.facts) == JobStatus::Failed)
 }
 
 /// The artifact a node-less job owes, read from the contract that owns it — the
@@ -812,7 +856,9 @@ pub async fn derive_terminal_issue_status_conn(
             let node_map_db: HashMap<&str, &DbRecipeNode> =
                 all_nodes_db.iter().map(|n| (n.id.as_str(), n)).collect();
             let upstream_failed =
-                upstream_failed_conn(conn, execution_id, node_id, &snapshot).await?;
+                dependency_impossible_nodes_conn(conn, execution_id, &snapshot, &HashSet::new())
+                    .await?
+                    .contains(node_id);
             let gathered = node_job_facts_conn(
                 conn,
                 job_id,
@@ -845,7 +891,10 @@ pub async fn derive_node_job_status_conn(
     let all_edges_db = snapshot_edges_to_db(&snapshot);
     let node_map_db: HashMap<&str, &DbRecipeNode> =
         all_nodes_db.iter().map(|n| (n.id.as_str(), n)).collect();
-    let upstream_failed = upstream_failed_conn(conn, execution_id, node_id, &snapshot).await?;
+    let upstream_failed =
+        dependency_impossible_nodes_conn(conn, execution_id, &snapshot, &HashSet::new())
+            .await?
+            .contains(node_id);
     let gathered = node_job_facts_conn(
         conn,
         job_id,
@@ -916,7 +965,14 @@ pub async fn rederive_after_reopen_conn(
         }
     }
     for execution_id in &executions {
-        recompute_execution_jobs_conn(conn, execution_id, &HashSet::new()).await?;
+        project_execution_jobs_conn(
+            conn,
+            execution_id,
+            &HashSet::new(),
+            &HashSet::new(),
+            ProjectionCause::ExplicitReopen,
+        )
+        .await?;
     }
     Ok(lifted)
 }
@@ -1259,35 +1315,6 @@ pub async fn recompute_job_status_conn(
     derive_node_job_status_conn(conn, job_id, &execution_id, &recipe_node_id).await
 }
 
-async fn upstream_failed_conn(
-    conn: &cairn_db::storage::TrackedConnection,
-    execution_id: &str,
-    node_id: &str,
-    snapshot: &crate::models::ExecutionSnapshot,
-) -> DbResult<bool> {
-    let parents: Vec<&str> = snapshot
-        .recipe
-        .edges
-        .iter()
-        .filter(|e| e.edge_type.to_string() == "control" && e.target_node_id == node_id)
-        .map(|e| e.source_node_id.as_str())
-        .collect();
-    for parent in parents {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM jobs
-                 WHERE execution_id = ?1 AND recipe_node_id = ?2 AND status = 'failed'
-                 LIMIT 1",
-                params![execution_id, parent],
-            )
-            .await?;
-        if rows.next().await?.is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Everything one execution sweep observed, for the effect emission that
 /// follows it.
 ///
@@ -1342,7 +1369,39 @@ pub async fn sweep_execution_jobs_conn(
     claimed_launch_job_ids: &HashSet<String>,
     settle_job_ids: &HashSet<String>,
 ) -> DbResult<RecomputeOutcome> {
-    let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
+    project_execution_jobs_conn(
+        conn,
+        execution_id,
+        claimed_launch_job_ids,
+        settle_job_ids,
+        ProjectionCause::Live,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionCause {
+    Live,
+    QuietRepair,
+    // Explicit unresolve already advanced the issue identity before lifting jobs.
+    ExplicitReopen,
+}
+
+async fn project_execution_jobs_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    execution_id: &str,
+    claimed_launch_job_ids: &HashSet<String>,
+    settle_job_ids: &HashSet<String>,
+    cause: ProjectionCause,
+) -> DbResult<RecomputeOutcome> {
+    let quiet_repair = matches!(cause, ProjectionCause::QuietRepair);
+    let snapshot = match load_execution_snapshot_conn(conn, execution_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            log::warn!("Preserving execution {execution_id}: cannot derive its snapshot: {error}");
+            return Ok(RecomputeOutcome::default());
+        }
+    };
     let all_nodes_db = snapshot_nodes_to_db(&snapshot);
     let all_edges_db = snapshot_edges_to_db(&snapshot);
     let node_map_db: HashMap<&str, &DbRecipeNode> =
@@ -1355,12 +1414,11 @@ pub async fn sweep_execution_jobs_conn(
         .filter(|e| e.edge_type.to_string() == "control")
         .map(|e| (e.source_node_id.clone(), e.target_node_id.clone()))
         .collect();
-    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
-    for (s, t) in &control {
-        parents.entry(t.clone()).or_default().push(s.clone());
-    }
 
     let jobs = load_sweep_jobs(conn, execution_id).await?;
+    let impossible =
+        dependency_impossible_nodes_conn(conn, execution_id, &snapshot, claimed_launch_job_ids)
+            .await?;
     let mut node_jobs: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, j) in jobs.iter().enumerate() {
         if let Some(nid) = &j.recipe_node_id {
@@ -1446,20 +1504,7 @@ pub async fn sweep_execution_jobs_conn(
             {
                 continue;
             }
-            let upstream_failed = parents
-                .get(node_id)
-                .map(|ps| {
-                    ps.iter().any(|p| {
-                        node_jobs
-                            .get(p)
-                            .map(|js| {
-                                js.iter()
-                                    .any(|&k| status.get(&jobs[k].id) == Some(&JobStatus::Failed))
-                            })
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
+            let upstream_failed = impossible.contains(node_id);
 
             let gathered = node_job_facts_conn(
                 conn,
@@ -1499,7 +1544,15 @@ pub async fn sweep_execution_jobs_conn(
                 {
                     continue;
                 }
-                (derived, ChangeCause::Derived)
+                let cause = if derived == JobStatus::Failed
+                    && upstream_failed
+                    && !gathered.facts.turn_failed
+                {
+                    ChangeCause::InheritedFailure
+                } else {
+                    ChangeCause::Derived
+                };
+                (derived, cause)
             };
             if derived != current {
                 // C4: distinguish Blocked-on-missing-output from Blocked-for-
@@ -1580,14 +1633,33 @@ pub async fn sweep_execution_jobs_conn(
     recompute_execution_status_conn(conn, execution_id).await?;
     let mut newly_terminal_issue_ids = Vec::new();
     if let Some(issue_id) = issue_id.as_deref() {
-        if recompute_issue_status_conn(conn, issue_id)
-            .await?
-            .became_terminal
-        {
+        let status_write = if matches!(cause, ProjectionCause::ExplicitReopen) {
+            crate::transitions::outcome::recompute_issue_status_after_unresolve_conn(conn, issue_id)
+                .await?
+        } else {
+            recompute_issue_status_conn(conn, issue_id).await?
+        };
+        if status_write.became_terminal {
             newly_terminal_issue_ids.push(issue_id.to_string());
         }
     }
 
+    if quiet_repair {
+        for change in &mut changes {
+            change.cause = ChangeCause::Repaired;
+        }
+        // Suppress the resolution edge as well as job-level effects, durably:
+        // a later boot must not interpret this repair as a missed live notice.
+        if let Some(issue_id) = issue_id.as_deref() {
+            conn.execute(
+                "UPDATE issues SET quiet_failure_generation = resolution_generation
+                 WHERE id = ?1 AND status = 'failed'",
+                (issue_id,),
+            )
+            .await?;
+        }
+        newly_terminal_issue_ids.clear();
+    }
     Ok(RecomputeOutcome {
         changes,
         newly_terminal_issue_ids,
@@ -2016,6 +2088,135 @@ pub async fn heal_stuck_delegated_children(runtime: &WorkflowRuntime) {
     }
 }
 
+/// Settle only canonical, started work with positively impossible pending
+/// descendants. Already-projected failures are historical repair; failure facts
+/// not yet projected stay live so neither a sweep nor a restart can silence them.
+/// Eligibility and projection share the owning write transaction.
+pub async fn heal_failed_dependencies_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    execution_id: &str,
+    claimed_launch_job_ids: &HashSet<String>,
+) -> DbResult<RecomputeOutcome> {
+    let mut rows = conn
+        .query(
+            concat!(
+                "SELECT 1 FROM executions e WHERE e.id = ?1 AND e.started_at IS NOT NULL
+             AND e.lifecycle = 'canonical' AND ",
+                cairn_db::live_execution_sql!(),
+                " AND NOT (",
+                cairn_db::gated_unreleased_sql!(),
+                ")"
+            ),
+            (execution_id,),
+        )
+        .await?;
+    if rows.next().await?.is_none() {
+        return Ok(RecomputeOutcome::default());
+    }
+    let snapshot = match load_execution_snapshot_conn(conn, execution_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            log::warn!("Preserving repair candidate {execution_id}: {error}");
+            return Ok(RecomputeOutcome::default());
+        }
+    };
+    let failure =
+        dependency_failure_analysis_conn(conn, execution_id, &snapshot, claimed_launch_job_ids)
+            .await?;
+    let jobs = load_sweep_jobs(conn, execution_id).await?;
+    if !jobs.iter().any(|job| {
+        job.status == JobStatus::Pending
+            && job
+                .recipe_node_id
+                .as_ref()
+                .is_some_and(|id| failure.impossible_nodes.contains(id))
+    }) {
+        return Ok(RecomputeOutcome::default());
+    }
+    let cause = if failure.has_unprojected_failure {
+        ProjectionCause::Live
+    } else {
+        ProjectionCause::QuietRepair
+    };
+    project_execution_jobs_conn(
+        conn,
+        execution_id,
+        claimed_launch_job_ids,
+        &HashSet::new(),
+        cause,
+    )
+    .await
+}
+
+/// A bounded jobs-index scan on each owning database. Snapshot reads happen
+/// only after candidate discovery, and each candidate is rechecked under write.
+/// Keyset pages let stale conservative candidates coexist with later repairs.
+pub async fn heal_failed_dependencies(runtime: &WorkflowRuntime) {
+    const PAGE_SIZE: u32 = 32;
+    const MAX_PAGES: usize = 8;
+    static CURSORS: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, String>>> =
+        std::sync::OnceLock::new();
+    let cursors = CURSORS.get_or_init(Default::default);
+    let claimed = runtime.host.claimed_launch_job_ids();
+    for db in runtime.host.databases().await {
+        let key = db.path().to_path_buf();
+        let mut after = cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        for _ in 0..MAX_PAGES {
+            let candidates =
+                match cairn_db::storage::failed_dependency_candidates(&db, &after, PAGE_SIZE).await
+                {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        log::warn!("Failed-dependency candidate scan failed: {error}");
+                        break;
+                    }
+                };
+            if candidates.is_empty() {
+                after.clear();
+                break;
+            }
+            let full_page = candidates.len() == PAGE_SIZE as usize;
+            for execution_id in candidates {
+                after = execution_id.clone();
+                let result = db
+                    .write(|conn| {
+                        let execution_id = execution_id.clone();
+                        let claimed = claimed.clone();
+                        Box::pin(async move {
+                            heal_failed_dependencies_conn(conn, &execution_id, &claimed).await
+                        })
+                    })
+                    .await;
+                match result {
+                    Ok(outcome) => {
+                        // Historical repairs carry only invalidation. A live
+                        // failure caught before projection needs normal delivery.
+                        if let Err(error) =
+                            publish_recompute_outcome(runtime, &execution_id, outcome)
+                        {
+                            log::warn!("Could not publish settlement of {execution_id}: {error}");
+                        }
+                    }
+                    Err(error) => log::warn!("Could not heal {execution_id}: {error}"),
+                }
+            }
+            if !full_page {
+                after.clear();
+                break;
+            }
+        }
+        cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, after);
+    }
+}
+
 /// The single entry point every former decider calls: run the execution sweep in
 /// a write transaction, then emit the follow-on effects keyed by each derived edge.
 pub fn recompute_execution_jobs(
@@ -2067,6 +2268,16 @@ fn sweep_execution_jobs(
         .map_err(|e| e.to_string())
     })?;
 
+    publish_recompute_outcome(runtime, execution_id, outcome)
+}
+
+/// Publish only after the owning transaction has committed all projections.
+/// Failure writers use this same path without opening a second write window.
+pub(super) fn publish_recompute_outcome(
+    runtime: &WorkflowRuntime,
+    execution_id: &str,
+    outcome: RecomputeOutcome,
+) -> Result<Vec<JobStatusChange>, String> {
     if outcome.changes.is_empty() && outcome.newly_terminal_issue_ids.is_empty() {
         return Ok(outcome.changes);
     }

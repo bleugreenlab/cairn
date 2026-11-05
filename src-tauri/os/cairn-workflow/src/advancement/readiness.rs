@@ -112,6 +112,245 @@ pub async fn is_action_node_ready_with_snapshot_conn(
     Ok(true)
 }
 
+pub(super) struct DependencyFailureAnalysis {
+    pub impossible_nodes: HashSet<String>,
+    pub has_unprojected_failure: bool,
+}
+
+/// Derive dependency failure without treating inherited status projections as
+/// independent failures. The caller owns snapshot validation and the transaction.
+pub(super) async fn dependency_impossible_nodes_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    execution_id: &str,
+    snapshot: &ExecutionSnapshot,
+    claimed_job_ids: &HashSet<String>,
+) -> DbResult<HashSet<String>> {
+    Ok(
+        dependency_failure_analysis_conn(conn, execution_id, snapshot, claimed_job_ids)
+            .await?
+            .impossible_nodes,
+    )
+}
+
+/// A failure fact can commit before its job projection. That unfinished live
+/// transition must never be mistaken for historical work by a repair pass.
+pub(super) async fn dependency_failure_analysis_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    execution_id: &str,
+    snapshot: &ExecutionSnapshot,
+    claimed_job_ids: &HashSet<String>,
+) -> DbResult<DependencyFailureAnalysis> {
+    let nodes = snapshot_nodes_to_db(snapshot);
+    let edges = snapshot_edges_to_db(snapshot);
+    let node_map = node_map(&nodes);
+    let mut protected = HashSet::new();
+    let mut failed = HashSet::new();
+    let mut unprojected_failures = HashSet::new();
+
+    // Match readiness's latest non-cancelled attempt, never an arbitrary
+    // historical failed job. Claimed launches protect even the pre-turn gap.
+    for node in &nodes {
+        let Some(job) =
+            crate::db_records::load_live_job_by_execution_node_conn(conn, execution_id, &node.id)
+                .await?
+        else {
+            continue;
+        };
+        let node_id = node.id.clone();
+        let job_id = job.id;
+        if claimed_job_ids.contains(&job_id) {
+            protected.insert(node_id.clone());
+        }
+        let turn = super::recompute::turn_facts(conn, &job_id).await?;
+        let mut runs = conn
+            .query(
+                "SELECT status, exit_reason FROM runs WHERE job_id = ?1
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (job_id.as_str(),),
+            )
+            .await?;
+        let latest_run = runs.next().await?;
+        let run_status = latest_run
+            .as_ref()
+            .map(|row| row.opt_text(0))
+            .transpose()?
+            .flatten();
+        let run_stopped = latest_run
+            .as_ref()
+            .map(|row| row.opt_text(1))
+            .transpose()?
+            .flatten()
+            .as_deref()
+            == Some("user_stop");
+        let mut stopped = conn
+            .query(
+                "SELECT COALESCE(t.end_reason, '') = 'user_stop'
+                    OR COALESCE(r.exit_reason, '') = 'user_stop'
+             FROM turns t LEFT JOIN runs r ON r.id = t.run_id
+             WHERE t.job_id = ?1 AND t.start_reason != 'memory_review'
+             ORDER BY t.created_at DESC, t.sequence DESC LIMIT 1",
+                (job_id.as_str(),),
+            )
+            .await?;
+        let work_stopped = stopped
+            .next()
+            .await?
+            .map(|row| row.i64(0))
+            .transpose()?
+            .unwrap_or(0)
+            != 0;
+        let mut active = conn
+            .query(
+                "SELECT 1 FROM runs WHERE job_id = ?1 AND status IN ('starting', 'live') LIMIT 1",
+                (job_id.as_str(),),
+            )
+            .await?;
+        // A clean work turn can still fail its declared output contract.
+        // Reuse projection's resolver rather than treating every Complete
+        // turn as success or duplicating the artifact/abandonment rules.
+        let completed_work_failed = if turn.work_state == Some(crate::models::TurnState::Complete) {
+            super::recompute::node_failed_on_own_facts_conn(
+                conn,
+                &job_id,
+                execution_id,
+                snapshot,
+                &node_id,
+                &edges,
+                &node_map,
+            )
+            .await?
+        } else {
+            false
+        };
+        let own_failure = !work_stopped
+            && (completed_work_failed
+                || turn.work_state == Some(crate::models::TurnState::Failed)
+                || (turn.work_state.is_none()
+                    && !run_stopped
+                    && matches!(run_status.as_deref(), Some("failed" | "crashed"))));
+        if work_stopped
+            || matches!(
+                turn.work_state,
+                Some(crate::models::TurnState::Interrupted | crate::models::TurnState::Cancelled)
+            )
+            || turn.work_live(active.next().await?.is_some())
+            || (!own_failure
+                && (job.status == "complete"
+                    || turn.work_state == Some(crate::models::TurnState::Complete)))
+        {
+            protected.insert(node_id);
+        } else if own_failure {
+            // Interrupted/cancelled turns and ordinary process exits are not
+            // evidence of failure. Inherited failed jobs have neither fact.
+            failed.insert(node_id.clone());
+            if job.status != "failed" {
+                unprojected_failures.insert(node_id);
+            }
+        }
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT recipe_node_id, status FROM action_runs
+         WHERE execution_id = ?1 ORDER BY created_at DESC, rowid DESC",
+            (execution_id,),
+        )
+        .await?;
+    let mut latest_actions = HashSet::new();
+    while let Some(row) = rows.next().await? {
+        let node_id = row.text(0)?;
+        let status = row.text(1)?;
+        // Readiness accepts any completed action. A blocked PR can still fire
+        // merge/close later, so upstream failure must not erase its open gate.
+        let latest = latest_actions.insert(node_id.clone());
+        if status == "complete"
+            || (latest && matches!(status.as_str(), "pending" | "running" | "blocked"))
+        {
+            protected.insert(node_id.clone());
+        }
+        if latest && status == "failed" {
+            // mark_action_run_failed commits this fact and its sweep together;
+            // unlike job/turn facts, it has no unprojected live failure window.
+            failed.insert(node_id);
+        }
+    }
+    let mut rows = conn
+        .query(
+            "SELECT recipe_node_id FROM condition_evaluations
+         WHERE execution_id = ?1 AND outcome = 'routed'",
+            (execution_id,),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        protected.insert(row.text(0)?);
+    }
+    for node in &nodes {
+        if node.node_type == "trigger" {
+            protected.insert(node.id.clone());
+        }
+    }
+
+    // Evaluate each required edge once with the same contract as launch
+    // readiness. A fired port is a boundary, even on an otherwise failed node.
+    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges
+        .iter()
+        .filter(|edge| edge.edge_type == "control" && edge.target_handle != "continue")
+    {
+        if protected.contains(&edge.target_node_id) {
+            continue;
+        }
+        // Projection may still say Complete immediately after a continuation
+        // fails. Its fresh failure fact outranks that stale job cache.
+        let failed_job_source = failed.contains(&edge.source_node_id)
+            && !protected.contains(&edge.source_node_id)
+            && !matches!(
+                node_map
+                    .get(edge.source_node_id.as_str())
+                    .map(|n| n.node_type.as_str()),
+                Some("action" | "pr" | "condition" | "decision" | "trigger")
+            );
+        if failed_job_source
+            || !is_action_node_ready_with_snapshot_conn(
+                conn,
+                execution_id,
+                &edge.target_node_id,
+                std::slice::from_ref(edge),
+                &node_map,
+            )
+            .await?
+        {
+            outgoing
+                .entry(edge.source_node_id.clone())
+                .or_default()
+                .push(edge.target_node_id.clone());
+        }
+    }
+    failed.retain(|id| !protected.contains(id) && node_map.contains_key(id.as_str()));
+    let mut queue: VecDeque<String> = failed.iter().cloned().collect();
+    let mut visited = failed.clone();
+    let mut impossible = HashSet::new();
+    while let Some(source) = queue.pop_front() {
+        if let Some(targets) = outgoing.get(&source) {
+            for target in targets {
+                if !node_map.contains_key(target.as_str()) {
+                    continue;
+                }
+                if !failed.contains(target) {
+                    impossible.insert(target.clone());
+                }
+                if visited.insert(target.clone()) {
+                    queue.push_back(target.clone());
+                }
+            }
+        }
+    }
+    Ok(DependencyFailureAnalysis {
+        impossible_nodes: impossible,
+        has_unprojected_failure: failed.iter().any(|id| unprojected_failures.contains(id)),
+    })
+}
+
 pub async fn is_job_ready_conn(
     conn: &cairn_db::storage::TrackedConnection,
     job: &DbJob,
@@ -480,6 +719,349 @@ mod tests {
         conn.execute("INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES ('child','p-1',2,'Child','active','active','none',1,1)", ()).await.unwrap();
         let snapshot_json = snapshot("child").to_json().unwrap();
         conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, snapshot) VALUES ('e-1','recipe-1','child','p-1','running',1,?1)", params![snapshot_json]).await.unwrap();
+    }
+
+    fn required_edge(source: &str, target: &str) -> RecipeEdge {
+        RecipeEdge {
+            id: format!("{source}-{target}"),
+            edge_type: RecipeEdgeType::Control,
+            source_node_id: source.into(),
+            source_handle: "output".into(),
+            target_node_id: target.into(),
+            target_handle: "input".into(),
+        }
+    }
+
+    async fn dependency_job(
+        conn: &cairn_db::storage::TrackedConnection,
+        id: &str,
+        node_id: &str,
+        status: &str,
+        state: Option<&str>,
+        created_at: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,created_at,updated_at)
+             VALUES(?1,'e-1',?2,'child','p-1',?3,?4,?4)",
+            params![id, node_id, status, created_at],
+        ).await.unwrap();
+        if let Some(state) = state {
+            conn.execute(
+                "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+                 VALUES(?1,?1,?2,1,?3,'initial',?4,?4)",
+                params![format!("turn-{id}"), id, state, created_at],
+            ).await.unwrap();
+        }
+    }
+
+    async fn dependency_result(
+        conn: &cairn_db::storage::TrackedConnection,
+        snapshot: &ExecutionSnapshot,
+        claimed: &[&str],
+    ) -> HashSet<String> {
+        dependency_impossible_nodes_conn(
+            conn,
+            "e-1",
+            snapshot,
+            &claimed.iter().map(|id| id.to_string()).collect(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dependency_impossibility_crosses_unstarted_pr_action_condition_and_decision() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed(conn).await;
+                let mut s = snapshot("child");
+                s.recipe.nodes = vec![
+                    node("planner", RecipeNodeType::Agent),
+                    node("builder", RecipeNodeType::Agent),
+                    node("pr", RecipeNodeType::Pr),
+                    node("condition", RecipeNodeType::Condition),
+                    node("decision", RecipeNodeType::Decision),
+                    node("action", RecipeNodeType::Action),
+                    node("review", RecipeNodeType::Agent),
+                    node("parallel", RecipeNodeType::Agent),
+                ];
+                let path = [
+                    "planner",
+                    "builder",
+                    "pr",
+                    "condition",
+                    "decision",
+                    "action",
+                    "review",
+                ];
+                s.recipe.edges = path
+                    .windows(2)
+                    .map(|pair| required_edge(pair[0], pair[1]))
+                    .collect();
+                dependency_job(
+                    conn,
+                    "planner-job",
+                    "planner",
+                    "complete",
+                    Some("complete"),
+                    1,
+                )
+                .await;
+                dependency_job(conn, "builder-job", "builder", "failed", Some("failed"), 1).await;
+                dependency_job(conn, "review-job", "review", "pending", None, 1).await;
+                dependency_job(
+                    conn,
+                    "parallel-job",
+                    "parallel",
+                    "running",
+                    Some("running"),
+                    1,
+                )
+                .await;
+                let expected: HashSet<String> = ["pr", "condition", "decision", "action", "review"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                assert_eq!(dependency_result(conn, &s, &[]).await, expected);
+                // Persisted inherited failures are not independent roots. Stopping
+                // the real failing source must make the entire chain resumable.
+                conn.execute("UPDATE jobs SET status='failed' WHERE id='review-job'", ())
+                    .await?;
+                conn.execute(
+                    "UPDATE turns SET state='interrupted' WHERE job_id='builder-job'",
+                    (),
+                )
+                .await?;
+                assert!(dependency_result(conn, &s, &[]).await.is_empty());
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dependency_impossibility_preserves_current_attempts_live_claimed_and_outcomes() {
+        let db = test_db().await;
+        db.write(|conn| Box::pin(async move {
+            seed(conn).await;
+            let mut s = snapshot("child");
+            s.recipe.nodes = vec![node("root", RecipeNodeType::Agent)];
+            s.recipe.edges.clear();
+            dependency_job(conn, "root-job", "root", "failed", Some("failed"), 1).await;
+            let cases = [
+                ("pending", "pending", None, true),
+                ("inherited", "failed", None, true),
+                ("live", "running", Some("running"), false),
+                ("yielded", "running", Some("yielded"), false),
+                ("stopped-target", "pending", Some("interrupted"), false),
+                ("cancelled-target", "pending", Some("cancelled"), false),
+                ("complete", "complete", Some("complete"), false),
+                ("output-gate", "blocked", Some("complete"), false),
+                ("claimed", "pending", None, false),
+                ("starting", "pending", None, false),
+                ("retry", "failed", Some("failed"), false),
+            ];
+            for (id, status, state, _) in cases {
+                s.recipe.nodes.push(node(id, RecipeNodeType::Agent));
+                s.recipe.nodes.push(node(&format!("{id}-child"), RecipeNodeType::Agent));
+                s.recipe.edges.push(required_edge("root", id));
+                s.recipe.edges.push(required_edge(id, &format!("{id}-child")));
+                dependency_job(conn, id, id, status, state, 1).await;
+            }
+            dependency_job(conn, "retry-success", "retry", "complete", Some("complete"), 2).await;
+            conn.execute("INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('start-run','starting','starting',2,2)", ()).await?;
+            dependency_job(conn, "archived-root", "root", "pending", None, 0).await;
+            let result = dependency_result(conn, &s, &["claimed", "archived-root"]).await;
+            for (id, _, _, impossible) in cases {
+                assert_eq!(result.contains(id), impossible, "{id}");
+                assert_eq!(result.contains(&format!("{id}-child")), impossible, "{id} child");
+            }
+            // Retrying the failure root successfully removes its old failure,
+            // even though its earlier attempt and failed turn remain persisted.
+            dependency_job(conn, "root-retry", "root", "complete", Some("complete"), 2).await;
+            assert!(dependency_result(conn, &s, &[]).await.is_empty());
+            Ok(())
+        })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dependency_impossibility_requires_positive_failure_not_stop_or_missing_work() {
+        let db = test_db().await;
+        db.write(|conn| Box::pin(async move {
+            seed(conn).await;
+            let mut s = snapshot("child");
+            s.recipe.nodes.clear();
+            s.recipe.edges.clear();
+            let cases = [
+                ("failed-turn", "failed", Some("failed"), None, true),
+                ("stale-complete", "complete", Some("failed"), None, true),
+                ("failed-run", "failed", None, Some("failed"), true),
+                ("crashed-run", "failed", None, Some("crashed"), true),
+                ("stopped", "failed", Some("interrupted"), Some("crashed"), false),
+                ("cancelled-turn", "pending", Some("cancelled"), Some("failed"), false),
+                ("cancelled-job", "cancelled", Some("failed"), None, false),
+                ("inherited", "failed", None, None, false),
+                ("parked", "pending", None, None, false),
+                ("blocked", "blocked", Some("complete"), None, false),
+                ("ordinary-exit", "pending", None, Some("exited"), false),
+            ];
+            for (id, status, state, run, _) in cases {
+                s.recipe.nodes.push(node(id, RecipeNodeType::Agent));
+                let child = format!("{id}-child");
+                s.recipe.nodes.push(node(&child, RecipeNodeType::Agent));
+                s.recipe.edges.push(required_edge(id, &child));
+                dependency_job(conn, id, id, status, state, 1).await;
+                if let Some(run) = run {
+                    conn.execute("INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES(?1,?2,?3,1,1)",
+                        params![format!("run-{id}"), id, run]).await?;
+                }
+            }
+            let result = dependency_result(conn, &s, &[]).await;
+            for (id, _, _, _, impossible) in cases {
+                assert_eq!(result.contains(&format!("{id}-child")), impossible, "{id}");
+            }
+            conn.execute("UPDATE runs SET exit_reason='user_stop' WHERE job_id='failed-run'", ()).await?;
+            conn.execute("UPDATE turns SET end_reason='user_stop' WHERE job_id='failed-turn'", ()).await?;
+            let stopped = dependency_result(conn, &s, &[]).await;
+            assert!(!stopped.contains("failed-run-child"));
+            assert!(!stopped.contains("failed-turn-child"));
+            Ok(())
+        })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dependency_impossibility_respects_readiness_edges_ports_and_action_attempts() {
+        let db = test_db().await;
+        db.write(|conn| Box::pin(async move {
+            seed(conn).await;
+            let mut s = snapshot("child");
+            s.recipe.nodes = vec![node("root", RecipeNodeType::Agent)];
+            s.recipe.edges.clear();
+            dependency_job(conn, "root", "root", "failed", Some("failed"), 1).await;
+            for (id, kind) in [
+                ("pr", RecipeNodeType::Pr), ("action", RecipeNodeType::Action),
+                ("condition", RecipeNodeType::Condition), ("decision", RecipeNodeType::Decision),
+                ("trigger", RecipeNodeType::Trigger), ("open-pr", RecipeNodeType::Pr),
+                ("failed-action", RecipeNodeType::Action),
+            ] {
+                s.recipe.nodes.push(node(id, kind));
+                s.recipe.edges.push(required_edge("root", id));
+                let child = format!("{id}-child");
+                s.recipe.nodes.push(node(&child, RecipeNodeType::Agent));
+                let mut edge = required_edge(id, &child);
+                edge.source_handle = "open".into();
+                s.recipe.edges.push(edge);
+            }
+            for id in ["continue", "data"] {
+                s.recipe.nodes.push(node(id, RecipeNodeType::Agent));
+                let mut edge = required_edge("root", id);
+                if id == "continue" { edge.target_handle = "continue".into(); }
+                else { edge.edge_type = RecipeEdgeType::Context; }
+                s.recipe.edges.push(edge);
+            }
+            conn.execute("INSERT INTO pr_node_port_fires(id,execution_id,recipe_node_id,port,fired_at) VALUES('fire','e-1','pr','open',1)", ()).await?;
+            for (id, status, time) in [("action", "complete", 1), ("open-pr", "blocked", 1), ("failed-action", "running", 1), ("failed-action", "failed", 2)] {
+                conn.execute("INSERT INTO action_runs(id,execution_id,recipe_node_id,action_config_id,project_id,status,created_at) VALUES(?1,'e-1',?2,'builtin:pr','p-1',?3,?4)",
+                    params![format!("{id}-{time}"), id, status, time]).await?;
+            }
+            for id in ["condition", "decision"] {
+                conn.execute("INSERT INTO condition_evaluations(id,execution_id,recipe_node_id,result_port,outcome,evaluated_at) VALUES(?1,'e-1',?1,'open','routed',1)", params![id]).await?;
+                // The latest routed row is authoritative, but a later blocked
+                // evaluation must not erase the already-fired route.
+                conn.execute("INSERT INTO condition_evaluations(id,execution_id,recipe_node_id,result_port,outcome,evaluated_at) VALUES(?1,'e-1',?2,'other','routed',2)",
+                    params![format!("{id}-new"), id]).await?;
+                conn.execute("INSERT INTO condition_evaluations(id,execution_id,recipe_node_id,result_port,outcome,evaluated_at) VALUES(?1,'e-1',?2,'','blocked',3)",
+                    params![format!("{id}-blocked"), id]).await?;
+            }
+            let result = dependency_result(conn, &s, &[]).await;
+            assert_eq!(result, ["pr", "failed-action-child"].into_iter().map(str::to_string).collect());
+            // A different, unsatisfied PR port remains downstream of failure.
+            s.recipe.edges.iter_mut().find(|e| e.source_node_id == "pr").unwrap().source_handle = "merge".into();
+            assert!(dependency_result(conn, &s, &[]).await.contains("pr-child"));
+            Ok(())
+        })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dependency_impossibility_distinguishes_abandoned_output_from_blocked_and_late_output()
+    {
+        let db = test_db().await;
+        db.write(|conn| Box::pin(async move {
+            seed(conn).await;
+            let mut s = snapshot("child");
+            let mut output = node("output", RecipeNodeType::Artifact);
+            output.artifact_config = Some(serde_json::from_value(serde_json::json!({
+                "name": "result", "schema": {"type": "object"}
+            })).unwrap());
+            s.recipe.nodes = vec![
+                node("builder", RecipeNodeType::Agent),
+                node("pr", RecipeNodeType::Pr),
+                node("review", RecipeNodeType::Agent),
+                output,
+            ];
+            let mut context = required_edge("builder", "output");
+            context.edge_type = RecipeEdgeType::Context;
+            context.source_handle = "context-out".into();
+            context.target_handle = "context-in".into();
+            s.recipe.edges = vec![
+                required_edge("builder", "pr"),
+                required_edge("pr", "review"),
+                context,
+            ];
+            dependency_job(conn, "builder", "builder", "complete", Some("complete"), 1).await;
+            dependency_job(conn, "review", "review", "pending", None, 1).await;
+            // Missing required output is a resumable Blocked gate, not failure.
+            assert!(dependency_result(conn, &s, &[]).await.is_empty());
+            conn.execute("UPDATE jobs SET return_abandoned_at=2 WHERE id='builder'", ()).await?;
+            let expected = ["pr", "review"].into_iter().map(str::to_string).collect();
+            assert_eq!(dependency_result(conn, &s, &[]).await, expected);
+            // An unrelated living document cannot satisfy the terminal contract.
+            conn.execute("INSERT INTO artifacts(id,job_id,artifact_type,output_name,data,confirmed,created_at,updated_at)
+                VALUES('living','builder','custom','notes','{}',1,3,3)", ()).await?;
+            assert!(dependency_result(conn, &s, &[]).await.contains("review"));
+            // The real output arriving late completes the work, even while the
+            // job cache still holds the earlier abandonment's failed projection.
+            conn.execute("UPDATE jobs SET status='failed' WHERE id='builder'", ()).await?;
+            conn.execute("INSERT INTO artifacts(id,job_id,artifact_type,output_name,data,confirmed,created_at,updated_at)
+                VALUES('result','builder','custom','result','{}',1,4,4)", ()).await?;
+            assert!(dependency_result(conn, &s, &[]).await.is_empty());
+            Ok(())
+        })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dependency_impossibility_walks_large_shared_dag_without_depth_limit() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed(conn).await;
+                let mut s = snapshot("child");
+                s.recipe.nodes = vec![node("root", RecipeNodeType::Agent)];
+                s.recipe.edges.clear();
+                dependency_job(conn, "root", "root", "failed", Some("failed"), 1).await;
+                // More than a typical recipe's size and deeper than a recursive SQL
+                // cutoff: every intermediate deliberately has no runtime row.
+                for index in 0..512 {
+                    let id = format!("node-{index}");
+                    s.recipe.nodes.push(node(&id, RecipeNodeType::Action));
+                    let previous = if index == 0 {
+                        "root".into()
+                    } else {
+                        format!("node-{}", index - 1)
+                    };
+                    s.recipe.edges.push(required_edge(&previous, &id));
+                    if index > 1 {
+                        s.recipe.edges.push(required_edge("node-0", &id));
+                    }
+                }
+                assert_eq!(dependency_result(conn, &s, &[]).await.len(), 512);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 
     /// Readiness is the DAG's alone. An issue-scoped job is not held by any

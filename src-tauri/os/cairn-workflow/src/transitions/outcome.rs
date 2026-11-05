@@ -256,6 +256,23 @@ pub async fn recompute_issue_status_conn(
     conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<StatusWrite> {
+    recompute_issue_status_with_reopen_conn(conn, issue_id, false).await
+}
+
+/// Project after explicit unresolve has already advanced the resolution identity
+/// and cleared completion timestamps in this transaction.
+pub async fn recompute_issue_status_after_unresolve_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    issue_id: &str,
+) -> DbResult<StatusWrite> {
+    recompute_issue_status_with_reopen_conn(conn, issue_id, true).await
+}
+
+async fn recompute_issue_status_with_reopen_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    issue_id: &str,
+    explicitly_reopened: bool,
+) -> DbResult<StatusWrite> {
     let Some((progress, attention)) = issue_progress_attention(conn, issue_id).await? else {
         return Ok(StatusWrite::default());
     };
@@ -289,11 +306,32 @@ pub async fn recompute_issue_status_conn(
         .is_ok_and(|projected| projected.is_terminal());
 
     let now = chrono::Utc::now().timestamp();
-    // The `completed_at` backfill is a repair, not a projection write: it fires
-    // whenever a terminated issue is still missing its completion instant, even
-    // when the three projected columns are unchanged. It is self-limiting —
-    // once stamped, the branch never fires for that issue again.
-    if matches!(progress, IssueProgress::Complete | IssueProgress::Failed)
+    let reopened_failure = !is_terminal
+        && stored
+            .as_ref()
+            .is_some_and(|(status, _, _)| status == "failed");
+    if reopened_failure {
+        // A delayed retry can revive failed work without explicit unresolve.
+        // Advance identity with the status write so repeated projections cannot
+        // increment it again; explicit reopen has already advanced it, including
+        // during the subsequent cancelled-job lift. Retain the historical quiet marker.
+        conn.execute(
+            "UPDATE issues
+             SET status = ?1, progress = ?2, attention = ?3, updated_at = ?4,
+                 completed_at = CASE WHEN ?2 = 'complete' THEN ?4 ELSE NULL END,
+                 resolution_generation = resolution_generation + ?6
+             WHERE id = ?5",
+            params![
+                status,
+                progress_text.as_str(),
+                attention_text.as_str(),
+                now,
+                issue_id,
+                i64::from(!explicitly_reopened)
+            ],
+        )
+        .await?;
+    } else if matches!(progress, IssueProgress::Complete | IssueProgress::Failed)
         && issue_completed_at(conn, issue_id).await?.is_none()
     {
         conn.execute(
@@ -658,6 +696,97 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn resolution_state(db: &LocalDb) -> (i64, Option<i64>, Option<i64>) {
+        db.query_one(
+            "SELECT resolution_generation, completed_at, quiet_failure_generation FROM issues WHERE id='i'",
+            (), |row| Ok((row.i64(0)?, row.opt_i64(1)?, row.opt_i64(2)?)),
+        ).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn implicit_failed_reopen_advances_identity_once_for_each_nonterminal_status() {
+        for (execution_status, job_status, expected) in [
+            ("running", "running", "active"),
+            ("running", "idle", "waiting"),
+            ("held", "pending", "backlog"),
+            ("complete", "complete", "complete"),
+        ] {
+            let db = migrated_db().await;
+            seed_issue_with_job(&db, job_status).await;
+            db.execute(
+                "UPDATE executions SET status=?1 WHERE id='e'",
+                (execution_status,),
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE issues SET status='failed', progress='failed', completed_at=42,
+                 resolution_generation=7, quiet_failure_generation=7 WHERE id='i'",
+                (),
+            )
+            .await
+            .unwrap();
+            let reopened = recompute(&db).await;
+            assert!(reopened.changed);
+            assert!(!reopened.became_terminal);
+            assert_eq!(issue_status_attention(&db).await.0, expected);
+            let reopened_state = resolution_state(&db).await;
+            assert_eq!((reopened_state.0, reopened_state.2), (8, Some(7)));
+            if expected == "complete" {
+                assert!(reopened_state.1.is_some_and(|instant| instant != 42));
+            } else {
+                assert_eq!(reopened_state.1, None);
+            }
+            db.execute("UPDATE issues SET updated_at=4242 WHERE id='i'", ())
+                .await
+                .unwrap();
+            assert!(!recompute(&db).await.changed);
+            assert_eq!(resolution_state(&db).await, reopened_state);
+            assert_eq!(issue_updated_at(&db).await, 4242);
+            db.execute("UPDATE jobs SET status='failed' WHERE id='j'", ())
+                .await
+                .unwrap();
+            db.execute("UPDATE executions SET status='failed' WHERE id='e'", ())
+                .await
+                .unwrap();
+            assert!(recompute(&db).await.became_terminal);
+            assert_eq!(resolution_state(&db).await.0, 8);
+            assert!(resolution_state(&db).await.1.is_some());
+            assert!(!recompute(&db).await.became_terminal);
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_failure_and_successful_resolution_do_not_advance_identity() {
+        for (stored_status, execution_status, terminal_column) in [
+            ("failed", "failed", None),
+            ("complete", "running", None),
+            ("merged", "running", Some("merged_at")),
+            ("closed", "running", Some("closed_at")),
+        ] {
+            let db = migrated_db().await;
+            seed_issue_with_job(&db, "failed").await;
+            db.execute(
+                "UPDATE executions SET status=?1 WHERE id='e'",
+                (execution_status,),
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE issues SET status=?1, completed_at=42, quiet_failure_generation=0 WHERE id='i'",
+                (stored_status,),
+            ).await.unwrap();
+            if let Some(column) = terminal_column {
+                db.execute(format!("UPDATE issues SET {column}=42 WHERE id='i'"), ())
+                    .await
+                    .unwrap();
+            }
+            recompute(&db).await;
+            recompute(&db).await;
+            assert_eq!(resolution_state(&db).await, (0, Some(42), Some(0)));
+        }
     }
 
     #[tokio::test]

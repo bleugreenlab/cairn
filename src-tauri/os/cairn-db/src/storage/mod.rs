@@ -2,6 +2,7 @@ mod blocking;
 mod context_tokens;
 mod error;
 mod fact_log;
+mod failed_dependencies;
 mod feed;
 mod local_db;
 mod migration;
@@ -45,6 +46,7 @@ pub use fact_log::{
     set_index_outcome, FactFilter, FactRow, FactScope, FactWake, LogDedupe, NewFact, PruneSelector,
     Recovery, WakeMatch, WakeWindow,
 };
+pub use failed_dependencies::{failed_dependency_candidates, failed_dependency_candidates_conn};
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};
 pub use local_db::{
     db_set_paths, db_set_size, install_crypto_provider, move_db_set, Caller, CheckpointReport,

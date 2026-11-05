@@ -677,7 +677,7 @@ mod tests {
             rendered.contains("team-9 \"Failed child\" failed"),
             "{rendered}"
         );
-        assert!(rendered.contains("retry or delegate a fix"), "{rendered}");
+        assert!(rendered.contains("Retry or delegate a fix"), "{rendered}");
         assert!(!rendered.contains("Successfully"), "{rendered}");
     }
 
@@ -888,6 +888,12 @@ mod tests {
             db.execute_script(
                 "DELETE FROM wake_subscriptions;
                  UPDATE issues SET parent_issue_id = 'parent' WHERE id = 'issue-1';",
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE issues SET status=?1,merged_at=1,closed_at=1 WHERE id='issue-1'",
+                (final_status.to_string(),),
             )
             .await
             .unwrap();
@@ -1191,7 +1197,7 @@ mod tests {
         let db = migrated_db().await;
         seed(&db, "muted", Some(r#"["resolved"]"#), None).await;
         db.execute(
-            "UPDATE issues SET parent_issue_id = 'parent' WHERE id = 'issue-1'",
+            "UPDATE issues SET parent_issue_id = 'parent',status='merged',merged_at=1 WHERE id = 'issue-1'",
             (),
         )
         .await
@@ -1225,6 +1231,12 @@ mod tests {
         use crate::orchestrator::attention_push::list_pending;
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
+        db.execute(
+            "UPDATE issues SET status='failed',completed_at=1 WHERE id='issue-1'",
+            (),
+        )
+        .await
+        .unwrap();
         let orch = test_orchestrator(db);
 
         super::create_resolved_push(
@@ -1255,6 +1267,12 @@ mod tests {
         use crate::orchestrator::attention_push::list_pending;
         let db = migrated_db().await;
         seed(&db, "muted", Some(r#"["resolved"]"#), None).await;
+        db.execute(
+            "UPDATE issues SET status='failed',completed_at=1 WHERE id='issue-1'",
+            (),
+        )
+        .await
+        .unwrap();
         let orch = test_orchestrator(db);
 
         super::create_resolved_push(
@@ -1285,6 +1303,12 @@ mod tests {
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
         add_issue_sub(&db, "child-job").await;
+        db.execute(
+            "UPDATE issues SET status='failed',completed_at=1 WHERE id='issue-1'",
+            (),
+        )
+        .await
+        .unwrap();
         let orch = test_orchestrator(db);
 
         super::create_resolved_push(

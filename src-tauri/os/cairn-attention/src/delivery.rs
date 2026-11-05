@@ -42,91 +42,195 @@ use crate::storage::{run_db_blocking, LocalDb, RowExt};
 /// resolved child issue's own jobs are excluded so a child never receives its own
 /// notification.
 pub fn create_resolved_push(runtime: &AttentionRuntime, event: &AttentionEvent) {
+    if !matches!(event.fact, AttentionFact::Resolved { .. }) {
+        return;
+    }
+    let runtime = runtime.clone();
+    let event = event.clone();
+    if let Err(error) =
+        run_db_blocking(move || async move { create_resolved_push_async(&runtime, &event).await })
+    {
+        log::warn!("resolved push creation failed: {error}");
+    }
+}
+
+pub(crate) async fn create_resolved_push_async(
+    runtime: &AttentionRuntime,
+    event: &AttentionEvent,
+) -> Result<usize, String> {
     let final_status = match &event.fact {
         AttentionFact::Resolved { final_status } => final_status.clone(),
-        _ => return,
+        _ => return Ok(0),
     };
-    let status_text = final_status.to_string();
-    let host = runtime.host.clone();
-    let issue_id = event.issue_id.clone();
-    let issue_uri = event.issue_uri.clone();
+    let db = runtime.host.database_for_issue(&event.issue_id).await?;
+    let Some(identity) =
+        resolution_key(&db, &event.issue_id, &final_status, event.updated_at).await?
+    else {
+        return Ok(0);
+    };
+    let fingerprint = format!("status:{final_status}:{identity}");
+    let key = format!("resolved:{}", event.issue_uri);
+    let watchers =
+        crate::wakes::watcher_jobs_for_issue(runtime.host.clone(), &db, &event.issue_uri).await?;
+    let parent =
+        crate::wakes::coordinating_job_for_child_issue(runtime.host.clone(), &db, &event.issue_uri)
+            .await?;
     let updated_at = event.updated_at;
-    let result = run_db_blocking(move || async move {
-        let db = host
-            .database_for_issue(&issue_id)
+    let mut created = 0;
+    for recipient in watchers {
+        if job_belongs_to_issue(&db, &recipient, &event.issue_id).await? {
+            continue;
+        }
+        let requested = if final_status == crate::models::IssueStatus::Failed
+            || parent.as_deref() == Some(recipient.as_str())
+        {
+            Wake::Wake
+        } else {
+            Wake::Passive
+        };
+        let wake = super::push::source_mute_downgrade(&db, &recipient, &key, requested)
             .await
             .map_err(|e| e.to_string())?;
-        let fingerprint = format!(
-            "status:{final_status}:{}",
-            resolution_key(&db, &issue_id, &final_status, updated_at).await
-        );
-        let key = format!("resolved:{issue_uri}");
-        let watchers = crate::wakes::watcher_jobs_for_issue(host.clone(), &db, &issue_uri).await?;
-        let parent_coordinator =
-            crate::wakes::coordinating_job_for_child_issue(host.clone(), &db, &issue_uri).await?;
-        let mut pushed = Vec::new();
-        for recipient in watchers {
-            if job_belongs_to_issue(&db, &recipient, &issue_id).await? {
-                continue;
-            }
-            // This is the canonical moment a child becomes terminal for its
-            // watchers, so it is where a thread learns that the turns which
-            // discussed that child may now stand behind one chapter line. The
-            // mark is eligibility only — nothing is rewritten here — and it is
-            // idempotent, so re-delivery of the same terminal fact is a no-op.
-            host.mark_thread_chapter(&db, &recipient, &issue_id, &issue_uri, &status_text)
-                .await;
-            if let Some(Some(previous)) =
-                super::push::latest_push_fingerprint(&db, &recipient, &key)
+        let (eligible, inserted) = db
+            .write(|conn| {
+                let issue_id = event.issue_id.clone();
+                let issue_uri = event.issue_uri.clone();
+                let status = final_status.to_string();
+                let fingerprint = fingerprint.clone();
+                let key = key.clone();
+                let recipient = recipient.clone();
+                Box::pin(async move {
+                    // Reopening and replay serialize with insertion, including
+                    // delivered history. A stale event cannot mark a chapter.
+                    let mut rows = conn
+                        .query(
+                            "SELECT status,
+                            CASE status WHEN 'merged' THEN merged_at WHEN 'closed' THEN closed_at
+                                ELSE completed_at END,
+                            resolution_generation, quiet_failure_generation
+                         FROM issues WHERE id=?1",
+                            (issue_id.as_str(),),
+                        )
+                        .await?;
+                    let Some(row) = rows.next().await? else {
+                        return Ok((false, None));
+                    };
+                    let generation = row.i64(2)?;
+                    if row.text(0)? != status
+                        || (status == "failed" && row.opt_i64(3)? == Some(generation))
+                    {
+                        return Ok((false, None));
+                    }
+                    let current = format!(
+                        "status:{status}:{}:{generation}",
+                        row.opt_i64(1)?.unwrap_or(updated_at)
+                    );
+                    if current != fingerprint {
+                        return Ok((false, None));
+                    }
+                    drop(rows);
+                    super::push::push_fingerprinted_conn(
+                        conn,
+                        &recipient,
+                        &issue_uri,
+                        wake,
+                        Boundary::Event,
+                        &key,
+                        Some(&fingerprint),
+                        true,
+                    )
                     .await
-                    .map_err(|e| e.to_string())?
-            {
-                if previous == fingerprint {
-                    continue;
-                }
-            }
-            let requested_wake = if final_status == crate::models::IssueStatus::Failed
-                || parent_coordinator.as_deref() == Some(recipient.as_str())
-            {
-                Wake::Wake
-            } else {
-                Wake::Passive
-            };
-            let (_, effective) = super::push::push_with_fingerprint(
+                    .map(|inserted| (true, inserted))
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if !eligible {
+            continue;
+        }
+        // Chapter bookkeeping is idempotent and also runs on replay: a crash
+        // after push commit but before this mark is repaired by the next boot.
+        runtime
+            .host
+            .mark_thread_chapter(
                 &db,
                 &recipient,
-                &issue_uri,
-                requested_wake,
-                Boundary::Event,
-                &key,
-                Some(&fingerprint),
+                &event.issue_id,
+                &event.issue_uri,
+                &final_status.to_string(),
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .await;
+        if let Some((_, effective)) = inserted {
+            created += 1;
             if effective.wakes_idle() {
-                pushed.push(recipient);
-            }
-        }
-        Ok::<_, String>(pushed)
-    });
-    match result {
-        Ok(recipients) => {
-            runtime.host.emit_change("attention_pushes", None);
-            for recipient in recipients {
-                if let Err(e) = runtime
+                if let Err(error) = runtime
                     .host
                     .nudge(&recipient, cairn_domain::DeliveryUrgency::Steer)
                 {
-                    log::warn!(
-                        "resolved push wake for {} failed: {}",
-                        &recipient[..recipient.len().min(8)],
-                        e
-                    );
+                    log::warn!("resolved push wake for {recipient} failed: {error}");
                 }
             }
         }
-        Err(e) => log::warn!("resolved push creation failed: {}", e),
     }
+    if created > 0 {
+        runtime.host.emit_change("attention_pushes", None);
+    }
+    Ok(created)
+}
+
+/// Recover failed resolutions committed before their attention emit. Existing
+/// pending delivery owns resuming recipients; this only reconstructs missing
+/// pushes through the normal creator and its current watcher/mute policy.
+pub async fn rearm_failed_resolutions(
+    runtime: &AttentionRuntime,
+    db: &LocalDb,
+) -> Result<usize, String> {
+    let candidates = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT i.id, p.key, i.number, COALESCE(i.completed_at,i.updated_at)
+             FROM issues i JOIN projects p ON p.id=i.project_id
+             WHERE i.status='failed'
+               AND (i.quiet_failure_generation IS NULL
+                    OR i.quiet_failure_generation != i.resolution_generation)
+             ORDER BY i.id",
+                        (),
+                    )
+                    .await?;
+                let mut candidates = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    candidates.push((
+                        row.text(0)?,
+                        cairn_common::uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
+                        row.i64(3)?,
+                    ));
+                }
+                Ok(candidates)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut created = 0;
+    for (issue_id, issue_uri, updated_at) in candidates {
+        let event = AttentionEvent {
+            issue_id,
+            issue_uri,
+            updated_at,
+            attention: crate::models::IssueAttention::None,
+            status: crate::models::IssueStatus::Failed,
+            route_provenance: None,
+            fact: AttentionFact::Resolved {
+                final_status: crate::models::IssueStatus::Failed,
+            },
+        };
+        match create_resolved_push_async(runtime, &event).await {
+            Ok(count) => created += count,
+            Err(error) => log::warn!("failed resolution startup re-arm: {error}"),
+        }
+    }
+    Ok(created)
 }
 
 /// Which resolution a resolved push announces — the identity its fingerprint is
@@ -141,16 +245,16 @@ pub fn create_resolved_push(runtime: &AttentionRuntime, event: &AttentionEvent) 
 /// Both halves are load-bearing, for opposite failure modes.
 ///
 /// The **instant** (`merged_at` / `closed_at` / `completed_at`) is written once
-/// by the transition that resolved the issue and cleared by `unresolve`, so it
+/// by the resolving transition and cleared on explicit or implicit reopen, so it
 /// is unmoved by any number of recomputes. That is what stops the replay.
 ///
 /// The **generation** is what makes a genuine re-resolution distinguishable. The
 /// instants are whole seconds, so an issue merged, reopened, and merged again
 /// inside one second would otherwise present two real resolutions under one key,
 /// and the second would be deduplicated into silence — the mirror of the replay
-/// bug, and equally a lie about what happened. `unresolve` increments the
-/// counter, and it is the only way back from a terminal status, so it sits
-/// between any two resolutions by construction (CAIRN-4767).
+/// bug, and equally a lie about what happened. Explicit `unresolve` increments
+/// the counter; the canonical issue projection also increments it when retry
+/// facts reopen failed work, without double-counting explicit reopen.
 ///
 /// A missing instant falls back to the event's own timestamp: weaker
 /// deduplication, but it never suppresses a resolution that has not been
@@ -168,31 +272,25 @@ async fn resolution_key(
     issue_id: &str,
     final_status: &crate::models::IssueStatus,
     fallback_instant: i64,
-) -> String {
+) -> Result<Option<String>, String> {
     use crate::models::IssueStatus;
     let column = match final_status {
         IssueStatus::Merged => "merged_at",
         IssueStatus::Closed => "closed_at",
         _ => "completed_at",
     };
-    match db
-        .query_opt(
-            format!("SELECT {column}, resolution_generation FROM issues WHERE id = ?1"),
-            params![issue_id.to_string()],
-            |row| Ok((row.opt_i64(0)?, row.i64(1)?)),
-        )
-        .await
-    {
-        Ok(Some((instant, generation))) => {
+    db.query_opt(
+        format!("SELECT {column}, resolution_generation FROM issues WHERE id = ?1"),
+        params![issue_id.to_string()],
+        |row| Ok((row.opt_i64(0)?, row.i64(1)?)),
+    )
+    .await
+    .map(|identity| {
+        identity.map(|(instant, generation)| {
             format!("{}:{generation}", instant.unwrap_or(fallback_instant))
-        }
-        // The identity could not be read at all. Rather than invent one out of
-        // defaults — which could collide with a real key and silence a genuine
-        // resolution — emit a key no well-formed identity can equal, so the
-        // guard cannot match and the notice goes out. Delivering twice on a
-        // failed read is the recoverable error; never delivering is not.
-        Ok(None) | Err(_) => format!("{fallback_instant}:unknown"),
-    }
+        })
+    })
+    .map_err(|error| error.to_string())
 }
 
 pub async fn job_belongs_to_issue(
@@ -1033,6 +1131,157 @@ async fn review_artifact_line(runtime: &AttentionRuntime, content_ref: &str) -> 
     ))
 }
 
+/// A persisted own failure, rather than a descendant's inherited failed projection.
+#[derive(Debug, Clone)]
+pub struct FailureEvidence {
+    pub job_id: Option<String>,
+    pub node_uri: String,
+    pub reason: String,
+}
+
+/// Read the latest work attempt only. A failed memory review or an older failed
+/// attempt must not stand in for a successful retry. Synthetic rejection turns
+/// have no run id, so their detail lives on the job's latest run.
+pub async fn job_failure_reason_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> crate::storage::DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT t.state, COALESCE(NULLIF(t.failure_reason,''), NULLIF(r.error_message,''), t.end_reason, r.exit_reason),
+                r.status, r.exit_reason, j.status, j.return_abandoned_at
+         FROM jobs j
+         LEFT JOIN turns t ON t.id=(
+             SELECT id FROM turns WHERE job_id=j.id AND start_reason != 'memory_review'
+             ORDER BY created_at DESC, sequence DESC LIMIT 1)
+         LEFT JOIN runs r ON r.id=COALESCE(t.run_id, (
+             SELECT id FROM runs WHERE job_id=j.id ORDER BY created_at DESC, rowid DESC LIMIT 1))
+         WHERE j.id=?1",
+            (job_id,),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let state = row.opt_text(0)?;
+    // The workflow projection has already evaluated the output contract. Do not
+    // rederive it here: Blocked missing-output work remains nonterminal and silent.
+    if state.as_deref() == Some("complete") && row.text(4)? == "failed" && row.opt_i64(5)?.is_some()
+    {
+        return Ok(Some(
+            "Required output was not produced after the return was abandoned".into(),
+        ));
+    }
+    let own_failure = state.as_deref() == Some("failed")
+        || (state.is_none()
+            && matches!(row.opt_text(2)?.as_deref(), Some("failed" | "crashed"))
+            && row.opt_text(3)?.as_deref() != Some("user_stop"));
+    if !own_failure {
+        return Ok(None);
+    }
+    let reason = row
+        .opt_text(1)?
+        .unwrap_or_else(|| "No failure detail was recorded".into());
+    Ok(Some(one_line_excerpt(&reason)))
+}
+
+/// Find the actual failed producer in the latest canonical execution. Descendants
+/// settled by impossibility have no failed work turn or crashed run of their own.
+pub async fn issue_failure_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    issue_id: &str,
+) -> crate::storage::DbResult<Option<FailureEvidence>> {
+    let mut rows = conn
+        .query(
+            "SELECT j.id, p.key, i.number, e.seq, COALESCE(j.uri_segment,j.node_name),
+                j.recipe_node_id, e.snapshot, j.parent_job_id
+         FROM issues i JOIN projects p ON p.id=i.project_id
+         JOIN executions e ON e.id=(
+             SELECT id FROM executions WHERE issue_id=i.id AND lifecycle='canonical'
+             ORDER BY seq DESC, started_at DESC LIMIT 1)
+         JOIN jobs j ON j.execution_id=e.id
+         WHERE i.id=?1 AND j.status='failed'
+           AND j.id=(SELECT latest.id FROM jobs latest
+               WHERE latest.execution_id=j.execution_id
+                 AND COALESCE(latest.recipe_node_id,latest.uri_segment,latest.node_name,latest.id)
+                     =COALESCE(j.recipe_node_id,j.uri_segment,j.node_name,j.id)
+               ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1)
+         ORDER BY j.updated_at DESC, j.id",
+            (issue_id,),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        // Inherited branches point parent_job_id at an upstream recipe job too.
+        // Snapshot membership, not that pointer, identifies DAG producers.
+        let node_id = row.opt_text(5)?;
+        let snapshot = row.opt_text(6)?;
+        let in_recipe = node_id.is_some()
+            && snapshot
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|value| value.get("recipe")?.get("nodes")?.as_array().cloned())
+                .is_some_and(|nodes| {
+                    nodes
+                        .iter()
+                        .any(|node| node.get("id").and_then(|id| id.as_str()) == node_id.as_deref())
+                });
+        if !in_recipe && row.opt_text(7)?.is_some() {
+            continue;
+        }
+        let job_id = row.text(0)?;
+        let Some(reason) = job_failure_reason_conn(conn, &job_id).await? else {
+            continue;
+        };
+        let Some(segment) = row.opt_text(4)? else {
+            continue;
+        };
+        let node_uri = cairn_common::uri::build_node_uri(
+            &row.text(1)?,
+            row.i64(2)? as i32,
+            row.i64(3)? as i32,
+            &segment,
+        );
+        return Ok(Some(FailureEvidence {
+            job_id: Some(job_id),
+            node_uri,
+            reason,
+        }));
+    }
+    drop(rows);
+    let mut actions = conn
+        .query(
+            "SELECT p.key, i.number, e.seq, a.uri_segment, a.error_message
+         FROM issues i JOIN projects p ON p.id=i.project_id
+         JOIN executions e ON e.id=(
+             SELECT id FROM executions WHERE issue_id=i.id AND lifecycle='canonical'
+             ORDER BY seq DESC, started_at DESC LIMIT 1)
+         JOIN action_runs a ON a.execution_id=e.id
+         WHERE i.id=?1 AND a.status='failed' AND a.uri_segment IS NOT NULL
+           AND a.id=(SELECT latest.id FROM action_runs latest
+               WHERE latest.execution_id=a.execution_id AND latest.recipe_node_id=a.recipe_node_id
+               ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1)
+         ORDER BY a.completed_at DESC, a.created_at DESC, a.id",
+            (issue_id,),
+        )
+        .await?;
+    if let Some(row) = actions.next().await? {
+        return Ok(Some(FailureEvidence {
+            job_id: None,
+            node_uri: cairn_common::uri::build_node_uri(
+                &row.text(0)?,
+                row.i64(1)? as i32,
+                row.i64(2)? as i32,
+                &row.text(3)?,
+            ),
+            reason: one_line_excerpt(
+                &row.opt_text(4)?
+                    .unwrap_or_else(|| "No failure detail was recorded".into()),
+            ),
+        }));
+    }
+    Ok(None)
+}
+
 async fn resolved_issue_confirmation(
     runtime: &AttentionRuntime,
     issue_uri: &str,
@@ -1053,10 +1302,14 @@ async fn resolved_issue_confirmation(
                 crate::models::IssueStatus::Merged => "merged",
                 crate::models::IssueStatus::Closed => "closed",
                 crate::models::IssueStatus::Failed => {
+                    let detail = match issue_failure_conn(conn, &issue.issue_id).await? {
+                        Some(failure) => format!("{} — {}", failure.node_uri, failure.reason),
+                        None => "No failure detail was recorded; inspect the child".into(),
+                    };
                     return Ok(Some(format!(
-                        "{}-{} \"{}\" failed — inspect the child and retry or delegate a fix",
+                        "{}-{} \"{}\" failed: {detail}. Retry or delegate a fix.",
                         issue.project_key, issue.number, issue.title
-                    )))
+                    )));
                 }
                 _ => return Ok(None),
             };

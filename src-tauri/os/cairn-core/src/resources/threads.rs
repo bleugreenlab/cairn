@@ -799,7 +799,7 @@ pub(super) async fn read_thread(
                     concat!(
                         "SELECT i.id, i.number, i.title, CASE WHEN ",
                         cairn_db::open_thread_child_sql!(),
-                        " THEN 1 ELSE 0 END
+                        " THEN 1 ELSE 0 END, i.status
                            FROM issues i WHERE i.parent_thread_id = ?1 ORDER BY i.number"
                     ),
                     params![id.as_str()],
@@ -811,12 +811,12 @@ pub(super) async fn read_thread(
             };
             let mut listed = Vec::new();
             while let Ok(Some(row)) = children.next().await {
-                let (Ok(issue_id), Ok(number), Ok(title), Ok(open)) =
-                    (row.text(0), row.i64(1), row.text(2), row.i64(3))
+                let (Ok(issue_id), Ok(number), Ok(title), Ok(open), Ok(status)) =
+                    (row.text(0), row.i64(1), row.text(2), row.i64(3), row.text(4))
                 else {
                     continue;
                 };
-                listed.push((issue_id, number, title, open != 0));
+                listed.push((issue_id, number, title, open != 0, status));
             }
             drop(children);
             let ids: Vec<String> = listed.iter().map(|(id, ..)| id.clone()).collect();
@@ -831,7 +831,7 @@ pub(super) async fn read_thread(
             // open PR. A held start on this thread waits behind them.
             let open: Vec<String> = listed
                 .iter()
-                .filter(|(.., open)| *open)
+                .filter(|(_, _, _, open, _)| *open)
                 .map(|(_, number, ..)| number.to_string())
                 .collect();
             let limit = default_open_children.max(1);
@@ -843,14 +843,28 @@ pub(super) async fn read_thread(
                 };
                 out.push_str(&format!("Open {}/{limit}{numbers}\n\n", open.len()));
             }
-            for (issue_id, number, title, _) in &listed {
+            for (issue_id, number, title, _, status) in &listed {
                 let held_line = held
                     .remove(issue_id)
                     .and_then(|gated| gated.held.into_iter().next())
                     .map(|execution| format!(" · {}", execution.line))
                     .unwrap_or_default();
+                let failed_line = if status == "failed" {
+                    match cairn_attention::delivery::issue_failure_conn(conn, issue_id)
+                        .await
+                        .ok()
+                        .flatten()
+                    {
+                        Some(failure) => format!(
+                            " · Failed: {} — `{}`", failure.reason, failure.node_uri
+                        ),
+                        None => " · Failed".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
                 out.push_str(&format!(
-                    "- [{number} — {title}](cairn://p/{}/{number}){held_line}\n",
+                    "- [{number} — {title}](cairn://p/{}/{number}){failed_line}{held_line}\n",
                     project.project_key
                 ));
             }
@@ -868,6 +882,30 @@ pub(super) async fn read_thread(
 mod children_tests {
     use crate::execution::gates::sweep::tests::{env, file};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn failed_projection_children_name_failed_without_consuming_an_open_slot() {
+        let env = env("thread-children-failed-projection.db").await;
+        env.db
+            .execute_script(
+                "INSERT INTO threads(id, project_id, name, created_at, updated_at)
+               VALUES('th', 'p', 'harness', 1, 1);
+             UPDATE issues SET parent_thread_id = 'th', status = 'failed' WHERE id = 'i1';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('failed-exec','recipe','i1','p','failed',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment,
+                              status, created_at, updated_at)
+               VALUES('failed-job','failed-exec','i1','p','Builder','builder','failed',1,1);
+             INSERT INTO runs(id, job_id, issue_id, status, error_message, created_at, updated_at)
+               VALUES('failed-run','failed-job','i1','crashed','Launch refused',1,1);",
+            )
+            .await
+            .unwrap();
+        let page = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
+        assert!(page.contains("Open 0/4"), "{page}");
+        assert!(page.contains("Failed"), "{page}");
+        assert!(page.contains("Launch refused"), "{page}");
+    }
 
     /// A thread's children read the queue's own line, and the open paragraph
     /// counts against the workspace limit.

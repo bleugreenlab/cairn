@@ -477,7 +477,7 @@ pub async fn push(
 /// A direct's source is its sender (peer/user axis), not the subject URI, so the
 /// direct creator applies the same [`crate::wakes::mute_downgrade`]
 /// rule explicitly at its own site rather than here.
-async fn source_mute_downgrade(
+pub(crate) async fn source_mute_downgrade(
     db: &LocalDb,
     recipient: &str,
     key: &str,
@@ -586,76 +586,117 @@ pub async fn push_with_fingerprint(
     let content_ref = cairn_common::uri::canonicalize_uri_identity(content_ref);
     let key = cairn_common::uri::canonicalize_uri_identity(key);
     let fingerprint = fingerprint.map(|s| s.to_string());
+    db.write(|conn| {
+        let recipient = recipient.clone();
+        let content_ref = content_ref.clone();
+        let key = key.clone();
+        let fingerprint = fingerprint.clone();
+        Box::pin(async move {
+            push_fingerprinted_conn(
+                conn,
+                &recipient,
+                &content_ref,
+                wake,
+                boundary,
+                &key,
+                fingerprint.as_deref(),
+                false,
+            )
+            .await?
+            .ok_or_else(|| DbError::Row("push unexpectedly deduplicated".into()))
+        })
+    })
+    .await
+}
+
+/// Insert or supersede a push using the caller's transaction. With deduplication,
+/// an identical fingerprint in pending OR delivered history is a no-op.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn push_fingerprinted_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    recipient: &str,
+    content_ref: &str,
+    wake: Wake,
+    boundary: Boundary,
+    key: &str,
+    fingerprint: Option<&str>,
+    deduplicate: bool,
+) -> DbResult<Option<(String, Wake)>> {
+    let canonical_content_ref = cairn_common::uri::canonicalize_uri_identity(content_ref);
+    let content_ref = canonical_content_ref.as_str();
+    let canonical_key = cairn_common::uri::canonicalize_uri_identity(key);
+    let key = canonical_key.as_str();
     let now = now_ts();
-    let id = db
-        .write(|conn| {
-            let recipient = recipient.clone();
-            let content_ref = content_ref.clone();
-            let key = key.clone();
-            let fingerprint = fingerprint.clone();
-            let id = Uuid::new_v4().to_string();
-            Box::pin(async move {
-                // Supersede in place: update the existing undelivered same-key row if
-                // one exists, otherwise insert a fresh row. db.write serializes the
-                // transaction so the update-then-insert is atomic; the partial unique
-                // index on (recipient, key) WHERE delivered_event_id IS NULL guards
-                // against a concurrent double-insert. (An ON CONFLICT upsert keyed on
-                // that partial index isn't accepted by the Turso SQL parser.)
-                let updated = conn
-                    .execute(
-                        "UPDATE attention_pushes
+    let id = Uuid::new_v4().to_string();
+    if deduplicate {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM attention_pushes
+             WHERE recipient=?1 AND key=?2 AND fingerprint=?3 LIMIT 1",
+                params![recipient, key, fingerprint],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(None);
+        }
+    }
+    // Supersede in place: update the existing undelivered same-key row if
+    // one exists, otherwise insert a fresh row. db.write serializes the
+    // transaction so the update-then-insert is atomic; the partial unique
+    // index on (recipient, key) WHERE delivered_event_id IS NULL guards
+    // against a concurrent double-insert. (An ON CONFLICT upsert keyed on
+    // that partial index isn't accepted by the Turso SQL parser.)
+    let updated = conn
+        .execute(
+            "UPDATE attention_pushes
                      SET content_ref=?1, wake=?2, boundary=?3, created_at=?4, fingerprint=?5
                      WHERE recipient=?6 AND key=?7
                        AND delivered_event_id IS NULL AND retired_at IS NULL",
-                        params![
-                            content_ref.as_str(),
-                            wake.as_str(),
-                            boundary.as_str(),
-                            now,
-                            fingerprint.as_deref(),
-                            recipient.as_str(),
-                            key.as_str()
-                        ],
-                    )
-                    .await?;
-                if updated == 0 {
-                    conn.execute(
-                        "INSERT INTO attention_pushes
+            params![
+                content_ref,
+                wake.as_str(),
+                boundary.as_str(),
+                now,
+                fingerprint,
+                recipient,
+                key
+            ],
+        )
+        .await?;
+    if updated == 0 {
+        conn.execute(
+            "INSERT INTO attention_pushes
                        (id, recipient, content_ref, wake, boundary, key, created_at, fingerprint)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                        params![
-                            id.as_str(),
-                            recipient.as_str(),
-                            content_ref.as_str(),
-                            wake.as_str(),
-                            boundary.as_str(),
-                            key.as_str(),
-                            now,
-                            fingerprint.as_deref()
-                        ],
-                    )
-                    .await?;
-                }
-                // The updated row keeps its original id; read back the canonical
-                // undelivered row's id (the partial unique index guarantees one).
-                let mut rows = conn
-                    .query(
-                        "SELECT id FROM attention_pushes
+            params![
+                id.as_str(),
+                recipient,
+                content_ref,
+                wake.as_str(),
+                boundary.as_str(),
+                key,
+                now,
+                fingerprint
+            ],
+        )
+        .await?;
+    }
+    // The updated row keeps its original id; read back the canonical
+    // undelivered row's id (the partial unique index guarantees one).
+    let mut rows = conn
+        .query(
+            "SELECT id FROM attention_pushes
                      WHERE recipient=?1 AND key=?2
                        AND delivered_event_id IS NULL AND retired_at IS NULL
                      LIMIT 1",
-                        params![recipient.as_str(), key.as_str()],
-                    )
-                    .await?;
-                let row = rows
-                    .next()
-                    .await?
-                    .ok_or_else(|| DbError::Row("push row missing after upsert".into()))?;
-                row.text(0)
-            })
-        })
+            params![recipient, key],
+        )
         .await?;
-    Ok((id, wake))
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| DbError::Row("push row missing after upsert".into()))?;
+    Ok(Some((row.text(0)?, wake)))
 }
 
 /// The `fingerprint` of the most recent push (delivered OR undelivered) for

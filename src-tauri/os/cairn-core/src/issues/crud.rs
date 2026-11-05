@@ -848,12 +848,9 @@ pub async fn unresolve(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), 
     db.write(|conn| {
         let id = id.clone();
         Box::pin(async move {
-            // Bumping the generation here is what gives a resolution a durable
-            // identity. An unresolve is the only way back from a terminal
-            // status, so it sits between any two resolutions by construction --
-            // which makes the counter separate them however close together in
-            // time they fall, where the second-resolution `merged_at`/`closed_at`
-            // /`completed_at` instants cannot (CAIRN-4767).
+            // Explicit reopen advances identity even within the same second.
+            // The projection also advances it when live retry facts implicitly
+            // reopen Failed work; tell that shared projection we already did so.
             conn.execute(
                 "UPDATE issues
                  SET merged_at = NULL, closed_at = NULL, completed_at = NULL,
@@ -863,7 +860,8 @@ pub async fn unresolve(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), 
                 params![now, id.as_str()],
             )
             .await?;
-            crate::transitions::outcome::recompute_issue_status_conn(conn, &id).await?;
+            crate::transitions::outcome::recompute_issue_status_after_unresolve_conn(conn, &id)
+                .await?;
             // In the same write, once the issue no longer reads resolved: lift
             // the jobs the resolution cancelled back onto their own facts.
             // Archived and superseded jobs stay Cancelled.

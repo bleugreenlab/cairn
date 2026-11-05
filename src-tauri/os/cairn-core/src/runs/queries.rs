@@ -39,6 +39,15 @@ pub fn reconcile_stale_runs(
     emitter: &dyn crate::services::EventEmitter,
     boot_at: i64,
 ) {
+    // Repair historical failed dependency projections before any ordinary
+    // startup re-projection can announce their resolution as new work.
+    let workflow = crate::workflow_host::runtime(orch);
+    if let Err(error) = crate::execution::advancement::run_advancement_db(async move {
+        cairn_workflow::advancement::recompute::heal_failed_dependencies(&workflow).await;
+        Ok::<_, String>(())
+    }) {
+        log::warn!("Startup failed-dependency repair failed: {error}");
+    }
     // Every `leased`/`starting` row is about to be requeued by ordinary
     // admission recovery, so all three pending states are relaunchable. A run
     // whose row is `active` had a process that died with the predecessor: it is

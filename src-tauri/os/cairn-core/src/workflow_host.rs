@@ -24,6 +24,21 @@ pub(crate) fn runtime(orch: &Orchestrator) -> WorkflowRuntime {
     )
 }
 
+/// Replay missed failed-resolution notices in every currently mounted owning
+/// database. The normal attention creator rechecks identity under its push write
+/// transaction, so startup can race safely with live resolution emitters.
+pub async fn rearm_failed_resolutions_on_startup(orch: &Orchestrator) -> usize {
+    let attention = crate::attention_host::runtime(orch);
+    let mut created = 0;
+    for db in orch.db.all_dbs().await {
+        match cairn_attention::delivery::rearm_failed_resolutions(&attention, &db).await {
+            Ok(count) => created += count,
+            Err(error) => log::warn!("failed resolution startup re-arm: {error}"),
+        }
+    }
+    created
+}
+
 struct CoreWorkflowHost(Orchestrator);
 
 /// The project an execution belongs to, so its decision resolves offers in
@@ -404,5 +419,672 @@ fn publish_projection(orch: &Orchestrator, execution_id: &str, outcome: &Recompu
             crate::orchestrator::lifecycle::evaluate_review_readiness(&orch_for_review, &issue_id)
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod failed_resolution_integration_tests {
+    use super::*;
+    use crate::models::{
+        ExecutionSnapshot, NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType,
+        RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
+    };
+    use crate::storage::{RowExt, SearchIndex};
+
+    fn node(id: &str, node_type: RecipeNodeType) -> RecipeNode {
+        RecipeNode {
+            id: id.into(),
+            name: id.into(),
+            node_type,
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            decision_config: None,
+            context_config: None,
+        }
+    }
+
+    fn snapshot() -> String {
+        let edges = [
+            ("planner", "output", "builder"),
+            ("builder", "output", "pr"),
+            ("pr", "open", "review"),
+        ]
+        .into_iter()
+        .map(|(from, handle, to)| RecipeEdge {
+            id: format!("{from}-{to}"),
+            edge_type: RecipeEdgeType::Control,
+            source_node_id: from.into(),
+            source_handle: handle.into(),
+            target_node_id: to.into(),
+            target_handle: "input".into(),
+        })
+        .collect();
+        ExecutionSnapshot::new(
+            RecipeSnapshot {
+                id: "r".into(),
+                name: "Failure recovery".into(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![
+                    node("planner", RecipeNodeType::Agent),
+                    node("builder", RecipeNodeType::Agent),
+                    node("pr", RecipeNodeType::Pr),
+                    node("review", RecipeNodeType::Agent),
+                ],
+                edges,
+            },
+            Default::default(),
+            Default::default(),
+            TriggerContext {
+                issue_id: Some("child".into()),
+                project_id: "p".into(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+        )
+        .to_json()
+        .unwrap()
+    }
+
+    async fn orchestrator() -> Orchestrator {
+        let db = crate::storage::migrated_test_db("resolved-composed").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('p','w','P','proj','/tmp',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+             VALUES('parent','p',1,'Parent','active','active','none',1,1),
+                   ('child','p',2,'Child','active','active','none',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+             VALUES('exec','r','child','p','running',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,execution_id,recipe_node_id,uri_segment,status,created_at,updated_at)
+             VALUES('planner','p','child','exec','planner','planner','complete',1,1),
+                   ('builder','p','child','exec','builder','builder','running',1,1),
+                   ('review','p','child','exec','review','review','pending',1,1);
+             UPDATE jobs SET parent_job_id='planner' WHERE id='builder';
+             INSERT INTO jobs(id,project_id,issue_id,uri_segment,status,created_at,updated_at)
+             VALUES('watcher','p','parent','watcher','running',1,1);
+             UPDATE issues SET parent_issue_id='parent',parent_job_id='watcher' WHERE id='child';
+             INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+             VALUES('planner-turn','planner-session','planner',1,'complete','initial',1,1),
+                   ('builder-turn','builder-session','builder',1,'running','initial',1,1),
+                   ('watcher-turn','watcher-session','watcher',1,'running','initial',1,1);
+             INSERT INTO wake_subscriptions(id,job_id,source_kind,source_ref,state,created_by,created_at,updated_at)
+             VALUES('watch','watcher','issue','cairn://p/proj/2','active','agent',1,1);"
+        ).await.unwrap();
+        db.execute(
+            "UPDATE executions SET snapshot=?1 WHERE id='exec'",
+            (snapshot(),),
+        )
+        .await
+        .unwrap();
+        orchestrator_for_db(db)
+    }
+
+    fn orchestrator_for_db(db: LocalDb) -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let state = Arc::new(crate::db::DbState::new(Arc::new(db), search));
+        let services = Arc::new(crate::services::testing::TestServicesBuilder::new().build());
+        crate::orchestrator::OrchestratorBuilder::new(state, services, config_dir).build()
+    }
+
+    async fn restart_before_projection(orch: Orchestrator) -> Orchestrator {
+        let path = orch.db.local.path().to_path_buf();
+        drop(orch);
+        orchestrator_for_db(LocalDb::open(path).await.unwrap())
+    }
+
+    async fn project_failure(orch: &Orchestrator) -> RecomputeOutcome {
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::advancement::recompute_execution_jobs_conn(
+                        conn,
+                        "exec",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn assert_live_gap_notice(mixed_action: bool) {
+        for restart in [false, true] {
+            for heal_first in [false, true] {
+                let mut orch = orchestrator().await;
+                // The turn writer commits before the separate job projection.
+                // A failed node-less task independently makes this execution a heal candidate.
+                orch.db.local.execute_script(
+                    "UPDATE turns SET state='failed', failure_reason='Provider failed before projection'
+                     WHERE id='builder-turn';
+                     INSERT INTO jobs(id,project_id,issue_id,execution_id,parent_job_id,uri_segment,status,created_at,updated_at)
+                     VALUES('delegated','p','child','exec','builder','delegated','failed',1,1);"
+                ).await.unwrap();
+                if mixed_action {
+                    orch.db.local.execute_script(
+                        "INSERT INTO action_runs(id,execution_id,recipe_node_id,action_config_id,issue_id,project_id,status,error_message,created_at)
+                         VALUES('historical-pr','exec','pr','builtin:pr','child','p','failed','Old publication failure',1);"
+                    ).await.unwrap();
+                }
+                if restart {
+                    orch = restart_before_projection(orch).await;
+                }
+                assert_eq!(orch.db.local.query_one(
+                    "SELECT j.status,t.state FROM jobs j JOIN turns t ON t.job_id=j.id WHERE j.id='builder'",
+                    (), |row| Ok((row.text(0)?, row.text(1)?)),
+                ).await.unwrap(), ("running".into(), "failed".into()));
+                assert_eq!(
+                    cairn_db::storage::failed_dependency_candidates(&orch.db.local, "", 32,)
+                        .await
+                        .unwrap(),
+                    ["exec"]
+                );
+
+                if heal_first {
+                    // Production boot heals before ordinary re-projection and re-arm.
+                    cairn_workflow::advancement::recompute::heal_failed_dependencies(&runtime(
+                        &orch,
+                    ))
+                    .await;
+                }
+                let outcome = project_failure(&orch).await;
+                if !heal_first {
+                    assert_eq!(outcome.newly_terminal_issue_ids, ["child"]);
+                }
+                let state = orch.db.local.query_one(
+                    "SELECT status,resolution_generation,quiet_failure_generation FROM issues WHERE id='child'",
+                    (), |row| Ok((row.text(0)?, row.i64(1)?, row.opt_i64(2)?)),
+                ).await.unwrap();
+                assert_eq!(
+                    state,
+                    ("failed".into(), 0, None),
+                    "restart={restart}, heal_first={heal_first}, mixed_action={mixed_action}"
+                );
+                for id in ["builder", "review"] {
+                    assert_eq!(
+                        orch.db
+                            .local
+                            .query_opt_text("SELECT status FROM jobs WHERE id=?1", (id,),)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("failed")
+                    );
+                }
+                if restart {
+                    // Startup re-arm may beat the normal post-commit emitter.
+                    assert_eq!(
+                        rearm_failed_resolutions_on_startup(&orch).await,
+                        usize::from(!heal_first)
+                    );
+                }
+                publish_projection(&orch, "exec", &outcome);
+                cairn_workflow::advancement::recompute::heal_failed_dependencies(&runtime(&orch))
+                    .await;
+                assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+                let pending = cairn_attention::push::list_pending(&orch.db.local, "watcher")
+                    .await
+                    .unwrap();
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].key, "resolved:cairn://p/proj/2");
+                assert_eq!(pending[0].wake, cairn_attention::push::Wake::Wake);
+                let rendered = cairn_attention::delivery::render_push_resolved(
+                    &crate::attention_host::runtime(&orch),
+                    &pending[0],
+                )
+                .await;
+                assert!(
+                    rendered.contains("Provider failed before projection"),
+                    "{rendered}"
+                );
+                assert!(
+                    rendered.contains("cairn://p/proj/2/1/builder"),
+                    "{rendered}"
+                );
+                cairn_attention::push::stamp_delivered(
+                    &orch.db.local,
+                    &[pending[0].id.clone()],
+                    "gap-carrier",
+                )
+                .await
+                .unwrap();
+                publish_projection(&orch, "exec", &outcome);
+                let replay = project_failure(&orch).await;
+                publish_projection(&orch, "exec", &replay);
+                cairn_workflow::advancement::recompute::heal_failed_dependencies(&runtime(&orch))
+                    .await;
+                assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+                assert!(
+                    cairn_attention::push::list_pending(&orch.db.local, "watcher")
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(orch.db.local.query_one(
+                    "SELECT COUNT(*) FROM attention_pushes WHERE recipient='watcher' AND key='resolved:cairn://p/proj/2'",
+                    (), |row| row.i64(0),
+                ).await.unwrap(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unprojected_failed_turn_heal_and_restart_deliver_one_resolved() {
+        assert_live_gap_notice(false).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_historical_action_and_unprojected_turn_deliver_one_resolved() {
+        assert_live_gap_notice(true).await;
+    }
+
+    #[tokio::test]
+    async fn historical_action_only_heals_quietly_across_restart_and_rearm() {
+        let orch = orchestrator().await;
+        orch.db.local.execute_script(
+            "UPDATE turns SET state='complete' WHERE id='builder-turn';
+             UPDATE jobs SET status='complete' WHERE id='builder';
+             INSERT INTO jobs(id,project_id,issue_id,execution_id,parent_job_id,uri_segment,status,created_at,updated_at)
+             VALUES('delegated','p','child','exec','builder','delegated','failed',1,1);
+             INSERT INTO action_runs(id,execution_id,recipe_node_id,action_config_id,issue_id,project_id,status,error_message,created_at)
+             VALUES('historical-pr','exec','pr','builtin:pr','child','p','failed','Old publication failure',1);"
+        ).await.unwrap();
+        let orch = restart_before_projection(orch).await;
+        assert_eq!(
+            cairn_db::storage::failed_dependency_candidates(&orch.db.local, "", 32,)
+                .await
+                .unwrap(),
+            ["exec"]
+        );
+        cairn_workflow::advancement::recompute::heal_failed_dependencies(&runtime(&orch)).await;
+        let state = orch.db.local.query_one(
+            "SELECT status,resolution_generation,quiet_failure_generation FROM issues WHERE id='child'",
+            (), |row| Ok((row.text(0)?, row.i64(1)?, row.opt_i64(2)?)),
+        ).await.unwrap();
+        assert_eq!(state, ("failed".into(), 0, Some(0)));
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT status FROM jobs WHERE id='review'", (),)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+        let outcome = project_failure(&orch).await;
+        assert!(outcome.newly_terminal_issue_ids.is_empty());
+        publish_projection(&orch, "exec", &outcome);
+        let orch = restart_before_projection(orch).await;
+        cairn_workflow::advancement::recompute::heal_failed_dependencies(&runtime(&orch)).await;
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+        assert_eq!(orch.db.local.query_one(
+            "SELECT COUNT(*) FROM attention_pushes WHERE recipient='watcher' AND key='resolved:cairn://p/proj/2'",
+            (), |row| row.i64(0),
+        ).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn failure_transaction_to_parent_resolved_replays_once_across_delivery() {
+        for startup_first in [false, true] {
+            let orch = orchestrator().await;
+            let (execution, outcome) = orch
+                .db
+                .local
+                .write(|conn| {
+                    Box::pin(async move {
+                        let projection = cairn_workflow::advancement::record_job_failure_conn(
+                            conn,
+                            "builder",
+                            "Provider launch rejected: executable unavailable",
+                            &HashSet::new(),
+                        )
+                        .await?
+                        .expect("a bound job has an execution");
+                        // Assert the whole invariant BEFORE returning from the transaction.
+                        for (table, id) in [
+                            ("jobs", "builder"),
+                            ("jobs", "review"),
+                            ("executions", "exec"),
+                            ("issues", "child"),
+                        ] {
+                            let mut rows = conn
+                                .query(format!("SELECT status FROM {table} WHERE id=?1"), (id,))
+                                .await?;
+                            assert_eq!(
+                                rows.next().await?.unwrap().text(0)?,
+                                "failed",
+                                "{table}/{id}"
+                            );
+                        }
+                        Ok(projection)
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.newly_terminal_issue_ids, vec!["child".to_string()]);
+            assert!(
+                cairn_attention::push::list_pending(&orch.db.local, "watcher")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "settlement committed without its post-commit emitter"
+            );
+            if startup_first {
+                assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 1);
+            }
+            publish_projection(&orch, &execution, &outcome);
+            assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+            let pending = cairn_attention::push::list_pending(&orch.db.local, "watcher")
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].key, "resolved:cairn://p/proj/2");
+            assert_eq!(pending[0].wake, cairn_attention::push::Wake::Wake);
+            let rendered = cairn_attention::delivery::render_push_resolved(
+                &crate::attention_host::runtime(&orch),
+                &pending[0],
+            )
+            .await;
+            assert!(
+                rendered.contains("cairn://p/proj/2/1/builder"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("Provider launch rejected: executable unavailable"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("/review"), "{rendered}");
+            cairn_attention::push::stamp_delivered(
+                &orch.db.local,
+                &[pending[0].id.clone()],
+                "carrying-event",
+            )
+            .await
+            .unwrap();
+            publish_projection(&orch, &execution, &outcome);
+            assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+            assert!(
+                cairn_attention::push::list_pending(&orch.db.local, "watcher")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let count = orch.db.local.read(|conn| Box::pin(async move {
+                let mut rows = conn.query(
+                    "SELECT COUNT(*) FROM attention_pushes WHERE recipient='watcher' AND key='resolved:cairn://p/proj/2'", ()
+                ).await?;
+                rows.next().await?.unwrap().i64(0)
+            })).await.unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_failure_live_retry_and_rearm_create_exactly_one_fresh_fact() {
+        let orch = orchestrator().await;
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE turns SET state='failed' WHERE id='builder-turn';
+             UPDATE jobs SET status='failed' WHERE id='builder';",
+            )
+            .await
+            .unwrap();
+        let quiet = orch
+            .db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::advancement::recompute::heal_failed_dependencies_conn(
+                        conn,
+                        "exec",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(quiet.newly_terminal_issue_ids.is_empty());
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+        orch.db.local.execute_script(
+            "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+             VALUES('retry','builder-session','builder',2,'running','retry',4,4);"
+        ).await.unwrap();
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::advancement::recompute_execution_jobs_conn(
+                        conn,
+                        "exec",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        let reopened = orch.db.local.query_one(
+            "SELECT resolution_generation, completed_at, quiet_failure_generation FROM issues WHERE id='child'",
+            (), |row| Ok((row.i64(0)?, row.opt_i64(1)?, row.opt_i64(2)?)),
+        ).await.unwrap();
+        assert_eq!(reopened, (1, None, Some(0)));
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+        let (_, outcome) = orch
+            .db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::advancement::record_job_failure_conn(
+                        conn,
+                        "builder",
+                        "Retry independently failed",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.newly_terminal_issue_ids, ["child"]);
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 1);
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+        let pending = cairn_attention::push::list_pending(&orch.db.local, "watcher")
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key, "resolved:cairn://p/proj/2");
+        cairn_attention::push::stamp_delivered(
+            &orch.db.local,
+            &[pending[0].id.clone()],
+            "retry-carrier",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+        let total = orch.db.local.query_one(
+            "SELECT COUNT(*) FROM attention_pushes WHERE recipient='watcher' AND key='resolved:cairn://p/proj/2'",
+            (), |row| row.i64(0),
+        ).await.unwrap();
+        assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_failed_unresolve_advances_resolution_identity_exactly_once() {
+        let orch = orchestrator().await;
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE issues SET status='failed', progress='failed', completed_at=42,
+             quiet_failure_generation=0 WHERE id='child';",
+            )
+            .await
+            .unwrap();
+        crate::issues::crud::unresolve(&orch.db.local, &crate::services::RealClock, "child")
+            .await
+            .unwrap();
+        let state = orch.db.local.query_one(
+            "SELECT status, resolution_generation, completed_at, quiet_failure_generation FROM issues WHERE id='child'",
+            (), |row| Ok((row.text(0)?, row.i64(1)?, row.opt_i64(2)?, row.opt_i64(3)?)),
+        ).await.unwrap();
+        assert_eq!(state, ("active".into(), 1, None, Some(0)));
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::transitions::outcome::recompute_issue_status_conn(conn, "child")
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        let generation = orch
+            .db
+            .local
+            .query_one(
+                "SELECT resolution_generation FROM issues WHERE id='child'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generation, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_unresolve_lifting_cancelled_parallel_work_advances_identity_once() {
+        let orch = orchestrator().await;
+        let mut independent: serde_json::Value = serde_json::from_str(&snapshot()).unwrap();
+        // Review is an independent branch, not a descendant of the failed builder.
+        independent["recipe"]["edges"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|edge| edge["targetNodeId"] != "review");
+        orch.db
+            .local
+            .execute(
+                "UPDATE executions SET snapshot=?1, status='failed' WHERE id='exec'",
+                (independent.to_string(),),
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE turns SET state='failed' WHERE id='builder-turn';
+             UPDATE jobs SET status='failed' WHERE id='builder';
+             UPDATE jobs SET status='cancelled' WHERE id='review';
+             UPDATE issues SET status='closed', progress='closed', closed_at=42,
+             completed_at=42, quiet_failure_generation=0 WHERE id='child';",
+            )
+            .await
+            .unwrap();
+        crate::issues::crud::unresolve(&orch.db.local, &crate::services::RealClock, "child")
+            .await
+            .unwrap();
+        let state = orch.db.local.query_one(
+            "SELECT status, resolution_generation, completed_at, quiet_failure_generation FROM issues WHERE id='child'",
+            (), |row| Ok((row.text(0)?, row.i64(1)?, row.opt_i64(2)?, row.opt_i64(3)?)),
+        ).await.unwrap();
+        assert_eq!(state, ("active".into(), 1, None, Some(0)));
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text("SELECT status FROM jobs WHERE id='review'", (),)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pending")
+        );
+        let (_, failed) = orch
+            .db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::advancement::record_job_failure_conn(
+                        conn,
+                        "review",
+                        "Independent reopened branch failed",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.newly_terminal_issue_ids, ["child"]);
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 1);
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_failed_resolution_rearm_visits_the_mounted_owning_database() {
+        let orch = orchestrator().await;
+        let team = Arc::new(crate::storage::migrated_test_db("resolved-team").await);
+        team.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('teamA~00000000-0000-4000-8000-000000000001','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('teamA~00000000-0000-4000-8000-000000000002','teamA~00000000-0000-4000-8000-000000000001','P','shared','/tmp',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,completed_at,created_at,updated_at)
+             VALUES('teamA~00000000-0000-4000-8000-000000000003','teamA~00000000-0000-4000-8000-000000000002',1,'Parent','active','active','none',NULL,1,1),
+                   ('teamA~00000000-0000-4000-8000-000000000004','teamA~00000000-0000-4000-8000-000000000002',2,'Child','failed','complete','none',10,1,10);
+             INSERT INTO jobs(id,project_id,issue_id,status,created_at,updated_at)
+             VALUES('teamA~00000000-0000-4000-8000-000000000005','teamA~00000000-0000-4000-8000-000000000002','teamA~00000000-0000-4000-8000-000000000003','running',1,1);
+             INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+             VALUES('teamA~00000000-0000-4000-8000-000000000006','teamA~00000000-0000-4000-8000-000000000007','teamA~00000000-0000-4000-8000-000000000005',1,'running','initial',1,1);
+             INSERT INTO wake_subscriptions(id,job_id,source_kind,source_ref,state,created_by,created_at,updated_at)
+             VALUES('teamA~00000000-0000-4000-8000-000000000008','teamA~00000000-0000-4000-8000-000000000005','issue','cairn://p/shared/2','active','agent',1,1);"
+        ).await.unwrap();
+        orch.db
+            .register_team_db_for_test("teamA".into(), team.clone())
+            .await;
+        orch.db.set_route("shared", Some("teamA".into())).await;
+        let owning = crate::issues::crud::owning_db_for_issue(
+            &orch.db,
+            "teamA~00000000-0000-4000-8000-000000000004",
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&owning, &team));
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 1);
+        assert_eq!(
+            cairn_attention::push::list_pending(
+                &team,
+                "teamA~00000000-0000-4000-8000-000000000005"
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(
+            cairn_attention::push::list_pending(
+                &orch.db.local,
+                "teamA~00000000-0000-4000-8000-000000000005"
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the notice belongs to the mounted owning database, never the private fallback"
+        );
+        assert_eq!(rearm_failed_resolutions_on_startup(&orch).await, 0);
     }
 }

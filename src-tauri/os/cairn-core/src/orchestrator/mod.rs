@@ -4037,6 +4037,10 @@ impl Orchestrator {
                 // so the parent-facing notice is swept for here, beside the
                 // stranded-job recovery that reads the same lifecycle evidence
                 // (CAIRN-4609).
+                cairn_workflow::advancement::recompute::heal_failed_dependencies(
+                    &crate::workflow_host::runtime(&orch),
+                )
+                .await;
                 crate::orchestrator::lifecycle::sweep_stalled_children(&orch).await;
                 // Likewise a child whose one restart resume did not take: some of
                 // those refusals leave no row to fire from.

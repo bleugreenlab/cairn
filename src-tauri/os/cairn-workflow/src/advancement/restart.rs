@@ -470,12 +470,39 @@ mod tests {
                 seed_project_issue_execution(conn, &snap).await;
                 seed_job(conn, "job-up", "up", "failed", Some("/tmp/wt-up"), true, 10).await;
                 seed_job(conn, "job-down", "down", "pending", None, false, 11).await;
+                // A failed projection alone is not an independent failure source.
+                conn.execute(
+                    "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason,
+                                        created_at, ended_at, updated_at)
+                     VALUES ('turn-up', 'sess-job-up', 'job-up', 1, 'failed', 'initial', 10, 11, 11)",
+                    (),
+                )
+                .await?;
+                assert_eq!(
+                    recompute_job_status_conn(conn, "job-up").await?,
+                    JobStatus::Failed,
+                    "up has its own persisted failed work turn"
+                );
 
                 // Before restart: down cascades to Failed off the failed upstream.
                 let before = recompute_job_status_conn(conn, "job-down").await?;
                 assert_eq!(before, JobStatus::Failed, "down cascades off failed up");
 
-                restart_node_conn(conn, "exec-1", "up").await.unwrap();
+                let restarted = restart_node_conn(conn, "exec-1", "up").await?;
+                assert_eq!(restarted.reconcile.cancelled_job_ids, vec!["job-up"]);
+                assert_eq!(restarted.created_jobs.len(), 1);
+                assert_eq!(
+                    recompute_job_status_conn(conn, &restarted.created_jobs[0].id).await?,
+                    JobStatus::Pending
+                );
+                let mut turns = conn
+                    .query("SELECT state FROM turns WHERE id = 'turn-up'", ())
+                    .await?;
+                assert_eq!(
+                    turns.next().await?.unwrap().text(0)?,
+                    "failed",
+                    "restart preserves the archived attempt's failure history"
+                );
 
                 // After restart: the live up job is fresh pending, so down derives
                 // back to gated/pending and will re-run once up completes.

@@ -38,6 +38,7 @@ pub(crate) use backend_turn::{
     apply_owned_turn_outcome, was_host_interrupted, ClaudeTurnContext, CodexTurnContext,
 };
 
+pub use crate::workflow_host::rearm_failed_resolutions_on_startup;
 pub(crate) use child_stall::{render_stall_push_body, sweep_stalled_children};
 pub(crate) use child_unresumed::{render_unresumed_push_body, sweep_unresumed_children};
 pub(crate) use common::set_exit_reason;

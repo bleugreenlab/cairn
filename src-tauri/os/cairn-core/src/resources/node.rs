@@ -336,9 +336,10 @@ fn render_job_summary_header(
     hold: Option<&crate::messages::delivery::Hold>,
 ) -> String {
     let icon = job_status_icon(status);
-    let mut output = match hold {
-        Some(hold) => format!("# {name} [{icon} {}]\n\n", hold.qualifier()),
-        None => format!("# {name} [{icon}]\n\n"),
+    let mut output = match (status, hold) {
+        ("failed", _) => format!("# {name} [{icon} Failed]\n\n"),
+        (_, Some(hold)) => format!("# {name} [{icon} {}]\n\n", hold.qualifier()),
+        (_, None) => format!("# {name} [{icon}]\n\n"),
     };
     append_optional_timestamp(&mut output, "Started", started_at);
     append_optional_timestamp(&mut output, "Completed", completed_at);
@@ -1700,6 +1701,7 @@ enum NodeSummaryRows {
 
 struct JobSummaryRows {
     job: ResourceJob,
+    failure_reason: Option<String>,
     visible_node_segment: String,
     activity: Option<NodeActivity>,
     named_artifacts: Vec<ResourceArtifact>,
@@ -1783,8 +1785,17 @@ pub(super) async fn read_node(
             let activity = load_node_activity(conn, &job.id).await;
             let named_artifacts = list_named_artifacts_for_job(conn, &job.id).await;
             let pr = load_node_pr_row(conn, &job.id).await;
+            let failure_reason = if job.status == "failed" {
+                cairn_attention::delivery::job_failure_reason_conn(conn, &job.id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             Ok(NodeSummaryRows::Job(Box::new(JobSummaryRows {
                 job,
+                failure_reason,
                 visible_node_segment,
                 activity,
                 named_artifacts,
@@ -1794,6 +1805,7 @@ pub(super) async fn read_node(
     });
     let JobSummaryRows {
         job,
+        failure_reason,
         visible_node_segment,
         activity,
         named_artifacts,
@@ -1829,6 +1841,9 @@ pub(super) async fn read_node(
         job.completed_at.map(i64::from),
         hold.as_ref(),
     );
+    if let Some(reason) = failure_reason {
+        output.push_str(&format!("Failure: {reason}\n\n"));
+    }
     push_placement_default(&mut output, db, &job.id).await;
     if job.status == "pending" && job.started_at.is_none() {
         output.push_str(&crate::jobs::queries::pending_dispatch_description(None));
@@ -4370,5 +4385,77 @@ mod hold_header_tests {
         let idle = render_job_summary_header("builder", "running", None, None, None);
         assert!(idle.starts_with("# builder [◐]\n"), "{idle}");
         assert!(!idle.contains("Not taking a turn"), "{idle}");
+    }
+}
+
+#[cfg(test)]
+mod failed_projection_tests {
+    async fn emitted_work(db: &crate::storage::LocalDb) -> (i64, i64, i64) {
+        use crate::storage::RowExt;
+        db.query_one(
+            "SELECT (SELECT COUNT(*) FROM messages),
+                    (SELECT COUNT(*) FROM attention_pushes),
+                    (SELECT COUNT(*) FROM effect_outbox)",
+            (),
+            |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_projection_node_summary_names_failed_and_persisted_reason() {
+        let env = crate::execution::gates::sweep::tests::env("node-failed-projection.db").await;
+        env.db
+            .execute_script(
+                "UPDATE jobs SET status = 'failed', completed_at = 30 WHERE id = 'coord';
+             UPDATE runs SET status = 'crashed', error_message = 'Backend launch refused',
+                             updated_at = 30 WHERE id = 'run-coord';",
+            )
+            .await
+            .unwrap();
+        let before = emitted_work(&env.db).await;
+        let page = super::read_node(&env.orch, "prj", 9, 1, "coordinator", false).await;
+        assert!(page.contains("# coordinator [✗ Failed]"), "{page}");
+        assert!(page.contains("Backend launch refused"), "{page}");
+        assert_eq!(
+            emitted_work(&env.db).await,
+            before,
+            "a passive mark emits no work"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_projection_node_reason_is_bounded_and_absent_on_live_work() {
+        let env =
+            crate::execution::gates::sweep::tests::env("node-failed-projection-bound.db").await;
+        let error = format!("Backend refused\n{}", "é".repeat(600));
+        env.db
+            .execute(
+                "UPDATE runs SET status='crashed', error_message=?1 WHERE id='run-coord'",
+                (error,),
+            )
+            .await
+            .unwrap();
+        let live = super::read_node(&env.orch, "prj", 9, 1, "coordinator", false).await;
+        assert!(!live.contains("Failure:"), "{live}");
+        env.db
+            .execute_script("UPDATE jobs SET status='failed' WHERE id='coord';")
+            .await
+            .unwrap();
+        let failed = super::read_node(&env.orch, "prj", 9, 1, "coordinator", false).await;
+        let reason = failed
+            .lines()
+            .find_map(|line| line.strip_prefix("Failure: "))
+            .unwrap();
+        assert!(reason.starts_with("Backend refused "), "{reason}");
+        assert!(reason.chars().count() <= 241, "{reason}");
+        assert!(reason.ends_with('…'), "{reason}");
+    }
+
+    #[test]
+    fn failed_projection_header_names_failed_even_without_error_evidence() {
+        let page = super::render_job_summary_header("builder", "failed", None, None, None);
+        assert!(page.contains("[✗ Failed]"), "{page}");
     }
 }

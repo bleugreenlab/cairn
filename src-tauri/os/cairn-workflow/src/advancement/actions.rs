@@ -101,43 +101,85 @@ pub fn block_job(runtime: &WorkflowRuntime, job_id: &str) -> Result<(), String> 
     recompute_job(runtime, job_id)
 }
 
+/// Record a genuine failure and settle its DAG in the same owning transaction.
+pub async fn record_job_failure_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+    error: &str,
+    claimed_launch_job_ids: &HashSet<String>,
+) -> DbResult<Option<(String, RecomputeOutcome)>> {
+    force_fail_job_turn_conn(conn, job_id).await?;
+    let bounded: String = error
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(512)
+        .collect();
+    conn.execute(
+        "UPDATE turns SET failure_reason = ?1 WHERE id = (
+            SELECT id FROM turns WHERE job_id = ?2 AND start_reason != 'memory_review'
+            ORDER BY created_at DESC, sequence DESC LIMIT 1)",
+        params![bounded.as_str(), job_id],
+    )
+    .await?;
+    conn.execute(
+        "UPDATE runs SET error_message = ?1 WHERE id = (
+            SELECT run_id FROM turns WHERE job_id = ?2 AND start_reason != 'memory_review'
+            ORDER BY created_at DESC, sequence DESC LIMIT 1)",
+        params![bounded.as_str(), job_id],
+    )
+    .await?;
+    let execution_id = crate::storage::query_opt_text_conn(
+        conn,
+        "SELECT execution_id FROM jobs WHERE id = ?1",
+        (job_id,),
+    )
+    .await?;
+    match execution_id {
+        Some(execution_id) => {
+            // The caller may still own its launch guard while recording this
+            // failure. That guard no longer proves this attempt can start.
+            let mut remaining_claims = claimed_launch_job_ids.clone();
+            remaining_claims.remove(job_id);
+            let outcome =
+                recompute_execution_jobs_conn(conn, &execution_id, &remaining_claims).await?;
+            Ok(Some((execution_id, outcome)))
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn mark_job_failed(runtime: &WorkflowRuntime, job_id: &str, error: &str) -> Result<(), String> {
-    // Record the failure as a turn fact; the projection derives Failed and cascades.
-    let owning_db = runtime.database(WorkflowOwner::Job(job_id))?;
-    let fail_db = owning_db.clone();
+    let db = runtime.database(WorkflowOwner::Job(job_id))?;
     let fail_job_id = job_id.to_string();
-    run_advancement_db(async move {
-        fail_db
-            .write(|conn| {
-                let job_id = fail_job_id.clone();
-                Box::pin(async move { force_fail_job_turn_conn(conn, &job_id).await })
+    let fail_error = error.to_string();
+    let claimed = runtime.host.claimed_launch_job_ids();
+    let (projection, run_id) = run_advancement_db(async move {
+        db.write(|conn| {
+            let job_id = fail_job_id.clone();
+            let error = fail_error.clone();
+            let claimed = claimed.clone();
+            Box::pin(async move {
+                let projection = record_job_failure_conn(conn, &job_id, &error, &claimed).await?;
+                let run_id = crate::storage::query_opt_text_conn(
+                    conn,
+                    "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (job_id.as_str(),),
+                ).await?;
+                Ok((projection, run_id))
             })
-            .await
-            .map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())
     })?;
-
-    let db = owning_db.clone();
-    let job_id_owned = job_id.to_string();
-    let run_id = run_advancement_db(async move {
-        db.query_text(
-            "SELECT id
-             FROM runs
-             WHERE job_id = ?1
-             ORDER BY created_at DESC
-             LIMIT 1",
-            (job_id_owned,),
-        )
-        .await
-        .map_err(|e| format!("Failed to load latest run: {e}"))
-    })?;
-
-    log::error!("Job {} failed: {}", job_id, error);
-
+    log::error!("Job {job_id} failed: {error}");
     if let Some(run_id) = run_id {
         runtime.host.run_error(&run_id, error);
     }
-
-    recompute_job(runtime, job_id)?;
+    if let Some((execution_id, outcome)) = projection {
+        super::recompute::publish_recompute_outcome(runtime, &execution_id, outcome)?;
+    } else {
+        recompute_job(runtime, job_id)?;
+    }
     Ok(())
 }
 
@@ -857,20 +899,34 @@ pub fn mark_action_run_failed(
     let log_action_run_id = action_run_id.clone();
     let log_error = error.clone();
     let scope_db = db.clone();
-    run_advancement_db(async move {
+    let claimed = runtime.host.claimed_launch_job_ids();
+    let projection = run_advancement_db(async move {
         db.write(|conn| {
             let (id,error) = (action_run_id.clone(), error.clone());
+            let claimed = claimed.clone();
             Box::pin(async move {
                 conn.execute(
                     "UPDATE action_runs SET status='failed',error_message=?1,completed_at=?2 WHERE id=?3",
                     params![error.as_str(),now,id.as_str()],
                 ).await?;
                 crate::pr_publish_attempts::settle_publish_attempt_conn(conn,&id,"failed",&error).await?;
-                Ok(())
+                let execution_id = crate::storage::query_opt_text_conn(
+                    conn, "SELECT execution_id FROM action_runs WHERE id = ?1", (id.as_str(),),
+                ).await?;
+                match execution_id {
+                    Some(execution_id) => {
+                        let outcome = recompute_execution_jobs_conn(conn, &execution_id, &claimed).await?;
+                        Ok(Some((execution_id, outcome)))
+                    }
+                    None => Ok(None),
+                }
             })
         }).await.map_err(|e|format!("Failed to update action_run: {e}"))
     })?;
 
+    if let Some((execution_id, outcome)) = projection {
+        super::recompute::publish_recompute_outcome(runtime, &execution_id, outcome)?;
+    }
     let runtime_for_ack = runtime.clone();
     let id_for_ack = log_action_run_id.clone();
     if let Err(error) = run_advancement_db(async move {

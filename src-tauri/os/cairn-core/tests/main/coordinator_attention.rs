@@ -121,7 +121,7 @@ async fn seed_coordinator(db: &LocalDb, root: &std::path::Path) {
     .to_json()
     .unwrap()
     .replace('\'', "''");
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "
         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
           VALUES('project','default','Coordinator','coord','{root}',1,1);
@@ -192,7 +192,7 @@ async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
     .to_json()
     .unwrap()
     .replace('\'', "''");
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "
         INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
           VALUES('child-exec','build','child','project','running',1,1,'{child_snapshot}');
@@ -319,7 +319,7 @@ async fn seed_plan_gate_child(db: &LocalDb) {
     .to_json()
     .unwrap()
     .replace('\'', "''");
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "
         INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
           VALUES('child-exec','planbuild','child','project','running',1,1,'{snapshot}');
@@ -664,7 +664,8 @@ async fn failed_child_finalize_wakes_once_and_delivers_failure_to_idle_coordinat
               current_turn_id='child-turn'
           WHERE id='child-builder';
         UPDATE runs
-          SET status='live', session_id='child-session'
+          SET status='live', session_id='child-session',
+              error_message='Child provider exited before producing output'
           WHERE id='child-run';
         UPDATE turns SET state='pending' WHERE id='child-turn';
         ",
@@ -715,7 +716,13 @@ async fn failed_child_finalize_wakes_once_and_delivers_failure_to_idle_coordinat
 
     let body = attention_event_body(&db).await;
     assert!(body.contains("Child") && body.contains("failed"), "{body}");
-    assert!(body.contains("retry or delegate a fix"), "{body}");
+    assert!(
+        body.contains(&format!(
+            "{CHILD_URI}/1/builder — Child provider exited before producing output. Retry or delegate a fix."
+        )),
+        "the briefing must identify the failed producer and its persisted reason: {body}"
+    );
+    assert!(!body.contains("No failure detail was recorded"), "{body}");
     assert!(!body.contains("Successfully"), "{body}");
     assert!(body.contains(CHILD_URI), "{body}");
 }

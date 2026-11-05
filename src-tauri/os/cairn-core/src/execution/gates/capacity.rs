@@ -1962,6 +1962,208 @@ pub(crate) mod tests {
         );
     }
 
+    async fn seed_failed_capacity_dag(env: &Env, with_planner: bool, parallel: bool) {
+        add_thread(env, "failure-thread", "failure-capacity").await;
+        add_started(env, 100, Some("failure-thread"), "running").await;
+        turn(env, 100, "failed", None).await;
+        let node = |id: &str, kind: &str| {
+            json!({
+                "id": id, "nodeType": kind, "name": id, "position": {"x": 0, "y": 0}
+            })
+        };
+        let edge = |from: &str, port: &str, to: &str| {
+            json!({
+                "id": format!("{from}-{to}"), "edgeType": "control", "sourceNodeId": from,
+                "sourceHandle": port, "targetNodeId": to, "targetHandle": "control-in"
+            })
+        };
+        let mut nodes = vec![
+            node("trigger", "trigger"),
+            node("builder", "agent"),
+            node("pr", "pr"),
+            node("review", "agent"),
+        ];
+        let mut edges = vec![
+            edge("trigger", "control-out", "builder"),
+            edge("builder", "control-out", "pr"),
+            edge("pr", "open", "review"),
+        ];
+        if with_planner {
+            nodes.push(node("planner", "agent"));
+            edges[0] = edge("trigger", "control-out", "planner");
+            edges.push(edge("planner", "control-out", "builder"));
+        }
+        if parallel {
+            nodes.push(node("parallel", "agent"));
+            edges.push(edge("trigger", "control-out", "parallel"));
+        }
+        let snapshot = json!({
+            "recipe": {"id": "recipe", "name": "Recipe", "trigger": "manual",
+                       "nodes": nodes, "edges": edges},
+            "agents": {}, "skills": {},
+            "triggerContext": {"issueId": "si100", "projectId": "p", "triggerType": "manual"},
+            "delegatedPackets": [], "createdAt": 1
+        });
+        env.db
+            .execute(
+                "UPDATE executions SET snapshot=?1 WHERE id='se100'",
+                (snapshot.to_string(),),
+            )
+            .await
+            .unwrap();
+        env.db
+            .execute_script(
+                "UPDATE jobs SET recipe_node_id='builder' WHERE id='sj100';
+             INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id,
+                              node_name, status, created_at, updated_at)
+               VALUES('capacity-review','se100','review','si100','p','review','pending',1,1);",
+            )
+            .await
+            .unwrap();
+        if with_planner {
+            env.db.execute_script(
+                "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id,
+                                  node_name, status, created_at, updated_at)
+                   VALUES('capacity-planner','se100','planner','si100','p','planner','complete',1,1);
+                 INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason,
+                                   created_at, ended_at, updated_at)
+                   VALUES('capacity-planner-turn','planner-session','capacity-planner',1,
+                          'complete','initial',1,2,2);"
+            ).await.unwrap();
+        }
+        if parallel {
+            env.db.execute_script(
+                "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id,
+                                  node_name, status, created_at, updated_at)
+                   VALUES('capacity-parallel','se100','parallel','si100','p','parallel','running',1,1);
+                 INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason,
+                                   created_at, updated_at)
+                   VALUES('capacity-parallel-turn','parallel-session','capacity-parallel',1,
+                          'running','initial',1,1);"
+            ).await.unwrap();
+        }
+    }
+
+    async fn settle_failed_capacity_dag(env: &Env) {
+        env.db
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::advancement::recompute_execution_jobs_conn(
+                        conn,
+                        "se100",
+                        &std::collections::HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_projection_settlement_frees_actual_fleet_and_thread_capacity() {
+        for with_planner in [false, true] {
+            let env = env("failed-capacity-settlement.db").await;
+            let baseline = fleet(&env).await;
+            seed_failed_capacity_dag(&env, with_planner, false).await;
+            assert_eq!(fleet(&env).await, baseline + 1);
+            assert_eq!(open_children(&env, 100).await, vec![100]);
+            settle_failed_capacity_dag(&env).await;
+            assert_eq!(fleet(&env).await, baseline);
+            assert!(open_children(&env, 100).await.is_empty());
+            let (jobs, executions, issues, actions) = env.db.query_one(
+                "SELECT (SELECT COUNT(*) FROM jobs WHERE execution_id='se100' AND status='failed'),
+                        (SELECT COUNT(*) FROM executions WHERE id='se100' AND status='failed'),
+                        (SELECT COUNT(*) FROM issues WHERE id='si100' AND status='failed'),
+                        (SELECT COUNT(*) FROM action_runs WHERE execution_id='se100')",
+                (), |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?, row.i64(3)?))
+            ).await.unwrap();
+            assert_eq!((jobs, executions, issues, actions), (2, 1, 1, 0));
+            settle_failed_capacity_dag(&env).await;
+            assert_eq!(fleet(&env).await, baseline);
+            assert!(open_children(&env, 100).await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_projection_parallel_branch_keeps_both_slots_until_it_ends() {
+        let env = env("failed-capacity-parallel.db").await;
+        let baseline = fleet(&env).await;
+        seed_failed_capacity_dag(&env, false, true).await;
+        settle_failed_capacity_dag(&env).await;
+        assert_eq!(fleet(&env).await, baseline + 1);
+        assert_eq!(open_children(&env, 100).await, vec![100]);
+        env.db
+            .execute_script(
+                "UPDATE turns SET state='complete', ended_at=3 WHERE id='capacity-parallel-turn';",
+            )
+            .await
+            .unwrap();
+        settle_failed_capacity_dag(&env).await;
+        assert_eq!(fleet(&env).await, baseline);
+        assert!(open_children(&env, 100).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_projection_open_pr_still_counts_as_a_thread_child() {
+        let env = env("failed-capacity-open-pr.db").await;
+        let baseline = fleet(&env).await;
+        seed_failed_capacity_dag(&env, false, false).await;
+        settle_failed_capacity_dag(&env).await;
+        merge_request(&env, 100, "open").await;
+        assert_eq!(fleet(&env).await, baseline);
+        assert_eq!(open_children(&env, 100).await, vec![100]);
+        env.db
+            .execute_script("UPDATE merge_requests SET status='closed' WHERE id='smr100';")
+            .await
+            .unwrap();
+        assert!(open_children(&env, 100).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_projection_quiet_healing_frees_both_slots_once_without_resolution_effects() {
+        let env = env("failed-capacity-quiet.db").await;
+        let baseline = fleet(&env).await;
+        seed_failed_capacity_dag(&env, false, false).await;
+        env.db
+            .execute_script("UPDATE jobs SET status='failed' WHERE id='sj100';")
+            .await
+            .unwrap();
+        assert_eq!(fleet(&env).await, baseline + 1);
+        assert_eq!(open_children(&env, 100).await, vec![100]);
+        for pass in 0..2 {
+            let outcome = env
+                .db
+                .write(|conn| {
+                    Box::pin(async move {
+                        cairn_workflow::advancement::recompute::heal_failed_dependencies_conn(
+                            conn,
+                            "se100",
+                            &std::collections::HashSet::new(),
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+            assert!(outcome.newly_terminal_issue_ids.is_empty());
+            assert_eq!(outcome.changes.len(), if pass == 0 { 1 } else { 0 });
+            for change in &outcome.changes {
+                assert_eq!(
+                    change.cause,
+                    cairn_workflow::advancement::recompute::ChangeCause::Repaired
+                );
+            }
+            assert_eq!(fleet(&env).await, baseline);
+            assert!(open_children(&env, 100).await.is_empty());
+        }
+        let quiet = env.db.query_one(
+            "SELECT quiet_failure_generation = resolution_generation FROM issues WHERE id='si100'",
+            (), |row| row.i64(0)
+        ).await.unwrap();
+        assert_eq!(quiet, 1);
+    }
+
     // -- the test world ----------------------------------------------------
 
     pub(crate) fn caps(env: &Env, fleet: i32, children: i32) {

@@ -953,15 +953,26 @@ async fn checkpoint_retry_requires_new_head_and_keeps_attempt_history() {
 }
 
 async fn pr_fixture(team: bool) -> (WorkflowRuntime, Arc<Host>, tempfile::TempDir, String) {
+    pr_fixture_with_review(team, false).await
+}
+
+async fn pr_fixture_with_review(
+    team: bool,
+    with_review: bool,
+) -> (WorkflowRuntime, Arc<Host>, tempfile::TempDir, String) {
     let (runtime, host, dir) = fixture(team).await;
     let mut pr = node("pr", "pr");
     pr["actionConfig"] = serde_json::json!({});
-    seed(
-        &host.owning,
-        vec![node("trigger", "trigger"), pr],
-        vec![edge("trigger", "control-out", "pr")],
-    )
-    .await;
+    let mut nodes = vec![node("trigger", "trigger"), pr];
+    let mut edges = vec![edge("trigger", "control-out", "pr")];
+    if with_review {
+        nodes.push(node("review", "agent"));
+        edges.push(edge("pr", "open", "review"));
+    }
+    seed(&host.owning, nodes, edges).await;
+    if with_review {
+        host.owning.execute_script("INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,node_name,uri_segment,created_at,updated_at) VALUES('review-job','exec','review','issue','p','pending','Review','review',1,1)").await.unwrap();
+    }
     let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").await.unwrap();
     let id = effects
         .iter()
@@ -1094,6 +1105,190 @@ async fn explicit_pr_retry_preserves_history_resets_cycle_and_persists_dispatch(
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn failed_pr_publication_retry_revives_review_and_advances_resolution_once() {
+    for team in [false, true] {
+        let (runtime, host, _dir, id) = pr_fixture_with_review(team, true).await;
+        let generation = count(
+            &host.owning,
+            "SELECT resolution_generation FROM issues WHERE id='issue'",
+        )
+        .await;
+        advancement::mark_action_run_failed(&runtime, &id, "push rejected").unwrap();
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='failed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM executions WHERE id='exec' AND status='failed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM issues WHERE id='issue' AND status='failed' AND completed_at IS NOT NULL").await, 1);
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT resolution_generation FROM issues WHERE id='issue'"
+            )
+            .await,
+            generation
+        );
+
+        pr_publish_attempts::retry_pr_publish(&runtime, &id)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            advancement::recompute_execution_jobs(&runtime, "exec").unwrap();
+            assert_eq!(
+                count(
+                    &host.owning,
+                    "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='pending'"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &host.owning,
+                    "SELECT COUNT(*) FROM executions WHERE id='exec' AND status='running'"
+                )
+                .await,
+                1
+            );
+            assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM issues WHERE id='issue' AND status='active' AND completed_at IS NULL").await, 1);
+            assert_eq!(
+                count(
+                    &host.owning,
+                    "SELECT resolution_generation FROM issues WHERE id='issue'"
+                )
+                .await,
+                generation + 1
+            );
+        }
+        assert!(
+            effects::dag::reduce_dag(&runtime, "exec")
+                .await
+                .unwrap()
+                .0
+                .is_empty(),
+            "Review must still wait for the open port"
+        );
+        assert!(pr_publish_attempts::claim_dispatch(&runtime, &id)
+            .await
+            .unwrap());
+        // Mirror the host's successful publication boundary: open port first,
+        // then the blocked merge/close gate and the settled publication attempt.
+        ports::fire_pr_node_port(&host.owning, "exec", "pr", "open")
+            .await
+            .unwrap();
+        host.owning
+            .write(|conn| {
+                let id = id.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "UPDATE action_runs SET status='blocked',error_message=NULL WHERE id=?1",
+                        (id.as_str(),),
+                    )
+                    .await?;
+                    pr_publish_attempts::settle_publish_attempt_conn(
+                        conn,
+                        &id,
+                        "published",
+                        "PR published",
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        pr_publish_attempts::acknowledge_settled_dispatch(&runtime, &id)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            advancement::recompute_execution_jobs(&runtime, "exec").unwrap();
+            assert_eq!(
+                count(
+                    &host.owning,
+                    "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='pending'"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &host.owning,
+                    "SELECT COUNT(*) FROM executions WHERE id='exec' AND status='running'"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &host.owning,
+                    "SELECT COUNT(*) FROM issues WHERE id='issue' AND status='failed'"
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                count(
+                    &host.owning,
+                    "SELECT resolution_generation FROM issues WHERE id='issue'"
+                )
+                .await,
+                generation + 1
+            );
+        }
+        let (ready, effects) = effects::dag::reduce_dag(&runtime, "exec").await.unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "review-job");
+        assert_eq!(ready[0].recipe_node_id.as_deref(), Some("review"));
+        assert!(effects
+            .iter()
+            .all(|effect| !matches!(effect, WorkflowEffect::ExecuteAction { .. })));
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='running'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM action_runs WHERE status='blocked'"
+            )
+            .await,
+            1
+        );
+        let attempts = pr_publish_attempts::list_publish_attempts(&host.owning, &id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!((attempts[0].cycle, attempts[0].attempt), (2, 1));
+        assert_eq!(attempts[0].outcome.as_deref(), Some("published"));
+        assert_eq!(attempts[1].outcome.as_deref(), Some("failed"));
+        assert_eq!(attempts[1].detail.as_deref(), Some("push rejected"));
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM turns WHERE job_id='review-job'"
+            )
+            .await,
+            0,
+            "inherited failure must not manufacture a failed Review turn"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1347,4 +1542,771 @@ async fn initial_pr_insert_failure_acknowledges_unclaimed_intent() {
         .await,
         1
     );
+}
+
+async fn seed_failed_builder_dag(db: &LocalDb, with_planner: bool) {
+    let mut nodes = vec![
+        node("trigger", "trigger"),
+        node("builder", "agent"),
+        node("pr", "pr"),
+        node("review", "agent"),
+    ];
+    let mut edges = vec![
+        edge("trigger", "control-out", "builder"),
+        edge("builder", "control-out", "pr"),
+        edge("pr", "open", "review"),
+    ];
+    if with_planner {
+        nodes.push(node("planner", "agent"));
+        edges[0] = edge("trigger", "control-out", "planner");
+        edges.push(edge("planner", "control-out", "builder"));
+    }
+    seed(db, nodes, edges).await;
+    db.execute_script("INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,node_name,uri_segment,started_at,created_at,updated_at) VALUES('builder-job','exec','builder','issue','p','running','builder','builder',1,1,1);
+        INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,node_name,uri_segment,created_at,updated_at) VALUES('review-job','exec','review','issue','p','pending','review','review',1,1);
+        INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at) VALUES('failure-turn','builder-session','builder-job',1,'failed','initial',2,3,3);").await.unwrap();
+    if with_planner {
+        db.execute_script("INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,node_name,uri_segment,started_at,created_at,updated_at) VALUES('planner-job','exec','planner','issue','p','complete','planner','planner',1,1,1);
+            INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at) VALUES('planner-turn','planner-session','planner-job',1,'complete','initial',1,2,2);").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_builder_through_unstarted_pr_settles_review_execution_and_issue() {
+    for with_planner in [false, true] {
+        let (_runtime, host, _dir) = fixture(false).await;
+        seed_failed_builder_dag(&host.owning, with_planner).await;
+        let outcome = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::recompute_execution_jobs_conn(conn, "exec", &HashSet::new()).await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&host.owning, "SELECT COUNT(*) FROM action_runs").await,
+            0
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='failed'"
+            )
+            .await,
+            1,
+            "review behind a PR with no action row must inherit the failure"
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM executions WHERE id='exec' AND status='failed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM issues WHERE id='issue' AND status='failed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(outcome.newly_terminal_issue_ids, ["issue"]);
+    }
+}
+
+#[tokio::test]
+async fn failure_recording_rolls_back_or_settles_every_projection_atomically() {
+    for team in [false, true] {
+        let (_runtime, host, _dir) = fixture(team).await;
+        seed_failed_builder_dag(&host.owning, true).await;
+        host.owning
+            .execute(
+                "UPDATE turns SET state='running',ended_at=NULL WHERE id='failure-turn'",
+                (),
+            )
+            .await
+            .unwrap();
+        let failed = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::record_job_failure_conn(
+                        conn,
+                        "builder-job",
+                        "launch failed: executable missing",
+                        &HashSet::new(),
+                    )
+                    .await?;
+                    Err::<(), _>(storage::DbError::internal("simulated crash before commit"))
+                })
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM turns WHERE id='failure-turn' AND state='running' AND failure_reason IS NULL").await, 1);
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='pending'"
+            )
+            .await,
+            1
+        );
+        let (_, outcome) = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::record_job_failure_conn(
+                        conn,
+                        "builder-job",
+                        &"launch failure ".repeat(200),
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE status='failed'"
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM issues WHERE status='failed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM turns WHERE state='failed' AND length(failure_reason) <= 512"
+            )
+            .await,
+            1
+        );
+        let inherited = outcome
+            .changes
+            .iter()
+            .find(|change| change.job_id == "review-job")
+            .unwrap();
+        assert_eq!(inherited.cause, advancement::ChangeCause::InheritedFailure);
+        assert!(!inherited.is_announced());
+        assert_eq!(outcome.newly_terminal_issue_ids, ["issue"]);
+    }
+}
+
+#[tokio::test]
+async fn dependency_healing_announces_unprojected_failure_before_live_recompute() {
+    for team in [false, true] {
+        let (_runtime, host, _dir) = fixture(team).await;
+        seed_failed_builder_dag(&host.owning, false).await;
+        host.owning.execute_script(
+            "INSERT INTO jobs(id,execution_id,parent_job_id,issue_id,project_id,status,created_at,updated_at)
+             VALUES('failed-task','exec','builder-job','issue','p','failed',1,1);",
+        ).await.unwrap();
+        let outcome = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::recompute::heal_failed_dependencies_conn(
+                        conn,
+                        "exec",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.newly_terminal_issue_ids,
+            ["issue"],
+            "a committed failure fact not yet projected is live, not quiet history"
+        );
+        assert_eq!(count(&host.owning,
+            "SELECT COUNT(*) FROM issues WHERE status='failed' AND quiet_failure_generation IS NULL").await, 1);
+        assert!(outcome
+            .changes
+            .iter()
+            .any(|change| change.job_id == "builder-job"
+                && change.cause == advancement::ChangeCause::Derived));
+        let replay = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::recompute_execution_jobs_conn(conn, "exec", &HashSet::new()).await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(replay.newly_terminal_issue_ids.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn dependency_healing_keeps_runless_and_abandoned_failures_live() {
+    for team in [false, true] {
+        for cached_status in ["running", "complete", "blocked"] {
+            let (_runtime, host, _dir) = fixture(team).await;
+            let db = &host.owning;
+            seed_failed_builder_dag(db, false).await;
+            db.execute_script(
+                "INSERT INTO jobs(id,execution_id,parent_job_id,issue_id,project_id,status,created_at,updated_at)
+                 VALUES('failed-task','exec','builder-job','issue','p','failed',1,1);",
+            ).await.unwrap();
+            if cached_status == "running" {
+                db.execute_script("DELETE FROM turns WHERE job_id='builder-job';
+                    INSERT INTO runs(id,job_id,project_id,status,error_message,created_at,updated_at)
+                    VALUES('failed-run','builder-job','p','crashed','launch failed before first turn',2,3);").await.unwrap();
+            } else {
+                use storage::RowExt;
+                let raw = db
+                    .query_one(
+                        "SELECT snapshot FROM executions WHERE id='exec'",
+                        (),
+                        |row| row.text(0),
+                    )
+                    .await
+                    .unwrap();
+                let mut snapshot: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let mut output = node("output", "artifact");
+                output["artifactConfig"] =
+                    serde_json::json!({"name":"result", "schema":{"type":"object"}});
+                snapshot["recipe"]["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(output);
+                let mut context = edge("builder", "context-out", "output");
+                context["edgeType"] = serde_json::json!("context");
+                context["targetHandle"] = serde_json::json!("context-in");
+                snapshot["recipe"]["edges"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(context);
+                db.execute(
+                    "UPDATE executions SET snapshot=?1 WHERE id='exec'",
+                    (snapshot.to_string(),),
+                )
+                .await
+                .unwrap();
+                db.execute(
+                    "UPDATE jobs SET status=?1,return_abandoned_at=3 WHERE id='builder-job'",
+                    (cached_status,),
+                )
+                .await
+                .unwrap();
+                db.execute(
+                    "UPDATE turns SET state='complete' WHERE id='failure-turn'",
+                    (),
+                )
+                .await
+                .unwrap();
+            }
+            let outcome = db
+                .write(|conn| {
+                    Box::pin(async move {
+                        advancement::recompute::heal_failed_dependencies_conn(
+                            conn,
+                            "exec",
+                            &HashSet::new(),
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.newly_terminal_issue_ids,
+                ["issue"],
+                "team={team}, cache={cached_status}"
+            );
+            assert_eq!(count(db, "SELECT COUNT(*) FROM issues WHERE status='failed' AND quiet_failure_generation IS NULL").await, 1);
+            assert_eq!(count(db, "SELECT COUNT(*) FROM jobs WHERE id IN ('builder-job','review-job') AND status='failed'").await, 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn quiet_dependency_healing_is_idempotent_and_durably_silent() {
+    for team in [false, true] {
+        let (runtime, host, _dir) = fixture(team).await;
+        seed_failed_builder_dag(&host.owning, false).await;
+        host.owning
+            .execute("UPDATE jobs SET status='failed' WHERE id='builder-job'", ())
+            .await
+            .unwrap();
+        let outcome = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::recompute::heal_failed_dependencies_conn(
+                        conn,
+                        "exec",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.changes.is_empty());
+        assert!(outcome
+            .changes
+            .iter()
+            .all(|change| change.cause == advancement::ChangeCause::Repaired));
+        assert!(outcome.newly_terminal_issue_ids.is_empty());
+        assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM issues WHERE status='failed' AND quiet_failure_generation=resolution_generation").await, 1);
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE status='pending'"
+            )
+            .await,
+            0
+        );
+        let replay = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::recompute::heal_failed_dependencies_conn(
+                        conn,
+                        "exec",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(replay.changes.is_empty());
+        assert!(replay.newly_terminal_issue_ids.is_empty());
+        advancement::recompute::heal_failed_dependencies(&runtime).await;
+        advancement::recompute::heal_failed_dependencies(&runtime).await;
+        assert_eq!(
+            count(&runtime.private_db, "SELECT COUNT(*) FROM effect_outbox").await,
+            0,
+            "quiet repair never launches DAG work"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quiet_dependency_healing_preserves_unproven_stopped_held_and_malformed_work() {
+    let controls = [
+        "UPDATE turns SET state='cancelled' WHERE id='failure-turn'; UPDATE jobs SET status='pending' WHERE id='builder-job';",
+        "UPDATE turns SET state='yielded',yield_reason='provider_limit' WHERE id='failure-turn'; UPDATE jobs SET current_turn_id='failure-turn' WHERE id='builder-job';",
+        "DELETE FROM turns;",
+        "UPDATE executions SET snapshot='{broken';",
+        "UPDATE executions SET lifecycle='superseded';",
+        "UPDATE executions SET lifecycle='pending';",
+        "INSERT INTO execution_gates(id,execution_id,seq,predicate_json,created_at) VALUES('gate','exec',0,'{\"fact\":\"fleet_slot\"}',1);"
+    ];
+    for sql in controls {
+        let (_runtime, host, _dir) = fixture(false).await;
+        seed_failed_builder_dag(&host.owning, false).await;
+        host.owning.execute_script(sql).await.unwrap();
+        let outcome = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    advancement::recompute::heal_failed_dependencies_conn(
+                        conn,
+                        "exec",
+                        &HashSet::new(),
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(outcome.changes.is_empty(), "{sql}");
+        assert!(outcome.newly_terminal_issue_ids.is_empty());
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='pending'"
+            )
+            .await,
+            1,
+            "{sql}"
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM issues WHERE quiet_failure_generation IS NOT NULL"
+            )
+            .await,
+            0,
+            "{sql}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn viable_parallel_work_delays_resolution_until_its_own_failure() {
+    let (_runtime, host, _dir) = fixture(false).await;
+    seed_failed_builder_dag(&host.owning, true).await;
+    let raw = host
+        .owning
+        .query_opt_text("SELECT snapshot FROM executions WHERE id='exec'", ())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut snapshot: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    snapshot["recipe"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(node("parallel", "agent"));
+    snapshot["recipe"]["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(edge("trigger", "control-out", "parallel"));
+    host.owning
+        .execute(
+            "UPDATE executions SET snapshot=?1 WHERE id='exec'",
+            (snapshot.to_string(),),
+        )
+        .await
+        .unwrap();
+    host.owning.execute_script("INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,node_name,uri_segment,created_at,updated_at) VALUES('parallel-job','exec','parallel','issue','p','pending','parallel','parallel',1,1);").await.unwrap();
+    let first = host
+        .owning
+        .write(|conn| {
+            Box::pin(async move {
+                advancement::recompute_execution_jobs_conn(conn, "exec", &HashSet::new()).await
+            })
+        })
+        .await
+        .unwrap();
+    assert!(first.newly_terminal_issue_ids.is_empty());
+    assert_eq!(
+        count(
+            &host.owning,
+            "SELECT COUNT(*) FROM jobs WHERE id='parallel-job' AND status='pending'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &host.owning,
+            "SELECT COUNT(*) FROM executions WHERE status='running'"
+        )
+        .await,
+        1
+    );
+    let (_, last) = host
+        .owning
+        .write(|conn| {
+            Box::pin(async move {
+                advancement::record_job_failure_conn(
+                    conn,
+                    "parallel-job",
+                    "independent parallel failure",
+                    &HashSet::new(),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.newly_terminal_issue_ids, ["issue"]);
+    assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM issues WHERE status='failed' AND quiet_failure_generation IS NULL").await, 1);
+}
+
+#[tokio::test]
+async fn a_run_only_failure_settles_its_unreachable_descendants() {
+    let (_runtime, host, _dir) = fixture(false).await;
+    seed_failed_builder_dag(&host.owning, false).await;
+    host.owning.execute_script("DELETE FROM turns;
+        INSERT INTO runs(id,job_id,project_id,status,error_message,created_at,updated_at) VALUES('failed-run','builder-job','p','crashed','process failed before first turn',2,3);").await.unwrap();
+    let outcome = host
+        .owning
+        .write(|conn| {
+            Box::pin(async move {
+                advancement::recompute_execution_jobs_conn(conn, "exec", &HashSet::new()).await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &host.owning,
+            "SELECT COUNT(*) FROM jobs WHERE status='failed'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(outcome.newly_terminal_issue_ids, ["issue"]);
+}
+
+#[tokio::test]
+async fn a_failing_launch_claim_does_not_hide_its_dependency_failure() {
+    let (_runtime, host, _dir) = fixture(false).await;
+    seed_failed_builder_dag(&host.owning, false).await;
+    host.owning
+        .execute(
+            "UPDATE turns SET state='pending',ended_at=NULL WHERE id='failure-turn'",
+            (),
+        )
+        .await
+        .unwrap();
+    let (_, outcome) = host
+        .owning
+        .write(|conn| {
+            Box::pin(async move {
+                let claims = HashSet::from(["builder-job".to_string()]);
+                advancement::record_job_failure_conn(
+                    conn,
+                    "builder-job",
+                    "promoted launch failed",
+                    &claims,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        count(
+            &host.owning,
+            "SELECT COUNT(*) FROM jobs WHERE status='failed'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(outcome.newly_terminal_issue_ids, ["issue"]);
+}
+
+#[tokio::test]
+async fn bounded_quiet_healing_advances_past_ineligible_candidates_on_later_sweeps() {
+    let (runtime, host, _dir) = fixture(false).await;
+    seed_failed_builder_dag(&host.owning, false).await;
+    host.owning
+        .execute("UPDATE jobs SET status='failed' WHERE id='builder-job'", ())
+        .await
+        .unwrap();
+    host.owning.write(|conn| Box::pin(async move {
+        for n in 0..256 {
+            let execution_id = format!("a-{n:04}");
+            conn.execute(
+                "INSERT INTO executions(id,recipe_id,project_id,status,started_at,lifecycle,snapshot)
+                 VALUES(?1,'recipe','p','running',1,'superseded','malformed')",
+                (execution_id.as_str(),),
+            ).await?;
+            for status in ["pending", "failed"] {
+                conn.execute(
+                    "INSERT INTO jobs(id,execution_id,project_id,status,created_at,updated_at)
+                     VALUES(?1,?2,'p',?3,1,1)",
+                    params![format!("{execution_id}-{status}"), execution_id.as_str(), status],
+                ).await?;
+            }
+        }
+        Ok(())
+    })).await.unwrap();
+    advancement::recompute::heal_failed_dependencies(&runtime).await;
+    assert_eq!(
+        count(
+            &host.owning,
+            "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='pending'"
+        )
+        .await,
+        1,
+        "one pass is bounded to 256 candidate executions"
+    );
+    advancement::recompute::heal_failed_dependencies(&runtime).await;
+    assert_eq!(
+        count(
+            &host.owning,
+            "SELECT COUNT(*) FROM jobs WHERE id='review-job' AND status='failed'"
+        )
+        .await,
+        1,
+        "a later pass must reach the viable repair rather than restarting forever"
+    );
+    assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM issues WHERE status='failed' AND quiet_failure_generation=resolution_generation").await, 1);
+    assert_eq!(
+        count(&runtime.private_db, "SELECT COUNT(*) FROM effect_outbox").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn failed_planner_crosses_an_already_inherited_failed_builder_and_unstarted_pr() {
+    for quiet in [false, true] {
+        let (_runtime, host, _dir) = fixture(false).await;
+        seed_failed_builder_dag(&host.owning, true).await;
+        host.owning
+            .execute_script(
+                "UPDATE jobs SET status='failed' WHERE id IN ('planner-job','builder-job');
+             UPDATE turns SET state='failed' WHERE id='planner-turn';
+             DELETE FROM turns WHERE id='failure-turn';",
+            )
+            .await
+            .unwrap();
+        let outcome = host
+            .owning
+            .write(|conn| {
+                Box::pin(async move {
+                    if quiet {
+                        advancement::recompute::heal_failed_dependencies_conn(
+                            conn,
+                            "exec",
+                            &HashSet::new(),
+                        )
+                        .await
+                    } else {
+                        advancement::recompute_execution_jobs_conn(conn, "exec", &HashSet::new())
+                            .await
+                    }
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM jobs WHERE status='failed'"
+            )
+            .await,
+            3
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM executions WHERE status='failed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM issues WHERE status='failed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &host.owning,
+                "SELECT COUNT(*) FROM turns WHERE state='failed'"
+            )
+            .await,
+            1,
+            "inherited failures must not acquire synthetic failed work turns"
+        );
+        if quiet {
+            assert!(outcome.newly_terminal_issue_ids.is_empty());
+            assert!(outcome
+                .changes
+                .iter()
+                .all(|change| change.cause == advancement::ChangeCause::Repaired));
+        } else {
+            assert_eq!(outcome.newly_terminal_issue_ids, ["issue"]);
+            assert!(outcome
+                .changes
+                .iter()
+                .all(|change| change.cause == advancement::ChangeCause::InheritedFailure));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_live_retry_after_quiet_failure_gets_a_new_resolution_identity() {
+    let (_runtime, host, _dir) = fixture(false).await;
+    seed_failed_builder_dag(&host.owning, false).await;
+    host.owning
+        .execute("UPDATE jobs SET status='failed' WHERE id='builder-job'", ())
+        .await
+        .unwrap();
+    host.owning
+        .write(|conn| {
+            Box::pin(async move {
+                advancement::recompute::heal_failed_dependencies_conn(conn, "exec", &HashSet::new())
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+    let quiet_generation = host
+        .owning
+        .query_one(
+            "SELECT resolution_generation FROM issues WHERE id='issue'",
+            (),
+            |row| {
+                use storage::RowExt;
+                row.i64(0)
+            },
+        )
+        .await
+        .unwrap();
+    host.owning.execute_script(
+        "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at)
+         VALUES('retry-after-quiet','builder-session','builder-job',2,'running','retry',4,4);"
+    ).await.unwrap();
+    host.owning
+        .write(|conn| {
+            Box::pin(async move {
+                advancement::recompute_execution_jobs_conn(conn, "exec", &HashSet::new()).await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &host.owning,
+            "SELECT COUNT(*) FROM issues WHERE status='active'"
+        )
+        .await,
+        1
+    );
+    let resumed_generation = host
+        .owning
+        .query_one(
+            "SELECT resolution_generation FROM issues WHERE id='issue'",
+            (),
+            |row| {
+                use storage::RowExt;
+                row.i64(0)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed_generation,
+        quiet_generation + 1,
+        "a genuine retry reopens failed work without necessarily calling explicit unresolve"
+    );
+    let (_, outcome) = host
+        .owning
+        .write(|conn| {
+            Box::pin(async move {
+                advancement::record_job_failure_conn(
+                    conn,
+                    "builder-job",
+                    "independent retry failure",
+                    &HashSet::new(),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.newly_terminal_issue_ids, ["issue"]);
+    assert_eq!(count(&host.owning, "SELECT COUNT(*) FROM issues WHERE status='failed' AND quiet_failure_generation <> resolution_generation").await, 1, "the historical quiet marker must not suppress the retry's new failure");
 }
