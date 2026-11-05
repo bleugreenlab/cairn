@@ -163,6 +163,59 @@ pub struct WeightFile {
     pub size: Option<u64>,
 }
 
+impl WeightFile {
+    /// Validate the components used both in the Hub URL and the local cache.
+    /// This is lexical: the cache itself is trusted, including its symlinks.
+    pub(crate) fn problem(&self) -> Option<&'static str> {
+        let repo_component = |part: &str| {
+            !part.is_empty()
+                && part.len() <= 96
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                && !part.starts_with(['.', '-'])
+                && !part.ends_with(['.', '-'])
+                && !part.contains("..")
+                && !part.contains("--")
+        };
+        let repo_ok = self.repo.split_once('/').is_some_and(|(owner, name)| {
+            repo_component(owner) && repo_component(name) && !name.ends_with(".git")
+        });
+        if !repo_ok {
+            return Some("repo must be a Hugging Face owner/name using letters, digits, _, - and . (no .. or --)");
+        }
+        if self.revision.is_empty()
+            || !self
+                .revision
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+            || self.revision.starts_with(['.', '-'])
+            || self.revision.ends_with('.')
+            || self.revision.contains("..")
+            || self.revision.ends_with(".lock")
+        {
+            return Some("revision must be a plain ref or sha using letters, digits, _, - and . (no / or ..)");
+        }
+        if self.path.is_empty()
+            || self.path.starts_with('/')
+            || self
+                .path
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\\' | ':' | '?' | '#' | '%'))
+            || self
+                .path
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+        {
+            return Some("path must be relative with no empty, . or .. segment, backslash, control character or URL/drive delimiter (: ? # %)");
+        }
+        if !is_sha256_hex(&self.sha256) {
+            return Some("sha256 is not 64 lowercase hex digits");
+        }
+        None
+    }
+}
+
 /// The engine that serves the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -509,18 +562,7 @@ impl InferenceProfile {
             problems.push(ValidationError::ProfileZeroMachines { profile: profile() });
         }
         for (index, weight) in self.model.weights.iter().enumerate() {
-            let problem = if weight.repo.is_empty() {
-                Some("no repository")
-            } else if weight.revision.is_empty() {
-                Some("no revision")
-            } else if weight.path.is_empty() {
-                Some("no path")
-            } else if !is_sha256_hex(&weight.sha256) {
-                Some("sha256 is not 64 lowercase hex digits")
-            } else {
-                None
-            };
-            if let Some(problem) = problem {
+            if let Some(problem) = weight.problem() {
                 problems.push(ValidationError::BadWeightFile {
                     profile: profile(),
                     index,

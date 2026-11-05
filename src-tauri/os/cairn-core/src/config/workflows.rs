@@ -310,9 +310,8 @@ pub fn delete_workflow(
     if dir.is_dir() {
         std::fs::remove_dir_all(&dir)
             .map_err(|e| format!("Failed to delete workflow directory: {e}"))?;
-        // A workflow an installed pack ships is copy-when-missing like every
-        // other pack item, so without recording the removal the next startup
-        // sync puts it straight back.
+        // Pack sync restores missing owned content, so record the removal
+        // before the next startup can put the workflow straight back.
         super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Workflow, id);
     }
     Ok(())

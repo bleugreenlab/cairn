@@ -102,6 +102,14 @@ pub fn render(
     deployment: &Deployment,
     machines: &[MachineAt],
 ) -> Result<Rendered, Refusal> {
+    for (index, weight) in profile.model.weights.iter().enumerate() {
+        if let Some(problem) = weight.problem() {
+            return Err(Refusal(format!(
+                "profile {} weight file {index}: {problem}",
+                profile.id
+            )));
+        }
+    }
     match &profile.engine {
         Engine::Command { start, stop, .. } => Ok(Rendered {
             start: start.clone(),
@@ -291,9 +299,6 @@ fn rank_script(
 
     if container.server == Server::LlamaCpp {
         for weight in &profile.model.weights {
-            for value in [&weight.repo, &weight.revision, &weight.path] {
-                no_newline(profile, value)?;
-            }
             let path = cached_weight_path("$hf", weight);
             let url = format!(
                 "https://huggingface.co/{}/resolve/{}/{}",
@@ -753,6 +758,150 @@ mod tests {
         assert!(start.contains(r#"'{"'\''"method"'\''"#) || start.contains("method"));
         let stop = rendered.stop.unwrap();
         assert!(stop.contains("'cairn-dsv4f-r0'") && stop.contains("cairn-dsv4f-r1"));
+    }
+
+    #[test]
+    fn a_hostile_weight_path_produces_no_script() {
+        let mut profile = embedder();
+        profile.model.weights[0].path = "../../../../../../tmp/cairn-hostile.gguf".into();
+        let result = render(
+            &profile,
+            &deployment("embed", &["fedora"], 8090),
+            &[MachineAt {
+                name: "fedora".into(),
+                address: None,
+                link: None,
+            }],
+        );
+        assert!(
+            result.is_err(),
+            "unsafe host download script was rendered: {result:?}"
+        );
+    }
+
+    #[test]
+    fn hostile_weight_locations_are_refused_by_inventory_and_render() {
+        use crate::inventory::{Inventory, ValidationError, YamlError};
+
+        for (field, value) in [
+            ("repo", "../model"),
+            ("repo", "owner/../model"),
+            ("repo", "/owner/model"),
+            ("repo", "owner/model?download=1"),
+            ("repo", "owner\\model"),
+            ("repo", "owner/model\n"),
+            ("revision", ".."),
+            ("revision", "../main"),
+            ("revision", "/main"),
+            ("revision", "refs/pr/1"),
+            ("revision", "main?download=1"),
+            ("revision", "main\\other"),
+            ("revision", "main\r"),
+            ("path", "../../../../../../tmp/cairn-hostile.gguf"),
+            ("path", "Q4_K_M/../model.gguf"),
+            ("path", ".."),
+            ("path", "model%2f..%2fother.gguf"),
+            ("path", "model.gguf?download=1"),
+            ("path", "model.gguf#fragment"),
+            ("path", "C:/tmp/model.gguf"),
+            ("path", "/tmp/cairn-hostile.gguf"),
+            ("path", "C:\\tmp\\model.gguf"),
+            ("path", "model\u{0000}.gguf"),
+            ("path", "model\t.gguf"),
+            ("path", "model\u{007f}.gguf"),
+        ] {
+            let mut profile = embedder();
+            let weight = &mut profile.model.weights[0];
+            match field {
+                "repo" => weight.repo = value.into(),
+                "revision" => weight.revision = value.into(),
+                "path" => weight.path = value.into(),
+                _ => unreachable!(),
+            }
+            let mut inventory = Inventory::default();
+            inventory.insert_model(crate::model::Model::named(&profile.model.name));
+            inventory
+                .profiles
+                .insert(profile.id.clone(), profile.clone());
+            let errors = inventory
+                .validate()
+                .expect_err("unsafe inventory must be refused");
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error, ValidationError::BadWeightFile { index: 0, problem, .. }
+                        if problem.contains(field)
+                )),
+                "{field}={value:?}: {errors:?}"
+            );
+            assert!(matches!(
+                Inventory::from_yaml(&inventory.to_yaml()),
+                Err(YamlError::Invalid(errors)) if errors.iter().any(|error|
+                    matches!(error, ValidationError::BadWeightFile { .. }))
+            ));
+            let rendered = render(
+                &profile,
+                &deployment("embed", &["fedora"], 8090),
+                &[MachineAt {
+                    name: "fedora".into(),
+                    address: None,
+                    link: None,
+                }],
+            );
+            assert!(
+                rendered.is_err(),
+                "no script may be produced for {field}={value:?}"
+            );
+            assert!(rendered.unwrap_err().0.contains(field));
+        }
+    }
+
+    #[test]
+    fn real_weight_names_and_nested_gguf_shards_validate_and_render() {
+        for (repo, revision, path) in [
+            (
+                "Qwen/Qwen3-Embedding-4B",
+                "5cf2132abc99cad020ac570b19d031efec650f2b",
+                "model-00001-of-00002.safetensors",
+            ),
+            (
+                "Qwen/Qwen3-Embedding-4B-GGUF",
+                "f4602530db1d980e16da9d7d3a70294cf5c190be",
+                "Qwen3-Embedding-4B-Q8_0.gguf",
+            ),
+            (
+                "unsloth/DeepSeek-R1-GGUF",
+                "main",
+                "DeepSeek-R1-Q4_K_M/DeepSeek-R1-Q4_K_M-00001-of-00009.gguf",
+            ),
+            ("owner_1/Model.v2", "v1.2-rc_1", "nested/model..v2.gguf"),
+        ] {
+            let mut profile = embedder();
+            let weight = &mut profile.model.weights[0];
+            weight.repo = repo.into();
+            weight.revision = revision.into();
+            weight.path = path.into();
+            let mut inventory = crate::inventory::Inventory::default();
+            inventory.insert_model(crate::model::Model::named(&profile.model.name));
+            inventory.insert_profile(profile.clone());
+            assert_eq!(inventory.validate(), Ok(()));
+            assert!(crate::inventory::Inventory::from_yaml(&inventory.to_yaml()).is_ok());
+            let rendered = render(
+                &profile,
+                &deployment("embed", &["fedora"], 8090),
+                &[MachineAt {
+                    name: "fedora".into(),
+                    address: None,
+                    link: None,
+                }],
+            )
+            .unwrap();
+            assert!(rendered.start.contains(&format!(
+                "https://huggingface.co/{repo}/resolve/{revision}/{path}"
+            )));
+            assert!(rendered
+                .start
+                .contains(&cached_weight_path("/models", &profile.model.weights[0])));
+        }
     }
 
     #[test]

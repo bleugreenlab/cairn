@@ -5101,6 +5101,297 @@ mod terminal_finalize_tests {
         (task, releases, ops, start_process)
     }
 
+    // Reuse the real logical-checkout and executor transport fixtures above: a
+    // boolean-only test cannot detect a surviving runtime blocking refresh.
+    async fn workflow_spawn_transport_case(replace_existing: bool, fail_stop: bool) {
+        use crate::backends::workflow::{spawn_workflow_process, WorkflowSpawnParams};
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        let db = crate::storage::migrated_test_db("workflow_redispatch.db").await;
+        let orch = test_orchestrator(db);
+        let checkout = tempdir().unwrap();
+        seed_managed_job_terminal_checkout(&orch, checkout.path()).await;
+        let run_id = "workflow-redispatch";
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at)
+             VALUES('workflow-redispatch','p','j','starting',1,1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let package = tempdir().unwrap();
+        std::fs::write(package.path().join("package.json"), "{}").unwrap();
+        let script = package.path().join("main.ts");
+        let old_source = "throw new Error('old approval protocol');";
+        let new_source = "export const approvalProtocol = 'current surface digest';";
+        std::fs::write(
+            &script,
+            if replace_existing {
+                old_source
+            } else {
+                new_source
+            },
+        )
+        .unwrap();
+        let tip = crate::fleet::residency::resolve_logical_commit(&orch, checkout.path(), "main")
+            .await
+            .unwrap();
+        let fence = ResidencyFence {
+            holder: ResidencyHolder::Workflow {
+                run_id: run_id.into(),
+            },
+            incarnation_id: "surviving-incarnation".into(),
+            cell_epoch: 7,
+        };
+        let mut cell = test_terminal_slot(&fence);
+        cell.path = checkout.path().to_string_lossy().into_owned();
+        cell.repository = cell.path.clone();
+        cell.last_sealed_commit = Some(tip.clone());
+        let residency = cell.residency.as_mut().unwrap();
+        residency.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "p".into(),
+            absolute_path: cell.path.clone(),
+        };
+        residency.current_base_commit = tip;
+        let mut old_process = cell.occupancy.processes.remove("main").unwrap();
+        old_process.kind = ResidentProcessKind::WorkflowRuntime {
+            workflow: "inference-generate".into(),
+        };
+        if replace_existing {
+            cell.occupancy
+                .processes
+                .insert(run_id.into(), old_process.clone());
+        }
+        let pool = orch.fleet.clone();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let connection_generation = pool.attach_executor(sender);
+        assert!(pool.set_executor_snapshot(
+            "colocated",
+            connection_generation,
+            FleetSnapshot {
+                cells: vec![cell.clone()],
+                ..Default::default()
+            },
+            ExecutorSubstrateReport::default(),
+        ));
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let logged = operations.clone();
+        let captured = Arc::new(Mutex::new(None::<ResidentProcessSpec>));
+        let started = captured.clone();
+        let (stop_seen_tx, stop_seen_rx) = oneshot::channel();
+        let (stop_ack_tx, mut stop_ack_rx) = oneshot::channel();
+        let mut stop_seen_tx = Some(stop_seen_tx);
+        let updated_script = script.clone();
+        let executor = tokio::spawn(async move {
+            let mut surviving = replace_existing;
+            while let Some(message) = receiver.recv().await {
+                let ExecutorMessage::ResidencyRequest {
+                    correlation_id,
+                    operation,
+                    ..
+                } = message
+                else {
+                    continue;
+                };
+                let result = match operation {
+                    ResidencyOperation::Acquire { request } => {
+                        assert_eq!(request.holder, fence.holder);
+                        logged.lock().unwrap().push("Acquire");
+                        ResidencyResult::State { cell: cell.clone() }
+                    }
+                    ResidencyOperation::StopProcess {
+                        fence: actual,
+                        process_key,
+                    } => {
+                        assert_eq!(actual, fence);
+                        assert_eq!(process_key, run_id);
+                        assert!(surviving, "initial dispatch must not stop a process");
+                        logged.lock().unwrap().push("StopProcess");
+                        stop_seen_tx.take().unwrap().send(()).unwrap();
+                        // Process a second request while stop is held, so a
+                        // fire-and-forget stop cannot masquerade as awaiting it.
+                        tokio::select! {
+                            result = &mut stop_ack_rx => result.unwrap(),
+                            message = receiver.recv() => panic!("operation before stop acknowledgement: {message:?}"),
+                        }
+                        if fail_stop {
+                            ResidencyResult::Failed {
+                                kind: ResidencyFailureKind::Process,
+                                diagnostic: "injected stop failure".into(),
+                                cell_outcome: None,
+                            }
+                        } else {
+                            surviving = false;
+                            cell.occupancy.processes.clear();
+                            std::fs::write(&updated_script, new_source).unwrap();
+                            // The old exit must not finalize the replacement.
+                            pool.handle_executor_message(
+                                "colocated",
+                                connection_generation,
+                                ExecutorMessage::ResidentProcessEvent {
+                                    event: ResidentProcessEvent {
+                                        holder: fence.holder.clone(),
+                                        incarnation_id: fence.incarnation_id.clone(),
+                                        cell_epoch: fence.cell_epoch,
+                                        process_key,
+                                        process_generation: 1,
+                                        event: ResidentProcessEventKind::State {
+                                            status: ResidentProcessStatus::Exited {
+                                                finished_at_unix_ms: 2,
+                                                exit_code: Some(1),
+                                                restartable: true,
+                                                executor_lost: false,
+                                            },
+                                        },
+                                    },
+                                },
+                            );
+                            logged.lock().unwrap().push("StopAcknowledged");
+                            ResidencyResult::State { cell: cell.clone() }
+                        }
+                    }
+                    ResidencyOperation::RefreshCheckout { .. } => {
+                        assert!(!surviving, "refresh cannot run while old workflow is alive");
+                        logged.lock().unwrap().push("RefreshCheckout");
+                        ResidencyResult::State { cell: cell.clone() }
+                    }
+                    ResidencyOperation::StartProcess {
+                        process_key,
+                        kind,
+                        process,
+                        ..
+                    } => {
+                        assert!(!surviving, "same-key workflow is still alive");
+                        assert_eq!(process_key, run_id);
+                        assert_eq!(kind, old_process.kind);
+                        logged.lock().unwrap().push("StartProcess");
+                        *started.lock().unwrap() = Some(process);
+                        old_process.generation = 2;
+                        cell.occupancy
+                            .processes
+                            .insert(process_key, old_process.clone());
+                        ResidencyResult::State { cell: cell.clone() }
+                    }
+                    ResidencyOperation::Release { .. } => {
+                        logged.lock().unwrap().push("Release");
+                        ResidencyResult::Released {
+                            holder: fence.holder.clone(),
+                            cell_epoch: fence.cell_epoch,
+                        }
+                    }
+                    other => panic!("unexpected workflow operation: {other:?}"),
+                };
+                pool.handle_executor_message(
+                    "colocated",
+                    connection_generation,
+                    ExecutorMessage::ResidencyResponse {
+                        correlation_id,
+                        result,
+                    },
+                );
+            }
+        });
+        let spawn_orch = orch.clone();
+        let params = WorkflowSpawnParams {
+            run_id: run_id.into(),
+            workflow_id: "inference-generate".into(),
+            project_id: "p".into(),
+            repository_path: checkout.path().into(),
+            anchor_branch: "main".into(),
+            branch_mode: "inherit".into(),
+            package_path: package.path().into(),
+            script_path: script,
+            args_json: "{}".into(),
+            turn_id: "unused-turn".into(),
+            session_id: None,
+            output_name: "return".into(),
+            replace_existing,
+        };
+        let mut spawn =
+            tokio::spawn(async move { spawn_workflow_process(&spawn_orch, params).await });
+        if replace_existing {
+            tokio::time::timeout(Duration::from_secs(10), stop_seen_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(50), &mut spawn)
+                .await
+                .is_err());
+            assert_eq!(*operations.lock().unwrap(), ["Acquire", "StopProcess"]);
+            stop_ack_tx.send(()).unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(10), spawn)
+            .await
+            .unwrap()
+            .unwrap();
+        if fail_stop {
+            assert!(result.unwrap_err().contains("injected stop failure"));
+            assert_eq!(
+                *operations.lock().unwrap(),
+                ["Acquire", "StopProcess", "Release"]
+            );
+            assert!(captured.lock().unwrap().is_none());
+        } else {
+            result.unwrap();
+            let expected = if replace_existing {
+                vec![
+                    "Acquire",
+                    "StopProcess",
+                    "StopAcknowledged",
+                    "RefreshCheckout",
+                    "StartProcess",
+                ]
+            } else {
+                vec!["Acquire", "RefreshCheckout", "StartProcess"]
+            };
+            assert_eq!(*operations.lock().unwrap(), expected);
+            let process = captured.lock().unwrap().take().unwrap();
+            let asset = process
+                .runtime_assets
+                .iter()
+                .find(|asset| asset.path == "workflow/main.ts")
+                .unwrap();
+            assert_eq!(
+                asset.data,
+                new_source.as_bytes(),
+                "replacement must ship current package bytes"
+            );
+            assert!(process.args[1].contains("/workflow/main.ts"));
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_text("SELECT status FROM runs WHERE id = ?1", (run_id,))
+                    .await
+                    .unwrap(),
+                Some("live".into()),
+                "the stopped runtime's exit must not finalize its replacement",
+            );
+        }
+        executor.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn workflow_transport_redispatch_awaits_stop_before_refresh_and_ships_updated_assets() {
+        workflow_spawn_transport_case(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn workflow_transport_initial_dispatch_does_not_stop_a_process() {
+        workflow_spawn_transport_case(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn workflow_transport_redispatch_stop_failure_releases_without_refresh_or_start() {
+        workflow_spawn_transport_case(true, true).await;
+    }
+
     async fn terminal_row_count(db: &LocalDb, slug: &str) -> i64 {
         db.query_one(
             "SELECT COUNT(*) FROM job_terminals WHERE slug = ?1",

@@ -57,6 +57,8 @@ pub(crate) struct WorkflowSpawnParams {
     pub turn_id: String,
     pub session_id: Option<String>,
     pub output_name: String,
+    /// Re-dispatch replaces a resident runtime that may have survived its host.
+    pub replace_existing: bool,
 }
 
 pub(crate) async fn spawn_workflow_process(
@@ -117,6 +119,15 @@ pub(crate) async fn spawn_workflow_process(
     )
     .await
     .map_err(|refusal| refusal.diagnostic)?;
+    // Reacquiring a holder preserves its processes. A host restart must run
+    // the current package, not leave an old runtime waiting on an old question.
+    // Stop before subscribing so its exit cannot finalize the replacement run.
+    if params.replace_existing {
+        if let Err(error) = crate::fleet::residency::stop(orch, &fence, &params.run_id).await {
+            let _ = crate::fleet::residency::release(orch, &fence).await;
+            return Err(error);
+        }
+    }
     if let Err(error) = crate::fleet::residency::refresh(orch, &fence, &tip).await {
         let _ = crate::fleet::residency::release(orch, &fence).await;
         return Err(error);

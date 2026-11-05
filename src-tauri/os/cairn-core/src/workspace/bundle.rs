@@ -1218,12 +1218,8 @@ mod tests {
         assert_eq!(entry.config.service.as_deref(), Some("probe"));
     }
 
-    /// A fresh workspace seeds the packed `fan-out` workflow package, the loader
-    /// then lists it, and a later sync of a CHANGED pack preserves the user's
-    /// edit to their copy (directory packages are copy-when-missing, never
-    /// overwritten). This is the loader-level proof that a fresh workspace lists
-    /// `fan-out` out of the box -- the built-in workflow's whole provisioning
-    /// contract -- without dogfooding through the running host.
+    /// Shipped workflows load on a fresh workspace and take pack updates while
+    /// still owned. A user edit forks the package and survives later syncs.
     #[test]
     fn packed_workflow_seeds_missing_lists_and_preserves_user_edits() {
         fn write_workflow(resources: &Path, body: &str) {
@@ -1259,10 +1255,16 @@ mod tests {
             "fresh workspace must list the packed fan-out workflow"
         );
 
-        // The user edits their copy, then a CHANGED pack syncs: the edit stands
-        // (copy-when-missing never overwrites an existing package).
-        std::fs::write(repo.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
         sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("workflows/fan-out/main.ts")).unwrap(),
+            "// v2\n",
+            "an owned workflow must take updated runtime code before redispatch"
+        );
+
+        // A later source change must preserve the user's fork.
+        std::fs::write(repo.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
+        sync_workspace_packs(&git, &fs, &resources_a, &repo, "3.0.0").unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.join("workflows/fan-out/main.ts")).unwrap(),
             "// user edit\n",

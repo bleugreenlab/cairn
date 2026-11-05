@@ -593,6 +593,7 @@ async fn respawn_workflow_run(
             turn_id,
             session_id: Some(session_id),
             output_name: row.output_name.clone(),
+            replace_existing: true,
         },
     )
     .await?;
@@ -802,6 +803,7 @@ pub(crate) async fn start_workflow_run(
             turn_id: prepared.turn_id.clone(),
             session_id: Some(prepared.session_id.clone()),
             output_name: prepared.output_name.clone(),
+            replace_existing: false,
         },
     )
     .await

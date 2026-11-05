@@ -698,6 +698,9 @@ pub fn runnable_surface(profile: &InferenceProfile) -> Option<Value> {
         return None;
     };
     Some(serde_json::json!({
+        "weights": profile.model.weights,
+        "server": container.server,
+        "accelerator": profile.requirements.accelerator,
         "image": container.image,
         "entrypoint": container.entrypoint,
         "args": container.args,
@@ -1507,6 +1510,11 @@ pub struct GenerationView {
     pub last_log: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<PendingQuestion>,
+    /// The current draft surface, so a workflow with an older digest can ask again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface_digest: Option<String>,
 }
 
 /// Every generation as it stands, newest first, reconciled with its workflow
@@ -1529,9 +1537,21 @@ pub async fn generation_view(orch: &Orchestrator, row: GenerationRow) -> Generat
         phase: None,
         last_log: None,
         pending_question: None,
+        surface: None,
+        surface_digest: None,
     };
     if !view.row.is_open() {
         return view;
+    }
+    if let (Some(draft), Ok(inventory)) = (
+        view.row.draft_profile.as_deref(),
+        load_inventory(&orch.db.local).await,
+    ) {
+        view.surface = inventory
+            .profiles
+            .get(&InferenceProfileId::from(draft))
+            .and_then(runnable_surface);
+        view.surface_digest = view.surface.as_ref().map(surface_digest);
     }
     if job_ended(orch, &view.row.job_id).await {
         view.status = "failed".into();
@@ -2264,6 +2284,99 @@ requirements:
         let (_, data) = write_generated(&db, "h", "j-wf", &changed).await.unwrap();
         assert_ne!(data["surfaceDigest"].as_str().unwrap(), digest);
         assert!(unapproved_draft(&db, "a").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn weights_server_and_accelerator_changes_each_require_fresh_approval() {
+        let db = crate::storage::migrated_test_db("inference-generate-surface-fields").await;
+        registered(&db).await;
+        insert_generation(&db, &generation("g1", "j-wf"))
+            .await
+            .unwrap();
+        let baseline: InferenceProfile =
+            serde_yaml::from_str(&profile_yaml("a", CONTAINER)).unwrap();
+        let baseline = serde_json::to_value(baseline).unwrap();
+        let mut changes = Vec::new();
+        for field in ["repo", "revision", "path", "sha256"] {
+            let mut changed = baseline.clone();
+            changed["model"]["weights"][0][field] = match field {
+                "repo" => "other/weights".into(),
+                "revision" => "def".into(),
+                "path" => "other.gguf".into(),
+                _ => "f".repeat(64).into(),
+            };
+            changes.push((field, changed));
+        }
+        let mut server = baseline.clone();
+        server["engine"]["server"] = "vllm".into();
+        changes.push(("server", server));
+        let mut accelerator = baseline.clone();
+        accelerator["requirements"]["accelerator"] =
+            serde_json::json!({"family": "amd", "runtime": "rocm"});
+        changes.push(("accelerator", accelerator));
+
+        for (field, changed) in changes {
+            let (_, original) =
+                write_generated(&db, "h", "j-wf", &serde_json::json!({"profile": baseline}))
+                    .await
+                    .unwrap();
+            let old = original["surfaceDigest"].as_str().unwrap();
+            approve(&db, "j-wf", "g1", Some(asked(old, Some(APPROVE))))
+                .await
+                .unwrap();
+            assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None);
+            let (_, revised) =
+                write_generated(&db, "h", "j-wf", &serde_json::json!({"profile": changed}))
+                    .await
+                    .unwrap();
+            let fresh = revised["surfaceDigest"].as_str().unwrap();
+            assert_ne!(old, fresh, "{field}");
+            assert!(
+                unapproved_draft(&db, "a").await.unwrap().is_some(),
+                "{field}"
+            );
+            assert!(
+                approve(&db, "j-wf", "g1", Some(asked(old, Some(APPROVE))))
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+            approve(&db, "j-wf", "g1", Some(asked(fresh, Some(APPROVE))))
+                .await
+                .unwrap();
+            assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None, "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_draft_with_a_legacy_digest_requires_the_expanded_surface_approval() {
+        let db = crate::storage::migrated_test_db("inference-generate-old-surface").await;
+        registered(&db).await;
+        insert_generation(&db, &generation("g1", "j-wf"))
+            .await
+            .unwrap();
+        let (_, written) = write_generated(&db, "h", "j-wf", &write("a"))
+            .await
+            .unwrap();
+        let mut legacy = written["surface"].clone();
+        for field in ["weights", "server", "accelerator"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        let legacy = surface_digest(&legacy);
+        set_approved(&db, "g1", &legacy).await.unwrap();
+        assert!(unapproved_draft(&db, "a").await.unwrap().is_some());
+        assert!(
+            approve(&db, "j-wf", "g1", Some(asked(&legacy, Some(APPROVE))))
+                .await
+                .is_err()
+        );
+        let current = written["surfaceDigest"].as_str().unwrap();
+        assert_ne!(legacy, current);
+        approve(&db, "j-wf", "g1", Some(asked(current, Some(APPROVE))))
+            .await
+            .unwrap();
+        assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None);
+        assert!(get_generation(&db, "g1").await.unwrap().unwrap().is_open());
     }
 
     #[tokio::test]
