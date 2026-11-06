@@ -1234,6 +1234,141 @@ mod tests {
         );
     }
 
+    fn shipped_ambient_yaml() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packs/core/routes/ambient-channel.yaml"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn shipped_ambient_route_loads_through_healing_with_full_bodies() {
+        let yaml = shipped_ambient_yaml();
+        let parsed = parse(&yaml).unwrap();
+        assert_eq!(parsed.name, "Ambient channel");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.nodes.len(), 8);
+        assert!(parsed.nodes.iter().all(|node| node.position.is_none()));
+        let RouteNodeConfig::Decision { decision, input } = &parsed.nodes[1].config else {
+            panic!("a decision node");
+        };
+        assert!(matches!(input, Some(ArgumentBinding::Field { field }) if field == "text"));
+        assert_eq!(decision.questions.len(), 1);
+        let question = &decision.questions[0];
+        assert_eq!(question.name, "thread");
+        assert_eq!(
+            question.option_source(),
+            Some(OptionSource::CharteredThreads)
+        );
+        assert_eq!(question.top_k(), 2);
+        assert!(
+            matches!(&question.kind, QuestionKind::Choice { options, .. } if options.is_empty())
+        );
+        let raw: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let pick = &raw["nodes"][1];
+        assert!(pick.get("models").is_none());
+        assert_eq!(decision.thresholds.native, Some(0.4));
+        assert_eq!(decision.thresholds.logprobs, Some(0.6));
+        assert_eq!(
+            serde_json::to_value(&parsed.nodes[0]).unwrap()["when"],
+            serde_json::json!({
+                "fact": "channel_message", "bindingKind": "ambient",
+                "addressed": false, "provider": "discord"
+            })
+        );
+
+        let RouteSink::Message { target, body } = sink_of(&parsed, "deliver") else {
+            panic!("message delivery");
+        };
+        assert!(
+            matches!(target, Bindable::Bound(ArgumentBinding::Field { field }) if field == "answers.thread.addresses")
+        );
+        assert_eq!(body.as_deref(), Some("Decision: {{answers.thread.citations}}.\nVia ambient Discord channel {{conversation}} from {{sender}} via discord. If this isn't yours, say so.\n\n{{text}}\n"));
+        let acknowledgements = [
+            ("ack_routed", "admitted", "Routed to {{answers.thread.citations}}."),
+            ("ack_below_threshold", "below_threshold", "No thread claimed this (closest: {{answers.thread.citation}}). Start with @thread or #channel to route it."),
+            ("ack_abstained", "refused", "The router abstained. Start with @thread or #channel to route it."),
+            ("ack_unavailable", "unanswerable", "Routing is unavailable: {{answers.thread.reason}}. Start with @thread or #channel to route it."),
+            ("ack_failed", "failed", "Routing failed: {{answers.thread.reason}}. Start with @thread or #channel to route it."),
+        ];
+        assert_eq!(parsed.sinks().count(), 6);
+        assert_eq!(parsed.edges.len(), 7);
+        assert!(parsed.edges[0].when.is_empty());
+        for (id, outcome, expected_body) in acknowledgements {
+            let RouteSink::Channel {
+                destination, body, ..
+            } = sink_of(&parsed, id)
+            else {
+                panic!("channel acknowledgement");
+            };
+            assert!(
+                matches!(destination, Bindable::Bound(ArgumentBinding::Field { field }) if field == "conversation")
+            );
+            assert_eq!(body.as_deref(), Some(expected_body));
+            let edge = parsed.edges.iter().find(|edge| edge.to == id).unwrap();
+            assert_eq!(edge.from, "pick");
+            assert_eq!(
+                serde_json::to_value(edge).unwrap()["when"],
+                serde_json::json!({"answers.thread.outcome": outcome})
+            );
+        }
+        let deliver = parsed
+            .edges
+            .iter()
+            .find(|edge| edge.to == "deliver")
+            .unwrap();
+        assert_eq!(deliver.from, "pick");
+        assert_eq!(
+            serde_json::to_value(deliver).unwrap()["when"],
+            serde_json::json!({"answers.thread.outcome": "admitted"})
+        );
+        let emitted = serde_yaml::to_string(&parsed).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&parse(&emitted).unwrap()).unwrap(),
+            emitted
+        );
+    }
+
+    #[test]
+    fn shipped_ambient_variant_heals_literal_and_bound_destinations_together() {
+        let yaml = shipped_ambient_yaml();
+        assert_eq!(
+            yaml.matches("destination: { field: conversation }").count(),
+            5
+        );
+        let variant = yaml.replacen(
+            "destination: { field: conversation }",
+            "destination: discord:1/2",
+            1,
+        );
+        let parsed = parse(&variant).unwrap();
+        assert!(parsed.nodes.iter().all(|node| node.position.is_none()));
+        let check_destinations = |definition: &RouteDefinition| {
+            let RouteSink::Channel { destination, .. } = sink_of(definition, "ack_routed") else {
+                panic!("channel sink");
+            };
+            assert!(
+                matches!(destination, Bindable::Fixed(ChannelDestination::Conversation(address)) if address.to_string() == "discord:1/2")
+            );
+            for id in [
+                "ack_below_threshold",
+                "ack_abstained",
+                "ack_unavailable",
+                "ack_failed",
+            ] {
+                assert!(
+                    matches!(sink_of(definition, id), RouteSink::Channel { destination: Bindable::Bound(ArgumentBinding::Field { field }), .. } if field == "conversation")
+                );
+            }
+        };
+        check_destinations(&parsed);
+        let emitted = serde_yaml::to_string(&parsed).unwrap();
+        let reparsed = parse(&emitted).unwrap();
+        check_destinations(&reparsed);
+        assert_eq!(serde_yaml::to_string(&reparsed).unwrap(), emitted);
+    }
+
     #[test]
     fn fixture_b_loads_with_positions_omitted_and_a_declared_option_source() {
         let parsed = parse(FIXTURE_B).unwrap();

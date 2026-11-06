@@ -116,19 +116,7 @@ pub(super) fn parse_change_report(tool_result: &str) -> Option<ChangeReport> {
     Some(ChangeReport { sha, applied })
 }
 
-/// The sha a run's commit barrier reported (`✓ Committed changes (<sha>)`).
-///
-/// The barrier line follows the batch's command output, which can itself
-/// contain the marker (a grep over this very code, say), so the last
-/// occurrence wins and only a hex sha is accepted.
-pub(super) fn run_commit_sha(tool_result: &str) -> Option<String> {
-    const MARKER: &str = "\u{2713} Committed changes (";
-    let start = tool_result.rfind(MARKER)? + MARKER.len();
-    let rest = &tool_result[start..];
-    let sha = &rest[..rest.find(')')?];
-    let is_sha = (7..=64).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit());
-    is_sha.then(|| sha.to_string())
-}
+pub(super) use crate::mcp::handlers::run::run_commit_sha;
 
 /// The gitcoord-read stub: drop the heavy rendered `toolResult`, pin
 /// `toolInput.paths` (the contract reconstruction dispatches on). Other fields

@@ -106,6 +106,15 @@ pub(crate) enum Condition {
         /// Defaults to false so rows written before this existed keep holding.
         #[serde(default)]
         host: bool,
+        /// The batch's normalized payload, so a detached batch this wait turns
+        /// into still refuses an identical reissue.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<String>,
+        /// The batch runs against a pinned revision in a checkout of its own
+        /// (`branch:`), so the branch moving never disturbs it. Defaults to
+        /// false so rows written before this existed keep holding.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        verdict_only: bool,
     },
 }
 
@@ -430,6 +439,22 @@ pub(crate) async fn await_inner_wait_release(db: &LocalDb, record: &Record) {
 }
 
 impl Condition {
+    /// Whether a run batch can write its branch or runs in the node's
+    /// residence, which is what makes it hold the replay mutation boundary.
+    /// A host batch holds no tree; a verdict-only one without a `commit_msg`
+    /// runs in a checkout of its own. Every other condition holds nothing.
+    pub(crate) fn holds_branch(&self) -> bool {
+        match self {
+            Condition::RunBatch {
+                commits,
+                host,
+                verdict_only,
+                ..
+            } => !host && (*commits || !verdict_only),
+            _ => false,
+        }
+    }
+
     /// Whether this is a `waitFor` condition, which only observes something,
     /// rather than a call whose result is work in flight.
     pub(crate) fn is_wait_for(&self) -> bool {
@@ -1067,6 +1092,8 @@ struct SuspendedCall {
     session_id: String,
     turn_id: String,
     tool_use_id: String,
+    /// What the call waits on, when its stored condition could be read.
+    condition: Option<Condition>,
 }
 
 impl SuspendedCall {
@@ -1077,38 +1104,76 @@ impl SuspendedCall {
             session_id: r.session_id.clone(),
             turn_id: r.turn_id.clone(),
             tool_use_id: r.tool_use_id.clone(),
+            condition: Some(r.condition.clone()),
         }
     }
 }
 
-/// Clear the way for a new suspension.
+/// Clear the way for a new suspension, abandoning another turn's active row
+/// only on evidence about THAT row (tenet 1421).
 ///
-/// A job parks exactly one turn at a time, and a partial unique index on
-/// `(job_id, tool_use_id)` bounds that: at most one active `agent_waits` row per
-/// CALL. A row that outlives the turn which created it therefore refuses that
-/// call's next suspension for the rest of the job's life -- permanently
-/// degrading it to inline waiting -- unless it is superseded here (CAIRN-3159).
+/// A partial unique index on `(job_id, tool_use_id)` allows at most one active
+/// `agent_waits` row per call. A row that outlives the turn which created it
+/// would refuse that call's next suspension for the rest of the job's life --
+/// permanently degrading it to inline waiting -- unless it is cleared here
+/// (CAIRN-3159). Another turn suspending is not, by itself, evidence that a
+/// row was abandoned: a job does not run one turn at a time in every carrier
+/// (a Codex exec cell outlives the provider turn that opened it), and an
+/// inline-held run batch on an earlier turn is live work whose result the job
+/// still needs (cairn/6145 comment #8). The evidence that counts:
 ///
-/// Rows do outlive their turn. A session reconstruction (an inactivity reseed, a
-/// backend rotation) moves the job onto a fresh session, run, and turn while the
-/// previous turn's row is still pending, and nothing ever claims it: startup
-/// reconciliation only runs when the host restarts, and this reconstruction
-/// happened mid-life. Such a row is disposable state, not a permanent fact --
-/// the same principle restore-on-entry applies to a worktree.
+/// 0. its resolution finished in fact and only its final write is missing;
+/// 1. the row's call is the incoming one (same tool use id), so it would
+///    collide with the index;
+/// 2. a run batch whose batch is over: its task and its fleet request are both
+///    gone from this runner, which placed it (a batch from before a restart
+///    was settled by startup reconciliation);
+/// 3. any other wait whose session is no longer the job's current one: the
+///    session reconstruction CAIRN-3159 was written for, whose waiter is gone.
 ///
-/// The incoming suspension is the evidence, and what it proves is about the
-/// OTHER turns. It comes from a turn that is running right now, and a job runs
-/// one turn at a time, so an active row belonging to any other turn was
-/// abandoned and is superseded. An active row belonging to the SAME turn proves
-/// nothing of the kind: it is a sibling call of the very turn now suspending,
-/// parked alongside this one, and is left exactly where it is (CAIRN-3232).
+/// A row of the SAME turn is a sibling call parked alongside this one and is
+/// never touched (CAIRN-3232). A live run batch on an earlier turn is left
+/// pending; when it resolves, [`resolve`] hands its result to the job rather
+/// than resuming a turn the job has moved past.
 async fn supersede_abandoned(orch: &Orchestrator, db: &LocalDb, r: &Record) -> Result<(), String> {
+    let current_session = db
+        .query_opt(
+            "SELECT current_session_id FROM jobs WHERE id=?1",
+            params![r.job_id.clone()],
+            |row| row.opt_text(0),
+        )
+        .await
+        .ok()
+        .flatten()
+        .flatten();
     for wait in active_waits_for_job(db, &r.job_id).await? {
         if wait.turn_id == r.turn_id {
             continue;
         }
+        // A row whose resolver already claimed its successor and delivered its
+        // result is finished in fact; its own columns say so.
+        complete_resolution_in_fact(db, &wait.id).await?;
+        let evidence = if wait.tool_use_id == r.tool_use_id {
+            "its call is the one suspending now"
+        } else {
+            match &wait.condition {
+                Some(Condition::RunBatch { request_id, .. }) => {
+                    if super::run::detached::batch_is_live(orch, request_id) {
+                        continue;
+                    }
+                    "its batch is no longer running"
+                }
+                _ if current_session
+                    .as_deref()
+                    .is_some_and(|current| current != wait.session_id) =>
+                {
+                    "its session is no longer the job's current one"
+                }
+                _ => continue,
+            }
+        };
         log::warn!(
-            "superseding abandoned suspension {} (turn {}) so job {} can suspend turn {}",
+            "superseding abandoned suspension {} (turn {}) so job {} can suspend turn {}: {evidence}",
             wait.id,
             wait.turn_id,
             r.job_id,
@@ -1236,12 +1301,40 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
     db.write(|c| {
         let (id, result) = (id.clone(), abandoned_result(cause));
         Box::pin(async move {
+            let mut rows = c
+                .query(
+                    "SELECT job_id,run_id,condition_json FROM agent_waits WHERE id=?1",
+                    params![id.clone()],
+                )
+                .await?;
+            let row = match rows.next().await? {
+                Some(row) => Some((row.text(0)?, row.text(1)?, row.text(2)?)),
+                None => None,
+            };
+            drop(rows);
+            let now = chrono::Utc::now().timestamp_millis();
             let marked = c
                 .execute(
                     "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=COALESCE(resolving_at,?3) WHERE id=?1 AND state IN ('pending','resolving') AND successor_turn_id IS NULL",
-                    params![id, result, chrono::Utc::now().timestamp_millis()],
+                    params![id, result, now],
                 )
                 .await?;
+            // Abandoning the wait never abandons its batch: a run batch that may
+            // still be running becomes a detached one in this same write, so its
+            // resolver hands the result to the job and the branch stays held.
+            if let (true, Some((job_id, run_id, condition))) = (marked > 0, row) {
+                if let Ok(condition) = serde_json::from_str::<Condition>(&condition) {
+                    super::run::detached::insert_converted(
+                        c,
+                        &job_id,
+                        &run_id,
+                        &condition,
+                        "its wait was abandoned while the batch ran",
+                        now,
+                    )
+                    .await?;
+                }
+            }
             Ok(marked > 0)
         })
     })
@@ -1269,12 +1362,24 @@ async fn deliver_abandonment(
             return;
         }
     }
+    // A run batch's call is told its batch carries on, not to reissue it.
+    let text = match &call.condition {
+        Some(Condition::RunBatch { request_id, .. }) => serde_json::json!({
+            "outcome": ABANDONED_OUTCOME,
+            "error": format!(
+                "This call's wait ended before its batch finished, but the batch keeps running. Cairn delivers its result to this job as a notice, and `{}` shows it now. Do not re-run it.",
+                super::run::detached::handle_uri(request_id)
+            ),
+        })
+        .to_string(),
+        _ => abandoned_result(cause),
+    };
     if let Err(error) = crate::execution::jobs::store_tool_result_event_with_turn(
         orch,
         &call.run_id,
         &call.session_id,
         &call.tool_use_id,
-        &abandoned_result(cause),
+        &text,
         true,
         chrono::Utc::now().timestamp() as i32,
         Some(&call.turn_id),
@@ -1337,7 +1442,7 @@ async fn active_waits_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<Suspende
         let job_id = job_id.clone();
         Box::pin(async move {
             let mut rows = c.query(
-                "SELECT id,run_id,session_id,predecessor_turn_id,tool_use_id FROM agent_waits WHERE job_id=?1 AND state IN ('pending','resolving')",
+                "SELECT id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json FROM agent_waits WHERE job_id=?1 AND state IN ('pending','resolving')",
                 params![job_id],
             ).await?;
             let mut found = Vec::new();
@@ -1348,6 +1453,7 @@ async fn active_waits_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<Suspende
                     session_id: row.text(2)?,
                     turn_id: row.text(3)?,
                     tool_use_id: row.text(4)?,
+                    condition: serde_json::from_str(&row.text(5)?).ok(),
                 });
             }
             Ok(found)
@@ -1443,6 +1549,17 @@ pub(crate) async fn resolve(
     // for that call. A real answer beats "this call's turn was replaced".
     store_result_once(orch, db, r, result).await?;
 
+    // A run batch whose turn the job has already moved past (its call was held
+    // inline on a turn that ended, or a later turn ran beside it) must not
+    // resume that turn: the agent no longer reads it. Its result goes to the
+    // job as a notice instead (tenet 1421). A row that already claimed its
+    // successor is a replay of a resume in progress and goes on as one.
+    if let Condition::RunBatch { .. } = &r.condition {
+        if stored_successor.is_none() && turn_moved_past(db, r).await {
+            return divert_to_job(orch, db, r, result, replay).await;
+        }
+    }
+
     // The election. A sibling call of this same turn still parked means this
     // resolver is not the last one out, and it is finished here.
     if stood_down_for_active_sibling(db, r).await? {
@@ -1537,6 +1654,84 @@ pub(crate) async fn resolve(
     // Mark resolved (idempotent CAS on the resolving state).
     let id = r.id.clone();
     db.write(|c|{let id=id.clone();Box::pin(async move{c.execute("UPDATE agent_waits SET state='resolved',resolved_at=?2 WHERE id=?1 AND state='resolving'",params![id,chrono::Utc::now().timestamp_millis()]).await?;Ok(())})}).await.map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+/// Whether the job has moved past the turn this call came from: a later turn
+/// of the same session exists, or the job now runs a different session. A
+/// read failure is not evidence, so it reads as not moved past.
+async fn turn_moved_past(db: &LocalDb, r: &Record) -> bool {
+    db.query_one(
+        "SELECT EXISTS(SELECT 1 FROM turns t JOIN turns p ON p.id=?1 \
+            WHERE t.session_id=p.session_id AND t.sequence>p.sequence) \
+         OR EXISTS(SELECT 1 FROM jobs WHERE id=?2 AND current_session_id IS NOT NULL \
+            AND current_session_id<>?3)",
+        params![r.turn_id.clone(), r.job_id.clone(), r.session_id.clone()],
+        |row| row.i64(0),
+    )
+    .await
+    .is_ok_and(|moved| moved != 0)
+}
+
+/// Settle a run-batch wait whose turn is gone by handing its batch's result to
+/// the job: the wait resolves, and the batch becomes a detached one in the
+/// same write. A live resolver settles that row with the batch's verdict right
+/// after; a replay has no resolver behind it and settles it here.
+async fn divert_to_job(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    r: &Record,
+    result: &str,
+    replay: bool,
+) -> Result<(), String> {
+    let Condition::RunBatch { request_id, .. } = r.condition.clone() else {
+        return Ok(());
+    };
+    let (id, job_id, run_id, condition) = (
+        r.id.clone(),
+        r.job_id.clone(),
+        r.run_id.clone(),
+        r.condition.clone(),
+    );
+    db.write(|c| {
+        let (id, job_id, run_id, condition) =
+            (id.clone(), job_id.clone(), run_id.clone(), condition.clone());
+        Box::pin(async move {
+            let now = chrono::Utc::now().timestamp_millis();
+            super::run::detached::insert_converted(
+                c,
+                &job_id,
+                &run_id,
+                &condition,
+                "its turn had ended when the batch finished",
+                now,
+            )
+            .await?;
+            c.execute(
+                "UPDATE agent_waits SET state='resolved',resolved_at=?2 WHERE id=?1 AND state='resolving'",
+                params![id, now],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    log::info!(
+        "run batch suspension {} resolved after its turn ended; its result goes to job {} as a notice",
+        r.id,
+        r.job_id
+    );
+    if replay {
+        super::run::detached::settle_and_deliver(
+            orch,
+            db,
+            &request_id,
+            &super::run::detached::verdict_from_text(result),
+            result,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -2347,11 +2542,12 @@ async fn settle_if_unresumable(db: &LocalDb, record: &Record) -> bool {
 /// Re-drive every suspension left pending or mid-resolution by a host restart.
 ///
 /// A waitFor condition is level-triggered and can simply be re-armed. A run
-/// batch cannot: its trigger was an in-memory join handle and its executor
-/// result channel is gone, so it resolves to a typed failure that names what
-/// happened -- fail closed and unblock the agent rather than strand it -- and
-/// cancels the abandoned request so a surviving executor stops a child whose
-/// result nobody will read.
+/// batch cannot: its trigger was an in-memory join handle that died with the
+/// old process. But a restart is not evidence the batch died, since it may
+/// still be running on its machine, so it is neither cancelled nor declared
+/// lost: its wait becomes a detached batch (which keeps holding its branch),
+/// the call is told so, and the batch's machine's report settles it later
+/// (`run::detached::sweep_unreported`).
 pub(crate) async fn reconcile(orch: &Orchestrator) {
     for db in orch.db.all_dbs().await {
         let records = db.read(|conn| Box::pin(async move {
@@ -2674,6 +2870,10 @@ pub(crate) fn spawn_scheduler(orch: Orchestrator) {
                             outcome.settled
                         );
                     }
+                    let lost = super::run::detached::sweep_unreported(&orch).await;
+                    if lost > 0 {
+                        log::warn!("{lost} detached run batch(es) can no longer report and were settled as lost");
+                    }
                 }
             }
         }
@@ -2718,13 +2918,35 @@ async fn resolution_after_restart(
                 }
             }
         }
-        Condition::RunBatch {
-            request_id,
-            commits,
-            ..
-        } => {
-            orch.cancel_cell_request(request_id);
-            super::run::run_batch_lost_to_restart_text(*commits)
+        Condition::RunBatch { request_id, .. } => {
+            // Written before the wait resolves, so the batch is never without
+            // an unsettled row; a crash in between converts it again.
+            let (job_id, run_id, condition) = (
+                record.job_id.clone(),
+                record.run_id.clone(),
+                record.condition.clone(),
+            );
+            let converted = db
+                .write(|c| {
+                    let (job_id, run_id, condition) =
+                        (job_id.clone(), run_id.clone(), condition.clone());
+                    Box::pin(async move {
+                        super::run::detached::insert_converted(
+                            c,
+                            &job_id,
+                            &run_id,
+                            &condition,
+                            "Cairn restarted while the batch ran",
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                    })
+                })
+                .await;
+            if let Err(error) = converted {
+                log::warn!("startup could not record run batch {request_id} as detached: {error}");
+            }
+            super::run::detached::restart_text(request_id)
         }
         // Level-triggered conditions re-arm from their own durable state, so a
         // restart simply asks them again.
@@ -2852,6 +3074,8 @@ mod tests {
             commits,
             label: label.map(str::to_string),
             host: false,
+            identity: None,
+            verdict_only: false,
         }
     }
 
@@ -2861,6 +3085,8 @@ mod tests {
             commits: false,
             label: None,
             host: false,
+            identity: None,
+            verdict_only: false,
         };
         record
     }
@@ -3233,11 +3459,18 @@ mod tests {
     /// executor result channel were in memory. Reconciliation must therefore
     /// resolve it exactly once to a typed failure that unblocks the agent, rather
     /// than leaving a pending row nobody will ever satisfy.
+    ///
+    /// The restart is not evidence the batch died (it may still be running on
+    /// its machine), so it is not cancelled or declared lost: it becomes a
+    /// detached batch that keeps its identity and keeps holding its branch.
     #[tokio::test]
     async fn a_pending_run_batch_resolves_to_a_typed_host_restart_failure() {
         let (orch, base, _) = durable_env().await;
         register_warm(&orch);
-        let record = run_batch_record(&base, true);
+        let mut record = run_batch_record(&base, true);
+        if let Condition::RunBatch { identity, .. } = &mut record.condition {
+            *identity = Some("{\"commands\":[]}".into());
+        }
         insert(&orch.db.local, &record).await.unwrap();
 
         reconcile(&orch).await;
@@ -3261,13 +3494,64 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            resolution.contains("restarted") && resolution.contains("may have landed"),
-            "unexpected restart resolution: {resolution}"
+        assert_eq!(
+            resolution,
+            super::super::run::detached::restart_text("request-1"),
+            "unexpected restart resolution"
         );
+        let (state, identity, holds): (String, Option<String>, i64) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT state, identity, holds_branch FROM run_batch_detached WHERE request_id='request-1'",
+                (),
+                |r| Ok((r.text(0)?, r.opt_text(1)?, r.i64(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, "running", "a restart settles nothing");
+        assert_eq!(identity.as_deref(), Some("{\"commands\":[]}"));
+        assert_eq!(holds, 1);
         // Exactly one resume, exactly one delivered result.
         assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
         assert_eq!(tool_result_count(&orch).await, 1);
+    }
+
+    /// Abandoning a run batch's wait converts its batch with the scope the wait
+    /// recorded: a verdict-only batch without a `commit_msg` holds no branch,
+    /// and its identity survives for the reissue refusal.
+    #[tokio::test]
+    async fn conversion_keeps_a_batchs_identity_and_verdict_only_scope() {
+        let (orch, base, _) = durable_env().await;
+        let mut record = run_batch_record(&base, false);
+        if let Condition::RunBatch {
+            identity,
+            verdict_only,
+            ..
+        } = &mut record.condition
+        {
+            *identity = Some("same-batch".into());
+            *verdict_only = true;
+        }
+        assert!(!record.condition.holds_branch());
+        insert(&orch.db.local, &record).await.unwrap();
+        assert!(
+            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::OperatorCompact)
+                .await
+                .unwrap()
+        );
+        let (identity, holds): (Option<String>, i64) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT identity, holds_branch FROM run_batch_detached WHERE request_id='request-1'",
+                (),
+                |r| Ok((r.opt_text(0)?, r.i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity.as_deref(), Some("same-batch"));
+        assert_eq!(holds, 0, "a verdict-only batch never holds its branch");
     }
 
     /// A run batch has no waitFor condition to await; asking for one is a bug,
@@ -6080,8 +6364,80 @@ mod tests {
         assert!(wait_resolved_turns(&orch).await.is_empty());
     }
 
+    /// cairn/6145 comment #8 (tenet 1421): a turn's run batch is held inline
+    /// and still running when a LATER turn of the same session suspends on a
+    /// duration. That suspension is no evidence about the batch, so its wait
+    /// stays pending; and when the batch settles, its result reaches the job
+    /// as Cairn's notice instead of resuming the turn the job has moved past.
+    #[tokio::test]
+    async fn a_live_held_run_batch_survives_a_later_suspension_and_reaches_the_job() {
+        let (orch, base, _) = durable_env().await;
+        let held = run_batch_record(&base, false);
+        insert_as(&orch.db.local, &held, Establish::Hold)
+            .await
+            .unwrap();
+        let live = super::super::run::detached::LiveBatch::claim("request-1");
+        for sql in [
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('later-turn','session-1','run-1','job-1',2,'running','initial',2,2)",
+            "UPDATE jobs SET current_turn_id='later-turn' WHERE id='job-1'",
+        ] {
+            orch.db.local.execute(sql, ()).await.unwrap();
+        }
+        register_warm(&orch);
+        let later = Record {
+            id: "wait-2".into(),
+            turn_id: "later-turn".into(),
+            tool_use_id: "tool-2".into(),
+            ..ten_minute_wait(base.clone())
+        };
+        suspend(&orch, &orch.db.local, &later).await.unwrap();
+        assert_eq!(
+            wait_row(&orch, "wait-1").await.0,
+            "pending",
+            "not abandoned"
+        );
+        assert_eq!(wait_row(&orch, "wait-2").await.0, "pending");
+
+        drop(live);
+        resolve(&orch, &orch.db.local, &held, "the batch's output", true)
+            .await
+            .unwrap();
+        assert_eq!(wait_row(&orch, "wait-1").await.0, "resolved");
+        let (state, output): (String, String) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT state, output FROM run_batch_detached WHERE request_id='request-1'",
+                (),
+                |r| Ok((r.text(0)?, r.text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, "settled");
+        assert_eq!(output, "the batch's output");
+        let notices = crate::messages::side_channel::peek_pending_side_channel_for_job_async(
+            &orch.db.local,
+            "job-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .render()
+                .starts_with("Your run batch 'unnamed' (cairn:~/batches/request-1) finished:"),
+            "{}",
+            notices[0].render()
+        );
+        assert!(
+            wait_resolved_turns(&orch).await.is_empty(),
+            "the turn the job moved past is not resumed"
+        );
+    }
+
     /// The same for a suspended `run` batch, whose row carries no pollable
-    /// condition and so can only ever be closed by something else.
+    /// condition and so can only ever be closed by something else. Its batch
+    /// is not running in this runner, which is the evidence that clears it.
     #[tokio::test]
     async fn abandoned_run_batch_row_does_not_block_the_reconstructed_session() {
         let (orch, base, _) = durable_env().await;

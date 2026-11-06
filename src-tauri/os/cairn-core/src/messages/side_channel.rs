@@ -17,6 +17,11 @@ pub enum SideChannelOrigin {
     IssueMessage {
         source: String,
     },
+    /// Cairn reporting a `run` batch that outlived its call. The content is
+    /// Cairn's own sentence, rendered as it stands: nobody sent it.
+    RunBatch {
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +66,7 @@ impl SideChannelNotice {
                     self.child_uri, self.content
                 )
             }
+            SideChannelOrigin::RunBatch { .. } => self.content.clone(),
         }
     }
 
@@ -69,8 +75,23 @@ impl SideChannelNotice {
             SideChannelOrigin::UserChild => "child_side_channel",
             SideChannelOrigin::IssueComment { .. } => "issue_comment",
             SideChannelOrigin::IssueMessage { .. } => "issue_message",
+            SideChannelOrigin::RunBatch { .. } => "run_batch",
         }
     }
+}
+
+/// Whether a detached run batch's result is still waiting for its job, which
+/// is reason enough to resume an idle one.
+pub(crate) async fn pending_run_batch_notice_count(db: &LocalDb, job_id: &str) -> usize {
+    peek_pending_side_channel_for_job_async(db, job_id)
+        .await
+        .map(|notices| {
+            notices
+                .iter()
+                .filter(|notice| matches!(notice.origin, SideChannelOrigin::RunBatch { .. }))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,11 +153,16 @@ fn parse_issue_notice_content(
 
 fn notice_from_wake(wake: crate::orchestrator::wakes::SuppressedWake) -> SideChannelNotice {
     let rendered = wake.content.unwrap_or_default();
+    let source_ref = wake.source_ref.clone();
     let child_uri = wake
         .latest_detail_uri
         .or(wake.source_ref)
         .unwrap_or_else(|| "unknown child".to_string());
-    let (origin, content) = if wake.source_kind == "issue_comment" {
+    let (origin, content) = if wake.source_kind == crate::orchestrator::wakes::SOURCE_KIND_RUN_BATCH
+    {
+        let request_id = source_ref.unwrap_or_default();
+        (SideChannelOrigin::RunBatch { request_id }, rendered)
+    } else if wake.source_kind == "issue_comment" {
         let (source, content) = parse_issue_notice_content(
             rendered,
             &child_uri,
@@ -692,6 +718,54 @@ mod tests {
         assert_eq!(notice.content, "message body");
         assert_eq!(notice.render(), rendered);
         assert_eq!(notice.channel_type(), "issue_message");
+    }
+
+    /// A detached batch's result reaches its job as Cairn's own sentence,
+    /// rendered verbatim: no side-channel prefix and no author, because nobody
+    /// sent it (cairn/6098, cairn/3162).
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_batch_notice_round_trips_as_cairns_own_sentence() {
+        let db = migrated_db().await;
+        seed_parent_job(&db, "job-a").await;
+        let sentence = "Your run batch 'cargo test' (cairn:~/batches/req-1) finished: succeeded, committed nothing.";
+        let queue = |db: &LocalDb| {
+            db.write(|c| {
+                Box::pin(async move {
+                    crate::mcp::handlers::run::detached::queue_notice(
+                        c,
+                        "job-a",
+                        "req-1",
+                        sentence,
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await
+                })
+            })
+        };
+        queue(&db).await.unwrap();
+        let notice = peek_pending_side_channel_for_job_async(&db, "job-a")
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            notice.origin,
+            SideChannelOrigin::RunBatch {
+                request_id: "req-1".into()
+            }
+        );
+        assert_eq!(notice.render(), sentence);
+        assert_eq!(notice.channel_type(), "run_batch");
+        assert!(!notice.render().contains("user"));
+
+        // Reported twice, queued once.
+        queue(&db).await.unwrap();
+        assert_eq!(pending_run_batch_notice_count(&db, "job-a").await, 1);
+        let claimed = claim_pending_side_channel_for_job_async(&db, "job-a")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].render(), sentence);
+        assert_eq!(pending_run_batch_notice_count(&db, "job-a").await, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

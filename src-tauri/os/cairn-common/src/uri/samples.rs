@@ -197,6 +197,14 @@ resource_samples! {
     NodeCalls { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeWakes { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeChecks { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
+    NodeBatches { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
+    NodeBatch {
+        project: project(),
+        number: 42,
+        exec_seq: 2,
+        node_id: node(),
+        request_id: "req-1".to_string(),
+    } => Parser,
     NodeQuestions { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeQuestion {
         project: project(),

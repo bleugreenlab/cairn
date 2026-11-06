@@ -3519,8 +3519,6 @@ fn continue_job_launch_locked(
         } else {
             None
         };
-    let trigger = resolve_resume_trigger(message, has_queued, has_pushes);
-    let base_prompt = resolve_skill_slash_command(orch, &trigger.message, project_path.as_deref());
     let side_channel_notices =
         match crate::messages::side_channel::claim_pending_side_channel_for_job(&owning_db, job_id)
         {
@@ -3534,6 +3532,16 @@ fn continue_job_launch_locked(
                 Vec::new()
             }
         };
+    // A detached run batch's result is content of its own: a resume that
+    // carries one is not the contentless restart the synthetic prompt names.
+    let carries_batch_result = side_channel_notices.iter().any(|notice| {
+        matches!(
+            notice.origin,
+            crate::messages::side_channel::SideChannelOrigin::RunBatch { .. }
+        )
+    });
+    let trigger = resolve_resume_trigger(message, has_queued || carries_batch_result, has_pushes);
+    let base_prompt = resolve_skill_slash_command(orch, &trigger.message, project_path.as_deref());
     if !side_channel_notices.is_empty() {
         crate::messages::transcript::insert_side_channel_events_sync(
             orch,

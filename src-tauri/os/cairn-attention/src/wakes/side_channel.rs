@@ -71,6 +71,13 @@ pub async fn record_live_issue_message_side_channel_message(
     .await
 }
 
+/// The notice row a detached run batch's result is queued under, so a second
+/// report of the same batch queues nothing new. The row itself is written in
+/// the transaction that settles the batch (cairn-core `run::detached`).
+pub fn run_batch_notice_id(request_id: &str) -> String {
+    format!("run-batch:{request_id}")
+}
+
 pub async fn peek_pending_live_side_channel_for_job(
     db: &LocalDb,
     job_id: &str,

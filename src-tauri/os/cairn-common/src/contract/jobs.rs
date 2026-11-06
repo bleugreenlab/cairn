@@ -52,6 +52,28 @@ pub(crate) const NODE_CHECKS_CONTRACT: ResourceContract =
         mutations: NO_MUTATIONS,
     };
 
+pub(crate) const NODE_BATCHES_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeBatches,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/batches",
+    name: "Node batches",
+    description: "Run batches that kept running after their call answered with a handle, newest first: state, verdict, and what each committed (read-only)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const NODE_BATCH_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeBatch,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/batches/{request_id}",
+    name: "Node batch",
+    description: "One run batch that kept running after its call answered: whether it is still running, its verdict and output once settled, and whether it committed (read-only)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const TASK_CHECKS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::TaskChecks,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/checks",

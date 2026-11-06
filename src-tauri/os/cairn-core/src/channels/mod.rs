@@ -484,6 +484,65 @@ pub fn submit_route(
     delivered.then_some(()).ok_or(Box::new(submission))
 }
 
+/// Stands in for `provider`'s running router: while it lives, every route
+/// submission [`submit_route`] directs at `provider` is held here instead of
+/// reaching a transport. Captures of one provider are serialized process-wide,
+/// because its submission slot is a global and a second capture would
+/// silently take the first one's submissions.
+#[cfg(test)]
+pub(crate) struct RouteSubmissionCapture {
+    provider: &'static str,
+    receiver: mpsc::UnboundedReceiver<router::RouterSubmission>,
+    _serial: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(test)]
+impl RouteSubmissionCapture {
+    pub(crate) async fn new(provider: &'static str) -> Self {
+        type ProviderCaptureLocks = Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>;
+        static SERIAL: OnceLock<ProviderCaptureLocks> = OnceLock::new();
+        let lock = SERIAL
+            .get_or_init(Mutex::default)
+            .lock()
+            .expect("capture serial poisoned")
+            .entry(provider)
+            .or_default()
+            .clone();
+        let serial = lock.lock_owned().await;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        route_submission_slot()
+            .lock()
+            .expect("route submission slot poisoned")
+            .insert(provider, sender);
+        Self {
+            provider,
+            receiver,
+            _serial: serial,
+        }
+    }
+
+    /// Every route submission received so far, in arrival order.
+    pub(crate) fn take(&mut self) -> Vec<crate::routes::ChannelSubmission> {
+        let mut submissions = Vec::new();
+        while let Ok(submission) = self.receiver.try_recv() {
+            if let router::RouterSubmission::Route(submission) = submission {
+                submissions.push(*submission);
+            }
+        }
+        submissions
+    }
+}
+
+#[cfg(test)]
+impl Drop for RouteSubmissionCapture {
+    fn drop(&mut self) {
+        route_submission_slot()
+            .lock()
+            .expect("route submission slot poisoned")
+            .remove(self.provider);
+    }
+}
+
 fn resolve_presence_with_lock(
     state: &mut OperatorPresenceState,
     inferred: OperatorPresence,

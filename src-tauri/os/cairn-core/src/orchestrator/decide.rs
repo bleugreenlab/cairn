@@ -783,6 +783,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("a request the script did not expect");
+            // `{"upstreamError": text}` scripts the provider call itself failing.
+            if let Some(error) = reply.get("upstreamError").and_then(Value::as_str) {
+                return Err(CompletionError::Upstream(error.to_string()));
+            }
             Ok(match call.wire {
                 CompletionWire::Decisions(_) => {
                     CompletionReply::Decisions(serde_json::from_value(reply).unwrap())

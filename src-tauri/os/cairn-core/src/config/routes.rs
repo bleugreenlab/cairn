@@ -161,6 +161,7 @@ mod tests {
 
     const FOLLOWED_ID: &str = "followed-thread-stream";
     const GITHUB_MENTION_ID: &str = "github-mention";
+    const AMBIENT_ID: &str = "ambient-channel";
 
     /// A workspace config dir synced from the packs this repository ships, so
     /// the routes under test are the real shipped files as the pack sync
@@ -208,7 +209,7 @@ mod tests {
         .unwrap();
 
         let workspace = list_routes(&config, None).unwrap();
-        for id in [FOLLOWED_ID, GITHUB_MENTION_ID] {
+        for id in [FOLLOWED_ID, GITHUB_MENTION_ID, AMBIENT_ID] {
             let route = ok_route(&workspace, id);
             assert!(!route.is_project_scoped);
             assert_eq!(
@@ -221,13 +222,19 @@ mod tests {
         let routes = list_routes(&config, Some(&project)).unwrap();
         assert_eq!(
             routes.len(),
-            2,
+            3,
             "the project copy shadows, never duplicates"
         );
         let route = ok_route(&routes, FOLLOWED_ID);
         assert!(route.is_project_scoped);
         assert_eq!(route.definition.name, "Project route");
         assert!(!ok_route(&routes, GITHUB_MENTION_ID).is_project_scoped);
+        assert!(!ok_route(&routes, AMBIENT_ID).is_project_scoped);
+        assert_eq!(
+            workspace.len(),
+            3,
+            "one workspace route per shipped filename"
+        );
     }
 
     /// Deleting a shipped route must hold across the next sync. The sync is

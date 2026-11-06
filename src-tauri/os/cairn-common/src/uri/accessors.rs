@@ -60,6 +60,8 @@ impl CairnResource {
             | NodeCalls { project, .. }
             | NodeWakes { project, .. }
             | NodeChecks { project, .. }
+            | NodeBatches { project, .. }
+            | NodeBatch { project, .. }
             | TaskChecks { project, .. }
             | NodeQuestions { project, .. }
             | NodeQuestion { project, .. }
@@ -313,6 +315,8 @@ impl CairnResource {
             | Self::NodeCalls { .. }
             | Self::NodeWakes { .. }
             | Self::NodeChecks { .. }
+            | Self::NodeBatches { .. }
+            | Self::NodeBatch { .. }
             | Self::TaskChecks { .. }
             | Self::NodeQuestions { .. }
             | Self::NodeQuestion { .. }
@@ -529,6 +533,8 @@ impl CairnResource {
             | Self::NodeCalls { project, .. }
             | Self::NodeWakes { project, .. }
             | Self::NodeChecks { project, .. }
+            | Self::NodeBatches { project, .. }
+            | Self::NodeBatch { project, .. }
             | Self::TaskChecks { project, .. }
             | Self::NodeQuestions { project, .. }
             | Self::NodeQuestion { project, .. }
@@ -701,6 +707,8 @@ impl CairnResource {
             | Self::NodeCalls { number, .. }
             | Self::NodeWakes { number, .. }
             | Self::NodeChecks { number, .. }
+            | Self::NodeBatches { number, .. }
+            | Self::NodeBatch { number, .. }
             | Self::TaskChecks { number, .. }
             | Self::NodeQuestions { number, .. }
             | Self::NodeQuestion { number, .. }

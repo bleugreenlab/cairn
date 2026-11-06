@@ -404,6 +404,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("message_streams", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     spec("message_stream_chunks", "stream_id IN (SELECT id FROM message_streams WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
     spec("sessions", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR chat_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
+    delete_only("run_batch_detached", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     delete_only("agent_waits", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR session_id IN (SELECT id FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("session_skyline_cache", "session_id IN (SELECT id FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("resource_surfacings", "session_id IN (SELECT id FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),

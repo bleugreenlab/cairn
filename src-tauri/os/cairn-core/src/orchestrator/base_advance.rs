@@ -974,13 +974,15 @@ fn run_batch_from_wait(
     condition_json: &str,
     created_at: i64,
 ) -> Option<InflightRunBatch> {
-    match serde_json::from_str(condition_json) {
-        Ok(crate::mcp::handlers::durable_suspend::Condition::RunBatch {
-            request_id,
-            label,
-            host: false,
-            ..
-        }) => Some(InflightRunBatch {
+    let condition: crate::mcp::handlers::durable_suspend::Condition =
+        serde_json::from_str(condition_json).ok()?;
+    if !condition.holds_branch() {
+        return None;
+    }
+    match condition {
+        crate::mcp::handlers::durable_suspend::Condition::RunBatch {
+            request_id, label, ..
+        } => Some(InflightRunBatch {
             job_id,
             holder: None,
             request_id,
@@ -991,7 +993,33 @@ fn run_batch_from_wait(
     }
 }
 
-/// The open run-batch suspension of one job, if it has one.
+/// A batch that outlived its call and still runs, as the boundary names it.
+fn run_batch_from_detached(
+    row: &cairn_db::turso::Row,
+) -> Result<InflightRunBatch, crate::storage::DbError> {
+    Ok(InflightRunBatch {
+        job_id: row.text(0)?,
+        holder: None,
+        request_id: row.text(1)?,
+        label: row.opt_text(2)?,
+        parked_at_ms: row.get::<i64>(3)?,
+    })
+}
+
+/// The unsettled batch rows that hold one job's branch.
+///
+/// A batch holds the boundary for as long as a durable row for its request is
+/// unsettled, and only settlement releases it (cairn/6145 and cairn/6205,
+/// agreed with the execution thread 11-05): an open run-batch wait
+/// (`pending` or `resolving`), or a `run_batch_detached` row still `running`
+/// for a batch that can disturb the branch. A wait abandoned while its batch
+/// ran becomes such a detached row in the same write, so the agent losing
+/// interest never ends the hold. The source is these durable rows, not the
+/// in-memory fleet registry, for two reasons: the boundary revalidates inside
+/// the store-lock bracket that moves the bookmark, where a durable row can be
+/// read and the registry cannot; and the registry is per-incarnation, so for
+/// minutes after a boot it reads "not in flight" for remote batches that are
+/// running (tenets 309 and 311).
 async fn inflight_run_batch_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -1015,7 +1043,19 @@ async fn inflight_run_batch_for_job(
                     return Ok(Some(batch));
                 }
             }
-            Ok(None)
+            drop(rows);
+            let mut rows = conn
+                .query(
+                    "SELECT job_id, request_id, label, created_ms FROM run_batch_detached
+                     WHERE job_id = ?1 AND state = 'running' AND holds_branch = 1
+                     ORDER BY created_ms LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(run_batch_from_detached(&row)?)),
+                None => Ok(None),
+            }
         })
     })
     .await
@@ -1047,9 +1087,27 @@ pub(crate) async fn inflight_run_batch_on_branch(
             AND {LIVE_JOB_PREDICATE}
           ORDER BY (w.job_id = ?1) DESC, w.created_at"
     );
+    // The same owner set for batches that outlived their calls; see
+    // [`inflight_run_batch_for_job`] for why these rows decide existence.
+    let detached_sql = format!(
+        "SELECT d.job_id, d.request_id, d.label, d.created_ms
+           FROM run_batch_detached d
+           JOIN jobs j ON j.id = d.job_id
+          WHERE j.project_id = (SELECT project_id FROM jobs WHERE id = ?1)
+            AND j.branch = ?2
+            AND d.state = 'running' AND d.holds_branch = 1
+            AND {LIVE_JOB_PREDICATE}
+          ORDER BY (d.job_id = ?1) DESC, d.created_ms
+          LIMIT 1"
+    );
     let found = db
         .read(|conn| {
-            let (job_id, branch, sql) = (job_id.clone(), branch.clone(), sql.clone());
+            let (job_id, branch, sql, detached_sql) = (
+                job_id.clone(),
+                branch.clone(),
+                sql.clone(),
+                detached_sql.clone(),
+            );
             Box::pin(async move {
                 let mut rows = conn
                     .query(&sql, params![job_id.as_str(), branch.as_str()])
@@ -1061,7 +1119,14 @@ pub(crate) async fn inflight_run_batch_on_branch(
                         return Ok(Some(batch));
                     }
                 }
-                Ok(None)
+                drop(rows);
+                let mut rows = conn
+                    .query(&detached_sql, params![job_id.as_str(), branch.as_str()])
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some(run_batch_from_detached(&row)?)),
+                    None => Ok(None),
+                }
             })
         })
         .await
@@ -7900,6 +7965,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(child_view.request_id, "request-child");
+    }
+
+    /// cairn/6145 and cairn/6205: a batch holds its branch while any durable row
+    /// for it is unsettled. A batch running detached (no wait row at all, as a
+    /// Codex carrier's batch or one whose wait was abandoned) holds it, whether
+    /// or not this runner's registry knows it; only settlement releases it,
+    /// and a verdict-only batch never holds.
+    #[tokio::test]
+    async fn a_batch_running_detached_holds_its_branch_until_it_settles() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        // The 6205 shape: the agent's wait was cancelled, the batch lives on.
+        for sql in [
+            "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,commits,holds_branch,state,reason,created_ms) VALUES('req-detached','job-overlap','run-job-overlap','cargo test',1,1,'running','its wait was abandoned while the batch ran',7)",
+            "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,commits,holds_branch,state,reason,created_ms) VALUES('req-verdict','job-clean','run-job-clean','branch: main',0,0,'running','x',7)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        assert_eq!(
+            count_waits(&db).await,
+            0,
+            "no wait row exists for either batch"
+        );
+
+        let hold = inflight_run_batch_on_branch(&db, "job-overlap", "agent/overlap").await;
+        assert_eq!(
+            hold.clone().unwrap(),
+            Some(InflightRunBatch {
+                job_id: "job-overlap".into(),
+                holder: hold.clone().unwrap().unwrap().holder,
+                request_id: "req-detached".into(),
+                label: Some("cargo test".into()),
+                parked_at_ms: 7,
+            })
+        );
+        assert!(mutation_boundary_hold(&hold).contains("`req-detached`"));
+        assert!(
+            inflight_run_batch_for_job(&db, "job-overlap")
+                .await
+                .unwrap()
+                .is_some(),
+            "the automatic reconcile's guard sees it too"
+        );
+        assert!(
+            inflight_run_batch_on_branch(&db, "job-clean", "agent/clean")
+                .await
+                .unwrap()
+                .is_none(),
+            "a verdict-only batch never holds its branch"
+        );
+
+        db.execute(
+            "UPDATE run_batch_detached SET state='settled' WHERE request_id='req-detached'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(
+            inflight_run_batch_on_branch(&db, "job-overlap", "agent/overlap")
+                .await
+                .unwrap()
+                .is_none(),
+            "settlement releases the hold"
+        );
+    }
+
+    async fn count_waits(db: &LocalDb) -> i64 {
+        db.query_one("SELECT COUNT(*) FROM agent_waits", (), |row| row.i64(0))
+            .await
+            .unwrap()
     }
 
     fn held() -> Result<Option<InflightRunBatch>, String> {

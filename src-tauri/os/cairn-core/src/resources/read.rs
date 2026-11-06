@@ -23,12 +23,12 @@ use super::node::{
     parse_artifact_format, ArtifactCoordinates,
 };
 use super::node::{
-    read_job_todos, read_node, read_node_artifact, read_node_calls, read_node_chat,
-    read_node_chat_event, read_node_chat_raw, read_node_chat_turn, read_node_checks,
-    read_node_permission, read_node_permissions, read_node_question, read_node_questions,
-    read_node_tasks, read_node_wakes, read_task, read_task_artifact, read_task_chat,
-    read_task_chat_event, read_task_chat_raw, read_task_chat_turn, read_task_checks,
-    read_task_permission, read_task_permissions,
+    read_job_todos, read_node, read_node_artifact, read_node_batches, read_node_calls,
+    read_node_chat, read_node_chat_event, read_node_chat_raw, read_node_chat_turn,
+    read_node_checks, read_node_permission, read_node_permissions, read_node_question,
+    read_node_questions, read_node_tasks, read_node_wakes, read_task, read_task_artifact,
+    read_task_chat, read_task_chat_event, read_task_chat_raw, read_task_chat_turn,
+    read_task_checks, read_task_permission, read_task_permissions,
 };
 use super::paging::{paging, RecordPage};
 use super::progress::read_node_progress;
@@ -3027,6 +3027,31 @@ async fn render_resource_body(
                 error
             } else {
                 read_node_checks(orch, &project, number, exec_seq, &node_id).await
+            }
+        }
+        CairnResource::NodeBatches {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => {
+            if let Some(error) = reject_query_params("node batches", &params) {
+                error
+            } else {
+                read_node_batches(db, &project, number, exec_seq, &node_id, None).await
+            }
+        }
+        CairnResource::NodeBatch {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            request_id,
+        } => {
+            if let Some(error) = reject_query_params("node batch", &params) {
+                error
+            } else {
+                read_node_batches(db, &project, number, exec_seq, &node_id, Some(&request_id)).await
             }
         }
         CairnResource::TaskChecks {

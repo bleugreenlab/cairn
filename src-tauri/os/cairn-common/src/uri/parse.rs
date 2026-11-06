@@ -873,6 +873,23 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 node_id: (*node_id).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "batches"] => {
+            Some(CairnResource::NodeBatches {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "batches", request_id] => {
+            Some(CairnResource::NodeBatch {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                request_id: (*request_id).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "questions"] => {
             Some(CairnResource::NodeQuestions {
                 project: canonical_project(project),

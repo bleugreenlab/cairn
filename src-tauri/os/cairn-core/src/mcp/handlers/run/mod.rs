@@ -10,6 +10,7 @@
 
 mod checks;
 mod commit_barrier;
+pub(crate) mod detached;
 mod embed;
 pub(crate) mod held;
 mod hygiene;
@@ -68,6 +69,20 @@ pub(crate) const RUN_FAILURE_OPENINGS: &[&str] = &[
     RUN_NOT_PUBLISHED,
     RUN_CANCELLED,
 ];
+
+/// The sha a run's commit barrier reported (`✓ Committed changes (<sha>)`).
+///
+/// The barrier line follows the batch's command output, which can itself
+/// contain the marker (a grep over this very code, say), so the last
+/// occurrence wins and only a hex sha is accepted.
+pub(crate) fn run_commit_sha(tool_result: &str) -> Option<String> {
+    const MARKER: &str = "\u{2713} Committed changes (";
+    let start = tool_result.rfind(MARKER)? + MARKER.len();
+    let rest = &tool_result[start..];
+    let sha = &rest[..rest.find(')')?];
+    let is_sha = (7..=64).contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit());
+    is_sha.then(|| sha.to_string())
+}
 
 /// Whether a composed run envelope reports a failure of the run itself.
 pub(crate) fn envelope_reports_run_failure(text: &str) -> bool {
@@ -3998,7 +4013,9 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     }
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     let (task_orch, task_request, task_control) = (orch.clone(), request.clone(), control.clone());
+    let live = detached::LiveBatch::claim(&control.request_id);
     tokio::spawn(async move {
+        let _live = live;
         let envelope = prepare_and_run_batch(
             &task_orch,
             &task_request,
@@ -5038,6 +5055,7 @@ async fn run_host_batch(
         store_lock: settlement.store_lock.clone(),
         host: true,
         may_park: suspendable,
+        verdict_only: settlement.verdict_only,
     });
     control.phase_done("prepare");
     let (interrupter, interrupt) = crate::responses::interruption();
@@ -5064,6 +5082,7 @@ async fn run_host_batch(
     let settled =
         off_frame(|| settle_host_batch(orch, &settlement, joined_host_outcomes(joined))).await;
     control.phase_done("settle");
+    control.set_verdict(settled.verdict.clone());
     settled_envelope(settled)
 }
 
@@ -5558,11 +5577,15 @@ struct SettledRunBatch {
     images: Vec<cairn_common::read::ImageBlock>,
     data: Option<Vec<serde_json::Value>>,
     suspended: bool,
+    /// One phrase for how the batch ended, which a detached batch's notice
+    /// states: "succeeded", "2 of 3 items failed", or the run's own failure.
+    verdict: String,
 }
 
 impl SettledRunBatch {
     fn failure(text: String) -> Self {
         Self {
+            verdict: detached::verdict_from_text(&text),
             text,
             images: Vec::new(),
             data: None,
@@ -5576,16 +5599,24 @@ impl SettledRunBatch {
             images: Vec::new(),
             data: None,
             suspended: true,
+            verdict: "suspended on an item's own approval".into(),
         }
     }
 
     /// A batch that ran to `text`, carrying its items' images and data.
     fn settled(text: String, mut outcomes: Vec<ItemOutcome>) -> Self {
+        let failed = outcomes.iter().filter(|outcome| !outcome.succeeded).count();
+        let verdict = match (failed, outcomes.len()) {
+            (0, _) => "succeeded".to_string(),
+            (1, 1) => "failed".to_string(),
+            (failed, total) => format!("{failed} of {total} items failed"),
+        };
         Self {
             text,
             data: collect_run_data(&mut outcomes),
             images: collect_run_images(outcomes),
             suspended: false,
+            verdict,
         }
     }
 }
@@ -5867,6 +5898,7 @@ async fn run_routed_batch(
         store_lock: settlement.store_lock.clone(),
         host: false,
         may_park: true,
+        verdict_only: settlement.verdict_only,
     });
     control.phase_done("prepare");
     let task_orch = orch.clone();
@@ -5892,6 +5924,7 @@ async fn run_routed_batch(
     let settled =
         off_frame(|| settle_joined_batch(orch, &settlement, joined, ceiling_detail)).await;
     control.phase_done("settle");
+    control.set_verdict(settled.verdict.clone());
     settled_envelope(settled)
 }
 
@@ -6365,6 +6398,18 @@ struct BatchFacts {
     /// decide, REPL, or executor-action items is capped at grace and never
     /// parks.
     may_park: bool,
+    /// The batch runs against a pinned revision in a checkout of its own
+    /// (`branch:`), so the branch moving never disturbs it.
+    verdict_only: bool,
+}
+
+impl BatchFacts {
+    /// Whether the batch can write its branch or runs in the node's
+    /// residence, which is what makes it hold the replay mutation boundary.
+    /// Before preparation has said otherwise, a batch is assumed to.
+    fn holds_branch(&self, commits: bool) -> bool {
+        !self.host && (commits || !self.verdict_only)
+    }
 }
 
 const SETTLE_RUNNING: u8 = 0;
@@ -6386,6 +6431,9 @@ struct BatchControl {
     /// abandoned the batch first. Exactly one of the two wins.
     settle_gate: std::sync::atomic::AtomicU8,
     facts: std::sync::Mutex<BatchFacts>,
+    /// The verdict settlement reached, for a result that reaches its job as a
+    /// notice rather than on its call.
+    verdict: std::sync::Mutex<Option<String>>,
     interrupter: std::sync::Mutex<Option<Interrupter>>,
     phases: std::sync::Mutex<(std::time::Instant, Vec<(&'static str, std::time::Duration)>)>,
 }
@@ -6401,7 +6449,9 @@ impl BatchControl {
                 store_lock: None,
                 host: false,
                 may_park: true,
+                verdict_only: false,
             }),
+            verdict: std::sync::Mutex::new(None),
             interrupter: std::sync::Mutex::new(None),
             phases: std::sync::Mutex::new((std::time::Instant::now(), Vec::new())),
         })
@@ -6413,6 +6463,19 @@ impl BatchControl {
 
     fn set_facts(&self, facts: BatchFacts) {
         *self.facts.lock().unwrap_or_else(|p| p.into_inner()) = facts;
+    }
+
+    fn set_verdict(&self, verdict: String) {
+        *self.verdict.lock().unwrap_or_else(|p| p.into_inner()) = Some(verdict);
+    }
+
+    /// The settled verdict, or the one the composed text states.
+    fn verdict_for(&self, text: &str) -> String {
+        self.verdict
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or_else(|| detached::verdict_from_text(text))
     }
 
     fn set_interrupter(&self, interrupter: Interrupter) {
@@ -6544,22 +6607,34 @@ impl BatchAnswer {
 /// or parked for the same turn.
 pub(crate) const RUN_BATCH_ALREADY_RUNNING: &str = "This batch is already running for this turn; its result resumes this turn when it settles. Nothing new was started.";
 
-/// Refuse a `run` that reissues a batch still held or parked for this turn:
-/// one whose answer was lost on the way back. The predecessor's own result
-/// resumes the turn, and a second copy would run the work twice. A legitimate
-/// sequential re-run never matches, because the first call's row is resolved
-/// once it answers.
-async fn reissue_refusal(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-) -> Option<&'static str> {
+/// Refuse a `run` that reissues a batch still held or parked for this turn, or
+/// still running detached for this job: one whose answer was lost on the way
+/// back, or that the agent was told not to re-run. The predecessor's own
+/// result reaches the turn or the job, and a second copy would run the work
+/// twice. A legitimate sequential re-run never matches, because the first
+/// call's row is settled once it answers.
+async fn reissue_refusal(orch: &Orchestrator, request: &McpCallbackRequest) -> Option<String> {
     request.run_id.as_ref()?;
     let (ctx, db) = super::run_context::lookup_run_routed(&orch.db, request)
         .await
         .ok()?;
+    let expected = batch_identity(&request.payload)?;
+    let expected_text = expected.to_string();
+    if let Some(twin) = detached::running_for_job(&db, &ctx.job_id)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|batch| batch.identity.as_deref() == Some(expected_text.as_str()))
+    {
+        log::info!(
+            "refusing a reissued run batch for run {}: its identical predecessor {} is still running detached",
+            ctx.run_id,
+            twin.request_id
+        );
+        return Some(detached::reissue_refusal_text(&twin.request_id));
+    }
     let turn_id =
         crate::mcp::handlers::durable_suspend::suspending_turn_id(orch, &db, &ctx.run_id).await?;
-    let expected = batch_identity(&request.payload)?;
     let (run_id, turn) = (ctx.run_id.clone(), turn_id.clone());
     let calls: Vec<String> = db
         .read(|c| {
@@ -6590,7 +6665,7 @@ async fn reissue_refusal(
                 "refusing a reissued run batch for run {}: its identical predecessor {call} is still running",
                 ctx.run_id
             );
-            return Some(RUN_BATCH_ALREADY_RUNNING);
+            return Some(RUN_BATCH_ALREADY_RUNNING.to_string());
         }
     }
     None
@@ -6746,6 +6821,8 @@ async fn establish_durable_record(
             commits: control.commits,
             label: batch_label(&request.payload),
             host: facts.host,
+            identity: batch_identity(&request.payload).map(|identity| identity.to_string()),
+            verdict_only: facts.verdict_only,
         },
         deadline: None,
         created: chrono::Utc::now().timestamp_millis(),
@@ -6808,7 +6885,11 @@ fn spawn_parked_resolver(
     use crate::mcp::handlers::durable_suspend;
 
     let orch = orch.clone();
+    // A wait converted to a detached batch while parked is settled by this
+    // resolver, so the sweep must not mistake it for one nobody hears.
+    let live = detached::LiveResolver::claim(&control.request_id);
     tokio::spawn(async move {
+        let _live = live;
         let answer = match answer {
             ParkedAnswer::Ready(answer) => answer,
             ParkedAnswer::Pending(mut rx) => loop {
@@ -6843,7 +6924,164 @@ fn spawn_parked_resolver(
         // being withdrawn, and its withdrawal hands this row back.
         durable_suspend::await_inner_wait_release(&db, &record).await;
         durable_suspend::drive_resolution(&orch, &db, &record, &answer.resume_text, false).await;
+        // A wait abandoned while its batch ran became a detached batch, and
+        // its result reaches the job as a notice instead. Settling is a no-op
+        // for a wait that resolved normally: no detached row exists for it.
+        detached::settle_and_deliver(
+            &orch,
+            &db,
+            &control.request_id,
+            &control.verdict_for(&answer.resume_text),
+            &answer.resume_text,
+        )
+        .await;
     });
+}
+
+/// The `run_batch_detached` row a call wrote for its batch.
+#[derive(Clone)]
+struct DetachedRecord {
+    db: std::sync::Arc<crate::storage::LocalDb>,
+}
+
+/// Why a call that never parks is detached: the tool call it came from cannot
+/// be suspended and resumed in place.
+const NO_RESUMABLE_CALL: &str =
+    "its carrier cannot suspend a nested tool call and resume it in place";
+
+/// Why a call whose transport closed before it answered is detached.
+const TRANSPORT_CLOSED: &str = "its transport closed before it answered";
+
+/// Write the durable row that makes this batch a detached one. Before the call
+/// answers, so there is never a moment when the batch runs with no record.
+async fn record_detached(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    control: &BatchControl,
+    reason: &str,
+) -> Result<DetachedRecord, String> {
+    if request.run_id.is_none() {
+        return Err("it belongs to no agent run".into());
+    }
+    let (ctx, db) = super::run_context::lookup_run_routed(&orch.db, request)
+        .await
+        .map_err(|error| format!("its run could not be found ({error})"))?;
+    let facts = control.facts();
+    let batch = detached::DetachedBatch {
+        request_id: control.request_id.clone(),
+        job_id: ctx.job_id.clone(),
+        run_id: ctx.run_id.clone(),
+        label: batch_label(&request.payload),
+        identity: batch_identity(&request.payload).map(|identity| identity.to_string()),
+        commits: control.commits,
+        holds_branch: facts.holds_branch(control.commits),
+        state: detached::DetachedState::Running,
+        verdict: None,
+        output: None,
+        commit_id: None,
+        reason: reason.to_string(),
+        lost_evidence: None,
+        created_ms: chrono::Utc::now().timestamp_millis(),
+        settled_ms: None,
+        notified_ms: None,
+    };
+    detached::insert(&db, &batch).await?;
+    Ok(DetachedRecord { db })
+}
+
+/// Settle a detached batch when it answers and hand its result to the job.
+fn spawn_detached_resolver(
+    orch: &Orchestrator,
+    control: std::sync::Arc<BatchControl>,
+    record: DetachedRecord,
+    rx: tokio::sync::oneshot::Receiver<BatchAnswer>,
+) {
+    let orch = orch.clone();
+    let live = detached::LiveResolver::claim(&control.request_id);
+    tokio::spawn(async move {
+        let _live = live;
+        let answer = rx.await.unwrap_or_else(|_| BatchAnswer::task_failed());
+        detached::settle_and_deliver(
+            &orch,
+            &record.db,
+            &control.request_id,
+            &control.verdict_for(&answer.resume_text),
+            &answer.resume_text,
+        )
+        .await;
+    });
+}
+
+/// Whether this call has no tool call of its own that a park could suspend
+/// and later resume in place.
+///
+/// The backend stands in for that fact, which the request cannot state: every
+/// Codex MCP call arrives nested inside a `functions.exec` cell. Parking sends
+/// `turn/interrupt`, which ends the cell, and the resume prompt then reaches a
+/// new turn rather than the cell, so a parked result has nowhere to land
+/// (cairn/6145 specimens #586 and #606). A call that carries its own tool use
+/// id is the Cairn-native loop's, which resumes in place.
+async fn cannot_resume_in_place(orch: &Orchestrator, request: &McpCallbackRequest) -> bool {
+    if request.tool_use_id.is_some() {
+        return false;
+    }
+    let Some(run_id) = request.run_id.as_deref() else {
+        return false;
+    };
+    let live = orch
+        .process_state
+        .processes
+        .lock()
+        .ok()
+        .and_then(|processes| processes.get(run_id).and_then(|run| run.backend.clone()));
+    let backend = match live {
+        Some(backend) => Some(backend),
+        None => match super::run_context::lookup_run_routed(&orch.db, request).await {
+            Ok((_, db)) => db
+                .query_opt(
+                    "SELECT s.backend FROM runs r JOIN sessions s ON s.id = r.session_id WHERE r.id = ?1",
+                    cairn_db::turso::params![run_id.to_string()],
+                    |row| row.opt_text(0),
+                )
+                .await
+                .ok()
+                .flatten()
+                .flatten(),
+            Err(_) => None,
+        },
+    };
+    backend.as_deref() == Some("codex")
+}
+
+/// Detach a batch whose transport went away before its call answered, so its
+/// result still reaches the job.
+async fn detach_dropped_call(
+    orch: Orchestrator,
+    control: std::sync::Arc<BatchControl>,
+    request: McpCallbackRequest,
+    recorded: Option<DetachedRecord>,
+    rx: Option<tokio::sync::oneshot::Receiver<BatchAnswer>>,
+) {
+    let Some(rx) = rx else {
+        return;
+    };
+    let record = match recorded {
+        Some(record) => Ok(record),
+        None => record_detached(&orch, &request, &control, TRANSPORT_CLOSED).await,
+    };
+    match record {
+        Ok(record) => {
+            log::warn!(
+                "run answer lost; batch {} keeps running detached",
+                control.request_id
+            );
+            spawn_detached_resolver(&orch, control, record, rx);
+        }
+        Err(error) => log::warn!(
+            "run answer lost; batch {} could not be recorded as detached ({error}); its result reaches only the log",
+            control.request_id
+        ),
+    }
 }
 
 /// The call's own side of a `run` batch: wait for the batch, hold, park, or
@@ -6855,11 +7093,17 @@ fn spawn_parked_resolver(
 /// response and MCP-tool items interrupted, since nobody is left to read them.
 struct CallAnswer {
     orch: Orchestrator,
+    request: McpCallbackRequest,
     control: std::sync::Arc<BatchControl>,
     deadlines: CallDeadlines,
     rx: Option<tokio::sync::oneshot::Receiver<BatchAnswer>>,
     held: Option<HeldCall>,
     arming: Option<Arming>,
+    /// The detached row written ahead of need for a call that can never park,
+    /// so its batch has a durable record from grace on.
+    detached: Option<DetachedRecord>,
+    /// The call has no tool call of its own a park could resume in place.
+    never_parks: bool,
     answered: bool,
 }
 
@@ -7016,6 +7260,23 @@ impl CallAnswer {
     async fn answer(&mut self, answer: BatchAnswer) -> String {
         use crate::mcp::handlers::durable_suspend::{self, HeldDelivery};
 
+        // The call carries the result itself, so a detached row written for
+        // it (ahead of need, or by an abandonment that converted its wait)
+        // settles without a notice.
+        let detached_db = self
+            .detached
+            .take()
+            .map(|record| record.db)
+            .or_else(|| self.held.as_ref().map(|held| held.db.clone()));
+        if let Some(db) = detached_db {
+            detached::settle_answered_inline(
+                &db,
+                &self.control.request_id,
+                &self.control.verdict_for(&answer.resume_text),
+                &answer.resume_text,
+            )
+            .await;
+        }
         let Some(held) = self.held.take() else {
             return self.finish(AnswerOutcome::Answered, answer.envelope);
         };
@@ -7096,7 +7357,7 @@ impl CallAnswer {
     }
 
     /// Past the work deadline: park the call, converting its hold when it has
-    /// one, or, when it cannot park, end the batch and still answer in time.
+    /// one, or, when it cannot park, detach the batch and still answer in time.
     async fn park(&mut self, request: &McpCallbackRequest) -> String {
         let started = std::time::Instant::now();
         if !self.control.facts().may_park {
@@ -7104,9 +7365,15 @@ impl CallAnswer {
                 .cannot_park("its batch runs on the host and cannot suspend")
                 .await;
         }
+        if self.never_parks {
+            return self.cannot_park(NO_RESUMABLE_CALL).await;
+        }
+        // Admission gives up early enough that a call that cannot park still
+        // has time to detach its batch before it must answer.
+        let admit_by = self.give_up();
         let parked = match self.held.take() {
             Some(held) => match tokio::time::timeout_at(
-                self.deadlines.answer,
+                admit_by,
                 crate::mcp::handlers::durable_suspend::convert_hold_to_park(
                     &self.orch,
                     &held.db,
@@ -7119,13 +7386,13 @@ impl CallAnswer {
                 _ => Err("its held record was settled by something else first"),
             },
             None => match tokio::time::timeout_at(
-                self.deadlines.answer,
+                admit_by,
                 establish_durable_record(
                     &self.orch,
                     request,
                     &self.control,
                     Durable::Park,
-                    self.deadlines.answer,
+                    admit_by,
                     None,
                 ),
             )
@@ -7161,18 +7428,90 @@ impl CallAnswer {
         }
     }
 
+    /// When a call that cannot park stops waiting for its batch.
+    fn give_up(&self) -> tokio::time::Instant {
+        (self.deadlines.answer - CANCEL_MARGIN).max(tokio::time::Instant::now())
+    }
+
     /// A call that cannot park still answers by its deadline, and until
-    /// shortly before it keeps waiting for its batch. A sender with no tool
-    /// call to park on that listens longer (the SDK states how long) gets its
-    /// batch's real result.
+    /// shortly before it keeps waiting for its batch: an inline result beats a
+    /// handle, and a sender that listens longer (the SDK states how long)
+    /// gets its batch's real result.
     ///
-    /// A host batch's response and MCP-tool items are first ended at the grace
-    /// window with a bound failure that says why, and the call answers with
-    /// the batch's real (capped) result. A batch that has not answered
-    /// [`CANCEL_MARGIN`] before the deadline is cancelled before it publishes,
-    /// or, if it was already publishing, given until the deadline; the call
-    /// says exactly what that left behind.
+    /// A batch that has not answered by then is detached, never cancelled: the
+    /// executor is healthy, and failing to record a wait is no reason to kill
+    /// its work. The call answers with the batch's handle, and the result
+    /// reaches the job as a notice when it settles.
+    ///
+    /// A host batch is not detached: it holds no tree and cannot commit, and
+    /// its response and MCP-tool items are capped at the grace window instead,
+    /// so it answers inline with the cap's reason (what the `run` description
+    /// promises an SDK call nested in a shell item).
     async fn cannot_park(&mut self, reason: &str) -> String {
+        let facts = self.control.facts();
+        if !facts.may_park || facts.host {
+            return self.answer_capped(reason).await;
+        }
+        let give_up = self.give_up();
+        if let Some(answer) = self.wait_until(give_up).await {
+            return self.answer(answer).await;
+        }
+        self.detach(reason).await
+    }
+
+    /// Answer now with the batch's handle and let it run to its own end.
+    async fn detach(&mut self, reason: &str) -> String {
+        let record = match self.detached.take() {
+            Some(record) => Ok(record),
+            None => {
+                let by = self
+                    .deadlines
+                    .answer
+                    .checked_sub(DETACH_RECORD_RESERVE)
+                    .unwrap_or(self.deadlines.answer);
+                match tokio::time::timeout_at(
+                    by,
+                    record_detached(&self.orch, &self.request, &self.control, reason),
+                )
+                .await
+                {
+                    Ok(recorded) => recorded,
+                    Err(_) => Err("its record could not be written in time".into()),
+                }
+            }
+        };
+        let record = match record {
+            Ok(record) => record,
+            Err(error) => {
+                log::warn!(
+                    "run batch {} cannot be parked ({reason}) or detached ({error}); cancelling it so its call answers in time",
+                    self.control.request_id
+                );
+                return self.cancel_in_time(reason).await;
+            }
+        };
+        log::info!(
+            "run batch {} cannot be parked ({reason}); it keeps running detached",
+            self.control.request_id
+        );
+        let rx = self
+            .rx
+            .take()
+            .expect("an unanswered call holds its receiver");
+        spawn_detached_resolver(&self.orch, self.control.clone(), record, rx);
+        self.finish(
+            AnswerOutcome::Detached,
+            run_envelope(
+                detached::detach_answer_text(&self.control.request_id, reason),
+                Vec::new(),
+            ),
+        )
+    }
+
+    /// A host batch that can never park: its response and MCP-tool items are
+    /// ended at the grace window with a bound failure that says why, and the
+    /// call answers with the batch's real (capped) result.
+    async fn answer_capped(&mut self, reason: &str) -> String {
         if self.control.facts().host {
             self.control.interrupt(Interruption::Capped {
                 limit: self.deadlines.grace_window,
@@ -7180,20 +7519,21 @@ impl CallAnswer {
                 why: UNPARKED_HOST_BATCH_WHY,
             });
         }
-        let give_up = self.deadlines.answer - CANCEL_MARGIN;
-        if let Some(answer) = self
-            .wait_until(give_up.max(tokio::time::Instant::now()))
-            .await
-        {
-            return self.finish(AnswerOutcome::Answered, answer.envelope);
+        let give_up = self.give_up();
+        if let Some(answer) = self.wait_until(give_up).await {
+            return self.answer(answer).await;
         }
-        log::warn!(
-            "run batch {} cannot be parked ({reason}); cancelling it so its call answers in time",
-            self.control.request_id
-        );
+        self.cancel_in_time(reason).await
+    }
+
+    /// The only cancel left: a batch that could neither park nor be recorded
+    /// as detached, which therefore has nowhere durable to report. It is
+    /// cancelled before it publishes or, if it was already publishing, given
+    /// until the deadline, and the call says exactly what that left behind.
+    async fn cancel_in_time(&mut self, reason: &str) -> String {
         if self.control.abandon(&self.orch) {
             let text = RunFailure::Cancelled(Some(format!(
-                "Cairn could not park this call ({reason}), so it cancelled the batch; nothing from it was committed."
+                "Cairn could not park this call ({reason}) or record it to finish on its own, so it cancelled the batch; nothing from it was committed."
             )))
             .text();
             return self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()));
@@ -7203,13 +7543,22 @@ impl CallAnswer {
         if let Some(answer) = self.wait_until(self.deadlines.answer).await {
             return self.finish(AnswerOutcome::Answered, answer.envelope);
         }
+        let left = if self.control.commits {
+            "so it may have committed; read `cairn:@/vcs/log?limit=5` before re-running"
+        } else {
+            "but it had no commit_msg, so it committed nothing"
+        };
         let text = RunFailure::Cancelled(Some(format!(
-            "Cairn could not park this call ({reason}), and the batch was already publishing its result when the call had to answer, so it may have committed; read `cairn:@/vcs/log?limit=5` before re-running."
+            "Cairn could not park this call ({reason}), and the batch was already publishing its result when the call had to answer, {left}."
         )))
         .text();
         self.finish(AnswerOutcome::Cancelled, run_envelope(text, Vec::new()))
     }
 }
+
+/// How long before its answer deadline a detaching call must have written its
+/// row, so the answer still goes out in time if the write fails.
+const DETACH_RECORD_RESERVE: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Drop for CallAnswer {
     fn drop(&mut self) {
@@ -7220,8 +7569,14 @@ impl Drop for CallAnswer {
         if held.is_some() || arming.is_some() {
             // The transport dropped a held call, or one whose hold was still
             // being armed. A hold that lands becomes the park it would have
-            // been; an arming still waiting on the store writes nothing.
-            let (orch, control, rx) = (self.orch.clone(), self.control.clone(), self.rx.take());
+            // been; an arming still waiting on the store writes nothing, and
+            // its batch is detached instead.
+            let (orch, control, rx, request) = (
+                self.orch.clone(),
+                self.control.clone(),
+                self.rx.take(),
+                self.request.clone(),
+            );
             tokio::spawn(async move {
                 let held = match (held, arming) {
                     (Some(held), _) => Some(held),
@@ -7236,12 +7591,22 @@ impl Drop for CallAnswer {
                     None if control.facts().host => {
                         control.interrupt(Interruption::Cancelled(CALL_ABANDONED_REASON.into()))
                     }
-                    None => {}
+                    None => detach_dropped_call(orch, control, request, None, rx).await,
                 }
             });
         } else if self.control.facts().host {
             self.control
                 .interrupt(Interruption::Cancelled(CALL_ABANDONED_REASON.into()));
+        } else {
+            // Nobody is left to read the batch's answer on this call, so it
+            // keeps running detached and its result reaches the job.
+            tokio::spawn(detach_dropped_call(
+                self.orch.clone(),
+                self.control.clone(),
+                self.request.clone(),
+                self.detached.take(),
+                self.rx.take(),
+            ));
         }
     }
 }
@@ -7256,11 +7621,14 @@ async fn answer_call(
 ) -> String {
     let mut call = CallAnswer {
         orch: orch.clone(),
+        request: request.clone(),
         control,
         deadlines,
         rx: Some(rx),
         held: None,
         arming: None,
+        detached: None,
+        never_parks: false,
         answered: false,
     };
     let first = if deadlines.holds_past_grace() {
@@ -7271,7 +7639,32 @@ async fn answer_call(
     if let Some(answer) = call.wait_until(first).await {
         return call.answer(answer).await;
     }
-    if deadlines.holds_past_grace() && call.control.facts().may_park {
+    call.never_parks = cannot_resume_in_place(orch, request).await;
+    if deadlines.holds_past_grace() && call.control.facts().may_park && call.never_parks {
+        // A call that can never park keeps waiting on its socket, but its
+        // batch gets its durable record now rather than at the work deadline,
+        // so the replay boundary and a restart both see it throughout. The
+        // row settles quietly if the batch answers on the socket after all.
+        match tokio::time::timeout_at(
+            deadlines.work,
+            record_detached(orch, request, &call.control, NO_RESUMABLE_CALL),
+        )
+        .await
+        {
+            Ok(Ok(record)) => call.detached = Some(record),
+            Ok(Err(error)) => log::warn!(
+                "run batch {} keeps waiting past grace without a durable record: {error}",
+                call.control.request_id
+            ),
+            Err(_) => log::warn!(
+                "run batch {} keeps waiting past grace without a durable record: its write outlived the work window",
+                call.control.request_id
+            ),
+        }
+        if let Some(answer) = call.wait_until(deadlines.work).await {
+            return call.answer(answer).await;
+        }
+    } else if deadlines.holds_past_grace() && call.control.facts().may_park {
         // Past grace with work time left: stay on the socket, but under the
         // durable record a park would take, so a host restart resumes the
         // turn exactly once. Arming waits on the project store lock, which
@@ -10829,11 +11222,13 @@ mod host_batch_tests {
         let orch = env().await;
         let store = tempfile::tempdir().unwrap().keep();
         let request = call_request(json!({"commands": [{"command": "cargo build"}]}));
+        // The answer bound leaves the park's admission (which gives up
+        // `CANCEL_MARGIN` before the answer deadline) time to outwait the lock.
         let deadlines = CallDeadlines::new(
             tokio::time::Instant::now(),
             ms(100),
-            ms(1_900),
-            ms(2_000),
+            ms(3_900),
+            ms(4_000),
             None,
         );
         let control = BatchControl::new(true);
@@ -10841,6 +11236,7 @@ mod host_batch_tests {
             store_lock: Some(store.clone()),
             host: false,
             may_park: true,
+            verdict_only: false,
         });
         let held = orch
             .acquire_jj_store_lock_with_timeout(
@@ -10880,7 +11276,7 @@ mod host_batch_tests {
         let text = answer_call(&orch, &request, deadlines, control, rx).await;
         assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
         assert!(
-            started.elapsed() < ms(2_000),
+            started.elapsed() < ms(4_000),
             "answered {:?} after arrival, past its answer deadline",
             started.elapsed()
         );
@@ -10891,14 +11287,341 @@ mod host_batch_tests {
         .expect("the parked call resumes with the published result");
     }
 
-    /// A park whose admission cannot get the store before the answer deadline
-    /// cannot park, so the call cancels the batch before it publishes and says
-    /// so, still inside its answer deadline.
+    fn envelope_text(envelope: &str) -> String {
+        serde_json::from_str::<cairn_common::read::RunBatchEnvelope>(envelope)
+            .map(|parsed| parsed.text)
+            .unwrap_or_else(|_| envelope.to_string())
+    }
+
+    async fn detached_state(orch: &Orchestrator, request_id: &str) -> Option<String> {
+        orch.db
+            .local
+            .query_text(
+                "SELECT state FROM run_batch_detached WHERE request_id=?1",
+                (request_id.to_string(),),
+            )
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn run_batch_notices(orch: &Orchestrator) -> i64 {
+        count(
+            orch,
+            "SELECT COUNT(*) FROM suppressed_wakes WHERE job_id='job-1' AND source_kind='run_batch'",
+        )
+        .await
+    }
+
+    /// Re-register the fixture's run under another backend.
+    fn set_backend(orch: &Orchestrator, backend: &str) {
+        let mut handle = crate::agent_process::process::RunHandle::new(
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(None)),
+            Some("session-1".to_string()),
+            Some("job-1".to_string()),
+        );
+        handle.backend = Some(backend.to_string());
+        handle.begin_turn("pred-turn");
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run-1".to_string(), handle);
+    }
+
+    /// Settle a detached batch and wait for its notice: the row settles with
+    /// the batch's output, and exactly one notice reaches the job.
+    async fn deliver_and_expect_one_notice(
+        orch: &Orchestrator,
+        request_id: &str,
+        tx: tokio::sync::oneshot::Sender<BatchAnswer>,
+        output: &str,
+    ) {
+        assert_eq!(
+            detached_state(orch, request_id).await.as_deref(),
+            Some("running")
+        );
+        let _ = tx.send(batch_answer(output));
+        eventually(Duration::from_secs(10), || async {
+            (detached_state(orch, request_id).await.as_deref() == Some("settled")).then_some(())
+        })
+        .await
+        .expect("the detached batch settles with its result");
+        let stored = orch
+            .db
+            .local
+            .query_text(
+                "SELECT output FROM run_batch_detached WHERE request_id=?1",
+                (request_id.to_string(),),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.contains(output), "{stored}");
+        eventually(Duration::from_secs(5), || async {
+            (run_batch_notices(orch).await == 1).then_some(())
+        })
+        .await
+        .expect("one notice reaches the job");
+        tokio::time::sleep(ms(300)).await;
+        assert_eq!(run_batch_notices(orch).await, 1, "delivered exactly once");
+    }
+
+    /// cairn/6145 requirement 1: a park whose admission cannot get the store
+    /// cannot park, and its batch is detached rather than cancelled. The call
+    /// answers in time with the handle, nothing parks, and the batch's result
+    /// reaches the job as one notice when it settles.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_park_the_store_refuses_past_the_answer_deadline_cancels_unpublished() {
+    async fn a_park_the_store_refuses_detaches_the_batch_and_delivers_its_result() {
         let orch = env().await;
         let store = tempfile::tempdir().unwrap().keep();
         let request = call_request(json!({"commands": [{"command": "cargo build"}]}));
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(2_900),
+            ms(3_000),
+            None,
+        );
+        let control = BatchControl::new(false);
+        control.set_facts(BatchFacts {
+            store_lock: Some(store.clone()),
+            host: false,
+            may_park: true,
+            verdict_only: false,
+        });
+        let _held = orch
+            .acquire_jj_store_lock_with_timeout(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "test holds the store",
+                None,
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let started = Instant::now();
+        let text = answer_call(&orch, &request, deadlines, control.clone(), rx).await;
+        assert!(
+            started.elapsed() < ms(3_000),
+            "answered {:?} after arrival",
+            started.elapsed()
+        );
+        assert_eq!(
+            envelope_text(&text),
+            detached::detach_answer_text(
+                &control.request_id,
+                "the project store was busy past its answer deadline"
+            )
+        );
+        assert!(control.begin_settling(), "the batch was not cancelled");
+        assert_eq!(count(&orch, "SELECT COUNT(*) FROM agent_waits").await, 0);
+        deliver_and_expect_one_notice(
+            &orch,
+            &control.request_id,
+            tx,
+            "built after the call answered",
+        )
+        .await;
+    }
+
+    /// A call whose transcript holds no `run` call of its own to claim (the
+    /// Claude parallel-block race) detaches too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_with_no_claimable_tool_call_detaches_and_delivers() {
+        let orch = env().await;
+        set_backend(&orch, "claude");
+        let mut request = call_request(json!({"commands": [{"command": "rg needle"}]}));
+        request.tool_use_id = None;
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(3_900),
+            ms(4_000),
+            None,
+        );
+        let control = BatchControl::new(false);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let text =
+            envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
+        assert_eq!(
+            text,
+            detached::detach_answer_text(
+                &control.request_id,
+                "it has no `run` tool call of its own to park on"
+            )
+        );
+        assert!(control.begin_settling(), "the batch was not cancelled");
+        deliver_and_expect_one_notice(&orch, &control.request_id, tx, "needle found").await;
+    }
+
+    /// cairn/6145 requirement 2: a call with no tool call of its own that a
+    /// park could resume in place (the Codex `functions.exec` carrier) never
+    /// parks. Its batch has a durable row from grace, the turn never yields,
+    /// no wait is written, and at its work deadline it detaches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_codex_nested_call_never_parks_and_detaches() {
+        let orch = env().await;
+        let mut request = call_request(declared_payload());
+        request.tool_use_id = None;
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(200),
+            ms(1_500),
+            Some(ms(600_000)),
+        );
+        assert!(deadlines.holds_past_grace());
+        let control = BatchControl::new(true);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn({
+            let (orch, control) = (orch.clone(), control.clone());
+            async move { answer_call(&orch, &request, deadlines, control, rx).await }
+        });
+        eventually(Duration::from_secs(3), || async {
+            (detached_state(&orch, &control.request_id).await.as_deref() == Some("running"))
+                .then_some(())
+        })
+        .await
+        .expect("the batch is recorded from grace on");
+        let text = envelope_text(&call.await.unwrap());
+        assert_eq!(
+            text,
+            detached::detach_answer_text(&control.request_id, NO_RESUMABLE_CALL)
+        );
+        assert_eq!(count(&orch, "SELECT COUNT(*) FROM agent_waits").await, 0);
+        let turn_state = orch
+            .db
+            .local
+            .query_text("SELECT state FROM turns WHERE id='pred-turn'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            turn_state.as_deref(),
+            Some("running"),
+            "the turn never yielded"
+        );
+        deliver_and_expect_one_notice(&orch, &control.request_id, tx, "tests passed").await;
+    }
+
+    /// The same carrier's batch that answers on its socket after grace settles
+    /// its row quietly: the call has the result, so no notice follows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_codex_nested_call_answered_on_its_socket_sends_no_notice() {
+        let orch = env().await;
+        let mut request = call_request(declared_payload());
+        request.tool_use_id = None;
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(200),
+            ms(5_000),
+            Some(ms(600_000)),
+        );
+        let control = BatchControl::new(false);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(ms(600)).await;
+            let _ = tx.send(batch_answer("done on the socket"));
+        });
+        let text = answer_call(&orch, &request, deadlines, control.clone(), rx).await;
+        assert!(text.contains("done on the socket"), "{text}");
+        assert_eq!(
+            detached_state(&orch, &control.request_id).await.as_deref(),
+            Some("settled")
+        );
+        tokio::time::sleep(ms(300)).await;
+        assert_eq!(run_batch_notices(&orch).await, 0);
+    }
+
+    /// An identical reissue while a batch runs detached is refused with its
+    /// handle, so "do not re-run it" holds; once it settles, a re-run is not
+    /// a reissue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reissue_of_a_running_detached_batch_is_refused_with_its_handle() {
+        let orch = env().await;
+        let payload = declared_payload();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,identity,commits,holds_branch,state,reason,created_ms) VALUES('req-d','job-1','run-1','cargo test',?1,0,1,'running','x',1)",
+                (batch_identity(&payload).unwrap().to_string(),),
+            )
+            .await
+            .unwrap();
+        let refusal = reissue_refusal(&orch, &call_request(payload.clone())).await;
+        assert_eq!(
+            refusal.as_deref(),
+            Some(detached::reissue_refusal_text("req-d").as_str())
+        );
+        assert!(refusal.unwrap().contains("cairn:~/batches/req-d"));
+        let different = call_request(json!({"commands": [{"command": "cargo check"}]}));
+        assert_eq!(reissue_refusal(&orch, &different).await, None);
+        orch.db
+            .local
+            .execute(
+                "UPDATE run_batch_detached SET state='settled' WHERE request_id='req-d'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reissue_refusal(&orch, &call_request(payload)).await, None);
+    }
+
+    /// A wait abandoned while its batch ran (an operator compact) converts the
+    /// batch with its identity, so an identical call from the next turn is
+    /// refused rather than starting the work a second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reissue_after_its_wait_was_abandoned_is_refused() {
+        let orch = env().await;
+        let payload = declared_payload();
+        let condition = json!({
+            "kind": "run_batch",
+            "request_id": "req-compacted",
+            "commits": false,
+            "label": "cargo test",
+            "host": false,
+            "identity": batch_identity(&payload).unwrap().to_string(),
+        })
+        .to_string();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at) VALUES('wait-c','job-1','run-1','session-1','pred-turn','tool-1',?1,NULL,'pending',1)",
+                (condition,),
+            )
+            .await
+            .unwrap();
+        crate::mcp::handlers::durable_suspend::abandon_job_waits_for_operator_compact(
+            &orch,
+            &orch.db.local,
+            "job-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            detached_state(&orch, "req-compacted").await.as_deref(),
+            Some("running")
+        );
+        let mut reissue = call_request(payload);
+        reissue.tool_use_id = Some("tool-2".into());
+        assert_eq!(
+            reissue_refusal(&orch, &reissue).await.as_deref(),
+            Some(detached::reissue_refusal_text("req-compacted").as_str())
+        );
+    }
+
+    /// The only cancel left: a batch that can neither park nor be recorded as
+    /// detached (it belongs to no run) is cancelled before it publishes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_that_cannot_be_recorded_is_still_cancelled_unpublished() {
+        let orch = env().await;
+        let store = tempfile::tempdir().unwrap().keep();
+        let mut request = call_request(json!({"commands": [{"command": "cargo build"}]}));
+        request.run_id = None;
         let deadlines =
             CallDeadlines::new(tokio::time::Instant::now(), ms(100), ms(700), ms(800), None);
         let control = BatchControl::new(true);
@@ -10906,6 +11629,7 @@ mod host_batch_tests {
             store_lock: Some(store.clone()),
             host: false,
             may_park: true,
+            verdict_only: false,
         });
         let _held = orch
             .acquire_jj_store_lock_with_timeout(
@@ -10927,7 +11651,7 @@ mod host_batch_tests {
             started.elapsed()
         );
         assert!(
-            text.contains("so it cancelled the batch; nothing from it was committed"),
+            text.contains("or record it to finish on its own, so it cancelled the batch; nothing from it was committed"),
             "{text}"
         );
         assert!(
@@ -11035,6 +11759,7 @@ mod host_batch_tests {
             store_lock: Some(store.clone()),
             host: false,
             may_park: true,
+            verdict_only: false,
         });
         let held = orch
             .acquire_jj_store_lock_with_timeout(
@@ -11163,7 +11888,7 @@ mod host_batch_tests {
         let mut reissue = call_request(payload.clone());
         reissue.tool_use_id = Some("tool-2".into());
         assert_eq!(
-            reissue_refusal(&orch, &reissue).await,
+            reissue_refusal(&orch, &reissue).await.as_deref(),
             Some(RUN_BATCH_ALREADY_RUNNING)
         );
         let different = call_request(json!({"commands": [{"command": "cargo check"}]}));

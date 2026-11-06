@@ -22,6 +22,10 @@ pub const SOURCE_KIND_FACT: &str = "fact";
 pub const ADDRESSED_FACT_REF_PREFIX: &str = "addressed:";
 pub const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 pub const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
+/// A `run` batch that outlived its call reported to its job. The row's
+/// `source_ref` is the batch's request id; its content is Cairn's own sentence
+/// about the result, never anyone's message.
+pub const SOURCE_KIND_RUN_BATCH: &str = "run_batch";
 pub const FACT_KIND_MESSAGE: &str = "message";
 pub const FACT_KIND_TERMINAL_EXIT: &str = "terminal_exit";
 pub const FACT_KIND_TERMINAL_OUTPUT: &str = "terminal_output";

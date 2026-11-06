@@ -900,9 +900,9 @@ fn queue_system_direct_impl(
 /// pushes itself and supplies its own default lead-in.
 struct PendingFlush {
     job_id: String,
-    /// Count of child side-channel notices pending for the job, claimed and
-    /// injected by `continue_job_impl`; kept only so a stranded notice still
-    /// triggers a resume.
+    /// Count of detached run-batch results pending for the job, claimed and
+    /// injected by `continue_job_impl` with every other side-channel notice;
+    /// counted only to decide that they justify a resume.
     notice_count: usize,
     /// Count of queued user messages (CAIRN-1309) pending for the job, claimed
     /// and injected by `continue_job_impl`; kept only so a stranded queued
@@ -970,9 +970,6 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush,
         }
     }
 
-    // Passive side-channel notices no longer wake an idle job; they ride along
-    // with the next agent-bound payload.
-    let notice_count = 0;
     let queued_count =
         crate::messages::queued::peek_waking_pending_count_for_job(db, &job_id).unwrap_or(0);
     // CAIRN-1876: an agent self-suspended on its OWN pending work (a sub-agent
@@ -988,6 +985,20 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush,
     // without this check, because the operator stays authoritative.
     // (docs/attention-redesign.md — "Wakeable vs self-suspended".)
     let self_suspended = head_turn_sync(db, &job_id).is_self_suspended();
+
+    // Passive side-channel notices do not wake an idle job; they ride along
+    // with the next agent-bound payload. The one exception is a detached run
+    // batch's result: the agent is waiting for it, and nothing else will
+    // carry it. A self-suspended job still gets it on its own resume.
+    let notice_count = if self_suspended {
+        0
+    } else {
+        let job_id = job_id.clone();
+        run_db_blocking(move || async move {
+            Ok(crate::messages::side_channel::pending_run_batch_notice_count(db, &job_id).await)
+        })
+        .unwrap_or(0)
+    };
 
     // CAIRN-1881/1900: a pending rousing (`wake`/`interrupt`) push for this job is
     // a reason to resume an *idle* agent — but never a self-suspended one.
@@ -1451,6 +1462,64 @@ mod tests {
             .await,
             1
         );
+    }
+
+    /// A thread message has one delivery record, the direct push, so the
+    /// thread's composer shows one card for it until the push is carried and
+    /// none after. The thread-channel row is the conversation record and never
+    /// surfaces as a second, unconsumable "Channel message" card.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_thread_message_is_pending_once_as_its_push_until_delivered() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_thread_session_run(&db).await;
+        db.execute_script(
+            "INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('sess-thread','job-thread','claude','open',1,1,1);
+             UPDATE jobs SET current_session_id='sess-thread' WHERE id='job-thread';",
+        )
+        .await
+        .unwrap();
+        // Parked on its own sub-agent work, the thread takes no turn for the
+        // message yet, so its push stays queued rather than being carried by an
+        // inline resume.
+        set_head_turn(&db, "job-thread", "yielded", Some("dependency_wait")).await;
+
+        append_thread_message(&orch, &db, "thread-1", None, "external", "are you there?")
+            .await
+            .expect("an active thread takes the prompt");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM messages WHERE channel_type='thread' AND channel_id='thread-1'"
+            )
+            .await,
+            1,
+            "the conversation record exists past the session's empty cursor"
+        );
+
+        // Read the cards as the composer receives them.
+        let pending = crate::messages::pending::list_pending_deliveries(&db, "job-thread")
+            .await
+            .unwrap();
+        let cards = serde_json::to_value(&pending).unwrap();
+        assert_eq!(pending.len(), 1, "{cards}");
+        assert_eq!(cards[0]["source"], "push", "{cards}");
+        assert!(
+            cards[0]["headline"]
+                .as_str()
+                .is_some_and(|headline| headline.starts_with("Message from")),
+            "{cards}"
+        );
+
+        let push_id = cards[0]["id"].as_str().unwrap().to_string();
+        crate::orchestrator::attention_push::stamp_delivered(&db, &[push_id], "ev-carrier")
+            .await
+            .unwrap();
+        let after = crate::messages::pending::list_pending_deliveries(&db, "job-thread")
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "{after:?}");
     }
 
     /// A push queued before closure stays on the books and stays undelivered.

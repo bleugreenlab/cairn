@@ -403,6 +403,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("job_terminals", "jobs"),
     owned("provider_limit_holds", "jobs"),
     owned("suppressed_wakes", "jobs"),
+    owned("run_batch_detached", "jobs"),
     owned("todos", "jobs"),
     owned("turn_end_check_attempts", "jobs"),
     owned("wake_subscriptions", "jobs"),

@@ -2326,6 +2326,12 @@ impl Orchestrator {
         }
     }
 
+    /// Whether the fleet holds the request in flight. See
+    /// [`crate::fleet::Fleet::is_request_in_flight`] for when a miss is evidence.
+    pub(crate) fn is_cell_request_in_flight(&self, request_id: &str) -> bool {
+        self.fleet.is_request_in_flight(request_id)
+    }
+
     pub fn cancel_cell_request(&self, request_id: &str) -> crate::fleet::CancelOutcome {
         let cancelled = self.fleet.cancel_request(request_id);
         if cancelled != crate::fleet::CancelOutcome::Unknown {

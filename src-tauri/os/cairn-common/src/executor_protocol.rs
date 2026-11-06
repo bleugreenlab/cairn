@@ -6975,6 +6975,13 @@ pub struct LearnedResourceEstimate {
 /// field changes: the work still ends as the existing `BuildVolumeLost`, and a
 /// runner talking to an older executor gets nothing wrong, since that executor's
 /// stray tree is on its own disk and never crosses the boundary.
+///
+/// cairn/6145 does not move the number. A bound batch's release now lifts the
+/// `Materializing` fence a cancel put on its execution environment's cell, as
+/// the unbound release already did. Only the executor's own cell record
+/// changes; no frame, field or variant does. A runner talking to an older
+/// executor gets nothing wrong it did not already get: that executor keeps
+/// refusing resident starts after a cancelled bound batch until it is updated.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 165;
 
 /// The version `build.rs` derived from the paragraphs above

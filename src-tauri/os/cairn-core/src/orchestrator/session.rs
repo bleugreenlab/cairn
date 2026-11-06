@@ -1392,12 +1392,12 @@ struct PeerAgent {
 fn build_messaging_context(
     orch: &Orchestrator,
     project_key: &str,
-    issue_id: &str,
+    issue_id: Option<&str>,
     current_run_id: &str,
 ) -> String {
     let dbs = orch.db.clone();
     let project_key = project_key.to_string();
-    let issue_id = issue_id.to_string();
+    let issue_id = issue_id.map(str::to_string);
     let current_run_id = current_run_id.to_string();
     let data = run_db_blocking(move || async move {
         let db = crate::execution::routing::owning_db_for_run(&dbs, &current_run_id)
@@ -1408,21 +1408,25 @@ fn build_messaging_context(
         let (peers, recent, session_id) = db
             .read(|conn| {
                 Box::pin(async move {
-                    let peers =
-                        find_peer_agents(conn, &project_key, &issue_id, &current_run_id).await?;
-                    let issue_key = issue_key(conn, &project_key, &issue_id).await?;
+                    let peers = match issue_id.as_deref() {
+                        Some(issue_id) => {
+                            find_peer_agents(conn, &project_key, issue_id, &current_run_id).await?
+                        }
+                        None => Vec::new(),
+                    };
                     let (session_id, job_id) =
                         session_and_job_id_for_run(conn, &current_run_id).await?;
+                    let channels = match job_id.as_deref() {
+                        Some(job_id) => injected_channels_for_job(conn, job_id).await?,
+                        None => InjectedChannels::None,
+                    };
                     let cursor = match session_id.as_deref() {
                         Some(sid) => read_channel_cursor(conn, sid).await?,
                         None => None,
                     };
                     let recent = recent_messages_for_run(
                         conn,
-                        &project_key,
-                        issue_key
-                            .as_deref()
-                            .map_or(ChannelScope::ProjectOnly, ChannelScope::Issue),
+                        &channels,
                         job_id.as_deref(),
                         cursor,
                         20,
@@ -1622,26 +1626,62 @@ async fn find_peer_agents(
     Ok(peers)
 }
 
-/// Which channel a run's messages come from, keyed by the job's OWNER.
+/// The channels a job's next turn injects as its "Recent Messages" catch-up,
+/// keyed by the job's owner. [`injected_channels_for_job`] is the one answer:
+/// [`build_messaging_context`] injects exactly these channels and
+/// [`pending_channel_messages_for_job`] lists exactly these as pending, so the
+/// composer never shows a channel card that no turn will carry.
 ///
-/// One job is never both: `thread_id` is set only by inheritance from a
-/// delegating parent, and a thread's children are linked by
-/// `issues.parent_thread_id` while their own jobs carry `issue_id` with
-/// `thread_id` NULL. Modelling that as a pair of `Option`s let a caller pass
-/// both and silently receive whichever arm the query tested first — and let a
-/// thread job pass neither and read only the project channel, which is the
-/// silence this sweep exists to remove.
-enum ChannelScope<'a> {
-    /// The owner could not be resolved, so only the project channel is in scope.
-    ProjectOnly,
-    Issue(&'a str),
-    Thread(&'a str),
+/// An issue job hears its issue channel and the project channel. Every other
+/// job hears no channel, and in particular a thread job does not hear its own
+/// thread channel. The thread channel is the thread's conversation record (its
+/// `/messages` surface), not a delivery channel: every message to a thread
+/// enters through `messages::delivery::append_thread_message`, which also mints
+/// a direct push to the thread's job, and that push, stamped with the
+/// transcript event that carried it, is the delivery. Injecting the thread
+/// channel as well would hand the agent each message twice; listing it as
+/// pending without injecting it leaves cards that nothing ever consumes.
+#[derive(Debug, PartialEq, Eq)]
+enum InjectedChannels {
+    None,
+    Issue {
+        project_key: String,
+        issue_key: String,
+    },
+}
+
+/// Resolve which channels `job_id`'s next turn injects; see [`InjectedChannels`].
+/// A job whose issue row is gone injects nothing, as does any job not owned by
+/// an issue.
+async fn injected_channels_for_job(
+    conn: &crate::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<InjectedChannels> {
+    let mut rows = conn
+        .query(
+            "SELECT p.key, i.number
+             FROM jobs j
+             JOIN issues i ON i.id = j.issue_id
+             JOIN projects p ON p.id = i.project_id
+             WHERE j.id = ?1",
+            params![job_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(InjectedChannels::None);
+    };
+    let project_key = row.text(0)?;
+    let number = row.i64(1)?;
+    Ok(InjectedChannels::Issue {
+        issue_key: format!("{project_key}/{number}"),
+        project_key,
+    })
 }
 
 /// One channel's messages past a session's injection cursor, newest first.
 ///
-/// A run reads up to two channels, the project's and its owner's issue or thread
-/// channel, and each gets its own statement. With both in one `OR` and the
+/// A run reads up to two channels, the project's and its issue's, and each gets
+/// its own statement. With both in one `OR` and the
 /// channel bound as parameters, Turso planned the read through
 /// `idx_messages_channel_created` on `channel_type` alone and fetched every row
 /// of that type in the workspace to find one channel's handful: 53k issue
@@ -1665,24 +1705,24 @@ const CHANNEL_MESSAGES_SQL: &str = "SELECT rowid, sender_name, content, created_
      ORDER BY rowid DESC
      LIMIT ?6";
 
-/// The newest `limit` messages across the channels `scope` reads, oldest first,
-/// excluding every run of `exclude_job_id` (a recipient never hears its own
-/// posts) and, unless `include_system`, lifecycle messages.
+/// The newest `limit` messages across `channels`, oldest first, excluding every
+/// run of `exclude_job_id` (a recipient never hears its own posts) and, unless
+/// `include_system`, lifecycle messages.
 async fn recent_messages_for_run(
     conn: &crate::storage::TrackedConnection,
-    project_key: &str,
-    scope: ChannelScope<'_>,
+    channels: &InjectedChannels,
     exclude_job_id: Option<&str>,
     cursor: Option<i64>,
     limit: i64,
     include_system: bool,
 ) -> DbResult<Vec<PromptMessage>> {
-    let mut channels = vec![("project", project_key)];
-    match scope {
-        ChannelScope::ProjectOnly => {}
-        ChannelScope::Issue(issue_key) => channels.push(("issue", issue_key)),
-        ChannelScope::Thread(thread_id) => channels.push(("thread", thread_id)),
-    }
+    let channels = match channels {
+        InjectedChannels::None => return Ok(Vec::new()),
+        InjectedChannels::Issue {
+            project_key,
+            issue_key,
+        } => [("project", project_key), ("issue", issue_key)],
+    };
     // Rowids start at 1, so an absent cursor is `rowid > 0`.
     let cursor = cursor.unwrap_or(0);
     let mut messages = Vec::new();
@@ -1692,7 +1732,7 @@ async fn recent_messages_for_run(
                 CHANNEL_MESSAGES_SQL,
                 params![
                     channel_type,
-                    channel_id,
+                    channel_id.as_str(),
                     cursor,
                     i64::from(include_system),
                     exclude_job_id,
@@ -1715,10 +1755,12 @@ async fn recent_messages_for_run(
     Ok(messages)
 }
 
-/// Non-stamping peek at project/issue channel messages that should surface as
-/// pending-delivery chips. This intentionally returns the non-system subset of
-/// messages that may be injected on the next messaging-context build, so passive
-/// lifecycle awareness can reach agents without becoming dismissible UI noise.
+/// Non-stamping peek at the channel messages the job's next messaging-context
+/// build would inject, surfaced as pending-delivery chips. The channels come
+/// from [`injected_channels_for_job`], the same answer the injection reads, so a
+/// thread job lists none. This intentionally returns the non-system subset, so
+/// passive lifecycle awareness can reach agents without becoming dismissible UI
+/// noise.
 pub(crate) async fn pending_channel_messages_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -1730,44 +1772,25 @@ pub(crate) async fn pending_channel_messages_for_job(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT p.key, i.number, j.current_session_id, j.thread_id
-                     FROM jobs j
-                     LEFT JOIN issues i ON i.id = j.issue_id
-                     JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id)
-                     WHERE j.id = ?1
-                     LIMIT 1",
+                    "SELECT current_session_id FROM jobs WHERE id = ?1 LIMIT 1",
                     params![job_id.as_str()],
                 )
                 .await?;
-            let Some(row) = rows.next().await? else {
+            let Some(session_id) = rows
+                .next()
+                .await?
+                .map(|row| row.opt_text(0))
+                .transpose()?
+                .flatten()
+            else {
                 return Ok(Vec::new());
             };
-            let project_key = row.text(0)?;
-            let issue_number = row.opt_i64(1)?;
-            let session_id = row.opt_text(2)?;
-            let thread_id = row.opt_text(3)?;
-            let Some(session_id) = session_id else {
+            let channels = injected_channels_for_job(conn, &job_id).await?;
+            if channels == InjectedChannels::None {
                 return Ok(Vec::new());
-            };
-            let issue_key = issue_number.map(|number| format!("{project_key}/{number}"));
+            }
             let cursor = read_channel_cursor(conn, &session_id).await?;
-            // Owner-keyed, not null-inferred: an issue job reads its issue
-            // channel, a thread job its thread channel.
-            let scope = match (issue_key.as_deref(), thread_id.as_deref()) {
-                (Some(issue_key), _) => ChannelScope::Issue(issue_key),
-                (None, Some(thread_id)) => ChannelScope::Thread(thread_id),
-                (None, None) => ChannelScope::ProjectOnly,
-            };
-            recent_messages_for_run(
-                conn,
-                &project_key,
-                scope,
-                Some(&job_id),
-                cursor,
-                limit,
-                false,
-            )
-            .await
+            recent_messages_for_run(conn, &channels, Some(&job_id), cursor, limit, false).await
         })
     })
     .await
@@ -2762,15 +2785,12 @@ pub fn start_agent_session(
         // system prompt, holding the system-prompt prefix byte-identical across
         // every resume in a session so the provider can reuse the prompt cache
         // rather than re-prime the whole context on each wake.
-        let messaging_section = match run_issue_id.as_deref() {
-            Some(issue_id) => build_messaging_context(
-                orch,
-                project_key.as_deref().unwrap_or(""),
-                issue_id,
-                run_id,
-            ),
-            None => String::new(),
-        };
+        let messaging_section = build_messaging_context(
+            orch,
+            project_key.as_deref().unwrap_or(""),
+            run_issue_id.as_deref(),
+            run_id,
+        );
         let resolved_prompt = compose_user_message(prompt, &messaging_section);
 
         (
@@ -4904,8 +4924,10 @@ mod tests {
             Box::pin(async move {
                 recent_messages_for_run(
                     conn,
-                    "proj",
-                    ChannelScope::Issue(&issue_key),
+                    &InjectedChannels::Issue {
+                        project_key: "proj".to_string(),
+                        issue_key,
+                    },
                     exclude_job_id.as_deref(),
                     cursor,
                     20,
@@ -5114,8 +5136,10 @@ mod tests {
                 Box::pin(async move {
                     recent_messages_for_run(
                         conn,
-                        "proj",
-                        ChannelScope::Issue("proj/1"),
+                        &InjectedChannels::Issue {
+                            project_key: "proj".to_string(),
+                            issue_key: "proj/1".to_string(),
+                        },
                         Some("j"),
                         None,
                         2,
@@ -5133,8 +5157,21 @@ mod tests {
         );
     }
 
+    async fn injected_channels(db: &LocalDb, job_id: &str) -> InjectedChannels {
+        let job_id = job_id.to_string();
+        db.read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move { injected_channels_for_job(conn, &job_id).await })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A thread's agent receives each thread message as the direct push
+    /// `append_thread_message` mints, so no channel delivers to it and none may
+    /// be listed as pending for it, however many rows sit past its cursor.
     #[tokio::test]
-    async fn pending_channel_messages_include_thread_messages_for_thread_jobs() {
+    async fn thread_jobs_inject_and_list_no_channel() {
         let db = migrated_db().await;
         let fixture = crate::test_support::seed_thread_session(&db).await;
         db.execute_script(
@@ -5147,34 +5184,104 @@ mod tests {
         .unwrap();
         insert_msg(
             &db,
-            "thread-system",
-            "thread",
-            fixture.thread_id,
-            None,
-            "system",
-            "task finished",
-            1000,
-        )
-        .await;
-        insert_msg(
-            &db,
             "thread-agent",
             "thread",
             fixture.thread_id,
             None,
             "builder",
             "thread-scoped handoff",
+            1000,
+        )
+        .await;
+        insert_msg(
+            &db,
+            "project-note",
+            "project",
+            "thread-project",
+            None,
+            "builder",
+            "project-wide note",
             2000,
         )
         .await;
 
+        assert_eq!(
+            injected_channels(&db, fixture.session_job_id).await,
+            InjectedChannels::None
+        );
+        assert_eq!(
+            injected_channels(&db, fixture.task_job_id).await,
+            InjectedChannels::None,
+            "a thread's delegated task inherits the thread, not an issue"
+        );
         let pending = pending_channel_messages_for_job(&db, fixture.session_job_id, 20)
             .await
             .unwrap();
+        assert!(pending.is_empty(), "{:?}", contents_of(&pending));
+    }
 
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].sender_name, "builder");
-        assert_eq!(pending[0].content, "thread-scoped handoff");
+    /// An issue job, including one under a thread, hears its issue channel and
+    /// the project channel, and the pending list offers exactly what the
+    /// injection would carry.
+    #[tokio::test]
+    async fn issue_jobs_inject_and_list_their_issue_and_project_channels() {
+        let db = migrated_db().await;
+        seed_session(&db).await;
+        for (id, channel_type, channel_id, content, at) in [
+            ("p1", "project", "proj", "project note", 1000),
+            ("i1", "issue", "proj/1", "issue note", 1001),
+            ("elsewhere", "issue", "proj/2", "another issue", 1002),
+        ] {
+            insert_msg(
+                &db,
+                id,
+                channel_type,
+                channel_id,
+                Some("run-peer"),
+                "builder",
+                content,
+                at,
+            )
+            .await;
+        }
+
+        let channels = injected_channels(&db, "j").await;
+        assert_eq!(
+            channels,
+            InjectedChannels::Issue {
+                project_key: "proj".to_string(),
+                issue_key: "proj/1".to_string(),
+            }
+        );
+        let pending = pending_channel_messages_for_job(&db, "j", 20)
+            .await
+            .unwrap();
+        let injected = db
+            .read(|conn| {
+                Box::pin(async move {
+                    recent_messages_for_run(conn, &channels, Some("j"), None, 20, true).await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(contents_of(&pending), ["project note", "issue note"]);
+        assert_eq!(contents_of(&pending), contents_of(&injected));
+
+        let fixture = crate::test_support::seed_thread_session(&db).await;
+        assert_eq!(
+            injected_channels(&db, fixture.child_issue_job_id).await,
+            InjectedChannels::Issue {
+                project_key: "thread-project".to_string(),
+                issue_key: "thread-project/7".to_string(),
+            }
+        );
+    }
+
+    fn contents_of(messages: &[PromptMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect()
     }
 
     #[tokio::test]

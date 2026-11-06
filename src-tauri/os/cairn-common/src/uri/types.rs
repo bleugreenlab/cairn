@@ -29,6 +29,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "tasks",
     "wakes",
     "checks",
+    "batches",
     "questions",
     "question",
     // A sub-resource the parser handles with its own arms, ordered ahead of the
@@ -517,6 +518,21 @@ pub enum CairnResource {
         number: i32,
         exec_seq: i32,
         node_id: String,
+    },
+    /// Run batches that outlived their calls, owned by a node job (collection).
+    NodeBatches {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// One run batch that outlived its call, by request id.
+    NodeBatch {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        request_id: String,
     },
     /// Turn-end project check results owned by a sub-agent task job (collection).
     TaskChecks {
@@ -1218,6 +1234,8 @@ impl CairnResource {
             Self::NodeCalls { .. } => ResourceKind::NodeCalls,
             Self::NodeWakes { .. } => ResourceKind::NodeWakes,
             Self::NodeChecks { .. } => ResourceKind::NodeChecks,
+            Self::NodeBatches { .. } => ResourceKind::NodeBatches,
+            Self::NodeBatch { .. } => ResourceKind::NodeBatch,
             Self::TaskChecks { .. } => ResourceKind::TaskChecks,
             Self::NodeQuestions { .. } => ResourceKind::NodeQuestions,
             Self::NodeQuestion { .. } => ResourceKind::NodeQuestion,

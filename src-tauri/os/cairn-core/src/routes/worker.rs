@@ -1146,6 +1146,10 @@ pub(crate) mod fixture {
 mod posts_tests;
 
 #[cfg(test)]
+#[path = "worker_ambient_tests.rs"]
+mod ambient_tests;
+
+#[cfg(test)]
 mod tests {
     use super::fixture::*;
     use super::*;

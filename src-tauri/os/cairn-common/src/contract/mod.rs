@@ -200,6 +200,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     tasks::TASK_ARTIFACT_CONTRACT,
     jobs::JOB_TODOS_CONTRACT,
     jobs::NODE_CHECKS_CONTRACT,
+    jobs::NODE_BATCHES_CONTRACT,
+    jobs::NODE_BATCH_CONTRACT,
     jobs::TASK_CHECKS_CONTRACT,
     jobs::NODE_WAKES_CONTRACT,
     jobs::NODE_TASKS_CONTRACT,

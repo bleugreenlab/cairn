@@ -2785,11 +2785,12 @@ async fn the_turn_resumes_only_after_the_last_batch_settles() {
     kill_all_sessions(&orch);
 }
 
-/// CAIRN-3159 in the run-batch shape. A job parks one turn at a time, and a row
-/// that outlived its turn must be superseded rather than refusing every later
-/// suspension — otherwise the first long batch of a job's life would be the only
-/// one that ever suspends, and every later one would fall back to the inline
-/// await this whole contract exists to remove.
+/// CAIRN-3159 in the run-batch shape: a row that outlived its turn must not
+/// refuse every later suspension, or the first long batch of a job's life would
+/// be the only one that ever suspends. Tenet 1421 (cairn/6145 comment #8): the
+/// later suspension is no evidence about the first batch, which is still
+/// running, so its row is NOT abandoned; the second suspension engages beside
+/// it (their call ids differ), and the first batch's result reaches the job.
 #[tokio::test]
 async fn suspension_engages_again_after_a_row_outlives_its_turn() {
     let (_temp, db, orch, cwd) = setup("run-resuspend").await;
@@ -2821,22 +2822,50 @@ async fn suspension_engages_again_after_a_row_outlives_its_turn() {
     );
     assert!(
         second_marker.contains(DURABLE_SUSPEND),
-        "a second suspension in the same job was refused instead of superseding the stale row: {second_marker}"
+        "a second suspension in the same job was refused: {second_marker}"
     );
 
     let rows = wait_rows(&db).await;
     assert_eq!(rows.len(), 2, "each suspension owns a row: {rows:?}");
     assert!(
-        rows[0]
+        !rows[0]
             .2
             .as_deref()
             .is_some_and(|r| r.contains("abandoned")),
-        "the stale row should have been superseded, not left to block the job: {rows:?}"
+        "a live batch's row was abandoned by another turn's suspension: {rows:?}"
     );
     assert_ne!(
         rows[1].1, "cancelled",
         "the new suspension must be live: {rows:?}"
     );
+
+    // The first batch finishes after the job moved on; its result reaches the
+    // job as Cairn's notice rather than resuming the turn it came from.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let notice = loop {
+        let notice = db
+            .query_opt_text(
+                "SELECT content FROM suppressed_wakes WHERE job_id='job-run-resuspend' AND source_kind='run_batch'",
+                (),
+            )
+            .await
+            .unwrap();
+        if let Some(notice) = notice {
+            break notice;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first batch's result never reached the job: {:?}",
+            wait_rows(&db).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    assert!(
+        notice.starts_with("Your run batch 'sleep 8' (cairn:~/batches/")
+            && notice.contains("finished: succeeded, committed nothing."),
+        "{notice}"
+    );
+    assert!(!notice.contains("The user sent"));
     kill_all_sessions(&orch);
 }
 

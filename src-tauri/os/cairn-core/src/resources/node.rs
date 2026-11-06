@@ -605,6 +605,54 @@ pub(super) async fn read_node_wakes(
     .await
 }
 
+/// A node's run batches that outlived their calls, or one of them by request
+/// id: the handle a detached call answered with.
+pub(super) async fn read_node_batches(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    request_id: Option<&str>,
+) -> String {
+    use crate::mcp::handlers::run::detached;
+    let job_id = match resolve_node_or_task_job_id_for_read(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        None,
+    )
+    .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => return error,
+    };
+    match request_id {
+        Some(request_id) => match detached::load(db, request_id).await {
+            Ok(Some(batch)) if batch.job_id == job_id => detached::render(&batch),
+            Ok(_) => format!(
+                "No run batch `{request_id}` kept running for {node_name} after its call answered. A batch whose call answered with its own result has no handle here."
+            ),
+            Err(error) => format!("Could not read run batch `{request_id}`: {error}"),
+        },
+        None => match detached::for_job(db, &job_id).await {
+            Ok(batches) if batches.is_empty() => format!(
+                "# Batches ({node_name})\n\nNo run batch of this node has kept running past its call.\n"
+            ),
+            Ok(batches) => {
+                let mut out = format!("# Batches ({node_name})\n\n");
+                for batch in batches {
+                    out.push_str(&format!("- {}\n", detached::summary_line(&batch)));
+                }
+                out
+            }
+            Err(error) => format!("Could not read this node's batches: {error}"),
+        },
+    }
+}
+
 pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_id: &str) -> String {
     let subscriptions =
         match crate::orchestrator::wakes::list_subscriptions_for_job(db, job_id).await {

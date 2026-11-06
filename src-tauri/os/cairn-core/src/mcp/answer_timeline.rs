@@ -23,7 +23,11 @@ pub enum AnswerOutcome {
     Parked,
     /// Refused before any work started.
     Refused,
-    /// Could be neither answered nor parked in time, so the work was cancelled.
+    /// Could be neither answered nor parked in time, so it answered with a
+    /// handle and its batch kept running.
+    Detached,
+    /// Could be neither answered, parked nor detached in time, so the work
+    /// was cancelled.
     Cancelled,
     /// The handler failed.
     Error,
@@ -36,6 +40,7 @@ impl AnswerOutcome {
             Self::Held => "held",
             Self::Parked => "parked",
             Self::Refused => "refused",
+            Self::Detached => "detached",
             Self::Cancelled => "cancelled",
             Self::Error => "error",
         }

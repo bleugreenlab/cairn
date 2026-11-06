@@ -3585,6 +3585,19 @@ impl ExecutorConnectionState {
     }
 }
 
+/// What the machines report about one request; see [`Fleet::request_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestReport {
+    /// Not every machine has reported since it attached, so nothing is known.
+    Unknown,
+    /// A machine still holds an attempt of it.
+    Held { executor_id: String },
+    /// A machine finished it and still lists the completion.
+    Completed(Box<cairn_common::executor_protocol::CellCompletion>),
+    /// Every machine has reported, and none holds or finished it.
+    Gone,
+}
+
 /// One executor link's snapshot count, read by [`Fleet::snapshot_receipts`].
 /// Counts restart with each link generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8477,6 +8490,88 @@ impl Fleet {
     /// case reported success for an action that changed nothing an operator
     /// could see — the row stayed, fed by executor occupancy, because the work
     /// was still running for everyone else.
+    /// What the machines' own reports say about a request this runner may no
+    /// longer hold a subscriber for (one placed before a restart).
+    ///
+    /// `Unknown` until the evidence is complete: every enrolled machine is
+    /// attached and the colocated substrate is not restoring, and every
+    /// attached machine has delivered at least one snapshot on its current
+    /// link. Attachment alone proves nothing; the snapshot is the machine's
+    /// account of the attempts it was granted and has not finished, and an
+    /// attempt absent from it and from its recent completions did not survive
+    /// the process that ran it (tenet 308).
+    pub(crate) fn request_report(&self, request_id: &str) -> RequestReport {
+        if !self.unattached_enrolled_remotes().is_empty()
+            || matches!(
+                self.link_restoration(),
+                placement::LinkRestoration::Restoring
+            )
+        {
+            return RequestReport::Unknown;
+        }
+        let connections = self.lock_connections();
+        if connections.is_empty()
+            || connections
+                .values()
+                .any(|connection| connection.snapshots_received == 0)
+        {
+            return RequestReport::Unknown;
+        }
+        let mut completed = None;
+        for (executor_id, connection) in connections.iter() {
+            let snapshot = &connection.snapshot;
+            let held = snapshot
+                .granted_attempts
+                .iter()
+                .any(|attempt| attempt.request_id == request_id)
+                || snapshot
+                    .executing_requests
+                    .iter()
+                    .any(|executing| executing.request_id == request_id)
+                || snapshot
+                    .queued_requests
+                    .iter()
+                    .any(|queued| queued.request_id == request_id)
+                || snapshot.cells.iter().any(|cell| {
+                    cell.occupancy
+                        .command
+                        .as_ref()
+                        .is_some_and(|command| command.request_id == request_id)
+                });
+            if held {
+                return RequestReport::Held {
+                    executor_id: executor_id.clone(),
+                };
+            }
+            if completed.is_none() {
+                completed = snapshot
+                    .recent_completions
+                    .iter()
+                    .find(|completion| completion.request_id == request_id)
+                    .cloned();
+            }
+        }
+        match completed {
+            Some(completion) => RequestReport::Completed(Box::new(completion)),
+            None => RequestReport::Gone,
+        }
+    }
+
+    /// Whether this runner's registry holds a live subscriber for the request.
+    ///
+    /// A per-incarnation answer: right after a boot the registry is empty while
+    /// remote batches are still running, so a miss is evidence of death only
+    /// for a request this incarnation placed, or once its machine has
+    /// reattached without rebinding it (tenets 308, 309 and 311).
+    pub(crate) fn is_request_in_flight(&self, request_id: &str) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .subscriber_keys
+            .keys()
+            .any(|(id, _)| id == request_id)
+    }
+
     pub(crate) fn cancel_request(&self, request_id: &str) -> CancelOutcome {
         let subscriber = self
             .in_flight
@@ -31924,6 +32019,45 @@ mod tests {
         let skew = pool.executor_health(1)[0].build_skew.clone().unwrap();
         assert_eq!(skew.runner_build_id, "deployed-build");
         assert_eq!(skew.executor_build_id, "running-build");
+    }
+
+    /// cairn/6145: what the machines report about a request placed before a
+    /// restart. Attachment alone says nothing; once every machine has delivered
+    /// a snapshot on its link, an attempt it lists is held and one absent from
+    /// every report is gone.
+    #[test]
+    fn a_request_report_speaks_only_once_every_machine_has_reported() {
+        let pool = Fleet::default();
+        let (executor_id, mut connection) = fleet_entry("bbs", "linux", 0, &[]);
+        connection.snapshots_received = 0;
+        Arc::make_mut(&mut connection.snapshot).granted_attempts =
+            vec![cairn_common::executor_protocol::GrantedAttempt {
+                request_id: "held".into(),
+                attempt_id: "a".into(),
+            }];
+        pool.lock_connections()
+            .insert(executor_id.clone(), connection);
+        assert_eq!(
+            pool.request_report("gone"),
+            RequestReport::Unknown,
+            "an attached machine that has not reported proves nothing"
+        );
+
+        pool.lock_connections()
+            .get_mut(&executor_id)
+            .unwrap()
+            .snapshots_received = 1;
+        assert_eq!(
+            pool.request_report("held"),
+            RequestReport::Held {
+                executor_id: executor_id.clone()
+            }
+        );
+        assert_eq!(pool.request_report("gone"), RequestReport::Gone);
+        assert!(
+            !pool.is_request_in_flight("held"),
+            "the registry has no subscriber for it, which is why the report is asked"
+        );
     }
 
     /// A remote running a different build from the one the runner serves for

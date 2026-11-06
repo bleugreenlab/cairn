@@ -1195,6 +1195,8 @@ mod tests {
                 commits: false,
                 label: None,
                 host: false,
+                identity: None,
+                verdict_only: false,
             },
         }
     }
