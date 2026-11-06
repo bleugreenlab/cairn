@@ -7027,6 +7027,15 @@ pub struct LearnedResourceEstimate {
 /// or 143. The wire shape is unchanged, but the exit-status semantics require
 /// both peers to agree. Manual-check handle persistence and result recovery are
 /// runner-local and add no wire fields or executor expectations.
+///
+/// cairn/6256 does not move the number. Executor handshake and artifact
+/// admission now answer a runner-side credential-store read failure with HTTP
+/// 500 instead of collapsing it into the 401 an unknown bearer gets. Bearers,
+/// grants, credentials and every frame are unchanged, and the runner's own
+/// database is the only thing that can produce the new status. A runner
+/// talking to an older executor gets nothing wrong: that executor reads the
+/// 500 as a failed request like any other non-success, and no longer mistakes
+/// a runner fault for its own credential having been refused.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 166;
 
 /// The version `build.rs` derived from the paragraphs above

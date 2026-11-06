@@ -1,6 +1,6 @@
 //! Durable, runner-scoped device enrollment credentials; raw bearers never enter synced state.
 
-use crate::storage::{LocalDb, RowExt};
+use crate::storage::{DbResult, LocalDb, RowExt};
 use base64::Engine;
 use cairn_common::executor_protocol::{
     normalize_executor_name, EnrollmentRejectionReason, ExecutorEnrollmentIdentity,
@@ -19,13 +19,16 @@ pub enum DeviceKind {
 /// Whether a bearer may reach the identity-bearing handshake. This deliberately
 /// does not authenticate an enrollment: the protocol layer still validates
 /// identity, revocation, expiry recovery, and supersession before attachment.
-pub async fn token_may_open_handshake(db: &LocalDb, kind: DeviceKind, raw: &str) -> bool {
+///
+/// `Err` means the credential store could not be read, which is not evidence
+/// about the bearer; callers answer it as a service failure, never a refusal.
+pub async fn token_may_open_handshake(db: &LocalDb, kind: DeviceKind, raw: &str) -> DbResult<bool> {
     let kind = kind.as_str();
     let digest = hash(raw);
     db.read(|conn| { let digest=digest.clone(); Box::pin(async move {
         let mut rows=conn.query("SELECT 1 FROM executor_enrollment_grants WHERE token_hash=?1 AND device_kind=?2 AND consumed_at IS NULL AND expires_at>?3 UNION ALL SELECT 1 FROM executor_enrollments WHERE device_kind=?2 AND (credential_hash=?1 OR previous_credential_hash=?1 OR superseded_credential_hash=?1) LIMIT 1", params![digest, kind, chrono::Utc::now().timestamp()]).await?;
         Ok(rows.next().await?.is_some())
-    })}).await.unwrap_or(false)
+    })}).await
 }
 
 /// What a bearer that failed admission turned out to be. Admission answers only
@@ -236,26 +239,54 @@ pub async fn create_grant(
     expected_device_id: Option<&str>,
     ttl_seconds: i64,
 ) -> Result<String, String> {
+    create_grant_at(
+        db,
+        kind,
+        runner_device_id,
+        expected_enrolled_endpoint_id,
+        expected_device_id,
+        ttl_seconds,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+}
+
+async fn create_grant_at(
+    db: &LocalDb,
+    kind: DeviceKind,
+    runner_device_id: &str,
+    expected_enrolled_endpoint_id: Option<&str>,
+    expected_device_id: Option<&str>,
+    ttl_seconds: i64,
+    now: i64,
+) -> Result<String, String> {
     let kind = kind.as_str();
     let raw = token();
     let token_hash = hash(&raw);
     let runner = runner_device_id.to_string();
     let endpoint = expected_enrolled_endpoint_id.map(str::to_owned);
     let device = expected_device_id.map(str::to_owned);
-    let now = chrono::Utc::now().timestamp();
     db.write(|conn| { let token_hash=token_hash.clone(); let runner=runner.clone(); let endpoint=endpoint.clone(); let device=device.clone(); Box::pin(async move {
         conn.execute("INSERT INTO executor_enrollment_grants (token_hash,device_kind,runner_device_id,expected_enrolled_endpoint_id,expected_device_id,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![token_hash,kind,runner,endpoint,device,now+ttl_seconds,now]).await?; Ok(())
     })}).await.map_err(|e| e.to_string())?;
     Ok(raw)
 }
 
-pub async fn token_is_known(db: &LocalDb, kind: DeviceKind, raw: &str) -> bool {
+/// Whether `raw` is a live grant or credential issued for exactly this device
+/// kind. `Ok(false)` is authentication evidence: the bearer is unknown,
+/// expired, consumed, revoked, or belongs to the other kind. `Err` means the
+/// credential store could not be read, which says nothing about the bearer.
+pub async fn token_is_known(db: &LocalDb, kind: DeviceKind, raw: &str) -> DbResult<bool> {
+    token_is_known_at(db, kind, raw, chrono::Utc::now().timestamp()).await
+}
+
+async fn token_is_known_at(db: &LocalDb, kind: DeviceKind, raw: &str, now: i64) -> DbResult<bool> {
     let kind = kind.as_str();
     let digest = hash(raw);
     db.read(|conn| { let digest=digest.clone(); Box::pin(async move {
-        let mut rows=conn.query("SELECT 1 FROM executor_enrollment_grants WHERE token_hash=?1 AND device_kind=?2 AND consumed_at IS NULL AND expires_at>?3 UNION ALL SELECT 1 FROM executor_enrollments WHERE device_kind=?2 AND revoked_at IS NULL AND ((credential_hash=?1 AND expires_at>?3) OR (previous_credential_hash=?1 AND previous_expires_at>?3)) LIMIT 1", params![digest, kind, chrono::Utc::now().timestamp()]).await?;
+        let mut rows=conn.query("SELECT 1 FROM executor_enrollment_grants WHERE token_hash=?1 AND device_kind=?2 AND consumed_at IS NULL AND expires_at>?3 UNION ALL SELECT 1 FROM executor_enrollments WHERE device_kind=?2 AND revoked_at IS NULL AND ((credential_hash=?1 AND expires_at>?3) OR (previous_credential_hash=?1 AND previous_expires_at>?3)) LIMIT 1", params![digest, kind, now]).await?;
         Ok(rows.next().await?.is_some())
-    })}).await.unwrap_or(false)
+    })}).await
 }
 
 /// The public name of the enrolled executor whose live credential `raw` is,
@@ -341,6 +372,7 @@ pub async fn accept(
                 },
                 runner_device_id,
                 Some(&identity.display_name),
+                chrono::Utc::now().timestamp(),
             )
             .await
             .map(AcceptOutcome::Enrolled)
@@ -459,10 +491,10 @@ async fn accept_grant_with_name(
     binding: &DeviceBinding,
     runner_device_id: &str,
     executor_display_name: Option<&str>,
+    now: i64,
 ) -> Result<String, EnrollmentRejectionReason> {
     let kind = kind.as_str();
     let digest = hash(raw);
-    let now = chrono::Utc::now().timestamp();
     let grant_binding = db.read(|conn| { let digest=digest.clone(); Box::pin(async move {
         let mut rows=conn.query("SELECT runner_device_id,expected_enrolled_endpoint_id,expected_device_id,expires_at FROM executor_enrollment_grants WHERE token_hash=?1 AND device_kind=?2 AND consumed_at IS NULL", params![digest, kind]).await?;
         let Some(row)=rows.next().await? else { return Ok(None) };
@@ -530,7 +562,26 @@ pub async fn accept_grant(
     binding: &DeviceBinding,
     runner_device_id: &str,
 ) -> Result<String, EnrollmentRejectionReason> {
-    accept_grant_with_name(db, kind, raw, binding, runner_device_id, None).await
+    accept_grant_at(
+        db,
+        kind,
+        raw,
+        binding,
+        runner_device_id,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+}
+
+async fn accept_grant_at(
+    db: &LocalDb,
+    kind: DeviceKind,
+    raw: &str,
+    binding: &DeviceBinding,
+    runner_device_id: &str,
+    now: i64,
+) -> Result<String, EnrollmentRejectionReason> {
+    accept_grant_with_name(db, kind, raw, binding, runner_device_id, None, now).await
 }
 
 /// What the one transaction that spends a grant decided.
@@ -549,12 +600,30 @@ pub async fn validate_binding_credential(
     binding: &DeviceBinding,
     runner: &str,
 ) -> Result<(), EnrollmentRejectionReason> {
+    validate_binding_credential_at(
+        db,
+        kind,
+        raw,
+        binding,
+        runner,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+}
+
+async fn validate_binding_credential_at(
+    db: &LocalDb,
+    kind: DeviceKind,
+    raw: &str,
+    binding: &DeviceBinding,
+    runner: &str,
+    now: i64,
+) -> Result<(), EnrollmentRejectionReason> {
     let kind = kind.as_str();
     let digest = hash(raw);
     let endpoint = binding.enrolled_endpoint_id.clone();
     let device = binding.device_id.clone();
     let runner = runner.to_string();
-    let now = chrono::Utc::now().timestamp();
     let state = db.read(|conn| Box::pin(async move {
         let mut rows=conn.query("SELECT revoked_at,credential_hash,previous_credential_hash,superseded_credential_hash,expires_at,previous_expires_at FROM executor_enrollments WHERE (credential_hash=?1 OR previous_credential_hash=?1 OR superseded_credential_hash=?1) AND device_kind=?5 AND enrolled_endpoint_id=?2 AND device_id=?3 AND runner_device_id=?4", params![digest.clone(),endpoint,device,runner,kind]).await?;
         let Some(row) = rows.next().await? else { return Ok(None) };
@@ -823,7 +892,9 @@ mod tests {
 
         // The spent grant is refused at the handshake and named as a replay
         // by the machine it enrolled, not as a stranger.
-        assert!(!token_may_open_handshake(&db, DeviceKind::Executor, &grant).await);
+        assert!(!token_may_open_handshake(&db, DeviceKind::Executor, &grant)
+            .await
+            .unwrap());
         let UnrecognizedBearer::ConsumedGrant { subject, .. } =
             describe_unrecognized_bearer(&db, DeviceKind::Executor, &grant).await
         else {
@@ -851,7 +922,9 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(!token_is_known(&db, DeviceKind::Executor, &credential).await);
+        assert!(!token_is_known(&db, DeviceKind::Executor, &credential)
+            .await
+            .unwrap());
         assert!(matches!(
             describe_unrecognized_bearer(&db, DeviceKind::Executor, &credential).await,
             UnrecognizedBearer::InactiveCredential { revoked: true, .. }
@@ -881,7 +954,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(token_is_known(&db, DeviceKind::Executor, &grant).await);
+        assert!(token_is_known(&db, DeviceKind::Executor, &grant)
+            .await
+            .unwrap());
         let identity = ExecutorIdentity {
             device_id: "device".into(),
             executor_id: "executor".into(),
@@ -902,8 +977,12 @@ mod tests {
             .await
             .unwrap(),
         );
-        assert!(!token_is_known(&db, DeviceKind::Executor, &grant).await);
-        assert!(token_is_known(&db, DeviceKind::Executor, &credential).await);
+        assert!(!token_is_known(&db, DeviceKind::Executor, &grant)
+            .await
+            .unwrap());
+        assert!(token_is_known(&db, DeviceKind::Executor, &credential)
+            .await
+            .unwrap());
         accept(
             &db,
             DeviceKind::Executor,
@@ -959,7 +1038,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!token_is_known(&db, DeviceKind::Executor, &credential).await);
+        assert!(!token_is_known(&db, DeviceKind::Executor, &credential)
+            .await
+            .unwrap());
         let outcome = accept(
             &db,
             DeviceKind::Executor,
@@ -1184,8 +1265,12 @@ mod tests {
             panic!("retry did not recover through the unacknowledged previous slot");
         };
         assert_ne!(first, second);
-        assert!(!token_may_open_handshake(&db, DeviceKind::Executor, &first).await);
-        assert!(token_may_open_handshake(&db, DeviceKind::Executor, &lapsed).await);
+        assert!(!token_may_open_handshake(&db, DeviceKind::Executor, &first)
+            .await
+            .unwrap());
+        assert!(token_may_open_handshake(&db, DeviceKind::Executor, &lapsed)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1334,7 +1419,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(token_is_known(&db, DeviceKind::Executor, &credential).await);
+        assert!(token_is_known(&db, DeviceKind::Executor, &credential)
+            .await
+            .unwrap());
         // Simulate disconnect before delivery: reconnecting with the previous
         // credential mints a new recoverable active secret.
         let (replacement, _) =
@@ -1343,7 +1430,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_ne!(replacement, lost_replacement);
-        assert!(!token_is_known(&db, DeviceKind::Executor, &lost_replacement).await);
+        assert!(
+            !token_is_known(&db, DeviceKind::Executor, &lost_replacement)
+                .await
+                .unwrap()
+        );
         assert!(confirm_rotated_credential(
             &db,
             DeviceKind::Executor,
@@ -1353,7 +1444,9 @@ mod tests {
         )
         .await
         .unwrap());
-        assert!(!token_is_known(&db, DeviceKind::Executor, &credential).await);
+        assert!(!token_is_known(&db, DeviceKind::Executor, &credential)
+            .await
+            .unwrap());
         assert!(
             rotate_credential(&db, DeviceKind::Executor, &credential, &identity, "runner")
                 .await
@@ -1538,7 +1631,9 @@ mod tests {
 
         // Nothing was spent, and nothing was created.
         assert!(
-            token_is_known(&db, DeviceKind::Executor, &grant).await,
+            token_is_known(&db, DeviceKind::Executor, &grant)
+                .await
+                .unwrap(),
             "a refused enrollment must leave its one-time grant unspent"
         );
         assert_eq!(
@@ -1655,7 +1750,9 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !token_is_known(&db, DeviceKind::Executor, &recovery).await,
+            !token_is_known(&db, DeviceKind::Executor, &recovery)
+                .await
+                .unwrap(),
             "revocation invalidates a recovery grant that has not been consumed"
         );
         assert!(create_recovery_grant(
@@ -1732,43 +1829,77 @@ mod tests {
 
     #[tokio::test]
     async fn companion_credentials_are_kind_isolated_and_identity_neutral() {
+        // One fixed instant for every step, so a loaded host that takes longer
+        // than the grant's lifetime between steps cannot expire it mid-test.
+        const NOW: i64 = 1_800_000_000;
         let db = db().await;
         let binding = DeviceBinding {
             enrolled_endpoint_id: "endpoint".into(),
             device_id: "phone".into(),
         };
-        let grant = create_grant(
+        let grant = create_grant_at(
             &db,
             DeviceKind::Companion,
             "runner",
             Some("endpoint"),
             Some("phone"),
             60,
+            NOW,
         )
         .await
         .unwrap();
 
-        assert!(token_is_known(&db, DeviceKind::Companion, &grant).await);
-        assert!(!token_is_known(&db, DeviceKind::Executor, &grant).await);
-        let credential = accept_grant(&db, DeviceKind::Companion, &grant, &binding, "runner")
+        assert!(token_is_known_at(&db, DeviceKind::Companion, &grant, NOW)
             .await
-            .unwrap();
-        assert!(!token_is_known(&db, DeviceKind::Companion, &grant).await);
-        assert!(validate_binding_credential(
+            .unwrap());
+        assert!(!token_is_known_at(&db, DeviceKind::Executor, &grant, NOW)
+            .await
+            .unwrap());
+        // Expiry is exact at the boundary and still answered per kind.
+        assert!(
+            token_is_known_at(&db, DeviceKind::Companion, &grant, NOW + 59)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !token_is_known_at(&db, DeviceKind::Companion, &grant, NOW + 60)
+                .await
+                .unwrap()
+        );
+        let credential =
+            accept_grant_at(&db, DeviceKind::Companion, &grant, &binding, "runner", NOW)
+                .await
+                .unwrap();
+        assert!(!token_is_known_at(&db, DeviceKind::Companion, &grant, NOW)
+            .await
+            .unwrap());
+        assert!(
+            token_is_known_at(&db, DeviceKind::Companion, &credential, NOW)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !token_is_known_at(&db, DeviceKind::Executor, &credential, NOW)
+                .await
+                .unwrap()
+        );
+        assert!(validate_binding_credential_at(
             &db,
             DeviceKind::Companion,
             &credential,
             &binding,
             "runner",
+            NOW,
         )
         .await
         .is_ok());
-        assert!(validate_binding_credential(
+        assert!(validate_binding_credential_at(
             &db,
             DeviceKind::Executor,
             &credential,
             &binding,
             "runner",
+            NOW,
         )
         .await
         .is_err());
@@ -1782,6 +1913,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, vec![None]);
+    }
+
+    /// A credential store that cannot be read is not evidence that a bearer is
+    /// unknown. Both lookups must hand the failure to their caller, for either
+    /// device kind, rather than answering `false`.
+    #[tokio::test]
+    async fn credential_lookup_surfaces_a_failed_read_instead_of_false() {
+        let db = db().await;
+        let grant = create_grant(&db, DeviceKind::Companion, "runner", None, None, 60)
+            .await
+            .unwrap();
+        db.execute("DROP TABLE executor_enrollment_grants", ())
+            .await
+            .unwrap();
+
+        for kind in [DeviceKind::Companion, DeviceKind::Executor] {
+            assert!(
+                token_is_known(&db, kind, &grant).await.is_err(),
+                "{kind:?} lookup turned a failed read into an answer"
+            );
+            assert!(
+                token_may_open_handshake(&db, kind, &grant).await.is_err(),
+                "{kind:?} handshake lookup turned a failed read into an answer"
+            );
+        }
     }
 
     #[tokio::test]

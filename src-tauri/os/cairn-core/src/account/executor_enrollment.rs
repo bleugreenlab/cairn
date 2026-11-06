@@ -8,7 +8,7 @@ use super::device_enrollment::{self, DeviceKind};
 pub use super::device_enrollment::{
     AcceptOutcome, BearerSubject, RecoverySource, UnrecognizedBearer,
 };
-use crate::storage::LocalDb;
+use crate::storage::{DbResult, LocalDb};
 use cairn_common::executor_protocol::{
     EnrollmentRejectionReason, ExecutorEnrollmentIdentity, ExecutorIdentity,
 };
@@ -22,10 +22,10 @@ pub async fn create_grant(
 ) -> Result<String, String> {
     device_enrollment::create_grant(db, DeviceKind::Executor, runner, endpoint, device, ttl).await
 }
-pub async fn token_may_open_handshake(db: &LocalDb, raw: &str) -> bool {
+pub async fn token_may_open_handshake(db: &LocalDb, raw: &str) -> DbResult<bool> {
     device_enrollment::token_may_open_handshake(db, DeviceKind::Executor, raw).await
 }
-pub async fn token_is_known(db: &LocalDb, raw: &str) -> bool {
+pub async fn token_is_known(db: &LocalDb, raw: &str) -> DbResult<bool> {
     device_enrollment::token_is_known(db, DeviceKind::Executor, raw).await
 }
 pub async fn executor_name_for_token(db: &LocalDb, raw: &str) -> Option<String> {
