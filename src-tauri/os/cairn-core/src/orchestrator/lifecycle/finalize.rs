@@ -1262,6 +1262,10 @@ fn claim_reseed_fallback(
     attempted.insert(session_id.to_string())
 }
 
+/// The exit reason a launch guard records on a run it inserted and then
+/// abandoned before any process attached to it.
+pub(crate) const LAUNCH_ATTACH_FAILED_EXIT_REASON: &str = "launch_attach_failed";
+
 /// React to a crashed run's session context.
 ///
 /// Always logs a crashed resume for operator visibility. When the backend
@@ -1320,6 +1324,17 @@ pub(crate) fn handle_session_crash(
         start_mode.as_deref(),
         exit_reason.as_deref(),
     ) {
+        // A launch refused before any process attached never touched the
+        // session, so it says nothing about whether the session is valid.
+        if exit_reason.as_deref() == Some(LAUNCH_ATTACH_FAILED_EXIT_REASON) {
+            log::info!(
+                "Resume run {} for session {} was refused before a process attached; \
+                 the session was not used",
+                &log_run_id[..log_run_id.len().min(8)],
+                &session_id[..session_id.len().min(8)]
+            );
+            return None;
+        }
         // Still the right observability for a resume that died for some other
         // reason — that one has no automatic recovery.
         if start_mode.as_deref() == Some("resume") {

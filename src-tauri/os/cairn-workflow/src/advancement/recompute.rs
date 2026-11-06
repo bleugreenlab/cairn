@@ -297,18 +297,27 @@ impl TurnFacts {
     }
 }
 
+/// A turn a launch created and then cancelled before any process received it
+/// (`end_reason = 'launch_refused'`). Nothing ran in it, so it is an audit row,
+/// not the job's latest work: reading it as a cancelled work turn turned a
+/// refused resume of a Blocked or Complete node into a DAG-ready Pending one,
+/// which advancement claimed and cold-started (cairn/5387).
+const UNSERVED_LAUNCH: &str =
+    "(state = 'cancelled' AND COALESCE(end_reason, '') = 'launch_refused')";
+
 pub async fn turn_facts(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> DbResult<TurnFacts> {
     let mut rows = conn
         .query(
-            "SELECT
+            &format!(
+                "SELECT
                (SELECT state FROM turns
-                WHERE job_id = ?1 AND start_reason != 'memory_review'
+                WHERE job_id = ?1 AND start_reason != 'memory_review' AND NOT {UNSERVED_LAUNCH}
                 ORDER BY created_at DESC, sequence DESC LIMIT 1),
                (SELECT state FROM turns
-                WHERE job_id = ?1
+                WHERE job_id = ?1 AND NOT {UNSERVED_LAUNCH}
                 ORDER BY created_at DESC, sequence DESC LIMIT 1),
                (SELECT state FROM turns
                 WHERE job_id = ?1 AND start_reason != 'memory_review'
@@ -317,7 +326,8 @@ pub async fn turn_facts(
                EXISTS (
                  SELECT 1 FROM jobs j JOIN turns t ON t.id=j.current_turn_id AND t.job_id=j.id
                  WHERE j.id=?1 AND t.state='yielded' AND t.yield_reason='provider_limit'
-               )",
+               )"
+            ),
             (job_id,),
         )
         .await?;
@@ -325,9 +335,8 @@ pub async fn turn_facts(
         return Ok(TurnFacts::default());
     };
     let state = |raw: Option<String>| raw.and_then(|s| s.parse::<TurnState>().ok());
-    // An unserved launch remains as a cancelled audit row after the provider
-    // resolver restores its yielded head. That newer row is not new work and
-    // must not hide the explicitly owned, still-live head.
+    // A provider hold owns the job's head explicitly. Whatever turn rows came
+    // after it, the held head is the live work.
     let provider_held = row.i64(3)? != 0;
     let work_state = if provider_held {
         Some(TurnState::Yielded)
@@ -597,9 +606,13 @@ async fn node_job_facts_conn(
     // living doc's confirm flag must never resolve the job's gate.
     let artifact = artifact_fact(conn, job_id, required_artifact_name.as_deref()).await?;
     let output_abandoned = output_abandoned_fact(conn, job_id).await?;
+    // Only a job that never had a turn row at all: a job whose only turn was
+    // a refused launch has no work state either, and its launch's run ended
+    // without attaching, which is not the job failing.
     let run_failed_without_turn = if turn.work_state.is_none() {
         let mut rows = conn.query(
             "SELECT status IN ('failed', 'crashed') AND COALESCE(exit_reason, '') != 'user_stop'
+                    AND NOT EXISTS (SELECT 1 FROM turns WHERE job_id = ?1)
              FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (job_id,),
         ).await?;

@@ -2193,10 +2193,13 @@ mod terminal_issue_tests {
             .await
             .unwrap();
 
-        // An interrupted or cancelled latest turn rests resumable on an open
-        // issue; the latest-outcome reading belongs to resolved issues only.
+        // An interrupted latest turn rests resumable on an open issue; the
+        // latest-outcome reading belongs to resolved issues only.
         assert_eq!(status_of(&db, "builder").await, "pending");
-        assert_eq!(status_of(&db, "shipper").await, "pending");
+        // A refused launch never ran, so it is not the shipper's latest work:
+        // it rests on the completion it had, rather than turning DAG-ready and
+        // being claimed for a cold start (cairn/5387).
+        assert_eq!(status_of(&db, "shipper").await, "complete");
         assert_eq!(status_of(&db, "child").await, "running");
         assert!(outcome
             .changes

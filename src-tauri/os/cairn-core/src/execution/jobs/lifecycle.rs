@@ -469,7 +469,7 @@ impl Drop for PendingLaunchTurnGuard<'_> {
             if let Err(error) = crate::orchestrator::lifecycle::set_exit_reason(
                 self.orch,
                 &run_id,
-                "launch_attach_failed",
+                crate::orchestrator::lifecycle::LAUNCH_ATTACH_FAILED_EXIT_REASON,
             ) {
                 log::error!("failed to record launch attachment failure for run {run_id}: {error}");
             }
@@ -1057,9 +1057,13 @@ pub(crate) struct ParentCoordinate {
 pub(crate) struct CoordinateRequest<'a> {
     pub job_id: &'a str,
     pub parent_job_id: Option<&'a str>,
-    /// A branch already recorded on the row — pre-assigned lineage, honored
-    /// instead of minting a fresh name.
+    /// A branch already recorded on the row, honored instead of minting a fresh
+    /// name. With a `recorded_base` beside it, a previous preparation of this
+    /// same job wrote both: the job is restarting on a branch it already owns.
     pub existing_branch: Option<&'a str>,
+    /// The job's own `jobs.base_commit`. A restart keeps it: base-advance moves
+    /// it as it rebases the branch, so the live base tip is not this job's base.
+    pub recorded_base: Option<&'a str>,
     /// The job's own base branch, the floor every non-inheriting job starts from.
     pub base_ref: &'a str,
     /// The committed head a fresh mint starts at INSTEAD of the base branch,
@@ -1088,6 +1092,13 @@ pub(crate) struct CoordinateRequest<'a> {
 ///
 /// `isolate` mints a child branch; `none` stays on the base coordinate with no
 /// branch of its own. Both resolve base live, and neither consults a parent.
+///
+/// A job that already owns its branch (a branch and a base on its row) is a
+/// restart of itself, not a mint: it continues on that branch wherever the
+/// bookmark now sits, with its recorded base unchanged. If the store cannot
+/// resolve that bookmark the restart refuses rather than re-creating it at the
+/// base, which would silently replace the job's committed work with an empty
+/// branch of the same name (the cairn/4897 shape).
 ///
 /// A mint is created at `request.adopt_head` when one is given and at the base
 /// otherwise. That is the whole of adoption at this layer: which prior head is
@@ -1154,12 +1165,27 @@ where
         return Ok((None, Some(base)));
     }
 
+    if let (Some(branch), Some(recorded_base)) = (request.existing_branch, request.recorded_base) {
+        let job_id = request.job_id;
+        if crate::jj::bookmark_commit(jj, store, branch).is_none() {
+            return Err(format!(
+                "Job {job_id} cannot restart: the branch {branch} this job owns does not \
+                 resolve in the store, so its committed work cannot be found. Creating it \
+                 again at the base would replace that work with an empty branch of the \
+                 same name."
+            ));
+        }
+        return Ok((Some(branch.to_string()), Some(recorded_base.to_string())));
+    }
+
     let branch = match request.existing_branch {
         Some(branch) => branch.to_string(),
         None => mint_name()?,
     };
     // Where the new bookmark is CREATED, which is the base unless a prior
-    // execution of this issue left committed work to carry forward.
+    // execution of this issue left committed work to carry forward. The guard
+    // below is for a name this preparation is about to create: one already in
+    // the store at another commit belongs to something else.
     let mint_point = request.adopt_head.unwrap_or(base.as_str());
     match crate::jj::bookmark_commit(jj, store, &branch) {
         Some(existing) if existing != mint_point => {
@@ -1340,6 +1366,7 @@ where
             job_id: &job.id,
             parent_job_id: job.parent_job_id.as_deref(),
             existing_branch: job.branch.as_deref(),
+            recorded_base: job.base_commit.as_deref(),
             base_ref,
             adopt_head: continuation.adopt_head(),
         },
@@ -10024,6 +10051,7 @@ mod tests {
             job_id: "child-job",
             parent_job_id,
             existing_branch: None,
+            recorded_base: None,
             base_ref: "main",
         }
     }
@@ -10254,6 +10282,117 @@ mod tests {
         );
     }
 
+    /// cairn/5387 replayed. A builder owns a branch ahead of its base; a resume
+    /// finds no provider account and is refused before any process receives it,
+    /// leaving a `launch_refused` turn and a run that never attached. The node
+    /// must rest where it was, so advancement claims nothing and the cold-start
+    /// funnel is never entered; and if anything re-dispatches it anyway, the
+    /// restart continues on its own branch rather than failing on it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_refused_resume_holds_the_node_and_leaves_its_branch_untouched() {
+        let Some((project, orch)) = job_about_to_prepare("refused-resume-replay").await else {
+            return;
+        };
+        let db = orch.db.local.clone();
+        drop(prepared(super::prepare_job(&orch, "j").unwrap()));
+        let base = db
+            .query_opt_text("SELECT base_commit FROM jobs WHERE id='j'", ())
+            .await
+            .unwrap()
+            .expect("the first launch records the base");
+
+        // The job's own work: a branch it owns, committed ahead of the base.
+        const OWN_BRANCH: &str = "agent/p-1-review-6";
+        git(project.path(), &["checkout", "-q", "-b", OWN_BRANCH]);
+        std::fs::write(project.path().join("work.rs"), "pub fn work() {}\n").unwrap();
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-q", "-m", "the job's work"]);
+        let own_head = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        git(project.path(), &["checkout", "-q", "main"]);
+        db.execute(
+            "UPDATE jobs SET branch = ?1 WHERE id = 'j'",
+            params![OWN_BRANCH],
+        )
+        .await
+        .unwrap();
+
+        // The turn it ran to the end, as the job rests before the resume.
+        db.execute_script(
+            "UPDATE turns SET state='complete', ended_at=2 WHERE job_id='j';
+             UPDATE runs SET status='crashed' WHERE job_id='j';",
+        )
+        .await
+        .unwrap();
+        crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+        let resting = db
+            .query_opt_text("SELECT status FROM jobs WHERE id='j'", ())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            resting, "pending",
+            "the fixture's premise is a node at rest"
+        );
+
+        // What the refused resume leaves behind, then the re-derivation its
+        // launch guard runs.
+        db.execute_script(
+            "INSERT INTO runs (id, project_id, job_id, status, session_id, exit_reason, created_at, updated_at, start_mode)
+             SELECT 'refused-run', 'p', 'j', 'crashed', current_session_id, 'launch_attach_failed', 3, 3, 'resume'
+               FROM jobs WHERE id = 'j';
+             INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, end_reason, created_at, ended_at, updated_at)
+             SELECT 'refused-turn', current_session_id, 'j', 2, 'cancelled', 'follow_up', 'launch_refused', 3, 3, 3
+               FROM jobs WHERE id = 'j';",
+        )
+        .await
+        .unwrap();
+        crate::execution::advancement::recompute_job(&orch, "j").unwrap();
+
+        assert_eq!(
+            db.query_opt_text("SELECT status FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(resting.as_str()),
+            "a launch nothing received is not work: the node rests where it was"
+        );
+        let claimed = crate::execution::advancement::advance_execution_with_actions(&orch, "e")
+            .await
+            .unwrap();
+        assert!(
+            claimed.is_empty(),
+            "advancement must not claim the node, which would cold-start it: {claimed:?}"
+        );
+
+        // A re-dispatch from elsewhere (an owner sweep, an operator start) is a
+        // restart of a job that owns its branch, not a mint onto a stale name.
+        drop(prepared(super::prepare_job(&orch, "j").expect(
+            "a restart on the job's own branch ahead of its base prepares",
+        )));
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, project.path());
+        assert_eq!(
+            crate::jj::bookmark_commit(&jj, &store, OWN_BRANCH).as_deref(),
+            Some(own_head.as_str()),
+            "the branch's committed work is where it was"
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT branch FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(OWN_BRANCH)
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT base_commit FROM jobs WHERE id='j'", ())
+                .await
+                .unwrap(),
+            Some(base),
+            "and the job is still measured against the base it recorded"
+        );
+    }
+
     // The specimen: execution 1 commits real work and then dies for a reason
     // that has nothing to do with that work, and execution 2 is started on the
     // same issue. These drive the actual composition `prepare_job` drives — a
@@ -10480,6 +10619,7 @@ mod tests {
                 job_id: "job-next",
                 parent_job_id: None,
                 existing_branch: None,
+                recorded_base: None,
                 base_ref: "main",
                 adopt_head: continuation.adopt_head(),
             },
@@ -10510,6 +10650,150 @@ mod tests {
             Some(fx.base.as_str()),
             "the recorded base stays the BASE: inherited commits are part of the change this \
              job ships, so its diff and PR must still measure against main"
+        );
+    }
+
+    /// A job restarting on the branch it already owns (cairn/5387: a builder 928
+    /// commits ahead of its base, re-dispatched after a refused resume) keeps that
+    /// branch where it is and keeps its recorded base. The fresh-mint collision
+    /// guard is not asked: the bookmark being ahead of the base is the job's own
+    /// work, not a stale name.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_restart_keeps_its_own_branch_ahead_of_the_base() {
+        let Some(fx) = successor_fixture() else {
+            eprintln!("skipping a_restart_keeps_its_own_branch_ahead_of_the_base: no jj");
+            return;
+        };
+        let base = fx.base.clone();
+        let (branch, base_commit) = select_job_coordinate(
+            &mints(),
+            CoordinateRequest {
+                job_id: "job-dead",
+                parent_job_id: None,
+                existing_branch: Some(DEAD_BRANCH),
+                recorded_base: Some(fx.base.as_str()),
+                base_ref: "main",
+                adopt_head: None,
+            },
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!("a minting job reads no parent"),
+            || unreachable!("a restart mints no name"),
+            move |revision| (revision == "main").then(|| base.clone()),
+        )
+        .expect("a restart on the job's own branch is not a collision");
+
+        assert_eq!(branch.as_deref(), Some(DEAD_BRANCH));
+        assert_eq!(base_commit.as_deref(), Some(fx.base.as_str()));
+        assert_eq!(
+            crate::jj::bookmark_commit(&fx.jj, &fx.store, DEAD_BRANCH).as_deref(),
+            Some(fx.dead_head.as_str()),
+            "the restart leaves the branch's committed work where it was"
+        );
+    }
+
+    /// The recorded base is the job's, not the live tip: base-advance moved it
+    /// with the branch, and a restart that overwrote it with the base branch's
+    /// current tip would measure the job's diff against code it never rebased on.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_restart_keeps_its_recorded_base_when_the_base_branch_moved() {
+        let Some(fx) = successor_fixture() else {
+            eprintln!("skipping a_restart_keeps_its_recorded_base: no jj");
+            return;
+        };
+        let (_, base_commit) = select_job_coordinate(
+            &mints(),
+            CoordinateRequest {
+                job_id: "job-dead",
+                parent_job_id: None,
+                existing_branch: Some(DEAD_BRANCH),
+                recorded_base: Some("recorded-base"),
+                base_ref: "main",
+                adopt_head: None,
+            },
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!(),
+            || unreachable!(),
+            |revision| (revision == "main").then(|| "moved-main-tip".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(base_commit.as_deref(), Some("recorded-base"));
+    }
+
+    /// A restart whose branch the store cannot resolve refuses by name. Before,
+    /// it fell through to the mint and re-created the bookmark at the base: the
+    /// job resumed on an empty branch wearing its old name.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_restart_whose_branch_does_not_resolve_refuses() {
+        let Some(fx) = successor_fixture() else {
+            eprintln!("skipping a_restart_whose_branch_does_not_resolve_refuses: no jj");
+            return;
+        };
+        let base = fx.base.clone();
+        let error = select_job_coordinate(
+            &mints(),
+            CoordinateRequest {
+                job_id: "job-lost",
+                parent_job_id: None,
+                existing_branch: Some("agent/proj-1-builder-gone"),
+                recorded_base: Some(fx.base.as_str()),
+                base_ref: "main",
+                adopt_head: None,
+            },
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!(),
+            || unreachable!(),
+            move |revision| (revision == "main").then(|| base.clone()),
+        )
+        .expect_err("a lost branch must not be re-minted at the base");
+
+        assert!(error.contains("job-lost"), "{error}");
+        assert!(error.contains("agent/proj-1-builder-gone"), "{error}");
+        assert!(error.contains("does not resolve in the store"), "{error}");
+        assert_eq!(
+            crate::jj::bookmark_commit(&fx.jj, &fx.store, "agent/proj-1-builder-gone"),
+            None,
+            "nothing was created under the lost name"
+        );
+    }
+
+    /// The fresh-mint guard still holds: a name this preparation is about to
+    /// create that already sits at another commit belongs to something else.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_fresh_mint_onto_a_name_at_another_commit_still_refuses() {
+        let Some(fx) = successor_fixture() else {
+            eprintln!("skipping a_fresh_mint_onto_a_name_at_another_commit: no jj");
+            return;
+        };
+        let base = fx.base.clone();
+        let error = select_job_coordinate(
+            &mints(),
+            CoordinateRequest {
+                job_id: "job-next",
+                parent_job_id: None,
+                existing_branch: None,
+                recorded_base: None,
+                base_ref: "main",
+                adopt_head: None,
+            },
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!(),
+            || Ok(DEAD_BRANCH.to_string()),
+            move |revision| (revision == "main").then(|| base.clone()),
+        )
+        .expect_err("a freshly minted name colliding with other work refuses");
+
+        assert!(
+            error.contains("already exists at a different commit"),
+            "{error}"
         );
     }
 
@@ -10547,6 +10831,7 @@ mod tests {
                 job_id: "job-next",
                 parent_job_id: None,
                 existing_branch: None,
+                recorded_base: None,
                 base_ref: "main",
                 adopt_head: continuation.adopt_head(),
             },
