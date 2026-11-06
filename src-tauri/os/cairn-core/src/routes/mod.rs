@@ -19,7 +19,8 @@ pub use definition::{
 #[cfg(test)]
 pub(crate) use dispatcher::HANGING_RESPONSE;
 pub use dispatcher::{
-    record_channel_outcome, test_definition, ChannelSubmission, RouteContext, RouteTestResult,
+    record_channel_outcome, test_definition, ChannelSubmission, LoggedEvent, RouteContext,
+    RouteTestResult, EVENT_PLACEHOLDER,
 };
 pub use graph::{GraphEdge, RouteGraph};
 pub use index::{invalidate_trigger_index, FactLogHandle};
@@ -30,13 +31,13 @@ pub(crate) use predicate::value_matches;
 pub use predicate::{
     clause_value_problem, explain_clause, matches, AddressKind, Audience, Fact, FactFieldShape,
     FactRegistry, FactSourceShape, FactSurface, FieldKind, FieldSpec, FieldVocabulary, LogDedupe,
-    Presence, SourceSpec, TriggerClause, ANSWERS_PREFIX, COMPARISON_OPERATORS,
+    Presence, SourceSpec, TriggerClause, ANSWERS_PREFIX, COMPARISON_OPERATORS, EVENT_FIELD,
 };
 pub use references::validate_references;
-pub use worker::spawn_fact_log_worker;
 pub(crate) use worker::{addressed_via, explain_thread_triggers};
 #[cfg(test)]
 pub(crate) use worker::{drain_fact_log, drain_fact_log_within, fixture};
+pub use worker::{event_uri, spawn_fact_log_worker};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -10,7 +10,7 @@
 use super::decision::{answer_field, check_clause_value, split_answer_key, AnswerField};
 use super::graph::RouteGraph;
 use super::predicate::{
-    clause_value_problem, AddressKind, FactRegistry, TriggerClause, ANSWERS_PREFIX,
+    clause_value_problem, AddressKind, FactRegistry, TriggerClause, ANSWERS_PREFIX, EVENT_FIELD,
 };
 use crate::models::decision::{DecisionNode, DecisionQuestion, Thresholds};
 use serde::{Deserialize, Serialize};
@@ -789,6 +789,9 @@ fn validate_binding(
             answer_at(graph, index, false, field)
                 .map_err(|lookup| answer_refusal(what, field, lookup))?;
         }
+        // Every trigger's dispatch binds the row URI, so `event` reaches every
+        // node whatever sources and decisions lie above it.
+        ArgumentBinding::Field { field } if field == EVENT_FIELD => {}
         ArgumentBinding::Field { field } => {
             let available = graph
                 .fact_sources(index)
@@ -1580,6 +1583,31 @@ mod tests {
             }
             assert!(parse(&yaml.replace("Via {{text}}", r"\{{foo}} {{ a b }}")).is_ok());
         }
+    }
+
+    #[test]
+    fn event_is_bound_on_every_node_whatever_reaches_it() {
+        for kind in [
+            "message, target: 'cairn://p/cairn/1'",
+            "channel, destination: 'discord:1/2'",
+        ] {
+            let yaml = graph_route(&format!("{{ kind: {kind}, body: '{{{{event}}}}' }}"), "");
+            assert!(parse(&yaml).is_ok(), "{yaml}");
+        }
+        // Below a decision too, and as an argument binding.
+        let below = FIXTURE_B.replace(
+            "target: { field: answers.thread.addresses } }",
+            "target: { field: answers.thread.addresses }, body: 'Re {{event}}' }",
+        );
+        assert!(parse(&below).is_ok());
+        assert!(
+            parse(&FIXTURE_B.replace("input: { field: text }", "input: { field: event }")).is_ok()
+        );
+        // It is not a delivery address.
+        let addressed = graph_route("{ kind: message, target: { field: event } }", "");
+        assert!(parse(&addressed)
+            .unwrap_err()
+            .contains("carries no message target"));
     }
 
     #[test]

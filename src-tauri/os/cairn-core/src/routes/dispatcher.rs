@@ -35,7 +35,24 @@ pub(crate) const HANGING_RESPONSE: &str = "test-hang";
 pub struct RouteContext<'a> {
     pub project_id: Option<&'a str>,
     pub project_path: Option<&'a Path>,
+    /// The fact log row this dispatch acts on, when it is log-driven.
+    pub event: Option<LoggedEvent<'a>>,
 }
+
+/// A fact log row as a dispatch names it: `id` joins every firing the row
+/// produced, and `uri` is what sink bodies and bindings read as
+/// [`EVENT_FIELD`](super::EVENT_FIELD). The row, not the firing, is the
+/// correlation key: a firing is journaled after delivery, one per address, in
+/// a ring buffer, so it neither exists when a body renders nor lasts.
+#[derive(Debug, Clone, Copy)]
+pub struct LoggedEvent<'a> {
+    pub id: i64,
+    pub uri: &'a str,
+}
+
+/// What a dry run binds as `event` when its sample has no fact log row. It is
+/// deliberately not a URI, so it cannot be mistaken for one in a preview.
+pub const EVENT_PLACEHOLDER: &str = "<event: this dry run has no fact log row>";
 
 /// Where a message sink delivers: a project or issue stream, or a thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -444,15 +461,17 @@ struct Carried {
 }
 
 /// The fields a node works on: the fact's, the content arriving on its path as
-/// `text`, and the `answers.*` of every decision that dominates it, nearest
-/// last so it wins a shared question name. This is the one definition of what
-/// a node can read, shared by edge clauses, bindings, and sink addresses.
+/// `text`, the `answers.*` of every decision that dominates it, nearest last so
+/// it wins a shared question name, and `event`, the fact log row's URI, when
+/// the dispatch has one. This is the one definition of what a node can read,
+/// shared by edge clauses, bindings, and sink addresses.
 pub(crate) fn node_fields(
     graph: &RouteGraph<'_>,
     index: usize,
     fact_fields: &BTreeMap<String, Value>,
     text: Option<&str>,
     answers: &HashMap<usize, BTreeMap<String, Value>>,
+    event: Option<&str>,
 ) -> BTreeMap<String, Value> {
     let mut fields = fact_fields.clone();
     if let Some(text) = text {
@@ -462,6 +481,9 @@ pub(crate) fn node_fields(
         if let Some(own) = answers.get(&decision) {
             fields.extend(own.iter().map(|(key, value)| (key.clone(), value.clone())));
         }
+    }
+    if let Some(event) = event {
+        fields.insert(super::EVENT_FIELD.into(), Value::String(event.to_owned()));
     }
     fields
 }
@@ -588,6 +610,7 @@ async fn walk<'a>(
     presence: Presence,
     run: RunResponse<'_>,
     decide: RunDecision<'_>,
+    event: Option<&str>,
 ) -> Walk<'a> {
     let mut outputs: HashMap<usize, String> = HashMap::new();
     let mut carried: HashMap<usize, Carried> = HashMap::new();
@@ -640,6 +663,7 @@ async fn walk<'a>(
                         &fact.fields,
                         inherited.text.as_deref(),
                         &answers,
+                        event,
                     );
                     let mut history = inherited.history.clone();
                     match config {
@@ -839,6 +863,22 @@ fn prepare_sink_text(
     }
 }
 
+/// Whether a sink's body template names `event`.
+fn body_names_event(sink: &RouteSink) -> bool {
+    let (RouteSink::Message {
+        body: Some(body), ..
+    }
+    | RouteSink::Channel {
+        body: Some(body), ..
+    }) = sink
+    else {
+        return false;
+    };
+    crate::text_template::tokens(body).iter().any(|token| {
+        matches!(token, crate::text_template::Token::Placeholder { name, .. } if *name == super::EVENT_FIELD)
+    })
+}
+
 /// What a sink would do with one firing, without doing it: the address it
 /// resolved, or why it would drop.
 async fn sink_preview(
@@ -950,7 +990,12 @@ pub async fn test_definition(
         })
     };
     let decide = production_decide(orch, context.project_id);
-    let walked = walk(&graph, &fact, presence, &run, &decide).await;
+    // The sample is the source's latest log row, so the dry run binds that
+    // row's URI. A sample with no row binds a marked placeholder instead: a
+    // body naming `event` always renders in production, so the preview must
+    // not report it unbound.
+    let event = context.event.map_or(EVENT_PLACEHOLDER, |event| event.uri);
+    let walked = walk(&graph, &fact, presence, &run, &decide, Some(event)).await;
     let matched = graph
         .triggers()
         .any(|index| trigger_matches(graph.node(index), &fact, presence));
@@ -961,7 +1006,13 @@ pub async fn test_definition(
             fields: &delivery.fields,
             outputs: &walked.outputs,
         };
-        sink_previews.push(sink_preview(orch, delivery, &bindings).await);
+        let mut preview = sink_preview(orch, delivery, &bindings).await;
+        if context.event.is_none() && body_names_event(delivery.sink) {
+            preview["note"] = Value::String(format!(
+                "{{{{event}}}} rendered as {EVENT_PLACEHOLDER}: this sample has no fact log row; a live firing binds the row's URI"
+            ));
+        }
+        sink_previews.push(preview);
     }
     Ok(RouteTestResult {
         matched,
@@ -1152,22 +1203,12 @@ pub(crate) async fn dispatch_row(
     presence: Presence,
     context: RouteContext<'_>,
     routes: &super::index::RouteSet,
-    fact_log_id: Option<i64>,
     submissions: &mut Vec<ChannelSubmission>,
 ) -> Result<(), String> {
     if fact.is_route_generated() {
         return Ok(());
     }
-    dispatch_into(
-        orch,
-        fact,
-        presence,
-        context,
-        routes,
-        fact_log_id,
-        submissions,
-    )
-    .await
+    dispatch_into(orch, fact, presence, context, routes, submissions).await
 }
 
 async fn dispatch_into(
@@ -1176,9 +1217,10 @@ async fn dispatch_into(
     presence: Presence,
     context: RouteContext<'_>,
     routes: &super::index::RouteSet,
-    fact_log_id: Option<i64>,
     submissions: &mut Vec<ChannelSubmission>,
 ) -> Result<(), String> {
+    let fact_log_id = context.event.map(|event| event.id);
+    let event = context.event.map(|event| event.uri);
     let mut firing_count = 0;
     for route in routes.routes_for(&fact.source) {
         let graph = RouteGraph::new(&route.definition)?;
@@ -1267,7 +1309,7 @@ async fn dispatch_into(
             })
         };
         let decide = production_decide(orch, context.project_id);
-        let walked = walk(&graph, fact, presence, &run, &decide).await;
+        let walked = walk(&graph, fact, presence, &run, &decide, event).await;
 
         // A decision whose answers took no edge stops the firing there. It is
         // journaled once, with the answers and what was judged, so a refusal
@@ -1626,17 +1668,9 @@ mod tests {
             orch.services.clock.now(),
         )?;
         let mut submissions = Vec::new();
-        dispatch_row(
-            orch,
-            &fact,
-            presence,
-            context,
-            &routes,
-            None,
-            &mut submissions,
-        )
-        .await
-        .map(|()| submissions)
+        dispatch_row(orch, &fact, presence, context, &routes, &mut submissions)
+            .await
+            .map(|()| submissions)
     }
 
     fn thread_fact(text: &str) -> RouteFact {
@@ -1698,7 +1732,7 @@ mod tests {
         let expected = fact.origin.clone();
         let run: RunResponse =
             &|_, _| -> ResponseFuture { Box::pin(async { Ok("rewritten".into()) }) };
-        let walked = walk(&graph, &fact, Presence::Away, run, &never_decides).await;
+        let walked = walk(&graph, &fact, Presence::Away, run, &never_decides, None).await;
         assert_eq!(text_of(&walked.deliveries[0].fields), "rewritten");
         assert_eq!(fact.origin, expected);
     }
@@ -1806,6 +1840,7 @@ mod tests {
             Presence::Away,
             &no_response(),
             &decide,
+            None,
         )
         .await;
         assert!(walked.unrouted.is_empty());
@@ -1881,6 +1916,7 @@ mod tests {
                 Presence::Away,
                 &no_response(),
                 &decide,
+                None,
             )
             .await;
             assert!(
@@ -1975,6 +2011,7 @@ mod tests {
             Presence::Away,
             run,
             &never_decides,
+            None,
         )
         .await;
 
@@ -2014,6 +2051,7 @@ mod tests {
             Presence::Away,
             counted,
             &never_decides,
+            None,
         )
         .await;
         assert_eq!(walked.deliveries.len(), 2);
@@ -2054,6 +2092,7 @@ mod tests {
             Presence::Away,
             recording,
             &never_decides,
+            None,
         )
         .await;
         // The second step saw the first step's input, because the first failed.
@@ -2085,6 +2124,7 @@ mod tests {
             Presence::Away,
             run,
             &never_decides,
+            None,
         )
         .await;
         assert_eq!(walked.deliveries.len(), 1);
@@ -2145,6 +2185,7 @@ mod tests {
             RouteContext {
                 project_id: Some("p"),
                 project_path: None,
+                event: None,
             },
         )
         .await
@@ -2195,6 +2236,7 @@ mod tests {
             RouteContext {
                 project_id: Some("p"),
                 project_path: None,
+                event: None,
             },
         )
         .await
@@ -2239,6 +2281,7 @@ mod tests {
         let context = || RouteContext {
             project_id: Some("p"),
             project_path: None,
+            event: None,
         };
 
         dispatch(
@@ -2291,6 +2334,7 @@ mod tests {
         let context = || RouteContext {
             project_id: Some("p"),
             project_path: None,
+            event: None,
         };
 
         dispatch(&orch, thread_fact("update"), Presence::Away, context())
@@ -2330,6 +2374,7 @@ mod tests {
             RouteContext {
                 project_id: None,
                 project_path: None,
+                event: None,
             },
         )
         .await
@@ -2471,6 +2516,155 @@ mod tests {
                 assert_eq!(firings[0].payload_text, None);
             }
         }
+    }
+
+    /// Log `fact` as the worker would find it, in `project_id`, and return the
+    /// row's id and the URI dispatch binds as `event`.
+    async fn logged(
+        orch: &Orchestrator,
+        fact: &RouteFact,
+        project_id: Option<&str>,
+    ) -> (i64, String) {
+        let id = crate::storage::insert_fact(
+            &orch.db.local,
+            crate::storage::NewFact {
+                project_id: project_id.map(str::to_owned),
+                source: fact.source.clone(),
+                identity: fact.identity.clone(),
+                record_ref: "cairn://p/cairn/42".into(),
+                record_id: None,
+                fields_json: serde_json::to_string(&fact.fields).unwrap(),
+                summary: fact.summary.clone(),
+                presence: "away".into(),
+                actor_job_id: None,
+                origin_principal_json: None,
+                origin_appearance_json: None,
+                route_provenance: None,
+                minted_at: 1,
+            },
+            crate::storage::LogDedupe::Unique,
+        )
+        .await
+        .unwrap()
+        .expect("a fresh row");
+        let row = crate::storage::get_fact(&orch.db.local, id)
+            .await
+            .unwrap()
+            .unwrap();
+        (id, crate::routes::event_uri(orch, &row).await)
+    }
+
+    fn at_event<'a>(project_id: Option<&'a str>, id: i64, uri: &'a str) -> RouteContext<'a> {
+        RouteContext {
+            project_id,
+            project_path: None,
+            event: Some(LoggedEvent { id, uri }),
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_name_the_fact_log_row_they_deliver_for() {
+        for kind in ["message", "channel"] {
+            let temp = tempfile::tempdir().unwrap();
+            let route = body_route(kind, Some("Re {{event}}"));
+            let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
+            db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+            let fact = thread_fact("hello");
+            let (id, uri) = logged(&orch, &fact, Some("p")).await;
+            assert_eq!(uri, format!("cairn://p/cairn/events/{id}"));
+            let expected = format!("Re {uri}");
+
+            let submissions = dispatch(&orch, fact, Presence::Away, at_event(Some("p"), id, &uri))
+                .await
+                .unwrap();
+            if kind == "channel" {
+                assert_eq!(submissions.len(), 1);
+                assert_eq!(submissions[0].text, expected);
+                assert_eq!(submissions[0].fact_log_id, Some(id));
+                record_channel_outcome(&orch, &submissions[0], Ok("discord:1/2".into()))
+                    .await
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    issue_messages(&orch, 42).await,
+                    Some(format!("route:body:{expected}"))
+                );
+            }
+            let firings = crate::storage::list_firings_for_fact(&db, id)
+                .await
+                .unwrap();
+            let [firing] = firings.as_slice() else {
+                panic!("one firing joins the row: {firings:?}");
+            };
+            assert_eq!(firing.status, "fired");
+            assert_eq!(firing.payload_text.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_less_row_is_named_by_its_workspace_uri() {
+        let temp = tempfile::tempdir().unwrap();
+        let route = body_route("message", Some("Re {{event}}"));
+        let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
+        db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+        let fact = thread_fact("hello");
+        let (id, uri) = logged(&orch, &fact, None).await;
+        assert_eq!(uri, format!("cairn://routes/events/{id}"));
+        dispatch(&orch, fact, Presence::Away, at_event(None, id, &uri))
+            .await
+            .unwrap();
+        assert_eq!(
+            issue_messages(&orch, 42).await,
+            Some(format!("route:body:Re {uri}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dry_run_binds_the_sample_row_or_a_marked_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let route = body_route("message", Some("Re {{event}}"));
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+        let fact = thread_fact("hello");
+        let (id, uri) = logged(&orch, &fact, Some("p")).await;
+
+        let sampled = test_definition(
+            &orch,
+            &definition(&route),
+            fact.clone(),
+            Presence::Away,
+            at_event(Some("p"), id, &uri),
+        )
+        .await
+        .unwrap();
+        let preview = &sampled.sink_previews[0];
+        assert_eq!(preview["text"], format!("Re {uri}"));
+        assert!(preview.get("note").is_none(), "{preview}");
+
+        let rowless = test_definition(
+            &orch,
+            &definition(&route),
+            fact,
+            Presence::Away,
+            in_project(),
+        )
+        .await
+        .unwrap();
+        let preview = &rowless.sink_previews[0];
+        assert!(preview.get("dropped").is_none(), "{preview}");
+        assert_eq!(preview["text"], format!("Re {EVENT_PLACEHOLDER}"));
+        assert!(
+            preview["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("no fact log row")),
+            "{preview}"
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -2690,7 +2884,7 @@ mod tests {
         let run: RunResponse = &|_, _| -> ResponseFuture {
             Box::pin(async { Ok("transformed producer text".into()) })
         };
-        let walked = walk(&graph, &fact, Presence::Away, run, &never_decides).await;
+        let walked = walk(&graph, &fact, Presence::Away, run, &never_decides, None).await;
         assert_eq!(walked.deliveries.len(), 1);
         let delivery = &walked.deliveries[0];
         assert_eq!(
@@ -2902,6 +3096,7 @@ mod tests {
             RouteContext {
                 project_id: Some("p"),
                 project_path: None,
+                event: None,
             },
         )
         .await
@@ -2974,6 +3169,7 @@ mod tests {
         RouteContext {
             project_id: Some("p"),
             project_path: None,
+            event: None,
         }
     }
 
@@ -3184,6 +3380,77 @@ mod tests {
         assert_eq!(thread_messages, Some(2));
     }
 
+    /// A top-k fan-out delivers one body to each admitted thread, and every
+    /// copy names the same row: the event is the correlation key, not the
+    /// per-address firing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fan_out_carries_one_event_to_every_address() {
+        let route = crate::routes::definition::FIXTURE_B.replace(
+            "target: { field: answers.thread.addresses } }",
+            "target: { field: answers.thread.addresses }, body: 'Re {{event}}' }",
+        );
+        assert_ne!(route, crate::routes::definition::FIXTURE_B);
+        let (orch, _) = deciding_workspace(
+            vec![choice_reply(
+                "thread",
+                "devops",
+                &[("devops", 0.5), ("docs", 0.4), ("ui", 0.1)],
+            )],
+            &[("ambient", &route)],
+        )
+        .await;
+        orch.db
+            .local
+            .execute_batch(
+                "INSERT INTO threads(id, project_id, name, jurisdiction, status, attention, created_at, updated_at) VALUES
+                   ('t-devops', 'p', 'devops', 'How the project builds and ships.', 'active', 'none', 1, 1),
+                   ('t-docs', 'p', 'docs', 'The documentation.', 'active', 'none', 1, 1),
+                   ('t-ui', 'p', 'ui', 'The interface.', 'active', 'none', 1, 1);",
+            )
+            .await
+            .unwrap();
+        let fact = channel_fact("who owns the release?");
+        let (id, uri) = logged(&orch, &fact, Some("p")).await;
+
+        dispatch(&orch, fact, Presence::Away, at_event(Some("p"), id, &uri))
+            .await
+            .unwrap();
+
+        let delivered = orch
+            .db
+            .local
+            .query_all(
+                "SELECT content FROM messages WHERE channel_type = 'thread' AND sender_name = 'route:ambient'",
+                (),
+                |row| crate::storage::RowExt::text(row, 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delivered, vec![format!("Re {uri}"); 2]);
+        let firings: Vec<_> = crate::storage::list_firings_for_fact(&orch.db.local, id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|firing| firing.sink_kind == "message")
+            .collect();
+        let mut addresses: Vec<_> = firings
+            .iter()
+            .map(|firing| {
+                assert_eq!(firing.status, "fired");
+                assert_eq!(
+                    firing.payload_text.as_deref(),
+                    Some(format!("Re {uri}").as_str())
+                );
+                firing.sink_ref.clone().unwrap_or_default()
+            })
+            .collect();
+        addresses.sort();
+        assert_eq!(
+            addresses,
+            ["cairn://p/cairn/devops", "cairn://p/cairn/docs"]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bound_conversation_that_is_not_configured_is_dropped_as_undeliverable() {
         let route = "name: ack\ndescription: acknowledge in the conversation\nnodes:\n  - { id: inbound, type: trigger, when: { fact: channel_message } }\n  - { id: ack, type: sink, sink: { kind: channel, destination: { field: conversation } } }\nedges:\n  - { from: inbound, to: ack }\n";
@@ -3284,6 +3551,7 @@ mod tests {
             RouteContext {
                 project_id: Some("p"),
                 project_path: None,
+                event: None,
             },
         )
         .await

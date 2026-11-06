@@ -633,6 +633,9 @@ impl Default for FactRegistry {
         .into_iter()
         .enumerate()
         .map(|(order, (fact, mut spec))| {
+            if let Some(problem) = source_fields_problem(fact, &spec) {
+                panic!("{problem}");
+            }
             for (source, field, address) in ADDRESS_FIELDS {
                 if *source == fact {
                     if let Some(spec) = spec.fields.get_mut(field) {
@@ -857,6 +860,22 @@ fn clause_matches(clause: &BTreeMap<String, Value>, fact: &Fact<'_>) -> bool {
 /// The prefix every decision answer field carries (`answers.<question>.<key>`).
 /// Registry fields never contain a dot, so the two can never collide.
 pub const ANSWERS_PREFIX: &str = "answers.";
+
+/// The field every node of a log-driven dispatch reads as the URI of the fact
+/// log row it acts on, whatever the source. Dispatch binds it, so no source may
+/// declare it: see [`source_fields_problem`].
+pub const EVENT_FIELD: &str = "event";
+
+/// Why a trigger source's declared fields cannot stand, if they cannot. A
+/// declared `event` would shadow, or be shadowed by, the row URI dispatch binds
+/// under that name, so a body naming `{{event}}` would be ambiguous.
+pub(crate) fn source_fields_problem(source: &str, spec: &SourceSpec) -> Option<String> {
+    spec.fields.contains_key(EVENT_FIELD).then(|| {
+        format!(
+            "fact source '{source}' declares a field named '{EVENT_FIELD}', which dispatch reserves for the fact log row's URI"
+        )
+    })
+}
 
 /// The comparison operators a clause value may use, as an operator object on
 /// the value side (`confidence: { gte: 0.2, lt: 0.6 }`). Several in one object
@@ -1472,6 +1491,27 @@ mod tests {
             explain("{ fact: file_changed, pathPrefix: src/ }", None).is_empty(),
             "a route carries no thread scope"
         );
+    }
+
+    #[test]
+    fn no_source_may_declare_the_field_dispatch_binds_as_event() {
+        let registry = FactRegistry::default();
+        for name in registry.source_names() {
+            assert!(!registry.source_has_field(name, EVENT_FIELD), "{name}");
+        }
+        let mut spec = registry.source("thread_stream").unwrap().clone();
+        assert_eq!(source_fields_problem("thread_stream", &spec), None);
+        spec.fields.insert(
+            EVENT_FIELD,
+            FieldSpec {
+                kind: FieldKind::Scalar,
+                address: None,
+                stored: true,
+            },
+        );
+        assert!(source_fields_problem("thread_stream", &spec)
+            .unwrap()
+            .contains("reserves for the fact log row's URI"));
     }
 
     #[test]

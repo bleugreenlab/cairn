@@ -289,6 +289,12 @@ pub(crate) fn fact_row_uri(project_key: Option<&str>, id: i64) -> String {
     }
 }
 
+/// The canonical URI of one fact log row, attributed to the row's project:
+/// what dispatch binds as [`EVENT_FIELD`](super::EVENT_FIELD).
+pub async fn event_uri(orch: &Orchestrator, row: &FactRow) -> String {
+    fact_row_uri(project_key(orch, row).await.as_deref(), row.id)
+}
+
 pub(crate) async fn project_key(orch: &Orchestrator, row: &FactRow) -> Option<String> {
     let project_id = row.project_id.clone()?;
     orch.db
@@ -847,6 +853,7 @@ async fn run_route_row(
     // The submissions live outside the timed future: a timeout cancels the
     // route that hung, not the deliveries the routes before it prepared.
     let mut submissions = Vec::new();
+    let event = event_uri(orch, &row).await;
     let result = tokio::time::timeout(
         timeout,
         super::dispatcher::dispatch_row(
@@ -856,9 +863,12 @@ async fn run_route_row(
             RouteContext {
                 project_id: row.project_id.as_deref(),
                 project_path: path.as_deref(),
+                event: Some(super::LoggedEvent {
+                    id: row.id,
+                    uri: &event,
+                }),
             },
             &routes,
-            Some(row.id),
             &mut submissions,
         ),
     )
