@@ -350,9 +350,9 @@ pub(super) struct ResolvedResourceProfile {
     /// hold the work, and to say so when none can.
     pub memory_fit: MemoryFit,
     /// The largest single process this work is known to hold, which placement
-    /// judges against what each machine can give one process. `None` when
-    /// nothing has measured it.
-    pub process_demand: Option<ProcessDemand>,
+    /// judges against what each machine can give one process, and any larger
+    /// peak that names no process.
+    pub process_evidence: ProcessEvidence,
 }
 
 /// The largest single process a request's work is known to hold, and where
@@ -408,6 +408,36 @@ impl ProcessDemand {
     }
 }
 
+/// What is known about one process of a request's work, split by whether it
+/// can be judged as one process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ProcessEvidence {
+    /// The largest single process measured: a peak the sampler named, or an
+    /// out-of-memory victim, which is one process by construction. Carries
+    /// this machine's kills of the suite.
+    pub demand: Option<ProcessDemand>,
+    /// The largest peak recorded with no process named. The macOS sampler
+    /// attributes no peak to one process, so what it records is the process
+    /// tree's, which grows with build width; it may inform a reservation but
+    /// never the single-process fit. Kept so placement can say what it
+    /// declined to judge.
+    pub unattributed: Option<ProcessDemand>,
+}
+
+impl ProcessEvidence {
+    /// A batch's evidence: the heaviest item on each side.
+    pub(super) fn max(left: Self, right: Self) -> Self {
+        Self {
+            demand: ProcessDemand::max(left.demand, right.demand),
+            unattributed: ProcessDemand::max(left.unattributed, right.unattributed),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.demand.is_none() && self.unattributed.is_none()
+    }
+}
+
 /// The key a suite's evidence is learned under: a configured check's name,
 /// else the command class, within the project. `None` for an unclassified
 /// command, which is exactly the case nothing is known about: learning one
@@ -449,18 +479,24 @@ fn suite_display(suite_key: &str) -> String {
 /// whole closure. A command-class suite only stands in for an identity that
 /// has measured nothing, since a class spans unrelated commands, and an
 /// identity measured once on any machine then speaks for itself.
+///
+/// A peak with no process named is never a single-process demand: the macOS
+/// sampler cannot attribute its peak to one process, so the number it records
+/// is the tree's, and judging it as one process refused the only macOS machine
+/// a suite it had just completed there (cairn/6310). Such a peak is returned
+/// as `unattributed`, for the reservation and the record; pricing a borrowed
+/// tree peak is cairn/6263's.
 pub(super) async fn resolve_process_demand(
     db: Arc<LocalDb>,
     identity: Option<&CommandResourceIdentity>,
     suite_key: Option<&str>,
     context: &ProfileContext,
-) -> Option<ProcessDemand> {
+) -> ProcessEvidence {
     let own = match identity {
         Some(identity) => load_identity_process_peak(db.clone(), identity, context)
             .await
-            .ok()
-            .flatten(),
-        None => None,
+            .unwrap_or_default(),
+        None => ProcessEvidence::default(),
     };
     let suite = match suite_key {
         Some(key) => load_suite_evidence(db, key, context).await.ok().flatten(),
@@ -468,7 +504,7 @@ pub(super) async fn resolve_process_demand(
     };
     let class_suite =
         suite_key.is_some_and(|key| suite_display(key).starts_with(CLASS_SUITE_PREFIX));
-    let suite_applies = !class_suite || own.is_none();
+    let suite_applies = !class_suite || own.is_empty();
     let kills_here = suite.as_ref().and_then(|suite| suite.kills_here);
     let suite_peak = suite
         .filter(|_| suite_applies)
@@ -480,7 +516,14 @@ pub(super) async fn resolve_process_demand(
             measured_on: Some(measured_on),
             kills_here: None,
         });
-    let mut demand = ProcessDemand::max(own, suite_peak);
+    // The suite's row keeps one peak, a measurement or a victim, with its
+    // name; unnamed, it cannot be told from a tree's total, so it is one.
+    let (suite_named, suite_unattributed) = match suite_peak {
+        Some(peak) if peak.name.is_some() => (Some(peak), None),
+        unattributed => (None, unattributed),
+    };
+    let unattributed = ProcessDemand::max(own.unattributed, suite_unattributed);
+    let mut demand = ProcessDemand::max(own.demand, suite_named);
     match (&mut demand, kills_here) {
         (Some(demand), kills) => demand.kills_here = kills,
         (None, Some(kills)) => {
@@ -494,7 +537,10 @@ pub(super) async fn resolve_process_demand(
         }
         (None, None) => {}
     }
-    demand
+    ProcessEvidence {
+        demand,
+        unattributed,
+    }
 }
 
 /// What one suite has measured on this platform: its largest process, with
@@ -508,7 +554,7 @@ async fn load_identity_process_peak(
     db: Arc<LocalDb>,
     identity: &CommandResourceIdentity,
     context: &ProfileContext,
-) -> Result<Option<ProcessDemand>, String> {
+) -> Result<ProcessEvidence, String> {
     let identity = identity.clone();
     let context = context.clone();
     db.read(|conn| {
@@ -523,25 +569,36 @@ async fn load_identity_process_peak(
                     params![identity.version as i64, identity.key, context.os, context.arch],
                 )
                 .await?;
-            let mut largest: Option<ProcessDemand> = None;
+            let mut evidence = ProcessEvidence::default();
             while let Some(row) = rows.next().await? {
+                let measured_on = row.get::<String>(0)?;
                 let measured = row.get::<Option<i64>>(1)?.map(|value| value as u64);
+                let name = row.get::<Option<String>>(2)?;
                 let victim = row.get::<Option<i64>>(3)?.map(|value| value as u64);
-                let Some(peak) = measured.max(victim) else {
-                    continue;
+                let at = |peak_bytes, name| {
+                    Some(ProcessDemand {
+                        peak_bytes,
+                        name,
+                        suite: None,
+                        measured_on: Some(measured_on.clone()),
+                        kills_here: None,
+                    })
                 };
-                if largest.as_ref().is_some_and(|held| held.peak_bytes >= peak) {
-                    continue;
+                // A victim is one process whether or not it was named; a
+                // measured peak is one only when its process was.
+                let (single, unattributed) = match name {
+                    Some(_) => (measured.max(victim), None),
+                    None => (victim, measured),
+                };
+                if let Some(peak) = single {
+                    evidence.demand = ProcessDemand::max(evidence.demand, at(peak, name));
                 }
-                largest = Some(ProcessDemand {
-                    peak_bytes: peak,
-                    name: row.get::<Option<String>>(2)?,
-                    suite: None,
-                    measured_on: Some(row.get::<String>(0)?),
-                    kills_here: None,
-                });
+                if let Some(peak) = unattributed {
+                    evidence.unattributed =
+                        ProcessDemand::max(evidence.unattributed, at(peak, None));
+                }
             }
-            Ok(largest)
+            Ok(evidence)
         })
     })
     .await
@@ -1181,7 +1238,7 @@ pub(super) async fn resolve_reservation(
             duration,
             item_durations: Vec::new(),
             memory_fit: MemoryFit::Unknown,
-            process_demand: None,
+            process_evidence: ProcessEvidence::default(),
         };
     };
     // A store that could not be read and a work class that has never run are
@@ -1218,7 +1275,7 @@ pub(super) async fn resolve_reservation(
     // any large machine's size and refused both Sparks a lane that peaked at
     // 15 GiB (cairn/6089). Whether this machine can hold the work at all is
     // the largest single process's question, which placement asks of
-    // `process_demand`; the tree's fit here speaks only for a peak this
+    // `process_evidence`; the tree's fit here speaks only for a peak this
     // machine measured itself, at the width it grants.
     let fit_for = |demand: Option<u64>| MemoryFit::of(demand, memory_budget_bytes);
     // The prior is settled before anything explains itself, so every rationale
@@ -1247,7 +1304,7 @@ pub(super) async fn resolve_reservation(
                 duration,
                 item_durations: Vec::new(),
                 memory_fit: MemoryFit::Unknown,
-                process_demand: None,
+                process_evidence: ProcessEvidence::default(),
             }
         }
         Err(_) => {
@@ -1258,7 +1315,7 @@ pub(super) async fn resolve_reservation(
                 duration,
                 item_durations: Vec::new(),
                 memory_fit: MemoryFit::Unknown,
-                process_demand: None,
+                process_evidence: ProcessEvidence::default(),
             }
         }
     };
@@ -1301,7 +1358,7 @@ pub(super) async fn resolve_reservation(
         // this machine's saturation, so it says nothing about fit and leaves
         // it unknown.
         memory_fit: fit_for(measured_memory_demand(&profile, memory_quarantined)),
-        process_demand: None,
+        process_evidence: ProcessEvidence::default(),
     };
     floored_by_kill(resolved, profile.memory_kill, memory_budget_bytes)
 }
@@ -2134,6 +2191,7 @@ mod process_peak_tests {
         }
         let demand = resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &fedora)
             .await
+            .demand
             .unwrap();
         assert_eq!(demand.peak_bytes, 10 * GIB);
         assert_eq!(demand.name.as_deref(), Some("rustc"));
@@ -2165,6 +2223,7 @@ mod process_peak_tests {
             &context("bgsrv-ub-device:bgsrv-ub"),
         )
         .await
+        .demand
         .unwrap();
         assert_eq!(demand.peak_bytes, 10 * GIB);
         assert_eq!(demand.suite.as_deref(), Some("rust-tests"));
@@ -2175,7 +2234,7 @@ mod process_peak_tests {
         };
         assert_eq!(
             resolve_process_demand(db, Some(&unseen), suite.as_deref(), &mac).await,
-            None,
+            ProcessEvidence::default(),
             "another platform's compiler says nothing here"
         );
     }
@@ -2200,6 +2259,7 @@ mod process_peak_tests {
         assert_eq!(
             resolve_process_demand(db.clone(), None, class.as_deref(), &fedora)
                 .await
+                .demand
                 .map(|demand| demand.peak_bytes),
             Some(10 * GIB),
             "an agent's batch has no identity, and its class speaks for it"
@@ -2219,6 +2279,7 @@ mod process_peak_tests {
         assert_eq!(
             resolve_process_demand(db, Some(&small), class.as_deref(), &fedora)
                 .await
+                .demand
                 .map(|demand| demand.peak_bytes),
             Some(GIB)
         );
@@ -2252,6 +2313,7 @@ mod process_peak_tests {
         }
         let demand = resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &ub)
             .await
+            .demand
             .unwrap();
         assert_eq!(demand.kills_here, Some((2, total)));
         assert_eq!(demand.peak_bytes, 3 * GIB);
@@ -2265,9 +2327,64 @@ mod process_peak_tests {
         .await;
         let demand = resolve_process_demand(db, Some(&id), suite.as_deref(), &ub)
             .await
+            .demand
             .unwrap();
         assert_eq!(demand.kills_here, Some((1, 2 * total)));
         assert_eq!(demand.peak_bytes, 3 * GIB, "the largest victim stands");
+    }
+
+    /// cairn/6310's specimen: the macOS sampler names no process, so the
+    /// 15.6 GiB it recorded for a whole suite is the tree's, and it is never
+    /// a single-process demand, from the identity's row or the suite's. The
+    /// same holds for an unnamed peak on Linux: the rule is about the
+    /// measurement, not the platform.
+    #[tokio::test]
+    async fn an_unnamed_peak_is_unattributed_never_a_single_process() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-unnamed.db").await);
+        let peak = 16_751_935_488;
+        let unnamed = CellExecutionMeta {
+            peak_process: Some(PeakProcess {
+                bytes: peak,
+                name: None,
+            }),
+            ..completed(peak, 1)
+        };
+        for host in [
+            ProfileContext {
+                os: "macos".into(),
+                arch: "aarch64".into(),
+                ..context("bgsrv-mac-device:bgsrv-mac")
+            },
+            context("fedora:fedora"),
+        ] {
+            let id = identity("rust-tests-whole");
+            let suite = suite_key("cairn", Some(&id), CellCommandClass::CargoTest);
+            observe_suite(
+                db.clone(),
+                suite.as_deref(),
+                &host,
+                &unnamed,
+                CompletionKind::Succeeded,
+            )
+            .await;
+            observe_completed(
+                db.clone(),
+                Some(&id),
+                &host,
+                &unnamed,
+                CompletionKind::Succeeded,
+            )
+            .await;
+            let evidence =
+                resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &host).await;
+            assert_eq!(evidence.demand, None, "{}: no single process", host.os);
+            let tree = evidence.unattributed.expect("the tree's peak is kept");
+            assert_eq!(tree.peak_bytes, peak);
+            assert_eq!(
+                tree.measured_on.as_deref(),
+                Some(host.executor_class.as_str())
+            );
+        }
     }
 }
 

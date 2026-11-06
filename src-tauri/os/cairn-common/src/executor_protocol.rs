@@ -7000,6 +7000,15 @@ pub struct LearnedResourceEstimate {
 /// nothing; that executor contributes no process peak and no standing use, so
 /// its fit falls back to the reservation cap, which is no worse than before.
 ///
+/// cairn/6310 does not move the number. It adds two omitted-when-absent
+/// fields an older peer neither sends nor reads: `measuredBytes` on
+/// [`ProcessMisfit`] and [`PlacementSelection::process_fit_waived`], with its
+/// new [`ProcessFitWaiver`]. Both are runner placement vocabulary under
+/// cairn/4931's argument: nothing the runner sends an executor carries them.
+/// The single-process fit now ignores an unnamed peak and stands down on a
+/// platform with no kernel memory killer, which is runner-local placement.
+/// What a runner gets wrong talking to an older executor: nothing.
+///
 /// Version 166 (cairn/6139) preserves Unix resident PTY signal deaths in the
 /// existing exit-code field as `128 + signal`, leaving normal exit codes intact.
 /// An older executor sends 1 for SIGKILL or SIGTERM, so a runner would mistake
@@ -16034,6 +16043,11 @@ pub struct PlacementSelection {
     /// not the demand, and this is what says so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_ceiling: Option<MemoryCeiling>,
+    /// Present when the single-process fit would have refused this machine
+    /// and did not, with the refusal it would have made and why it stood
+    /// down. See [`ProcessFitWaiver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_fit_waived: Option<ProcessFitWaiver>,
 }
 
 /// Why this machine, in words that distinguish a measured win from the absence
@@ -17108,6 +17122,10 @@ impl MemoryKill {
 pub struct ProcessMisfit {
     /// The demand, with headroom.
     pub process_bytes: u64,
+    /// The measurement the demand was priced from, before headroom. `None`
+    /// on a record from before it was kept, and when only kills decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
     /// The suite whose evidence set the demand, when the suite's did rather
@@ -17140,12 +17158,22 @@ impl ProcessMisfit {
         if let Some(suite) = &self.suite {
             evidence.push(format!("suite {suite}"));
         }
+        // The measurement and the headroom added to it, so a reader can tell
+        // what a machine measured from what placement charged for it.
+        let (measured, headroom) = match self.measured_bytes.filter(|bytes| *bytes > 0) {
+            Some(bytes) => (
+                format!("{} ", describe_gib(bytes)),
+                format!(" x {} headroom", measured_headroom_factor()),
+            ),
+            None => (String::new(), String::new()),
+        };
         match (&self.measured_on, self.measured_here) {
-            (_, true) => evidence.push("measured here".into()),
-            (Some(machine), false) => {
-                evidence.push(format!("measured on {machine}; estimated here"))
-            }
-            (None, false) => evidence.push("estimated here".into()),
+            (_, true) => evidence.push(format!("{measured}measured here{headroom}")),
+            (Some(machine), false) => evidence.push(format!(
+                "{measured}measured on {machine}{headroom}; estimated here"
+            )),
+            (None, false) if measured.is_empty() => evidence.push("estimated here".into()),
+            (None, false) => evidence.push(format!("{measured}measured{headroom}; estimated here")),
         }
         let capacity = match self.standing_bytes {
             Some(standing) => format!(
@@ -17172,6 +17200,60 @@ impl ProcessMisfit {
             ),
             None => format!("{demand}; {capacity}"),
         }
+    }
+}
+
+/// [`MEASURED_RESERVATION_HEADROOM_PERCENT`] as the factor a measurement is
+/// multiplied by: `1.25` for 25%.
+fn measured_headroom_factor() -> String {
+    let percent = 100 + MEASURED_RESERVATION_HEADROOM_PERCENT;
+    format!("{}.{:02}", percent / 100, percent % 100)
+}
+
+/// Why a machine the single-process fit would have refused was offered the
+/// work anyway. The fit is a filter only where its two premises hold: the
+/// demand is one process's measured size, and the machine's kernel kills a
+/// process too large for it. Where either fails, the refusal it would have
+/// made is kept here and the work is offered at its reservation, priced like
+/// any other demand larger than a machine holds, rather than withheld.
+///
+/// Runner placement vocabulary like [`ProcessMisfit`]: nothing the runner
+/// sends an executor carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessFitWaiver {
+    /// The refusal the fit would have made.
+    pub misfit: ProcessMisfit,
+    pub reason: ProcessFitWaiverReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessFitWaiverReason {
+    /// The peak names no process. A sampler that cannot attribute a peak to
+    /// one process (macOS's) records the process tree's, which grows with
+    /// build width and says nothing about the largest single process.
+    UnattributedPeak,
+    /// The platform has no kernel memory killer (macOS): a process larger
+    /// than the machine is slowed by compression and swap, never killed, so
+    /// its size is a cost to price, not a death to prevent.
+    NoMemoryKiller,
+}
+
+impl ProcessFitWaiver {
+    pub fn describe(&self) -> String {
+        let why = match self.reason {
+            ProcessFitWaiverReason::UnattributedPeak => {
+                "no process was named for that peak, so it is a process tree's total rather than one process's size"
+            }
+            ProcessFitWaiverReason::NoMemoryKiller => {
+                "this platform has no kernel memory killer, so an oversized process is slowed by compression and swap rather than killed"
+            }
+        };
+        format!(
+            "not refused for one process's size, which would have read: {}; {why}. Offered at its reservation and priced instead",
+            self.misfit.describe()
+        )
     }
 }
 
@@ -21397,6 +21479,7 @@ mod tests {
                 cache_distance: None,
                 prediction: None,
                 memory_ceiling: None,
+                process_fit_waived: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,

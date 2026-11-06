@@ -10192,11 +10192,13 @@ impl Fleet {
             None,
             cairn_common::executor_protocol::CellCommandClass::classify(command),
         )?;
-        let demand =
-            resource_profiles::resolve_process_demand(db, None, Some(&suite), &context).await?;
+        let evidence =
+            resource_profiles::resolve_process_demand(db, None, Some(&suite), &context).await;
         let connections = self.lock_connections();
         let entry = connections.get(&selected.executor_id)?;
-        let reason = process_misfit(&demand, entry)?;
+        let ProcessFit::Refused(reason) = process_fit(&evidence, entry)? else {
+            return None;
+        };
         Some(format!(
             "{} cannot run this terminal's command: {}. Nothing was started; run the command as a batch, which placement sends to a machine that can hold it, or start the terminal on such a machine.",
             executor_public_name(entry),
@@ -16141,17 +16143,37 @@ fn excluded_by_memory_kill(reason: &PlacementRejectionReason) -> bool {
 /// is the machine's answer. A constant, not a setting.
 const KILLS_THAT_END_FIT: u32 = 2;
 
+/// What the single-process fit concluded on one machine, when it concluded
+/// anything but "fits".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessFit {
+    /// Not offered the work: a filter, never a clamp.
+    Refused(PlacementRejectionReason),
+    /// The fit would have refused, but one of its premises does not hold
+    /// here; offered at its reservation, with the refusal on the record.
+    Waived(cairn_common::executor_protocol::ProcessFitWaiver),
+}
+
+/// Whether this platform's kernel kills a process the machine cannot hold.
+/// Linux's OOM killer does, and Windows fails the allocation, which ends the
+/// compiler as surely. macOS has none: it compresses and swaps, so an
+/// oversized process is slowed, never killed, and its size is a price
+/// (tenets 1309, 1139), not a reason to withhold the machine.
+fn kernel_kills_for_memory(os: &str) -> bool {
+    os != "macos"
+}
+
 /// Whether one process of this work is larger than this machine can give a
 /// single process: its total memory less its standing use, or, from an
 /// executor that posts no standing use, its reservation cap. Never `available`
 /// at this instant, which says what is free now rather than what the machine
 /// can hold. `None` when it fits, or when the machine's total is unread.
-fn process_misfit(
-    demand: &resource_profiles::ProcessDemand,
+fn process_fit(
+    evidence: &resource_profiles::ProcessEvidence,
     entry: &ExecutorConnectionState,
-) -> Option<PlacementRejectionReason> {
-    judge_process_fit(
-        demand,
+) -> Option<ProcessFit> {
+    judge_process_evidence(
+        evidence,
         entry.health.machine.memory.value()?.total_bytes,
         entry.health.memory_record.standing_bytes,
         entry.advertisement.capabilities.memory_budget_bytes,
@@ -16159,18 +16181,61 @@ fn process_misfit(
             "{}:{}",
             entry.identity.device_id, entry.identity.executor_id
         ),
+        kernel_kills_for_memory(&entry.advertisement.capabilities.os),
     )
 }
 
-/// [`process_misfit`] over the machine's numbers: its total, its standing
-/// use, its memory budget, and its profile context (`device:executor`).
+/// [`process_fit`] over the machine's numbers: its total, its standing use,
+/// its memory budget, its profile context (`device:executor`), and whether
+/// its kernel kills for memory.
+///
+/// The fit refuses only where both its premises hold: a single process was
+/// measured (a named peak, or a kill's victim), and the kernel here would kill
+/// it. A named demand on a platform that cannot kill, or an unnamed peak that
+/// would have misfit anywhere, is waived with the refusal kept for the record.
+fn judge_process_evidence(
+    evidence: &resource_profiles::ProcessEvidence,
+    total_bytes: u64,
+    standing_bytes: Option<u64>,
+    memory_budget_bytes: Option<u64>,
+    here: &str,
+    kernel_kills: bool,
+) -> Option<ProcessFit> {
+    use cairn_common::executor_protocol::{ProcessFitWaiver, ProcessFitWaiverReason};
+    let judge = |demand: &resource_profiles::ProcessDemand| {
+        judge_process_fit(
+            demand,
+            total_bytes,
+            standing_bytes,
+            memory_budget_bytes,
+            here,
+        )
+    };
+    if let Some(misfit) = evidence.demand.as_ref().and_then(judge) {
+        return Some(match kernel_kills {
+            true => ProcessFit::Refused(PlacementRejectionReason::ProcessTooLarge(misfit)),
+            false => ProcessFit::Waived(ProcessFitWaiver {
+                misfit,
+                reason: ProcessFitWaiverReason::NoMemoryKiller,
+            }),
+        });
+    }
+    let misfit = evidence.unattributed.as_ref().and_then(judge)?;
+    Some(ProcessFit::Waived(ProcessFitWaiver {
+        misfit,
+        reason: ProcessFitWaiverReason::UnattributedPeak,
+    }))
+}
+
+/// One measured demand against the machine's numbers, whatever the platform:
+/// the misfit the fit would name, or `None` when the process fits.
 fn judge_process_fit(
     demand: &resource_profiles::ProcessDemand,
     total_bytes: u64,
     standing_bytes: Option<u64>,
     memory_budget_bytes: Option<u64>,
     here: &str,
-) -> Option<PlacementRejectionReason> {
+) -> Option<cairn_common::executor_protocol::ProcessMisfit> {
     let capacity_bytes = match (standing_bytes, memory_budget_bytes) {
         (Some(standing), _) => total_bytes.saturating_sub(standing),
         (None, Some(budget)) => resource_profiles::memory_reservation_cap(budget),
@@ -16184,27 +16249,26 @@ fn judge_process_fit(
     if !too_large && killed_out.is_none() {
         return None;
     }
-    Some(PlacementRejectionReason::ProcessTooLarge(
-        cairn_common::executor_protocol::ProcessMisfit {
-            process_bytes: demand.demand_bytes(),
-            process_name: demand.name.clone(),
-            suite: demand.suite.clone(),
-            measured_on: demand.measured_on.as_deref().map(|context| {
-                context
-                    .rsplit_once(':')
-                    .map_or(context, |(_, executor)| executor)
-                    .to_string()
-            }),
-            measured_here: demand.measured_on.as_deref() == Some(here),
-            capacity_bytes,
-            total_bytes,
-            standing_bytes,
-            kills_here: (!too_large)
-                .then_some(killed_out)
-                .flatten()
-                .map(|(count, _)| count),
-        },
-    ))
+    Some(cairn_common::executor_protocol::ProcessMisfit {
+        process_bytes: demand.demand_bytes(),
+        measured_bytes: (demand.peak_bytes > 0).then_some(demand.peak_bytes),
+        process_name: demand.name.clone(),
+        suite: demand.suite.clone(),
+        measured_on: demand.measured_on.as_deref().map(|context| {
+            context
+                .rsplit_once(':')
+                .map_or(context, |(_, executor)| executor)
+                .to_string()
+        }),
+        measured_here: demand.measured_on.as_deref() == Some(here),
+        capacity_bytes,
+        total_bytes,
+        standing_bytes,
+        kills_here: (!too_large)
+            .then_some(killed_out)
+            .flatten()
+            .map(|(count, _)| count),
+    })
 }
 
 /// The machines a pass passed over because the work cannot run there, each
@@ -16296,6 +16360,34 @@ mod process_fit_tests {
         }
     }
 
+    /// The fit of a single named demand on a platform whose kernel kills: a
+    /// refusal, or nothing.
+    fn refuse(
+        demand: &resource_profiles::ProcessDemand,
+        total_bytes: u64,
+        standing_bytes: Option<u64>,
+        memory_budget_bytes: Option<u64>,
+        here: &str,
+    ) -> Option<PlacementRejectionReason> {
+        let evidence = resource_profiles::ProcessEvidence {
+            demand: Some(demand.clone()),
+            unattributed: None,
+        };
+        match judge_process_evidence(
+            &evidence,
+            total_bytes,
+            standing_bytes,
+            memory_budget_bytes,
+            here,
+            true,
+        )? {
+            ProcessFit::Refused(reason) => Some(reason),
+            ProcessFit::Waived(waiver) => {
+                panic!("a named demand on Linux is never waived: {waiver:?}")
+            }
+        }
+    }
+
     /// The issue's test: a learned 10 GiB process is not offered to a 12 GiB
     /// machine with 2.7 GiB standing, is offered to a 125 GiB one, and the
     /// record names the process, the suite, where it was measured, and that
@@ -16303,7 +16395,7 @@ mod process_fit_tests {
     #[test]
     fn a_ten_gib_process_fits_a_large_machine_and_not_a_small_one() {
         let demand = rustc(10 * GIB, None);
-        let reason = judge_process_fit(
+        let reason = refuse(
             &demand,
             13 * GIB,
             Some(2 * GIB + 7 * GIB / 10),
@@ -16313,12 +16405,12 @@ mod process_fit_tests {
         .expect("refused on the small machine");
         let text = reason.describe();
         assert!(
-            text.starts_with("needs one process of ~12.5 GiB (rustc, suite rust-tests, measured on bgsrv-ub2; estimated here); this machine can give one process 10.3 GiB (13.0 GiB total, 2.7 GiB standing)"),
+            text.starts_with("needs one process of ~12.5 GiB (rustc, suite rust-tests, 10.0 GiB measured on bgsrv-ub2 x 1.25 headroom; estimated here); this machine can give one process 10.3 GiB (13.0 GiB total, 2.7 GiB standing)"),
             "{text}"
         );
         assert!(excluded_by_memory_kill(&reason), "a filter, never a clamp");
         assert_eq!(
-            judge_process_fit(
+            refuse(
                 &demand,
                 125 * GIB,
                 Some(6 * GIB),
@@ -16333,7 +16425,7 @@ mod process_fit_tests {
     /// reservation cap, which is no more permissive than before.
     #[test]
     fn without_standing_use_the_cap_is_the_capacity() {
-        let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) = judge_process_fit(
+        let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) = refuse(
             &rustc(7 * GIB, None),
             13 * GIB,
             None,
@@ -16356,12 +16448,9 @@ mod process_fit_tests {
         let total = 13 * GIB;
         let small = |kills| rustc(2 * GIB, Some((kills, total)));
         let here = "bgsrv-ub-device:bgsrv-ub";
-        assert_eq!(
-            judge_process_fit(&small(1), total, Some(GIB), None, here),
-            None
-        );
+        assert_eq!(refuse(&small(1), total, Some(GIB), None, here), None);
         let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) =
-            judge_process_fit(&small(2), total, Some(GIB), None, here)
+            refuse(&small(2), total, Some(GIB), None, here)
         else {
             panic!("two kills end fit");
         };
@@ -16370,9 +16459,103 @@ mod process_fit_tests {
             .describe()
             .contains("killed it here for memory 2 times"));
         assert_eq!(
-            judge_process_fit(&small(2), 32 * GIB, Some(GIB), None, here),
+            refuse(&small(2), 32 * GIB, Some(GIB), None, here),
             None,
             "a machine with more memory is a new machine"
+        );
+    }
+
+    /// cairn/6310's specimen: bgsrv-mac's only evidence for the whole suite
+    /// is the 15.6 GiB its sampler recorded with no process named, against a
+    /// 15.3 GiB cap. It is offered the suite, and the record keeps the
+    /// refusal it would have made, with its arithmetic, and why it did not.
+    /// The same unnamed peak on Linux is waived the same way: the rule is
+    /// about the measurement, not the platform.
+    #[test]
+    fn an_unnamed_peak_is_waived_on_any_platform_with_its_arithmetic_shown() {
+        let here = "bgsrv-mac-device:bgsrv-mac";
+        let evidence = resource_profiles::ProcessEvidence {
+            demand: None,
+            unattributed: Some(resource_profiles::ProcessDemand {
+                peak_bytes: 16_751_935_488,
+                name: None,
+                suite: Some("rust-tests".into()),
+                measured_on: Some(here.into()),
+                kills_here: None,
+            }),
+        };
+        let budget = Some(24 * GIB / 100 * 85);
+        for kernel_kills in [false, true] {
+            let Some(ProcessFit::Waived(waiver)) =
+                judge_process_evidence(&evidence, 24 * GIB, None, budget, here, kernel_kills)
+            else {
+                panic!("an unnamed peak never refuses (kernel kills: {kernel_kills})");
+            };
+            assert_eq!(
+                waiver.reason,
+                cairn_common::executor_protocol::ProcessFitWaiverReason::UnattributedPeak
+            );
+            let text = waiver.describe();
+            assert!(
+                text.contains("needs one process of ~19.5 GiB (suite rust-tests, 15.6 GiB measured here x 1.25 headroom); this machine can give one process 15.3 GiB (24.0 GiB total; its standing use is unmeasured"),
+                "{text}"
+            );
+            assert!(
+                text.contains("no process was named for that peak"),
+                "{text}"
+            );
+        }
+    }
+
+    /// A named process too large for the machine is refused where the kernel
+    /// kills and waived where it cannot: macOS slows it, never kills it.
+    #[test]
+    fn a_named_misfit_is_waived_only_where_nothing_kills() {
+        let evidence = resource_profiles::ProcessEvidence {
+            demand: Some(rustc(10 * GIB, None)),
+            unattributed: None,
+        };
+        let judge = |kernel_kills| {
+            judge_process_evidence(
+                &evidence,
+                13 * GIB,
+                Some(2 * GIB),
+                None,
+                "m-device:m",
+                kernel_kills,
+            )
+        };
+        assert!(matches!(
+            judge(true),
+            Some(ProcessFit::Refused(
+                PlacementRejectionReason::ProcessTooLarge(_)
+            ))
+        ));
+        let Some(ProcessFit::Waived(waiver)) = judge(false) else {
+            panic!("no kernel memory killer, no refusal");
+        };
+        assert_eq!(
+            waiver.reason,
+            cairn_common::executor_protocol::ProcessFitWaiverReason::NoMemoryKiller
+        );
+        assert!(!kernel_kills_for_memory("macos"));
+        assert!(kernel_kills_for_memory("linux"));
+    }
+
+    /// A named demand that fits keeps an unnamed, larger peak from being
+    /// judged as one process, and an unnamed peak that fits says nothing.
+    #[test]
+    fn a_fitting_unnamed_peak_leaves_no_record() {
+        let evidence = resource_profiles::ProcessEvidence {
+            demand: Some(rustc(GIB, None)),
+            unattributed: Some(resource_profiles::ProcessDemand {
+                name: None,
+                ..rustc(2 * GIB, None)
+            }),
+        };
+        assert_eq!(
+            judge_process_evidence(&evidence, 13 * GIB, Some(GIB), None, "m-device:m", true),
+            None
         );
     }
 
@@ -16382,7 +16565,7 @@ mod process_fit_tests {
             measured_on: Some("bgsrv-ub-device:bgsrv-ub".into()),
             ..rustc(10 * GIB, None)
         };
-        let reason = judge_process_fit(
+        let reason = refuse(
             &demand,
             13 * GIB,
             Some(GIB),
@@ -16909,6 +17092,7 @@ fn rank_survey(
         memory_ceiling: winner
             .reservation
             .and_then(|resolved| resolved.memory_fit.ceiling()),
+        process_fit_waived: winner.process_fit_waived.clone(),
         cache_distance: winner.cache_distance.map(|distance| {
             cairn_common::cache_distance::MeasuredDistance {
                 target_commit: request.base_commit.clone(),
@@ -16970,6 +17154,9 @@ struct ScoredCandidate<'a> {
     /// else of Cairn's ran beside it. Unlike `over_ceiling` it is a filter, not
     /// a ranking key: such a machine is never selected, not even at the clamp.
     excluded: Option<PlacementRejectionReason>,
+    /// The single-process refusal this machine would have met and did not,
+    /// and why; carried onto the record if it wins.
+    process_fit_waived: Option<cairn_common::executor_protocol::ProcessFitWaiver>,
     /// What this machine has posted that its admission would decline this
     /// request on now. A current fact, so it outranks everything below it.
     held: Option<AdmissionHoldEvidence>,
@@ -17121,13 +17308,15 @@ impl<'a> ScoredCandidate<'a> {
                     <= capacity
             });
         let ceiling = reservation.and_then(|resolved| resolved.memory_fit.ceiling());
+        let (too_large, process_fit_waived) =
+            match reservation.and_then(|resolved| process_fit(&resolved.process_evidence, entry)) {
+                Some(ProcessFit::Refused(reason)) => (Some(reason), None),
+                Some(ProcessFit::Waived(waiver)) => (None, Some(waiver)),
+                None => (None, None),
+            };
         let excluded = ceiling
             .and_then(|ceiling| memory_kill_exclusion(ceiling.killed_here.as_ref()?, machine))
-            .or_else(|| {
-                reservation
-                    .and_then(|resolved| resolved.process_demand.as_ref())
-                    .and_then(|demand| process_misfit(demand, entry))
-            });
+            .or(too_large);
         let over_ceiling = ceiling.map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
             estimate_bytes: ceiling.estimate_bytes,
             ceiling_bytes: ceiling.ceiling_bytes,
@@ -17142,6 +17331,7 @@ impl<'a> ScoredCandidate<'a> {
             model_room: None,
             over_ceiling,
             excluded,
+            process_fit_waived,
             held: hold.map(|hold| hold.evidence.clone()),
             admission_accepts,
             declined_here,
@@ -18573,11 +18763,11 @@ impl ReservationPlan {
     }
 
     /// The largest single process this work is known to hold on `context`'s
-    /// platform: a batch's heaviest item.
-    async fn process_demand(
+    /// platform, and its largest unattributed peak: a batch's heaviest item.
+    async fn process_evidence(
         &self,
         context: &resource_profiles::ProfileContext,
-    ) -> Option<resource_profiles::ProcessDemand> {
+    ) -> resource_profiles::ProcessEvidence {
         if self.batch_suites.is_empty() {
             return resource_profiles::resolve_process_demand(
                 self.db.clone(),
@@ -18587,7 +18777,7 @@ impl ReservationPlan {
             )
             .await;
         }
-        let mut demand = None;
+        let mut evidence = resource_profiles::ProcessEvidence::default();
         for (identity, suite) in &self.batch_suites {
             let item = resource_profiles::resolve_process_demand(
                 self.db.clone(),
@@ -18596,9 +18786,9 @@ impl ReservationPlan {
                 context,
             )
             .await;
-            demand = resource_profiles::ProcessDemand::max(demand, item);
+            evidence = resource_profiles::ProcessEvidence::max(evidence, item);
         }
-        demand
+        evidence
     }
 
     fn profile_context(selected: &SelectedExecutor) -> resource_profiles::ProfileContext {
@@ -18656,7 +18846,7 @@ impl ReservationPlan {
                 memory_fit: resource_profiles::MemoryFit::Unknown,
                 // Whether one process fits is the machine's size, which no
                 // caller's statement changes.
-                process_demand: self.process_demand(&context).await,
+                process_evidence: self.process_evidence(&context).await,
             };
         }
         // Whether the caller declared concurrency is decided here, before the
@@ -18712,7 +18902,7 @@ impl ReservationPlan {
             resolved.reservation.source = ResourceReservationSource::Declared;
             resolved.rationale.declared_concurrency_units = Some(clamped);
         }
-        resolved.process_demand = self.process_demand(&context).await;
+        resolved.process_evidence = self.process_evidence(&context).await;
         resolved
     }
 
@@ -18846,7 +19036,7 @@ impl ReservationPlan {
             duration: self.predict_batch_duration(context, duration_context).await,
             item_durations,
             memory_fit: resource_profiles::MemoryFit::of_batch(memory_fits),
-            process_demand: None,
+            process_evidence: resource_profiles::ProcessEvidence::default(),
         }
     }
 }
@@ -27003,6 +27193,98 @@ mod tests {
         );
     }
 
+    /// cairn/6310 end to end: bgsrv-mac, the only macOS machine, whose
+    /// sampler recorded the whole suite's 15.6 GiB with no process named, is
+    /// judged against its 15.3 GiB reservation cap (it posts no standing
+    /// use). It is offered the suite, and the placement record keeps the
+    /// refusal that would have been made and why it was not.
+    #[tokio::test]
+    async fn the_only_macos_machine_is_offered_a_suite_its_unnamed_peak_would_have_refused() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let db = Arc::new(crate::storage::migrated_test_db("process-fit-macos.db").await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "rust-tests:whole".into(),
+            suite: Some("rust-tests".into()),
+        };
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let total = 24 * GIB;
+        let (id, mut entry) = fleet_entry_at("bgsrv-mac", "macos", 0, &[], now);
+        entry.advertisement.capabilities.memory_budget_bytes = Some(total / 100 * 85);
+        measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
+        Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
+            now,
+            MachineMemory {
+                total_bytes: total,
+                available_bytes: total - 3 * GIB,
+            },
+        );
+        Arc::make_mut(&mut entry.health)
+            .memory_record
+            .standing_bytes = None;
+        let context = ReservationPlan::context_for(
+            &entry.identity.device_id,
+            &entry.identity.executor_id,
+            &entry.advertisement.capabilities,
+        );
+        pool.lock_connections().insert(id, entry);
+        let mut request = spillable_request();
+        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
+        let suite = resource_profiles::suite_key(
+            &request.project_id,
+            Some(&identity),
+            request.command_class,
+        );
+        resource_profiles::observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            &context,
+            &CellExecutionMeta {
+                stop: None,
+                peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                    bytes: 16_751_935_488,
+                    name: None,
+                }),
+                ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
+            },
+            resource_profiles::CompletionKind::Succeeded,
+        )
+        .await;
+        request.command_resource_identity = Some(identity);
+        let plan = ReservationPlan::new(db, &request, None);
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .expect("bgsrv-mac is offered the suite");
+        assert_eq!(placement.selected.executor_id, "bgsrv-mac");
+        let PlacementOutcome::Selected(selection) = &placement.decision.outcome else {
+            panic!("placed means selected");
+        };
+        let waiver = selection
+            .process_fit_waived
+            .as_ref()
+            .expect("the record says why the fit did not refuse");
+        assert_eq!(
+            waiver.reason,
+            cairn_common::executor_protocol::ProcessFitWaiverReason::UnattributedPeak
+        );
+        let text = waiver.describe();
+        assert!(
+            text.contains("~19.5 GiB (suite rust-tests, 15.6 GiB measured here x 1.25 headroom)"),
+            "{text}"
+        );
+    }
+
     fn pinned_to(mut request: CellRequest, home: &str) -> CellRequest {
         request.pinned_executor_id = Some(home.into());
         request.placement_mobility = PlacementMobility::PinnedOrColocated;
@@ -30072,7 +30354,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
-            process_demand: None,
+            process_evidence: resource_profiles::ProcessEvidence::default(),
         };
         let reservations = HashMap::from([
             ("a-fast".to_string(), demand.clone()),
@@ -30909,7 +31191,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
-            process_demand: None,
+            process_evidence: resource_profiles::ProcessEvidence::default(),
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -30965,7 +31247,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
-            process_demand: None,
+            process_evidence: resource_profiles::ProcessEvidence::default(),
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -31097,7 +31379,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
-            process_demand: None,
+            process_evidence: resource_profiles::ProcessEvidence::default(),
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),

@@ -3036,6 +3036,9 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
                 selection.reservation.source,
                 describe_rationale(&selection.reservation_rationale)
             ));
+            if let Some(waiver) = &selection.process_fit_waived {
+                out.push_str(&format!("  - Single-process fit: {}\n", waiver.describe()));
+            }
             out.push_str(&format!(
                 "  - Repository sync: {}\n",
                 match selection.sync_cost {
@@ -10507,6 +10510,7 @@ mod tests {
                 cache_distance: None,
                 prediction: None,
                 memory_ceiling: None,
+                process_fit_waived: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,
