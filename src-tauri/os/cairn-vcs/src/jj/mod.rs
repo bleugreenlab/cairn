@@ -25,6 +25,7 @@ mod merge;
 mod packed_refs;
 mod publish;
 mod reconcile;
+mod recovery;
 mod seal;
 mod three_way;
 mod workspace;
@@ -53,6 +54,11 @@ pub use packed_refs::{
 };
 pub use publish::*;
 pub use reconcile::*;
+pub use recovery::{
+    bookmarks_an_import_would_move, interrupted_repair_coordinates, repair_branch_recovery,
+    validate_store_recovery, BookmarkRecovery, RecoveryCoordinates, RecoveryScope, RepairVerdict,
+    RollbackFailurePhase, StoreValidation, SurvivorRecord,
+};
 pub use seal::*;
 pub use three_way::*;
 pub use workspace::*;

@@ -1127,6 +1127,14 @@ async fn refresh_default_branch(
         )
         .await;
     let _phase = guard.phase("main cadence canonical refresh");
+    let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, &store).await;
+    crate::orchestrator::branch_recovery::refuse_import_if_fenced(
+        &fence_db,
+        &store,
+        &[default_branch],
+        &format!("Refreshing `{default_branch}` from origin for the main cadence"),
+    )
+    .await?;
     crate::jj::ensure_store_initialized(&jj, &store, repo_root)
         .map_err(|error| format!("store init failed: {error}"))?;
     crate::jj::reconcile_tracked_bookmark(&jj, &store, default_branch)

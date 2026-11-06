@@ -586,6 +586,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("held_publications", SMALL),
     keep("jj_reconcile_intents", SMALL),
     keep("jj_reconcile_quarantines", SMALL),
+    keep("jj_branch_recoveries", SMALL),
     keep("job_presence", SMALL),
     keep("landing_allocations", SMALL),
     keep("pending_injections", SMALL),

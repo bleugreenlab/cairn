@@ -137,22 +137,32 @@ pub(crate) fn restore_bookmark(
 /// LOCAL-VIEW op between snapshot and restore is the caller's own. Pushes and
 /// fetches deliberately run without the lock and may interleave; they write only
 /// remote-tracking state, which [`restore_operation`] leaves alone.
+///
+/// In a budgeted environment the read also snapshots every local bookmark and
+/// backing Git head at that operation, so a later [`restore_operation`] to it
+/// can be verified rather than assumed.
 pub fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
-    jj.run(
-        store,
-        &[
-            "op",
-            "log",
-            "--no-graph",
-            "-n",
-            "1",
-            "-T",
-            "id",
-            "--ignore-working-copy",
-        ],
-        "jj op id",
-    )
-    .map(|s| s.trim().to_string())
+    let op_id = jj
+        .run(
+            store,
+            &[
+                "op",
+                "log",
+                "--no-graph",
+                "-n",
+                "1",
+                "-T",
+                "id",
+                "--ignore-working-copy",
+            ],
+            "jj op id",
+        )
+        .map(|s| s.trim().to_string())?;
+    if jj.is_budgeted() {
+        let snapshot = super::recovery::RollbackSnapshot::capture(store, &op_id);
+        jj.ledger().remember(snapshot);
+    }
+    Ok(op_id)
 }
 
 /// Rewind the store's LOCAL VIEW to a prior operation `op_id` (an exact undo of
@@ -172,7 +182,16 @@ pub fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
 ///
 /// The caller MUST hold the per-store lock; under it every local-view op since
 /// the snapshot is the caller's own.
+///
+/// In a budgeted environment the restore is verified against the snapshot
+/// [`operation_id`] took: every local bookmark back at its target and every
+/// touched bookmark's Git head with it. An unverified restore returns a
+/// [`rollback_incomplete`] error AND leaves typed recovery coordinates in the
+/// transaction's ledger (see [`JjEnv::take_recoveries`]).
 pub fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), String> {
+    if jj.is_budgeted() {
+        return super::recovery::restore_recorded(jj, store, op_id);
+    }
     // Patient, because every rollback depends on it. Restoring to the same
     // operation twice yields the same view, so a repeat is idempotent.
     super::packed_refs::with_packed_refs_patience_for(
@@ -201,6 +220,23 @@ pub fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), St
     export_git_preserving_checkout(jj, store, true, "jj git export (after op restore)")
 }
 
+/// [`restore_operation`], then the principal bookmark's verified export. A
+/// budgeted restore already proved every touched bookmark's Git head, so the
+/// second export is only for unbudgeted callers, which have no snapshot.
+pub(crate) fn restore_operation_and_export(
+    jj: &JjEnv,
+    store: &Path,
+    op_id: &str,
+    branch: &str,
+    ctx: &str,
+) -> Result<(), String> {
+    restore_operation(jj, store, op_id)?;
+    if jj.is_budgeted() {
+        return Ok(());
+    }
+    super::export_bookmark_advance(jj, store, true, branch, ctx)
+}
+
 /// Local bookmarks that ride a commit inside `range_revset`, excluding `exclude`.
 /// A base advance that bakes conflicts into a branch's intermediate commits can
 /// leave a SIBLING bookmark pointing at one of those intermediates (its own tip
@@ -209,7 +245,7 @@ pub fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), St
 /// [`flatten_branch_recovery`] re-points each such rider onto the flattened
 /// commit. `local_bookmarks` is the jj 0.42 template keyword for a commit's local
 /// bookmarks; `--ignore-working-copy` keeps the enumeration store-driven.
-fn local_bookmarks_in_range(
+pub fn local_bookmarks_in_range(
     jj: &JjEnv,
     store: &Path,
     range_revset: &str,
@@ -695,13 +731,19 @@ pub(crate) fn roll_back_refused_heal(
         );
         return;
     }
-    if let Err(error) = export_bookmark_advance(
-        jj,
-        store,
-        true,
-        branch,
-        "jj git export (refused heal rolled back)",
-    ) {
+    // A budgeted restore already proved every touched Git head.
+    let exported = if jj.is_budgeted() {
+        Ok(())
+    } else {
+        export_bookmark_advance(
+            jj,
+            store,
+            true,
+            branch,
+            "jj git export (refused heal rolled back)",
+        )
+    };
+    if let Err(error) = exported {
         record_failure(
             report,
             branch,

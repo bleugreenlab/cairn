@@ -36,12 +36,12 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
             let action = payload_non_empty_str(payload, "action", &[])
                 .ok_or_else(|| build_failure(index, item, "payload.action is required"))?;
-            if !matches!(action, "replay" | "fast-forward-from-origin") {
+            if !matches!(action, "replay" | "fast-forward-from-origin" | "repair") {
                 return Err(build_failure(
                     index,
                     item,
                     format!(
-                        "payload.action must be 'replay' or 'fast-forward-from-origin', got '{action}'"
+                        "payload.action must be 'replay', 'fast-forward-from-origin' or 'repair', got '{action}'"
                     ),
                 ));
             }
@@ -100,7 +100,20 @@ pub(super) async fn dispatch(
                 )
             })?;
 
-            if action == "fast-forward-from-origin" {
+            if action == "repair" {
+                // The bounded managed retry of a recovery fence's targeted
+                // repair: the same attempt the sweep makes, brought forward.
+                if dry_run {
+                    format!("Would retry the targeted recovery repair of `{branch}` now")
+                } else {
+                    let store = rows
+                        .store_path(orch)
+                        .map_err(|error| build_failure(index, item, error))?;
+                    crate::orchestrator::branch_recovery::repair_now(orch, &db, &store, &branch)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?
+                }
+            } else if action == "fast-forward-from-origin" {
                 let target = if fast_forward_branch.is_some() {
                     crate::resources::node_base_branch(orch, &rows, &branch)
                         .await

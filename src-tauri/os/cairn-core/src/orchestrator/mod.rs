@@ -12,6 +12,7 @@ pub mod attention_delivery;
 pub mod attention_push;
 pub mod attention_retirement;
 pub mod base_advance;
+pub(crate) mod branch_recovery;
 pub mod build_change;
 pub mod build_services;
 mod claude_credentials;

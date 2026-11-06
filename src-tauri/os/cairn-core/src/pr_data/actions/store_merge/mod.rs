@@ -260,6 +260,19 @@ pub(super) async fn land_verified_store_merge_child(
     let store =
         crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
     let revalidating = trace.phase("revalidate verified tips");
+    // Under the caller's landing guard: a fenced source or target is never
+    // folded and published, whatever verified it before the fence was laid.
+    let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, &store).await;
+    crate::orchestrator::branch_recovery::refuse_if_fenced(
+        &fence_db,
+        &store,
+        &[
+            merge_context.source_branch.as_str(),
+            merge_context.target_branch.as_str(),
+        ],
+        "Merging this pull request",
+    )
+    .await?;
     if crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch).as_deref()
         != Some(&verified.source_tip)
         || crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch).as_deref()
@@ -669,6 +682,14 @@ async fn store_merge_child_inner(
         // commits, when the two have diverged. The caller holds the store lock;
         // the fetch lock is only ever taken inside it.
         if has_remote {
+            let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, &store).await;
+            crate::orchestrator::branch_recovery::refuse_import_if_fenced(
+                &fence_db,
+                &store,
+                &[target_branch, source_branch],
+                &format!("Taking origin's `{target_branch}` before this merge"),
+            )
+            .await?;
             let observed =
                 crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
                     crate::jj::fetch_origin_observation(&store, target_branch)

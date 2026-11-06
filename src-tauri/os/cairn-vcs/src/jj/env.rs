@@ -16,7 +16,11 @@ const JJ_DEFAULT_USER_EMAIL: &str = crate::MANAGED_IDENTITY_EMAIL;
 /// Total subprocess budget for one automatic reconcile phase under the store lock.
 pub const BACKGROUND_RECONCILE_BUDGET: Duration = Duration::from_secs(10);
 /// Rollback has its own allowance: an expired forward budget cannot prevent undo.
-const RECONCILE_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+/// It covers the bounded reap of a killed writer, the operation restore, the
+/// export, and their verification, all against one deadline. Twenty seconds
+/// sits well above an `op restore` plus export on a stalled disk (observed at
+/// 0.5 to 2 s each), and what still does not fit is fenced, not abandoned.
+pub const RECONCILE_CLEANUP_BUDGET: Duration = Duration::from_secs(20);
 
 /// Do not start another forward subprocess with only a scheduling sliver left.
 /// Cleanup is deliberately exempt so this guard cannot prevent rollback.
@@ -43,6 +47,9 @@ pub struct JjEnv {
     cleanup_deadline: Arc<OnceLock<Instant>>,
     is_cleanup: bool,
     operation_phases: Option<Arc<Mutex<Vec<OperationPhase>>>>,
+    /// What this budgeted transaction has done that its rollback must know:
+    /// shared by every clone, fresh for each [`JjEnv::with_operation_budget`].
+    ledger: Arc<Mutex<super::recovery::OperationLedger>>,
     bin: String,
     config_path: PathBuf,
     pub(super) checkout_repair_policy: crate::checkout::CheckoutRepairPolicy,
@@ -66,7 +73,50 @@ impl JjEnv {
         scoped.cleanup_deadline = Default::default();
         scoped.is_cleanup = false;
         scoped.operation_phases = Some(Default::default());
+        scoped.ledger = Default::default();
         scoped
+    }
+
+    /// Whether this environment runs one budgeted transaction, whose rollback
+    /// is verified and whose unverified rollback leaves recovery coordinates.
+    pub fn is_budgeted(&self) -> bool {
+        self.operation_deadline.is_some()
+    }
+
+    pub(super) fn ledger(&self) -> std::sync::MutexGuard<'_, super::recovery::OperationLedger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Drain what this transaction's rollbacks could not verify, including a
+    /// timed-out writer no rollback was attempted for. The caller persists it
+    /// before releasing the store lock; an empty answer means every rollback
+    /// in this transaction was verified (or none ran).
+    pub fn take_recoveries(&self) -> Vec<super::recovery::RecoveryCoordinates> {
+        self.ledger().take_recoveries()
+    }
+
+    /// Expire this transaction's cleanup allowance now, as if it had been
+    /// spent: the real command boundary then refuses to spawn.
+    #[cfg(test)]
+    pub(crate) fn expire_cleanup_for_test(&self) {
+        let _ = self.cleanup_deadline.set(Instant::now());
+    }
+
+    /// Record a killed writer as not proven gone, as the bounded reap does.
+    #[cfg(test)]
+    pub(crate) fn inject_survivor_for_test(
+        &self,
+        survivor: cairn_platform::process::SurvivingProcess,
+    ) {
+        self.ledger().survivors.push(survivor);
+    }
+
+    /// Whether a writer this transaction killed was not proven gone. While so,
+    /// nothing else is spawned against the store through this environment.
+    pub fn writer_may_survive(&self) -> bool {
+        !self.ledger().survivors.is_empty()
     }
 
     /// Start a distinct transaction after a conflict was successfully rolled back.
@@ -95,6 +145,18 @@ impl JjEnv {
         }
         if self.cleanup_deadline.get().is_none() {
             return Err("a successor transaction requires a prior conflict rollback".to_string());
+        }
+        // A rollback this transaction could not verify, or a writer it could
+        // not prove gone, is a recovery fence, never a restored conflict.
+        {
+            let ledger = self.ledger();
+            if !ledger.survivors.is_empty() || !ledger.recoveries.is_empty() {
+                return Err(
+                    "a successor transaction requires a verified rollback; this one left a \
+                     recovery fence or a writer not proven gone"
+                        .to_string(),
+                );
+            }
         }
         let mut successor = self.clone();
         successor.cleanup_deadline = Default::default();
@@ -206,8 +268,42 @@ impl JjEnv {
             }
             self.check_operation_budget(ctx)
                 .map_err(|error| format!("{error} before spawning"))?;
+            if let Some(survivor) = self.ledger().survivors.first() {
+                return Err(format!(
+                    "{ctx} refused before spawning: a timed-out jj writer (pid {}) was not \
+                     proven gone, so nothing else may write this store until it is",
+                    survivor.pid
+                ));
+            }
             spawned = true;
-            let output = bounded_command_output(command, timeout, ctx)?;
+            self.ledger().spawns += 1;
+            let output = if self.is_budgeted() {
+                // A budgeted transaction's timeout starts its cleanup at the
+                // kill, and the reap spends that same allowance: proving the
+                // writer gone is the first step of the undo, not an extra
+                // unbounded phase.
+                let cleanup_deadline = Arc::clone(&self.cleanup_deadline);
+                let reap_by =
+                    || *cleanup_deadline.get_or_init(|| Instant::now() + RECONCILE_CLEANUP_BUDGET);
+                match cairn_platform::process::bounded_command_output_reaped(
+                    command, timeout, ctx, &reap_by,
+                ) {
+                    Ok(output) => output,
+                    Err(cairn_platform::process::BoundedCommandError::Failed(error)) => {
+                        return Err(error)
+                    }
+                    Err(cairn_platform::process::BoundedCommandError::TerminationUnproven {
+                        message,
+                        survivor,
+                    }) => {
+                        log::error!("{message}");
+                        self.ledger().survivors.push(survivor);
+                        return Err(message);
+                    }
+                }
+            } else {
+                bounded_command_output(command, timeout, ctx)?
+            };
             self.check_operation_budget(ctx)?;
             Ok(output)
         })();
@@ -251,6 +347,7 @@ impl JjEnv {
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
+            ledger: Default::default(),
             checkout_repair_policy: Default::default(),
         }
     }
@@ -269,6 +366,7 @@ impl JjEnv {
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
+            ledger: Default::default(),
             checkout_repair_policy: Default::default(),
         }
     }
@@ -1079,6 +1177,7 @@ mod tests {
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
+            ledger: Default::default(),
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -1132,6 +1231,7 @@ mod tests {
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
+            ledger: Default::default(),
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -1174,6 +1274,7 @@ mod tests {
             cleanup_deadline: Default::default(),
             is_cleanup: false,
             operation_phases: None,
+            ledger: Default::default(),
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),

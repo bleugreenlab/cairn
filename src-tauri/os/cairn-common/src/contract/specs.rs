@@ -310,7 +310,7 @@ pub(crate) const ATTACHMENT_ACTION: KeySpec = KeySpec::new(
 pub(crate) const REBASE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "replay — replay onto the base; fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward",
+    "replay — replay onto the base; fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward; repair — retry now the targeted repair of a recovery fence on this branch (only the recorded bookmarks and Git heads move)",
 );
 pub(crate) const REBASE_FINGERPRINT: KeySpec = KeySpec::new(
     "fingerprint",

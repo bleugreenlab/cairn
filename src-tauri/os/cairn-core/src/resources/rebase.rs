@@ -205,7 +205,8 @@ pub(super) async fn read_node_rebase(
     // replay can run, so everything below it describes a branch that cannot
     // move until this is settled.
     let name_section = format!(
-        "{}{}",
+        "{}{}{}",
+        recovery_fence_section(orch, &db, &rows, &branch).await,
         own_origin_section(orch, &rows, &branch).await,
         conflicted_name_section(orch, &rows, &branch).await
     );
@@ -239,6 +240,38 @@ pub(super) async fn read_node_rebase(
         return rendered;
     }
     format!("{name_section}{rendered}")
+}
+
+/// A durable recovery fence on this branch, first on the page: while it
+/// stands, nothing below can move the branch.
+async fn recovery_fence_section(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    rows: &NodeRebaseRows,
+    branch: &str,
+) -> String {
+    let Ok(store) = rows.store_path(orch) else {
+        return String::new();
+    };
+    match crate::orchestrator::branch_recovery::fences_for_branch(db, &store, branch).await {
+        Ok(fences) if fences.is_empty() => String::new(),
+        Ok(fences) => format!(
+            "## Recovery fence\n\nAn earlier reconcile of this store could not verify its \
+             rollback, so this branch is fenced: no replay, write or publication moves it until \
+             a verified targeted repair clears the fence. That repair puts back only the \
+             recorded bookmarks and Git heads; it never restores an old store view. A normal \
+             replay is not repair.\n\n{}\n\n",
+            fences
+                .iter()
+                .map(crate::orchestrator::branch_recovery::render_for_page)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        Err(error) => format!(
+            "## Recovery fence\n\nThe recovery fences could not be read ({error}), so writes, \
+             replays and publication of this branch are refused until they can be.\n\n"
+        ),
+    }
 }
 
 /// The page for a branch with no OPEN session.
@@ -471,6 +504,16 @@ pub(crate) struct NodeRebaseRows {
 }
 
 impl NodeRebaseRows {
+    /// The project's branch store, where this node's bookmark lives.
+    pub(crate) fn store_path(&self, orch: &Orchestrator) -> Result<std::path::PathBuf, String> {
+        self.repo_path
+            .as_ref()
+            .map_err(Clone::clone)
+            .map(|repo_path| {
+                crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path))
+            })
+    }
+
     #[track_caller]
     pub(crate) fn read<'s>(
         db: &'s crate::storage::LocalDb,

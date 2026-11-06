@@ -1905,6 +1905,37 @@ pub(super) async fn finalize_file_commit(
         }
     }
 
+    // Under the store lock this write holds: a fence the previous holder
+    // recorded is seen, and a fenced branch's write is refused with its route.
+    let fence_db = crate::orchestrator::base_advance::recovery_fence_db(
+        orch,
+        &logical_resolution.repository_path,
+    )
+    .await;
+    if let Err(error) = crate::orchestrator::branch_recovery::refuse_if_fenced(
+        &fence_db,
+        &logical_resolution.repository_path,
+        &[logical_resolution.rev.as_str()],
+        "This write",
+    )
+    .await
+    {
+        return Err(Box::new(IndexedFailure {
+            failure: ChangeFailure {
+                index: first_change.index,
+                target: first_change.item.target.clone(),
+                mode: mode_name(first_change.item.mode).to_string(),
+                kind: "file".to_string(),
+                error: error.clone(),
+            },
+            commit: Some(CommitReport {
+                status: "failed".to_string(),
+                sha: None,
+                pr_number: None,
+                message: Some(error),
+            }),
+        }));
+    }
     let publication = crate::jj::publish_logical_head_exported(
         &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
         &logical_resolution.repository_path,

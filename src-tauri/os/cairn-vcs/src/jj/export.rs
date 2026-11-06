@@ -919,6 +919,87 @@ fn read_branch_commit(repo: &Path, branch: &str) -> Option<String> {
     })
 }
 
+/// Every `refs/heads/*` the backing checkout of `store` holds, read from disk
+/// with no subprocess: `packed-refs` first, then loose refs, which override it.
+/// An unreadable layout (a reftable, an unparseable ref, no backing checkout) is
+/// an error, never an empty map.
+pub(crate) fn backing_branch_heads(
+    store: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let repo = resolve_backing_checkout(store)
+        .ok_or_else(|| format!("no backing git checkout resolved for {}", store.display()))?;
+    read_branch_heads(&repo)
+}
+
+fn read_branch_heads(repo: &Path) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let dot_git = repo.join(".git");
+    if !dot_git.is_dir() || dot_git.join("reftable").exists() {
+        return Err(format!(
+            "{} is not a files-backend git directory",
+            dot_git.display()
+        ));
+    }
+    let mut heads = std::collections::BTreeMap::new();
+    match std::fs::read_to_string(dot_git.join("packed-refs")) {
+        Ok(packed) => {
+            for line in packed.lines() {
+                if line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                if let Some((id, branch)) = line
+                    .split_once(' ')
+                    .and_then(|(id, name)| Some((id, name.strip_prefix("refs/heads/")?)))
+                {
+                    if is_object_id(id) {
+                        heads.insert(branch.to_string(), id.to_string());
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read packed-refs: {error}")),
+    }
+    let root = dot_git.join("refs").join("heads");
+    let mut pending = vec![root.clone()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("list {}: {error}", dir.display())),
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|error| format!("list {}: {error}", dir.display()))?
+                .path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "lock")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("read {}: {error}", path.display()))?;
+            let text = text.trim();
+            let name = path
+                .strip_prefix(&root)
+                .map_err(|error| format!("name {}: {error}", path.display()))?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if !is_object_id(text) {
+                return Err(format!(
+                    "refs/heads/{name} does not name an object: {text:?}"
+                ));
+            }
+            heads.insert(name, text.to_string());
+        }
+    }
+    Ok(heads)
+}
+
 /// Repair a detach the export caused, and ONLY that: HEAD must be detached now,
 /// and the branch it was attached to must have actually moved during the export.
 /// Any other post-state (still attached, or the branch did not move) is left

@@ -2442,6 +2442,8 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("jj_reconcile_intents", TableScope::ProjectScoped),
     ("jj_reconcile_items", TableScope::ProjectScoped),
     ("jj_reconcile_quarantines", TableScope::ProjectScoped),
+    // cairn/6173: this runner's durable fences on its own store's bookmarks.
+    ("jj_branch_recoveries", TableScope::ProjectScoped),
     // cairn/5222: the identifiers this installation's store bound at landing.
     // A landing runs against this machine's store, so the record of what it
     // allocated is this installation's own.
@@ -3273,6 +3275,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "jj_reconcile_quarantines",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "jj_branch_recoveries",
         id_columns: &["project_id"],
     },
     // job_file_activity.id is the composite `{event_id}:{tool_use_id}:{ordinal}`

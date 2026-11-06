@@ -142,8 +142,14 @@ fn finish_pipe_reader(
     handle: thread::JoinHandle<()>,
     ctx: &str,
     stream: &str,
+    deadline: Option<Instant>,
 ) -> Result<Vec<u8>, String> {
-    match receiver.recv_timeout(PIPE_READER_JOIN_TIMEOUT) {
+    // Within a bounded reap, pipe draining spends the same allowance rather than
+    // adding its own two seconds per stream.
+    let wait = deadline.map_or(PIPE_READER_JOIN_TIMEOUT, |deadline| {
+        PIPE_READER_JOIN_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()))
+    });
+    match receiver.recv_timeout(wait) {
         Ok(result) => {
             handle
                 .join()
@@ -161,14 +167,86 @@ fn finish_pipe_reader(
     }
 }
 
+/// A process a timed-out command left behind: killed, and not proven gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurvivingProcess {
+    pub pid: u32,
+    /// The group the child led, which its descendants joined.
+    pub process_group: u32,
+    /// The leader's kernel start token, read right after spawn, so a later
+    /// check can tell this process from a reuse of its pid.
+    pub start_token: Option<String>,
+    /// What was still outstanding when the reap bound expired.
+    pub outstanding: String,
+}
+
+/// Why a [`bounded_command_output_reaped`] command produced no output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedCommandError {
+    /// The command could not be spawned, failed while running, or ran out of
+    /// time and was killed with its whole process group proven gone. Whatever
+    /// it changed, nothing it started is still running.
+    Failed(String),
+    /// The command ran out of time and was killed, but its leader was not
+    /// reaped, or its process group not proven empty, before the reap bound.
+    /// A writer may still be running.
+    TerminationUnproven {
+        message: String,
+        survivor: SurvivingProcess,
+    },
+}
+
+impl std::fmt::Display for BoundedCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) | Self::TerminationUnproven { message, .. } => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
 /// Run a subprocess with drained output pipes and a hard deadline. The child is
 /// placed in its own process group on Unix so timeout cleanup also reaches git,
 /// ssh, credential helpers, and any other descendants spawned by jj.
+///
+/// A timed-out child is waited on without bound, exactly as before
+/// [`bounded_command_output_reaped`] existed: callers that have no fence to
+/// fall back on keep the guarantee that nothing they started outlives the call.
 pub fn bounded_command_output(
     command: &mut Command,
     timeout: Duration,
     ctx: &str,
 ) -> Result<Output, String> {
+    run_bounded(command, timeout, ctx, None).map_err(|error| error.to_string())
+}
+
+/// [`bounded_command_output`] whose timeout reap is itself bounded.
+///
+/// When the child outlives `timeout`, its group is killed and `reap_deadline`
+/// is called once, at that moment, for the instant by which termination must be
+/// proven: the leader reaped, and no live process left in its group. Short of
+/// that proof the call returns [`BoundedCommandError::TerminationUnproven`]
+/// naming the survivor, and a detached thread keeps waiting on the leader so it
+/// is reaped whenever the kernel lets it go. It never waits past the bound, so a
+/// caller holding a lock can release it, provided it first fences what the
+/// survivor may still be writing.
+pub fn bounded_command_output_reaped(
+    command: &mut Command,
+    timeout: Duration,
+    ctx: &str,
+    reap_deadline: &dyn Fn() -> Instant,
+) -> Result<Output, BoundedCommandError> {
+    run_bounded(command, timeout, ctx, Some(reap_deadline))
+}
+
+fn run_bounded(
+    command: &mut Command,
+    timeout: Duration,
+    ctx: &str,
+    reap_deadline: Option<&dyn Fn() -> Instant>,
+) -> Result<Output, BoundedCommandError> {
+    let failed = |error: String| BoundedCommandError::Failed(error);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -180,41 +258,137 @@ pub fn bounded_command_output(
         command.process_group(0);
     }
 
-    let mut child = observed_spawn(command).map_err(|e| format!("{ctx}: {e}"))?;
+    let mut child = observed_spawn(command).map_err(|e| failed(format!("{ctx}: {e}")))?;
+    // Read now, while the child certainly runs: after a kill the token is what
+    // tells a survivor from a stranger that reused its pid.
+    let start_token =
+        reap_deadline.and_then(|_| cairn_common::process_identity::process_start_token(child.id()));
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let (stdout_rx, stdout_reader) = spawn_pipe_reader(stdout);
     let (stderr_rx, stderr_reader) = spawn_pipe_reader(stderr);
 
     let deadline = Instant::now() + timeout;
+    let mut pipe_deadline = None;
     let (status, timed_out) = loop {
-        match child.try_wait().map_err(|e| format!("{ctx}: {e}"))? {
+        match child
+            .try_wait()
+            .map_err(|e| failed(format!("{ctx}: {e}")))?
+        {
             Some(status) => break (status, false),
             None if Instant::now() >= deadline => {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                kill_group(&mut child);
+                let Some(reap_deadline) = reap_deadline else {
+                    let status = child.wait().map_err(|e| failed(format!("{ctx}: {e}")))?;
+                    break (status, true);
+                };
+                let reap_by = reap_deadline();
+                match reap_within(&mut child, reap_by) {
+                    Ok(status) => {
+                        pipe_deadline = Some(reap_by);
+                        break (status, true);
+                    }
+                    Err(outstanding) => {
+                        let pid = child.id();
+                        // Keep waiting where no lock is held, so the leader is
+                        // still reaped once the kernel releases it.
+                        thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        return Err(BoundedCommandError::TerminationUnproven {
+                            message: format!(
+                                "{ctx} timed out after {}s and was killed, but its termination \
+                                 was not proven before the reap bound: {outstanding}",
+                                timeout.as_secs_f64()
+                            ),
+                            survivor: SurvivingProcess {
+                                pid,
+                                process_group: pid,
+                                start_token,
+                                outstanding,
+                            },
+                        });
+                    }
                 }
-                let _ = child.kill();
-                let status = child.wait().map_err(|e| format!("{ctx}: {e}"))?;
-                break (status, true);
             }
             None => thread::sleep(Duration::from_millis(50)),
         }
     };
-    let stdout = finish_pipe_reader(stdout_rx, stdout_reader, ctx, "stdout")?;
-    let stderr = finish_pipe_reader(stderr_rx, stderr_reader, ctx, "stderr")?;
+    let stdout = finish_pipe_reader(stdout_rx, stdout_reader, ctx, "stdout", pipe_deadline)
+        .map_err(failed)?;
+    let stderr = finish_pipe_reader(stderr_rx, stderr_reader, ctx, "stderr", pipe_deadline)
+        .map_err(failed)?;
     if timed_out {
-        return Err(format!(
+        return Err(failed(format!(
             "{ctx} timed out after {}s and was killed",
             timeout.as_secs_f64()
-        ));
+        )));
     }
     Ok(Output {
         status,
         stdout,
         stderr,
     })
+}
+
+fn kill_group(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+/// Reap the killed leader, then prove its group empty, by `reap_by`.
+///
+/// The leader is reaped first, deliberately: Darwin answers a group probe with
+/// `EPERM` rather than `ESRCH` while the group holds only an unreaped zombie
+/// leader (cairn/6159), so a membership probe before the reap could never
+/// conclude. Membership is read through the shared process-identity stack,
+/// which leaves zombies out; an unreadable listing is not proof of absence.
+fn reap_within(child: &mut Child, reap_by: Instant) -> Result<ExitStatus, String> {
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= reap_by => {
+                return Err(format!("leader pid {} was not reaped", child.id()));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => return Err(format!("waiting on leader pid {}: {error}", child.id())),
+        }
+    };
+    #[cfg(unix)]
+    {
+        let group = child.id();
+        loop {
+            match cairn_common::process_identity::process_group_members(group) {
+                Ok(members) if members.is_empty() => break,
+                outcome if Instant::now() >= reap_by => {
+                    return Err(match outcome {
+                        Ok(members) => format!(
+                            "process group {group} still held {} live process(es): {}",
+                            members.len(),
+                            members
+                                .iter()
+                                .map(|member| member.pid.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        Err(error) => {
+                            format!("process group {group} membership unreadable: {error}")
+                        }
+                    });
+                }
+                _ => {
+                    unsafe {
+                        libc::kill(-(group as i32), libc::SIGKILL);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    Ok(status)
 }
 
 #[cfg(all(test, unix))]

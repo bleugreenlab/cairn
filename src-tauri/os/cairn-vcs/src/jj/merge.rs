@@ -1096,15 +1096,13 @@ pub(crate) fn roll_back_rebase(
 ) -> String {
     let cleanup = jj.cleanup_env();
     let jj = &cleanup;
-    let undone = restore_operation(jj, store, pre_op).and_then(|()| {
-        export_bookmark_advance(
-            jj,
-            store,
-            true,
-            branch,
-            "jj git export (failed rebase rolled back)",
-        )
-    });
+    let undone = super::reconcile::restore_operation_and_export(
+        jj,
+        store,
+        pre_op,
+        branch,
+        "jj git export (failed rebase rolled back)",
+    );
     match undone {
         Ok(()) => format!(
             "{failure}\nThe rebase was rolled back to operation {pre_op}, so the branch is unchanged."
@@ -1135,23 +1133,20 @@ fn roll_back_conflicting_rebase(
 ) -> Result<(), String> {
     let cleanup = jj.cleanup_env();
     let jj = &cleanup;
-    restore_operation(jj, store, pre_op)
-        .and_then(|()| {
-            export_bookmark_advance(
-                jj,
-                store,
-                true,
-                branch,
-                "jj git export (conflicting rebase rolled back)",
-            )
-        })
-        .map_err(|error| {
-            rollback_incomplete(&format!(
-                "jj rebase of `{branch}` onto `{dest}` was refused as a conflict, and the store \
+    super::reconcile::restore_operation_and_export(
+        jj,
+        store,
+        pre_op,
+        branch,
+        "jj git export (conflicting rebase rolled back)",
+    )
+    .map_err(|error| {
+        rollback_incomplete(&format!(
+            "jj rebase of `{branch}` onto `{dest}` was refused as a conflict, and the store \
                  could not be proven rolled back to its pre-rebase operation {pre_op}: {error}. \
                  The branch may be sitting on the refused commit; do NOT export or publish it."
-            ))
-        })
+        ))
+    })
 }
 
 /// Rebase a branch while honoring an explicitly identified committed resolution.

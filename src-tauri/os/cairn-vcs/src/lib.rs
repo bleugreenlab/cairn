@@ -609,6 +609,219 @@ async fn repoint_bookmark_if_unchanged_inner(
     Ok(())
 }
 
+/// One local bookmark's target in a view, as hexadecimal commit ids: what it
+/// adds and, for a conflicted name, what it removes. A normal bookmark adds
+/// exactly one commit and removes none; an absent one does neither.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct BookmarkState {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl BookmarkState {
+    fn of(target: &RefTarget) -> Self {
+        let mut added: Vec<String> = target.added_ids().map(|id| id.hex()).collect();
+        let mut removed: Vec<String> = target.removed_ids().map(|id| id.hex()).collect();
+        added.sort();
+        removed.sort();
+        Self { added, removed }
+    }
+
+    pub fn normal(commit: &str) -> Self {
+        Self {
+            added: vec![commit.trim().to_ascii_lowercase()],
+            removed: Vec::new(),
+        }
+    }
+
+    pub fn is_absent(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// The commit an ordinary bookmark names; `None` when absent or conflicted.
+    pub fn commit(&self) -> Option<&str> {
+        match (self.added.as_slice(), self.removed.is_empty()) {
+            ([commit], true) => Some(commit),
+            _ => None,
+        }
+    }
+
+    pub fn is_conflicted(&self) -> bool {
+        !self.is_absent() && self.commit().is_none()
+    }
+}
+
+impl std::fmt::Display for BookmarkState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_absent() {
+            return f.write_str("<absent>");
+        }
+        if let Some(commit) = self.commit() {
+            return f.write_str(commit);
+        }
+        write!(
+            f,
+            "conflicted(+{} -{})",
+            self.added.join("+"),
+            self.removed.join("-")
+        )
+    }
+}
+
+/// Every local bookmark of a store at one operation, read in process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBookmarkView {
+    pub operation_id: String,
+    pub bookmarks: std::collections::BTreeMap<String, BookmarkState>,
+}
+
+impl LocalBookmarkView {
+    pub fn state(&self, bookmark: &str) -> BookmarkState {
+        self.bookmarks.get(bookmark).cloned().unwrap_or_default()
+    }
+}
+
+/// Read a store's operation id and every local bookmark target in one
+/// repository load, with no subprocess.
+///
+/// Used where a rollback needs the local view and cannot spend a subprocess on
+/// it: before a budgeted mutation (the snapshot a failed undo is compared
+/// against) and after one fails (what the failure left). A failed read is an
+/// error, never an empty view.
+pub fn read_local_bookmark_view(repository_path: &Path) -> Result<LocalBookmarkView, String> {
+    futures::executor::block_on(async {
+        let repo = load_repo_at_head(repository_path)
+            .await
+            .map_err(|error| format!("load the store view: {error}"))?;
+        Ok(LocalBookmarkView {
+            operation_id: repo.operation().id().hex(),
+            bookmarks: repo
+                .view()
+                .local_bookmarks()
+                .map(|(name, target)| (name.as_str().to_string(), BookmarkState::of(target)))
+                .collect(),
+        })
+    })
+}
+
+/// Put one recorded bookmark back where a failed attempt found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedBookmarkRestore {
+    pub bookmark: String,
+    /// Where the bookmark stood before the attempt: absent, or one commit.
+    pub target: BookmarkState,
+    /// The only states the repair may replace. Anything else is a movement
+    /// nobody recorded, and belongs to whoever made it.
+    pub replaceable: Vec<BookmarkState>,
+}
+
+/// What [`restore_recorded_bookmarks`] committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedRestoreOutcome {
+    pub operation_id: String,
+    /// Recorded bookmarks whose `refs/heads/*` the scoped export could not
+    /// move, with jj's reason. Empty when every ref followed.
+    pub export_failures: Vec<String>,
+}
+
+/// Compare-and-swap each recorded bookmark back to its saved target, and export
+/// exactly those bookmarks to Git, in one transaction on the CURRENT view.
+///
+/// Nothing else in the view is touched: no historical operation is restored,
+/// no commit is rebased or abandoned, and remote-tracking bookmarks are left
+/// alone. The whole repair is refused before writing anything when any recorded
+/// bookmark holds a state outside its `replaceable` set, so work committed
+/// after the failure is never overwritten.
+///
+/// The export is jj's own, filtered to the recorded names: each Git ref moves
+/// only from the value jj last exported for it (an expected-old-value update),
+/// and jj's record of the Git ref is updated with it, so a later ordinary export
+/// sees no difference to re-export. A ref Git moved by itself is reported in
+/// [`ScopedRestoreOutcome::export_failures`] rather than overwritten. The
+/// transaction is committed even then, so the bookmarks that did export are
+/// recorded truthfully and a retry starts from the real state.
+pub fn restore_recorded_bookmarks(
+    repository_path: &Path,
+    restores: &[RecordedBookmarkRestore],
+    description: &str,
+) -> Result<ScopedRestoreOutcome, String> {
+    futures::executor::block_on(async {
+        let repo = load_repo_at_head(repository_path)
+            .await
+            .map_err(|error| format!("load the store view: {error}"))?;
+        let mut moved = Vec::new();
+        for restore in restores {
+            if restore.target.is_conflicted() {
+                return Err(format!(
+                    "bookmark `{}` was conflicted before the attempt ({}); a conflicted \
+                     position is not restored automatically",
+                    restore.bookmark, restore.target
+                ));
+            }
+            if let Some(commit) = restore.target.commit() {
+                let id = CommitId::try_from_hex(commit).ok_or_else(|| {
+                    format!("recorded target `{commit}` is not a full hexadecimal object ID")
+                })?;
+                repo.store()
+                    .get_commit(&id)
+                    .map_err(|error| format!("read recorded target `{commit}`: {error}"))?;
+            }
+            let current = BookmarkState::of(
+                repo.view()
+                    .get_local_bookmark(RefName::new(&restore.bookmark)),
+            );
+            if current != restore.target && !restore.replaceable.contains(&current) {
+                moved.push(format!(
+                    "`{}` is at {current}, which this recovery did not record",
+                    restore.bookmark
+                ));
+            }
+        }
+        if !moved.is_empty() {
+            return Err(format!(
+                "targeted repair refused before writing anything: {}",
+                moved.join("; ")
+            ));
+        }
+        let mut tx = repo.start_transaction();
+        for restore in restores {
+            let target = match restore.target.commit() {
+                Some(commit) => {
+                    RefTarget::normal(CommitId::try_from_hex(commit).expect("validated above"))
+                }
+                None => RefTarget::absent(),
+            };
+            tx.repo_mut()
+                .set_local_bookmark_target(RefName::new(&restore.bookmark), target);
+        }
+        let names: std::collections::BTreeSet<&str> = restores
+            .iter()
+            .map(|restore| restore.bookmark.as_str())
+            .collect();
+        let stats = jj_lib::git::export_some_refs(tx.repo_mut(), |kind, symbol| {
+            matches!(kind, jj_lib::git::GitRefKind::Bookmark)
+                && symbol.remote == jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                && names.contains(symbol.name.as_str())
+        })
+        .map_err(|error| format!("scoped git export: {error}"))?;
+        let export_failures = stats
+            .failed_bookmarks
+            .iter()
+            .map(|(symbol, reason)| format!("`{}`: {reason}", symbol.name.as_str()))
+            .collect();
+        let committed = tx
+            .commit(description.to_string())
+            .await
+            .map_err(|error| format!("commit targeted repair: {error}"))?;
+        Ok(ScopedRestoreOutcome {
+            operation_id: committed.operation().id().hex(),
+            export_failures,
+        })
+    })
+}
+
 impl std::fmt::Display for CoordinateResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

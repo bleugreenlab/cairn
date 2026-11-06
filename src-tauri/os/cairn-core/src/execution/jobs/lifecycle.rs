@@ -1317,6 +1317,7 @@ where
             )
             .await)
     })?;
+    refuse_fenced_import(orch, store, "Preparing this job's branch")?;
     crate::jj::ensure_project_store(jj, store, repo_path)?;
 
     let base_ref = job.base_branch.as_deref().unwrap_or("HEAD");
@@ -1378,7 +1379,21 @@ pub(crate) fn import_project_store_locked(
             )
             .await)
     })?;
+    refuse_fenced_import(
+        orch,
+        store,
+        &format!("Importing the project store ({operation})"),
+    )?;
     crate::jj::ensure_project_store(jj, store, repo_path)
+}
+
+/// The import every job preparation runs is a store write: a store fence
+/// refuses it, and so does a branch fence it would carry off its position.
+fn refuse_fenced_import(orch: &Orchestrator, store: &Path, action: &str) -> Result<(), String> {
+    run_db_borrowed(async {
+        let db = crate::orchestrator::base_advance::recovery_fence_db(orch, store).await;
+        crate::orchestrator::branch_recovery::refuse_import_if_fenced(&db, store, &[], action).await
+    })
 }
 
 /// The run that already owns `job_id`'s launch: its latest run is non-terminal and

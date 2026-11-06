@@ -28,7 +28,7 @@ diffy = "0.5"
 # refusal name the line and column of the first error.
 syn = { version = "2", default-features = false, features = ["full", "parsing"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"

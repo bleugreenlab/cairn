@@ -596,15 +596,13 @@ pub(super) fn undo_branch_rewrite(
 ) -> String {
     let cleanup = jj.cleanup_env();
     let jj = &cleanup;
-    let undone = restore_operation(jj, store, pre_op).and_then(|()| {
-        export_bookmark_advance(
-            jj,
-            store,
-            true,
-            branch,
-            &format!("jj git export (refused {rewrite} undone)"),
-        )
-    });
+    let undone = super::reconcile::restore_operation_and_export(
+        jj,
+        store,
+        pre_op,
+        branch,
+        &format!("jj git export (refused {rewrite} undone)"),
+    );
     match undone {
         Ok(()) => reason,
         Err(error) => {

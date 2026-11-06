@@ -444,6 +444,123 @@ async fn stale_verified_landing_refuses_without_moving_target() {
     );
 }
 
+/// A recovery fence on `bookmark` at `tip`, as an unverified rollback leaves.
+fn fence_coordinates(
+    scope: crate::jj::RecoveryScope,
+    bookmark: &str,
+    tip: &str,
+) -> crate::jj::RecoveryCoordinates {
+    crate::jj::RecoveryCoordinates {
+        scope,
+        phase: crate::jj::RollbackFailurePhase::ExportUnverified,
+        pre_op: Some("0".repeat(40)),
+        pre_view: None,
+        pre_git: None,
+        failed_view: None,
+        bookmarks: vec![crate::jj::BookmarkRecovery {
+            bookmark: bookmark.to_string(),
+            pre: cairn_vcs::BookmarkState::normal(tip),
+            pre_git: Some(tip.to_string()),
+            failed: cairn_vcs::BookmarkState::normal(tip),
+        }],
+        survivors: Vec::new(),
+        evidence: vec!["test fence".into()],
+    }
+}
+
+/// A verified landing whose source is fenced after verification is refused
+/// under the landing guard, and neither the store's target nor origin moves.
+/// A store fence refuses a landing between two unfenced branches too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fenced_branch_is_never_folded_by_a_verified_landing() {
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let plan = prospective_store_merge_child(&fx.orch, &fx.ctx, "squash")
+        .await
+        .expect("clean prospective merge");
+    let target_before = crate::jj::bookmark_commit(&fx.jj, &fx.store, fx.int).unwrap();
+    let origin_before = git_stdout(&fx.origin_path, &["rev-parse", fx.int]);
+    let source_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch).unwrap();
+
+    let records = crate::orchestrator::branch_recovery::record_recoveries(
+        &fx.orch.db.local,
+        "proj-1",
+        &fx.store,
+        Some(&fx.ctx.source_branch),
+        crate::orchestrator::branch_recovery::BUDGET_AUTOMATIC,
+        "test",
+        vec![fence_coordinates(
+            crate::jj::RecoveryScope::Branch,
+            &fx.ctx.source_branch,
+            &source_tip,
+        )],
+    )
+    .await
+    .unwrap();
+    let refusal =
+        land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan, &test_trace(&fx).await)
+            .await
+            .unwrap_err();
+    assert!(refusal.contains(&records[0].id), "{refusal}");
+    assert!(
+        refusal.contains("Merging this pull request refused"),
+        "{refusal}"
+    );
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, fx.int).unwrap(),
+        target_before
+    );
+    assert_eq!(
+        git_stdout(&fx.origin_path, &["rev-parse", fx.int]),
+        origin_before
+    );
+
+    // A store fence on an unrelated bookmark still refuses the landing.
+    fx.orch
+        .db
+        .local
+        .execute("DELETE FROM jj_branch_recoveries", ())
+        .await
+        .unwrap();
+    crate::orchestrator::branch_recovery::record_recoveries(
+        &fx.orch.db.local,
+        "proj-1",
+        &fx.store,
+        None,
+        crate::orchestrator::branch_recovery::BUDGET_AUTOMATIC,
+        "test",
+        vec![fence_coordinates(
+            crate::jj::RecoveryScope::Store,
+            "agent/unrelated",
+            &source_tip,
+        )],
+    )
+    .await
+    .unwrap();
+    let refusal =
+        land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan, &test_trace(&fx).await)
+            .await
+            .unwrap_err();
+    assert!(refusal.contains("store scope"), "{refusal}");
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, fx.int).unwrap(),
+        target_before
+    );
+
+    // With the fence repaired, the same verified plan lands.
+    fx.orch
+        .db
+        .local
+        .execute("UPDATE jj_branch_recoveries SET status = 'repaired'", ())
+        .await
+        .unwrap();
+    let landed =
+        land_verified_store_merge_child(&fx.orch, &fx.ctx, "squash", &plan, &test_trace(&fx).await)
+            .await
+            .expect("an unfenced landing proceeds");
+    assert!(matches!(landed, VerifiedLanding::Landed(_)));
+}
+
 /// A store-lock trace for calling a function that reports phases into one.
 async fn test_trace(fx: &MergeFixture) -> crate::orchestrator::JjStoreOperationTrace {
     fx.orch

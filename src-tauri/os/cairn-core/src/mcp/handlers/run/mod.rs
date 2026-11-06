@@ -1507,6 +1507,14 @@ async fn publish_available_delta(
     // preserves the author, so withholding the identity here leaves the
     // amended commit unpushable.
     let identity = author.cloned();
+    let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, store_dir).await;
+    crate::orchestrator::branch_recovery::refuse_if_fenced(
+        &fence_db,
+        store_dir,
+        &[branch],
+        "This commit",
+    )
+    .await?;
     let crate::jj::PublishedLogicalHead {
         landed,
         export,
