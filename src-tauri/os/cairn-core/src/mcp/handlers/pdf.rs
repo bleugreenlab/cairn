@@ -1,79 +1,121 @@
 //! Typed PDF extraction.
 //!
-//! `.pdf` reads (a local `file:` PDF or a remote `.pdf` URL) route here from
-//! [`super::web`]. The active provider (`config::pdf`) decides how the bytes
-//! become text:
+//! Two callers, one extractor:
 //!
-//! - **Local** (the default): a pure-Rust extractor that reads the bytes (from
-//!   disk or over HTTP) and pulls out the text. No auth.
-//! - **bmd**: routes remote PDF URLs through bmd's `fetch` tool (the same MCP
-//!   path as bmd web fetch). bmd's HTTP fetch cannot read local bytes, so a
-//!   local PDF file falls back to the local extractor.
+//! - A **local** `file:` PDF is an ordinary file read (`read/file.rs`). It is
+//!   gated, resolved and read exactly like any other `file:` target, and only
+//!   its finished bytes pass through [`file_text_bytes`] to become text. There
+//!   is deliberately no PDF-specific path to disk here: a second one would need
+//!   its own copy of the protected-path, deny-read and logical-root checks.
+//! - A **remote** `.pdf` URL routes here from [`super::web`], and the active
+//!   provider (`config::pdf`) decides how it becomes text. **Local** (the
+//!   default) downloads the bytes and extracts them in-process; **bmd** routes
+//!   the URL through bmd's `fetch` tool (the same MCP path as bmd web fetch).
+
+use std::borrow::Cow;
+use std::path::Path;
 
 use crate::config::pdf::{self, PdfProviderId};
 use crate::orchestrator::Orchestrator;
 
-/// Whether the target is a PDF: a local `file:` target (only PDFs reach the web
-/// handler as files) or a URL whose path ends in `.pdf` (ignoring any query).
-pub(crate) fn is_pdf_target(target: &str, is_file: bool) -> bool {
-    is_file
-        || target
-            .split('?')
-            .next()
-            .unwrap_or(target)
-            .to_lowercase()
-            .ends_with(".pdf")
+/// Whether a URL's path ends in `.pdf` (ignoring any query).
+pub(crate) fn is_pdf_url(url: &str) -> bool {
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .to_lowercase()
+        .ends_with(".pdf")
 }
 
-/// Extract a PDF (local file or remote URL) to text via the active PDF provider.
-pub(crate) async fn read_pdf_markdown(
+/// Whether a file path names a PDF, by extension.
+pub(crate) fn is_pdf_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+/// The bytes a file read renders for a file it has already read: a PDF's
+/// extracted text, or the bytes unchanged for any other file.
+pub(crate) fn file_text_bytes<'a>(path: &Path, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
+    if !is_pdf_path(path) {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    extract_text(bytes).map(|text| Cow::Owned(text.into_bytes()))
+}
+
+/// Extract the text of PDF bytes already in hand (a file read, an attachment).
+pub(crate) fn extract_text(bytes: &[u8]) -> Result<String, String> {
+    pdf_extract::extract_text_from_mem(bytes)
+        .map_err(|error| format!("Failed to extract text from PDF: {error}"))
+}
+
+/// Extract a remote PDF URL to text via the active PDF provider.
+pub(crate) async fn read_pdf_url_markdown(
     orch: &Orchestrator,
-    resolved_target: &str,
-    original_target: &str,
-    is_file: bool,
+    url: &str,
 ) -> Result<String, String> {
     match pdf::resolve_active_pdf(&orch.config_dir) {
-        PdfProviderId::Local => local_extract(resolved_target, original_target, is_file).await,
-        PdfProviderId::Bmd => {
-            if is_file {
-                // bmd's HTTP fetch cannot read local bytes; fall back to local.
-                local_extract(resolved_target, original_target, is_file).await
-            } else {
-                super::fetch_web::bmd_fetch(orch, original_target).await
-            }
-        }
+        PdfProviderId::Local => download_and_extract(url).await,
+        PdfProviderId::Bmd => super::fetch_web::bmd_fetch(orch, url).await,
     }
 }
 
-/// Pure-Rust local extraction: read the bytes (from disk or over HTTP) and pull
-/// out the text.
-async fn local_extract(
-    resolved_target: &str,
-    original_target: &str,
-    is_file: bool,
-) -> Result<String, String> {
-    let bytes = if is_file {
-        std::fs::read(resolved_target)
-            .map_err(|e| format!("Failed to read `{original_target}`: {e}"))?
-    } else {
-        let resp = cairn_tls::client()
-            .get(resolved_target)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to download `{original_target}`: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!(
-                "Download of `{original_target}` failed: HTTP {}",
-                resp.status().as_u16()
-            ));
-        }
-        resp.bytes()
-            .await
-            .map_err(|e| format!("Failed to read `{original_target}`: {e}"))?
-            .to_vec()
-    };
+/// Pure-Rust extraction of a remote PDF: download the bytes and pull out the text.
+async fn download_and_extract(url: &str) -> Result<String, String> {
+    let resp = cairn_tls::client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download `{url}`: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Download of `{url}` failed: HTTP {}",
+            resp.status().as_u16()
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read `{url}`: {e}"))?;
     pdf_extract::extract_text_from_mem(&bytes)
-        .map_err(|e| format!("Failed to extract text from `{original_target}`: {e}"))
+        .map_err(|e| format!("Failed to extract text from `{url}`: {e}"))
+}
+
+/// A minimal, well-formed one-page PDF whose page shows `text` in Helvetica.
+/// The xref offsets are exact so extractors parse it as a real document.
+#[cfg(test)]
+pub(crate) fn text_pdf(text: &str) -> Vec<u8> {
+    let content = format!("BT /F1 12 Tf 72 712 Td ({text}) Tj ET");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_string(),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+    }
+    let xref_offset = pdf.len();
+    let mut xref = format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+    for offset in offsets {
+        xref.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    xref.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+        objects.len() + 1
+    ));
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf
 }
 
 #[cfg(test)]
@@ -81,13 +123,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_pdf_target_detects_files_and_urls() {
-        assert!(is_pdf_target("file:docs/design.pdf", true));
-        assert!(is_pdf_target("https://example.com/a.pdf", false));
-        assert!(is_pdf_target("https://example.com/a.PDF", false));
-        assert!(is_pdf_target("https://example.com/a.pdf?x=1", false));
-        assert!(!is_pdf_target("https://example.com/page", false));
-        assert!(!is_pdf_target("https://example.com/notpdf.html", false));
+    fn is_pdf_url_detects_pdf_paths() {
+        assert!(is_pdf_url("https://example.com/a.pdf"));
+        assert!(is_pdf_url("https://example.com/a.PDF"));
+        assert!(is_pdf_url("https://example.com/a.pdf?x=1"));
+        assert!(!is_pdf_url("https://example.com/page"));
+        assert!(!is_pdf_url("https://example.com/notpdf.html"));
+    }
+
+    #[test]
+    fn file_text_bytes_extracts_pdfs_and_passes_other_files_through() {
+        let pdf = text_pdf("needle-in-pdf");
+        let text = file_text_bytes(Path::new("docs/a.PDF"), &pdf).unwrap();
+        assert!(
+            String::from_utf8_lossy(&text).contains("needle-in-pdf"),
+            "{}",
+            String::from_utf8_lossy(&text)
+        );
+
+        let plain = file_text_bytes(Path::new("notes.txt"), b"plain").unwrap();
+        assert!(matches!(plain, Cow::Borrowed(b"plain")));
+
+        let error = file_text_bytes(Path::new("fake.pdf"), b"not a pdf").unwrap_err();
+        assert!(
+            error.starts_with("Failed to extract text from PDF"),
+            "{error}"
+        );
     }
 
     /// A small, well-formed PDF whose only object is `depth` nested arrays. The

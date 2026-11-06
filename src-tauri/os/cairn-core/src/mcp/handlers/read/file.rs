@@ -896,6 +896,19 @@ pub(crate) fn produce_archived_file_segment(
     let rel_path = rel_path.as_str();
     let path = std::path::Path::new(rel_path);
 
+    // The live producer renders a PDF's extracted text in its plain and grep
+    // arms; reconstruction renders the same text so the two compare equal.
+    let text;
+    let bytes = if matches!(projection, ReadProjection::Grep(_) | ReadProjection::None) {
+        text = match crate::mcp::handlers::pdf::file_text_bytes(path, bytes) {
+            Ok(text) => text,
+            Err(error) => return Ok(error_segment(uri, error)),
+        };
+        &*text
+    } else {
+        bytes
+    };
+
     match projection {
         ReadProjection::Glob { .. } => {
             unreachable!("parse_archived_file_target refuses glob projections")
@@ -1577,7 +1590,11 @@ pub(crate) async fn produce_file_segment_with(
                         Ok(Err(plan)) => read_ignored_materialization(orch, request, plan).await,
                         Err(error) => Err(error),
                     };
-                    match bytes {
+                    let text = bytes.and_then(|bytes| {
+                        crate::mcp::handlers::pdf::file_text_bytes(full_path, &bytes)
+                            .map(|text| text.into_owned())
+                    });
+                    match text {
                         Ok(bytes) => {
                             let label = full_path
                                 .file_name()
@@ -1604,7 +1621,13 @@ pub(crate) async fn produce_file_segment_with(
                     }
                 }
             } else if single_file {
-                match std::fs::read(full_path) {
+                let text = std::fs::read(full_path)
+                    .map_err(|error| format!("Failed to read file: {error}"))
+                    .and_then(|bytes| {
+                        crate::mcp::handlers::pdf::file_text_bytes(full_path, &bytes)
+                            .map(|text| text.into_owned())
+                    });
+                match text {
                     Ok(bytes) => {
                         let label = full_path
                             .file_name()
@@ -1616,12 +1639,7 @@ pub(crate) async fn produce_file_segment_with(
                             &grep_payload,
                         )
                     }
-                    Err(error) => {
-                        return Produced::Segment(error_segment(
-                            uri,
-                            format!("Failed to read file: {error}"),
-                        ))
-                    }
+                    Err(error) => return Produced::Segment(error_segment(uri, error)),
                 }
             } else {
                 grep_payload.path = Some(full_path.display().to_string());
@@ -1826,6 +1844,10 @@ pub(crate) async fn produce_file_segment_with(
                         ))
                     }
                 }
+            };
+            let bytes = match crate::mcp::handlers::pdf::file_text_bytes(full_path, &bytes) {
+                Ok(text) => text.into_owned(),
+                Err(error) => return Produced::Segment(error_segment(uri, error)),
             };
             if let Some(summary) = render_mat_file_summary(full_path, &bytes) {
                 return match summary {

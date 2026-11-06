@@ -1,15 +1,15 @@
 //! Typed PDF-extraction service catalog.
 //!
-//! PDF reads (`read` of a local `.pdf` file or a remote `.pdf` URL) are their
-//! own typed service, parallel to web fetch ([`super::web_fetch`]) and web
-//! search ([`super::web_search`]). Selection is a single workspace scalar
-//! `activePdf`; per-provider options live under `pdf.<provider>`.
+//! Remote `.pdf` URL reads are their own typed service, parallel to web fetch
+//! ([`super::web_fetch`]) and web search ([`super::web_search`]). Selection is
+//! a single workspace scalar `activePdf`; per-provider options live under
+//! `pdf.<provider>`. A local `.pdf` is an ordinary `file:` read and never
+//! consults this catalog.
 //!
-//! - **Local** (the default) — a pure-Rust extractor that works on local files
-//!   and remote PDF URLs with no auth.
+//! - **Local** (the default) — downloads the URL and extracts it with a
+//!   pure-Rust extractor, no auth.
 //! - **bmd** — routes remote PDF URLs through the configured `bmd` MCP server's
-//!   `fetch` tool. bmd's HTTP fetch cannot read local bytes, so local PDF files
-//!   fall back to the local extractor.
+//!   `fetch` tool.
 
 use super::provider_options::{validate_options, ProviderOption};
 use serde::{Deserialize, Serialize};

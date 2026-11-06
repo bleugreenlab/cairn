@@ -252,20 +252,15 @@ async fn produce_segment(
     }
     Produced::Segment(error_segment(
         target,
-        format!(
-            "Invalid target: expected cairn://…, file:…, an http(s) URL, or a local .pdf path, got '{target}'"
-        ),
+        format!("Invalid target: expected cairn://…, file:…, or an http(s) URL, got '{target}'"),
     ))
 }
 
+/// An `http(s)://` URL. A local PDF is not a web target: it is a `file:` read,
+/// so it meets the same protected-path, deny-read and logical-root checks as
+/// every other file before its bytes are read.
 fn is_web_target(target: &str) -> bool {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return true;
-    }
-    let base = split_target_query(target)
-        .map(|split| split.identity)
-        .unwrap_or_else(|_| target.to_string());
-    base.to_lowercase().ends_with(".pdf")
+    target.starts_with("http://") || target.starts_with("https://")
 }
 
 /// A canonical `cairn://` target, or a deictic `cairn:~` / `cairn:@` one. The
@@ -1532,7 +1527,8 @@ mod tests {
     fn web_targets_are_classified() {
         assert!(is_web_target("https://example.com"));
         assert!(is_web_target("http://example.com/x"));
-        assert!(is_web_target("file:docs/design.PDF?offset=1"));
+        assert!(is_web_target("https://example.com/paper.pdf"));
+        assert!(!is_web_target("file:docs/design.PDF?offset=1"));
         assert!(!is_web_target("file:src/lib.rs"));
         assert!(!is_web_target("cairn://p/X/1"));
     }
@@ -2520,5 +2516,173 @@ omega-24')",
 
         assert!(text.contains("Terminal 'ci' not found"), "{text}");
         assert!(!text.contains("read_resource"), "{text}");
+    }
+
+    async fn orch_with_config(config: &std::path::Path) -> Orchestrator {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, SearchIndex};
+        use std::sync::Arc;
+
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            config.to_path_buf(),
+        )
+        .build()
+    }
+
+    /// One target composed exactly as an agent's `read` composes it, returning
+    /// its single segment's kind and final body.
+    async fn compose_one(
+        orch: &Orchestrator,
+        worktree: &std::path::Path,
+        run_id: Option<&str>,
+        target: &str,
+    ) -> (SegmentKind, String) {
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: worktree.display().to_string(),
+            run_id: run_id.map(str::to_string),
+            tool: "read_batch".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+            origin: None,
+        };
+        let options = ReadOptions {
+            budget: view::ReadBudget::Context,
+            include_bodies: true,
+            fence_ask: FenceAsk::Ask,
+        };
+        let cursors = Mutex::new(HashMap::new());
+        match compose_read(orch, &request, &cursors, &[target.to_string()], options).await {
+            Composed::Envelope(envelope) => (
+                envelope.segments[0].kind,
+                envelope.bodies.expect("bodies requested")[0].clone(),
+            ),
+            Composed::Suspended(message) => panic!("{target}: suspended: {message}"),
+            Composed::Declined { reason, .. } => panic!("{target}: declined: {reason}"),
+        }
+    }
+
+    /// A PDF in a deny-listed directory meets the same deny-read crossing a
+    /// text file there does. The run here has no resolvable permission context,
+    /// so the crossing reports that rather than prompting; what matters is that
+    /// both reads stop at the same gate with the same answer, and neither
+    /// returns the file's contents.
+    #[tokio::test]
+    async fn pdf_in_a_deny_listed_directory_meets_the_same_crossing_as_a_text_file() {
+        let config = tempfile::tempdir().unwrap();
+        let denied = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("settings.yaml"),
+            format!("sandboxDenyRead:\n  - {}\n", denied.path().display()),
+        )
+        .unwrap();
+        std::fs::write(denied.path().join("secret.txt"), "txt-secret\n").unwrap();
+        std::fs::write(
+            denied.path().join("secret.pdf"),
+            crate::mcp::handlers::pdf::text_pdf("pdf-secret"),
+        )
+        .unwrap();
+        let orch = orch_with_config(config.path()).await;
+        let worktree = tempfile::tempdir().unwrap();
+
+        let target = |name: &str| format!("file:{}", denied.path().join(name).display());
+        let (txt_kind, txt_body) = compose_one(
+            &orch,
+            worktree.path(),
+            Some("unknown-run"),
+            &target("secret.txt"),
+        )
+        .await;
+        let (pdf_kind, pdf_body) = compose_one(
+            &orch,
+            worktree.path(),
+            Some("unknown-run"),
+            &target("secret.pdf"),
+        )
+        .await;
+
+        assert_eq!(txt_kind, SegmentKind::Error, "{txt_body}");
+        assert!(
+            txt_body.contains("permission context unavailable"),
+            "{txt_body}"
+        );
+        assert_eq!(pdf_kind, SegmentKind::Error, "{pdf_body}");
+        assert_eq!(
+            pdf_body.replace("secret.pdf", "secret.X"),
+            txt_body.replace("secret.txt", "secret.X"),
+            "a PDF must meet the same crossing as a text file"
+        );
+        assert!(!pdf_body.contains("pdf-secret"), "{pdf_body}");
+    }
+
+    /// A worktree `x.pdf` that is a symlink to the operator credential is
+    /// judged by the path it resolves to and refused, whether named logically
+    /// or absolutely. The credential here is a real PDF, so a read that got as
+    /// far as the bytes would have returned its text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pdf_symlink_to_the_operator_credential_is_refused() {
+        let config = tempfile::tempdir().unwrap();
+        let credential = crate::authorization::protected::operator_credential_path(config.path());
+        std::fs::write(
+            &credential,
+            crate::mcp::handlers::pdf::text_pdf("credential-bytes"),
+        )
+        .unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let link = worktree.path().join("x.pdf");
+        std::os::unix::fs::symlink(&credential, &link).unwrap();
+        let orch = orch_with_config(config.path()).await;
+
+        for target in ["file:x.pdf".to_string(), format!("file:{}", link.display())] {
+            let (kind, body) = compose_one(&orch, worktree.path(), None, &target).await;
+            assert_eq!(kind, SegmentKind::Error, "{target}: {body}");
+            assert!(
+                body.contains(cairn_sandbox::OPERATOR_CREDENTIAL_REFUSAL),
+                "{target}: {body}"
+            );
+            assert!(!body.contains("credential-bytes"), "{target}: {body}");
+        }
+    }
+
+    /// An ordinary PDF in the worktree still reads as text, and greps over
+    /// that text rather than the raw PDF bytes.
+    #[tokio::test]
+    async fn worktree_pdf_still_reads_and_greps_as_text() {
+        let config = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            worktree.path().join("design.pdf"),
+            crate::mcp::handlers::pdf::text_pdf("needle-design"),
+        )
+        .unwrap();
+        let orch = orch_with_config(config.path()).await;
+
+        let (kind, body) = compose_one(&orch, worktree.path(), None, "file:design.pdf").await;
+        assert_eq!(kind, SegmentKind::File, "{body}");
+        assert!(body.contains("needle-design"), "{body}");
+
+        let (kind, body) = compose_one(
+            &orch,
+            worktree.path(),
+            None,
+            "file:design.pdf?grep=needle-design",
+        )
+        .await;
+        assert_eq!(kind, SegmentKind::Grep, "{body}");
+        assert!(body.contains("design.pdf\n"), "{body}");
+        assert!(body.contains(":needle-design"), "{body}");
     }
 }

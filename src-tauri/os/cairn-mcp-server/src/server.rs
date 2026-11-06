@@ -205,7 +205,7 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
 Targets (mix freely within one call):
 - File: `file:` (worktree root), `file:src/lib.rs` (worktree-relative), `file:/abs/path` (absolute / global)
 - Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` and the other `cairn://` families (posts, feed, executors, channels, models, inference, help); `cairn:~/...` resolves against the run home. Source-control questions need no checkout: `cairn:@/vcs/diff`, `/vcs/ancestry` (fork point, ahead/behind, is X in main), `/vcs/log` and `/vcs/blame` answer from the store and take the same refs `branch=` does. Services are project-declared supervised processes at `cairn://p/PROJECT/services/<name>` (with `/status` and `/log`): a `write` patch `{action:"start"|"stop"|"restart"}` controls one, and an append `{method, params}` calls it. Every resource read returns an affordance block listing its filters, links, and actions.
-- Web: `http(s)://...` URLs and local `.pdf` paths return markdown; `cairn://websearch?q=QUERY` runs a web search (everything after `q=` is the literal query, so spaces are fine).
+- Web: `http(s)://...` URLs (remote `.pdf` included) return markdown, and a local `file:` PDF reads as its extracted text; `cairn://websearch?q=QUERY` runs a web search (everything after `q=` is the literal query, so spaces are fine).
 - Images: reading an image (an image file, `cairn:~/browser?screenshot`, a stored image URI) shows it to BOTH you and the user, and a durable `![label](cairn://p/PROJECT/ISSUE/images/N)` reference renders in the transcript to carry the image forward.
 
 Per-target scoping rides in each URI's query string — append `?key=value&...`:
