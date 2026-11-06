@@ -25,7 +25,7 @@ use crate::merge_requests::queries::{
 };
 use crate::messages::delivery::{
     latest_run_for_job, queue_system_direct, queue_system_direct_once,
-    queue_system_direct_once_confirmed, DirectQueueDisposition,
+    queue_system_direct_once_confirmed, system_direct_once_message_id, DirectQueueDisposition,
 };
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::ExecutionSnapshot;
@@ -3837,6 +3837,11 @@ async fn execute_reconcile_claim(
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
     let intent_id = claim.id.as_str();
 
+    // One pass visits each branch once. Two jobs on one branch (a node's
+    // successive executions) would otherwise replay it twice, and the second
+    // visit meets the quarantine the first just wrote and rewrites the item as
+    // parked, erasing the conflict it recorded.
+    let specs = unique_branches(specs);
     // List bookmarks once, then transact only live siblings.
     let (specs, skipped_missing) = retain_present_siblings(specs, existing_bookmarks.as_ref());
     if skipped_missing > 0 {
@@ -3850,7 +3855,6 @@ async fn execute_reconcile_claim(
     }
 
     let mut ambiguous: Vec<AmbiguousDivergence> = Vec::new();
-    let mut marker_states: HashMap<String, MarkerState> = HashMap::new();
     let mut pending_quarantines: Vec<PendingReconcileQuarantine> = Vec::new();
     let mut before: HashMap<String, String> = HashMap::new();
     let mut after: HashMap<String, String> = HashMap::new();
@@ -3877,7 +3881,7 @@ async fn execute_reconcile_claim(
         // bookmark or prepare its resolution basis just to decide not to replay
         // it. Admission is rechecked under each mutation guard below.
         let branch_siblings = siblings_for_branch(&siblings, branch);
-        if progress.as_ref().is_none_or(|p| p.status != "graph_moved") {
+        if progress.as_ref().is_none_or(|p| !resumes_past_mutation(p)) {
             if let Some(batch) = inflight_run_batch(db, &branch_siblings).await? {
                 defer_run_batch_reconcile(
                     db,
@@ -3913,6 +3917,27 @@ async fn execute_reconcile_claim(
         };
         let mut quarantine =
             load_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
+        let parked_unannounced = match quarantine.as_ref() {
+            Some(existing)
+                if existing.failure_kind == ROLLED_BACK_CONFLICT
+                    && quarantine_blocks_automatic_replay(
+                        existing,
+                        current_tip.as_deref(),
+                        label,
+                    ) =>
+            {
+                !conflict_wake_queued(db, branch).await?
+            }
+            _ => false,
+        };
+        if parked_unannounced {
+            log::info!(
+                "jj reconcile ({label}): {branch} is parked on a conflict whose blocking note was \
+                 never queued; replaying it so the session is re-recorded and its agent woken"
+            );
+            release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
+            quarantine = None;
+        }
         if let Some(existing) = quarantine.as_ref() {
             if quarantine_blocks_automatic_replay(existing, current_tip.as_deref(), label) {
                 if existing.failure_kind == RECONCILE_TIMEOUT {
@@ -4040,7 +4065,7 @@ async fn execute_reconcile_claim(
         let mut ambiguous_item = None;
         let mut divergence_resolved = false;
         let mut item_report = if let Some(progress) =
-            progress.as_ref().filter(|p| p.status == "graph_moved")
+            progress.as_ref().filter(|p| resumes_past_mutation(p))
         {
             let mut resumed = crate::jj::ReconcileReport::default();
             match progress.outcome_kind.as_deref() {
@@ -4714,6 +4739,7 @@ async fn execute_reconcile_claim(
         // order matters: the session row must exist before the diagnostic can
         // land on it, and the marker state must be recorded from what the
         // executor confirmed before any wake is composed.
+        let mut marker_state: Option<MarkerState> = None;
         if let Some(diagnostic) = item_report.conflict_diagnostics.get(branch) {
             // Inherited from the session open before this pass: which paths of
             // the tip that just failed were resolved against what.
@@ -4726,6 +4752,7 @@ async fn execute_reconcile_claim(
             record_conflict_session(db, intent_id, branch, diagnostic, &notes.incoming, &basis)
                 .await?;
             supersede_stale_sessions(db, branch, intent_id).await?;
+            withdraw_pending_clean_notes(db, branch).await?;
             let (state, marker_diagnostic, dispositions) =
                 materialize_markers_for_branch(orch, db, &claim.project_id, branch, diagnostic)
                     .await;
@@ -4738,7 +4765,7 @@ async fn execute_reconcile_claim(
                 &dispositions,
             )
             .await?;
-            marker_states.insert(branch.clone(), state);
+            marker_state = Some(state);
         } else if item_report.rebased_clean.contains(branch) {
             // The branch absorbed the incoming change, so whatever session it had
             // is genuinely finished. This is the only truthful close: an ordinary
@@ -4753,6 +4780,41 @@ async fn execute_reconcile_claim(
             }) {
                 release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
             }
+        }
+
+        // The blocking note goes out with the session that justifies it, not
+        // after the loop: a pass that dies on a later branch (the base
+        // routinely moves again mid-pass) must not take this one's note with
+        // it. It is sent without the moved-commit filter clean notes use,
+        // because a conflict is rolled back and so never moves the commit;
+        // redundancy is the delivery key's to suppress, and the key carries the
+        // diagnostic's fingerprint so a genuinely new advance still gets through.
+        if item_report.conflicted.contains(branch) {
+            let only = |value| HashMap::from([(branch.clone(), value)]);
+            let evidence = ConflictEvidence {
+                diagnostics: item_report
+                    .conflict_diagnostics
+                    .get(branch)
+                    .cloned()
+                    .map(only)
+                    .unwrap_or_default(),
+                marker_states: marker_state
+                    .map(|state| HashMap::from([(branch.clone(), state)]))
+                    .unwrap_or_default(),
+                carry_notes: carry_notes
+                    .remove(branch)
+                    .map(|note| HashMap::from([(branch.clone(), note)]))
+                    .unwrap_or_default(),
+            };
+            notify_conflicted_siblings(
+                orch,
+                db,
+                &siblings,
+                std::slice::from_ref(branch),
+                &notes.conflict,
+                &evidence,
+                intent_id,
+            )?;
         }
 
         report.rebased_clean.append(&mut item_report.rebased_clean);
@@ -4811,61 +4873,30 @@ async fn execute_reconcile_claim(
         })
         .collect();
 
-    // Conflicted siblings are notified WITHOUT the rewritten filter, deliberately.
-    // A conflicting rebase is now rolled back, so the branch's commit is exactly
-    // what it was — the very condition `siblings_rewritten` reads as "nothing
-    // happened". Filtering here would silence every conflict this reconcile found.
-    // Redundancy is instead handled where it belongs: the delivery key is scoped
-    // to this intent, so a resumed or double-fired reconcile at the same dest
-    // cannot re-wake the agent, while a genuinely new base advance (a new intent)
-    // correctly does.
-    if report.conflicted.is_empty() {
-        log::debug!("jj reconcile ({label}): no sibling conflicted with the advanced base");
-    } else {
-        // The conflicting files come from the reconcile report, captured inside
-        // the rebase before it was rolled back. Nothing can enumerate them here:
-        // the branch is clean again by now, so a fresh probe would report none.
-        // (The old probe was worse than useless — `conflicted_files` runs
-        // `jj resolve --list`, which is working-copy scoped, so aimed at the bare
-        // store it answered for the store's scratch `@` rather than the sibling.)
-        let evidence = ConflictEvidence {
-            diagnostics: report
-                .conflicted
-                .iter()
-                .filter_map(|branch| {
-                    siblings.iter().find(|sibling| {
-                        sibling_branch(sibling).as_deref() == Some(branch.as_str())
-                    })?;
-                    let diagnostic = report.conflict_diagnostics.get(branch).cloned()?;
-                    Some((branch.clone(), diagnostic))
-                })
-                .collect(),
-            marker_states,
-            carry_notes,
-        };
-        notify_conflicted_siblings(
-            orch,
-            db,
-            &siblings,
-            &report.conflicted,
-            &notes.conflict,
-            &evidence,
-            intent_id,
-        )?;
-    }
-
     // Cleanly-rebased siblings: nothing to resolve, but their branch moved — a
     // passive (non-waking) note rides along into their next natural run.
     let mut clean_rewritten = siblings_rewritten(&report.rebased_clean, &before, &after);
     clean_rewritten.retain(|branch| !report.silent.contains(branch));
-    if clean_rewritten.is_empty() {
-        log::debug!("jj reconcile ({label}): clean rebases unchanged since a prior reconcile; no redundant note");
+    // A clean replay closes its branch's session on the way through, so a
+    // session open now was recorded since, and "nothing to resolve" would
+    // contradict the blocking note that session sent.
+    let mut clean_announced = Vec::with_capacity(clean_rewritten.len());
+    for branch in &clean_rewritten {
+        if crate::orchestrator::conflict_session::load_active_session(db, branch)
+            .await?
+            .is_none()
+        {
+            clean_announced.push(branch.clone());
+        }
+    }
+    if clean_announced.is_empty() {
+        log::debug!("jj reconcile ({label}): clean rebases unchanged since a prior reconcile, or now in conflict; no clean note");
     } else {
         notify_clean_siblings(
             orch,
             db,
             &siblings,
-            &clean_rewritten,
+            &clean_announced,
             &notes.clean,
             intent_id,
         )?;
@@ -5012,6 +5043,109 @@ fn retain_present_siblings(
 /// The sibling's runner-owned logical bookmark.
 fn sibling_branch(sibling: &SiblingJob) -> Option<String> {
     sibling.branch.clone()
+}
+
+/// Each branch once, in first-seen order.
+fn unique_branches(specs: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    specs
+        .into_iter()
+        .filter(|branch| seen.insert(branch.clone()))
+        .collect()
+}
+
+/// Whether a re-claimed pass takes this item up after its graph mutation
+/// instead of replaying it. A conflict never qualifies: its rebase was rolled
+/// back, so the graph did not move, and replaying is what rebuilds the
+/// diagnostic its blocking note is composed from.
+fn resumes_past_mutation(progress: &ReconcileItemProgress) -> bool {
+    progress.status == "graph_moved" && progress.outcome_kind.as_deref() != Some("conflicted")
+}
+
+/// The delivery key of a branch's conflict note, without the diagnostic
+/// fingerprint `notify_conflicted_siblings` appends when it has one. Every
+/// note for one session shares this prefix.
+fn conflict_wake_key(delivery_scope: &str, branch: &str) -> String {
+    format!("{delivery_scope}:{branch}:conflicted")
+}
+
+/// The delivery key of a branch's clean-rebase note.
+fn clean_note_key(delivery_scope: &str, branch: &str) -> String {
+    format!("{delivery_scope}:{branch}:clean")
+}
+
+/// Whether the branch's open conflict session has put its blocking note in an
+/// agent's queue.
+///
+/// A rolled-back conflict parks its branch, and a parked branch is not replayed
+/// again until its tip changes, so the park is only safe once the agent has
+/// been told. The note is the fact to check, not the order things were written
+/// in: a pass can record the session and quarantine and then die before
+/// notifying (the base moving again mid-pass ends one every few minutes), and
+/// the intent it belonged to is then superseded and never revisited.
+async fn conflict_wake_queued(db: &LocalDb, branch: &str) -> Result<bool, String> {
+    let Some(session) =
+        crate::orchestrator::conflict_session::load_active_session(db, branch).await?
+    else {
+        return Ok(false);
+    };
+    let prefix = system_direct_once_message_id(&conflict_wake_key(&session.intent_id, branch));
+    let queued = db
+        .query_text(
+            "SELECT id FROM messages WHERE substr(id, 1, length(?1)) = ?1 LIMIT 1",
+            params![prefix.as_str()],
+        )
+        .await
+        .map_err(|error| format!("read conflict wake for {branch}: {error}"))?;
+    Ok(queued.is_some())
+}
+
+/// Withdraw every clean-rebase note still waiting in a queue for `branch`.
+///
+/// Each was true when it was queued and is false once the branch has an open
+/// conflict session: read after the conflict, "nothing to resolve" is how an
+/// agent learns to discount the one note that matters. Only pending pushes are
+/// dismissed; one already delivered stays delivered, and the message row stays
+/// as the record of what was said.
+async fn withdraw_pending_clean_notes(db: &LocalDb, branch: &str) -> Result<(), String> {
+    let prefix = crate::orchestrator::attention_push::direct_push_key(
+        &system_direct_once_message_id(""),
+        None,
+    );
+    let suffix = clean_note_key("", branch);
+    let ids = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM attention_pushes
+                          WHERE delivered_event_id IS NULL AND retired_at IS NULL
+                            AND substr(key, 1, length(?1)) = ?1
+                            AND substr(key, length(key) - length(?2) + 1) = ?2",
+                        params![prefix.as_str(), suffix.as_str()],
+                    )
+                    .await?;
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    ids.push(row.text(0)?);
+                }
+                Ok(ids)
+            })
+        })
+        .await
+        .map_err(|error| format!("list pending clean notes for {branch}: {error}"))?;
+    for id in &ids {
+        crate::orchestrator::attention_push::delete_pending_by_id(db, id)
+            .await
+            .map_err(|error| format!("withdraw clean note {id}: {error}"))?;
+    }
+    if !ids.is_empty() {
+        log::info!(
+            "jj reconcile: withdrew {} pending clean-rebase note(s) for {branch}, which now has an open conflict session",
+            ids.len()
+        );
+    }
+    Ok(())
 }
 
 /// The IDENTITY half of the note for a sibling whose auto-rebase could not be
@@ -5616,10 +5750,11 @@ fn notify_conflicted_siblings(
         // silently swallowed as a duplicate of the first.
         let key = match diagnostic {
             Some(diagnostic) => format!(
-                "{delivery_scope}:{branch}:conflicted:{}",
+                "{}:{}",
+                conflict_wake_key(delivery_scope, &branch),
                 diagnostic.fingerprint()
             ),
-            None => format!("{delivery_scope}:{branch}:conflicted"),
+            None => conflict_wake_key(delivery_scope, &branch),
         };
         queue_system_direct_once(orch, &run_id, &message, DeliveryUrgency::Steer, &key)?;
         log::info!(
@@ -5733,7 +5868,7 @@ fn notify_clean_siblings(
             );
             continue;
         };
-        let key = format!("{delivery_scope}:{branch}:clean");
+        let key = clean_note_key(delivery_scope, &branch);
         queue_system_direct_once(orch, &run_id, note, DeliveryUrgency::Passive, &key)?;
         log::info!(
             "Passively notified jj sibling job {} of a clean base-advance rebase",
@@ -10502,6 +10637,20 @@ mod real_store_collision_tests {
 
     /// The automatic base advance a merge on main triggers.
     async fn automatic_advance(r: &Replay) {
+        advance_siblings(
+            r,
+            vec![SiblingJob {
+                id: JOB.to_string(),
+                branch: Some(BRANCH.to_string()),
+                base_commit: None,
+            }],
+        )
+        .await;
+    }
+
+    /// An automatic advance over an explicit sibling set.
+    async fn advance_siblings(r: &Replay, siblings: Vec<SiblingJob>) {
+        let eligible = siblings.len();
         let notes = BaseAdvanceNotes {
             conflict: build_jj_conflict_note("main", None, None),
             clean: build_jj_clean_note("main", None, None),
@@ -10518,17 +10667,184 @@ mod real_store_collision_tests {
             &r.fx.repo.to_string_lossy(),
             "main",
             "main",
-            vec![SiblingJob {
-                id: JOB.to_string(),
-                branch: Some(BRANCH.to_string()),
-                base_commit: None,
-            }],
+            siblings,
             notes,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.eligible, 1, "the advance claimed the branch");
+        assert_eq!(outcome.eligible, eligible, "the advance claimed the branch");
         wait_for_worker(r).await;
+    }
+
+    /// Conflict notes queued for `BRANCH`, as (message id, wake level).
+    async fn conflict_wakes(r: &Replay) -> Vec<(String, String)> {
+        let pattern = format!("reconcile:%:{BRANCH}:conflicted%");
+        r.db.read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT m.id, p.wake FROM messages m
+                           JOIN attention_pushes p ON p.key = 'direct:' || m.id
+                          WHERE m.id LIKE ?1 ORDER BY m.created_at, m.id",
+                        params![pattern.as_str()],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push((row.text(0)?, row.text(1)?));
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn pending_clean_notes(r: &Replay) -> i64 {
+        r.db.query_one(
+            "SELECT COUNT(*) FROM attention_pushes
+              WHERE delivered_event_id IS NULL AND retired_at IS NULL AND key LIKE ?1",
+            params![format!("direct:reconcile:%:{BRANCH}:clean")],
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Erase every conflict note for `BRANCH`: the state a pass leaves behind
+    /// when it records the session and quarantine and then dies before notifying.
+    async fn lose_conflict_wakes(r: &Replay) {
+        let pattern = format!("reconcile:%:{BRANCH}:conflicted%");
+        r.db.execute(
+            "DELETE FROM attention_pushes WHERE key LIKE 'direct:' || ?1",
+            params![pattern.as_str()],
+        )
+        .await
+        .unwrap();
+        r.db.execute(
+            "DELETE FROM messages WHERE id LIKE ?1",
+            params![pattern.as_str()],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A parked conflict is silent only once its agent was told. With the note
+    /// lost, the next advance replays the branch, re-records the session and
+    /// wakes the agent; with the note queued, the advance after that parks it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn an_open_conflict_session_wakes_its_agent_even_when_its_note_was_lost() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(&bin, "conflict-wake.db", &[(LIST, "head\n")]).await;
+        let tip = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nX\n")],
+            "branch appends X",
+        );
+        let d1 = commit(&r.fx, &r.main_ws, MAIN_LINE, &[(LIST, "head\nA\n")], "D1");
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+
+        assert!(open_session(&r).await.is_some(), "D1 conflicts");
+        let first = conflict_wakes(&r).await;
+        assert_eq!(first.len(), 1, "the session's note is queued: {first:?}");
+        assert_ne!(first[0].1, "passive", "a conflict note wakes its agent");
+
+        lose_conflict_wakes(&r).await;
+        let d2 = commit(&r.fx, &r.main_ws, MAIN_LINE, &[("other.txt", "o\n")], "D2");
+        set_main(&r.fx, &d2);
+        automatic_advance(&r).await;
+
+        assert_eq!(branch_tip(&r), tip, "the replay conflicted and rolled back");
+        let session = open_session(&r).await.expect("the session is re-recorded");
+        assert_eq!(session.theirs.as_deref(), Some(d2.as_str()));
+        let resent = conflict_wakes(&r).await;
+        assert_eq!(
+            resent.len(),
+            1,
+            "a parked branch whose note was lost is woken again: {resent:?}"
+        );
+        assert!(
+            resent[0].0.contains(&session.intent_id),
+            "the note belongs to the session now open"
+        );
+
+        let d3 = commit(&r.fx, &r.main_ws, MAIN_LINE, &[("third.txt", "t\n")], "D3");
+        set_main(&r.fx, &d3);
+        automatic_advance(&r).await;
+        assert_eq!(
+            conflict_wakes(&r).await,
+            resent,
+            "once its agent was told, an unchanged conflicted tip stays parked"
+        );
+        assert_eq!(
+            open_session(&r).await.map(|session| session.intent_id),
+            Some(session.intent_id),
+            "a parked branch is not replayed again"
+        );
+    }
+
+    /// A branch two jobs share is replayed once per pass, its conflict stays
+    /// recorded as a conflict, and the clean note an earlier advance left
+    /// pending is withdrawn before it can contradict the blocking one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_conflict_withdraws_pending_clean_notes_and_survives_a_shared_branch() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(&bin, "conflict-shared.db", &[(LIST, "head\n")]).await;
+        let both = || {
+            [JOB, "job-replay-earlier"]
+                .into_iter()
+                .map(|id| SiblingJob {
+                    id: id.to_string(),
+                    branch: Some(BRANCH.to_string()),
+                    base_commit: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nX\n")],
+            "branch appends X",
+        );
+        let d1 = commit(&r.fx, &r.main_ws, MAIN_LINE, &[("other.txt", "o\n")], "D1");
+        set_main(&r.fx, &d1);
+        advance_siblings(&r, both()).await;
+        assert_eq!(pending_clean_notes(&r).await, 1, "D1 replays cleanly");
+
+        let d2 = commit(&r.fx, &r.main_ws, MAIN_LINE, &[(LIST, "head\nA\n")], "D2");
+        set_main(&r.fx, &d2);
+        advance_siblings(&r, both()).await;
+
+        let session = open_session(&r).await.expect("D2 conflicts");
+        let outcome = r
+            .db
+            .query_text(
+                "SELECT outcome_kind FROM jj_reconcile_items WHERE intent_id = ?1 AND bookmark = ?2",
+                params![session.intent_id.as_str(), BRANCH],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.as_deref(),
+            Some("conflicted"),
+            "a second visit in the same pass must not rewrite the conflict as parked"
+        );
+        assert_eq!(conflict_wakes(&r).await.len(), 1, "the agent is woken");
+        assert_eq!(
+            pending_clean_notes(&r).await,
+            0,
+            "no clean note is left to deliver while the session is open"
+        );
     }
 
     async fn request_take_committed_tip(r: &Replay) -> String {

@@ -122,6 +122,14 @@ fn fleet_mutation_guard() -> std::sync::MutexGuard<'static, ()> {
 
 const BUILD_SLOTS_KEY: &str = "buildSlots";
 
+fn parse_fleet_block(slots: &serde_yaml::Value) -> Result<crate::fleet::FleetConfig, String> {
+    // Match the settings file's YAML-text read: from_value rejects scalar-to-string
+    // coercions such as the unquoted SSH argument -4 in older fleet files.
+    let yaml = serde_yaml::to_string(slots)
+        .map_err(|error| format!("Failed to serialize buildSlots: {error}"))?;
+    serde_yaml::from_str(&yaml).map_err(|error| format!("Failed to parse buildSlots: {error}"))
+}
+
 fn insert_fleet(
     root: &mut serde_yaml::Mapping,
     config: &crate::fleet::FleetConfig,
@@ -138,14 +146,19 @@ fn insert_fleet(
 /// Replace the runner-owned fleet capability in `settings.yaml` without
 /// routing it through the general Settings DTO. Only `buildSlots` is touched.
 ///
-/// Machine roles are the one part this does NOT replace: the roles already on
-/// disk are kept (less any for a machine `config` no longer declares), whatever
-/// `config` carries. Every caller of this writes back a snapshot it read
+/// Machine roles already on disk are kept (less any for a machine `config`
+/// no longer declares), whatever `config` carries. Every caller of this
+/// writes back a snapshot it read
 /// earlier, so letting it write roles would let a stale snapshot undo a role an
 /// operator set in between, on disk and, at the next start, in placement. Roles
 /// change only through [`mutate_fleet`], which reads, writes and publishes them
 /// as one step. The colocated build root is held the same way: only the
 /// build-root command, which validates the path and writes its marker, sets it.
+/// Machine-service selections are also held from disk, including converted
+/// legacy desktop toggles. Selection edits and machine renames/removals go
+/// through [`mutate_fleet`]. A whole-config snapshot can neither plant nor
+/// restore one, nor undo a selection made after the snapshot was read.
+/// A malformed fleet block is refused, not replaced with defaults.
 pub fn set_fleet(
     config_dir: &std::path::Path,
     config: &crate::fleet::FleetConfig,
@@ -161,9 +174,14 @@ pub fn set_fleet(
             .get(BUILD_SLOTS_KEY)
             .and_then(|slots| slots.get("colocatedBuildRoot"))
             .and_then(|build_root| serde_yaml::from_value(build_root.clone()).ok());
+        let held_services = match root.get(BUILD_SLOTS_KEY) {
+            None => Default::default(),
+            Some(slots) => parse_fleet_block(slots)?.healed().machine_services,
+        };
         let mut next = config.clone();
         next.carry_machine_roles(held_roles);
         next.colocated_build_root = held_build_root;
+        next.machine_services = held_services;
         insert_fleet(root, &next)
     })
 }
@@ -187,9 +205,7 @@ pub fn mutate_fleet<T>(
         mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
             let mut config = match root.get(BUILD_SLOTS_KEY) {
                 None => crate::fleet::FleetConfig::default(),
-                Some(slots) => serde_yaml::from_value::<crate::fleet::FleetConfig>(slots.clone())
-                    .map_err(|error| format!("Failed to parse buildSlots: {error}"))?
-                    .healed(),
+                Some(slots) => parse_fleet_block(slots)?.healed(),
             };
             let result = mutate(&mut config)?;
             insert_fleet(root, &config)?;
@@ -218,8 +234,7 @@ pub fn migrate_desktop_automation(
             let Some(slots) = root.get(BUILD_SLOTS_KEY) else {
                 return Ok(None);
             };
-            let mut config = serde_yaml::from_value::<crate::fleet::FleetConfig>(slots.clone())
-                .map_err(|error| format!("Failed to parse buildSlots: {error}"))?;
+            let mut config = parse_fleet_block(slots)?;
             let Some(notes) = config.adopt_legacy_desktop_automation() else {
                 return Ok(None);
             };
@@ -3655,6 +3670,10 @@ buildSlots:
         let temp = tempfile::TempDir::new().unwrap();
         let yaml = r#"
 buildSlots:
+  machineServices:
+    axon/axon:
+      machines:
+        local: {}
   remoteExecutors:
     bglab-ub:
       host: bglab-ub.local
@@ -3681,16 +3700,30 @@ buildSlots:
         assert_eq!(remote.bootstrapped_at_unix_ms, None);
         assert_eq!(remote.legacy_tunnel_port, Some(43_849));
         assert!(fleet.drained_machines.contains("bglab-mac"));
+        assert!(!fleet.machine_services.is_empty());
+        let selections = fleet.machine_services.clone();
         super::set_fleet(temp.path(), &fleet).unwrap();
         let serialized = std::fs::read_to_string(super::get_settings_path(temp.path())).unwrap();
         assert!(!serialized.contains("tunnelPort"));
         let reopened = super::load_fleet(temp.path());
         assert!(reopened.remote_executors.contains_key("bglab-ub"));
         assert!(reopened.drained_machines.contains("bglab-mac"));
+        assert_eq!(reopened.machine_services, selections);
         assert_eq!(
             reopened.remote_executors["bglab-ub"].legacy_tunnel_port,
             None
         );
+        std::fs::write(super::get_settings_path(temp.path()), yaml).unwrap();
+        super::mutate_fleet(temp.path(), |_| Ok(()), |_| {}).unwrap();
+        assert_eq!(super::load_fleet(temp.path()).machine_services, selections);
+        assert_eq!(
+            super::load_fleet(temp.path()).remote_executors["bglab-ub"].extra_ssh_args,
+            vec!["-4".to_string()]
+        );
+        std::fs::write(super::get_settings_path(temp.path()), yaml).unwrap();
+        assert!(super::migrate_desktop_automation(temp.path())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3771,6 +3804,80 @@ extraSshArgs: []
         )
         .unwrap();
         assert!(super::mutate_fleet(dir, |_| Ok(()), |_: &FleetConfig| {}).is_err());
+    }
+
+    #[test]
+    fn set_fleet_cannot_plant_remove_or_restore_machine_services() {
+        use crate::fleet::{FleetConfig, MachineSelection, MachineServiceKey};
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let key: MachineServiceKey = "axon/axon".parse().unwrap();
+        let mut forged = FleetConfig::default();
+        forged
+            .machine_services
+            .select(key.clone(), "local", MachineSelection::default())
+            .unwrap();
+
+        super::set_fleet(dir, &forged).unwrap();
+        assert!(
+            super::load_fleet(dir).machine_services.is_empty(),
+            "a snapshot cannot plant a selection"
+        );
+        super::mutate_fleet(
+            dir,
+            |fleet| {
+                fleet.machine_services = forged.machine_services.clone();
+                Ok(())
+            },
+            |_| {},
+        )
+        .unwrap();
+        super::set_fleet(dir, &FleetConfig::default()).unwrap();
+        assert_eq!(
+            super::load_fleet(dir).machine_services,
+            forged.machine_services,
+            "an omitted row cannot remove a selection"
+        );
+        super::mutate_fleet(
+            dir,
+            |fleet| {
+                fleet.machine_services = Default::default();
+                Ok(())
+            },
+            |_| {},
+        )
+        .unwrap();
+        super::set_fleet(dir, &forged).unwrap();
+        assert!(
+            super::load_fleet(dir).machine_services.is_empty(),
+            "a stale snapshot cannot restore a selection"
+        );
+    }
+
+    #[test]
+    fn set_fleet_preserves_only_the_disks_legacy_desktop_selection() {
+        use crate::fleet::FleetConfig;
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        let legacy = "desktopAutomation:\n  enabled: true\n  machines:\n    local: {}\n";
+        let forged: FleetConfig = serde_yaml::from_str(legacy).unwrap();
+        super::set_fleet(dir, &forged).unwrap();
+        assert!(super::load_fleet(dir).machine_services.is_empty());
+        std::fs::write(
+            super::get_settings_path(dir),
+            format!(
+                "buildSlots:\n{}",
+                legacy
+                    .lines()
+                    .map(|line| format!("  {line}\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let expected = super::load_fleet(dir).machine_services;
+        assert!(!expected.is_empty());
+        super::set_fleet(dir, &FleetConfig::default()).unwrap();
+        assert_eq!(super::load_fleet(dir).machine_services, expected);
     }
 
     #[test]

@@ -295,6 +295,11 @@ async fn describe_table(
 /// count; it is null for an empty table and for one a declared `rowid` column
 /// shadows. `root` is the store's canonical URI, and `writable` whether it takes
 /// row writes at all.
+///
+/// A writable store is a thread's, which is small and bounded, so each of its
+/// tables also carries `rows`, the exact count, in the same short read: a
+/// rowid high-water is no size at all for a table a service rewrites. The
+/// application database (never writable) is never counted.
 pub(crate) async fn overview_document(
     db: &LocalDb,
     params: &OverviewParams,
@@ -320,7 +325,7 @@ pub(crate) async fn overview_document(
     let mut tables = Vec::with_capacity(selected.len());
     for table in &selected {
         let indexes = catalog.indexes.remove(table).unwrap_or_default();
-        if let Some(entry) = table_document(db, table.clone(), indexes, detail).await? {
+        if let Some(entry) = table_document(db, table.clone(), indexes, detail, writable).await? {
             tables.push(entry);
         }
     }
@@ -342,11 +347,13 @@ pub(crate) async fn overview_document(
 }
 
 /// One table's entry in the overview document, read in a read of its own.
+/// `count` adds the table's exact `rows`.
 async fn table_document(
     db: &LocalDb,
     table: String,
     indexes: Vec<IndexEntry>,
     detail: bool,
+    count: bool,
 ) -> DbResult<Option<serde_json::Value>> {
     use super::db_rows::TableShape;
     use serde_json::{json, Value};
@@ -376,6 +383,15 @@ async fn table_document(
                 "maxRowid": max_rowid,
                 "primaryKey": shape.primary_key().map(|column| column.name.clone()),
             });
+            if count {
+                let sql = format!("SELECT count(*) FROM {}", quote_identifier(&table));
+                let mut rows = conn.query(sql, ()).await?;
+                let counted = match rows.next().await? {
+                    Some(row) => row.get::<i64>(0)?,
+                    None => 0,
+                };
+                entry["rows"] = json!(counted);
+            }
             if detail {
                 let columns: Vec<Value> = shape
                     .columns
@@ -911,7 +927,8 @@ mod tests {
              CREATE INDEX attempts_problem ON attempts(problem);
              CREATE TABLE commits(sha TEXT PRIMARY KEY, subject TEXT NOT NULL);
              CREATE TABLE pairs(a TEXT, b TEXT, PRIMARY KEY (a, b));
-             INSERT INTO attempts(problem) VALUES ('p'), ('q');",
+             INSERT INTO attempts(problem) VALUES ('o'), ('p'), ('q');
+             DELETE FROM attempts WHERE id = 1;",
         )
         .await
         .unwrap();
@@ -938,10 +955,20 @@ mod tests {
         assert_eq!(
             listing["tables"],
             serde_json::json!([
-                {"name": "attempts", "maxRowid": 2, "primaryKey": "id"},
-                {"name": "commits", "maxRowid": null, "primaryKey": "sha"},
-                {"name": "pairs", "maxRowid": null, "primaryKey": null},
+                {"name": "attempts", "maxRowid": 3, "rows": 2, "primaryKey": "id"},
+                {"name": "commits", "maxRowid": null, "rows": 0, "primaryKey": "sha"},
+                {"name": "pairs", "maxRowid": null, "rows": 0, "primaryKey": null},
             ])
+        );
+
+        // A read-only store (the application database) is never counted.
+        let unwritable = overview_document(&db, &params(None), "cairn://db", false)
+            .await
+            .unwrap();
+        let unwritable: serde_json::Value = serde_json::from_str(&unwritable.body).unwrap();
+        assert_eq!(
+            unwritable["tables"][0],
+            serde_json::json!({"name": "attempts", "maxRowid": 3, "primaryKey": "id"})
         );
 
         let detail = overview_document(&db, &params(Some("attempts")), root, false)

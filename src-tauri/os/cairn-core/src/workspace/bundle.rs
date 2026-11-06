@@ -5,8 +5,34 @@ use crate::config::{
     mcp_servers::McpServerConfigExt,
     pack::{self, lock as pack_lock, PackItemKind},
 };
-#[cfg(test)]
 use std::path::Path;
+
+/// Preserve desktop-automation opt-in when converting fleet selections. An
+/// offered pack is not installed by the ordinary startup sync.
+pub(crate) fn migrate_desktop_automation(
+    git: &dyn crate::services::GitClient,
+    fs: &dyn crate::services::FileSystem,
+    config_dir: &Path,
+) -> Result<Option<Vec<String>>, String> {
+    use crate::config::{pack, settings};
+    use cairn_config::fleet::{MachineServiceKey, AXON_MACHINE_SERVICE};
+
+    let notes = settings::migrate_desktop_automation(config_dir)?;
+    let key: MachineServiceKey = AXON_MACHINE_SERVICE.parse()?;
+    if !settings::load_fleet(config_dir)
+        .machine_services
+        .machines_for(&key)
+        .is_empty()
+        && pack::lock::read_lock(config_dir, "axon").is_none()
+    {
+        // Also repairs a selection persisted by an earlier conversion, or by
+        // a conversion whose pack install failed. Never resync an existing pack.
+        let source = pack::source_dir(config_dir)
+            .ok_or("Cannot migrate Axon selection: no recorded app resource directory")?;
+        sync_one_pack(git, fs, &source, config_dir, "axon")?;
+    }
+    Ok(notes)
+}
 #[cfg(test)]
 const DEFAULT_BRANCH: &str = "main";
 #[cfg(test)]
@@ -156,9 +182,121 @@ mod tests {
             .unwrap();
     }
 
+    fn shipped_resources() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("cairn-core manifest is nested under src-tauri")
+    }
+
+    #[test]
+    fn desktop_automation_upgrade_installs_axon_only_for_selected_machines() {
+        use cairn_config::fleet::MachineServiceKey;
+
+        for enabled in [true, false] {
+            let temp = TempDir::new().unwrap();
+            let repo = temp.path().join("home");
+            write(
+                &repo.join("settings.yaml"),
+                &format!("buildSlots:\n  desktopAutomation:\n    enabled: {enabled}\n    machines:\n      local: {{}}\n"),
+            );
+            sync_workspace_packs(
+                &RealGitClient,
+                &RealFileSystem,
+                shipped_resources(),
+                &repo,
+                "1.0.0",
+            )
+            .unwrap();
+            assert!(pack_lock::read_lock(&repo, "axon").is_none());
+            migrate_desktop_automation(&RealGitClient, &RealFileSystem, &repo).unwrap();
+
+            let key: MachineServiceKey = "axon/axon".parse().unwrap();
+            let fleet = crate::config::settings::load_fleet(&repo);
+            let selection = fleet.machine_services.selection(&key, "local");
+            assert_eq!(selection.is_some(), enabled);
+            assert!(selection.is_none_or(|selected| selected.override_command().is_none()));
+            assert_eq!(pack_lock::read_lock(&repo, "axon").is_some(), enabled);
+            assert_eq!(repo.join("services/axon/service.yaml").exists(), enabled);
+            assert_eq!(repo.join("packs/axon/mcp.yaml").exists(), enabled);
+            let before = snapshot_tree(&repo);
+            assert!(
+                migrate_desktop_automation(&RealGitClient, &RealFileSystem, &repo)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                snapshot_tree(&repo),
+                before,
+                "repeat migration writes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_already_migrated_axon_selection_installs_the_offered_pack() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        write(
+            &repo.join("settings.yaml"),
+            "buildSlots:\n  machineServices:\n    axon/axon:\n      machines:\n        local: {}\n",
+        );
+        sync_workspace_packs(
+            &RealGitClient,
+            &RealFileSystem,
+            shipped_resources(),
+            &repo,
+            "1.0.0",
+        )
+        .unwrap();
+        let settings = std::fs::read(repo.join("settings.yaml")).unwrap();
+        migrate_desktop_automation(&RealGitClient, &RealFileSystem, &repo).unwrap();
+        assert!(pack_lock::read_lock(&repo, "axon").is_some());
+        assert!(repo.join("services/axon/service.yaml").exists());
+        assert_eq!(std::fs::read(repo.join("settings.yaml")).unwrap(), settings);
+    }
+
+    #[test]
+    fn an_installed_axon_pack_is_untouched_by_the_opt_in_migration() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        sync_one_pack(
+            &RealGitClient,
+            &RealFileSystem,
+            shipped_resources(),
+            &repo,
+            "axon",
+        )
+        .unwrap();
+        write(
+            &repo.join("settings.yaml"),
+            "buildSlots:\n  machineServices:\n    axon/axon:\n      machines:\n        local: {}\n",
+        );
+        write(&repo.join("services/axon/service.yaml"), "operator edit\n");
+        let before = snapshot_tree(&repo);
+        migrate_desktop_automation(&RealGitClient, &RealFileSystem, &repo).unwrap();
+        assert_eq!(snapshot_tree(&repo), before);
+        sync_workspace_packs(
+            &RealGitClient,
+            &RealFileSystem,
+            shipped_resources(),
+            &repo,
+            "1.0.0",
+        )
+        .unwrap();
+        assert!(
+            pack_lock::read_lock(&repo, "axon").is_some(),
+            "offered does not mean uninstalled"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("services/axon/service.yaml")).unwrap(),
+            "operator edit\n"
+        );
+    }
+
     /// The acceptance path, exercised against the packs this repository actually
     /// ships rather than a fixture: a fresh workspace materializes `core` only,
-    /// `matlab` and `linear` wait in the catalog, and installing each one lands
+    /// `axon`, `matlab`, and `linear` wait in the catalog, and installing the latter two lands
     /// exactly what it carries — files for `matlab`, nothing but a connector for
     /// `linear`. Fixtures can drift from the shipped tree; this cannot.
     #[test]
@@ -199,6 +337,8 @@ mod tests {
         assert!(!repo.join("skills/matlab").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(pack_lock::read_lock(&repo, "linear").is_none());
+        assert!(pack_lock::read_lock(&repo, "axon").is_none());
+        assert!(!repo.join("services/axon").exists());
         let library = crate::library::LibraryContext::configured();
         let catalog = crate::resources::packs::read_packs(
             &repo,
@@ -208,20 +348,21 @@ mod tests {
         );
         assert!(catalog.contains("`matlab`"), "{catalog}");
         assert!(catalog.contains("`linear`"), "{catalog}");
+        let available = crate::resources::packs::read_packs(
+            &repo,
+            &library,
+            &crate::config::machine_services::MachineServiceSnapshot::empty(),
+            Some("available"),
+        );
+        assert!(available.contains("`axon`"), "{available}");
+        let installed: std::collections::BTreeSet<_> = pack_lock::installed_packs(&repo)
+            .into_iter()
+            .map(|pack| pack.id)
+            .collect();
         assert_eq!(
-            crate::resources::packs::read_packs(
-                &repo,
-                &library,
-                &crate::config::machine_services::MachineServiceSnapshot::empty(),
-                Some("installed")
-            )
-            .matches("State: installed")
-            .count(),
-            pack::discover_available_packs(src_tauri)
-                .iter()
-                .filter(|manifest| manifest.default)
-                .count(),
-            "only the default set is installed on a fresh workspace"
+            installed,
+            std::collections::BTreeSet::from(["core".to_string()]),
+            "only core is installed on a fresh workspace"
         );
 
         // Installing matlab lands its skill AND its MCP definition.

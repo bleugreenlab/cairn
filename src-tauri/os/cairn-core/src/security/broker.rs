@@ -1676,7 +1676,8 @@ mod tests {
         assert_eq!(resolve(&HashMap::new()), stored);
 
         let mut sanitizer = Sanitizer::exact();
-        let echoed = sanitizer.text(&format!("late echo: {stored} and {typed}"));
+        let late_echo = format!("late echo: {stored} and {typed}");
+        let echoed = sanitizer.text(&late_echo);
         assert!(!echoed.contains(stored), "stored value leaked: {echoed}");
         assert!(!echoed.contains(typed), "override value leaked: {echoed}");
     }

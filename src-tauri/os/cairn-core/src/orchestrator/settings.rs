@@ -90,7 +90,12 @@ impl Orchestrator {
     /// machine-service selections, if it has not been written yet, and log what
     /// did not carry over exactly. Idempotent.
     pub fn migrate_desktop_automation(&self) -> Result<(), String> {
-        let Some(notes) = settings::migrate_desktop_automation(&self.config_dir)? else {
+        let Some(notes) = crate::workspace::bundle::migrate_desktop_automation(
+            &crate::services::RealGitClient,
+            &crate::services::RealFileSystem,
+            &self.config_dir,
+        )?
+        else {
             return Ok(());
         };
         log::info!("Converted buildSlots.desktopAutomation into buildSlots.machineServices");

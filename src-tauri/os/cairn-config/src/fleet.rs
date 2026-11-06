@@ -243,8 +243,8 @@ pub struct FleetConfig {
     /// The retired per-machine desktop toggles, read only as input to their
     /// conversion into `machineServices.axon/axon`
     /// ([`FleetConfig::adopt_legacy_desktop_automation`]). Every typed read
-    /// converts it through [`FleetConfig::healed`], so a snapshot written back
-    /// by `set_fleet` carries the converted row rather than dropping it, and
+    /// converts it through [`FleetConfig::healed`]. Whole-fleet writes preserve
+    /// the converted selections from disk, not the caller's snapshot, and
     /// `skip_serializing` removes the key at the first write.
     #[serde(default, rename = "desktopAutomation", skip_serializing)]
     pub legacy_desktop_automation: Option<LegacyDesktopAutomation>,
