@@ -411,8 +411,11 @@ pub async fn create_catchup_push(
 }
 
 /// Create the passive catch-up push for **every job that watches** the issue the
-/// addressed node belongs to (CAIRN-3342). The fan-out an operator message goes
-/// through; [`create_catchup_push`] is the per-recipient primitive underneath it.
+/// addressed node belongs to (CAIRN-3342), for a message the **operator** sent
+/// that node: the composer's queued text, an answer to a question, or a direct
+/// message with no sending run. Agent-to-agent traffic inside a child never
+/// comes through here; [`create_catchup_push`] is the per-recipient primitive
+/// underneath it.
 ///
 /// The recipient set is derived, never materialized: [`watcher_jobs_for_issue`]
 /// resolves the issue's current coordinator on every call, plus any explicit
@@ -434,7 +437,6 @@ pub async fn create_catchup_pushes_for_watchers(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
     db: &LocalDb,
     child_uri: &str,
-    exclude_job: Option<&str>,
 ) -> Result<usize, String> {
     let Some(parsed) = cairn_common::uri::parse_uri(child_uri) else {
         return Ok(0);
@@ -453,9 +455,6 @@ pub async fn create_catchup_pushes_for_watchers(
     let issue_id = issue_id_for_issue_uri(db, &issue_uri).await?;
     let mut created = 0usize;
     for recipient in watchers {
-        if Some(recipient.as_str()) == exclude_job {
-            continue;
-        }
         if let Some(issue_id) = issue_id.as_deref() {
             if job_belongs_to_issue(db, &recipient, issue_id).await? {
                 continue;
@@ -481,7 +480,7 @@ pub async fn create_catchup_pushes_for_job(
     else {
         return Ok(0);
     };
-    create_catchup_pushes_for_watchers(host, db, &child_uri, None).await
+    create_catchup_pushes_for_watchers(host, db, &child_uri).await
 }
 
 async fn issue_id_for_issue_uri(db: &LocalDb, issue_uri: &str) -> Result<Option<String>, String> {

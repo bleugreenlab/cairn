@@ -728,8 +728,9 @@ mod tests {
         let db = migrated_db().await;
         seed_parent_job(&db, "job-a").await;
         let sentence = "Your run batch 'cargo test' (cairn:~/batches/req-1) finished: succeeded, committed nothing.";
-        let queue = |db: &LocalDb| {
-            db.write(|c| {
+        let db_ref = &db;
+        let queue = move || {
+            db_ref.write(move |c| {
                 Box::pin(async move {
                     crate::mcp::handlers::run::detached::queue_notice(
                         c,
@@ -742,7 +743,7 @@ mod tests {
                 })
             })
         };
-        queue(&db).await.unwrap();
+        queue().await.unwrap();
         let notice = peek_pending_side_channel_for_job_async(&db, "job-a")
             .await
             .unwrap()
@@ -758,7 +759,7 @@ mod tests {
         assert!(!notice.render().contains("user"));
 
         // Reported twice, queued once.
-        queue(&db).await.unwrap();
+        queue().await.unwrap();
         assert_eq!(pending_run_batch_notice_count(&db, "job-a").await, 1);
         let claimed = claim_pending_side_channel_for_job_async(&db, "job-a")
             .await

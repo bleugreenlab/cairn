@@ -722,6 +722,107 @@ async fn sender_name_for_top_level_sender_unchanged() {
     );
 }
 
+/// Parent the seeded issue under issue 41, driven by a `coordinator` job, so the
+/// child has a derived watcher outside it.
+async fn insert_watching_coordinator(db: &LocalDb) {
+    db.execute_script(
+        "INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+           VALUES ('parent-issue', 'proj-1', 41, 'parent issue', 1, 1);
+         UPDATE issues SET parent_issue_id = 'parent-issue' WHERE id = 'issue-1';
+         INSERT INTO jobs (id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+           VALUES ('coordinator', 'proj-1', 'parent-issue', 'running', 'session-c', 1, 1);",
+    )
+    .await
+    .unwrap();
+}
+
+async fn catchup_count(db: &LocalDb, recipient: &str) -> i64 {
+    let recipient = recipient.to_string();
+    db.read(|conn| {
+        let recipient = recipient.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM attention_pushes
+                     WHERE recipient = ?1 AND key LIKE 'catchup:%'",
+                    params![recipient.as_str()],
+                )
+                .await?;
+            rows.next().await?.expect("count row").i64(0)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// Catch-up to a child's watchers is for the operator's messages to the child.
+/// The cairn/6197 shape: a thread watches an issue whose builder and sub-task
+/// exchange messages all day. None of that correspondence reaches the watcher;
+/// one operator message to the builder reaches it exactly once.
+#[tokio::test(flavor = "current_thread")]
+async fn only_operator_directs_leave_the_watcher_a_catchup() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = orch.db.local.clone();
+    insert_node_and_subtask(&db, "proj").await;
+    insert_watching_coordinator(&db).await;
+
+    for _ in 0..3 {
+        append_direct_message(
+            &orch,
+            &callback_request("write", Some("run-builder")),
+            "proj",
+            42,
+            1,
+            "builder",
+            Some("review"),
+            "builder to its task",
+            false,
+        )
+        .await
+        .expect("builder messages its sub-task");
+        append_direct_message(
+            &orch,
+            &callback_request("write", Some("run-review")),
+            "proj",
+            42,
+            1,
+            "builder",
+            None,
+            "task to its builder",
+            false,
+        )
+        .await
+        .expect("sub-task messages its builder");
+    }
+    assert_eq!(
+        catchup_count(&db, "coordinator").await,
+        0,
+        "agent traffic inside the child must not catch up its watcher"
+    );
+
+    append_direct_message(
+        &orch,
+        &callback_request("write", None),
+        "proj",
+        42,
+        1,
+        "builder",
+        None,
+        "operator to builder",
+        false,
+    )
+    .await
+    .expect("operator messages the builder");
+    assert_eq!(
+        catchup_count(&db, "coordinator").await,
+        1,
+        "the operator's message to the child catches up its watcher once"
+    );
+    for job in ["job-builder", "job-review"] {
+        assert_eq!(catchup_count(&db, job).await, 0, "{job} is on the child");
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_tool_no_augmentation_without_run_id() {
     let (_temp, orch) = common::test_orchestrator().await;

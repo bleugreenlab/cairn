@@ -42,13 +42,11 @@ pub(crate) async fn push_to_issue_watchers(
 pub(crate) async fn create_catchup_pushes_for_watchers(
     db: &LocalDb,
     child_uri: &str,
-    exclude_job: Option<&str>,
 ) -> Result<usize, String> {
     cairn_attention::delivery::create_catchup_pushes_for_watchers(
         Arc::new(crate::attention_host::CoreRecipients),
         db,
         child_uri,
-        exclude_job,
     )
     .await
 }
@@ -1482,7 +1480,7 @@ mod tests {
         add_chat_turn(&db, "t1", 1).await;
 
         assert_eq!(
-            super::create_catchup_pushes_for_watchers(&db, &child_node_uri(), None)
+            super::create_catchup_pushes_for_watchers(&db, &child_node_uri())
                 .await
                 .unwrap(),
             1,
@@ -1811,7 +1809,7 @@ mod tests {
         .unwrap();
         add_chat_turn(&db, "t1", 1).await;
 
-        let created = create_catchup_pushes_for_watchers(&db, &child_node_uri(), None)
+        let created = create_catchup_pushes_for_watchers(&db, &child_node_uri())
             .await
             .unwrap();
 
@@ -1839,7 +1837,7 @@ mod tests {
         add_issue_sub(&db, "child-job").await;
         add_chat_turn(&db, "t1", 1).await;
 
-        create_catchup_pushes_for_watchers(&db, &child_node_uri(), None)
+        create_catchup_pushes_for_watchers(&db, &child_node_uri())
             .await
             .unwrap();
 
@@ -1856,27 +1854,13 @@ mod tests {
         seed(&db, "muted", None, None).await;
         add_chat_turn(&db, "t1", 1).await;
 
-        create_catchup_pushes_for_watchers(&db, &child_node_uri(), None)
+        create_catchup_pushes_for_watchers(&db, &child_node_uri())
             .await
             .unwrap();
 
         let pushes = pending_catchup(&db, "watcher").await;
         assert_eq!(pushes.len(), 1);
         assert_eq!(pushes[0].wake, Wake::Passive);
-    }
-
-    #[tokio::test]
-    async fn a_sender_is_not_told_about_its_own_message() {
-        let db = migrated_db().await;
-        seed(&db, "active", None, None).await;
-        add_chat_turn(&db, "t1", 1).await;
-
-        let created = create_catchup_pushes_for_watchers(&db, &child_node_uri(), Some("watcher"))
-            .await
-            .unwrap();
-
-        assert_eq!(created, 0);
-        assert!(pending_catchup(&db, "watcher").await.is_empty());
     }
 
     #[tokio::test]
@@ -1924,7 +1908,7 @@ mod tests {
         add_chat_turn(&db, "t1", 1).await;
         queue_operator_message(&db, "q-1", 300, "also ship the trusted producer").await;
 
-        create_catchup_pushes_for_watchers(&db, &child_node_uri(), None)
+        create_catchup_pushes_for_watchers(&db, &child_node_uri())
             .await
             .unwrap();
         let digest = catchup_operator_digest(&db, "watcher", "child-job")
@@ -2236,7 +2220,7 @@ mod tests {
         )
         .await;
 
-        let created = create_catchup_pushes_for_watchers(&db, CHILD_NODE, None)
+        let created = create_catchup_pushes_for_watchers(&db, CHILD_NODE)
             .await
             .unwrap();
         assert_eq!(

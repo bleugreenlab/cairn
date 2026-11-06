@@ -662,37 +662,41 @@ pub async fn append_direct_message_with_urgency(
         }
     }
 
-    // The watching coordinator's copy of a message addressed to a child node is a
-    // passive catch-up push (CAIRN-1894), fanned out to every derived watcher of
-    // that node's issue (CAIRN-3342). It never wakes them; it rides along on their
-    // next run. The sender's own job is excluded so an agent messaging a child is
-    // not told about its own message. Sender resolution routes to the database
-    // that owns the sender's run (a team agent's run lives in its replica, not
-    // the private DB), matching how the rest of this handler routes by owner.
-    let (sender_job_id, sender_uri) = match sender_run_id.as_deref() {
+    // Sender resolution routes to the database that owns the sender's run (a team
+    // agent's run lives in its replica, not the private DB), matching how the
+    // rest of this handler routes by owner.
+    let sender_uri = match sender_run_id.as_deref() {
         Some(run_id) => {
             let sender_db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
                 .await
                 .unwrap_or_else(|_| orch.db.local.clone());
-            let job_id = crate::messages::side_channel::job_id_for_run(&sender_db, run_id).await;
-            let uri = match job_id.as_deref() {
-                Some(job_id) => delivery::node_uri_for_job(&sender_db, job_id).await,
+            match crate::messages::side_channel::job_id_for_run(&sender_db, run_id).await {
+                Some(job_id) => delivery::node_uri_for_job(&sender_db, &job_id).await,
                 None => None,
-            };
-            (job_id, uri)
+            }
         }
-        None => (None, None),
+        None => None,
     };
-    match crate::orchestrator::attention_delivery::create_catchup_pushes_for_watchers(
-        &owning_db,
-        &addressed_uri,
-        sender_job_id.as_deref(),
-    )
-    .await
-    {
-        Ok(created) if created > 0 => orch.notifier.emit_change("attention_pushes"),
-        Ok(_) => {}
-        Err(error) => log::warn!("catch-up push creation for {addressed_uri} failed: {error}"),
+
+    // The operator's message to a child node leaves every derived watcher of that
+    // node's issue a passive catch-up push (CAIRN-1894, CAIRN-3342): the watcher
+    // is the one participant who would otherwise never see the operator intervene.
+    // A sender with a run is an agent, and agent traffic inside a child (a builder
+    // and its sub-tasks) is the child's own business: an agent that wants the
+    // watcher to know messages the watcher, and the digest could not say what an
+    // agent wrote anyway. A sender without a run is the operator (an external
+    // CLI/MCP session or a remote intent; see `sender_context`).
+    if sender_run_id.is_none() {
+        match crate::orchestrator::attention_delivery::create_catchup_pushes_for_watchers(
+            &owning_db,
+            &addressed_uri,
+        )
+        .await
+        {
+            Ok(created) if created > 0 => orch.notifier.emit_change("attention_pushes"),
+            Ok(_) => {}
+            Err(error) => log::warn!("catch-up push creation for {addressed_uri} failed: {error}"),
+        }
     }
 
     // Nudge only when the effective wake still wakes an idle recipient. A muted
