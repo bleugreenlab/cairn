@@ -508,17 +508,22 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// The plan steps that read `alias`, whether Turso names it bare
+    /// (`SCAN a …`) or with its table (`SCAN executions AS ex …`).
+    pub(crate) fn steps_reaching<'a>(plan: &'a str, alias: &str) -> Vec<&'a str> {
+        plan.lines()
+            .filter(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                words.get(1) == Some(&alias)
+                    || (words.get(2) == Some(&"AS") && words.get(3) == Some(&alias))
+            })
+            .collect()
+    }
+
     /// Every plan step that reaches `alias` reads only an index.
     pub(crate) fn assert_index_only(plan: &str, aliases: &[&str]) {
         for alias in aliases {
-            let steps: Vec<&str> = plan
-                .lines()
-                .filter(|line| {
-                    line.split_whitespace()
-                        .nth(1)
-                        .is_some_and(|table| table == *alias)
-                })
-                .collect();
+            let steps = steps_reaching(plan, alias);
             assert!(!steps.is_empty(), "no step reaches {alias}:\n{plan}");
             for step in steps {
                 assert!(

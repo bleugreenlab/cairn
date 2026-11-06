@@ -1548,6 +1548,7 @@ impl CairnResource {
             Self::DevLaunchTicket => "cairn://dev/launch-ticket".to_string(),
             Self::Logs => "cairn://logs".to_string(),
             Self::ChannelsConversations => "cairn://channels/conversations".to_string(),
+            Self::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback".to_string(),
             Self::Executors => "cairn://executors".to_string(),
             Self::Grants => "cairn://grants".to_string(),
             Self::Grant { id } => format!("cairn://grants/{id}"),

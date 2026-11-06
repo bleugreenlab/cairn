@@ -12,6 +12,19 @@ pub(crate) const CHANNEL_CONVERSATION: KeySpec = KeySpec::new(
     KeyType::Str,
     "canonical address of a row that carries send",
 );
+pub(crate) const AMBIENT_FEEDBACK_EVENT: KeySpec = KeySpec::new(
+    "event",
+    KeyType::Any,
+    "the event URI the delivered message cites (cairn://p/{project}/events/{id}), or its id",
+);
+pub(crate) const AMBIENT_FEEDBACK_VERDICT: KeySpec =
+    KeySpec::new("verdict", KeyType::Str, "not_mine | reroute");
+pub(crate) const AMBIENT_FEEDBACK_TO: KeySpec = KeySpec::new(
+    "to",
+    KeyType::Str,
+    "the chartered thread URI that owns it; required for reroute, refused for not_mine",
+);
+pub(crate) const AMBIENT_FEEDBACK_NOTE: KeySpec = KeySpec::new("note", KeyType::Str, "");
 pub(crate) const CHANNEL_MESSAGE_CONTENT: KeySpec = KeySpec::new(
     "content",
     KeyType::Str,

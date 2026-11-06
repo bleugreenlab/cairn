@@ -2774,6 +2774,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectTenets => "cairn://p/cairn/tenets",
         K::ProjectTenet => "cairn://p/cairn/tenets/1",
         K::ChannelsConversations => "cairn://channels/conversations",
+        K::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback",
         K::ProjectThreads => "cairn://p/cairn/threads",
         K::Thread => "cairn://p/cairn/design-review",
         K::ProjectMessages => "cairn://p/cairn/messages",

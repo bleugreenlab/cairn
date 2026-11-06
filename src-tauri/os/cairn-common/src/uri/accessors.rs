@@ -399,6 +399,7 @@ impl CairnResource {
             | Self::DevLaunchTicket
             | Self::Logs
             | Self::ChannelsConversations
+            | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }
             | Self::ExecutorAction { .. }
@@ -634,6 +635,7 @@ impl CairnResource {
             | Self::DevLaunchTicket
             | Self::Logs
             | Self::ChannelsConversations
+            | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }
             | Self::ExecutorAction { .. }
@@ -837,6 +839,7 @@ impl CairnResource {
             | Self::DevLaunchTicket
             | Self::Logs
             | Self::ChannelsConversations
+            | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }
             | Self::ExecutorAction { .. }

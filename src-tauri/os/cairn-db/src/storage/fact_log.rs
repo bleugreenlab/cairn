@@ -337,6 +337,22 @@ pub async fn list_facts(db: &LocalDb, filter: FactFilter) -> DbResult<Vec<FactRo
     .await
 }
 
+/// Up to `limit` rows of `source` after `after_id`, oldest first: a cursor
+/// walk for a consumer that settles rows in log order.
+pub async fn list_facts_after(
+    db: &LocalDb,
+    source: &str,
+    after_id: i64,
+    limit: i64,
+) -> DbResult<Vec<FactRow>> {
+    db.query_all(
+        format!("SELECT {COLUMNS} FROM fact_log WHERE source=?1 AND id>?2 ORDER BY id LIMIT ?3"),
+        (source.to_string(), after_id, limit),
+        from_row,
+    )
+    .await
+}
+
 pub async fn get_fact(db: &LocalDb, id: i64) -> DbResult<Option<FactRow>> {
     db.query_opt(
         format!("SELECT {COLUMNS} FROM fact_log WHERE id=?1"),

@@ -4,9 +4,9 @@ use cairn_common::executor_protocol::{
     CellCommandClass, CellExecutionMeta, CommandResourceIdentity, CommandStop, ContentionEstimate,
     ContentionEvidence, ContentionFallback, DurationEstimate, DurationEvidence, DurationFallback,
     ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
-    MemoryKill, ReservationFallback, ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS,
-    DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
-    MIN_CONFIDENT_RESERVATION_SAMPLES,
+    MemoryKill, ProcessDemandBasis, ReservationFallback, ReservationRationale,
+    DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT,
+    MIN_CONFIDENT_DURATION_SAMPLES, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
 use std::sync::Arc;
@@ -376,6 +376,9 @@ pub(super) struct ProcessDemand {
     /// Kills of this suite in this machine context, and the machine total
     /// they happened at.
     pub kills_here: Option<(u32, u64)>,
+    /// Whether the number was measured on this platform, borrowed from
+    /// another, or is the project's class prior.
+    pub basis: ProcessDemandBasis,
 }
 
 impl ProcessDemand {
@@ -422,6 +425,10 @@ pub(super) struct ProcessEvidence {
     /// never the single-process fit. Kept so placement can say what it
     /// declined to judge.
     pub unattributed: Option<ProcessDemand>,
+    /// The work compiles the project's Rust and no single process of it, of
+    /// its suite, or of any of the project's Rust compiles was measured on
+    /// any platform: placement offers it the largest machines first.
+    pub unmeasured_compile: bool,
 }
 
 impl ProcessEvidence {
@@ -430,6 +437,7 @@ impl ProcessEvidence {
         Self {
             demand: ProcessDemand::max(left.demand, right.demand),
             unattributed: ProcessDemand::max(left.unattributed, right.unattributed),
+            unmeasured_compile: left.unmeasured_compile || right.unmeasured_compile,
         }
     }
 
@@ -486,35 +494,54 @@ fn suite_display(suite_key: &str) -> String {
 /// a suite it had just completed there (cairn/6310). Such a peak is returned
 /// as `unattributed`, for the reservation and the record; pricing a borrowed
 /// tree peak is cairn/6263's.
+///
+/// A platform that has measured nothing is not left blind (cairn/6312). A
+/// cold identity on a platform whose sampler, executor build or machines had
+/// never measured it was placed with no single-process demand at all, and
+/// the measurement that would have refused it was the kernel's kill. So when
+/// this platform has no named number, the identity's and its suite's largest
+/// named number on any other platform stands in, marked with the platform it
+/// came from; and when no platform has one, a Rust compile (`class`) stands
+/// on the project's largest measured rustc across its suites, a class prior
+/// that placement defers small machines on rather than refusing them. Only
+/// when the project has measured no rustc anywhere is a Rust compile left
+/// without a number, and then `unmeasured_compile` says so.
 pub(super) async fn resolve_process_demand(
     db: Arc<LocalDb>,
     identity: Option<&CommandResourceIdentity>,
     suite_key: Option<&str>,
+    class: CellCommandClass,
     context: &ProfileContext,
 ) -> ProcessEvidence {
-    let own = match identity {
+    let (own, own_elsewhere) = match identity {
         Some(identity) => load_identity_process_peak(db.clone(), identity, context)
             .await
             .unwrap_or_default(),
-        None => ProcessEvidence::default(),
+        None => (ProcessEvidence::default(), None),
     };
     let suite = match suite_key {
-        Some(key) => load_suite_evidence(db, key, context).await.ok().flatten(),
+        Some(key) => load_suite_evidence(db.clone(), key, context)
+            .await
+            .ok()
+            .flatten(),
         None => None,
     };
     let class_suite =
         suite_key.is_some_and(|key| suite_display(key).starts_with(CLASS_SUITE_PREFIX));
     let suite_applies = !class_suite || own.is_empty();
+    let measured_nowhere = own.is_empty() && own_elsewhere.is_none();
     let kills_here = suite.as_ref().and_then(|suite| suite.kills_here);
     let suite_peak = suite
+        .as_ref()
         .filter(|_| suite_applies)
-        .and_then(|suite| suite.peak)
+        .and_then(|suite| suite.peak.clone())
         .map(|(bytes, name, measured_on)| ProcessDemand {
             peak_bytes: bytes,
             name,
             suite: suite_key.map(suite_display),
             measured_on: Some(measured_on),
             kills_here: None,
+            basis: ProcessDemandBasis::ThisPlatform,
         });
     // The suite's row keeps one peak, a measurement or a victim, with its
     // name; unnamed, it cannot be told from a tree's total, so it is one.
@@ -524,6 +551,30 @@ pub(super) async fn resolve_process_demand(
     };
     let unattributed = ProcessDemand::max(own.unattributed, suite_unattributed);
     let mut demand = ProcessDemand::max(own.demand, suite_named);
+    if demand.is_none() {
+        let suite_elsewhere = suite
+            .as_ref()
+            .filter(|_| !class_suite || measured_nowhere)
+            .and_then(|suite| suite.elsewhere.clone())
+            .map(|(bytes, name, measured_on, platform)| ProcessDemand {
+                peak_bytes: bytes,
+                name: Some(name),
+                suite: suite_key.map(suite_display),
+                measured_on: Some(measured_on),
+                kills_here: None,
+                basis: ProcessDemandBasis::OtherPlatform { platform },
+            });
+        demand = ProcessDemand::max(own_elsewhere, suite_elsewhere);
+    }
+    if demand.is_none() && class.compiles_rust() {
+        if let Some((project_id, _)) = suite_key.and_then(|key| key.split_once('/')) {
+            demand = load_class_prior(db, project_id, context)
+                .await
+                .ok()
+                .flatten();
+        }
+    }
+    let unmeasured_compile = demand.is_none() && class.compiles_rust();
     match (&mut demand, kills_here) {
         (Some(demand), kills) => demand.kills_here = kills,
         (None, Some(kills)) => {
@@ -533,6 +584,7 @@ pub(super) async fn resolve_process_demand(
                 suite: suite_key.map(suite_display),
                 measured_on: Some(context.executor_class.clone()),
                 kills_here: Some(kills),
+                basis: ProcessDemandBasis::ThisPlatform,
             })
         }
         (None, None) => {}
@@ -540,21 +592,42 @@ pub(super) async fn resolve_process_demand(
     ProcessEvidence {
         demand,
         unattributed,
+        unmeasured_compile,
     }
 }
 
-/// What one suite has measured on this platform: its largest process, with
-/// its name and the context that measured it, and its kills in this context.
+/// The name the Linux sampler and the kernel give the Rust compiler, which
+/// marks a peak as one of the project's Rust compiles whatever suite it ran
+/// under.
+const RUST_COMPILER_PROCESS: &str = "rustc";
+
+/// Another platform as a reader of `context`'s machine names it: its
+/// architecture, or its system and architecture when the system differs.
+fn platform_label(os: &str, arch: &str, context: &ProfileContext) -> String {
+    if os == context.os {
+        arch.to_string()
+    } else {
+        format!("{os} {arch}")
+    }
+}
+
+/// What one suite has measured: on this platform, its largest process with
+/// its name and the context that measured it, and its kills in this
+/// context; elsewhere, its largest named process with the context and the
+/// platform that measured it.
 struct SuiteEvidence {
     peak: Option<(u64, Option<String>, String)>,
     kills_here: Option<(u32, u64)>,
+    elsewhere: Option<(u64, String, String, String)>,
 }
 
+/// The identity's evidence on this platform, and its largest single process
+/// measured on any other.
 async fn load_identity_process_peak(
     db: Arc<LocalDb>,
     identity: &CommandResourceIdentity,
     context: &ProfileContext,
-) -> Result<ProcessEvidence, String> {
+) -> Result<(ProcessEvidence, Option<ProcessDemand>), String> {
     let identity = identity.clone();
     let context = context.clone();
     db.read(|conn| {
@@ -563,18 +636,28 @@ async fn load_identity_process_peak(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT executor_class, upper_process_peak_bytes, process_peak_name, oom_victim_rss_bytes
+                    "SELECT executor_class, upper_process_peak_bytes, process_peak_name, oom_victim_rss_bytes, os, arch
                      FROM command_resource_profiles
-                     WHERE identity_version=?1 AND command_identity=?2 AND os=?3 AND arch=?4",
-                    params![identity.version as i64, identity.key, context.os, context.arch],
+                     WHERE identity_version=?1 AND command_identity=?2",
+                    params![identity.version as i64, identity.key],
                 )
                 .await?;
             let mut evidence = ProcessEvidence::default();
+            let mut elsewhere: Option<ProcessDemand> = None;
             while let Some(row) = rows.next().await? {
                 let measured_on = row.get::<String>(0)?;
                 let measured = row.get::<Option<i64>>(1)?.map(|value| value as u64);
                 let name = row.get::<Option<String>>(2)?;
                 let victim = row.get::<Option<i64>>(3)?.map(|value| value as u64);
+                let os = row.get::<String>(4)?;
+                let arch = row.get::<String>(5)?;
+                let basis = if os == context.os && arch == context.arch {
+                    ProcessDemandBasis::ThisPlatform
+                } else {
+                    ProcessDemandBasis::OtherPlatform {
+                        platform: platform_label(&os, &arch, &context),
+                    }
+                };
                 let at = |peak_bytes, name| {
                     Some(ProcessDemand {
                         peak_bytes,
@@ -582,6 +665,7 @@ async fn load_identity_process_peak(
                         suite: None,
                         measured_on: Some(measured_on.clone()),
                         kills_here: None,
+                        basis: basis.clone(),
                     })
                 };
                 // A victim is one process whether or not it was named; a
@@ -590,6 +674,14 @@ async fn load_identity_process_peak(
                     Some(_) => (measured.max(victim), None),
                     None => (victim, measured),
                 };
+                if !basis.is_this_platform() {
+                    // Another platform lends only a single process: a tree's
+                    // total there says even less here than it does there.
+                    if let Some(peak) = single {
+                        elsewhere = ProcessDemand::max(elsewhere, at(peak, name));
+                    }
+                    continue;
+                }
                 if let Some(peak) = single {
                     evidence.demand = ProcessDemand::max(evidence.demand, at(peak, name));
                 }
@@ -598,7 +690,7 @@ async fn load_identity_process_peak(
                         ProcessDemand::max(evidence.unattributed, at(peak, None));
                 }
             }
-            Ok(evidence)
+            Ok((evidence, elsewhere))
         })
     })
     .await
@@ -619,20 +711,41 @@ async fn load_suite_evidence(
             let mut rows = conn
                 .query(
                     "SELECT executor_class, upper_process_peak_bytes, process_peak_name,
-                            oom_kill_count, oom_machine_total_bytes
+                            oom_kill_count, oom_machine_total_bytes, os, arch
                      FROM suite_memory_evidence
-                     WHERE suite_key=?1 AND os=?2 AND arch=?3",
-                    params![suite_key, context.os, context.arch],
+                     WHERE suite_key=?1",
+                    params![suite_key],
                 )
                 .await?;
             let mut evidence = SuiteEvidence {
                 peak: None,
                 kills_here: None,
+                elsewhere: None,
             };
             let mut any = false;
             while let Some(row) = rows.next().await? {
                 any = true;
                 let executor_class = row.get::<String>(0)?;
+                let os = row.get::<String>(5)?;
+                let arch = row.get::<String>(6)?;
+                if os != context.os || arch != context.arch {
+                    let peak = row.get::<Option<i64>>(1)?.map(|value| value as u64);
+                    if let (Some(peak), Some(name)) = (peak, row.get::<Option<String>>(2)?) {
+                        if evidence
+                            .elsewhere
+                            .as_ref()
+                            .is_none_or(|(held, ..)| peak > *held)
+                        {
+                            evidence.elsewhere = Some((
+                                peak,
+                                name,
+                                executor_class,
+                                platform_label(&os, &arch, &context),
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 if let Some(peak) = row.get::<Option<i64>>(1)?.map(|value| value as u64) {
                     if evidence
                         .peak
@@ -651,6 +764,55 @@ async fn load_suite_evidence(
                 }
             }
             Ok(any.then_some(evidence))
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// The class prior for a Rust compile of `project_id` that nothing has
+/// measured on any platform: the largest rustc any of the project's suites
+/// measured, or lost to the kernel, on any machine. A largest rather than a
+/// typical number, because what it guards against is a kill.
+async fn load_class_prior(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    context: &ProfileContext,
+) -> Result<Option<ProcessDemand>, String> {
+    let prefix = format!("{project_id}/");
+    let context = context.clone();
+    db.read(|conn| {
+        let prefix = prefix.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT suite_key, executor_class, os, arch, upper_process_peak_bytes
+                     FROM suite_memory_evidence
+                     WHERE substr(suite_key, 1, ?2) = ?1 AND process_peak_name = ?3
+                       AND upper_process_peak_bytes IS NOT NULL
+                     ORDER BY upper_process_peak_bytes DESC
+                     LIMIT 1",
+                    params![prefix.clone(), prefix.len() as i64, RUST_COMPILER_PROCESS],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let suite_key = row.get::<String>(0)?;
+            let os = row.get::<String>(2)?;
+            let arch = row.get::<String>(3)?;
+            Ok(Some(ProcessDemand {
+                peak_bytes: row.get::<i64>(4)?.max(0) as u64,
+                name: Some(RUST_COMPILER_PROCESS.to_string()),
+                suite: Some(suite_display(&suite_key)),
+                measured_on: Some(row.get::<String>(1)?),
+                kills_here: None,
+                basis: ProcessDemandBasis::ClassPrior {
+                    platform: (os != context.os || arch != context.arch)
+                        .then(|| platform_label(&os, &arch, &context)),
+                },
+            }))
         })
     })
     .await
@@ -2189,10 +2351,16 @@ mod process_peak_tests {
             )
             .await;
         }
-        let demand = resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &fedora)
-            .await
-            .demand
-            .unwrap();
+        let demand = resolve_process_demand(
+            db.clone(),
+            Some(&id),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &fedora,
+        )
+        .await
+        .demand
+        .unwrap();
         assert_eq!(demand.peak_bytes, 10 * GIB);
         assert_eq!(demand.name.as_deref(), Some("rustc"));
         assert_eq!(demand.measured_on.as_deref(), Some("fedora:fedora"));
@@ -2220,6 +2388,7 @@ mod process_peak_tests {
             db.clone(),
             Some(&unseen),
             suite.as_deref(),
+            CellCommandClass::CargoTest,
             &context("bgsrv-ub-device:bgsrv-ub"),
         )
         .await
@@ -2227,16 +2396,151 @@ mod process_peak_tests {
         .unwrap();
         assert_eq!(demand.peak_bytes, 10 * GIB);
         assert_eq!(demand.suite.as_deref(), Some("rust-tests"));
+        assert_eq!(demand.basis, ProcessDemandBasis::ThisPlatform);
+        // cairn/6312: another platform's compiler is borrowed rather than
+        // leaving this one blind, and says where it came from.
         let mac = ProfileContext {
             os: "macos".into(),
             arch: "aarch64".into(),
             ..fedora
         };
+        let borrowed = resolve_process_demand(
+            db,
+            Some(&unseen),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &mac,
+        )
+        .await
+        .demand
+        .expect("another platform's compiler stands in");
+        assert_eq!(borrowed.peak_bytes, 10 * GIB);
         assert_eq!(
-            resolve_process_demand(db, Some(&unseen), suite.as_deref(), &mac).await,
-            ProcessEvidence::default(),
-            "another platform's compiler says nothing here"
+            borrowed.basis,
+            ProcessDemandBasis::OtherPlatform {
+                platform: "linux x86_64".into()
+            }
         );
+    }
+
+    /// cairn/6312's order of evidence for a platform that has measured
+    /// nothing: the identity's largest named peak on any other platform,
+    /// then the project's largest rustc as a class prior, and only then
+    /// nothing, said as such, and only for a Rust compile.
+    #[tokio::test]
+    async fn an_unmeasured_platform_borrows_then_falls_to_the_class_prior() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-borrow.db").await);
+        let ub = context("bgsrv-ub-device:bgsrv-ub");
+        let spark = ProfileContext {
+            arch: "aarch64".into(),
+            ..context("bginf-sp1-device:bginf-sp1")
+        };
+        let compile = CommandResourceIdentity {
+            suite: Some("workspace-compile".into()),
+            ..identity("workspace-compile-a")
+        };
+        let compile_suite = suite_key("cairn", Some(&compile), CellCommandClass::CargoCheck);
+        let resolve = |identity: CommandResourceIdentity, class| {
+            let db = db.clone();
+            let suite = suite_key("cairn", Some(&identity), class);
+            let ub = ub.clone();
+            async move {
+                resolve_process_demand(db, Some(&identity), suite.as_deref(), class, &ub).await
+            }
+        };
+
+        let nothing = resolve(compile.clone(), CellCommandClass::CargoCheck).await;
+        assert_eq!(nothing.demand, None);
+        assert!(
+            nothing.unmeasured_compile,
+            "a Rust compile measured nowhere"
+        );
+        let vitest = CommandResourceIdentity {
+            suite: None,
+            ..identity("vitest")
+        };
+        assert!(
+            !resolve(vitest.clone(), CellCommandClass::Vitest)
+                .await
+                .unmeasured_compile,
+            "only a Rust compile is owed a prior"
+        );
+
+        // Another suite of the project measured a rustc: the class prior.
+        observe_suite(
+            db.clone(),
+            Some("cairn/rust-tests"),
+            &ub,
+            &completed(9 * GIB, 1),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        let prior = resolve(compile.clone(), CellCommandClass::CargoCheck)
+            .await
+            .demand
+            .expect("the class prior");
+        assert_eq!(prior.peak_bytes, 9 * GIB);
+        assert_eq!(prior.suite.as_deref(), Some("rust-tests"));
+        assert_eq!(
+            prior.basis,
+            ProcessDemandBasis::ClassPrior { platform: None }
+        );
+        assert_eq!(
+            resolve(vitest, CellCommandClass::Vitest).await.demand,
+            None,
+            "a class prior is for Rust compiles"
+        );
+
+        // The work itself measured on aarch64 outranks any prior.
+        for (id, peak) in [(&compile, 12 * GIB)] {
+            observe_completed(
+                db.clone(),
+                Some(id),
+                &spark,
+                &completed(peak, 2),
+                CompletionKind::Succeeded,
+            )
+            .await;
+        }
+        observe_suite(
+            db.clone(),
+            compile_suite.as_deref(),
+            &spark,
+            &completed(10 * GIB, 2),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        let borrowed = resolve(compile.clone(), CellCommandClass::CargoCheck)
+            .await
+            .demand
+            .expect("borrowed from aarch64");
+        assert_eq!(borrowed.peak_bytes, 12 * GIB, "the largest on any platform");
+        assert_eq!(
+            borrowed.measured_on.as_deref(),
+            Some("bginf-sp1-device:bginf-sp1")
+        );
+        assert_eq!(
+            borrowed.basis,
+            ProcessDemandBasis::OtherPlatform {
+                platform: "aarch64".into()
+            }
+        );
+
+        // And a measurement on this platform outranks a larger one elsewhere.
+        observe_suite(
+            db.clone(),
+            compile_suite.as_deref(),
+            &context("bbs-device:bbs"),
+            &completed(8 * GIB, 3),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        let here = resolve(compile, CellCommandClass::CargoCheck)
+            .await
+            .demand
+            .unwrap();
+        assert_eq!(here.peak_bytes, 8 * GIB);
+        assert_eq!(here.basis, ProcessDemandBasis::ThisPlatform);
     }
 
     /// A command class spans unrelated commands, so its suite only stands
@@ -2257,10 +2561,16 @@ mod process_peak_tests {
         )
         .await;
         assert_eq!(
-            resolve_process_demand(db.clone(), None, class.as_deref(), &fedora)
-                .await
-                .demand
-                .map(|demand| demand.peak_bytes),
+            resolve_process_demand(
+                db.clone(),
+                None,
+                class.as_deref(),
+                CellCommandClass::CargoTest,
+                &fedora
+            )
+            .await
+            .demand
+            .map(|demand| demand.peak_bytes),
             Some(10 * GIB),
             "an agent's batch has no identity, and its class speaks for it"
         );
@@ -2277,10 +2587,16 @@ mod process_peak_tests {
         )
         .await;
         assert_eq!(
-            resolve_process_demand(db, Some(&small), class.as_deref(), &fedora)
-                .await
-                .demand
-                .map(|demand| demand.peak_bytes),
+            resolve_process_demand(
+                db,
+                Some(&small),
+                class.as_deref(),
+                CellCommandClass::CargoTest,
+                &fedora
+            )
+            .await
+            .demand
+            .map(|demand| demand.peak_bytes),
             Some(GIB)
         );
     }
@@ -2311,10 +2627,16 @@ mod process_peak_tests {
             )
             .await;
         }
-        let demand = resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &ub)
-            .await
-            .demand
-            .unwrap();
+        let demand = resolve_process_demand(
+            db.clone(),
+            Some(&id),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &ub,
+        )
+        .await
+        .demand
+        .unwrap();
         assert_eq!(demand.kills_here, Some((2, total)));
         assert_eq!(demand.peak_bytes, 3 * GIB);
         observe_suite(
@@ -2325,10 +2647,16 @@ mod process_peak_tests {
             CompletionKind::Failed,
         )
         .await;
-        let demand = resolve_process_demand(db, Some(&id), suite.as_deref(), &ub)
-            .await
-            .demand
-            .unwrap();
+        let demand = resolve_process_demand(
+            db,
+            Some(&id),
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &ub,
+        )
+        .await
+        .demand
+        .unwrap();
         assert_eq!(demand.kills_here, Some((1, 2 * total)));
         assert_eq!(demand.peak_bytes, 3 * GIB, "the largest victim stands");
     }
@@ -2375,8 +2703,14 @@ mod process_peak_tests {
                 CompletionKind::Succeeded,
             )
             .await;
-            let evidence =
-                resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &host).await;
+            let evidence = resolve_process_demand(
+                db.clone(),
+                Some(&id),
+                suite.as_deref(),
+                CellCommandClass::CargoTest,
+                &host,
+            )
+            .await;
             assert_eq!(evidence.demand, None, "{}: no single process", host.os);
             let tree = evidence.unattributed.expect("the tree's peak is kept");
             assert_eq!(tree.peak_bytes, peak);

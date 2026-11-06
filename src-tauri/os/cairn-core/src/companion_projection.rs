@@ -152,21 +152,53 @@ impl CompanionSections {
     }
 }
 
+/// The live executions are read through `idx_executions_live` alone, never
+/// their rows, which carry the snapshot. Both predicates are spelled exactly as
+/// the partial index's so Turso can substitute it, and `INDEXED BY` turns any
+/// drift into a `no query solution` error instead of a silent row walk.
+/// `CROSS JOIN` fixes the join order: executions drive the issue lookup, and
+/// ranked issues drive the per-issue execution seek.
 const ACTIVE_GRAPH_CTES: &str = "WITH ranked_issues AS (
- SELECT i.id, i.number, i.title, i.status, MAX(e.started_at) AS latest_started
- FROM issues i JOIN executions e ON e.issue_id=i.id
- WHERE e.status IN ('running','paused') GROUP BY i.id
+ SELECT i.id, i.number, i.title, i.status, MAX(ex.started_at) AS latest_started
+ FROM executions ex INDEXED BY idx_executions_live CROSS JOIN issues i ON i.id=ex.issue_id
+ WHERE ex.status IN ('running','paused') GROUP BY i.id
  ORDER BY latest_started DESC, i.id LIMIT ?1
 ), selected_executions AS (
- SELECT e.id, e.issue_id, COALESCE(e.seq,0) AS seq, e.status, e.started_at
- FROM executions e JOIN ranked_issues i ON i.id=e.issue_id
- WHERE e.status IN ('running','paused') ORDER BY e.started_at DESC, e.id LIMIT ?2
+ SELECT ex.id, ex.issue_id, COALESCE(ex.seq,0) AS seq, ex.status, ex.started_at
+ FROM ranked_issues i CROSS JOIN executions ex INDEXED BY idx_executions_live ON ex.issue_id=i.id
+ WHERE ex.status IN ('running','paused') ORDER BY ex.started_at DESC, ex.id LIMIT ?2
 ), selected_jobs AS (
  SELECT j.id, j.execution_id, COALESCE(j.uri_segment,j.recipe_node_id,j.id) AS name,
         j.status, j.created_at, j.current_turn_id
  FROM jobs j JOIN selected_executions e ON e.id=j.execution_id
  WHERE j.status <> 'cancelled' ORDER BY e.started_at DESC, j.created_at DESC, j.id LIMIT ?3
 ) ";
+
+fn issues_sql() -> String {
+    format!("{ACTIVE_GRAPH_CTES} SELECT id,number,title,status FROM ranked_issues")
+}
+
+fn executions_sql() -> String {
+    format!("{ACTIVE_GRAPH_CTES} SELECT id,issue_id,seq,status,started_at FROM selected_executions")
+}
+
+fn nodes_sql() -> String {
+    format!("{ACTIVE_GRAPH_CTES} SELECT j.id,j.execution_id,j.name,j.status,
+          CASE WHEN EXISTS(SELECT 1 FROM prompts p WHERE p.turn_id=j.current_turn_id AND p.response IS NULL AND p.withdrawn_at IS NULL)
+                 OR EXISTS(SELECT 1 FROM permission_requests pr LEFT JOIN runs r ON r.id=pr.run_id WHERE COALESCE(pr.job_id,r.job_id)=j.id AND pr.status='pending') THEN 'awaitinginput'
+               WHEN t.state IN ('running','starting') THEN 'running' ELSE 'idle' END
+          FROM selected_jobs j LEFT JOIN turns t ON t.id=COALESCE(j.current_turn_id,(SELECT id FROM turns WHERE job_id=j.id ORDER BY created_at DESC,sequence DESC LIMIT 1))")
+}
+
+/// `check_result_cache` is wide (`target_results_json`), so the window sort
+/// carries only the columns the outer select takes.
+fn checks_sql() -> String {
+    format!("{ACTIVE_GRAPH_CTES}, latest AS (
+          SELECT c.job_id, c.check_name, c.passed, c.failure_kind, c.ran_at,
+                 ROW_NUMBER() OVER(PARTITION BY c.job_id,c.check_name ORDER BY c.ran_at DESC,c.tree_hash DESC,c.input_hash DESC) AS rn
+          FROM check_result_cache c JOIN selected_jobs j ON j.id=c.job_id)
+          SELECT job_id,check_name,passed,failure_kind,ran_at FROM latest WHERE rn=1 ORDER BY ran_at DESC,job_id,check_name LIMIT ?4")
+}
 
 /// Section reads per database handle, as `(graph, checks, feed)`. Keyed by the
 /// handle's process-unique instance, so a test counts the reads made against
@@ -205,38 +237,113 @@ async fn read_graph(
 > {
     #[cfg(test)]
     count_read(db, |reads| reads.0 += 1);
-    db.read(|conn| Box::pin(async move {
-        let mut issues = BTreeMap::new();
-        let mut rows = conn.query(&format!("{ACTIVE_GRAPH_CTES} SELECT id,number,title,status FROM ranked_issues"), params![MAX_ISSUES as i64]).await?;
-        while let Some(r)=rows.next().await? { let id=r.text(0)?; issues.insert(id.clone(), CompanionIssue{id,number:r.i64(1)? as i32,title:bounded(r.text(2)?),status:r.text(3)?}); }
-        let mut executions = BTreeMap::new();
-        let mut rows = conn.query(&format!("{ACTIVE_GRAPH_CTES} SELECT id,issue_id,seq,status,started_at FROM selected_executions"), params![MAX_ISSUES as i64, MAX_EXECUTIONS as i64]).await?;
-        while let Some(r)=rows.next().await? { let id=r.text(0)?; executions.insert(id.clone(), CompanionExecution{id,issue_id:r.text(1)?,sequence:r.i64(2)? as i32,status:r.text(3)?,started_at:r.i64(4)?}); }
-        let mut nodes = BTreeMap::new();
-        let sql=format!("{ACTIVE_GRAPH_CTES} SELECT j.id,j.execution_id,j.name,j.status,
-          CASE WHEN EXISTS(SELECT 1 FROM prompts p WHERE p.turn_id=j.current_turn_id AND p.response IS NULL AND p.withdrawn_at IS NULL)
-                 OR EXISTS(SELECT 1 FROM permission_requests pr LEFT JOIN runs r ON r.id=pr.run_id WHERE COALESCE(pr.job_id,r.job_id)=j.id AND pr.status='pending') THEN 'awaitinginput'
-               WHEN t.state IN ('running','starting') THEN 'running' ELSE 'idle' END
-          FROM selected_jobs j LEFT JOIN turns t ON t.id=COALESCE(j.current_turn_id,(SELECT id FROM turns WHERE job_id=j.id ORDER BY created_at DESC,sequence DESC LIMIT 1))");
-        let mut rows=conn.query(&sql,params![MAX_ISSUES as i64, MAX_EXECUTIONS as i64, MAX_NODES as i64]).await?;
-        while let Some(r)=rows.next().await? { let id=r.text(0)?; nodes.insert(id.clone(),CompanionNode{id,execution_id:r.text(1)?,name:bounded(r.text(2)?),status:r.text(3)?,activity:r.text(4)?}); }
-        Ok((issues,executions,nodes))
-    })).await.map_err(|e|e.to_string())
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut issues = BTreeMap::new();
+            let mut rows = conn
+                .query(&issues_sql(), params![MAX_ISSUES as i64])
+                .await?;
+            while let Some(r) = rows.next().await? {
+                let id = r.text(0)?;
+                issues.insert(
+                    id.clone(),
+                    CompanionIssue {
+                        id,
+                        number: r.i64(1)? as i32,
+                        title: bounded(r.text(2)?),
+                        status: r.text(3)?,
+                    },
+                );
+            }
+            let mut executions = BTreeMap::new();
+            let mut rows = conn
+                .query(
+                    &executions_sql(),
+                    params![MAX_ISSUES as i64, MAX_EXECUTIONS as i64],
+                )
+                .await?;
+            while let Some(r) = rows.next().await? {
+                let id = r.text(0)?;
+                executions.insert(
+                    id.clone(),
+                    CompanionExecution {
+                        id,
+                        issue_id: r.text(1)?,
+                        sequence: r.i64(2)? as i32,
+                        status: r.text(3)?,
+                        started_at: r.i64(4)?,
+                    },
+                );
+            }
+            let mut nodes = BTreeMap::new();
+            let mut rows = conn
+                .query(
+                    &nodes_sql(),
+                    params![MAX_ISSUES as i64, MAX_EXECUTIONS as i64, MAX_NODES as i64],
+                )
+                .await?;
+            while let Some(r) = rows.next().await? {
+                let id = r.text(0)?;
+                nodes.insert(
+                    id.clone(),
+                    CompanionNode {
+                        id,
+                        execution_id: r.text(1)?,
+                        name: bounded(r.text(2)?),
+                        status: r.text(3)?,
+                        activity: r.text(4)?,
+                    },
+                );
+            }
+            Ok((issues, executions, nodes))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn read_checks(db: &LocalDb) -> Result<BTreeMap<String, CompanionCheck>, String> {
     #[cfg(test)]
     count_read(db, |reads| reads.1 += 1);
-    db.read(|conn| Box::pin(async move {
-        let sql=format!("{ACTIVE_GRAPH_CTES}, latest AS (
-          SELECT c.*, ROW_NUMBER() OVER(PARTITION BY c.job_id,c.check_name ORDER BY c.ran_at DESC,c.tree_hash DESC,c.input_hash DESC) AS rn
-          FROM check_result_cache c JOIN selected_jobs j ON j.id=c.job_id)
-          SELECT job_id,check_name,passed,failure_kind,ran_at FROM latest WHERE rn=1 ORDER BY ran_at DESC,job_id,check_name LIMIT ?4");
-        let mut rows=conn.query(&sql,params![MAX_ISSUES as i64,MAX_EXECUTIONS as i64,MAX_NODES as i64,MAX_CHECKS as i64]).await?;
-        let mut checks=BTreeMap::new();
-        while let Some(r)=rows.next().await? { let node_id=r.text(0)?; let name=r.text(1)?; let id=format!("{node_id}:{name}"); let passed=r.i64(2)? != 0; checks.insert(id.clone(),CompanionCheck{id,node_id,name:bounded(name),verdict:if passed{"passed".into()}else{r.opt_text(3)?.unwrap_or_else(||"failed".into())},ran_at:r.i64(4)?}); }
-        Ok(checks)
-    })).await.map_err(|e|e.to_string())
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    &checks_sql(),
+                    params![
+                        MAX_ISSUES as i64,
+                        MAX_EXECUTIONS as i64,
+                        MAX_NODES as i64,
+                        MAX_CHECKS as i64
+                    ],
+                )
+                .await?;
+            let mut checks = BTreeMap::new();
+            while let Some(r) = rows.next().await? {
+                let node_id = r.text(0)?;
+                let name = r.text(1)?;
+                let id = format!("{node_id}:{name}");
+                let passed = r.i64(2)? != 0;
+                checks.insert(
+                    id.clone(),
+                    CompanionCheck {
+                        id,
+                        node_id,
+                        name: bounded(name),
+                        verdict: if passed {
+                            "passed".into()
+                        } else {
+                            r.opt_text(3)?.unwrap_or_else(|| "failed".into())
+                        },
+                        ran_at: r.i64(4)?,
+                    },
+                );
+            }
+            Ok(checks)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn read_feed(db: &LocalDb) -> Result<BTreeMap<String, CompanionFeedItem>, String> {
@@ -579,6 +686,84 @@ mod tests {
             (check.node_id.as_str(), check.verdict.as_str()),
             ("j", "passed")
         );
+    }
+
+    /// Every active-graph statement, with the parameters the runtime binds.
+    fn active_graph_statements() -> Vec<(&'static str, String, Vec<cairn_db::turso::Value>)> {
+        use cairn_db::turso::Value;
+        let bounds =
+            [MAX_ISSUES, MAX_EXECUTIONS, MAX_NODES, MAX_CHECKS].map(|n| Value::Integer(n as i64));
+        vec![
+            ("issues", issues_sql(), bounds[..1].to_vec()),
+            ("executions", executions_sql(), bounds[..2].to_vec()),
+            ("nodes", nodes_sql(), bounds[..3].to_vec()),
+            ("checks", checks_sql(), bounds.to_vec()),
+        ]
+    }
+
+    /// An execution's row carries its snapshot, and Turso assembles the whole
+    /// row to read any column (cairn/5894), so the projection reads the live
+    /// set from `idx_executions_live` alone: a scan of the partial index to
+    /// rank issues, and a per-issue seek of it to select executions.
+    #[tokio::test]
+    async fn active_graph_reads_never_touch_an_execution_row() {
+        use crate::execution::approvals::tests::{assert_index_only, query_plan, steps_reaching};
+        let db = projection_db().await;
+        for (name, sql, params) in active_graph_statements() {
+            let plan = query_plan(&db, sql, params).await;
+            assert_index_only(&plan, &["ex"]);
+            let ex_steps = steps_reaching(&plan, "ex");
+            assert!(
+                ex_steps
+                    .iter()
+                    .all(|step| step.contains("USING COVERING INDEX idx_executions_live")),
+                "{name}:\n{plan}"
+            );
+            assert!(
+                ex_steps.iter().any(|step| step.starts_with("SCAN ")),
+                "{name}: ranked_issues does not scan the live index:\n{plan}"
+            );
+            if name != "issues" {
+                assert!(
+                    ex_steps
+                        .iter()
+                        .any(|step| step.starts_with("SEARCH ") && step.contains("(issue_id=?)")),
+                    "{name}: selected_executions does not seek the live index by issue:\n{plan}"
+                );
+            }
+        }
+    }
+
+    /// Finished executions sit outside the partial index; the rewritten reads
+    /// must still exclude them from both membership and issue ranking.
+    #[tokio::test]
+    async fn finished_executions_neither_appear_nor_rank_issues() {
+        let db = projection_db().await;
+        db.execute_script("INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','w',1,1); INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','p','p','/tmp/p',1,1); \
+            INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'old live, newer finished','active',1,1),('k','p',2,'newer live','active',1,1),('d','p',3,'finished only','active',1,1); \
+            INSERT INTO executions(id,recipe_id,issue_id,project_id,seq,status,started_at) VALUES('e','build','i','p',2,'running',1),('k1','build','k','p',1,'paused',5),('d1','build','d','p',1,'completed',200); \
+            INSERT INTO executions(id,recipe_id,issue_id,project_id,seq,status,started_at,lifecycle) VALUES('done','build','i','p',1,'completed',100,'superseded');").await.unwrap();
+
+        let snapshot = read_companion_snapshot(db.clone()).await.unwrap();
+        assert_eq!(snapshot.executions.keys().collect::<Vec<_>>(), ["e", "k1"]);
+        assert_eq!(snapshot.issues.keys().collect::<Vec<_>>(), ["i", "k"]);
+
+        let ranked = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(&issues_sql(), params![MAX_ISSUES as i64])
+                        .await?;
+                    let mut ids = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        ids.push(row.text(0)?);
+                    }
+                    Ok(ids)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(ranked, ["k", "i"], "a finished execution ranked its issue");
     }
 
     #[tokio::test]

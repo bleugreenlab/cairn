@@ -1371,6 +1371,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push_str(&render_oom_kills(
         &health.memory_record,
         executor.captured_at_unix_ms,
+        &executor.recent_placements,
     ));
 
     out.push_str(&render_gpus(
@@ -3036,6 +3037,9 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
                 selection.reservation.source,
                 describe_rationale(&selection.reservation_rationale)
             ));
+            if let Some(demand) = &selection.process_demand {
+                out.push_str(&format!("  - Single process: {}\n", demand.describe()));
+            }
             if let Some(waiver) = &selection.process_fit_waived {
                 out.push_str(&format!("  - Single-process fit: {}\n", waiver.describe()));
             }
@@ -4098,9 +4102,14 @@ fn duration_words(ms: u64) -> String {
 /// attributed in the last day, under a line that says how many the kernel made
 /// and how many Cairn could not attribute, so an unnamed kill still shows.
 /// Said only when the kernel has killed something.
+///
+/// A killed command whose placement here was made without a measurement of
+/// its process on this platform says so: that is why the fit was silent, and
+/// the kill was the platform's first measurement of it.
 fn render_oom_kills(
     record: &cairn_common::executor_protocol::MemoryRecord,
     captured_at_unix_ms: u64,
+    placements: &[PlacementDecision],
 ) -> String {
     let recent: Vec<&cairn_common::executor_protocol::OomKillReport> = record
         .oom_kills
@@ -4139,13 +4148,40 @@ fn render_oom_kills(
     out.push_str(&format!("- {}\n", summary.join("; ")));
     for kill in recent.iter().rev() {
         out.push_str(&format!(
-            "- {}: {}\n",
+            "- {}: {}{}\n",
             age(captured_at_unix_ms.saturating_sub(kill.killed_at_unix_ms)),
-            kill.describe()
+            kill.describe(),
+            placed_blind(kill, placements).unwrap_or_default()
         ));
     }
     out.push('\n');
     out
+}
+
+/// For a killed command whose placement record shows it was placed with no
+/// measurement of its process on this platform, the clause that says so.
+fn placed_blind(
+    kill: &cairn_common::executor_protocol::OomKillReport,
+    placements: &[PlacementDecision],
+) -> Option<String> {
+    use cairn_common::executor_protocol::{LiveUsageSubject, ProcessDemandRecord};
+    let Some(LiveUsageSubject::Command { request_id, .. }) = &kill.owner else {
+        return None;
+    };
+    let demand = placements.iter().find_map(|decision| {
+        match (&decision.outcome, decision.request_id == *request_id) {
+            (PlacementOutcome::Selected(selection), true) => selection.process_demand.as_ref(),
+            _ => None,
+        }
+    })?;
+    let placed = match demand {
+        _ if demand.measured_on_this_platform() => return None,
+        ProcessDemandRecord::Unmeasured { .. } => "placed unmeasured".to_string(),
+        ProcessDemandRecord::Estimated(_) => format!("placed on {}", demand.describe()),
+    };
+    Some(format!(
+        "; {placed}; the first measurement on this platform was this kill"
+    ))
 }
 
 /// The commands this machine ended, and what each teardown left alive.
@@ -10395,7 +10431,7 @@ mod tests {
     fn an_out_of_memory_kill_is_a_line_on_the_page() {
         use cairn_common::executor_protocol::{LiveUsageSubject, MemoryRecord, OomKillReport};
         assert!(
-            render_oom_kills(&MemoryRecord::default(), CAPTURED_AT).is_empty(),
+            render_oom_kills(&MemoryRecord::default(), CAPTURED_AT, &[]).is_empty(),
             "a machine that killed nothing says nothing"
         );
         let record = MemoryRecord {
@@ -10419,7 +10455,7 @@ mod tests {
             machine_oom_kills: Some(46),
             attribution: Some("oom_score".into()),
         };
-        let rendered = render_oom_kills(&record, CAPTURED_AT);
+        let rendered = render_oom_kills(&record, CAPTURED_AT, &[]);
         assert!(
             rendered.starts_with("## Out-of-memory kills (24 h)\n"),
             "{rendered}"
@@ -10442,8 +10478,83 @@ mod tests {
             ..record
         };
         assert!(
-            !render_oom_kills(&old, CAPTURED_AT + OOM_KILLS_SHOWN_MS).contains("rustc"),
+            !render_oom_kills(&old, CAPTURED_AT + OOM_KILLS_SHOWN_MS, &[]).contains("rustc"),
             "a kill older than a day is counted, not listed"
+        );
+    }
+
+    /// cairn/6312: bgsrv-ub's two workspace-compile kills on 11-06 were the
+    /// platform's first measurement of that rustc. A kill of a command placed
+    /// unmeasured, or on a number borrowed from another platform, says so
+    /// beside the kill; one placed on a number measured on this platform
+    /// adds nothing.
+    #[test]
+    fn a_kill_of_work_placed_unmeasured_says_it_was_the_first_measurement() {
+        use cairn_common::executor_protocol::{
+            LiveUsageSubject, MemoryRecord, OomKillReport, ProcessDemandBasis,
+            ProcessDemandEstimate, ProcessDemandRecord,
+        };
+        let mut executor = inspection("bgsrv-ub", false);
+        executor.recent_placements = vec![sample_placement("req-cold", "bgsrv-ub")];
+        let kill = |request_id: &str| OomKillReport {
+            killed_at_unix_ms: CAPTURED_AT - 60_000,
+            pid: 3_137_146,
+            process_name: Some("rustc".into()),
+            footprint_bytes: Some(9_910_000_000),
+            owner: Some(LiveUsageSubject::Command {
+                request_id: request_id.into(),
+                attempt_id: "att-1".into(),
+            }),
+            project_id: None,
+            command_class: None,
+        };
+        let record = MemoryRecord {
+            oom_kills: vec![kill("req-cold")],
+            cgroup_oom_kills: Some(2),
+            ..MemoryRecord::default()
+        };
+        let with_demand = |demand: Option<ProcessDemandRecord>| {
+            let mut placements = executor.recent_placements.clone();
+            let PlacementOutcome::Selected(selection) = &mut placements[0].outcome else {
+                panic!("the sample placement is a selection");
+            };
+            selection.process_demand = demand;
+            render_oom_kills(&record, CAPTURED_AT, &placements)
+        };
+        let rendered = with_demand(Some(ProcessDemandRecord::Unmeasured {
+            capacity_bytes: Some(10_307_921_510),
+        }));
+        assert!(
+            rendered.contains("rustc (pid 3137146) at 9.2 GiB, command req-cold/att-1; placed unmeasured; the first measurement on this platform was this kill"),
+            "{rendered}"
+        );
+        let estimate = ProcessDemandEstimate {
+            process_bytes: 7 * (1 << 30),
+            measured_bytes: 5_905_580_032,
+            process_name: Some("rustc".into()),
+            suite: Some("workspace-compile".into()),
+            measured_on: Some("bginf-sp2".into()),
+            measured_here: false,
+            basis: ProcessDemandBasis::OtherPlatform {
+                platform: "aarch64".into(),
+            },
+            capacity_bytes: None,
+        };
+        let rendered = with_demand(Some(ProcessDemandRecord::Estimated(estimate.clone())));
+        assert!(
+            rendered.contains("; placed on one process of ~7.0 GiB (rustc, suite workspace-compile, 5.5 GiB measured on bginf-sp2 (aarch64) x 1.25 headroom; estimated here); the first measurement on this platform was this kill"),
+            "{rendered}"
+        );
+        let measured = with_demand(Some(ProcessDemandRecord::Estimated(
+            ProcessDemandEstimate {
+                basis: ProcessDemandBasis::ThisPlatform,
+                ..estimate
+            },
+        )));
+        assert!(!measured.contains("first measurement"), "{measured}");
+        assert!(
+            !with_demand(None).contains("first measurement"),
+            "a record from before the demand was kept says nothing it cannot stand behind"
         );
     }
 
@@ -10487,17 +10598,22 @@ mod tests {
     /// invisible.
     #[test]
     fn a_placement_record_names_the_machine_the_evidence_and_the_passed_over() {
+        let mut executor = inspection("bglab-ub", false);
+        executor.recent_placements = vec![sample_placement("check-cadence-7", "bglab-ub")];
+        placement_record_assertions(executor);
+    }
+
+    /// A spill-eligible decision that chose `executor_name` for `request_id`
+    /// on full readings, passing over a volume-blind local machine.
+    fn sample_placement(request_id: &str, executor_name: &str) -> PlacementDecision {
         use cairn_common::executor_protocol::{
             CpuPressure, MachineMeasurement, MachineMemory, MachineVolume, ObservationReuse,
-            PlacementDecision, PlacementMobility, PlacementOutcome, PlacementReadings,
-            PlacementReason, PlacementRejection, PlacementRejectionReason, PlacementSelection,
-            PlacementSyncCost, ReservationRationale, ResourceReservation,
-            ResourceReservationSource,
+            PlacementMobility, PlacementReadings, PlacementReason, PlacementRejection,
+            PlacementRejectionReason, PlacementSelection, PlacementSyncCost, ReservationRationale,
+            ResourceReservation, ResourceReservationSource,
         };
-
-        let mut executor = inspection("bglab-ub", false);
-        executor.recent_placements = vec![PlacementDecision {
-            request_id: "check-cadence-7".into(),
+        PlacementDecision {
+            request_id: request_id.into(),
             attempt_id: "a".into(),
             decided_at_unix_ms: CAPTURED_AT,
             mobility: PlacementMobility::SpillEligible,
@@ -10511,7 +10627,8 @@ mod tests {
                 prediction: None,
                 memory_ceiling: None,
                 process_fit_waived: None,
-                executor_name: "bglab-ub".into(),
+                process_demand: None,
+                executor_name: executor_name.into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,
                 reason: PlacementReason::PredictedEarliestVerdict,
@@ -10574,8 +10691,13 @@ mod tests {
                     gap: MeasurementGap::SamplingFailed,
                 },
             }],
-        }];
+        }
+    }
 
+    fn placement_record_assertions(mut executor: ExecutorInspection) {
+        use cairn_common::executor_protocol::{
+            PlacementReason, PlacementRejection, PlacementRejectionReason,
+        };
         let status = render_executor(&executor);
         assert!(!status.contains("check-cadence-7"), "{status}");
         assert!(

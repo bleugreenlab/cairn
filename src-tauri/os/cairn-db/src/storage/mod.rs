@@ -20,6 +20,7 @@ mod test_template;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod checkpoint_probe;
 
+pub mod ambient_feedback;
 pub mod authority;
 pub mod content_store;
 pub mod events;
@@ -43,7 +44,7 @@ pub use fact_log::{
     claim_due_wake as claim_due_fact_wake, claim_for_index, claim_next_queued,
     coalesce_wake as coalesce_fact_wake, count_facts, finish as finish_fact,
     finish_wake as finish_fact_wake, get_fact, get_wakes as get_fact_wakes, insert_fact,
-    latest_for_source, latest_per_source, list_facts, prune as prune_facts,
+    latest_for_source, latest_per_source, list_facts, list_facts_after, prune as prune_facts,
     prune_wakes as prune_fact_wakes, recover_on_start as recover_fact_log, route_state,
     set_index_outcome, FactFilter, FactRow, FactScope, FactWake, LogDedupe, NewFact, PruneSelector,
     Recovery, WakeMatch, WakeWindow,

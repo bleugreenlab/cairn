@@ -114,6 +114,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["dev", "launch-ticket"] => Some(CairnResource::DevLaunchTicket),
         ["logs"] => Some(CairnResource::Logs),
         ["channels", "conversations"] => Some(CairnResource::ChannelsConversations),
+        ["channels", "ambient", "feedback"] => Some(CairnResource::ChannelsAmbientFeedback),
         ["executors"] => Some(CairnResource::Executors),
         ["grants"] => Some(CairnResource::Grants),
         ["grants", id] => Some(CairnResource::Grant {

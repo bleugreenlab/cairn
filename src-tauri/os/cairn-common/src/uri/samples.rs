@@ -450,6 +450,7 @@ resource_samples! {
     DevLaunchTicket {} => Parser,
     Logs {} => Parser,
     ChannelsConversations {} => Parser,
+    ChannelsAmbientFeedback {} => Parser,
     Executors {} => Parser,
     Executor { name: "mac-mini".to_string() } => Parser,
     ExecutorAction { name: "mac-mini".to_string(), action: "restart".to_string() } => Parser,

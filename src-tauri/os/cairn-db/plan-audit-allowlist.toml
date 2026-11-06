@@ -51,46 +51,6 @@ kind = "debt"
 issue = "cairn://p/cairn/6132"
 reason = "The offload pass finds packs by scanning, which steps past more NULL rows as it succeeds."
 
-# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
-[[allow]]
-file = "os/cairn-core/src/companion_projection.rs"
-rule = "wide-scan"
-table = "executions"
-statement = "16d4103a3a75a1f2"
-kind = "debt"
-issue = "cairn://p/cairn/6129"
-reason = "The active-graph CTE walks executions on each projection read."
-
-# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
-[[allow]]
-file = "os/cairn-core/src/companion_projection.rs"
-rule = "wide-scan"
-table = "executions"
-statement = "2617d17ae5e7266b"
-kind = "debt"
-issue = "cairn://p/cairn/6129"
-reason = "The active-graph CTE walks executions on each projection read."
-
-# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
-[[allow]]
-file = "os/cairn-core/src/companion_projection.rs"
-rule = "wide-scan"
-table = "executions"
-statement = "79f4acf9cda6fb69"
-kind = "debt"
-issue = "cairn://p/cairn/6129"
-reason = "The active-graph CTE walks executions on each projection read."
-
-# WITH ranked_issues AS ( SELECT i.id, i.number, i.title, i.status, MAX(e.started_
-[[allow]]
-file = "os/cairn-core/src/companion_projection.rs"
-rule = "wide-scan"
-table = "executions"
-statement = "fb660d0c205bbc7f"
-kind = "debt"
-issue = "cairn://p/cairn/6129"
-reason = "The active-graph CTE walks executions on each projection read."
-
 # SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at FRO
 [[allow]]
 file = "os/cairn-core/src/embeddings/resources.rs"

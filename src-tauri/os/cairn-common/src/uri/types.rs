@@ -1003,6 +1003,9 @@ pub enum CairnResource {
     Logs,
     /// Configured, enabled external-channel conversations and their deliverability.
     ChannelsConversations,
+    /// The ambient Discord route's label set: one row per routing outcome,
+    /// read by judgment and labelled by the receiving threads.
+    ChannelsAmbientFeedback,
     /// Workspace-level fleet collection: every enrolled executor by public name.
     ///
     /// Machines are machine-scoped rather than project-scoped, so the family
@@ -1261,6 +1264,7 @@ impl CairnResource {
             Self::DevLaunchTicket => ResourceKind::DevLaunchTicket,
             Self::Logs => ResourceKind::Logs,
             Self::ChannelsConversations => ResourceKind::ChannelsConversations,
+            Self::ChannelsAmbientFeedback => ResourceKind::ChannelsAmbientFeedback,
             Self::Executors => ResourceKind::Executors,
             Self::Executor { .. } => ResourceKind::Executor,
             Self::ExecutorAction { .. } => ResourceKind::ExecutorAction,

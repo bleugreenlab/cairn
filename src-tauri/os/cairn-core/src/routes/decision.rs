@@ -487,6 +487,15 @@ pub fn revision(text: &str) -> String {
         .to_string()
 }
 
+/// Whether `thread` can own routed work: active, with a non-empty charter.
+pub fn is_chartered_active(thread: &crate::models::Thread) -> bool {
+    thread.status == crate::models::ThreadStatus::Active
+        && thread
+            .jurisdiction
+            .as_deref()
+            .is_some_and(|charter| !charter.trim().is_empty())
+}
+
 /// The chartered threads of a project as choice options: every active thread
 /// with a non-empty jurisdiction, by name, each carrying its jurisdiction as
 /// the description, its URI as the address, and the jurisdiction's digest as
@@ -497,10 +506,10 @@ pub fn chartered_options(
 ) -> Vec<DecisionOption> {
     let mut options: Vec<DecisionOption> = threads
         .iter()
-        .filter(|thread| thread.status == crate::models::ThreadStatus::Active)
+        .filter(|thread| is_chartered_active(thread))
         .filter_map(|thread| {
             let charter = thread.jurisdiction.as_deref()?.trim();
-            (!charter.is_empty()).then(|| DecisionOption {
+            Some(DecisionOption {
                 value: thread.name.clone(),
                 description: Some(charter.to_string()),
                 address: Some(cairn_common::uri::build_thread_uri(

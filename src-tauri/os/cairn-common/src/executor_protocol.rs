@@ -7027,6 +7027,16 @@ pub struct LearnedResourceEstimate {
 /// platform with no kernel memory killer, which is runner-local placement.
 /// What a runner gets wrong talking to an older executor: nothing.
 ///
+/// cairn/6312 does not move the number. It adds `basis` on
+/// [`ProcessMisfit`], [`PlacementSelection::process_demand`] with its new
+/// [`ProcessDemandRecord`], the `noLargerMachine` waiver reason, and
+/// [`PlacementRejectionReason::ProcessDeferred`]: all runner placement
+/// vocabulary under cairn/4931's argument, omitted when absent, and carried
+/// to no executor. A single-process demand now borrows another platform's
+/// measurement, then a class prior, before it is left unknown, which is
+/// runner-local placement. What a runner gets wrong talking to an older
+/// executor: nothing.
+///
 /// Version 166 (cairn/6139) preserves Unix resident PTY signal deaths in the
 /// existing exit-code field as `128 + signal`, leaving normal exit codes intact.
 /// An older executor sends 1 for SIGKILL or SIGTERM, so a runner would mistake
@@ -16075,6 +16085,12 @@ pub struct PlacementSelection {
     /// down. See [`ProcessFitWaiver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_fit_waived: Option<ProcessFitWaiver>,
+    /// The single process this machine was judged on, or that heavy work
+    /// was placed with none known. Absent for work whose class compiles
+    /// nothing and that measured no process, and on a record from before it
+    /// was kept. See [`ProcessDemandRecord`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_demand: Option<ProcessDemandRecord>,
 }
 
 /// Why this machine, in words that distinguish a measured win from the absence
@@ -17174,34 +17190,121 @@ pub struct ProcessMisfit {
     /// rather than the size decided the misfit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kills_here: Option<u32>,
+    /// Where the demand came from when no machine of this platform measured
+    /// this work. Absent means it did.
+    #[serde(default, skip_serializing_if = "ProcessDemandBasis::is_this_platform")]
+    pub basis: ProcessDemandBasis,
+}
+
+/// Where a single-process demand came from, when not from this work measured
+/// on a machine of the platform it is judged on.
+///
+/// A heavy lane is never judged on nothing: one rustc's working set is the
+/// code's far more than the platform's, so a peak measured on another
+/// architecture stands in for a platform that has measured nothing, and a
+/// Rust compile measured nowhere stands on the project's largest measured
+/// rustc. Either is named as an estimate, with where it was measured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProcessDemandBasis {
+    /// This work's identity or suite, measured on a machine of this platform.
+    #[default]
+    ThisPlatform,
+    /// This work's identity or suite, measured only on another platform.
+    /// `platform` is that platform as a reader names it: its architecture,
+    /// or its operating system and architecture when the system differs too.
+    OtherPlatform { platform: String },
+    /// Nothing of this work was measured on any platform. The demand is the
+    /// project's largest measured rustc across its suites, a prior for any
+    /// Rust compile of the project. `platform` is set when that rustc was
+    /// measured on another platform. Unlike a measurement of the work, a
+    /// prior defers a machine too small for it rather than refusing it.
+    ClassPrior {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform: Option<String>,
+    },
+}
+
+impl ProcessDemandBasis {
+    pub fn is_this_platform(&self) -> bool {
+        matches!(self, Self::ThisPlatform)
+    }
+
+    pub fn is_class_prior(&self) -> bool {
+        matches!(self, Self::ClassPrior { .. })
+    }
+}
+
+/// The evidence half of a single-process demand's sentence: the process,
+/// its suite, and the measurement with where it was taken and the headroom
+/// added to it, so a reader can tell what a machine measured from what
+/// placement charged for it.
+fn describe_process_evidence(
+    process_name: Option<&str>,
+    suite: Option<&str>,
+    measured_bytes: Option<u64>,
+    measured_on: Option<&str>,
+    measured_here: bool,
+    basis: &ProcessDemandBasis,
+) -> String {
+    let mut evidence: Vec<String> = Vec::new();
+    if let Some(name) = process_name {
+        evidence.push(name.to_string());
+    }
+    if let Some(suite) = suite {
+        evidence.push(format!("suite {suite}"));
+    }
+    let (measured, headroom) = match measured_bytes.filter(|bytes| *bytes > 0) {
+        Some(bytes) => (
+            format!("{} ", describe_gib(bytes)),
+            format!(" x {} headroom", measured_headroom_factor()),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let platform = match basis {
+        ProcessDemandBasis::ThisPlatform | ProcessDemandBasis::ClassPrior { platform: None } => {
+            None
+        }
+        ProcessDemandBasis::OtherPlatform { platform }
+        | ProcessDemandBasis::ClassPrior {
+            platform: Some(platform),
+        } => Some(platform.as_str()),
+    };
+    let place = match (measured_on, platform) {
+        (Some(machine), Some(platform)) => format!(" on {machine} ({platform})"),
+        (Some(machine), None) => format!(" on {machine}"),
+        (None, Some(platform)) => format!(" on {platform}"),
+        (None, None) => String::new(),
+    };
+    let prior = if basis.is_class_prior() {
+        "; a prior for this project's Rust compiles, since nothing of this work was measured on any platform"
+    } else {
+        ""
+    };
+    match (measured_here, measured.is_empty() && place.is_empty()) {
+        (true, _) => evidence.push(format!("{measured}measured here{headroom}{prior}")),
+        (false, true) => evidence.push(format!("estimated here{prior}")),
+        (false, false) => evidence.push(format!(
+            "{measured}measured{place}{headroom}{prior}; estimated here"
+        )),
+    }
+    evidence.join(", ")
 }
 
 impl ProcessMisfit {
     pub fn describe(&self) -> String {
-        let mut evidence: Vec<String> = Vec::new();
-        if let Some(name) = &self.process_name {
-            evidence.push(name.clone());
-        }
-        if let Some(suite) = &self.suite {
-            evidence.push(format!("suite {suite}"));
-        }
-        // The measurement and the headroom added to it, so a reader can tell
-        // what a machine measured from what placement charged for it.
-        let (measured, headroom) = match self.measured_bytes.filter(|bytes| *bytes > 0) {
-            Some(bytes) => (
-                format!("{} ", describe_gib(bytes)),
-                format!(" x {} headroom", measured_headroom_factor()),
-            ),
-            None => (String::new(), String::new()),
-        };
-        match (&self.measured_on, self.measured_here) {
-            (_, true) => evidence.push(format!("{measured}measured here{headroom}")),
-            (Some(machine), false) => evidence.push(format!(
-                "{measured}measured on {machine}{headroom}; estimated here"
-            )),
-            (None, false) if measured.is_empty() => evidence.push("estimated here".into()),
-            (None, false) => evidence.push(format!("{measured}measured{headroom}; estimated here")),
-        }
+        let evidence = describe_process_evidence(
+            self.process_name.as_deref(),
+            self.suite.as_deref(),
+            self.measured_bytes,
+            self.measured_on.as_deref(),
+            self.measured_here,
+            &self.basis,
+        );
         let capacity = match self.standing_bytes {
             Some(standing) => format!(
                 "this machine can give one process {} ({} total, {} standing)",
@@ -17216,9 +17319,8 @@ impl ProcessMisfit {
             ),
         };
         let demand = format!(
-            "needs one process of ~{} ({})",
-            describe_gib(self.process_bytes),
-            evidence.join(", ")
+            "needs one process of ~{} ({evidence})",
+            describe_gib(self.process_bytes)
         );
         match self.kills_here {
             Some(kills) => format!(
@@ -17265,6 +17367,11 @@ pub enum ProcessFitWaiverReason {
     /// than the machine is slowed by compression and swap, never killed, so
     /// its size is a cost to price, not a death to prevent.
     NoMemoryKiller,
+    /// The demand is a class prior ([`ProcessDemandBasis::ClassPrior`]), not
+    /// a measurement of this work, and no machine that can give one process
+    /// that much could take the work. Deferred machines are offered it last;
+    /// this one was the last.
+    NoLargerMachine,
 }
 
 impl ProcessFitWaiver {
@@ -17276,11 +17383,100 @@ impl ProcessFitWaiver {
             ProcessFitWaiverReason::NoMemoryKiller => {
                 "this platform has no kernel memory killer, so an oversized process is slowed by compression and swap rather than killed"
             }
+            ProcessFitWaiverReason::NoLargerMachine => {
+                "that number is a prior rather than this work's measurement, and no machine that can give one process that much could take the work"
+            }
         };
         format!(
             "not refused for one process's size, which would have read: {}; {why}. Offered at its reservation and priced instead",
             self.misfit.describe()
         )
+    }
+}
+
+/// The single process a placement judged the chosen machine on, so every
+/// record of heavy work says what one process of it was expected to need,
+/// or that nothing was known.
+///
+/// Runner placement vocabulary like [`ProcessMisfit`]: nothing the runner
+/// sends an executor carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProcessDemandRecord {
+    /// A named demand, measured or borrowed.
+    Estimated(ProcessDemandEstimate),
+    /// A Rust compile of which no single process, of this work, its suite,
+    /// or any of the project's Rust compiles, was measured on any platform.
+    /// Such work is offered machines by what they can give one process,
+    /// largest first. `capacity_bytes` is what this machine can give.
+    Unmeasured {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capacity_bytes: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessDemandEstimate {
+    /// The demand, with headroom.
+    pub process_bytes: u64,
+    pub measured_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_on: Option<String>,
+    pub measured_here: bool,
+    #[serde(default, skip_serializing_if = "ProcessDemandBasis::is_this_platform")]
+    pub basis: ProcessDemandBasis,
+    /// What this machine can give one process, when its total was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_bytes: Option<u64>,
+}
+
+impl ProcessDemandRecord {
+    /// Whether a machine of the chosen machine's platform had measured this
+    /// work's process when it was placed. A kill of work placed without one
+    /// is the first measurement on this platform.
+    pub fn measured_on_this_platform(&self) -> bool {
+        matches!(self, Self::Estimated(estimate) if estimate.basis.is_this_platform())
+    }
+
+    pub fn describe(&self) -> String {
+        let capacity = |capacity: Option<u64>| {
+            capacity
+                .map(|bytes| {
+                    format!(
+                        "; this machine can give one process {}",
+                        describe_gib(bytes)
+                    )
+                })
+                .unwrap_or_default()
+        };
+        match self {
+            Self::Estimated(estimate) => format!(
+                "one process of ~{} ({}){}",
+                describe_gib(estimate.process_bytes),
+                describe_process_evidence(
+                    estimate.process_name.as_deref(),
+                    estimate.suite.as_deref(),
+                    Some(estimate.measured_bytes),
+                    estimate.measured_on.as_deref(),
+                    estimate.measured_here,
+                    &estimate.basis,
+                ),
+                capacity(estimate.capacity_bytes)
+            ),
+            Self::Unmeasured { capacity_bytes } => format!(
+                "placed unmeasured: no single process of this work, its suite, or any of this project's Rust compiles was measured on any platform, so it was offered the machines that can give one process the most first{}",
+                capacity(*capacity_bytes)
+            ),
+        }
     }
 }
 
@@ -17473,6 +17669,12 @@ pub enum PlacementRejectionReason {
     /// [`Self::MemoryKillExcluded`]: never placed here at any clamp, and the
     /// work waits for a machine that can hold it. See [`ProcessMisfit`].
     ProcessTooLarge(ProcessMisfit),
+    /// One process of this work, priced on a class prior rather than a
+    /// measurement of it ([`ProcessDemandBasis::ClassPrior`]), is larger than
+    /// this machine can give a single process. Not a filter: the machine
+    /// ranks behind every machine that can hold the prior, and is chosen only
+    /// when none of those can be.
+    ProcessDeferred(ProcessMisfit),
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
     /// Capable of running the work, but not a platform whose answer the
@@ -17705,6 +17907,10 @@ impl PlacementRejectionReason {
                 describe_age(*killed_at_unix_ms)
             ),
             Self::ProcessTooLarge(misfit) => misfit.describe(),
+            Self::ProcessDeferred(misfit) => format!(
+                "deferred: {}; offered only when no machine that can hold that can take the work",
+                misfit.describe()
+            ),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
             Self::UntrustedVerdictPlatform { os, trusted } => format!(
                 "runs {os}, and this verdict counts only from {}",
@@ -21507,6 +21713,7 @@ mod tests {
                 prediction: None,
                 memory_ceiling: None,
                 process_fit_waived: None,
+                process_demand: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,

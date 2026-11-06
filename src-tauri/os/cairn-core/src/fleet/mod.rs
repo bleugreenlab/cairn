@@ -10207,13 +10207,11 @@ impl Fleet {
         self.learn_resident_kills(db.clone(), &selected.executor_id, &context)
             .await;
         let command = launch_command?;
-        let suite = resource_profiles::suite_key(
-            project_id,
-            None,
-            cairn_common::executor_protocol::CellCommandClass::classify(command),
-        )?;
+        let class = cairn_common::executor_protocol::CellCommandClass::classify(command);
+        let suite = resource_profiles::suite_key(project_id, None, class)?;
         let evidence =
-            resource_profiles::resolve_process_demand(db, None, Some(&suite), &context).await;
+            resource_profiles::resolve_process_demand(db, None, Some(&suite), class, &context)
+                .await;
         let connections = self.lock_connections();
         let entry = connections.get(&selected.executor_id)?;
         let ProcessFit::Refused(reason) = process_fit(&evidence, entry)? else {
@@ -13349,7 +13347,7 @@ impl Fleet {
         let batch_suites: Vec<Option<String>> = plan
             .batch_suites
             .iter()
-            .map(|(_, suite)| suite.clone())
+            .map(|(_, suite, _)| suite.clone())
             .collect();
         let batch_items_share_the_machine = plan.parallel_width > 1;
         let profile_identity = request.command_resource_identity.clone();
@@ -16171,6 +16169,10 @@ enum ProcessFit {
     /// The fit would have refused, but one of its premises does not hold
     /// here; offered at its reservation, with the refusal on the record.
     Waived(cairn_common::executor_protocol::ProcessFitWaiver),
+    /// The demand is a class prior, not a measurement of the work, and this
+    /// machine cannot give one process that much: offered only when no
+    /// machine that can is selectable.
+    Deferred(cairn_common::executor_protocol::ProcessMisfit),
 }
 
 /// Whether this platform's kernel kills a process the machine cannot hold.
@@ -16212,6 +16214,10 @@ fn process_fit(
 /// measured (a named peak, or a kill's victim), and the kernel here would kill
 /// it. A named demand on a platform that cannot kill, or an unnamed peak that
 /// would have misfit anywhere, is waived with the refusal kept for the record.
+/// A measurement borrowed from another platform refuses like one taken here.
+/// A class prior defers instead: it is the project's largest rustc, not this
+/// work's, so a machine too small for it is offered the work last rather than
+/// never, unless the work's own kills here have already answered.
 fn judge_process_evidence(
     evidence: &resource_profiles::ProcessEvidence,
     total_bytes: u64,
@@ -16231,12 +16237,14 @@ fn judge_process_evidence(
         )
     };
     if let Some(misfit) = evidence.demand.as_ref().and_then(judge) {
-        return Some(match kernel_kills {
-            true => ProcessFit::Refused(PlacementRejectionReason::ProcessTooLarge(misfit)),
-            false => ProcessFit::Waived(ProcessFitWaiver {
+        let prior = misfit.basis.is_class_prior() && misfit.kills_here.is_none();
+        return Some(match (kernel_kills, prior) {
+            (false, _) => ProcessFit::Waived(ProcessFitWaiver {
                 misfit,
                 reason: ProcessFitWaiverReason::NoMemoryKiller,
             }),
+            (true, true) => ProcessFit::Deferred(misfit),
+            (true, false) => ProcessFit::Refused(PlacementRejectionReason::ProcessTooLarge(misfit)),
         });
     }
     let misfit = evidence.unattributed.as_ref().and_then(judge)?;
@@ -16255,11 +16263,7 @@ fn judge_process_fit(
     memory_budget_bytes: Option<u64>,
     here: &str,
 ) -> Option<cairn_common::executor_protocol::ProcessMisfit> {
-    let capacity_bytes = match (standing_bytes, memory_budget_bytes) {
-        (Some(standing), _) => total_bytes.saturating_sub(standing),
-        (None, Some(budget)) => resource_profiles::memory_reservation_cap(budget),
-        (None, None) => total_bytes,
-    };
+    let capacity_bytes = single_process_capacity(total_bytes, standing_bytes, memory_budget_bytes);
     let too_large = demand.peak_bytes > 0 && demand.demand_bytes() > capacity_bytes;
     let killed_out = demand.kills_here.filter(|(count, killed_at_total)| {
         *count >= KILLS_THAT_END_FIT
@@ -16287,7 +16291,75 @@ fn judge_process_fit(
             .then_some(killed_out)
             .flatten()
             .map(|(count, _)| count),
+        basis: demand.basis.clone(),
     })
+}
+
+/// What a machine can give one process: its total less its standing use,
+/// or, from an executor that posts no standing use, its reservation cap.
+fn single_process_capacity(
+    total_bytes: u64,
+    standing_bytes: Option<u64>,
+    memory_budget_bytes: Option<u64>,
+) -> u64 {
+    match (standing_bytes, memory_budget_bytes) {
+        (Some(standing), _) => total_bytes.saturating_sub(standing),
+        (None, Some(budget)) => resource_profiles::memory_reservation_cap(budget),
+        (None, None) => total_bytes,
+    }
+}
+
+/// [`single_process_capacity`] for a connected machine, `None` while its
+/// total is unread.
+fn entry_process_capacity(entry: &ExecutorConnectionState) -> Option<u64> {
+    Some(single_process_capacity(
+        entry.health.machine.memory.value()?.total_bytes,
+        entry.health.memory_record.standing_bytes,
+        entry.advertisement.capabilities.memory_budget_bytes,
+    ))
+}
+
+/// The single process `entry` was judged on, for the placement record: the
+/// named demand and where it came from, or, for a Rust compile nothing has
+/// measured, that it was placed unmeasured. `None` for work that compiles
+/// nothing and measured no process.
+fn process_demand_record(
+    evidence: &resource_profiles::ProcessEvidence,
+    entry: &ExecutorConnectionState,
+) -> Option<cairn_common::executor_protocol::ProcessDemandRecord> {
+    use cairn_common::executor_protocol::{ProcessDemandEstimate, ProcessDemandRecord};
+    let capacity_bytes = entry_process_capacity(entry);
+    match evidence
+        .demand
+        .as_ref()
+        .filter(|demand| demand.peak_bytes > 0)
+    {
+        Some(demand) => Some(ProcessDemandRecord::Estimated(ProcessDemandEstimate {
+            process_bytes: demand.demand_bytes(),
+            measured_bytes: demand.peak_bytes,
+            process_name: demand.name.clone(),
+            suite: demand.suite.clone(),
+            measured_on: demand.measured_on.as_deref().map(|context| {
+                context
+                    .rsplit_once(':')
+                    .map_or(context, |(_, executor)| executor)
+                    .to_string()
+            }),
+            measured_here: demand.measured_on.as_deref()
+                == Some(
+                    format!(
+                        "{}:{}",
+                        entry.identity.device_id, entry.identity.executor_id
+                    )
+                    .as_str(),
+                ),
+            basis: demand.basis.clone(),
+            capacity_bytes,
+        })),
+        None => evidence
+            .unmeasured_compile
+            .then_some(ProcessDemandRecord::Unmeasured { capacity_bytes }),
+    }
 }
 
 /// The machines a pass passed over because the work cannot run there, each
@@ -16376,6 +16448,7 @@ mod process_fit_tests {
             suite: Some("rust-tests".into()),
             measured_on: Some("bgsrv-ub2-device:bgsrv-ub2".into()),
             kills_here,
+            basis: Default::default(),
         }
     }
 
@@ -16391,6 +16464,7 @@ mod process_fit_tests {
         let evidence = resource_profiles::ProcessEvidence {
             demand: Some(demand.clone()),
             unattributed: None,
+            unmeasured_compile: false,
         };
         match judge_process_evidence(
             &evidence,
@@ -16403,6 +16477,9 @@ mod process_fit_tests {
             ProcessFit::Refused(reason) => Some(reason),
             ProcessFit::Waived(waiver) => {
                 panic!("a named demand on Linux is never waived: {waiver:?}")
+            }
+            ProcessFit::Deferred(misfit) => {
+                panic!("a measured demand is never deferred: {misfit:?}")
             }
         }
     }
@@ -16501,7 +16578,9 @@ mod process_fit_tests {
                 suite: Some("rust-tests".into()),
                 measured_on: Some(here.into()),
                 kills_here: None,
+                basis: Default::default(),
             }),
+            unmeasured_compile: false,
         };
         let budget = Some(24 * GIB / 100 * 85);
         for kernel_kills in [false, true] {
@@ -16533,6 +16612,7 @@ mod process_fit_tests {
         let evidence = resource_profiles::ProcessEvidence {
             demand: Some(rustc(10 * GIB, None)),
             unattributed: None,
+            unmeasured_compile: false,
         };
         let judge = |kernel_kills| {
             judge_process_evidence(
@@ -16571,10 +16651,192 @@ mod process_fit_tests {
                 name: None,
                 ..rustc(2 * GIB, None)
             }),
+            unmeasured_compile: false,
         };
         assert_eq!(
             judge_process_evidence(&evidence, 13 * GIB, Some(GIB), None, "m-device:m", true),
             None
+        );
+    }
+
+    /// bgsrv-ub as it reads on its page: 12.1 GiB total, 2.5 GiB standing,
+    /// so 9.6 GiB for one process.
+    const UB_TOTAL: u64 = 12_992_276_070;
+    const UB_STANDING: u64 = 2_684_354_560;
+    const UB: &str = "bgsrv-ub-device:bgsrv-ub";
+    /// The rustc the kernel killed there twice on 11-06 (9.2 GiB).
+    const KILLED_RUSTC: u64 = 9_910_000_000;
+
+    fn linux(executor_class: &str, arch: &str) -> resource_profiles::ProfileContext {
+        resource_profiles::ProfileContext {
+            executor_class: executor_class.into(),
+            os: "linux".into(),
+            arch: arch.into(),
+            toolchain_fingerprint: "bun\u{1f}rust".into(),
+        }
+    }
+
+    fn workspace_compile(key: &str) -> CommandResourceIdentity {
+        CommandResourceIdentity {
+            version: 1,
+            key: key.into(),
+            suite: Some("workspace-compile".into()),
+        }
+    }
+
+    fn rustc_completion(peak: u64, at: u64) -> CellExecutionMeta {
+        CellExecutionMeta {
+            stop: None,
+            peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                bytes: peak,
+                name: Some("rustc".into()),
+            }),
+            ..resource_profiles::oom_killed_for_test(peak, None, 0, at)
+        }
+    }
+
+    async fn evidence_on_ub(
+        db: Arc<cairn_db::storage::LocalDb>,
+        identity: &CommandResourceIdentity,
+    ) -> resource_profiles::ProcessEvidence {
+        let class = cairn_common::executor_protocol::CellCommandClass::CargoCheck;
+        let suite = resource_profiles::suite_key("cairn", Some(identity), class);
+        resource_profiles::resolve_process_demand(
+            db,
+            Some(identity),
+            suite.as_deref(),
+            class,
+            &linux(UB, "x86_64"),
+        )
+        .await
+    }
+
+    /// cairn/6312 pin (a): the identity has no x86_64 peak (fedora's rows
+    /// predate the peak-reporting sampler, bbs had not yet written one) but
+    /// bginf-sp1 measured a 12 GiB rustc on aarch64. bgsrv-ub refuses it on
+    /// that borrowed number, and the sentence names where it came from.
+    #[tokio::test]
+    async fn an_aarch64_peak_refuses_a_cold_x86_identity_on_the_small_machine() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-fit-borrowed.db").await);
+        let id = workspace_compile("workspace-compile:6a649d48");
+        let unnamed = CellExecutionMeta {
+            peak_process: None,
+            ..rustc_completion(4 * GIB, 1)
+        };
+        resource_profiles::observe_completed(
+            db.clone(),
+            Some(&id),
+            &linux("fedora:fedora", "x86_64"),
+            &unnamed,
+            resource_profiles::CompletionKind::Succeeded,
+        )
+        .await;
+        resource_profiles::observe_completed(
+            db.clone(),
+            Some(&id),
+            &linux("bginf-sp1-device:bginf-sp1", "aarch64"),
+            &rustc_completion(12 * GIB, 2),
+            resource_profiles::CompletionKind::Succeeded,
+        )
+        .await;
+        let evidence = evidence_on_ub(db, &id).await;
+        let Some(ProcessFit::Refused(PlacementRejectionReason::ProcessTooLarge(misfit))) =
+            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, UB, true)
+        else {
+            panic!("a borrowed measurement refuses like one taken here: {evidence:?}");
+        };
+        let text = misfit.describe();
+        assert!(
+            text.contains("needs one process of ~15.0 GiB (rustc, 12.0 GiB measured on bginf-sp1 (aarch64) x 1.25 headroom; estimated here); this machine can give one process 9.6 GiB"),
+            "{text}"
+        );
+        assert_eq!(
+            judge_process_evidence(&evidence, 62 * GIB, Some(4 * GIB), None, "bbs:bbs", true),
+            None,
+            "a 62 GiB machine holds it"
+        );
+    }
+
+    /// cairn/6312 pin (b): nothing of the identity was measured anywhere,
+    /// and the project's largest rustc is the 9.2 GiB its rust-tests suite
+    /// lost. bgsrv-ub is deferred on that prior, not refused, and a 62 GiB
+    /// machine fits it.
+    #[tokio::test]
+    async fn the_class_prior_defers_the_small_machine() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-fit-prior.db").await);
+        resource_profiles::observe_suite(
+            db.clone(),
+            Some("cairn/rust-tests"),
+            &linux("bgsrv-ub2-device:bgsrv-ub2", "x86_64"),
+            &rustc_completion(KILLED_RUSTC, 1),
+            resource_profiles::CompletionKind::Failed,
+        )
+        .await;
+        let evidence = evidence_on_ub(db, &workspace_compile("workspace-compile:cold")).await;
+        let Some(ProcessFit::Deferred(misfit)) =
+            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, UB, true)
+        else {
+            panic!("a class prior defers: {evidence:?}");
+        };
+        let text = PlacementRejectionReason::ProcessDeferred(misfit).describe();
+        assert!(
+            text.contains("(rustc, suite rust-tests, 9.2 GiB measured on bgsrv-ub2 x 1.25 headroom; a prior for this project's Rust compiles"),
+            "{text}"
+        );
+        assert!(text.starts_with("deferred: "), "{text}");
+        assert_eq!(
+            judge_process_evidence(&evidence, 62 * GIB, Some(4 * GIB), None, "bbs:bbs", true),
+            None
+        );
+        assert!(
+            matches!(
+                judge_process_evidence(&evidence, 10 * GIB, None, None, UB, false),
+                Some(ProcessFit::Waived(_))
+            ),
+            "a platform with no memory killer prices a prior as it prices a measurement"
+        );
+    }
+
+    /// cairn/6312 pin (d), on 11-06's rows: workspace-compile's rustc
+    /// measured 9.2 GiB on bgsrv-ub and was killed there twice at 12.1 GiB.
+    /// The next request, under any identity of the suite, is refused there,
+    /// on its size measured here.
+    #[tokio::test]
+    async fn a_suite_killed_here_at_its_measured_size_is_refused_on_the_next_request() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-fit-killed.db").await);
+        for at in [1, 2] {
+            let mut kill =
+                resource_profiles::oom_killed_for_test(KILLED_RUSTC, Some(UB_TOTAL), 1, at);
+            if let Some(cairn_common::executor_protocol::CommandStop::OomKilled {
+                process_name,
+                ..
+            }) = &mut kill.stop
+            {
+                *process_name = Some("rustc".into());
+            }
+            resource_profiles::observe_suite(
+                db.clone(),
+                Some("cairn/workspace-compile"),
+                &linux(UB, "x86_64"),
+                &kill,
+                resource_profiles::CompletionKind::Failed,
+            )
+            .await;
+        }
+        let evidence = evidence_on_ub(db, &workspace_compile("workspace-compile:next")).await;
+        let demand = evidence.demand.as_ref().unwrap();
+        assert_eq!(demand.kills_here, Some((2, UB_TOTAL)));
+        let Some(ProcessFit::Refused(reason)) =
+            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, UB, true)
+        else {
+            panic!("refused where it was killed");
+        };
+        let text = reason.describe();
+        assert!(
+            text.contains(
+                "(rustc, suite workspace-compile, 9.2 GiB measured here x 1.25 headroom)"
+            ),
+            "{text}"
         );
     }
 
@@ -16637,6 +16899,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::ExceedsMemoryCeiling { .. } => "exceedsMemoryCeiling",
         PlacementRejectionReason::MemoryKillExcluded { .. } => "memoryKillExcluded",
         PlacementRejectionReason::ProcessTooLarge(_) => "processTooLarge",
+        PlacementRejectionReason::ProcessDeferred(_) => "processDeferred",
         PlacementRejectionReason::OutrankedBy { .. } => "outrankedBy",
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
@@ -17052,6 +17315,32 @@ fn rank_survey(
             policy: policy_evidence(request, policy, false),
         });
     }
+    // The same trade for a machine too small for the class prior: while a
+    // machine whose cap holds the prior has only said "not yet", the work
+    // waits for it rather than being the small machine's first measurement.
+    if let Some(PlacementRejectionReason::ProcessDeferred(misfit)) = &winner.deferred {
+        let holds_prior = |rejection: &PlacementRejection| {
+            memory_budgets
+                .get(&rejection.executor_id)
+                .copied()
+                .flatten()
+                .is_none_or(|budget| {
+                    resource_profiles::memory_reservation_cap(budget) >= misfit.process_bytes
+                })
+        };
+        if exercising_spill
+            && rejected
+                .iter()
+                .any(|rejection| waits_on_machine(&rejection.reason) && holds_prior(rejection))
+        {
+            rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
+            return Ok(PlacementDraft {
+                selected: None,
+                rejected,
+                policy: policy_evidence(request, policy, false),
+            });
+        }
+    }
 
     // Blindness is named ahead of `OnlyCandidate` deliberately. A lone
     // measured-blind home winning by default is precisely the local-degradation
@@ -17111,7 +17400,23 @@ fn rank_survey(
         memory_ceiling: winner
             .reservation
             .and_then(|resolved| resolved.memory_fit.ceiling()),
-        process_fit_waived: winner.process_fit_waived.clone(),
+        // A deferred machine wins only when no machine that can hold the
+        // prior was selectable, and its record says that is why.
+        process_fit_waived: winner.process_fit_waived.clone().or_else(|| {
+            match &winner.deferred {
+                Some(PlacementRejectionReason::ProcessDeferred(misfit)) => {
+                    Some(cairn_common::executor_protocol::ProcessFitWaiver {
+                        misfit: misfit.clone(),
+                        reason:
+                            cairn_common::executor_protocol::ProcessFitWaiverReason::NoLargerMachine,
+                    })
+                }
+                _ => None,
+            }
+        }),
+        process_demand: winner.reservation.and_then(|resolved| {
+            process_demand_record(&resolved.process_evidence, winner.entry)
+        }),
         cache_distance: winner.cache_distance.map(|distance| {
             cairn_common::cache_distance::MeasuredDistance {
                 target_commit: request.base_commit.clone(),
@@ -17176,6 +17481,14 @@ struct ScoredCandidate<'a> {
     /// The single-process refusal this machine would have met and did not,
     /// and why; carried onto the record if it wins.
     process_fit_waived: Option<cairn_common::executor_protocol::ProcessFitWaiver>,
+    /// Set when the work's class prior is larger than this machine can give
+    /// one process: it ranks behind every machine that is not, and is
+    /// selectable only when none of those is.
+    deferred: Option<PlacementRejectionReason>,
+    /// What this machine can give one process, set only for a Rust compile
+    /// nothing has measured on any platform, which is offered the machines
+    /// that can give the most first.
+    unmeasured_capacity: Option<Option<u64>>,
     /// What this machine has posted that its admission would decline this
     /// request on now. A current fact, so it outranks everything below it.
     held: Option<AdmissionHoldEvidence>,
@@ -17327,12 +17640,23 @@ impl<'a> ScoredCandidate<'a> {
                     <= capacity
             });
         let ceiling = reservation.and_then(|resolved| resolved.memory_fit.ceiling());
-        let (too_large, process_fit_waived) =
+        let (too_large, process_fit_waived, deferred) =
             match reservation.and_then(|resolved| process_fit(&resolved.process_evidence, entry)) {
-                Some(ProcessFit::Refused(reason)) => (Some(reason), None),
-                Some(ProcessFit::Waived(waiver)) => (None, Some(waiver)),
-                None => (None, None),
+                Some(ProcessFit::Refused(reason)) => (Some(reason), None, None),
+                Some(ProcessFit::Waived(waiver)) => (None, Some(waiver), None),
+                Some(ProcessFit::Deferred(misfit)) => (
+                    None,
+                    None,
+                    Some(PlacementRejectionReason::ProcessDeferred(misfit)),
+                ),
+                None => (None, None, None),
             };
+        let unmeasured_capacity = reservation
+            .filter(|resolved| {
+                resolved.process_evidence.unmeasured_compile
+                    && resolved.process_evidence.demand.is_none()
+            })
+            .map(|_| entry_process_capacity(entry));
         let excluded = ceiling
             .and_then(|ceiling| memory_kill_exclusion(ceiling.killed_here.as_ref()?, machine))
             .or(too_large);
@@ -17351,6 +17675,8 @@ impl<'a> ScoredCandidate<'a> {
             over_ceiling,
             excluded,
             process_fit_waived,
+            deferred,
+            unmeasured_capacity,
             held: hold.map(|hold| hold.evidence.clone()),
             admission_accepts,
             declined_here,
@@ -17373,6 +17699,7 @@ impl<'a> ScoredCandidate<'a> {
                 .clone()
                 .or_else(|| self.model_room.clone())
                 .or_else(|| self.blindness.clone())
+                .or_else(|| self.deferred.clone())
                 .or_else(|| self.over_ceiling.clone())
                 .or_else(|| self.misfit.clone())
                 .or_else(|| self.held_rejection())
@@ -17388,6 +17715,7 @@ impl<'a> ScoredCandidate<'a> {
             .clone()
             .or_else(|| self.model_room.clone())
             .or_else(|| self.blindness.clone())
+            .or_else(|| self.deferred.clone())
             .or_else(|| self.over_ceiling.clone())
             .or_else(|| self.misfit.clone())
             .or_else(|| self.held_rejection())
@@ -17476,6 +17804,11 @@ fn rank_candidates<'a, 'b>(
             .cmp(&b.excluded.is_some())
             .then_with(|| a.model_room.is_some().cmp(&b.model_room.is_some()))
             .then_with(|| a.blindness.is_some().cmp(&b.blindness.is_some()))
+            // Like the ceiling below, a fact about the machine's size: a
+            // large machine that is busy queues the work, a small idle one
+            // runs it into the kernel.
+            .then_with(|| a.deferred.is_some().cmp(&b.deferred.is_some()))
+            .then_with(|| b.unmeasured_capacity.cmp(&a.unmeasured_capacity))
             .then_with(|| a.over_ceiling.is_some().cmp(&b.over_ceiling.is_some()))
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
             .then_with(|| a.held.is_some().cmp(&b.held.is_some()))
@@ -17550,7 +17883,7 @@ fn rank_candidates<'a, 'b>(
                 .cmp(&b.entry.identity.executor_id)
         })
     };
-    let selectable = |candidate: &&ScoredCandidate<'a>| {
+    let usable = |candidate: &&ScoredCandidate<'a>| {
         candidate.excluded.is_none()
             && candidate.model_room.is_none()
             && (candidate.blindness.is_none()
@@ -17563,6 +17896,15 @@ fn rank_candidates<'a, 'b>(
                     PlacementStance::RemoteOnly
                 )
                 && candidate.entry.colocated)
+    };
+    // A machine too small for the class prior is taken only when nothing
+    // that can hold it is usable; otherwise ranking would still choose it
+    // whenever every larger machine was outranked on some later key.
+    let undeferred_usable = scored
+        .iter()
+        .any(|candidate| candidate.deferred.is_none() && usable(&candidate));
+    let selectable = |candidate: &&ScoredCandidate<'a>| {
+        usable(candidate) && (candidate.deferred.is_none() || !undeferred_usable)
     };
 
     let mut baseline: Vec<&ScoredCandidate<'a>> = scored.iter().collect();
@@ -17615,6 +17957,10 @@ fn rank_candidates<'a, 'b>(
             // Exploring a machine that can never hold the work earns an
             // out-of-memory kill, not a duration sample.
             && candidate.over_ceiling.is_none()
+            // Nor is a Rust compile whose single process nothing measured
+            // explored onto whatever machine is due: its order is by size.
+            && candidate.deferred.is_none()
+            && candidate.unmeasured_capacity.is_none()
             && candidate.admission_accepts
             && candidate.prediction.queue.predicted_ms() == Some(0)
             && resource_profiles::teaches_baseline(&forecast_start(&candidate.prediction))
@@ -18707,9 +19053,13 @@ struct ReservationPlan {
     parallel_width: u32,
     /// The suite a single-command request's evidence is learned under.
     suite: Option<String>,
-    /// Every batch item's identity and suite, in item order, including the
-    /// items no identity was minted for.
-    batch_suites: Vec<(Option<CommandResourceIdentity>, Option<String>)>,
+    /// Every batch item's identity, suite and command class, in item order,
+    /// including the items no identity was minted for.
+    batch_suites: Vec<(
+        Option<CommandResourceIdentity>,
+        Option<String>,
+        cairn_common::executor_protocol::CellCommandClass,
+    )>,
 }
 
 impl ReservationPlan {
@@ -18764,15 +19114,17 @@ impl ReservationPlan {
                                 .chain(item.args.iter().map(String::as_str))
                                 .collect::<Vec<_>>()
                                 .join(" ");
+                            let class = cairn_common::executor_protocol::CellCommandClass::classify(
+                                &command,
+                            );
                             (
                                 item.command_resource_identity.clone(),
                                 resource_profiles::suite_key(
                                     &request.project_id,
                                     item.command_resource_identity.as_ref(),
-                                    cairn_common::executor_protocol::CellCommandClass::classify(
-                                        &command,
-                                    ),
+                                    class,
                                 ),
+                                class,
                             )
                         })
                         .collect()
@@ -18792,16 +19144,18 @@ impl ReservationPlan {
                 self.db.clone(),
                 self.request_identity.as_ref(),
                 self.suite.as_deref(),
+                self.command_class,
                 context,
             )
             .await;
         }
         let mut evidence = resource_profiles::ProcessEvidence::default();
-        for (identity, suite) in &self.batch_suites {
+        for (identity, suite, class) in &self.batch_suites {
             let item = resource_profiles::resolve_process_demand(
                 self.db.clone(),
                 identity.as_ref(),
                 suite.as_deref(),
+                *class,
                 context,
             )
             .await;
@@ -27210,6 +27564,160 @@ mod tests {
             select(pool, db, request).await.unwrap().placed().is_none(),
             "a drained machine that fits is worth waiting for"
         );
+    }
+
+    /// cairn/6312 pin (b) end to end: a cold workspace-compile identity that
+    /// nothing measured on any platform, in a project whose rust-tests suite
+    /// lost a 9.2 GiB rustc. bgsrv-ub (12.1 GiB) is deferred while a 62 GiB
+    /// machine can take the work, and the winner's record names the prior;
+    /// with the large machine drained, bgsrv-ub takes it, and its record says
+    /// no larger machine could. With no rustc measured anywhere, the record
+    /// says the work was placed unmeasured, and the larger machine wins.
+    #[tokio::test]
+    async fn a_cold_compile_is_offered_the_small_machine_last_on_the_class_prior() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        async fn fleet(
+            db_name: &str,
+            large_drained: bool,
+            prior: bool,
+        ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
+            let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
+            let pool = Fleet::default();
+            let now = unix_time_ms();
+            let mut connections = HashMap::new();
+            let mut small = None;
+            for (id, total) in [("bgsrv-ub", 12_992_276_070_u64), ("bbs", 62 * GIB)] {
+                let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
+                entry.advertisement.capabilities.memory_budget_bytes = Some(total / 100 * 85);
+                measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
+                Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
+                    now,
+                    MachineMemory {
+                        total_bytes: total,
+                        available_bytes: total - 3 * GIB,
+                    },
+                );
+                Arc::make_mut(&mut entry.health)
+                    .memory_record
+                    .standing_bytes = Some(5 * GIB / 2);
+                entry.drained = id == "bbs" && large_drained;
+                small.get_or_insert_with(|| {
+                    ReservationPlan::context_for(
+                        &entry.identity.device_id,
+                        &entry.identity.executor_id,
+                        &entry.advertisement.capabilities,
+                    )
+                });
+                connections.insert(id, entry);
+            }
+            *pool.lock_connections() = connections;
+            let mut request = spillable_request();
+            request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoCheck;
+            if prior {
+                resource_profiles::observe_suite(
+                    db.clone(),
+                    Some(&format!("{}/rust-tests", request.project_id)),
+                    &small.unwrap(),
+                    &CellExecutionMeta {
+                        stop: None,
+                        peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                            bytes: 9_910_000_000,
+                            name: Some("rustc".into()),
+                        }),
+                        ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
+                    },
+                    resource_profiles::CompletionKind::Failed,
+                )
+                .await;
+            }
+            request.command_resource_identity = Some(CommandResourceIdentity {
+                version: 1,
+                key: "workspace-compile:cold".into(),
+                suite: Some("workspace-compile".into()),
+            });
+            (pool, db, request)
+        }
+        let select = |pool: Fleet, db, request: CellRequest| async move {
+            let plan = ReservationPlan::new(db, &request, None);
+            pool.select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+        };
+        let selection = |placement: &Placement| match &placement.decision.outcome {
+            PlacementOutcome::Selected(selection) => selection.as_ref().clone(),
+            other => panic!("placed means selected: {other:?}"),
+        };
+
+        let (pool, db, request) = fleet("process-prior-large.db", false, true).await;
+        let placement = select(pool, db, request)
+            .await
+            .unwrap()
+            .placed()
+            .expect("the large machine takes it");
+        assert_eq!(placement.selected.executor_id, "bbs");
+        let small = placement
+            .decision
+            .rejected
+            .iter()
+            .find(|rejection| rejection.executor_id == "bgsrv-ub")
+            .expect("bgsrv-ub is on the record");
+        assert!(
+            matches!(small.reason, PlacementRejectionReason::ProcessDeferred(_)),
+            "{}",
+            small.reason.describe()
+        );
+        let demand = selection(&placement)
+            .process_demand
+            .expect("the winner's record names its single process");
+        assert!(
+            demand
+                .describe()
+                .starts_with("one process of ~11.5 GiB (rustc, suite rust-tests, 9.2 GiB measured on bgsrv-ub x 1.25 headroom; a prior for this project's Rust compiles"),
+            "{}",
+            demand.describe()
+        );
+        assert!(!demand.measured_on_this_platform());
+
+        let (pool, db, request) = fleet("process-prior-drained.db", true, true).await;
+        let placement = select(pool, db, request)
+            .await
+            .unwrap()
+            .placed()
+            .expect("with the large machine drained, the small one is last but not never");
+        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
+        let waiver = selection(&placement)
+            .process_fit_waived
+            .expect("the record says why the small machine took it");
+        assert_eq!(
+            waiver.reason,
+            cairn_common::executor_protocol::ProcessFitWaiverReason::NoLargerMachine
+        );
+
+        let (pool, db, request) = fleet("process-prior-none.db", false, false).await;
+        let placement = select(pool, db, request)
+            .await
+            .unwrap()
+            .placed()
+            .expect("unmeasured work is still placed");
+        assert_eq!(
+            placement.selected.executor_id, "bbs",
+            "the machine that can give one process the most"
+        );
+        let demand = selection(&placement).process_demand.unwrap();
+        assert!(
+            matches!(
+                demand,
+                cairn_common::executor_protocol::ProcessDemandRecord::Unmeasured { .. }
+            ),
+            "{demand:?}"
+        );
+        assert!(demand.describe().starts_with("placed unmeasured"));
     }
 
     /// cairn/6310 end to end: bgsrv-mac, the only macOS machine, whose

@@ -25,6 +25,50 @@ fn required_text<'a>(
         })
 }
 
+/// The channels resources' writes: an agent sending free text to a bound
+/// conversation, and a label on an ambient routing.
+pub(super) async fn dispatch(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    index: usize,
+    item: &ChangeItem,
+    dry_run: bool,
+    resource: &CairnResource,
+) -> ResourceMutationResult<Option<String>> {
+    match (resource, item.mode) {
+        (CairnResource::ChannelsConversations, ChangeMode::Append) => {
+            send(orch, request, index, item, dry_run).await.map(Some)
+        }
+        (CairnResource::ChannelsAmbientFeedback, ChangeMode::Append) => {
+            label(orch, request, index, item, dry_run).await.map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A thread or the operator labelling an ambient routing. Refusals come in a
+/// fixed order, each a sentence naming its reason: the payload's shape, then
+/// the labeller (a chartered thread, never a task or node; or a run-less
+/// operator write), then the event, then the re-route target.
+async fn label(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    index: usize,
+    item: &ChangeItem,
+    dry_run: bool,
+) -> ResourceMutationResult<String> {
+    use crate::channels::ambient_feedback::{apply_label, labeller, LabelPayload};
+    let payload = append_payload(index, item)?;
+    let payload =
+        LabelPayload::parse(payload).map_err(|error| build_failure(index, item, error))?;
+    let labeller = labeller(orch, request)
+        .await
+        .map_err(|error| build_failure(index, item, error))?;
+    apply_label(orch, request, &labeller, &payload, dry_run)
+        .await
+        .map_err(|error| build_failure(index, item, error))
+}
+
 /// An agent sending free text to a bound conversation.
 ///
 /// Every refusal happens before the intent is ledgered, in a fixed order: the
@@ -34,17 +78,13 @@ fn required_text<'a>(
 /// limit. A successful write reports the enqueue and never claims delivery:
 /// the router sends it, and a failure lands on the `channel_outbound` row and the
 /// provider's `last_send_error` like any other outbound.
-pub(super) async fn dispatch(
+async fn send(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
     dry_run: bool,
-    resource: &CairnResource,
-) -> ResourceMutationResult<Option<String>> {
-    let (CairnResource::ChannelsConversations, ChangeMode::Append) = (resource, item.mode) else {
-        return Ok(None);
-    };
+) -> ResourceMutationResult<String> {
     let payload = append_payload(index, item)?;
     let conversation = required_text(index, item, payload, "conversation")?;
     let content = required_text(index, item, payload, "content")?;
@@ -80,10 +120,10 @@ pub(super) async fn dispatch(
         .unwrap_or_default();
 
     if dry_run {
-        return Ok(Some(format!(
+        return Ok(format!(
             "Would send a message to {address} as {}.{warning}",
             agent.home
-        )));
+        ));
     }
     let id = agent_message::enqueue(
         &orch.db.local,
@@ -94,9 +134,9 @@ pub(super) async fn dispatch(
     )
     .await
     .map_err(|error| build_failure(index, item, error))?;
-    Ok(Some(format!(
+    Ok(format!(
         "Queued message {id} to {address} (pending); delivery and any failure are recorded on channel_outbound {id} and surface as this provider's last_send_error on cairn://channels/conversations.{warning}"
-    )))
+    ))
 }
 
 #[cfg(test)]

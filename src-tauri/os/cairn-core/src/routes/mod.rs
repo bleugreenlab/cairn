@@ -34,7 +34,7 @@ pub use predicate::{
     Presence, SourceSpec, TriggerClause, ANSWERS_PREFIX, COMPARISON_OPERATORS, EVENT_FIELD,
 };
 pub use references::validate_references;
-pub(crate) use worker::{addressed_via, explain_thread_triggers};
+pub(crate) use worker::{addressed_via, explain_thread_triggers, fact_row_uri, project_key};
 #[cfg(test)]
 pub(crate) use worker::{drain_fact_log, drain_fact_log_within, fixture};
 pub use worker::{event_uri, spawn_fact_log_worker};

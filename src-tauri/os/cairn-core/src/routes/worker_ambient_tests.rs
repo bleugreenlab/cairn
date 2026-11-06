@@ -403,10 +403,15 @@ fn citation(name: &str, probability: &str, method: &str) -> String {
     )
 }
 
-fn delivered(citations: &str, conversation: &str, sender: &str, text: &str) -> String {
+fn delivered(citations: &str, conversation: &str, sender: &str, event: &str, text: &str) -> String {
     format!(
-        "Decision: {citations}.\nVia ambient Discord channel {conversation} from {sender} via discord. If this isn't yours, say so.\n\n{text}\n"
+        "Decision: {citations}.\nVia ambient Discord channel {conversation}, from {sender}. Event {event}.\nIf this isn't yours, answer the event: write cairn://channels/ambient/feedback {{event, verdict: not_mine | reroute, to?}}.\n\n{text}\n"
     )
+}
+
+/// The URI of the fact a routed message came from, as its body cites it.
+fn event_of(routed: &Routed) -> String {
+    fact_row_uri(Some(PROJECT), routed.row.id)
 }
 
 /// Exactly one acknowledgement, from the sink at `position`, to the message's
@@ -551,10 +556,19 @@ async fn one_admitted_thread_hears_the_message_and_the_conversation_hears_where_
 
     assert_eq!(server.calls(), 1, "one decision, asked once");
     let devops = citation("devops", "0.9", "native");
-    let body = delivered(&devops, FIRST, "ada", inbound.text);
+    let event = event_of(&routed);
+    assert_eq!(
+        event,
+        format!("cairn://p/{PROJECT}/events/{}", routed.row.id)
+    );
+    let body = delivered(&devops, FIRST, "ada", &event, inbound.text);
     assert_eq!(
         thread_messages(&orch).await,
         [("devops".to_string(), format!("route:{ROUTE}"), body.clone())]
+    );
+    assert!(
+        body.contains(&event),
+        "the delivered text cites the fact that produced it"
     );
     assert_eq!(route_messages(&orch).await, 1, "no message anywhere else");
 
@@ -629,15 +643,34 @@ async fn two_admitted_threads_each_hear_it_and_one_acknowledgement_cites_both_in
     let docs = citation("docs", "0.47", "native");
     assert_ne!(revision(charter("devops")), revision(charter("docs")));
     let citations = format!("{devops}, {docs}");
-    let body = delivered(&citations, FIRST, "grace", inbound.text);
+    let event = event_of(&routed);
+    let body = delivered(&citations, FIRST, "grace", &event, inbound.text);
     let sender = format!("route:{ROUTE}");
+    let messages = thread_messages(&orch).await;
     assert_eq!(
-        thread_messages(&orch).await,
+        messages,
         [
             ("devops".to_string(), sender.clone(), body.clone()),
             ("docs".to_string(), sender, body.clone()),
         ],
         "one message per admitted thread; the rest fell short and old/scratch were never options"
+    );
+    let cited: Vec<_> = messages
+        .iter()
+        .map(|(_, _, content)| {
+            content
+                .lines()
+                .nth(1)
+                .and_then(|line| line.split("Event ").nth(1))
+                .and_then(|rest| rest.strip_suffix('.'))
+                .unwrap_or_else(|| panic!("an event line: {content}"))
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        cited,
+        [event.clone(), event],
+        "both deliveries carry the one fact's URI"
     );
     assert_eq!(route_messages(&orch).await, 2);
 
@@ -697,6 +730,45 @@ async fn two_admitted_threads_each_hear_it_and_one_acknowledgement_cites_both_in
         ]
     );
     assert_ack_journal(&orch, &routed, &inbound, &record).await;
+
+    // The label set's sweep reads this journal: one row per delivered thread,
+    // each snapshotting the decision.
+    let now = orch.services.clock.now();
+    let report = crate::channels::ambient_feedback::sweep_once(&orch, now)
+        .await
+        .unwrap();
+    assert_eq!((report.inserted, report.unrecorded), (2, 0));
+    for name in ["devops", "docs"] {
+        let row = crate::storage::ambient_feedback::find(
+            &orch.db.local,
+            PROJECT,
+            routed.row.id,
+            Some(&build_thread_uri(PROJECT, name)),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("a label-set row for {name}"));
+        assert_eq!(
+            (
+                row.outcome.as_str(),
+                row.pick.as_deref(),
+                row.probability,
+                row.measured_by.as_deref(),
+                row.revision,
+                row.picks_json.as_deref(),
+                row.addresses_from.as_str(),
+            ),
+            (
+                "admitted",
+                Some("devops"),
+                Some(0.48),
+                Some("native"),
+                Some(revision(charter("devops"))),
+                Some(r#"["devops","docs"]"#),
+                "firings",
+            )
+        );
+    }
 }
 
 /// devops at 0.4 over ten threads normalizes to 0.33, under the native 0.4.
@@ -989,12 +1061,18 @@ async fn each_conversation_hears_about_its_own_message() {
             (
                 "devops".to_string(),
                 sender.clone(),
-                delivered(&devops, FIRST, "ada", first.text)
+                delivered(&devops, FIRST, "ada", &event_of(&routed_first), first.text)
             ),
             (
                 "docs".to_string(),
                 sender,
-                delivered(&docs, SECOND, "grace", second.text)
+                delivered(
+                    &docs,
+                    SECOND,
+                    "grace",
+                    &event_of(&routed_second),
+                    second.text
+                )
             ),
         ]
     );

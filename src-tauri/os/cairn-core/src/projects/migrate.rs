@@ -83,6 +83,11 @@ pub(super) const CHANNEL_KEY_ADDRESSED: &[KeyAddressedSpec] = &[
         table: "channel_state_card",
         sweep_where_sql: "project_key = ?1",
     },
+    // The ambient route's label set, keyed by the project its events belong to.
+    KeyAddressedSpec {
+        table: "ambient_routing_feedback",
+        sweep_where_sql: "project_key = ?1",
+    },
     KeyAddressedSpec {
         table: "channel_conversation_binding",
         sweep_where_sql: "target_uri = 'cairn://p/' || ?1 OR substr(target_uri, 1, length(?1) + 11) = 'cairn://p/' || ?1 || '/'",
@@ -1601,6 +1606,9 @@ pub(super) mod tests {
             INSERT INTO channel_inbound(id, channel, sender, text, received_at, conversation, target_uri, binding_kind)
               VALUES ('inbound-ambient-{project_key}', 'discord', 'operator', 'who owns this?', 1, 'discord:1/104', 'cairn://p/{project_key}', 'ambient'),
                      ('inbound-thread-{project_key}', 'discord', 'operator', 'hello', 1, 'discord:1/102', 'cairn://p/{project_key}/general', 'structural');
+            INSERT INTO ambient_routing_feedback(project_key, event_id, recipient_thread, outcome, addresses_from, event_at, swept_at)
+              VALUES ('{project_key}', 1, 'cairn://p/{project_key}/general', 'admitted', 'firings', 1, 1),
+                     ('{project_key}', 2, NULL, 'refused', 'firings', 1, 1);
             "#
         ))
         .await
@@ -1823,7 +1831,12 @@ pub(super) mod tests {
         key_addressed.sort_unstable();
         assert_eq!(
             key_addressed,
-            ["channel_state_card", "discord_surface", "project_routes"]
+            [
+                "ambient_routing_feedback",
+                "channel_state_card",
+                "discord_surface",
+                "project_routes"
+            ]
         );
         // `project_routes` is intentionally swept by the routing path because
         // local and team deletion have different route-removal transactions.
@@ -2070,6 +2083,7 @@ pub(super) mod tests {
             "channel_outbound",
             "channel_ask_action",
             "channel_ask_resolution",
+            "ambient_routing_feedback",
         ] {
             assert_eq!(count_rows(&db, table).await, 0, "{table} retained rows");
         }
@@ -2157,12 +2171,27 @@ pub(super) mod tests {
         .await
         .unwrap();
 
+        db.execute(
+            "INSERT INTO ambient_routing_feedback(project_key, event_id, outcome, addresses_from, event_at, swept_at)
+             VALUES ('mixedcase_', 9, 'refused', 'firings', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
         sweep_project_channel_surfaces(&db, "MixedCase")
             .await
             .unwrap();
 
         assert_eq!(count_rows(&db, "discord_surface").await, 0);
         assert_eq!(count_rows(&db, "channel_state_card").await, 0);
+        assert_eq!(
+            db.query_text("SELECT project_key FROM ambient_routing_feedback", ())
+                .await
+                .unwrap(),
+            Some("mixedcase_".to_string()),
+            "a project's sweep must leave a neighbouring key's label set"
+        );
         assert_eq!(count_rows(&db, "channel_conversation_binding").await, 1);
         assert_eq!(
             db.query_text("SELECT id FROM channel_inbound", ())
@@ -2737,6 +2766,7 @@ pub(super) mod tests {
             "channel_outbound",
             "channel_ask_action",
             "channel_ask_resolution",
+            "ambient_routing_feedback",
         ] {
             assert!(
                 count_rows(&fixture.local, table).await > 0,
@@ -2761,6 +2791,7 @@ pub(super) mod tests {
             "channel_outbound",
             "channel_ask_action",
             "channel_ask_resolution",
+            "ambient_routing_feedback",
         ] {
             assert_eq!(
                 count_rows(&fixture.local, table).await,
@@ -3218,6 +3249,7 @@ pub(super) mod tests {
             "discord_surface",
             "channel_state_card",
             "channel_conversation_binding",
+            "ambient_routing_feedback",
         ] {
             assert!(
                 count_rows(&local, table).await > 0,

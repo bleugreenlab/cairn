@@ -83,6 +83,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::DEV_LAUNCH_TICKET_CONTRACT,
     globals::LOGS_CONTRACT,
     globals::CHANNELS_CONVERSATIONS_CONTRACT,
+    globals::CHANNELS_AMBIENT_FEEDBACK_CONTRACT,
     globals::EXECUTORS_CONTRACT,
     globals::EXECUTOR_CONTRACT,
     globals::GRANTS_CONTRACT,

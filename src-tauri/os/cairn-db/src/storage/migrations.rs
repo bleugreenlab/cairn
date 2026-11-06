@@ -2867,6 +2867,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "fact_log_wakes",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // The ambient route's label set is swept from this runner's fact log and
+    // firing journal, and sits beside them for the same reason.
+    (
+        "ambient_routing_feedback",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "ambient_routing_feedback_cursor",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "write_replay_ledger",
         TableScope::Private(PrivateReason::RunnerTransient),

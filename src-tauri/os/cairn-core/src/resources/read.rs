@@ -2101,6 +2101,9 @@ async fn render_resource_body(
                 None => crate::resources::channels::render_conversations(orch, &params).await,
             }
         }
+        CairnResource::ChannelsAmbientFeedback => {
+            crate::resources::channels::render_ambient_feedback(orch, &params).await
+        }
         // The fleet is machine-scoped, so both arms read the runner's cached
         // projection rather than any project's database. `captured_at` is taken
         // once so every age on the rendering is derived from one instant.

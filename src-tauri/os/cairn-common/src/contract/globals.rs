@@ -78,6 +78,30 @@ pub(crate) const CHANNELS_CONVERSATIONS_CONTRACT: ResourceContract = ResourceCon
     }],
 };
 
+pub(crate) const CHANNELS_AMBIENT_FEEDBACK_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ChannelsAmbientFeedback,
+    uri_template: "cairn://channels/ambient/feedback",
+    name: "Ambient routing feedback",
+    description: "The ambient Discord route's label set: one row per routing outcome, swept from the event log every five minutes. An admitted message has one row per thread it was delivered to; any other outcome (below_threshold, refused, unanswerable, failed) has one refused-side row, and an event the sweep reached after the route's firing journal evicted it reads `unrecorded`. Each row snapshots the pick, probability, method, charter revision and admitted picks, beside the label and the passive engagement the sweep records 48 hours after the event (engaged when the recipient cited the event or sent to its conversation; on a refused-side row, engaged_by names the first thread that cited it). Append {event, verdict} to label a delivery: the labeller is the writing thread, never the payload, and only a chartered thread or the operator may write. `not_mine` disowns a delivery on the writer's own row. `reroute` with `to` names the thread that owns it: on the recipient's own row it also delivers the original message once to that thread's messages; from anyone else it records where the event ended up on the refused-side row and delivers nothing. Nothing is sent to Discord: an ambient conversation grants no agent free text by default (tenet 1031, cairn/4884).",
+    read_projections: &[
+        ProjectionSpec { key: "since", values: "epoch seconds; events at or after" },
+        ProjectionSpec { key: "limit", values: "N rows (default 50, max 500)" },
+        ProjectionSpec { key: "verdict", values: "not_mine | reroute" },
+        ProjectionSpec { key: "outcome", values: "admitted | below_threshold | refused | unanswerable | failed | unrecorded" },
+        ProjectionSpec { key: "thread", values: "thread URI; rows delivered or re-routed to it" },
+        ProjectionSpec { key: "engaged", values: "true | false | unchecked" },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Append,
+        required: &[AMBIENT_FEEDBACK_EVENT, AMBIENT_FEEDBACK_VERDICT],
+        optional: &[AMBIENT_FEEDBACK_TO, AMBIENT_FEEDBACK_NOTE],
+        label: "label an ambient routing",
+        example: "write({changes:[{target:\"cairn://channels/ambient/feedback\",mode:\"append\",payload:{event:\"cairn://p/PROJECT/events/ID\",verdict:\"reroute\",to:\"cairn://p/PROJECT/THREAD\"}}]})",
+    }],
+};
+
 pub(crate) const EXECUTOR_ACTION_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ExecutorAction,
     uri_template: "cairn://executors/{name}/{action}",
