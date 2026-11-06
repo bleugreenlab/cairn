@@ -90,6 +90,7 @@ pub mod routes;
 pub mod runtime_admission;
 pub mod skills;
 pub mod system_prompt;
+pub(crate) mod text_template;
 pub mod transcripts;
 
 // ── Internal implementation modules ────────────────────

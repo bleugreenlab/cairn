@@ -275,9 +275,13 @@ pub enum RouteSink {
         destination: Bindable<ChannelDestination>,
         #[serde(default, rename = "initiatedBy")]
         initiated_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
     },
     Message {
         target: Bindable<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
     },
     Issue {
         #[serde(default)]
@@ -656,10 +660,35 @@ fn validate_sink(
     sink: &RouteSink,
 ) -> Result<(), String> {
     let id = &graph.node(index).id;
+    let body = match sink {
+        RouteSink::Message { body, .. } | RouteSink::Channel { body, .. } => body.as_deref(),
+        _ => None,
+    };
+    if let Some(body) = body {
+        if body.trim().is_empty() {
+            return Err(format!("sink '{id}' body must not be blank"));
+        }
+        for token in crate::text_template::tokens(body) {
+            let crate::text_template::Token::Placeholder { name, .. } = token else {
+                continue;
+            };
+            let what = format!("sink '{id}' body");
+            let binding = ArgumentBinding::Field { field: name.into() };
+            if let Err(problem) = validate_binding(graph, index, registry, &binding, &what) {
+                if name.starts_with(ANSWERS_PREFIX) {
+                    return Err(problem);
+                }
+                return Err(format!(
+                    "sink '{id}' body names {{{{{name}}}}}, which no field reaching it provides"
+                ));
+            }
+        }
+    }
     match sink {
         RouteSink::Channel {
             destination,
             initiated_by,
+            ..
         } => match destination {
             Bindable::Fixed(ChannelDestination::Subscriptions) => {
                 if initiated_by
@@ -700,11 +729,13 @@ fn validate_sink(
         },
         RouteSink::Message {
             target: Bindable::Fixed(target),
+            ..
         } if !super::decision::is_message_target(target) => {
             return Err("message target must be a canonical project, issue, or thread URI".into())
         }
         RouteSink::Message {
             target: Bindable::Bound(binding),
+            ..
         } => {
             let what = format!("message sink '{id}' target");
             validate_binding(graph, index, registry, binding, &what)?;
@@ -1185,7 +1216,8 @@ mod tests {
         assert!(matches!(
             sink_of(&parsed, "deliver"),
             RouteSink::Message {
-                target: Bindable::Bound(ArgumentBinding::Field { .. })
+                target: Bindable::Bound(ArgumentBinding::Field { .. }),
+                ..
             }
         ));
 
@@ -1384,12 +1416,89 @@ mod tests {
     }
 
     #[test]
-    fn literal_sinks_and_the_core_pack_routes_load_and_re_save_unchanged() {
-        for yaml in [
-            include_str!("../../../../packs/core/routes/followed-thread-stream.yaml"),
-            include_str!("../../../../packs/core/routes/github-mention.yaml"),
+    fn sink_body_templates_round_trip_and_validate_reaching_fields() {
+        for kind in [
+            "message, target: 'cairn://p/cairn/1'",
+            "channel, destination: 'discord:1/2'",
         ] {
-            let parsed = parse(yaml).unwrap();
+            let yaml = graph_route(
+                &format!("{{ kind: {kind}, body: 'Via {{text}}' }}").replace("{text}", "{{text}}"),
+                "",
+            );
+            let parsed = parse(&yaml).unwrap();
+            let emitted = serde_yaml::to_string(&parsed).unwrap();
+            assert!(emitted.contains("body:"), "{emitted}");
+            assert_eq!(
+                serde_yaml::to_string(&parse(&emitted).unwrap()).unwrap(),
+                emitted
+            );
+            let unknown = yaml.replace("{{text}}", "{{foo}}");
+            assert_eq!(
+                parse(&unknown).unwrap_err(),
+                "sink 'sink-1' body names {{foo}}, which no field reaching it provides"
+            );
+            for blank in ["", "  "] {
+                let blank = yaml.replace("Via {{text}}", blank);
+                assert!(parse(&blank)
+                    .unwrap_err()
+                    .contains("sink 'sink-1' body must not be blank"));
+            }
+            assert!(parse(&yaml.replace("Via {{text}}", r"\{{foo}} {{ a b }}")).is_ok());
+        }
+    }
+
+    #[test]
+    fn sink_body_templates_use_all_sources_and_dominating_declared_answers() {
+        let body = FIXTURE_B.replace(
+            "kind: channel, destination:",
+            "kind: channel, body: '{{answers.thread.probability.devops}} {{text}}', destination:",
+        );
+        assert!(
+            parse(&body).is_ok(),
+            "concrete probability of sourced choice is declared"
+        );
+        assert!(parse(&body.replace("probability.devops", "imaginary"))
+            .unwrap_err()
+            .contains("has no answer"));
+        let bypass = body.replace(
+            "  - { from: inbound, to: pick }",
+            "  - { from: inbound, to: pick }\n  - { from: inbound, to: ack_routed }",
+        );
+        assert!(parse(&bypass)
+            .unwrap_err()
+            .contains("no decision above it asks 'thread'"));
+        let all_sources = graph_route(
+            "{ kind: message, target: 'cairn://p/cairn/1', body: '{{conversation}}' }",
+            "",
+        )
+        .replace(
+            "when: { fact: attention }",
+            "when: { fact: channel_message }",
+        )
+        .replace(
+            "  - id: sink-1",
+            "  - { id: second, type: trigger, when: { fact: thread_stream } }\n  - id: sink-1",
+        )
+        .replace(
+            "  - { from: trigger-1, to: sink-1 }",
+            "  - { from: trigger-1, to: sink-1 }\n  - { from: second, to: sink-1 }",
+        );
+        assert_eq!(
+            parse(&all_sources).unwrap_err(),
+            "sink 'sink-1' body names {{conversation}}, which no field reaching it provides"
+        );
+        let ambiguous = body.replace("  - { from: inbound, to: pick }", "  - { from: inbound, to: earlier }\n  - { from: earlier, to: pick, when: { answers.thread.outcome: admitted } }")
+            .replace("  - id: pick", "  - id: earlier\n    type: decision\n    questions: [ { name: thread, type: choice, instructions: First?, source: chartered_threads } ]\n  - id: pick");
+        assert!(parse(&ambiguous).unwrap_err().contains("ambiguous"));
+    }
+
+    #[test]
+    fn literal_sinks_and_the_core_pack_routes_load_and_re_save_unchanged() {
+        for name in ["followed-thread-stream", "github-mention"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../packs/core/routes/{name}.yaml"));
+            let yaml = std::fs::read_to_string(path).unwrap();
+            let parsed = parse(&yaml).unwrap();
             let emitted = serde_yaml::to_string(&parsed).unwrap();
             assert_eq!(
                 serde_yaml::to_string(&parse(&emitted).unwrap()).unwrap(),

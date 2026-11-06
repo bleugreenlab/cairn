@@ -83,6 +83,7 @@ async fn validate_sink_references(
     // journaled as dropped then; a literal one is checked now.
     if let RouteSink::Message {
         target: Bindable::Fixed(target),
+        ..
     } = sink
     {
         let (project, number) = match parse_uri(target) {

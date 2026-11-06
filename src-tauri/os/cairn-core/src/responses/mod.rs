@@ -1,6 +1,5 @@
 //! Pure Response definition parsing, template rendering, and output validation.
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -1576,14 +1575,20 @@ impl ResponseDefinition {
                 }
             }
         }
-        Ok(template_regex()
-            .replace_all(&self.template, |captures: &regex::Captures<'_>| {
-                values
-                    .get(captures.get(1).unwrap().as_str())
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .into_owned())
+        let mut rendered = String::new();
+        for token in crate::text_template::tokens(&self.template) {
+            match token {
+                crate::text_template::Token::Literal(text) => rendered.push_str(text),
+                crate::text_template::Token::Placeholder { name, source } => {
+                    if crate::text_template::is_response_name(name) {
+                        rendered.push_str(values.get(name).map(String::as_str).unwrap_or_default());
+                    } else {
+                        rendered.push_str(source);
+                    }
+                }
+            }
+        }
+        Ok(rendered)
     }
 
     pub fn validate_output(
@@ -1645,13 +1650,17 @@ fn example_output_text(output: &Value, schema: Option<&Value>) -> Result<String,
         .map_err(|e| format!("output has no key order the output contract enforces: {e}"))
 }
 
-fn template_regex() -> Regex {
-    Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}").unwrap()
-}
 fn template_variables(template: &str) -> Vec<String> {
-    template_regex()
-        .captures_iter(template)
-        .map(|c| c[1].to_string())
+    crate::text_template::tokens(template)
+        .into_iter()
+        .filter_map(|token| match token {
+            crate::text_template::Token::Placeholder { name, .. }
+                if crate::text_template::is_response_name(name) =>
+            {
+                Some(name.to_owned())
+            }
+            _ => None,
+        })
         .collect()
 }
 fn render_value(value: &Value) -> String {
@@ -2607,6 +2616,95 @@ mod tests {
             ),
             "an off-contract answer is charged to the account that gave it: {:?}",
             violated.result
+        );
+    }
+
+    #[test]
+    fn shared_template_fixture_validates_and_renders_response_policy() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../src/test/fixtures/text-template.json");
+        let cases: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for case in cases {
+            let mut response = definition();
+            response.template = case["source"].as_str().unwrap().into();
+            let names = case["response"]["names"].as_array().unwrap();
+            let unique: std::collections::BTreeSet<_> =
+                names.iter().map(|name| name.as_str().unwrap()).collect();
+            response.variables = unique
+                .iter()
+                .map(|name| serde_json::from_value(json!({"name":name})).unwrap())
+                .collect();
+            response.validate().unwrap();
+            assert_eq!(
+                json!(template_variables(&response.template)),
+                case["response"]["names"]
+            );
+            let args: Map<String, Value> = unique
+                .iter()
+                .map(|name| (name.to_string(), json!(format!("<{name}>"))))
+                .collect();
+            let expected: String = case["response"]["segments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|segment| {
+                    segment
+                        .get("literal")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("<{}>", segment["name"].as_str().unwrap()))
+                })
+                .collect();
+            assert_eq!(
+                response.render(&Value::Object(args)).unwrap(),
+                expected,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn shared_template_escape_and_response_policy() {
+        let response = parse_definition(
+            "---\nname: Test\ndescription: test\n---\n\\{{missing}} {{ a.b }} {{my-field}} {{ a b }} {{#if x}} {{\"key\": 1}} {{}} {{"
+        ).unwrap();
+        assert_eq!(
+            response.render(&json!({})).unwrap(),
+            "{{missing}} {{ a.b }} {{my-field}} {{ a b }} {{#if x}} {{\"key\": 1}} {{}} {{"
+        );
+        assert!(
+            parse_definition("---\nname: Test\ndescription: test\n---\n{{missing}}")
+                .unwrap_err()
+                .contains("undeclared variable 'missing'")
+        );
+    }
+
+    #[test]
+    fn shared_template_preserves_response_value_policy() {
+        let response = parse_definition(
+            "---\nname: Test\ndescription: test\nvariables:\n  - name: value\n    required: true\n  - name: optional\n---\n{{value}}/{{ optional }}"
+        ).unwrap();
+        assert_eq!(
+            response.render(&json!({"value": {"x":[1,2]}})).unwrap(),
+            "{\"x\":[1,2]}/"
+        );
+        assert_eq!(
+            response.render(&json!({"value": 1.2345})).unwrap(),
+            "1.2345/"
+        );
+        assert_eq!(
+            response.render(&json!({"value": "{{optional}}"})).unwrap(),
+            "{{optional}}/"
+        );
+        assert!(response
+            .render(&json!({}))
+            .unwrap_err()
+            .contains("Missing required"));
+        assert_eq!(
+            definition().render(&json!({"required":"ok"})).unwrap(),
+            "ok / fallback"
         );
     }
 

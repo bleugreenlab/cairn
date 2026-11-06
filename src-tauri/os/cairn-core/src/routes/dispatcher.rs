@@ -805,6 +805,40 @@ fn production_decide(
     }
 }
 
+/// Prepare once, before address resolution and fanout. The snapshot and the
+/// delivery must describe the same string, while absent bodies keep the
+/// upstream text/snapshot conventions (including missing or empty text).
+#[derive(Debug)]
+struct PreparedText {
+    text: String,
+    payload: Option<String>,
+}
+
+fn prepare_sink_text(
+    sink: &RouteSink,
+    fields: &BTreeMap<String, Value>,
+) -> Result<PreparedText, crate::text_template::UnboundName> {
+    let body = match sink {
+        RouteSink::Message { body, .. } | RouteSink::Channel { body, .. } => body.as_deref(),
+        _ => None,
+    };
+    match body {
+        Some(body) => {
+            let fields = fields
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let text = crate::text_template::render(body, &fields)?;
+            let payload = crate::storage::firing_snapshot(&text);
+            Ok(PreparedText { text, payload })
+        }
+        None => Ok(PreparedText {
+            text: text_of(fields).to_owned(),
+            payload: text_payload(fields),
+        }),
+    }
+}
+
 /// What a sink would do with one firing, without doing it: the address it
 /// resolved, or why it would drop.
 async fn sink_preview(
@@ -814,12 +848,23 @@ async fn sink_preview(
 ) -> Value {
     let fields = &delivery.fields;
     let node_id = delivery.node_id;
+    let prepared = match prepare_sink_text(delivery.sink, fields) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let kind = match delivery.sink {
+                RouteSink::Channel { .. } => "channel",
+                _ => "message",
+            };
+            return serde_json::json!({"nodeId": node_id, "kind": kind, "dropped": "unbound_template", "error": error.name});
+        }
+    };
     match delivery.sink {
         RouteSink::Channel {
             destination,
             initiated_by,
+            ..
         } => {
-            let mut preview = serde_json::json!({"nodeId":node_id,"kind":"channel","initiatedBy":initiated_by,"text":text_of(fields),"context":fields.get("context").and_then(Value::as_str).unwrap_or("[Cairn]"),"jobId":fields.get("jobId").cloned()});
+            let mut preview = serde_json::json!({"nodeId":node_id,"kind":"channel","initiatedBy":initiated_by,"text":prepared.text,"context":fields.get("context").and_then(Value::as_str).unwrap_or("[Cairn]"),"jobId":fields.get("jobId").cloned()});
             match destination {
                 Bindable::Fixed(destination) => {
                     preview["destination"] = serde_json::json!(destination)
@@ -836,7 +881,7 @@ async fn sink_preview(
             }
             preview
         }
-        RouteSink::Message { target } => {
+        RouteSink::Message { target, .. } => {
             let plans = message_targets(bindings, target);
             let targets: Vec<Value> = plans
                 .iter()
@@ -851,7 +896,7 @@ async fn sink_preview(
                 TargetPlan::Deliver { canonical, .. } => Some(canonical.clone()),
                 TargetPlan::SinkDrop(_) => None,
             });
-            serde_json::json!({"nodeId":node_id,"kind":"message","target":first,"targets":targets,"text":text_of(fields)})
+            serde_json::json!({"nodeId":node_id,"kind":"message","target":first,"targets":targets,"text":prepared.text})
         }
         RouteSink::Label { issue, labels } => match bindings.string(issue) {
             Ok(issue) => {
@@ -1272,10 +1317,27 @@ async fn dispatch_into(
                 fields,
                 outputs: &walked.outputs,
             };
+            let prepared = match prepare_sink_text(delivery.sink, fields) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    record(
+                        orch,
+                        firing,
+                        transforms_json,
+                        Outcome {
+                            error: Some(error.name),
+                            ..Outcome::dropped("unbound_template")
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+            };
             match delivery.sink {
                 RouteSink::Channel {
                     destination,
                     initiated_by,
+                    ..
                 } => {
                     let destination = match destination {
                         Bindable::Fixed(ChannelDestination::Subscriptions) => None,
@@ -1290,7 +1352,7 @@ async fn dispatch_into(
                                         orch,
                                         firing,
                                         transforms_json,
-                                        Outcome::sink_drop(drop, text_payload(fields)),
+                                        Outcome::sink_drop(drop, prepared.payload.clone()),
                                     )
                                     .await?;
                                     continue;
@@ -1317,7 +1379,7 @@ async fn dispatch_into(
                         fact: fact.clone(),
                         transforms_json,
                         created_at: now,
-                        text: text_of(fields).to_owned(),
+                        text: prepared.text,
                         context: fields
                             .get("context")
                             .and_then(Value::as_str)
@@ -1333,7 +1395,7 @@ async fn dispatch_into(
                         provider: None,
                     });
                 }
-                RouteSink::Message { target } => {
+                RouteSink::Message { target, .. } => {
                     // A bound list fans out here, one delivery and one journal
                     // row per address, so a decision asked once can reach
                     // several targets while every other sink still fires once.
@@ -1342,14 +1404,14 @@ async fn dispatch_into(
                             TargetPlan::Deliver { target, canonical } => {
                                 let delivered = super::with_provenance(
                                     route.id.clone(),
-                                    deliver_message(orch, &route.id, &target, text_of(fields)),
+                                    deliver_message(orch, &route.id, &target, &prepared.text),
                                 )
                                 .await
                                 .map(|()| canonical);
-                                Outcome::delivery(delivered, text_payload(fields))
+                                Outcome::delivery(delivered, prepared.payload.clone())
                             }
                             TargetPlan::SinkDrop(drop) => {
-                                Outcome::sink_drop(drop, text_payload(fields))
+                                Outcome::sink_drop(drop, prepared.payload.clone())
                             }
                         };
                         record(orch, firing, transforms_json.clone(), outcome).await?;
@@ -1434,6 +1496,7 @@ fn submission_sink(submission: &ChannelSubmission) -> RouteSink {
             ChannelDestination::Conversation,
         )),
         initiated_by: submission.initiated_by.clone(),
+        body: None,
     }
 }
 
@@ -1478,7 +1541,9 @@ async fn record(
                 ChannelDestination::Conversation(address) => address.to_string(),
             }),
         ),
-        FiringSink::Route(RouteSink::Message { target }) => ("message", target.fixed().cloned()),
+        FiringSink::Route(RouteSink::Message { target, .. }) => {
+            ("message", target.fixed().cloned())
+        }
         FiringSink::Route(RouteSink::Issue { .. }) => ("issue", None),
         FiringSink::Route(RouteSink::Label { .. }) => ("label", None),
         // `sink_kind` is free text in the journal, so a decision that routed
@@ -1759,7 +1824,7 @@ mod tests {
             fields: &delivery.fields,
             outputs: &walked.outputs,
         };
-        let RouteSink::Message { target } = delivery.sink else {
+        let RouteSink::Message { target, .. } = delivery.sink else {
             panic!("a message sink");
         };
         assert_eq!(
@@ -2276,6 +2341,550 @@ mod tests {
                 .unwrap(),
             Some(0)
         );
+    }
+
+    fn body_route(kind: &str, body: Option<&str>) -> String {
+        let sink = match kind {
+            "message" => "kind: message, target: 'cairn://p/cairn/42'",
+            "channel" => "kind: channel, destination: 'discord:1/2'",
+            _ => unreachable!(),
+        };
+        let body = body
+            .map(|body| format!(", body: {}", serde_json::to_string(body).unwrap()))
+            .unwrap_or_default();
+        format!("name: Body\ndescription: deterministic text\nnodes:\n  - {{ id: input, type: trigger, when: {{ fact: thread_stream }} }}\n  - {{ id: out, type: sink, sink: {{ {sink}{body} }} }}\nedges:\n  - {{ from: input, to: out }}\n")
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_live_preview_and_journal_agree() {
+        for kind in ["message", "channel"] {
+            let temp = tempfile::tempdir().unwrap();
+            let route = body_route(kind, Some("Via {{text}}."));
+            let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
+            db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+            let preview = test_definition(
+                &orch,
+                &definition(&route),
+                thread_fact("hello {{literal}}"),
+                Presence::Away,
+                in_project(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(preview.sink_previews[0]["text"], "Via hello {{literal}}.");
+            assert_eq!(
+                db.query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
+                    .await
+                    .unwrap(),
+                Some(0)
+            );
+            assert_eq!(
+                db.query_opt_i64("SELECT COUNT(*) FROM messages", ())
+                    .await
+                    .unwrap(),
+                Some(0)
+            );
+            let submissions = dispatch(
+                &orch,
+                thread_fact("hello {{literal}}"),
+                Presence::Away,
+                in_project(),
+            )
+            .await
+            .unwrap();
+            if kind == "channel" {
+                assert_eq!(submissions.len(), 1);
+                assert_eq!(submissions[0].text, "Via hello {{literal}}.");
+                assert_eq!(submissions[0].binding_ref, "route:body:event:1");
+                record_channel_outcome(&orch, &submissions[0], Ok("discord:1/2".into()))
+                    .await
+                    .unwrap();
+            } else {
+                assert!(submissions.is_empty());
+                assert_eq!(
+                    issue_messages(&orch, 42).await.as_deref(),
+                    Some("route:body:Via hello {{literal}}.")
+                );
+            }
+            let firings = crate::storage::list_route_firings(&db, "workspace", "body", 10)
+                .await
+                .unwrap();
+            assert_eq!(firings.len(), 1);
+            assert_eq!(firings[0].status, "fired");
+            assert_eq!(
+                firings[0].payload_text.as_deref(),
+                Some("Via hello {{literal}}.")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_unbound_drop_before_delivery_and_preview_has_no_payload() {
+        for kind in ["message", "channel"] {
+            for empty_list in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let route = body_route(kind, Some("Before {{text}} after"));
+                let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
+                db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+                let mut fact = thread_fact("upstream must never leak");
+                if empty_list {
+                    fact.fields.insert("text".into(), serde_json::json!([]));
+                } else {
+                    fact.fields.remove("text");
+                }
+                let preview = test_definition(
+                    &orch,
+                    &definition(&route),
+                    fact.clone(),
+                    Presence::Away,
+                    in_project(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(preview.sink_previews[0]["dropped"], "unbound_template");
+                assert_eq!(preview.sink_previews[0]["error"], "text");
+                assert!(preview.sink_previews[0].get("text").is_none());
+                assert_eq!(
+                    db.query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
+                        .await
+                        .unwrap(),
+                    Some(0)
+                );
+                let submissions = dispatch(&orch, fact, Presence::Away, in_project())
+                    .await
+                    .unwrap();
+                assert!(submissions.is_empty(), "no external channel delivery");
+                assert_eq!(
+                    db.query_opt_i64("SELECT COUNT(*) FROM messages", ())
+                        .await
+                        .unwrap(),
+                    Some(0),
+                    "no message delivery"
+                );
+                let firings = crate::storage::list_route_firings(&db, "workspace", "body", 10)
+                    .await
+                    .unwrap();
+                assert_eq!(firings.len(), 1);
+                assert_eq!(firings[0].status, "dropped");
+                assert_eq!(firings[0].drop_reason.as_deref(), Some("unbound_template"));
+                assert_eq!(firings[0].error.as_deref(), Some("text"));
+                assert_eq!(firings[0].payload_text, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_rendered_empty_keeps_legacy_empty_content_path() {
+        for kind in ["message", "channel"] {
+            let temp = tempfile::tempdir().unwrap();
+            let upstream = body_route(kind, None);
+            let template = body_route(kind, Some("{{text}}"));
+            let (orch, db) = orchestrator(
+                temp.path(),
+                &[("upstream", &upstream), ("template", &template)],
+            )
+            .await;
+            db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+            let submissions = dispatch(&orch, thread_fact(""), Presence::Away, in_project())
+                .await
+                .unwrap();
+            if kind == "channel" {
+                assert_eq!(submissions.len(), 2);
+                for submission in &submissions {
+                    assert_eq!(submission.text, "");
+                    record_channel_outcome(&orch, submission, Ok("discord:1/2".into()))
+                        .await
+                        .unwrap();
+                }
+            }
+            let legacy = crate::storage::list_route_firings(&db, "workspace", "upstream", 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let rendered = crate::storage::list_route_firings(&db, "workspace", "template", 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(rendered.status, legacy.status);
+            assert_eq!(rendered.drop_reason, legacy.drop_reason);
+            assert_eq!(rendered.error, legacy.error);
+            assert_eq!(rendered.payload_text, legacy.payload_text);
+            assert_ne!(rendered.drop_reason.as_deref(), Some("unbound_template"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_render_transformed_text_and_projected_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, _) = orchestrator(temp.path(), &[]).await;
+        let template = "Routed to {{answers.thread.citations}}.\nVia ambient Discord channel {{conversation}} from {{sender}}. If this isn't yours, say so.\n{{text}}";
+        let route = body_route("message", Some(template));
+        // Exercise the delivery's existing flat fields, including producer text,
+        // instead of looking answers up again from the graph.
+        let definition = definition(&body_route("message", None));
+        let graph = RouteGraph::new(&definition).unwrap();
+        let sink: RouteSink = serde_json::from_value(
+            serde_json::json!({"kind":"message","target":"cairn://p/cairn/42","body":template}),
+        )
+        .unwrap();
+        let fields = BTreeMap::from([
+            (
+                "text".into(),
+                serde_json::json!("transformed producer text"),
+            ),
+            ("conversation".into(), serde_json::json!("discord:G/C")),
+            ("sender".into(), serde_json::json!("Ada")),
+            (
+                "answers.thread.citations".into(),
+                serde_json::json!([
+                    "devops (0.82, native, rev 1a2b3c4d5e6f)",
+                    "execution (0.61, native, rev 9f8e7d6c5b4a)"
+                ]),
+            ),
+        ]);
+        let outputs = HashMap::new();
+        let bindings = Bindings {
+            graph: &graph,
+            fields: &fields,
+            outputs: &outputs,
+        };
+        let delivery = Delivery {
+            node_id: "out",
+            sink: &sink,
+            fields: fields.clone(),
+            transforms: Vec::new(),
+            position: 0,
+        };
+        let preview = sink_preview(&orch, &delivery, &bindings).await;
+        assert_eq!(preview["text"], "Routed to devops (0.82, native, rev 1a2b3c4d5e6f), execution (0.61, native, rev 9f8e7d6c5b4a).\nVia ambient Discord channel discord:G/C from Ada. If this isn't yours, say so.\ntransformed producer text");
+        assert!(route.contains("body:"));
+    }
+
+    #[test]
+    fn sink_body_templates_render_actual_decision_presentations() {
+        use crate::models::decision::{
+            Decision, DecisionAnswer, DecisionOption, DecisionQuestion, MeasuredBy,
+            OptionProbability, QuestionKind, Thresholds,
+        };
+        use crate::orchestrator::DecisionFailure;
+        let mut question = DecisionQuestion::choice(
+            "thread",
+            "Which thread?",
+            vec![
+                DecisionOption::new("execution", None),
+                DecisionOption::new("devops", None),
+            ],
+        );
+        if let QuestionKind::Choice { options, top_k, .. } = &mut question.kind {
+            *top_k = Some(2);
+            options[0].revision = Some("9f8e7d6c5b4a".into());
+            options[1].revision = Some("1a2b3c4d5e6f".into());
+        }
+        let asked = DecisionNode {
+            questions: vec![question],
+            models: None,
+            thresholds: Thresholds {
+                native: Some(0.5),
+                logprobs: None,
+            },
+        };
+        let answered = |answer| {
+            Ok(Decision {
+                provider: "custom:x".into(),
+                model: "jev".into(),
+                answers: vec![answer],
+                usage: Default::default(),
+            })
+        };
+        let choice = |confidence, probability| {
+            answered(DecisionAnswer::Choice {
+                name: "thread".into(),
+                measured_by: MeasuredBy::Native,
+                pick: "devops".into(),
+                confidence: Some(confidence),
+                probabilities: vec![
+                    OptionProbability {
+                        value: "execution".into(),
+                        probability: 0.61,
+                    },
+                    OptionProbability {
+                        value: "devops".into(),
+                        probability,
+                    },
+                ],
+            })
+        };
+        let render = |template: &str, result: &Result<Decision, DecisionFailure>, native| {
+            let mut asked = asked.clone();
+            asked.thresholds.native = Some(native);
+            let fields = decisions::answer_fields(&decisions::outcomes(&asked, result));
+            let sink = RouteSink::Message {
+                target: Bindable::Fixed("cairn://p/cairn/42".into()),
+                body: Some(template.into()),
+            };
+            prepare_sink_text(&sink, &fields).map(|text| text.text)
+        };
+        assert_eq!(render("Routed to {{answers.thread.citations}}.", &choice(0.82, 0.82), 0.2).unwrap(),
+            "Routed to devops (0.82, native, rev 1a2b3c4d5e6f), execution (0.61, native, rev 9f8e7d6c5b4a).");
+        let mut low = choice(0.41, 0.41);
+        if let Ok(result) = &mut low {
+            if let DecisionAnswer::Choice { probabilities, .. } = &mut result.answers[0] {
+                probabilities[0].probability = 0.2;
+            }
+        }
+        assert_eq!(render("No thread claimed this (closest: {{answers.thread.citation}}). Start with @thread or #channel to route it.", &low, 0.5).unwrap(),
+            "No thread claimed this (closest: devops (0.41, native, rev 1a2b3c4d5e6f)). Start with @thread or #channel to route it.");
+        assert_eq!(
+            render("Routed to {{answers.thread.citations}}.", &low, 0.5)
+                .unwrap_err()
+                .name,
+            "answers.thread.citations"
+        );
+        for (result, reason) in [
+            (
+                answered(DecisionAnswer::Refusal {
+                    name: "thread".into(),
+                    measured_by: MeasuredBy::Native,
+                    reason: Some(" policy text ".into()),
+                }),
+                " policy text ",
+            ),
+            (
+                answered(DecisionAnswer::Refusal {
+                    name: "thread".into(),
+                    measured_by: MeasuredBy::Native,
+                    reason: None,
+                }),
+                "the model refused to answer 'thread'",
+            ),
+            (
+                Err(DecisionFailure::Unanswerable("no suitable offer".into())),
+                "no suitable offer",
+            ),
+            (
+                Err(DecisionFailure::Failed("provider failed".into())),
+                "provider failed",
+            ),
+        ] {
+            assert_eq!(render("Routing is unavailable: {{answers.thread.reason}}. Start with @thread or #channel to route it.", &result, 0.5).unwrap(),
+                format!("Routing is unavailable: {reason}. Start with @thread or #channel to route it."));
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_use_response_output_instead_of_original_fact_text() {
+        let route = body_route("message", Some("Via {{text}}."))
+            .replace(
+                "  - { id: out,",
+                "  - { id: transform, type: response, response: conveyor }\n  - { id: out,",
+            )
+            .replace(
+                "  - { from: input, to: out }",
+                "  - { from: input, to: transform }\n  - { from: transform, to: out }",
+            );
+        let definition = definition(&route);
+        let graph = RouteGraph::new(&definition).unwrap();
+        let fact = thread_fact("original text");
+        let run: RunResponse = &|_, _| -> ResponseFuture {
+            Box::pin(async { Ok("transformed producer text".into()) })
+        };
+        let walked = walk(&graph, &fact, Presence::Away, run, &never_decides).await;
+        assert_eq!(walked.deliveries.len(), 1);
+        let delivery = &walked.deliveries[0];
+        assert_eq!(
+            prepare_sink_text(delivery.sink, &delivery.fields)
+                .unwrap()
+                .text,
+            "Via transformed producer text."
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_keep_prepared_payload_on_address_drops() {
+        for kind in ["message", "channel"] {
+            let temp = tempfile::tempdir().unwrap();
+            let route = body_route(kind, Some("Prepared {{text}}"))
+                .replace(
+                    "target: 'cairn://p/cairn/42'",
+                    "target: { field: threadUri }",
+                )
+                .replace(
+                    "destination: 'discord:1/2'",
+                    "destination: { field: conversation }",
+                );
+            let route = if kind == "channel" {
+                route.replace("fact: thread_stream", "fact: channel_message")
+            } else {
+                route
+            };
+            let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
+            db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+            let mut fact = thread_fact("content");
+            if kind == "channel" {
+                fact.source = "channel_message".into();
+            }
+            let previews = test_definition(
+                &orch,
+                &definition(&route),
+                fact.clone(),
+                Presence::Away,
+                in_project(),
+            )
+            .await
+            .unwrap()
+            .sink_previews;
+            assert_eq!(previews[0]["text"], "Prepared content");
+            let submissions = dispatch(&orch, fact, Presence::Away, in_project())
+                .await
+                .unwrap();
+            assert!(submissions.is_empty());
+            let firings = crate::storage::list_route_firings(&db, "workspace", "body", 10)
+                .await
+                .unwrap();
+            assert_eq!(firings.len(), 1);
+            assert_eq!(firings[0].status, "dropped");
+            assert_eq!(firings[0].drop_reason.as_deref(), Some("unbound_target"));
+            assert_eq!(firings[0].payload_text.as_deref(), Some("Prepared content"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_body_templates_message_fanout_delivers_one_prepared_body_per_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let route = body_route("message", Some("Prepared {{text}}")).replace(
+            "target: 'cairn://p/cairn/42'",
+            "target: { field: threadUri }",
+        );
+        let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
+        db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+        db.execute_batch("INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at) VALUES('i43', 'p', 43, 'Second', 'active', 1, 1);").await.unwrap();
+        let mut fact = thread_fact("{{text}}");
+        fact.fields.insert(
+            "threadUri".into(),
+            serde_json::json!(["cairn://p/cairn/42", "cairn://p/cairn/43"]),
+        );
+        dispatch(&orch, fact, Presence::Away, in_project())
+            .await
+            .unwrap();
+        for number in [42, 43] {
+            assert_eq!(
+                issue_messages(&orch, number).await.as_deref(),
+                Some("route:body:Prepared {{text}}")
+            );
+        }
+        let firings = crate::storage::list_route_firings(&db, "workspace", "body", 10)
+            .await
+            .unwrap();
+        assert_eq!(firings.len(), 2);
+        assert!(
+            firings
+                .iter()
+                .all(|f| f.status == "fired"
+                    && f.payload_text.as_deref() == Some("Prepared {{text}}"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sink_body_templates_sourced_probability_absent_drops_both_sink_kinds() {
+        let route = crate::routes::definition::FIXTURE_B
+            .replace("kind: message, target:", "kind: message, body: 'Probability {{answers.thread.probability.devops}}', target:")
+            .replace("kind: channel, destination:", "kind: channel, body: 'Probability {{answers.thread.probability.devops}}', destination:");
+        let (orch, server) = deciding_workspace(
+            vec![choice_reply("thread", "docs", &[("docs", 1.0)])],
+            &[("body", &route)],
+        )
+        .await;
+        orch.db.local.execute_batch("INSERT INTO threads(id, project_id, name, jurisdiction, status, attention, created_at, updated_at) VALUES
+            ('t-devops', 'p', 'devops', 'Builds.', 'active', 'none', 1, 1),
+            ('t-docs', 'p', 'docs', 'Documentation.', 'active', 'none', 1, 1);").await.unwrap();
+        let submissions = dispatch(&orch, channel_fact("content"), Presence::Away, in_project())
+            .await
+            .unwrap();
+        assert_eq!(server.calls(), 1);
+        assert!(submissions.is_empty());
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64("SELECT COUNT(*) FROM messages", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        let firings = crate::storage::list_route_firings(&orch.db.local, "workspace", "body", 10)
+            .await
+            .unwrap();
+        assert_eq!(firings.len(), 2);
+        assert!(firings.iter().any(|f| f.sink_kind == "message"));
+        assert!(firings.iter().any(|f| f.sink_kind == "channel"));
+        for firing in firings {
+            assert_eq!(firing.status, "dropped");
+            assert_eq!(firing.drop_reason.as_deref(), Some("unbound_template"));
+            assert_eq!(
+                firing.error.as_deref(),
+                Some("answers.thread.probability.devops")
+            );
+            assert_eq!(firing.payload_text, None);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sink_body_templates_below_threshold_journals_unbound_citations_for_both_kinds() {
+        let route = crate::routes::definition::FIXTURE_B
+            .replace(
+                "    input: { field: text }",
+                "    input: { field: text }\n    thresholds: { native: 0.6 }",
+            )
+            .replace(
+                "kind: message, target:",
+                "kind: message, body: 'Routed to {{answers.thread.citations}}.', target:",
+            )
+            .replace(
+                "kind: channel, destination:",
+                "kind: channel, body: 'Routed to {{answers.thread.citations}}.', destination:",
+            )
+            .replace(
+                "from: pick, to: deliver, when: { answers.thread.outcome: admitted }",
+                "from: pick, to: deliver, when: { answers.thread.outcome: below_threshold }",
+            );
+        let (orch, server) = deciding_workspace(
+            vec![choice_reply(
+                "thread",
+                "devops",
+                &[("devops", 0.41), ("docs", 0.2)],
+            )],
+            &[("body", &route)],
+        )
+        .await;
+        orch.db.local.execute_batch("INSERT INTO threads(id, project_id, name, jurisdiction, status, attention, created_at, updated_at) VALUES
+            ('t-devops', 'p', 'devops', 'Builds.', 'active', 'none', 1, 1),
+            ('t-docs', 'p', 'docs', 'Documentation.', 'active', 'none', 1, 1);").await.unwrap();
+        let submissions = dispatch(&orch, channel_fact("content"), Presence::Away, in_project())
+            .await
+            .unwrap();
+        assert_eq!(server.calls(), 1);
+        assert!(submissions.is_empty());
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64("SELECT COUNT(*) FROM messages", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        let firings = crate::storage::list_route_firings(&orch.db.local, "workspace", "body", 10)
+            .await
+            .unwrap();
+        assert_eq!(firings.len(), 2);
+        assert!(firings.iter().any(|f| f.sink_kind == "message"));
+        assert!(firings.iter().any(|f| f.sink_kind == "channel"));
+        for firing in firings {
+            assert_eq!(firing.status, "dropped");
+            assert_eq!(firing.drop_reason.as_deref(), Some("unbound_template"));
+            assert_eq!(firing.error.as_deref(), Some("answers.thread.citations"));
+            assert_eq!(firing.payload_text, None);
+        }
     }
 
     #[tokio::test]

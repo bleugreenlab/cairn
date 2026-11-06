@@ -119,6 +119,9 @@ pub fn answer_vocabulary(question: &DecisionQuestion) -> Vec<AnswerField> {
         field("refused", AnswerValues::Bool, false, false),
         field("pick", answers.clone(), false, picks_are_addresses),
         field("picks", answers.clone(), true, picks_are_addresses),
+        field("reason", AnswerValues::Any, false, false),
+        field("citation", AnswerValues::Any, false, false),
+        field("citations", AnswerValues::Any, true, false),
     ];
     if options.is_some_and(|options| sourced || options.iter().any(|o| o.address.is_some())) {
         fields.push(field("address", AnswerValues::Any, false, true));
@@ -235,6 +238,9 @@ pub struct QuestionOutcome {
     pub pick: Option<String>,
     pub picks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub citation: Option<String>,
+    pub citations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
@@ -258,6 +264,8 @@ impl QuestionOutcome {
             outcome,
             pick: None,
             picks: Vec::new(),
+            citation: None,
+            citations: Vec::new(),
             address: None,
             addresses: Vec::new(),
             confidence: None,
@@ -300,16 +308,47 @@ pub(crate) fn outcomes(
         .collect()
 }
 
+fn citation_for(
+    question: &DecisionQuestion,
+    pick: &str,
+    measured_by: &str,
+    probabilities: &[(String, f64)],
+) -> String {
+    let mut components = Vec::new();
+    if let Some((_, probability)) = probabilities.iter().find(|(value, _)| value == pick) {
+        components.push(crate::text_template::format_number(*probability));
+    }
+    components.push(measured_by.to_owned());
+    if let Some(revision) = choice_options(question)
+        .and_then(|options| options.iter().find(|option| option.value == pick))
+        .and_then(|option| option.revision.as_deref())
+    {
+        components.push(format!("rev {revision}"));
+    }
+    format!("{pick} ({})", components.join(", "))
+}
+
 fn question_outcome(
     asked: &DecisionNode,
     question: &DecisionQuestion,
     answer: &DecisionAnswer,
 ) -> QuestionOutcome {
-    let measured_by = Some(answer.measured_by().as_str());
+    let method = answer.measured_by().as_str();
+    let measured_by = Some(method);
     if let DecisionAnswer::Refusal { reason, .. } = answer {
         return QuestionOutcome {
             measured_by,
-            ..QuestionOutcome::empty(&question.name, "refused", reason.clone())
+            ..QuestionOutcome::empty(
+                &question.name,
+                "refused",
+                Some(reason.clone().unwrap_or_else(|| {
+                    Abstention::Refused {
+                        question: question.name.clone(),
+                        reason: None,
+                    }
+                    .to_string()
+                })),
+            )
         };
     }
     let address_of = |value: &str| {
@@ -319,7 +358,7 @@ fn question_outcome(
             .address
             .clone()
     };
-    let probabilities = match answer {
+    let probabilities: Vec<(String, f64)> = match answer {
         DecisionAnswer::Choice { probabilities, .. }
         | DecisionAnswer::Score { probabilities, .. } => probabilities
             .iter()
@@ -356,9 +395,18 @@ fn question_outcome(
         .iter()
         .filter_map(|value: &String| address_of(value))
         .collect();
+    let citation = pick
+        .as_deref()
+        .map(|value| citation_for(question, value, method, &probabilities));
+    let citations = picks
+        .iter()
+        .map(|value| citation_for(question, value, method, &probabilities))
+        .collect();
     QuestionOutcome {
         name: question.name.clone(),
         outcome,
+        citation,
+        citations,
         address: pick.as_deref().and_then(address_of),
         pick,
         picks,
@@ -383,6 +431,13 @@ pub fn answer_fields(outcomes: &[QuestionOutcome]) -> BTreeMap<String, Value> {
         fields.insert(key("outcome"), json!(outcome.outcome));
         fields.insert(key("refused"), json!(outcome.outcome == "refused"));
         fields.insert(key("picks"), json!(outcome.picks));
+        fields.insert(key("citations"), json!(outcome.citations));
+        if let Some(citation) = &outcome.citation {
+            fields.insert(key("citation"), json!(citation));
+        }
+        if let Some(reason) = &outcome.reason {
+            fields.insert(key("reason"), json!(reason));
+        }
         if let Some(pick) = &outcome.pick {
             fields.insert(key("pick"), json!(pick));
         }
@@ -725,6 +780,234 @@ mod tests {
             answers: vec![answer],
             usage: Default::default(),
         })
+    }
+
+    fn presentation_choice(top_k: u8) -> DecisionQuestion {
+        let mut question = listed("thread", &["execution", "devops"]);
+        if let QuestionKind::Choice {
+            options,
+            top_k: count,
+            ..
+        } = &mut question.kind
+        {
+            *count = Some(top_k);
+            options[0].revision = Some("9f8e7d6c5b4a".into());
+            options[1].revision = Some("1a2b3c4d5e6f".into());
+        }
+        question
+    }
+
+    fn presentation_answer(
+        probabilities: &[(&str, f64)],
+        confidence: f64,
+    ) -> Result<Decision, DecisionFailure> {
+        answered(DecisionAnswer::Choice {
+            name: "thread".into(),
+            measured_by: MeasuredBy::Native,
+            pick: "devops".into(),
+            confidence: Some(confidence),
+            probabilities: probabilities
+                .iter()
+                .map(|(value, probability)| OptionProbability {
+                    value: (*value).into(),
+                    probability: *probability,
+                })
+                .collect(),
+        })
+    }
+
+    fn assert_presentation_parity(
+        asked: &DecisionNode,
+        result: &Result<Decision, DecisionFailure>,
+    ) -> BTreeMap<String, Value> {
+        let outcomes = outcomes(asked, result);
+        let trace = summary(&outcomes);
+        let fields = answer_fields(&outcomes);
+        for outcome in &outcomes {
+            for rest in ["reason", "citation", "citations"] {
+                let key = format!("answers.{}.{rest}", outcome.name);
+                let value = trace[&outcome.name].get(rest);
+                assert_eq!(fields.get(&key), value, "{key}");
+                let descriptor = answer_field(&asked.questions[0], rest).unwrap();
+                assert_eq!(descriptor.values, AnswerValues::Any);
+                assert_eq!(descriptor.list, rest == "citations");
+                assert!(!descriptor.address);
+                if let Some(value) = value {
+                    check_clause_value(&descriptor, value).unwrap();
+                }
+            }
+        }
+        fields
+    }
+
+    #[test]
+    fn presentation_top_k_matches_revisions_and_probabilities_by_value() {
+        // A 0.61 runner-up over two options has chance-normalized confidence 0.22.
+        let asked = node(presentation_choice(2), Some(0.2));
+        // Option declaration, probability report and admitted rank deliberately differ.
+        let result = presentation_answer(&[("execution", 0.61), ("devops", 0.82)], 0.82);
+        let fields = assert_presentation_parity(&asked, &result);
+        assert_eq!(
+            fields["answers.thread.citation"],
+            json!("devops (0.82, native, rev 1a2b3c4d5e6f)")
+        );
+        assert_eq!(
+            fields["answers.thread.citations"],
+            json!([
+                "devops (0.82, native, rev 1a2b3c4d5e6f)",
+                "execution (0.61, native, rev 9f8e7d6c5b4a)"
+            ])
+        );
+        let citations = fields["answers.thread.citations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(format!("Routed to {citations}."), "Routed to devops (0.82, native, rev 1a2b3c4d5e6f), execution (0.61, native, rev 9f8e7d6c5b4a).");
+        assert!(!fields.contains_key("answers.thread.reason"));
+    }
+
+    #[test]
+    fn presentation_below_threshold_preserves_closest_citation() {
+        let asked = node(presentation_choice(1), Some(0.5));
+        let result = presentation_answer(&[("execution", 0.2), ("devops", 0.41)], 0.41);
+        let fields = assert_presentation_parity(&asked, &result);
+        assert_eq!(fields["answers.thread.outcome"], json!("below_threshold"));
+        assert_eq!(fields["answers.thread.citations"], json!([]));
+        assert_eq!(
+            fields["answers.thread.citation"],
+            json!("devops (0.41, native, rev 1a2b3c4d5e6f)")
+        );
+        assert_eq!(format!("No thread claimed this (closest: {}). Start with @thread or #channel to route it.",
+            fields["answers.thread.citation"].as_str().unwrap()),
+            "No thread claimed this (closest: devops (0.41, native, rev 1a2b3c4d5e6f)). Start with @thread or #channel to route it.");
+        assert!(fields["answers.thread.reason"]
+            .as_str()
+            .unwrap()
+            .contains("below the native threshold"));
+    }
+
+    #[test]
+    fn presentation_unavailable_reasons_are_verbatim_with_refusal_fallback() {
+        let asked = node(presentation_choice(1), Some(0.5));
+        let cases = [
+            (
+                answered(DecisionAnswer::Refusal {
+                    name: "thread".into(),
+                    measured_by: MeasuredBy::Native,
+                    reason: Some(" policy text ".into()),
+                }),
+                " policy text ",
+            ),
+            (
+                answered(DecisionAnswer::Refusal {
+                    name: "thread".into(),
+                    measured_by: MeasuredBy::Native,
+                    reason: None,
+                }),
+                "the model refused to answer 'thread'",
+            ),
+            (
+                Err(DecisionFailure::Unanswerable("no suitable offer".into())),
+                "no suitable offer",
+            ),
+            (
+                Err(DecisionFailure::Failed("provider failed".into())),
+                "provider failed",
+            ),
+            (
+                answered(DecisionAnswer::Refusal {
+                    name: "other".into(),
+                    measured_by: MeasuredBy::Native,
+                    reason: None,
+                }),
+                "the reply carried no answer for 'thread'",
+            ),
+        ];
+        for (result, expected) in cases {
+            let fields = assert_presentation_parity(&asked, &result);
+            assert_eq!(fields["answers.thread.reason"], json!(expected));
+            assert_eq!(fields["answers.thread.citations"], json!([]));
+            assert!(!fields.contains_key("answers.thread.citation"));
+            assert_eq!(format!("Routing is unavailable: {}. Start with @thread or #channel to route it.",
+                fields["answers.thread.reason"].as_str().unwrap()),
+                format!("Routing is unavailable: {expected}. Start with @thread or #channel to route it."));
+        }
+    }
+
+    #[test]
+    fn presentation_omits_unreported_probability_and_literal_revision() {
+        let asked = node(listed("thread", &["execution", "devops"]), Some(0.5));
+        let fields = assert_presentation_parity(&asked, &presentation_answer(&[], 0.9));
+        assert_eq!(fields["answers.thread.citation"], json!("devops (native)"));
+        assert_eq!(
+            fields["answers.thread.citations"],
+            json!(["devops (native)"])
+        );
+        let fields =
+            assert_presentation_parity(&asked, &presentation_answer(&[("devops", 0.826)], 0.9));
+        assert_eq!(
+            fields["answers.thread.citation"],
+            json!("devops (0.83, native)")
+        );
+        let asked = node(presentation_choice(1), Some(0.5));
+        let fields = assert_presentation_parity(&asked, &presentation_answer(&[], 0.9));
+        assert_eq!(
+            fields["answers.thread.citation"],
+            json!("devops (native, rev 1a2b3c4d5e6f)")
+        );
+    }
+
+    #[test]
+    fn presentation_predicate_and_score_share_vocabulary_and_trace_fields() {
+        let predicate: DecisionQuestion = serde_json::from_value(json!({
+            "name": "q", "instructions": "Yes?", "type": "predicate"
+        }))
+        .unwrap();
+        let score: DecisionQuestion = serde_json::from_value(json!({
+            "name": "q", "instructions": "Level?", "type": "score",
+            "levels": [{"label":"low"}, {"label":"high"}]
+        }))
+        .unwrap();
+        for (question, answer, expected) in [
+            (
+                predicate,
+                DecisionAnswer::Predicate {
+                    name: "q".into(),
+                    measured_by: MeasuredBy::Logprobs,
+                    probability_yes: 0.8,
+                },
+                "yes (0.8, logprobs)",
+            ),
+            (
+                score,
+                DecisionAnswer::Score {
+                    name: "q".into(),
+                    measured_by: MeasuredBy::Native,
+                    score: 1.0,
+                    pick: "high".into(),
+                    confidence: Some(0.9),
+                    probabilities: vec![
+                        OptionProbability {
+                            value: "high".into(),
+                            probability: 1.0,
+                        },
+                        OptionProbability {
+                            value: "low".into(),
+                            probability: 0.0,
+                        },
+                    ],
+                },
+                "high (1, native)",
+            ),
+        ] {
+            let fields = assert_presentation_parity(&node(question, None), &answered(answer));
+            assert_eq!(fields["answers.q.citation"], json!(expected));
+            assert_eq!(fields["answers.q.citations"], json!([expected]));
+            assert!(!fields.contains_key("answers.q.reason"));
+        }
     }
 
     #[test]
