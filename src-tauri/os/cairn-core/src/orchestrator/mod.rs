@@ -171,7 +171,6 @@ pub enum TurnEndCancelReason {
     IssueResolved = 0,
     BranchAdvanced = 1,
     UserRequested = 2,
-    OperatorCompact = 3,
 }
 
 impl TurnEndCancelReason {
@@ -180,7 +179,6 @@ impl TurnEndCancelReason {
             Self::IssueResolved => "its issue resolved",
             Self::BranchAdvanced => "its branch advanced",
             Self::UserRequested => "a user requested cancellation",
-            Self::OperatorCompact => "the operator compacted its session",
         }
     }
 
@@ -192,7 +190,6 @@ impl TurnEndCancelReason {
             Self::IssueResolved => 0,
             Self::BranchAdvanced => 1,
             Self::UserRequested => 2,
-            Self::OperatorCompact => 3,
         }
     }
 
@@ -201,7 +198,6 @@ impl TurnEndCancelReason {
             0 => Some(Self::IssueResolved),
             1 => Some(Self::BranchAdvanced),
             2 => Some(Self::UserRequested),
-            3 => Some(Self::OperatorCompact),
             NOT_CANCELLED => None,
             _ => None,
         }

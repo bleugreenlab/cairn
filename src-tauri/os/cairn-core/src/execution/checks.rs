@@ -17536,6 +17536,8 @@ cairn-common = { path = "../cairn-common" }
                 .collect(),
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         }
     }
 
@@ -24945,6 +24947,8 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         }
     }
 
@@ -25929,6 +25933,8 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         }
     }
 
@@ -26244,6 +26250,8 @@ mod executor_base_content_tests {
                 baseline: None,
             }),
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         };
         let command = "bun run check:lint";
         assert!(check_reuse_decision(command, None, Some(&eslint(Some(Vec::new())))).reusable);

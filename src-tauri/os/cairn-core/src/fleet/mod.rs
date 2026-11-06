@@ -970,7 +970,8 @@ pub(crate) enum CancelCause {
     JobStopped,
     /// The job's issue resolved and its session closed.
     SessionClosed,
-    /// The operator compacted the job.
+    /// The operator compacted the job's session. Ends the session's own work
+    /// only; see [`CancelCause::ends_job_work_at`].
     OperatorCompact,
     /// The operator cancelled this one request.
     OperatorRetracted,
@@ -998,6 +999,20 @@ impl CancelCause {
             Self::Preempted(preemption) => preemption.sentence(),
             Self::Unrecorded => "cause not recorded".into(),
         }
+    }
+
+    /// Whether a job-wide cancel for this cause ends the job's work submitted
+    /// at `priority`.
+    ///
+    /// A compaction resets the session, so it ends only the session's own run
+    /// batches (`AgentInteractive`). Check lanes at either cadence (turn-end
+    /// waves, write-cadence lanes, merge-gate verification, a manual `cairn
+    /// check run`) are verdicts on a sealed commit that read nothing from the
+    /// session, and every one settles through the job (its observation, and a
+    /// push addressed to the job), so they keep running for the rebuilt
+    /// session to read. Every other cause ends the whole job.
+    pub(crate) fn ends_job_work_at(&self, priority: CellPriority) -> bool {
+        !matches!(self, Self::OperatorCompact) || priority == CellPriority::AgentInteractive
     }
 }
 
@@ -9344,12 +9359,14 @@ impl Fleet {
         Detachment::Retired { leader }
     }
 
-    /// Cancel everything one job is waiting on, for `cause`.
+    /// Cancel everything one job is waiting on that `cause` ends
+    /// ([`CancelCause::ends_job_work_at`]).
     ///
-    /// Job-wide on purpose: every consumer in the job is ended, so only a
-    /// caller ending the whole job may call it. A caller abandoning its own
-    /// requests drops the futures awaiting them instead, and leaves the job's
-    /// other consumers their answers.
+    /// Job-wide on purpose: every consumer in the job the cause covers is
+    /// ended, so only a caller ending the whole job (or, for a compaction, the
+    /// whole session) may call it. A caller abandoning its own requests drops
+    /// the futures awaiting them instead, and leaves the job's other consumers
+    /// their answers.
     pub(crate) fn cancel_job_requests(&self, job_id: &str, cause: CancelCause) -> usize {
         let subscribers: Vec<_> = self
             .in_flight
@@ -9358,7 +9375,10 @@ impl Fleet {
             .by_key
             .values()
             .flat_map(|execution| execution.subscribers.iter())
-            .filter(|(_, subscriber)| subscriber.requesting_job_id.as_deref() == Some(job_id))
+            .filter(|(_, subscriber)| {
+                subscriber.requesting_job_id.as_deref() == Some(job_id)
+                    && cause.ends_job_work_at(subscriber.priority)
+            })
             .map(|(identity, _)| identity.clone())
             .collect();
         let subscriber_count = subscribers.len();
@@ -9369,7 +9389,7 @@ impl Fleet {
         let coalesced_leaders = self.coalesced_leaders.lock().unwrap().clone();
         let pending: Vec<_> = self
             .queue
-            .bindings_for_job(job_id)
+            .bindings_for_job(job_id, |priority| cause.ends_job_work_at(priority))
             .into_iter()
             .filter(|(identity, _, _)| !coalesced_leaders.contains(identity))
             .map(|((request_id, attempt_id), executor_id, generation)| {
@@ -37569,6 +37589,140 @@ mod tests {
             .unwrap()
             .insert(leader.clone());
         key
+    }
+
+    /// A compaction resets the session, not the commit: of three waits in the
+    /// job on one shared answer, its job-wide cancel ends only the session's
+    /// own run batch, and leaves the turn-end wave's and the write-cadence
+    /// lane's to finish. Stopping the job still ends both.
+    #[tokio::test]
+    async fn a_compaction_spares_the_jobs_review_priority_work() {
+        let pool = Fleet::default();
+        let wave = ("wave".to_string(), "attempt-w".to_string());
+        let lane = ("lane".to_string(), "attempt-l".to_string());
+        let batch = ("batch".to_string(), "attempt-b".to_string());
+        let (wave_tx, wave_rx) = oneshot::channel();
+        let key = register_coalesced(&pool, &wave, vec![(wave.clone(), wave_tx, "job")]);
+        let (lane_tx, lane_rx) = oneshot::channel();
+        let (batch_tx, batch_rx) = oneshot::channel();
+        {
+            let mut registry = pool.in_flight.lock().unwrap();
+            for (identity, waiter, priority) in [
+                (lane.clone(), lane_tx, CellPriority::WriteCheck),
+                (batch.clone(), batch_tx, CellPriority::AgentInteractive),
+            ] {
+                registry
+                    .subscriber_keys
+                    .insert(identity.clone(), key.clone());
+                registry.by_key.get_mut(&key).unwrap().subscribers.insert(
+                    identity,
+                    CoalescedSubscriber {
+                        waiter,
+                        priority,
+                        requesting_job_id: Some("job".into()),
+                    },
+                );
+            }
+        }
+
+        assert_eq!(
+            pool.cancel_job_requests("job", CancelCause::OperatorCompact),
+            1,
+            "only the session's own run batch is cancelled"
+        );
+        assert_eq!(
+            batch_rx.await.unwrap().err(),
+            Some(CoalescedWaitError::Cancelled(CancelCause::OperatorCompact))
+        );
+        {
+            let registry = pool.in_flight.lock().unwrap();
+            let subscribers = &registry.by_key[&key].subscribers;
+            assert!(
+                subscribers.contains_key(&wave),
+                "the wave still waits on the execution"
+            );
+            assert!(
+                subscribers.contains_key(&lane),
+                "the write-cadence lane still waits on the execution"
+            );
+        }
+        assert!(!pool.cancelled_leaders.lock().unwrap().contains(&wave));
+
+        assert_eq!(pool.cancel_job_requests("job", CancelCause::JobStopped), 2);
+        assert_eq!(
+            wave_rx.await.unwrap().err(),
+            Some(CoalescedWaitError::Cancelled(CancelCause::JobStopped))
+        );
+        assert_eq!(
+            lane_rx.await.unwrap().err(),
+            Some(CoalescedWaitError::Cancelled(CancelCause::JobStopped))
+        );
+    }
+
+    /// The same rule on the queue: a compaction sends `Cancel` for the job's
+    /// claimed run batch and not for its claimed review or write check.
+    #[test]
+    fn a_compaction_cancels_the_jobs_claimed_batch_and_not_its_review_check() {
+        let pool = Fleet::default();
+        let (executor_tx, mut executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        while executor_rx.try_recv().is_ok() {}
+        let claim = |key: &RequestIdentity, priority: CellPriority| {
+            let mut request = provenance_request();
+            request.request_id.clone_from(&key.0);
+            request.attempt_id.clone_from(&key.1);
+            request.requesting_job_id = Some("job".into());
+            request.priority = priority;
+            request.wait_horizon_unix_ms = unix_time_ms() + 60_000;
+            let (entry_id, receiver) = pool
+                .queue
+                .enqueue(
+                    queue::NewEntry {
+                        request,
+                        admission_kind: CellAdmissionKind::Command,
+                        interactive: false,
+                        execution_residency: None,
+                        standing: false,
+                    },
+                    unix_time_ms(),
+                )
+                .expect("a fresh request identity enqueues");
+            assert!(pool.queue.offer(
+                &entry_id,
+                COLOCATED_EXECUTOR_ID,
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                unix_time_ms()
+            ));
+            assert_eq!(
+                pool.queue
+                    .claim(&entry_id, COLOCATED_EXECUTOR_ID, generation, unix_time_ms()),
+                queue::ClaimVerdict::Granted
+            );
+            receiver
+        };
+        let batch = ("batch".to_string(), "attempt-b".to_string());
+        let review = ("review".to_string(), "attempt-r".to_string());
+        let _batch_rx = claim(&batch, CellPriority::AgentInteractive);
+        let _review_rx = claim(&review, CellPriority::ReviewCheck);
+        let write = ("write".to_string(), "attempt-w".to_string());
+        let _write_rx = claim(&write, CellPriority::WriteCheck);
+
+        assert_eq!(
+            pool.cancel_job_requests("job", CancelCause::OperatorCompact),
+            1
+        );
+        let mut cancelled = Vec::new();
+        while let Ok(message) = executor_rx.try_recv() {
+            if let ExecutorMessage::Cancel {
+                request_id,
+                attempt_id,
+            } = message
+            {
+                cancelled.push((request_id, attempt_id));
+            }
+        }
+        assert_eq!(cancelled, vec![batch]);
     }
 
     /// A turn-end wave abandons its lanes by dropping the future awaiting

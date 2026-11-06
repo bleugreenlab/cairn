@@ -624,6 +624,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         }
     }

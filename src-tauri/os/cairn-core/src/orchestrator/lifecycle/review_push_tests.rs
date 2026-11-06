@@ -124,6 +124,7 @@ fn waited_on_lanes(
                 declared_unverified: None,
                 progress: None,
                 base_attribution: None,
+                evidence: None,
                 plan_audit_note: None,
             },
         )
@@ -4915,4 +4916,364 @@ async fn cancellation_retains_completed_placement_evidence_under_the_original_pl
         .await
         .unwrap();
     assert_eq!(Some(remaining.as_str()), passed["id"].as_str());
+}
+
+/// Give `j-prod` an open Claude session stuck mid-turn, the state an operator
+/// Compact exists to clear, so a confirmed Compact on it takes the cold path.
+async fn seed_live_session(db: &LocalDb) {
+    db.execute_script(
+        "INSERT INTO sessions(id, job_id, backend, status, sequence, backend_id, created_at, updated_at)
+           VALUES('s-prod','j-prod','claude','open',1,'handle-prod',1,1);
+         UPDATE runs SET status='live', session_id='s-prod', start_mode='resume' WHERE id='r-prod';
+         INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+           VALUES('t-live','s-prod','r-prod','j-prod',2,'running','initial',2,2);
+         UPDATE jobs SET status='running', current_session_id='s-prod', current_turn_id='t-live'
+          WHERE id='j-prod';
+         INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at, turn_id)
+           VALUES('ev-prod','r-prod','s-prod',1,1,'assistant',
+                  '{\"type\":\"assistant\",\"content\":\"working on the change\"}',1,'t-live');",
+    )
+    .await
+    .unwrap();
+}
+
+/// Press Compact on `j-prod` with the operator's consent to the cold path,
+/// returning what it tore down.
+async fn cold_compact(
+    orch: &Orchestrator,
+) -> crate::execution::operator_compact::OperatorCompactReport {
+    use crate::execution::operator_compact::{compact_job, ColdCompact, CompactResult};
+    let orch = orch.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        compact_job(&orch, "j-prod", None, ColdCompact::Confirmed)
+    })
+    .await
+    .unwrap()
+    .expect("a job stuck mid-turn compacts");
+    let CompactResult::Compacted(outcome) = result else {
+        panic!("a confirmed Compact asked for confirmation");
+    };
+    outcome.report.expect("live work takes the cold path")
+}
+
+/// The job's current session, which a cold Compact replaces.
+async fn current_session(db: &LocalDb) -> (String, String) {
+    db.query_one(
+        "SELECT s.id, s.status FROM jobs j JOIN sessions s ON s.id = j.current_session_id
+          WHERE j.id = 'j-prod'",
+        (),
+        |row| Ok((row.text(0)?, row.text(1)?)),
+    )
+    .await
+    .unwrap()
+}
+
+/// The successor session's first turn ends, which is what arms a turn-end wave
+/// (a live head turn arms nothing).
+async fn end_successor_turn(db: &LocalDb) {
+    db.execute(
+        "UPDATE turns SET state='complete'
+          WHERE job_id='j-prod' AND state IN ('pending','running','yielded')",
+        (),
+    )
+    .await
+    .unwrap();
+}
+
+/// A cold Compact is a reset of the session, and a review wave belongs to the
+/// commit it sealed. The wave in flight when the operator compacts keeps
+/// running: no machine is told to cancel its lane, its observation is recorded
+/// for the sealed commit, and its verdict reaches the job once, as an
+/// undelivered push the successor session receives. cairn/6070's wave was
+/// cancelled by a Compact after two hours and recorded nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jj)]
+async fn an_operator_compact_leaves_the_wave_running_and_its_verdict_reaches_the_successor() {
+    use cairn_common::executor_protocol::{CellOutcome, ExecutorMessage};
+
+    let bin = crate::jj::tests::jj_bin().expect("this acceptance requires jj");
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    seed_live_session(&db).await;
+    let orch = test_orchestrator(db);
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/cairn-6090-compact-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    let platform = crate::fleet::ExecutorPlatform::this_process();
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        format!(
+            "checks:\n  only-a:\n    command: \"true\"\n    when: review\n    verdictPlatforms: [{}]\n",
+            platform.os
+        ),
+    )
+    .unwrap();
+    std::fs::write(workspace.join("change.rs"), "the change under review\n").unwrap();
+    crate::jj::seal(&jj, &workspace, "compact keeps the wave", None).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+
+    let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_executor(sender);
+    let (attempt, slot) = claimed_slot(&orch, "j-prod");
+    let wave = tokio::spawn(crate::execution::checks_turn_end::run_turn_end_checks(
+        orch.clone(),
+        "j-prod".to_string(),
+        slot,
+    ));
+    let request = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            match executor
+                .recv()
+                .await
+                .expect("the fake fleet link stays open")
+            {
+                ExecutorMessage::Offer { entry_id, .. } => {
+                    orch.fleet.handle_executor_message(
+                        crate::fleet::COLOCATED_EXECUTOR_ID,
+                        generation,
+                        ExecutorMessage::Claim { entry_id },
+                    );
+                }
+                ExecutorMessage::Granted {
+                    request,
+                    batch: Some(_),
+                    ..
+                } => return request,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the wave's lane reaches the fake machine");
+
+    let report = cold_compact(&orch).await;
+    assert_eq!(report.turns_cancelled, 1, "{report:?}");
+    assert_eq!(
+        report.batches_cancelled, 0,
+        "the wave's lane is not the session's batch: {report:?}"
+    );
+    let (successor, status) = current_session(&orch.db.local).await;
+    assert_ne!(
+        successor, "s-prod",
+        "the job continues on a rebuilt session"
+    );
+    assert_eq!(status, "open");
+    while let Ok(message) = executor.try_recv() {
+        if let ExecutorMessage::Cancel { request_id, .. } = message {
+            assert_ne!(
+                request_id, request.request_id,
+                "the machine running the wave's lane is never told to stop it"
+            );
+        }
+    }
+
+    let plan: crate::execution::checks_turn_end::WavePlan = {
+        let json = orch
+            .db
+            .local
+            .query_one(
+                "SELECT plan_json FROM turn_end_check_attempts WHERE id=?1",
+                (attempt.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    };
+    let outcomes = serde_json::json!([{
+        "header": "only-a", "body": "only-a output",
+        "succeeded": true, "suspended": false, "exitCode": 0,
+        "startedAtUnixMs": 1, "finishedAtUnixMs": 2, "durationMs": 1,
+    }]);
+    let metadata = serde_json::from_value(serde_json::json!({
+        "executorId": crate::fleet::COLOCATED_EXECUTOR_ID,
+        "executorDeviceId": "local-device",
+        "executorConnectionGeneration": generation,
+        "slotId": "cell", "cellEpoch": 1,
+        "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+        "verdictPlatform": platform.os, "verdictArch": platform.arch,
+        "toolchainFingerprint": plan.expected_toolchain,
+        "verdictEnvironmentHash": cairn_checkenv::verdict_environment_hash(
+            Vec::<String>::new(), |name| std::env::var(name).ok()
+        ),
+    }))
+    .unwrap();
+    orch.fleet.handle_executor_message(
+        crate::fleet::COLOCATED_EXECUTOR_ID,
+        generation,
+        ExecutorMessage::Result {
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            outcome: CellOutcome::Completed {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                exit_code: Some(0),
+                output: outcomes.to_string(),
+                timed_out: false,
+                metadata,
+                mutation_delta: None,
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+                node_scratch: None,
+            },
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(120), wave)
+        .await
+        .expect("the wave settles once its lane answers")
+        .expect("the wave does not panic");
+
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    let settled = rows.iter().find(|row| row.0 == attempt).unwrap();
+    assert_eq!(
+        (settled.1.as_str(), settled.2.as_deref()),
+        (
+            "completed",
+            Some("check wave completed and delivery was persisted")
+        ),
+        "the Compact did not cancel the wave: {rows:?}"
+    );
+    assert_eq!(rows.len(), 1, "no second wave was started: {rows:?}");
+    let recorded = orch
+        .db
+        .local
+        .query_all(
+            "SELECT commit_sha, verdict FROM check_result_observations
+              WHERE job_id='j-prod' AND cadence='review' AND check_name='only-a'",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded,
+        vec![(plan.head.clone(), "passed".to_string())],
+        "the verdict is recorded once, for the commit the wave sealed"
+    );
+    let delivered: Vec<_> = pending(&orch, "j-prod")
+        .await
+        .into_iter()
+        .filter(|push| push.key.starts_with("turn-checks:"))
+        .collect();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "one verdict push, addressed to the job: {delivered:?}"
+    );
+    assert!(
+        delivered[0].delivered_event_id.is_none(),
+        "it waits for the successor session rather than the dead one"
+    );
+    assert_eq!(current_session(&orch.db.local).await.0, successor);
+}
+
+/// A Compact does not change what makes a wave stale. A commit landing after
+/// the Compact cancels the wave because its branch advanced, and its release
+/// arms the successor wave for the new tree, as it would without a Compact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jj)]
+async fn after_a_compact_a_new_commit_still_cancels_the_wave_and_arms_its_successor() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    seed_live_session(&db).await;
+    let orch = test_orchestrator(db);
+    let (head, _dirs) = resolvable_head(&orch)
+        .await
+        .expect("this acceptance requires jj");
+    let (wave, slot) = claimed_slot(&orch, "j-prod");
+    slot.cancel().set_runtime_status(&wave, plan_at(&head));
+
+    cold_compact(&orch).await;
+    assert!(!slot.is_cancelled(), "the Compact leaves the wave running");
+    assert!(orch.turn_end_checks_in_flight("j-prod"));
+
+    end_successor_turn(&orch.db.local).await;
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        &orch,
+        "j-prod",
+        crate::execution::checks::BranchAdvance::Commit,
+    )
+    .await;
+    assert_eq!(
+        slot.cancel().cancelled().await,
+        crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
+        "the commit cancels the wave as stale"
+    );
+    drop(slot);
+
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(rows.len(), 2, "exactly one successor is armed: {rows:?}");
+    assert!(
+        !matches!(rows[1].1.as_str(), "superseded" | "skipped" | "failed"),
+        "the successor wave starts: {rows:?}"
+    );
+    assert!(
+        orch.turn_end_checks_in_flight("j-prod"),
+        "the successor holds the job's slot"
+    );
+}
+
+/// The rebuilt session's first turn end on the tree the live wave sealed does
+/// not start a second wave beside it: the slot is the job's, so the turn end is
+/// refused and owed, and the wave's release owes nothing because the head has
+/// not moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jj)]
+async fn after_a_compact_the_successors_turn_end_starts_no_second_wave_on_the_same_tree() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    seed_live_session(&db).await;
+    let orch = test_orchestrator(db);
+    let (head, _dirs) = resolvable_head(&orch)
+        .await
+        .expect("this acceptance requires jj");
+    let (wave, slot) = claimed_slot(&orch, "j-prod");
+    slot.cancel().set_runtime_status(&wave, plan_at(&head));
+
+    cold_compact(&orch).await;
+    end_successor_turn(&orch.db.local).await;
+    spawn_turn_end_checks(&orch, "j-prod");
+
+    assert!(!slot.is_cancelled(), "the Compact leaves the wave running");
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[1].1.as_str(), rows[1].2.as_deref()),
+        (
+            "superseded",
+            Some(super::review_push::OWED_SUCCESSOR_REASON)
+        ),
+        "the successor's turn end is refused while the wave holds the slot: {rows:?}"
+    );
+
+    slot.finish("completed", "check wave completed").await;
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "the head did not move, so no successor: {rows:?}"
+    );
+    assert!(!orch.turn_end_checks_in_flight("j-prod"));
 }

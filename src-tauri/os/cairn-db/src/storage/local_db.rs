@@ -20,6 +20,7 @@ use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 use tokio::time::{error::Elapsed, sleep, timeout};
 use turso::{params::IntoParams, Builder, Connection, Row};
 
+use super::commit_watch::{watch_commit, CommitWatchBounds};
 use super::plan_audit::{self, PlanAudit};
 
 const CONTENTION_ATTEMPT_THRESHOLD: usize = 1;
@@ -770,12 +771,6 @@ pub struct LocalDb {
     /// drop its hold and reopen the boolean gate while another is still draining
     /// or running TRUNCATE.
     checkpoint_lock: AsyncMutex<()>,
-    /// Set while a TRUNCATE attempt runs on its checkpoint thread, and cleared
-    /// by that thread when the engine returns. A pass that finds it set follows
-    /// one whose attempt outlived [`CHECKPOINT_WEDGE_BACKSTOP`], and must
-    /// neither start a second TRUNCATE beside it nor close the gate for an
-    /// attempt it cannot make.
-    checkpoint_in_engine: Arc<AtomicBool>,
     /// Read transactions opened over this handle's life. Lets a test assert
     /// that an operation's transaction count is a constant rather than a
     /// function of how much data it covers — a load-independent guard against
@@ -858,7 +853,6 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -925,7 +919,6 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -988,7 +981,6 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -1119,7 +1111,7 @@ impl LocalDb {
     /// maintenance pass that folds when due skips its fold while one is, rather
     /// than waiting on it.
     pub fn checkpoint_in_engine(&self) -> bool {
-        self.checkpoint_in_engine.load(Ordering::SeqCst)
+        self.gate.checkpoint_in_engine.load(Ordering::SeqCst)
     }
 
     /// The private database that owns machine-local route metadata for this team
@@ -2064,7 +2056,7 @@ impl LocalDb {
     /// pass that started it. Optional work that would add reads to a database
     /// in that state (the daily storage census) waits for it to clear.
     pub fn checkpoint_in_flight(&self) -> bool {
-        self.checkpoint_in_engine.load(Ordering::SeqCst)
+        self.gate.checkpoint_in_engine.load(Ordering::SeqCst)
     }
 
     /// Fold the logical log back into the main database, creating the quiet
@@ -2161,7 +2153,7 @@ impl LocalDb {
         let started = Instant::now();
         let log_bytes_before = self.logical_log_bytes();
 
-        if self.checkpoint_in_engine.load(Ordering::SeqCst) {
+        if self.gate.checkpoint_in_engine.load(Ordering::SeqCst) {
             return Ok(CheckpointReport {
                 attempts: 0,
                 error: Some("an earlier checkpoint attempt is still running in the engine".into()),
@@ -2204,7 +2196,7 @@ impl LocalDb {
                 attempt.clone(),
                 until_slow,
                 remaining,
-                &self.checkpoint_in_engine,
+                &self.gate.checkpoint_in_engine,
                 logical_log_path(&self.path),
                 || {
                     log::warn!(
@@ -2337,6 +2329,13 @@ pub(super) struct ConnectionGate {
     /// Woken when the last live connection is released, so a drain settles the
     /// instant it can rather than at the end of a polling interval.
     drained: Notify,
+    /// Set while a TRUNCATE attempt runs on its checkpoint thread, and cleared
+    /// by that thread when the engine returns. A pass that finds it set follows
+    /// one whose attempt outlived [`CHECKPOINT_WEDGE_BACKSTOP`], and must
+    /// neither start a second TRUNCATE beside it nor close the gate for an
+    /// attempt it cannot make. On the gate because a slow commit reports it,
+    /// and the gate is what every connection reaches.
+    checkpoint_in_engine: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -2374,7 +2373,52 @@ impl ConnectionGate {
             state: Mutex::new(GateState::default()),
             reopened: Notify::new(),
             drained: Notify::new(),
+            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// What a slow commit reports about the rest of the database: whether a
+    /// checkpoint attempt is in the engine, how many pooled writes hold a
+    /// connection, and the oldest holders with their ages and statements.
+    ///
+    /// Only looks. [`LocalDb::overdue_holders`] marks the holders it reports
+    /// and interrupts runaway reads; a commit path calling that would change
+    /// what the gate watch says next and cut reads it has no business cutting.
+    fn neighbourhood(&self) -> String {
+        const SHOWN: usize = 8;
+        let now = Instant::now();
+        let (pooled_writes, mut held) = {
+            let state = self.lock();
+            let pooled_writes = state
+                .live
+                .values()
+                .filter(|live| live.kind == HolderKind::PooledWrite)
+                .count();
+            let held: Vec<(Duration, HolderKind, Arc<str>)> = state
+                .live
+                .values()
+                .map(|live| {
+                    (
+                        now.saturating_duration_since(live.since),
+                        live.kind,
+                        live.holder.statement(),
+                    )
+                })
+                .collect();
+            (pooled_writes, held)
+        };
+        held.sort_by_key(|(age, _, _)| std::cmp::Reverse(*age));
+        let total = held.len();
+        let shown: Vec<String> = held
+            .iter()
+            .take(SHOWN)
+            .map(|(age, kind, statement)| format!("{} ms {kind} {statement}", age.as_millis()))
+            .collect();
+        format!(
+            "checkpoint_in_engine={} pooled_writes_held={pooled_writes} connections_held={total} oldest=[{}]",
+            self.checkpoint_in_engine.load(Ordering::SeqCst),
+            shown.join("; "),
+        )
     }
 
     fn lock(&self) -> MutexGuard<'_, GateState> {
@@ -2633,12 +2677,17 @@ impl TrackedConnection {
         self.slot.holder.set_statement(at, sql.as_ref());
         let audit = self.plan_audit(at, sql.as_ref());
         let in_flight = self.slot.holder.start_statement();
+        let commit = is_commit(sql.as_ref());
         let running = self.conn.execute(sql, params);
         async move {
             if let Some(audit) = audit {
                 audit.await;
             }
-            let changed = running.await;
+            let changed = if commit {
+                watched_commit(running, &self.slot).await
+            } else {
+                running.await
+            };
             drop(in_flight);
             changed
         }
@@ -3232,8 +3281,15 @@ struct TxAttempt<T> {
 /// evidence that this connection's transaction state is unknown, which is
 /// already the pool's condition for retiring one ([`TxAttempt::reusable`]). The
 /// connection is dropped either way; only the caller's fate differs.
-async fn end_tx(conn: &Connection, sql: &'static str) -> DbResult<()> {
-    match AssertUnwindSafe(conn.execute(sql, ())).catch_unwind().await {
+async fn end_tx(conn: &TrackedConnection, sql: &'static str) -> DbResult<()> {
+    let ending = async {
+        if is_commit(sql) {
+            watched_commit(conn.conn.execute(sql, ()), &conn.slot).await
+        } else {
+            conn.conn.execute(sql, ()).await
+        }
+    };
+    match AssertUnwindSafe(ending).catch_unwind().await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(error.into()),
         Err(payload) => {
@@ -3246,6 +3302,65 @@ async fn end_tx(conn: &Connection, sql: &'static str) -> DbResult<()> {
             )))
         }
     }
+}
+
+/// Whether `sql` ends a transaction by committing it.
+///
+/// The commit watch sees a COMMIT only where this is asked: [`end_tx`] and
+/// [`TrackedConnection::execute`]. A COMMIT run through `prepare` and stepped
+/// by hand would go unwatched, so every commit goes through one of those two.
+fn is_commit(sql: &str) -> bool {
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    sql.eq_ignore_ascii_case("COMMIT")
+        || sql.eq_ignore_ascii_case("END")
+        || sql.eq_ignore_ascii_case("COMMIT TRANSACTION")
+        || sql.eq_ignore_ascii_case("END TRANSACTION")
+}
+
+/// A COMMIT run under [`watch_commit`], so a commit the engine leaves pending
+/// with nothing to wake it is polled again rather than parked for good, and a
+/// slow one says so.
+///
+/// A commit is never cancelled and never given a deadline that returns an
+/// error. Once the engine has appended the commit's log record, a dropped
+/// commit still commits (the engine's dropped-commit cleanup finishes it), so
+/// an error here would have the caller apply a write that already landed.
+///
+/// Both lines start with `slow commit:` so they can be counted. The first
+/// prints once the commit has been pending [`CommitWatchBounds::slow_after`],
+/// with what the gate can see of the database at that instant; the second
+/// prints when it returns, naming the poll it returned on. A commit that
+/// returned on a re-poll the engine never asked for was a lost wakeup that the
+/// re-poll contained; one that returned on an engine wake was a real wait
+/// that the re-poll only observed.
+async fn watched_commit(
+    commit: impl Future<Output = turso::Result<u64>>,
+    slot: &ConnectionSlot,
+) -> turso::Result<u64> {
+    let bounds = CommitWatchBounds::PRODUCTION;
+    let (result, watch) = watch_commit(commit, bounds, |pending, repolls| {
+        log::info!(
+            "slow commit: {} pending {} ms, re-polled {repolls} times; {}",
+            slot.holder.statement(),
+            pending.as_millis(),
+            slot.gate.neighbourhood(),
+        );
+    })
+    .await;
+    if watch.elapsed >= bounds.slow_after {
+        let outcome = match &result {
+            Ok(_) => "committed".to_owned(),
+            Err(error) => format!("failed: {error}"),
+        };
+        log::info!(
+            "slow commit: {} returned after {} ms, re-polled {} times, returned on {}; {outcome}",
+            slot.holder.statement(),
+            watch.elapsed.as_millis(),
+            watch.repolls,
+            watch.returned_on,
+        );
+    }
+    result
 }
 
 async fn run_tx<T>(
@@ -3264,13 +3379,13 @@ async fn run_tx<T>(
     }
 
     match f(conn).await {
-        Ok(value) => match end_tx(&conn.conn, "COMMIT").await {
+        Ok(value) => match end_tx(conn, "COMMIT").await {
             Ok(()) => TxAttempt {
                 result: Ok(value),
                 reusable: true,
             },
             Err(error) => {
-                let reusable = end_tx(&conn.conn, "ROLLBACK").await.is_ok();
+                let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
                 TxAttempt {
                     result: Err(error),
                     reusable,
@@ -3278,7 +3393,7 @@ async fn run_tx<T>(
             }
         },
         Err(error) => {
-            let reusable = end_tx(&conn.conn, "ROLLBACK").await.is_ok();
+            let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
             TxAttempt {
                 result: Err(error),
                 reusable,
@@ -3309,7 +3424,7 @@ async fn run_read_tx<T>(
             // produced is returned rather than thrown away with it. Reporting
             // the teardown instead would fail a read that had already
             // succeeded, on grounds the caller can neither see nor act on.
-            let outcome = end_tx(&conn.conn, "ROLLBACK").await;
+            let outcome = end_tx(conn, "ROLLBACK").await;
             if let Err(error) = &outcome {
                 log::warn!(
                     "read transaction completed but its ROLLBACK failed ({error}); returning the value and retiring this connection"
@@ -3321,7 +3436,7 @@ async fn run_read_tx<T>(
             }
         }
         Err(error) => {
-            let reusable = end_tx(&conn.conn, "ROLLBACK").await.is_ok();
+            let reusable = end_tx(conn, "ROLLBACK").await.is_ok();
             TxAttempt {
                 result: Err(error),
                 reusable,
@@ -3666,6 +3781,13 @@ mod tests {
                 counter_id TEXT NOT NULL REFERENCES counters(id)
             );
 
+            CREATE TABLE hot_row (
+                id TEXT PRIMARY KEY NOT NULL,
+                cursor INTEGER NOT NULL,
+                health_state TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY NOT NULL,
                 project_id TEXT NOT NULL,
@@ -3728,6 +3850,33 @@ mod tests {
             .unwrap();
         let (one, read) = overhead_of(&audited).await;
         println!("statement_overhead_probe: audited query_one={one}ns/call read={read}ns/call");
+        let write = write_overhead_of(&db).await;
+        println!("statement_overhead_probe: execute={write}ns/call");
+    }
+
+    /// Best-of-five nanoseconds per one-row upsert through `execute`: the
+    /// write path's `BEGIN CONCURRENT`, the statement, and its watched
+    /// `COMMIT` (cairn/6134).
+    async fn write_overhead_of(db: &LocalDb) -> u128 {
+        const CALLS: u32 = 5_000;
+        let mut best = u128::MAX;
+        for round in 0..6 {
+            let started = Instant::now();
+            for i in 0..CALLS {
+                db.execute(
+                    "INSERT INTO counters(id, value) VALUES ('probe', ?1) \
+                     ON CONFLICT(id) DO UPDATE SET value = excluded.value",
+                    (i64::from(i),),
+                )
+                .await
+                .unwrap();
+            }
+            // The first round warms the pool and the plan audit.
+            if round > 0 {
+                best = best.min(started.elapsed().as_nanos() / u128::from(CALLS));
+            }
+        }
+        best
     }
 
     /// Best-of-five nanoseconds per `SELECT 1` through `query_one` and `read`.
@@ -4259,7 +4408,6 @@ mod tests {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-utils"))]
@@ -4411,6 +4559,187 @@ mod tests {
         assert!(
             attempts.load(Ordering::SeqCst) > 16,
             "expected at least one optimistic retry under shared-row contention"
+        );
+    }
+
+    /// Where each looping writer of [`two_writers_of_one_row_stress`] is: the
+    /// iteration it is on, and when that iteration began (micros since the
+    /// test's epoch, plus one; zero between iterations).
+    #[derive(Default)]
+    struct WriterProgress {
+        iteration: std::sync::atomic::AtomicU64,
+        started_us: std::sync::atomic::AtomicU64,
+    }
+
+    const HOT_UPSERT: &str = "INSERT INTO hot_row(id, cursor, health_state, updated_at) \
+         VALUES ('default', ?1, 'healthy', ?2) \
+         ON CONFLICT(id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at";
+    /// Matches no row, so its commit is the read-only one that waits on any
+    /// preparing version it read.
+    const HOT_NOOP_UPDATE: &str = "UPDATE hot_row SET health_state = 'healthy' \
+         WHERE id = 'default' AND health_state = 'unauthorized'";
+
+    /// The cairn/6134 shape: an upsert and a no-op UPDATE of one row, looping
+    /// against each other beside unrelated writers and pooled reads, with one
+    /// of the UPDATE writers on a plain thread under `Handle::block_on` (the
+    /// path `run_db_blocking` takes from a reader thread). A writer whose
+    /// current iteration passes the deadline is a stall; the monitor then
+    /// reports the holders, runs one checkpoint attempt, and measures how long
+    /// the stalled writers take to move after it.
+    ///
+    /// `CAIRN_6134_ITERATIONS` sets the iterations per hot writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "stress reproduction; run explicitly in release"]
+    async fn two_writers_of_one_row_stress() {
+        use std::sync::atomic::AtomicBool;
+
+        const DEADLINE: Duration = Duration::from_secs(5);
+        const BACKGROUND_WRITERS: usize = 4;
+        let iterations: u64 = std::env::var("CAIRN_6134_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20_000);
+
+        let db = Arc::new(test_db().await.unwrap());
+        db.execute(HOT_UPSERT, (0_i64, 0_i64)).await.unwrap();
+        let epoch = Instant::now();
+        let now_us = move || epoch.elapsed().as_micros() as u64 + 1;
+        let done = Arc::new(AtomicBool::new(false));
+        let names = ["upsert", "noop-update", "noop-update-bridged"];
+        let progress: Arc<Vec<WriterProgress>> =
+            Arc::new(names.iter().map(|_| WriterProgress::default()).collect());
+
+        let mut hot = Vec::new();
+        for (index, sql) in [(0, HOT_UPSERT), (1, HOT_NOOP_UPDATE)] {
+            let (db, progress) = (db.clone(), progress.clone());
+            hot.push(tokio::spawn(async move {
+                for i in 0..iterations {
+                    let me = &progress[index];
+                    me.iteration.store(i, Ordering::SeqCst);
+                    me.started_us.store(now_us(), Ordering::SeqCst);
+                    if index == 0 {
+                        db.execute(sql, (i as i64, now_us() as i64)).await.unwrap();
+                    } else {
+                        db.execute(sql, ()).await.unwrap();
+                    }
+                    me.started_us.store(0, Ordering::SeqCst);
+                }
+            }));
+        }
+        let bridged = {
+            let (db, progress) = (db.clone(), progress.clone());
+            let handle = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                for i in 0..iterations {
+                    let me = &progress[2];
+                    me.iteration.store(i, Ordering::SeqCst);
+                    me.started_us.store(now_us(), Ordering::SeqCst);
+                    handle.block_on(db.execute(HOT_NOOP_UPDATE, ())).unwrap();
+                    me.started_us.store(0, Ordering::SeqCst);
+                }
+            })
+        };
+
+        let mut background = Vec::new();
+        for writer in 0..BACKGROUND_WRITERS {
+            let (db, done) = (db.clone(), done.clone());
+            background.push(tokio::spawn(async move {
+                let mut i = 0_u64;
+                while !done.load(Ordering::SeqCst) {
+                    db.execute(
+                        "INSERT INTO unrelated_writes(id, value) VALUES (?1, 'x') \
+                         ON CONFLICT(id) DO UPDATE SET value = excluded.value",
+                        (format!("bg-{writer}-{}", i % 64),),
+                    )
+                    .await
+                    .unwrap();
+                    i += 1;
+                }
+            }));
+        }
+        {
+            let (db, done) = (db.clone(), done.clone());
+            background.push(tokio::spawn(async move {
+                while !done.load(Ordering::SeqCst) {
+                    query_i64(&db, "SELECT cursor FROM hot_row WHERE id = 'default'")
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }));
+        }
+
+        let mut stall = None;
+        let started = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let hot_done = hot.iter().all(|task| task.is_finished()) && bridged.is_finished();
+            if hot_done {
+                break;
+            }
+            let now = now_us();
+            let stalled: Vec<(usize, u64, u64)> = progress
+                .iter()
+                .enumerate()
+                .filter_map(|(index, p)| {
+                    let since = p.started_us.load(Ordering::SeqCst);
+                    (since != 0 && now - since > DEADLINE.as_micros() as u64)
+                        .then(|| (index, p.iteration.load(Ordering::SeqCst), now - since))
+                })
+                .collect();
+            if stalled.is_empty() {
+                continue;
+            }
+            let holders = db.overdue_holders(Duration::from_secs(1), Duration::ZERO);
+            let release_started = Instant::now();
+            let report = db
+                .checkpoint(
+                    1,
+                    Duration::ZERO,
+                    DrainBudget::fixed(Duration::from_secs(1)),
+                )
+                .await;
+            let mut released_after = None;
+            while release_started.elapsed() < Duration::from_secs(30) {
+                let moved = stalled.iter().all(|&(index, iteration, _)| {
+                    let p = &progress[index];
+                    p.iteration.load(Ordering::SeqCst) != iteration
+                        || p.started_us.load(Ordering::SeqCst) == 0
+                });
+                if moved {
+                    released_after = Some(release_started.elapsed());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stall =
+                Some(format!(
+                "stalled after {:?}: {:?}; holders: {:?}; checkpoint: {:?}; released after: {:?}",
+                started.elapsed(),
+                stalled
+                    .iter()
+                    .map(|&(index, iteration, us)| (names[index], iteration, us / 1000))
+                    .collect::<Vec<_>>(),
+                holders.iter().map(OverdueHolder::describe).collect::<Vec<_>>(),
+                report.map(|r| (r.error, r.drain.drained, r.drain.still_open)),
+                released_after,
+            ));
+            break;
+        }
+        done.store(true, Ordering::SeqCst);
+        if let Some(stall) = stall {
+            panic!("{stall}");
+        }
+        for task in hot {
+            task.await.unwrap();
+        }
+        bridged.join().unwrap();
+        for task in background {
+            task.await.unwrap();
+        }
+        println!(
+            "two_writers_of_one_row_stress: {iterations} iterations per hot writer in {:?}",
+            started.elapsed()
         );
     }
 
@@ -6398,7 +6727,7 @@ mod tests {
 
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while db.checkpoint_in_engine.load(Ordering::SeqCst) {
+        while db.gate.checkpoint_in_engine.load(Ordering::SeqCst) {
             assert!(
                 Instant::now() < deadline,
                 "the released attempt never left the engine"

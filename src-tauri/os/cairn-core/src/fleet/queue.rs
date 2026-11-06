@@ -1485,13 +1485,19 @@ impl ExecutionQueue {
         .flatten()
     }
 
-    /// Every bound entry a job owns, for cancelling that job's work.
-    pub(crate) fn bindings_for_job(&self, job_id: &str) -> Vec<(RequestIdentity, String, u64)> {
+    /// Every bound entry a job owns at a priority `ends` selects, for
+    /// cancelling that job's work.
+    pub(crate) fn bindings_for_job(
+        &self,
+        job_id: &str,
+        ends: impl Fn(super::CellPriority) -> bool,
+    ) -> Vec<(RequestIdentity, String, u64)> {
         let state = self.entries.lock().unwrap();
         state
             .entries
             .values()
             .filter(|entry| entry.requesting_job_id.as_deref() == Some(job_id))
+            .filter(|entry| ends(entry.request.priority))
             .filter_map(|entry| {
                 Some((
                     entry.identity(),
@@ -1891,7 +1897,8 @@ impl super::Fleet {
             owner: None,
             cwd: String::new(),
             env: Vec::new(),
-            priority: super::CellPriority::ReviewCheck,
+            // An agent's run batch, as `mcp::handlers::run` submits one.
+            priority: super::CellPriority::AgentInteractive,
             wait_horizon_unix_ms: now + 60_000,
             waiting_since_unix_ms: 0,
             timeout_ms: 60_000,

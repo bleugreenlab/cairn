@@ -1,4 +1,5 @@
 mod blocking;
+mod commit_watch;
 mod context_tokens;
 mod error;
 mod fact_log;

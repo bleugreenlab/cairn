@@ -27,7 +27,7 @@ use crate::orchestrator::lifecycle::{
     find_descendant_job_ids, kill_session_with_reason, settle_live_turn, TurnSettlement,
     OPERATOR_COMPACT_EXIT_REASON,
 };
-use crate::orchestrator::{Orchestrator, TurnEndCancelReason};
+use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -231,7 +231,6 @@ pub struct OperatorCompactReport {
     pub turns_cancelled: usize,
     pub runs_killed: usize,
     pub batches_cancelled: usize,
-    pub checks_cancelled: usize,
     pub permissions_withdrawn: usize,
     pub questions_withdrawn: usize,
     pub waits_abandoned: usize,
@@ -245,13 +244,12 @@ impl OperatorCompactReport {
     fn summary(&self) -> String {
         format!(
             "The operator compacted this session while it had live work. Cancelled {} turn(s), \
-             killed {} run(s), cancelled {} executor batch(es) and {} turn-end check wave(s), \
-             withdrew {} permission(s) and {} question(s), and abandoned {} durable wait(s). \
-             The job continues on a fresh session rebuilt from its digest.",
+             killed {} run(s), cancelled {} executor batch(es), withdrew {} permission(s) and \
+             {} question(s), and abandoned {} durable wait(s). The job continues on a fresh \
+             session rebuilt from its digest.",
             self.turns_cancelled,
             self.runs_killed,
             self.batches_cancelled,
-            self.checks_cancelled,
             self.permissions_withdrawn,
             self.questions_withdrawn,
             self.waits_abandoned,
@@ -488,11 +486,9 @@ fn tear_down(
 ) -> Result<OperatorCompactReport, String> {
     let mut report = OperatorCompactReport::default();
 
-    for job in &live.jobs {
-        if orch.cancel_turn_end_checks(job, TurnEndCancelReason::OperatorCompact) {
-            report.checks_cancelled += 1;
-        }
-    }
+    // The job's in-flight turn-end check wave is deliberately left running. It
+    // is a pure verdict on a sealed commit, keyed on the job rather than the
+    // session, so the rebuilt session reads its verdict when it lands.
 
     // Every process this Compact will kill: the job's own live runs, warm or
     // not, and each sub-agent run serving a turn.
@@ -534,6 +530,8 @@ fn tear_down(
     }
 
     // After the kill, so a batch dispatched in the final moments is caught too.
+    // The cause ends only the session's run batches: a check lane at either
+    // cadence is a verdict on a commit, not the session's own work.
     for job in &live.jobs {
         report.batches_cancelled += orch
             .fleet

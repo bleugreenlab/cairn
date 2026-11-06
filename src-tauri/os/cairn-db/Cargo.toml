@@ -59,6 +59,8 @@ unigram = "0.2"
 
 [dev-dependencies]
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
+# Paused time for commit_watch's re-poll tests.
+tokio = { version = "1", features = ["test-util"] }
 
 [features]
 # Exposes InMemoryContentStore, event_fixture, events::testutil, reconstruct_fixture,

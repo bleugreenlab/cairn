@@ -14,6 +14,10 @@ use crate::orchestrator::Orchestrator;
 use cairn_common::query::{encode_query_params, QueryParam};
 
 use super::paging::RecordPage;
+use crate::execution::check_evidence::{
+    reconcile_evidence, EvidenceClass, EvidenceInputs, EvidenceReconciliation,
+};
+
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 const RESULT_SCHEMA_VERSION: i64 =
@@ -491,7 +495,6 @@ fn render_observation_page(
     permalink: Option<&str>,
     ran_on: Option<&str>,
 ) -> RecordPage {
-    let (count_lines, count_mismatch) = observation_count_lines(observation);
     let short_commit = commit.get(..12).unwrap_or(commit);
     let handle = format!("{}@{short_commit}", observation.check_name);
     let params = encode_query_params(&[
@@ -506,6 +509,23 @@ fn render_observation_page(
     ]);
     let coordinate = format!("cairn://p/{project}/check-results/{commit}?{params}");
     let citation = permalink.unwrap_or(&coordinate);
+    // A cached alias answers this commit with an execution at another one; the
+    // populations below are that execution's, never this request's.
+    let reused_from = (observation.disposition == "cached").then(|| {
+        let source = observation.public_handle.as_deref().map_or_else(
+            || "its source observation has no permalink handle".to_string(),
+            |handle| format!("cairn://p/{project}/check-observations/{handle}"),
+        );
+        format!(
+            "the execution at {} ({source})",
+            observation
+                .source_commit_sha
+                .get(..12)
+                .unwrap_or(&observation.source_commit_sha)
+        )
+    });
+    let (count_lines, evidence) = observation_evidence(observation, reused_from);
+    let count_mismatch = evidence.class.revokes_authority();
     let mut body = vec![
         format!("# Check results: {}", observation.check_name),
         String::new(),
@@ -587,6 +607,13 @@ fn render_observation_page(
     if let Some(phases) = &observation.phases {
         body.extend(phase_lines(phases, observation.duration_ms));
     }
+    body.extend([
+        String::new(),
+        "## Evidence accounting".to_string(),
+        String::new(),
+    ]);
+    body.extend(evidence.lines());
+    body.push(String::new());
     if let Some(line) = cell_line(
         observation.execution_warmth.as_deref(),
         observation.cell_origin.as_ref(),
@@ -774,12 +801,66 @@ fn render_observation_page(
     }
 }
 
-/// Compare a single nextest run with the global manifest, never with a page.
-/// A composed tier's summaries may overlap, so even a retained single pass is
-/// not a witness for the composition.
-fn observation_count_lines(observation: &CheckResultObservationProjection) -> (Vec<String>, bool) {
+/// The observation's count lines and its evidence reconciliation. A result
+/// that carries accounting is reconciled from it, link by link; one recorded
+/// before accounting falls back to comparing a retained nextest Summary with
+/// the stored rows, and that comparison is one more input to the same
+/// classification rather than a verdict of its own.
+fn observation_evidence(
+    observation: &CheckResultObservationProjection,
+    reused_from: Option<String>,
+) -> (Vec<String>, EvidenceReconciliation) {
+    let parsed = observation.verdict_result.as_ref();
+    let accounting = parsed.and_then(|parsed| parsed.accounting.as_ref());
+    let (mut lines, retained_tally_mismatch) = if accounting.is_some() {
+        (persisted_count_lines(observation), None)
+    } else {
+        observation_count_lines(observation)
+    };
+    let evidence = reconcile_evidence(EvidenceInputs {
+        parsed,
+        failure_kind: observation.failure_kind.as_deref(),
+        expects_enumeration: None,
+        persisted: Some(&observation.persisted_counts),
+        reused_from,
+        retained_tally_mismatch,
+    });
+    if let Some(accounting) = accounting {
+        for pass in &accounting.passes {
+            lines.push(match &pass.runner {
+                Some(runner) => format!(
+                    "- Runner-reported ({}, pass `{}`): {} total; {} passed, {} failed, {} skipped, {} timed out",
+                    runner.source,
+                    pass.pass,
+                    runner.total,
+                    runner.passed,
+                    runner.failed,
+                    runner.skipped,
+                    runner.timed_out
+                ),
+                None => format!(
+                    "- Runner witness unavailable for pass `{}`: the runner left no tally",
+                    pass.pass
+                ),
+            });
+        }
+        lines.push(format!(
+            "- Count reconciliation: {}",
+            if evidence.class.revokes_authority() {
+                "MISMATCH (see Evidence accounting). Enumeration is incomplete/non-authoritative; not reusable."
+            } else if evidence.class == EvidenceClass::Accounted {
+                "matched link by link (see Evidence accounting)"
+            } else {
+                "see Evidence accounting"
+            }
+        ));
+    }
+    (lines, evidence)
+}
+
+fn persisted_count_lines(observation: &CheckResultObservationProjection) -> Vec<String> {
     let counts = &observation.persisted_counts;
-    let mut lines = vec![
+    vec![
         format!(
             "- Persisted outcomes (global): {} total; {} passed, {} failed, {} skipped, {} deferred",
             counts.total(), counts.passed, counts.failed, counts.skipped, counts.deferred
@@ -788,7 +869,32 @@ fn observation_count_lines(observation: &CheckResultObservationProjection) -> (V
             "- Self-skips: {} (ledger-reported; transferred from runner passes to persisted skips when reconciling)",
             counts.self_skipped
         ),
-    ];
+    ]
+}
+
+/// Compare a single nextest run with the global manifest, never with a page.
+/// A composed tier's summaries may overlap, so even a retained single pass is
+/// not a witness for the composition. Returns the lines and, on a mismatch,
+/// the sentence that names it.
+fn observation_count_lines(
+    observation: &CheckResultObservationProjection,
+) -> (Vec<String>, Option<String>) {
+    let counts = &observation.persisted_counts;
+    let mut lines = persisted_count_lines(observation);
+    // Only nextest prints the Summary this compares; another runner's
+    // observation without accounting has no retained tally at all.
+    if let Some(parser) = observation
+        .verdict_result
+        .as_ref()
+        .map(|parsed| parsed.parser.as_str())
+        .filter(|parser| *parser != "nextest")
+    {
+        lines.push(format!(
+            "- Runner witness unavailable: no runner tally was recorded for this {parser} result; using persisted counts"
+        ));
+        lines.push("- Count reconciliation: unavailable".into());
+        return (lines, None);
+    }
     let unavailable = if observation.selection.as_deref()
         == Some(crate::execution::check_parsers::FAST_TIER_SELECTION)
     {
@@ -811,12 +917,12 @@ fn observation_count_lines(observation: &CheckResultObservationProjection) -> (V
             "- Runner witness unavailable: {reason}; using persisted counts"
         ));
         lines.push("- Count reconciliation: unavailable".into());
-        return (lines, false);
+        return (lines, None);
     }
     let Some(summary) = summary else {
         lines.push("- Runner witness unavailable: no single unambiguous nextest Summary retained; using persisted counts".into());
         lines.push("- Count reconciliation: unavailable".into());
-        return (lines, false);
+        return (lines, None);
     };
     lines.push(format!(
         "- Runner-reported (nextest Summary): {} total; {} passed, {} failed, {} skipped, {} timed out",
@@ -824,7 +930,7 @@ fn observation_count_lines(observation: &CheckResultObservationProjection) -> (V
     ));
     if observation.selection.as_deref() == Some("filtered") {
         lines.push("- Count reconciliation: unavailable (filtered selection; runner skips may include unselected tests outside the persisted manifest)".into());
-        return (lines, false);
+        return (lines, None);
     }
     let matched = counts.passed.checked_add(counts.self_skipped) == Some(summary.passed)
         && Some(counts.failed) == summary.failed.checked_add(summary.timed_out)
@@ -832,13 +938,19 @@ fn observation_count_lines(observation: &CheckResultObservationProjection) -> (V
         && counts.deferred == 0;
     if matched {
         lines.push("- Count reconciliation: matched after self-skip pass-to-skip transfers (counts only; not proof of test identity)".into());
-    } else {
-        lines.push(format!(
-            "- Count reconciliation: MISMATCH after {} self-skip pass-to-skip transfers; runner total {}, persisted total {}. Enumeration is incomplete/non-authoritative; not reusable.",
-            counts.self_skipped, summary.run + summary.skipped, counts.total()
-        ));
+        return (lines, None);
     }
-    (lines, !matched)
+    let mismatch = format!(
+        "retained nextest Summary ({} total) disagrees with the stored rows ({} total) after {} self-skip pass-to-skip transfers",
+        summary.run + summary.skipped,
+        counts.total(),
+        counts.self_skipped
+    );
+    lines.push(format!(
+        "- Count reconciliation: MISMATCH after {} self-skip pass-to-skip transfers; runner total {}, persisted total {}. Enumeration is incomplete/non-authoritative; not reusable.",
+        counts.self_skipped, summary.run + summary.skipped, counts.total()
+    ));
+    (lines, Some(mismatch))
 }
 
 /// A backtick fence longer than any backtick run inside the output, so tool
@@ -1391,6 +1503,8 @@ mod tests {
                 failed: 1,
                 ..Default::default()
             },
+            verdict_result: None,
+            public_handle: Some("0123456789abcdef01234567".into()),
             test_total: 3,
             test_offset: 0,
         }
@@ -1414,6 +1528,79 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn compact(value: serde_json::Value) -> crate::execution::check_parsers::ParsedCheckResult {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_vitest_observation_without_accounting_is_not_described_in_nextest_terms() {
+        let mut observation = cached_observation();
+        observation.verdict_result = Some(compact(serde_json::json!({
+            "parser": "vitest", "complete": true, "selection": "full",
+            "passed": 2, "failed": 1, "skipped": 0, "failures": []
+        })));
+        let page = counts_page(&observation);
+        assert!(
+            page.contains("no runner tally was recorded for this vitest result"),
+            "{page}"
+        );
+        assert!(!page.contains("nextest Summary"), "{page}");
+        assert!(page.contains("## Evidence accounting"));
+        assert!(page.contains("- Class: uninstrumented"), "{page}");
+    }
+
+    #[test]
+    fn stored_rows_short_of_the_accounting_revoke_the_shown_authority() {
+        let mut observation = cached_observation();
+        observation.reusable = true;
+        observation.verdict_result = Some(compact(serde_json::json!({
+            "parser": "vitest", "complete": true, "selection": "full",
+            "passed": 3, "failed": 1, "skipped": 0, "failures": [],
+            "ingestion": {"received": 4, "kept": 4},
+            "accounting": {
+                "version": 1,
+                "inventory": {"state": "listed", "unit": "file", "count": 2, "unreported": 0, "unreportedIds": []},
+                "passes": [{
+                    "pass": "vitest", "processes": 1, "started": null,
+                    "enumerated": {"passed": 3, "failed": 1, "skipped": 0, "deferred": 0},
+                    "runner": {"source": "vitest-report", "total": 4, "passed": 3, "failed": 1, "skipped": 0, "timedOut": 0},
+                    "runnerReconciled": true
+                }],
+                "final": {"passed": 3, "failed": 1, "skipped": 0, "deferred": 0, "rows": 4, "duplicateIds": 0}
+            }
+        })));
+        // The fixture stores 2 passed + 1 failed: one row short of the 4 kept.
+        let page = counts_page(&observation);
+        assert!(page.contains("- Class: lost evidence"), "{page}");
+        assert!(
+            page.contains("- Runner-reported (vitest-report, pass `vitest`): 4 total"),
+            "{page}"
+        );
+        assert!(page.contains("- Complete: false"), "{page}");
+        assert!(page.contains("- Reusable: false"), "{page}");
+        assert!(page.contains(
+            "Recorded authority (overridden by count mismatch): complete=true, reusable=true"
+        ));
+        assert!(
+            page.contains("- Expected inventory: listed: 2 files, 0 unreported"),
+            "{page}"
+        );
+        // A cached alias says whose execution these populations are.
+        assert!(
+            page.contains("- Execution: reused from the execution at source-commi (cairn://p/cairn/check-observations/0123456789abcdef01234567) (not counted as a fresh execution)"),
+            "{page}"
+        );
+
+        observation.persisted_counts.passed = 3;
+        let page = counts_page(&observation);
+        assert!(page.contains("- Class: accounted"), "{page}");
+        assert!(
+            page.contains("- Count reconciliation: matched link by link"),
+            "{page}"
+        );
+        assert!(page.contains("- Reusable: true"), "{page}");
     }
 
     #[test]

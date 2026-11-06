@@ -19,6 +19,7 @@ pub mod artifact_revisions;
 pub mod branch_target;
 pub mod cache;
 pub mod canonical;
+pub mod check_evidence;
 pub mod check_identity;
 pub mod check_parsers;
 pub mod check_placement;

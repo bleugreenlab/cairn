@@ -498,6 +498,8 @@ mod tests {
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         };
         assert_eq!(
             card_check_verdict(true, Some(&empty.verdict_facts())),
@@ -940,6 +942,8 @@ mod tests {
                 unverified: None,
                 lint_findings: None,
                 plan_audit: None,
+                accounting: None,
+                ingestion: None,
             };
             Some(serde_json::to_string(&parsed).unwrap())
         };

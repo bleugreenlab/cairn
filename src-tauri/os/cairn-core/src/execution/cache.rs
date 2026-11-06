@@ -2266,6 +2266,14 @@ pub(crate) struct CheckResultObservationProjection {
     pub tests: Vec<CheckTestResultRow>,
     /// Global counts, independent of the requested page and filters.
     pub persisted_counts: ObservationTestCounts,
+    /// The observation's compact structured result (`verdict_result_json`):
+    /// its parser, counts, and, when the producer wrote it, the evidence
+    /// accounting the page reconciles against `persisted_counts`. Carries no
+    /// per-test rows. `None` for a run that produced no parse.
+    pub verdict_result: Option<crate::execution::check_parsers::ParsedCheckResult>,
+    /// The source observation's permalink handle, so a reused verdict cites the
+    /// execution it came from. `None` on rows recorded before handles existed.
+    pub public_handle: Option<String>,
     pub test_total: usize,
     pub test_offset: usize,
 }
@@ -3110,18 +3118,48 @@ fn compact_verdict_result(json: Option<&str>) -> Option<String> {
         deferred: usize,
         #[serde(default)]
         unverified: Option<String>,
+        // Bounded at ingestion (named identities are capped), so the compact
+        // column carries them whole: they are what the observation read
+        // reconciles against the stored rows.
+        #[serde(default)]
+        accounting: Option<serde_json::Value>,
+        #[serde(default)]
+        ingestion: Option<serde_json::Value>,
+        #[serde(default)]
+        report: Option<String>,
     }
     let summary: Summary = serde_json::from_str(json?).ok()?;
-    Some(
-        serde_json::json!({
-            "parser": summary.parser, "complete": summary.complete,
-            "selection": summary.selection.unwrap_or_else(|| "unknown".into()),
-            "passed": summary.passed, "failed": summary.failed,
-            "skipped": summary.skipped, "deferred": summary.deferred,
-            "unverified": summary.unverified, "failures": [],
-        })
-        .to_string(),
-    )
+    let mut compact = serde_json::json!({
+        "parser": summary.parser, "complete": summary.complete,
+        "selection": summary.selection.unwrap_or_else(|| "unknown".into()),
+        "passed": summary.passed, "failed": summary.failed,
+        "skipped": summary.skipped, "deferred": summary.deferred,
+        "unverified": summary.unverified, "failures": [],
+    });
+    // Only results that carry accounting grow the column, so a row recorded
+    // before it keeps its exact immutable shape on re-record.
+    if let Some(accounting) = summary.accounting {
+        compact["accounting"] = accounting;
+        compact["ingestion"] = summary.ingestion.unwrap_or(serde_json::Value::Null);
+        // The first line says why a producer called itself incomplete.
+        compact["report"] = summary
+            .report
+            .and_then(|report| report.lines().next().map(str::to_string))
+            .map_or(serde_json::Value::Null, serde_json::Value::String);
+    }
+    Some(compact.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn compact_verdict_result_for_test(json: &str) -> Option<String> {
+    compact_verdict_result(Some(json))
+}
+
+/// A stored compact result, decoded; one this build cannot read is none.
+fn compact_result(
+    json: Option<String>,
+) -> Option<crate::execution::check_parsers::ParsedCheckResult> {
+    json.and_then(|json| serde_json::from_str(&json).ok())
 }
 
 /// Record reuse at another commit without mutating either the source observation
@@ -3219,7 +3257,7 @@ pub(crate) fn get_check_result_observation(
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                             o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
                             o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count,
-                            {OBSERVATION_PHASE_COLUMNS}
+                            {OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,o.public_handle
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
                       WHERE a.project_id=?1 AND a.commit_sha=?2 AND a.check_name=?3
@@ -3256,6 +3294,8 @@ pub(crate) fn get_check_result_observation(
                     selection: row.opt_text(38)?, deferred_count: row.i64(39)?,
                     phases, execution_warmth, cell_origin, build_jobs, tests: Vec::new(),
                     persisted_counts: observation_test_totals(conn, &observation_id).await?,
+                    verdict_result: compact_result(row.opt_text(53)?),
+                    public_handle: row.opt_text(54)?,
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
@@ -3287,7 +3327,7 @@ fn observation_by_handle_sql() -> String {
                 o.executor_lease_epoch,o.executor_started_at_unix_ms,
                 o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                 o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
-                o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS}
+                o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS},o.verdict_result_json
            FROM check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
           WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
     )
@@ -3364,6 +3404,8 @@ pub(crate) fn get_check_result_observation_by_handle(
                     build_jobs,
                     tests: Vec::new(),
                     persisted_counts: observation_test_totals(conn, &id).await?,
+                    verdict_result: compact_result(row.opt_text(48)?),
+                    public_handle: Some(keys.1.clone()),
                     test_total: 0,
                     test_offset: 0,
                 };
@@ -4343,6 +4385,115 @@ mod tests {
             error.to_string().contains("was not found"),
             "a missing job reads as missing: {error}"
         );
+    }
+
+    /// The observation read carries the compact result, accounting included,
+    /// and the shared classification reconciles it against the stored rows. The
+    /// second observation is the negative control: its writer was handed one
+    /// row fewer than ingestion kept, which only the store comparison can see.
+    #[tokio::test]
+    async fn an_observation_read_reconciles_its_accounting_against_the_stored_rows() {
+        use crate::execution::check_evidence::{reconcile_evidence, EvidenceClass, EvidenceInputs};
+        let db = cache_db().await;
+        let artifact = serde_json::json!({
+            "schemaVersion": 1, "parser": "nextest", "complete": true, "selection": "full",
+            "undeclaredSkips": 0,
+            "tests": [
+                {"id": "crate::passes", "status": "passed", "attempts": 1, "retried": false, "flaky": false},
+                {"id": "crate::also", "status": "passed", "attempts": 1, "retried": false, "flaky": false},
+            ],
+            "accounting": {
+                "version": 1,
+                "inventory": {"state": "unavailable", "reason": "nextest enumerates at run time"},
+                "passes": [{
+                    "pass": "full", "processes": 1, "started": 2,
+                    "enumerated": {"passed": 2, "failed": 0, "skipped": 0, "deferred": 0},
+                    "unresolved": 0, "unresolvedIds": [],
+                    "runner": {"source": "nextest-summary", "total": 2, "passed": 2, "failed": 0, "skipped": 0, "timedOut": 0},
+                    "runnerReconciled": true
+                }],
+                "transfers": {"selfSkips": 0, "ledgerOnlySkips": 0, "tierOverlap": 0},
+                "final": {"passed": 2, "failed": 0, "skipped": 0, "deferred": 0, "rows": 2, "duplicateIds": 0}
+            }
+        });
+        let parsed = crate::execution::check_parsers::parse_check_output(
+            "bun run test:rust",
+            &format!(
+                "{}{artifact}",
+                crate::execution::check_parsers::RESULT_ARTIFACT_JSON_MARKER
+            ),
+        )
+        .unwrap();
+        let row = |id: &str| CheckTestResultRow {
+            test_id: id.to_string(),
+            status: "passed".to_string(),
+            duration_ms: Some(1),
+            attempt_count: Some(1),
+            failure_excerpt: None,
+            skip_reason: None,
+            declaration_source: None,
+            flaky: false,
+            started_offset_ms: None,
+        };
+        let mut whole = observation("obs-accounted", "commit-accounted", "env-accounted");
+        whole.selection = Some("full".to_string());
+        whole.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
+        whole.tests = vec![row("crate::also"), row("crate::passes")];
+        let mut short = observation("obs-short", "commit-short", "env-short");
+        short.selection = whole.selection.clone();
+        short.target_results_json = whole.target_results_json.clone();
+        short.tests = vec![row("crate::passes")];
+        // Same row count as ingestion kept, one status different.
+        let mut flipped = observation("obs-flipped", "commit-flipped", "env-flipped");
+        flipped.selection = whole.selection.clone();
+        flipped.target_results_json = whole.target_results_json.clone();
+        flipped.tests = vec![
+            CheckTestResultRow {
+                status: "failed".to_string(),
+                ..row("crate::also")
+            },
+            row("crate::passes"),
+        ];
+        for write in [&whole, &short, &flipped] {
+            record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+        }
+
+        let classify = |handle: &str| {
+            let projection =
+                get_check_result_observation_by_handle(db.clone(), "project-a", handle)
+                    .unwrap()
+                    .unwrap();
+            let accounting = projection
+                .verdict_result
+                .as_ref()
+                .and_then(|parsed| parsed.accounting.as_ref())
+                .is_some();
+            let evidence = reconcile_evidence(EvidenceInputs {
+                parsed: projection.verdict_result.as_ref(),
+                failure_kind: projection.failure_kind.as_deref(),
+                expects_enumeration: None,
+                persisted: Some(&projection.persisted_counts),
+                reused_from: None,
+                retained_tally_mismatch: None,
+            });
+            (accounting, evidence)
+        };
+        let (accounting, evidence) = classify(&whole.public_handle);
+        assert!(accounting, "the compact column keeps the accounting");
+        assert_eq!(evidence.class, EvidenceClass::Accounted, "{evidence:#?}");
+        assert_eq!((evidence.ingested, evidence.persisted), (Some(2), Some(2)));
+
+        let (_, evidence) = classify(&short.public_handle);
+        assert_eq!(evidence.class, EvidenceClass::LostEvidence, "{evidence:#?}");
+        assert_eq!((evidence.ingested, evidence.persisted), (Some(2), Some(1)));
+
+        let (_, evidence) = classify(&flipped.public_handle);
+        assert_eq!(evidence.class, EvidenceClass::Incomplete, "{evidence:#?}");
+        assert_eq!((evidence.ingested, evidence.persisted), (Some(2), Some(2)));
+        assert!(evidence
+            .findings
+            .iter()
+            .any(|finding| finding.contains("status by status")));
     }
 
     async fn cache_db() -> Arc<LocalDb> {

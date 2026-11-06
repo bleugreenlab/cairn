@@ -49,6 +49,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::execution::check_evidence::{EvidenceAccounting, Ingestion, NAMED_IDS};
+
 /// Chars of failure detail inlined per failing check into either surface (the
 /// write-cadence inline summary and the turn-end `### Systematic checks`
 /// section). One constant for both surfaces, sized at the turn-end section's
@@ -181,6 +183,15 @@ pub struct ParsedCheckResult {
     /// a branch's attribution reads them like tests; no test count includes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) plan_audit: Option<ParsedPlanAudit>,
+    /// What the producer's result accounts for, from its runner's starts and
+    /// tally to the rows it handed off ([`EvidenceAccounting`]). `None` for a
+    /// producer that writes none and for an unreadable block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) accounting: Option<EvidenceAccounting>,
+    /// What this core received from a per-test result and kept. Set for every
+    /// parsed test artifact, whatever its producer wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ingestion: Option<Ingestion>,
 }
 
 /// What a plan-audit failure's name opens with. The rest is its row's `id`.
@@ -763,6 +774,8 @@ pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCh
             unverified: Some(reason),
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         },
     })
 }
@@ -881,6 +894,10 @@ fn parse_structured_artifact(clean: &str) -> Option<ParsedCheckResult> {
 /// writer cannot claim a tally its rows do not carry.
 fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<ParsedCheckResult> {
     let rows: Vec<CheckTestResult> = serde_json::from_value(value.get("tests")?.clone()).ok()?;
+    let mut ingestion = Ingestion {
+        received: rows.len(),
+        ..Ingestion::default()
+    };
     let mut tests: Vec<CheckTestResult> = Vec::with_capacity(rows.len());
     let mut indices = std::collections::HashMap::<String, usize>::new();
     let mut invalid = Vec::new();
@@ -892,10 +909,17 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
             )
         {
             invalid.push(format!("invalid terminal row: {} ({})", row.id, row.status));
+            ingestion.invalid_rows += 1;
             continue;
         }
         if let Some(index) = indices.get(&row.id).copied() {
             invalid.push(format!("duplicate test identity: {}", row.id));
+            ingestion.duplicate_rows += 1;
+            if ingestion.duplicate_ids.len() < NAMED_IDS {
+                ingestion
+                    .duplicate_ids
+                    .push(row.id.chars().take(MESSAGE_CHARS).collect());
+            }
             // Preserve a named failure for diagnosis rather than letting a
             // first pass hide it behind the database's unique key.
             if row.status == "failed" {
@@ -948,8 +972,11 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
                 .map(PlanAuditRow::failure),
         )
         .collect();
+    ingestion.kept = tests.len();
     Some(ParsedCheckResult {
         plan_audit,
+        accounting: EvidenceAccounting::from_artifact(value),
+        ingestion: Some(ingestion),
         schema_version: 1,
         complete,
         selection: value
@@ -1042,6 +1069,8 @@ fn parse_lint_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         unverified: None,
         lint_findings,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     })
 }
 
@@ -1088,6 +1117,8 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
         unverified: None,
         lint_findings: None,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     })
 }
 
@@ -1231,6 +1262,8 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         unverified: None,
         lint_findings: None,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     })
 }
 
@@ -1335,6 +1368,8 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
         unverified: None,
         lint_findings: None,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     })
 }
 
@@ -1485,6 +1520,8 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
         unverified: None,
         lint_findings: None,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     })
 }
 
@@ -1719,6 +1756,8 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         unverified: None,
         lint_findings: None,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     })
 }
 
@@ -1820,6 +1859,8 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         unverified: None,
         lint_findings: None,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     })
 }
 
@@ -3085,6 +3126,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                 .collect(),
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         };
         let s = format_failure_names(&parsed).unwrap();
         assert!(s.starts_with("8 failed: f0, f1, f2, f3, f4"));
@@ -3112,6 +3155,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         };
         assert!(format_failure_names(&parsed).is_none());
     }
@@ -3296,6 +3341,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         };
         let e = format_failure_excerpt(Some(&with_msgs), "RAW TAIL");
         assert_eq!(e, "suite test: AssertionError: boom");
@@ -3322,6 +3369,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         };
         assert_eq!(
             format_failure_excerpt(Some(&no_msgs), "panic at src/lib.rs"),

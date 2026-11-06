@@ -5,6 +5,9 @@ use crate::execution::cache::{
     list_check_results_for_job, observed_commit_for_job, resolve_job_logical_head,
     CheckResultCacheEntry, HeadVerdictKeys, OwnedHeadVerdictKeys,
 };
+use crate::execution::check_evidence::{
+    reconcile_evidence, EvidenceInputs, EvidenceReconciliation,
+};
 use crate::execution::check_parsers::{
     anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
     is_lint_parser, is_test_runner_parser, join_failure_names, report_excerpt, ParsedCheckResult,
@@ -663,6 +666,7 @@ pub(crate) fn test_status(
         declared_unverified: None,
         progress: None,
         base_attribution: None,
+        evidence: None,
         plan_audit_note: None,
     }
 }
@@ -796,6 +800,38 @@ pub struct NodeCheckStatus {
     /// lane, and for one the ledger could not answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) base_attribution: Option<BaseAttribution>,
+    /// The lane result's evidence accounting
+    /// ([`crate::execution::check_evidence::reconcile_evidence`]): what it
+    /// started, finished, handed off and ingested, and the one class naming
+    /// its gap. `None` for a lane with no result yet. This projection reads no
+    /// stored rows, so `persisted` is absent here; the observation read
+    /// reconciles against the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence: Option<EvidenceReconciliation>,
+}
+
+/// [`reconcile_evidence`] of one lane row, where the lane's command says
+/// whether it owes a test enumeration (`None` when the command is unknown).
+pub(crate) fn row_evidence(
+    row: &CheckResultCacheEntry,
+    parsed: Option<&ParsedCheckResult>,
+    expects_enumeration: Option<bool>,
+) -> EvidenceReconciliation {
+    reconcile_evidence(EvidenceInputs {
+        parsed,
+        failure_kind: row.failure_kind.as_deref(),
+        expects_enumeration,
+        persisted: None,
+        // Reuse attribution marks a row recorded at another tree; the row
+        // carries no source observation of its own to cite beyond that tree.
+        reused_from: (row.cached == Some(true)).then(|| {
+            format!(
+                "the execution recorded for identical inputs at tree {}",
+                row.tree_hash.get(..12).unwrap_or(&row.tree_hash)
+            )
+        }),
+        retained_tally_mismatch: None,
+    })
 }
 
 /// Where one member of a running review wave stands. Members run in order
@@ -1008,6 +1044,7 @@ fn unsupported_lanes<'a>(
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: Some(crate::execution::check_evidence::unsupported_evidence()),
             plan_audit_note: None,
         }
     })
@@ -1675,6 +1712,17 @@ fn assemble_statuses(
                 );
                 status.verified_on = verified_on.get(&name).cloned();
                 status.base_attribution = attributions.get(&name).cloned();
+                let parsed = row
+                    .target_results_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<ParsedCheckResult>(json).ok());
+                status.evidence = Some(row_evidence(
+                    row,
+                    parsed.as_ref(),
+                    Some(crate::execution::check_parsers::is_test_runner_command(
+                        &check.command,
+                    )),
+                ));
                 status.notice = newer_attempt_note(lane);
                 if let Some(held) = &lane.held {
                     // Held, not red: the breaker's count is the lane's
@@ -1742,6 +1790,7 @@ fn assemble_statuses(
                 declared_unverified: None,
                 progress,
                 base_attribution: None,
+                evidence: None,
                 plan_audit_note: None,
             }
         })
@@ -1956,6 +2005,7 @@ fn status_from_row(
         declared_unverified: parsed.and_then(|p| p.unverified),
         progress: None,
         base_attribution: None,
+        evidence: None,
     }
 }
 
@@ -2632,6 +2682,8 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
         unverified: None,
         lint_findings: None,
         plan_audit: None,
+        accounting: None,
+        ingestion: None,
     };
     format_failure_names(&parsed)
 }
@@ -3222,6 +3274,8 @@ mod tests {
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         })
         .unwrap()
     }
@@ -3846,6 +3900,43 @@ mod tests {
         );
     }
 
+    /// The node projection classifies through the same function as the
+    /// observation read, reads no stored rows, and says when it is reused.
+    #[test]
+    fn a_lane_row_carries_the_shared_evidence_classification() {
+        use crate::execution::check_evidence::EvidenceClass;
+        let script = verdict_row("migrations", true);
+        assert_eq!(
+            row_evidence(&script, None, Some(false)).class,
+            EvidenceClass::NoEnumerationExpected
+        );
+        assert_eq!(
+            row_evidence(&script, None, Some(true)).class,
+            EvidenceClass::NoResultAuthority
+        );
+
+        let mut row = verdict_row("rust-tests", true);
+        let parsed: ParsedCheckResult = serde_json::from_str(&parsed_json(0, &[])).unwrap();
+        row.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
+        let evidence = row_evidence(&row, Some(&parsed), Some(true));
+        assert_eq!(
+            evidence.persisted, None,
+            "this projection reads no stored rows"
+        );
+        assert!(evidence.fresh);
+        row.cached = Some(true);
+        let reused = row_evidence(&row, Some(&parsed), Some(true));
+        assert!(!reused.fresh);
+        assert!(reused
+            .reused_from
+            .as_deref()
+            .is_some_and(|source| source.contains("identical inputs")));
+        assert_eq!(reused.class, evidence.class);
+        let value = serde_json::to_value(&reused).unwrap();
+        assert_eq!(value["fresh"], serde_json::json!(false));
+        assert!(value["class"].is_string());
+    }
+
     #[test]
     fn a_success_without_a_canonical_result_is_unverified_but_tsc_is_verified() {
         let row = verdict_row("lint", true);
@@ -3879,6 +3970,8 @@ mod tests {
             unverified: None,
             lint_findings: None,
             plan_audit: None,
+            accounting: None,
+            ingestion: None,
         };
         tsc.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
         let status = status_from_row(
@@ -3920,6 +4013,8 @@ mod tests {
                 unverified: None,
                 lint_findings: None,
                 plan_audit: None,
+                accounting: None,
+                ingestion: None,
             })
             .unwrap(),
         );
@@ -4100,6 +4195,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         };
         assert_eq!(
@@ -4169,6 +4265,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         };
         assert_eq!(
@@ -4266,6 +4363,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         };
         assert_eq!(
@@ -4312,6 +4410,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         };
         assert_eq!(
@@ -4367,6 +4466,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         };
         assert_eq!(
@@ -4453,6 +4553,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         };
         assert_eq!(
@@ -4557,6 +4658,7 @@ mod tests {
             declared_unverified: None,
             progress: None,
             base_attribution: None,
+            evidence: None,
             plan_audit_note: None,
         };
         assert_eq!(
