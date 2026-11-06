@@ -52,21 +52,24 @@ impl LibraryContext {
 /// contacts it again.
 pub const REFRESH_TTL_MINUTES: i64 = 15;
 
-/// Who is asking for a pack update.
+/// Who is asking for a pack install, restore, update, or item reset.
 ///
-/// An update that changes what runs on this machine is the operator's to
-/// apply (tenet 1189's "applied on click" is the operator's click). The
-/// transport decides which one an invoke carries from its credentials; every
-/// agent-facing path is [`UpdateAuthority::Agent`].
+/// An act that changes what runs on this machine is the operator's: a library
+/// update that changes a server's command or endpoint or a workflow (tenet
+/// 1189's "applied on click" is the operator's click), and any act that puts
+/// a native machine service's declaration into the workspace, since a selected
+/// machine runs that service as a resident outside any fence. The transport
+/// decides which one an invoke carries from its credentials; every
+/// agent-facing path is [`PackAuthority::Agent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateAuthority {
+pub enum PackAuthority {
     Operator,
     Agent,
 }
 
-/// The phrase every operator-only refusal carries, so a transport can answer
-/// it as Forbidden rather than as a malformed request.
-pub const OPERATOR_ONLY_UPDATE: &str = "changes what runs on this machine";
+/// The phrase every operator-only pack refusal carries, so a transport can
+/// answer it as Forbidden rather than as a malformed request.
+pub const OPERATOR_ONLY_PACK_ACT: &str = "changes what runs on this machine";
 
 /// The refusal for any attempt to add a library source in this slice.
 pub const ADD_SOURCE_REFUSAL: &str =

@@ -3268,6 +3268,7 @@ async fn an_edited_copy_drains_at_the_next_pass_and_a_reset_brings_the_artifact_
         "kit",
         cairn_packs::PackItemKind::Service,
         "probe",
+        crate::library::PackAuthority::Operator,
     )
     .unwrap();
     assert_eq!(

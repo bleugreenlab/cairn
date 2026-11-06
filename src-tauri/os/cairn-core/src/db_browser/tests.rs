@@ -113,6 +113,50 @@ async fn a_browser_read_admits_only_database_uris_in_its_own_project() {
     ));
 }
 
+/// The browser parses what it reads, so the agent read budget does not apply:
+/// a page of rows far past it comes back as one whole document, not a window
+/// cut mid-JSON.
+#[tokio::test]
+async fn a_browser_read_of_a_page_past_the_agent_budget_is_one_whole_document() {
+    let (orch, _) = seeded_for_writes().await;
+    let wide = "w".repeat(2_000);
+    let rows: Vec<Value> = (0..100)
+        .map(|index| {
+            change(
+                ATTEMPTS,
+                "append",
+                json!({"problem": format!("p{index}"), "code": wide}),
+            )
+        })
+        .collect();
+    write(&orch, rows).await.unwrap();
+
+    let response = read_db(
+        &orch,
+        "p",
+        &[format!("{ATTEMPTS}?limit=100&offset=0&format=json")],
+    )
+    .await
+    .unwrap();
+    let envelope: cairn_common::read::ReadBatchEnvelope =
+        serde_json::from_str(response["result"].as_str().unwrap()).unwrap();
+    assert!(!envelope.segments[0].truncated);
+    let body = &envelope.bodies.unwrap()[0];
+    assert!(
+        body.len() > crate::storage::render::CLIENT_TOOL_RESULT_BYTE_CEILING,
+        "the page must exceed the agent budget to test anything: {} bytes",
+        body.len()
+    );
+    let document: Value = serde_json::from_str(body).unwrap_or_else(|error| {
+        panic!(
+            "not one JSON document ({error}): {}",
+            &body[body.len().saturating_sub(300)..]
+        )
+    });
+    assert_eq!(document["rows"].as_array().map(Vec::len), Some(100));
+    assert_eq!(document["rows"][99]["code"], json!(wide));
+}
+
 /// A browser read crosses the same final-response guard a model-visible read
 /// does, so a registered secret stored in a row comes back redacted.
 #[tokio::test]

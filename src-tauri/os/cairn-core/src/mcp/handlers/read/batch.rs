@@ -30,15 +30,33 @@ struct ReadBatchPayload {
     include_bodies: bool,
 }
 
-/// Handle a `read_batch` callback: classify, produce, dedup, and assemble. The
-/// MCP tool's result lands in a model's context, so it reads under the context
-/// budget.
+/// Handle a `read_batch` callback: classify, produce, dedup, and assemble under
+/// [`read_budget_for`].
 pub(crate) async fn handle_read_batch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     read_cursors: &ReadCursorState,
 ) -> String {
-    read_batch(orch, request, read_cursors, view::ReadBudget::Context).await
+    read_batch(orch, request, read_cursors, read_budget_for(request)).await
+}
+
+/// The budget a `read_batch` callback composes under. The read budget exists to
+/// keep a read from flooding a model's context, so only a call a model-facing
+/// edge stamped (the MCP tools, the HTTP-loop backend) reads under it. Every
+/// other caller hands the body to code that parses it: the standalone `cairn`
+/// CLI, an `@cairn/sdk` script or a service's `ctx.cairn`, the database
+/// browser. Those read every target whole, refused in place past
+/// [`view::WHOLE_READ_BYTE_CEILING`] rather than cut. An agent that runs one of
+/// them inside a `run` batch still sees only what the batch result's own output
+/// cap lets through.
+pub(crate) fn read_budget_for(request: &McpCallbackRequest) -> view::ReadBudget {
+    if request.is_model_facing() {
+        view::ReadBudget::Context
+    } else {
+        view::ReadBudget::Whole {
+            byte_ceiling: view::WHOLE_READ_BYTE_CEILING,
+        }
+    }
 }
 
 /// A `read_batch` composed under `budget`, which the caller chooses for who the
@@ -1009,10 +1027,10 @@ mod tests {
             cwd: worktree.path().display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),
-            payload: serde_json::json!({
+            payload: model_facing(serde_json::json!({
                 "paths": paths,
                 "include_bodies": true
-            }),
+            })),
             tool_use_id: None,
             origin: None,
         };
@@ -1041,9 +1059,9 @@ mod tests {
         }
 
         let plain_request = McpCallbackRequest {
-            payload: serde_json::json!({
+            payload: model_facing(serde_json::json!({
                 "paths": ["file:small.rs", "file:huge.rs", "file:missing.rs"]
-            }),
+            })),
             ..structured_request
         };
         let plain_raw = handle_read_batch(&orch, &plain_request, &cursors).await;
@@ -1051,6 +1069,48 @@ mod tests {
         assert!(plain_json.get("bodies").is_none());
         let plain: ReadBatchEnvelope = serde_json::from_str(&plain_raw).unwrap();
         assert!(plain.bodies.is_none());
+    }
+
+    /// The read budget bounds a model's context and nothing else. Only a call a
+    /// model-facing edge stamped is cut to it; the same read from code (the
+    /// CLI's `cli` stamp, or an `@cairn/sdk` script, a service, or the database
+    /// browser, which stamp nothing) carries the target whole.
+    #[tokio::test]
+    async fn only_a_model_facing_read_is_cut_to_the_read_budget() {
+        use cairn_common::protocol::{stamp_callback_origin, MODEL_FACING_ORIGIN};
+        let orch = seeded_orch().await;
+        let worktree = tempfile::tempdir().unwrap();
+        let huge = format!("single huge line: {}", "x".repeat(100_000));
+        std::fs::write(worktree.path().join("huge.rs"), &huge).unwrap();
+        let cursors = Mutex::new(HashMap::new());
+
+        for origin in [Some(MODEL_FACING_ORIGIN), Some("cli"), None] {
+            let mut payload =
+                serde_json::json!({"paths": ["file:huge.rs"], "include_bodies": true});
+            if let Some(origin) = origin {
+                stamp_callback_origin(&mut payload, origin);
+            }
+            let request = McpCallbackRequest {
+                cwd: worktree.path().display().to_string(),
+                tool: "read_batch".to_string(),
+                payload,
+                ..Default::default()
+            };
+            let model = origin == Some(MODEL_FACING_ORIGIN);
+            assert_eq!(
+                read_budget_for(&request) == view::ReadBudget::Context,
+                model,
+                "{origin:?}"
+            );
+            let raw = handle_read_batch(&orch, &request, &cursors).await;
+            let envelope: ReadBatchEnvelope = serde_json::from_str(&raw).unwrap();
+            assert_eq!(envelope.segments[0].truncated, model, "{origin:?}");
+            let body = &envelope.bodies.as_ref().unwrap()[0];
+            assert_eq!(body.contains(&huge), !model, "{origin:?}");
+            if model {
+                assert!(envelope.text.len() <= view::CLIENT_TOOL_RESULT_BYTE_CEILING);
+            }
+        }
     }
 
     #[tokio::test]

@@ -739,6 +739,57 @@ async fn the_packs_resource_refuses_to_add_a_library_source() {
     }
 }
 
+/// A resource write carries no operator credential, so a pack that ships a
+/// native machine service cannot be put in place through `cairn://packs`; the
+/// refusal names the Library page, where the operator does it.
+#[tokio::test]
+async fn the_packs_resource_refuses_to_install_a_machine_service() {
+    let orch = seeded_orch().await;
+    let resources = tempfile::tempdir().unwrap().keep();
+    let kit = resources.join("packs/kit");
+    std::fs::create_dir_all(kit.join("services/probe")).unwrap();
+    std::fs::write(
+        kit.join("cairn-pack.yaml"),
+        "id: kit\nname: Kit\nversion: 1.0.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        kit.join("services/probe/service.yaml"),
+        "name: Probe\nruntime: native\nplacement: per-machine\n",
+    )
+    .unwrap();
+    crate::config::pack::record_source_dir(
+        &crate::services::RealFileSystem,
+        &resources,
+        &orch.config_dir,
+    )
+    .unwrap();
+
+    let error = apply(
+        &orch,
+        &change_item(
+            "cairn://packs/kit",
+            ChangeMode::Patch,
+            Some(serde_json::json!({"action": "install"})),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.error.contains(crate::library::OPERATOR_ONLY_PACK_ACT),
+        "{}",
+        error.error
+    );
+    assert!(error.error.contains("kit/probe"), "{}", error.error);
+    assert!(
+        error.error.contains("Library page in Settings"),
+        "{}",
+        error.error
+    );
+    assert!(crate::config::pack::lock::read_lock(&orch.config_dir, "kit").is_none());
+    assert!(!orch.config_dir.join("services/probe").exists());
+}
+
 pub(super) fn change_item(
     target: &str,
     mode: ChangeMode,

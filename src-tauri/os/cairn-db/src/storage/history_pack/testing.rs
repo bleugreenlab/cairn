@@ -299,7 +299,7 @@ pub async fn seed_fixture_execution(db: &LocalDb, prefix: &str) -> FixtureEvents
     db.execute(
         "UPDATE events SET input_tokens = 7, output_tokens = 11, cost_usd = 0.125,
                 reported_model = 'claude-opus-5-5', change_preview_status = 'applied',
-                change_applied_at = 99
+                change_applied_at = 99, account_id = 'acct-a'
          WHERE id = ?1",
         params![names.restored.as_str()],
     )

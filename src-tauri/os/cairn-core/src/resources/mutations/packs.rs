@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::pack::{self, ContentHash, PackItem, PackItemKind};
+use crate::library::{PackAuthority, OPERATOR_ONLY_PACK_ACT};
 use crate::orchestrator::Orchestrator;
 use crate::services::{RealFileSystem, RealGitClient};
 use crate::workspace::bundle::{sync_one_pack, sync_resolved_pack, uninstall_pack};
@@ -355,12 +356,15 @@ pub fn export_agent_plugin(
 ///
 /// Reset is deliberately distinct from restoring a removed item: it requires a
 /// live fork, and it is the only operation that may remove a workspace MCP
-/// shadow in favor of the pack definition.
+/// shadow in favor of the pack definition. Resetting a machine service puts the
+/// shipped declaration back in force, so it is the operator's, like installing
+/// one.
 pub fn reset_pack_item(
     orch: &Orchestrator,
     pack_id: &str,
     kind: PackItemKind,
     item_id: &str,
+    authority: PackAuthority,
 ) -> Result<PackMutationResult, String> {
     let mut lock = pack::lock::read_lock(&orch.config_dir, pack_id)
         .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
@@ -373,6 +377,12 @@ pub fn reset_pack_item(
         return Err(format!(
             "Pack `{pack_id}` does not currently ship {} `{item_id}`",
             kind.as_str()
+        ));
+    }
+    if kind == PackItemKind::Service && authority != PackAuthority::Operator {
+        return Err(machine_service_refusal(
+            &format!("Resetting machine service `{pack_id}/{item_id}` to the shipped version"),
+            pack_id,
         ));
     }
     let item = lock.item(kind, item_id).cloned().ok_or_else(|| {
@@ -621,7 +631,7 @@ fn library_offer(
 fn update_library_pack(
     orch: &Orchestrator,
     lock: &pack::PackLock,
-    authority: crate::library::UpdateAuthority,
+    authority: PackAuthority,
 ) -> Result<PackMutationResult, String> {
     let url = lock.source.url.as_deref().unwrap_or_default();
     let source = orch.library.source_for_url(url).cloned().ok_or_else(|| {
@@ -655,7 +665,7 @@ fn update_library_pack(
     })?;
     match crate::library::pending_update(&orch.config_dir, lock, entry) {
         crate::library::PendingUpdate::NeedsReview(changes)
-            if authority != crate::library::UpdateAuthority::Operator =>
+            if authority != PackAuthority::Operator =>
         {
             let what = changes
                 .iter()
@@ -665,8 +675,7 @@ fn update_library_pack(
             return Err(format!(
                 "Pack `{}`'s update {} ({what}), so only the operator may apply it, from the \
                  Library page in Settings. Updates that change only content apply on their own.",
-                lock.id,
-                crate::library::OPERATOR_ONLY_UPDATE
+                lock.id, OPERATOR_ONLY_PACK_ACT
             ));
         }
         crate::library::PendingUpdate::UpToDate => {
@@ -724,7 +733,58 @@ fn source_dir(orch: &Orchestrator) -> Result<std::path::PathBuf, String> {
     })
 }
 
-/// Install, update, or restore one pack.
+/// The refusal for an agent's act that would put a native machine service's
+/// declaration in force; `act` is the sentence's subject.
+fn machine_service_refusal(act: &str, pack_id: &str) -> String {
+    format!(
+        "{act} {OPERATOR_ONLY_PACK_ACT}: a machine service runs on a selected machine as a \
+         resident, outside any fence, so only the operator may put it in place, from the \
+         Library page in Settings. Nothing in pack `{pack_id}` was changed."
+    )
+}
+
+/// Refuse an install, update, or restore of a pack that ships a native machine
+/// service unless the operator asked. Only bundled packs can carry one (every
+/// other source drops services when its manifest resolves), so this asks what
+/// the pack would materialize from the bundle.
+fn require_operator_for_machine_services(
+    manifest: &pack::PackManifest,
+    action: &str,
+    authority: PackAuthority,
+) -> Result<(), String> {
+    if authority == PackAuthority::Operator {
+        return Ok(());
+    }
+    let services: Vec<String> = manifest
+        .items()
+        .into_iter()
+        .filter(|item| item.kind == PackItemKind::Service)
+        .map(|item| format!("{}/{}", manifest.id, item.id))
+        .collect();
+    if services.is_empty() {
+        return Ok(());
+    }
+    let verb = match action {
+        "install" => "Installing",
+        "restore" => "Restoring",
+        _ => "Updating",
+    };
+    let noun = if services.len() == 1 {
+        "machine service"
+    } else {
+        "machine services"
+    };
+    Err(machine_service_refusal(
+        &format!(
+            "{verb} pack `{}`, which carries the native {noun} {},",
+            manifest.id,
+            services.join(", ")
+        ),
+        &manifest.id,
+    ))
+}
+
+/// Install, update, or restore one pack, as an agent.
 ///
 /// Emits the registry change only after the filesystem, lock, and Git work has
 /// succeeded, so a failed action never invalidates a caller's view of a
@@ -734,21 +794,17 @@ pub fn apply_pack_action(
     action: &str,
     pack_id: &str,
 ) -> Result<PackMutationResult, String> {
-    apply_pack_action_as(
-        orch,
-        action,
-        pack_id,
-        crate::library::UpdateAuthority::Agent,
-    )
+    apply_pack_action_as(orch, action, pack_id, PackAuthority::Agent)
 }
 
 /// [`apply_pack_action`] for a caller whose authority the transport has
-/// established. Only an update can need it.
+/// established. A library update that changes what runs, and any act on a
+/// pack that ships a native machine service, needs the operator.
 pub fn apply_pack_action_as(
     orch: &Orchestrator,
     action: &str,
     pack_id: &str,
-    authority: crate::library::UpdateAuthority,
+    authority: PackAuthority,
 ) -> Result<PackMutationResult, String> {
     let lock = pack::lock::read_lock(&orch.config_dir, pack_id);
     match (action, &lock) {
@@ -779,10 +835,15 @@ pub fn apply_pack_action_as(
     // still intact — otherwise the reachable "installed pack whose shipped
     // source is gone" case clears the user's removal markers and then fails.
     let resource_dir = source_dir(orch)?;
-    if pack::available_pack(&resource_dir, pack_id).is_none() {
+    let Some(shipped) = pack::available_pack(&resource_dir, pack_id) else {
         return Err(format!(
             "No pack `{pack_id}` is shipped in {resource_dir:?}"
         ));
+    };
+    // Ahead of the restore below for the same reason: a refusal must leave the
+    // lock, and the removal records in it, untouched.
+    if matches!(action, "install" | "update" | "restore") {
+        require_operator_for_machine_services(&shipped, action, authority)?;
     }
 
     let previous_lock = pack::lock::read_lock(&orch.config_dir, pack_id);
@@ -1041,7 +1102,9 @@ pub fn apply_pack_item_removal(
 }
 
 /// The `cairn://packs/{id}` patch arm: read the action off the payload and run
-/// the same function the settings command runs.
+/// the same function the settings command runs. A resource write carries no
+/// operator credential, so it always acts as an agent; an act that needs the
+/// operator is refused naming the Library page, where the operator makes it.
 pub(super) fn dispatch_pack_action(
     orch: &Orchestrator,
     payload: &serde_json::Value,
@@ -1060,7 +1123,7 @@ pub(super) fn dispatch_pack_action(
             .ok_or("payload.itemId is required for reset-item")?;
         let kind =
             PackItemKind::parse(kind).ok_or_else(|| format!("Unknown pack item kind `{kind}`"))?;
-        reset_pack_item(orch, pack_id, kind, item_id)
+        reset_pack_item(orch, pack_id, kind, item_id, PackAuthority::Agent)
     } else {
         apply_pack_action(orch, action, pack_id)
     }
@@ -1294,13 +1357,30 @@ mod tests {
         );
         let before = seed_catalogs(&ws);
 
-        reset_pack_item(&ws.orch, "matlab", PackItemKind::Mcp, "matlab").unwrap();
+        reset_pack_item(
+            &ws.orch,
+            "matlab",
+            PackItemKind::Mcp,
+            "matlab",
+            PackAuthority::Agent,
+        )
+        .unwrap();
 
         assert_workspace_catalog_withdrawn(&ws, &before);
         assert!(
             !crate::config::mcp_servers::load_settings_mcp_servers(&ws.home).contains_key("matlab")
         );
         assert!(pack::mcp::load_pack_mcp_servers(&ws.home).contains_key("matlab"));
+    }
+
+    /// The fixture's `core` ships the probe service, so acting on it is the
+    /// operator's.
+    fn as_operator(
+        ws: &Workspace,
+        action: &str,
+        pack_id: &str,
+    ) -> Result<PackMutationResult, String> {
+        apply_pack_action_as(&ws.orch, action, pack_id, PackAuthority::Operator)
     }
 
     fn pack_events(ws: &Workspace) -> usize {
@@ -1367,7 +1447,7 @@ mod tests {
         apply_pack_item_removal(&ws.orch, "core", PackItemKind::Service, "probe").unwrap();
         assert!(selected_on(&ws, &key).is_empty(), "overrides included");
 
-        apply_pack_action(&ws.orch, "restore", "core").unwrap();
+        as_operator(&ws, "restore", "core").unwrap();
         assert!(ws.home.join("services/probe/service.yaml").exists());
         assert!(selected_on(&ws, &key).is_empty(), "restore selects nothing");
 
@@ -1375,7 +1455,7 @@ mod tests {
         apply_pack_delete(&ws.orch, "core").unwrap();
         assert!(selected_on(&ws, &key).is_empty());
 
-        apply_pack_action(&ws.orch, "install", "core").unwrap();
+        as_operator(&ws, "install", "core").unwrap();
         assert!(
             selected_on(&ws, &key).is_empty(),
             "reinstall selects nothing"
@@ -1408,7 +1488,7 @@ mod tests {
             "id: solo\nname: Solo\nversion: 1.0.0\n",
         );
         write(&solo.join("services/solo/service.yaml"), PROBE_SERVICE);
-        apply_pack_action(&ws.orch, "install", "solo").unwrap();
+        as_operator(&ws, "install", "solo").unwrap();
 
         let candidate = |name: &str, target: &str| MachineCandidate {
             name: name.to_string(),
@@ -1568,8 +1648,11 @@ mod tests {
         );
 
         // A restore per pack brings every one of them back, materialized.
-        for pack_id in ["core", "matlab"] {
-            let restored = apply_pack_action(&ws.orch, "restore", pack_id).unwrap();
+        // `core` ships the probe service, so its restore is the operator's.
+        for restored in [
+            as_operator(&ws, "restore", "core").unwrap(),
+            apply_pack_action(&ws.orch, "restore", "matlab").unwrap(),
+        ] {
             assert!(!restored.restored_items.is_empty());
         }
         for path in [
@@ -1641,7 +1724,7 @@ mod tests {
                 item_state(&ws, "search-fixture", kind.as_str(), id),
                 Some(PackItemState::EditedByUser)
             );
-            reset_pack_item(&ws.orch, "search-fixture", kind, id).unwrap();
+            reset_pack_item(&ws.orch, "search-fixture", kind, id, PackAuthority::Agent).unwrap();
             assert_eq!(std::fs::read_to_string(&installed).unwrap(), original);
             assert_eq!(
                 item_state(&ws, "search-fixture", kind.as_str(), id),
@@ -1735,7 +1818,14 @@ mod tests {
         assert_eq!(skill.files[0].path, "skills/example/notes.md");
         assert_eq!(skill.files[0].shipped, None);
 
-        reset_pack_item(&ws.orch, "core", PackItemKind::Agent, "explore").unwrap();
+        reset_pack_item(
+            &ws.orch,
+            "core",
+            PackItemKind::Agent,
+            "explore",
+            PackAuthority::Agent,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(ws.home.join("agents/explore.md")).unwrap(),
             "bundle agent\n"
@@ -1767,7 +1857,7 @@ mod tests {
         apply_pack_item_removal(&ws.orch, "core", PackItemKind::Route, "ping").unwrap();
         assert_eq!(cached(&ws), 0, "a removed route must stop matching at once");
 
-        apply_pack_action(&ws.orch, "restore", "core").unwrap();
+        as_operator(&ws, "restore", "core").unwrap();
         assert_eq!(cached(&ws), 1, "a restored route must match at once");
     }
 
@@ -1830,7 +1920,7 @@ mod tests {
             &source_pack(&ws.resources, "core").join("agents/explore.md"),
             "shipped v2\n",
         );
-        let result = apply_pack_action(&ws.orch, "update", "core").unwrap();
+        let result = as_operator(&ws, "update", "core").unwrap();
 
         assert_eq!(result.action, "update");
         assert_eq!(
@@ -1881,8 +1971,14 @@ mod tests {
     async fn a_successful_mutation_emits_one_pack_change_and_a_failure_emits_none() {
         let ws = workspace().await;
 
+        // `matlab` ships no machine service, so an agent installs, updates,
+        // and restores it exactly as the operator would.
         apply_pack_action(&ws.orch, "install", "matlab").unwrap();
         assert_eq!(pack_events(&ws), 1);
+        apply_pack_action(&ws.orch, "update", "matlab").unwrap();
+        apply_pack_item_removal(&ws.orch, "matlab", PackItemKind::Mcp, "matlab").unwrap();
+        apply_pack_action(&ws.orch, "restore", "matlab").unwrap();
+        assert_eq!(pack_events(&ws), 4);
 
         assert!(
             apply_pack_action(&ws.orch, "install", "matlab").is_err(),
@@ -1893,10 +1989,94 @@ mod tests {
         assert!(
             apply_pack_item_removal(&ws.orch, "core", PackItemKind::Agent, "nonexistent").is_err()
         );
-        assert_eq!(pack_events(&ws), 1, "a failed mutation emits nothing");
+        assert_eq!(pack_events(&ws), 4, "a failed mutation emits nothing");
 
         apply_pack_delete(&ws.orch, "matlab").unwrap();
-        assert_eq!(pack_events(&ws), 2);
+        assert_eq!(pack_events(&ws), 5);
+    }
+
+    /// A machine service runs on a selected machine as a resident outside any
+    /// fence, so putting its declaration in place is the operator's: an agent's
+    /// install, restore, update, or reset of it is refused with nothing
+    /// written and no event, and the operator's goes through.
+    #[tokio::test]
+    async fn a_pack_that_ships_a_machine_service_is_the_operators_to_put_in_place() {
+        let ws = workspace().await;
+        let solo = source_pack(&ws.resources, "solo");
+        write(
+            &solo.join("cairn-pack.yaml"),
+            "id: solo\nname: Solo\nversion: 1.0.0\n",
+        );
+        write(
+            &solo.join("skills/solo/SKILL.md"),
+            "---\nname: solo\ndescription: Solo.\n---\n",
+        );
+        write(&solo.join("services/solo/service.yaml"), PROBE_SERVICE);
+        let refused = |error: String| {
+            assert!(error.contains(OPERATOR_ONLY_PACK_ACT), "{error}");
+            assert!(error.contains("solo/solo"), "{error}");
+            assert!(error.contains("outside any fence"), "{error}");
+            assert!(
+                error.contains("from the Library page in Settings"),
+                "{error}"
+            );
+        };
+        let events = pack_events(&ws);
+
+        refused(apply_pack_action(&ws.orch, "install", "solo").unwrap_err());
+        assert!(pack::lock::read_lock(&ws.home, "solo").is_none());
+        assert!(!ws.home.join("services/solo").exists());
+        assert!(!ws.home.join("skills/solo").exists());
+        assert_eq!(pack_events(&ws), events, "a refusal emits nothing");
+
+        as_operator(&ws, "install", "solo").unwrap();
+        assert!(ws.home.join("services/solo/service.yaml").is_file());
+
+        refused(apply_pack_action(&ws.orch, "update", "solo").unwrap_err());
+        as_operator(&ws, "update", "solo").unwrap();
+
+        apply_pack_item_removal(&ws.orch, "solo", PackItemKind::Service, "solo").unwrap();
+        let lock = std::fs::read(pack::lock::lock_path(&ws.home, "solo")).unwrap();
+        let events = pack_events(&ws);
+        refused(apply_pack_action(&ws.orch, "restore", "solo").unwrap_err());
+        assert_eq!(
+            std::fs::read(pack::lock::lock_path(&ws.home, "solo")).unwrap(),
+            lock,
+            "a refused restore leaves the removal recorded"
+        );
+        assert!(!ws.home.join("services/solo").exists());
+        assert_eq!(pack_events(&ws), events);
+        as_operator(&ws, "restore", "solo").unwrap();
+        assert!(ws.home.join("services/solo/service.yaml").is_file());
+
+        let declaration = ws.home.join("services/solo/service.yaml");
+        write(&declaration, "name: Mine\n");
+        refused(
+            reset_pack_item(
+                &ws.orch,
+                "solo",
+                PackItemKind::Service,
+                "solo",
+                PackAuthority::Agent,
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&declaration).unwrap(),
+            "name: Mine\n"
+        );
+        reset_pack_item(
+            &ws.orch,
+            "solo",
+            PackItemKind::Service,
+            "solo",
+            PackAuthority::Operator,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&declaration).unwrap(),
+            PROBE_SERVICE
+        );
     }
 
     /// A restore discards the removal records BEFORE the sync that materializes
@@ -2158,8 +2338,8 @@ mod tests {
     // verified by the production verifier against a fixture key.
 
     use crate::config::mcp_servers::NotReady;
+    use crate::library::refresh_library_sources;
     use crate::library::testing::LibraryFixture;
-    use crate::library::{refresh_library_sources, UpdateAuthority, OPERATOR_ONLY_UPDATE};
 
     fn stdio_connector(fixture: &LibraryFixture, id: &str, command: &str) {
         fixture.write(
@@ -2343,7 +2523,7 @@ mod tests {
         );
 
         let error = apply_pack_action(&ws.orch, "update", "acme").unwrap_err();
-        assert!(error.contains(OPERATOR_ONLY_UPDATE), "{error}");
+        assert!(error.contains(OPERATOR_ONLY_PACK_ACT), "{error}");
         assert!(
             error.contains("from the Library page in Settings"),
             "{error}"
@@ -2354,7 +2534,7 @@ mod tests {
             "a refused update writes nothing"
         );
 
-        apply_pack_action_as(&ws.orch, "update", "acme", UpdateAuthority::Operator).unwrap();
+        apply_pack_action_as(&ws.orch, "update", "acme", PackAuthority::Operator).unwrap();
         assert!(mcp_layer(&ws, "acme").contains("acme-mcp-v2"));
         let after = pack_catalog(
             &ws.home,

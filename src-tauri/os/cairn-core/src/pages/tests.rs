@@ -1023,7 +1023,11 @@ async fn a_page_read_carries_a_body_past_the_agent_budget_whole() {
         &orch,
         &McpCallbackRequest {
             tool: "read_batch".to_string(),
-            payload: json!({"paths": ["cairn://p/prj/7"], "include_bodies": true}),
+            payload: json!({
+                "paths": ["cairn://p/prj/7"],
+                "include_bodies": true,
+                "_cairn_origin": cairn_common::protocol::MODEL_FACING_ORIGIN,
+            }),
             ..request()
         },
         &std::sync::Mutex::new(std::collections::HashMap::new()),

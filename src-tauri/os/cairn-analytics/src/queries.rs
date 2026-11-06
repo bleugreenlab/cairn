@@ -112,6 +112,26 @@ pub fn reported_model_column(
     cairn_db::storage::events::columns::reported_model(data)
 }
 
+/// Whether the transcript insert seam stamps `events.account_id` on an event:
+/// the events the token rollup reads (an `assistant` or `result%` turn event,
+/// or one carrying a real cost), the same population the fold's watermark
+/// counts.
+pub fn stamps_account(event_type: &str, cost_usd: Option<f64>) -> bool {
+    event_type == "assistant" || event_type.starts_with("result") || cost_usd.is_some()
+}
+
+/// The `events.account_id` value expression for the transcript insert seam,
+/// given the bound run id and a bound [`stamps_account`] flag: the account the
+/// run's current process was launched on, read in the insert itself.
+/// `runs.account_id` is rewritten at each process launch, before that process
+/// emits anything, so freezing it on the event is what keeps a run that
+/// restarted onto another account attributed per event; a join from the
+/// rollup to `runs.account_id` would give every earlier event the last
+/// account.
+pub fn event_account_sql(run_id_param: usize, stamp_param: usize) -> String {
+    format!("CASE WHEN ?{stamp_param} THEN (SELECT account_id FROM runs WHERE id = ?{run_id_param}) END")
+}
+
 /// Whether one event's prompt (input + cache reads + cache writes) is over
 /// [`LONG_PROMPT_TOKENS`], so a model with a long-prompt tier bills it there.
 /// The threshold is the price table's; see `pricing`'s module doc.
@@ -231,7 +251,10 @@ fn scope_range_params_doubled(scope: &Scope, range: &TimeRange) -> Vec<Value> {
 /// settlement event is not itself a billable token event. The synthetic `id`
 /// is unique per grouped row because all of its components are functionally
 /// determined by the run (fixed at `?1`) plus the grouped hour/session/model/
-/// backend/agent dimensions. The model dimension is the canonical key
+/// backend/agent/account dimensions. The account (`events.account_id`, frozen
+/// on the event when it was stored) is appended only when present, so a row
+/// of events stored before the column existed keeps its original id and stays
+/// unattributed. The model dimension is the canonical key
 /// ([`model_key_expr`]), so it can differ between a run's events only when the
 /// job names no model and the events report different ones. The `long_*`
 /// measures repeat the four components over only the billable events whose own
@@ -244,12 +267,14 @@ fn rollup_insert_sql() -> String {
             agent_config_id, backend, input_tokens, cache_read_tokens,
             cache_create_tokens, output_tokens, thinking_tokens, billable_tokens,
             token_event_count, exact_cost, exact_cost_count, long_input_tokens,
-            long_cache_read_tokens, long_cache_create_tokens, long_output_tokens
+            long_cache_read_tokens, long_cache_create_tokens, long_output_tokens,
+            account_id
         )
         SELECT
             CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
                 COALESCE(e.session_id, '') || ':' || COALESCE({model_key}, '') || ':' ||
-                {backend} || ':' || COALESCE(j.agent_config_id, '') AS id,
+                {backend} || ':' || COALESCE(j.agent_config_id, '') ||
+                COALESCE(':' || e.account_id, '') AS id,
             (e.created_at / 3600) * 3600 AS bucket_start,
             COALESCE(r.project_id, j.project_id) AS project_id,
             e.run_id AS run_id,
@@ -271,7 +296,8 @@ fn rollup_insert_sql() -> String {
             SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.input_tokens, 0) ELSE 0 END),
             SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_read_tokens, 0) ELSE 0 END),
             SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_create_tokens, 0) ELSE 0 END),
-            SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END)
+            SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END),
+            e.account_id AS account_id
         FROM events e
         LEFT JOIN runs r ON r.id = e.run_id
         LEFT JOIN sessions s ON s.id = e.session_id
@@ -286,7 +312,8 @@ fn rollup_insert_sql() -> String {
                  j.node_name,
                  {model_key},
                  j.agent_config_id,
-                 {backend}",
+                 {backend},
+                 e.account_id",
         backend = BACKEND_EXPR,
         billable = BILLABLE_PREDICATE,
         billable_total = BILLABLE_TOTAL,
@@ -465,12 +492,14 @@ fn token_rollup_event_upsert_sql() -> String {
             agent_config_id, backend, input_tokens, cache_read_tokens,
             cache_create_tokens, output_tokens, thinking_tokens, billable_tokens,
             token_event_count, exact_cost, exact_cost_count, long_input_tokens,
-            long_cache_read_tokens, long_cache_create_tokens, long_output_tokens
+            long_cache_read_tokens, long_cache_create_tokens, long_output_tokens,
+            account_id
         )
         SELECT
             CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
                 COALESCE(e.session_id, '') || ':' || COALESCE({model_key}, '') || ':' ||
-                {backend} || ':' || COALESCE(j.agent_config_id, '') AS id,
+                {backend} || ':' || COALESCE(j.agent_config_id, '') ||
+                COALESCE(':' || e.account_id, '') AS id,
             (e.created_at / 3600) * 3600 AS bucket_start,
             COALESCE(r.project_id, j.project_id) AS project_id,
             e.run_id,
@@ -492,7 +521,8 @@ fn token_rollup_event_upsert_sql() -> String {
             CASE WHEN {billable} AND {long} THEN COALESCE(e.input_tokens, 0) ELSE 0 END,
             CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_read_tokens, 0) ELSE 0 END,
             CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_create_tokens, 0) ELSE 0 END,
-            CASE WHEN {billable} AND {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END
+            CASE WHEN {billable} AND {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END,
+            e.account_id
         FROM events e
         LEFT JOIN runs r ON r.id = e.run_id
         LEFT JOIN sessions s ON s.id = e.session_id

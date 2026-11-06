@@ -2351,6 +2351,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "model_requests",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    // cairn/6032: the usage-window time series of this install's provider
+    // accounts. The accounts and their credentials are this install's.
+    (
+        "usage_window_readings",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     ("check_result_cache", TableScope::ProjectScoped),
     // CAIRN-4665: the durable record of which execution stopped owning an
     // issue's attempt, and the work item that interrupts its surviving agents.

@@ -92,10 +92,11 @@ pub struct EventExtras {
     pub reported_model: Option<String>,
     pub change_preview_status: Option<String>,
     pub change_applied_at: Option<i64>,
+    pub account_id: Option<String>,
 }
 
-const EXTRA_COLUMNS: &str = "reported_model, change_preview_status, change_applied_at";
-const EXTRA_COLUMN_COUNT: usize = 3;
+const EXTRA_COLUMNS: &str = "reported_model, change_preview_status, change_applied_at, account_id";
+const EXTRA_COLUMN_COUNT: usize = 4;
 
 /// One event as a reader sees it.
 #[derive(Debug, Clone)]
@@ -1774,6 +1775,7 @@ impl HotRow {
                 reported_model: row.opt_text(offset + EVENT_COLUMN_COUNT)?,
                 change_preview_status: row.opt_text(offset + EVENT_COLUMN_COUNT + 1)?,
                 change_applied_at: row.opt_i64(offset + EVENT_COLUMN_COUNT + 2)?,
+                account_id: row.opt_text(offset + EVENT_COLUMN_COUNT + 3)?,
             },
         })
     }
@@ -1813,6 +1815,7 @@ fn extras_from_row(row: &turso::Row) -> DbResult<EventExtras> {
         reported_model: row.opt_text(EVENT_COLUMN_COUNT)?,
         change_preview_status: row.opt_text(EVENT_COLUMN_COUNT + 1)?,
         change_applied_at: row.opt_i64(EVENT_COLUMN_COUNT + 2)?,
+        account_id: row.opt_text(EVENT_COLUMN_COUNT + 3)?,
     })
 }
 

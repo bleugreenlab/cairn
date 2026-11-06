@@ -183,15 +183,22 @@ async fn insert_event_at_conn(
         event.parent_tool_use_id.as_deref(),
         &event.data,
     );
+    // The account serving the run, frozen on the events the rollup reads; see
+    // `event_account_sql`.
+    let stamps_account =
+        cairn_analytics::queries::stamps_account(&event.event_type, event.cost_usd);
     let count = conn
         .execute(
-            "INSERT INTO events(
+            &format!(
+                "INSERT INTO events(
                 id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd,
-                reported_model
+                reported_model, account_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, {account})",
+                account = cairn_analytics::queries::event_account_sql(2, 18)
+            ),
             params![
                 event.id.as_str(),
                 event.run_id.as_str(),
@@ -209,7 +216,8 @@ async fn insert_event_at_conn(
                 event.thinking_tokens,
                 event.turn_id.as_deref(),
                 event.cost_usd,
-                reported_model.as_deref()
+                reported_model.as_deref(),
+                i64::from(stamps_account)
             ],
         )
         .await?;

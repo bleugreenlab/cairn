@@ -418,6 +418,7 @@ async fn a_pack_states_every_section_and_counts_what_it_read() {
         "reported_model",
         "change_preview_status",
         "change_applied_at",
+        "account_id",
     ] {
         assert!(live.contains(&column), "{column} is packed");
     }

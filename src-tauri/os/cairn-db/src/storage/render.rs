@@ -135,6 +135,18 @@ pub enum ReadBudget {
     Whole { byte_ceiling: usize },
 }
 
+/// The most one target of a [`ReadBudget::Whole`] read may render, in bytes:
+/// the bound every reader whose body is parsed by code shares (a page's bridged
+/// read, the database browser, the CLI, `@cairn/sdk` scripts and services).
+///
+/// No model context is at stake there, so this bounds only what one response
+/// holds in memory and serializes. Row caps bound a read's row count, not a
+/// row's width; the largest plausible target is a full 1000-row page of a wide
+/// table (the row grammar's own cap), which this carries at 8 KiB a row. A
+/// target past it is refused in place, so the reader narrows its rows or
+/// columns and reads in parts.
+pub const WHOLE_READ_BYTE_CEILING: usize = 8 << 20;
+
 /// Counts bytes as tokens. The whole-read composer's meter, where nothing is
 /// cut and counting only has to be cheap, and the tests' deterministic one.
 pub(crate) struct ByteMeter;
@@ -1478,7 +1490,7 @@ fn assemble_whole(
                 return rendered;
             }
             let refusal = format!(
-                "{} renders {} bytes, more than the {byte_ceiling}-byte ceiling a whole read carries for one target. It is refused rather than cut, because a cut body is not the answer it claims to be (cut JSON does not parse). Narrow the read, for example with a smaller `limit`, a `path`, or a line range, and read it in parts.",
+                "{} renders {} bytes, more than the {byte_ceiling}-byte ceiling a whole read carries for one target. It is refused rather than cut, because a cut body is not the answer it claims to be (cut JSON does not parse). Narrow the read and take it in parts: fewer rows (a smaller `limit`), fewer columns (a `?sql=` that selects only the ones needed), a `path`, or a line range.",
                 bounded_uri_label(&rendered.meta.uri),
                 rendered.text.len(),
             );

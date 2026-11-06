@@ -31,6 +31,7 @@ pub mod plan_audit;
 pub mod quarantine;
 pub mod render;
 pub mod served_api;
+pub mod usage_readings;
 
 /// Normalized team identifier. Defined here (rather than reaching up into
 /// cairn-core's `db` module) so `content_store` and `local_db` can name it

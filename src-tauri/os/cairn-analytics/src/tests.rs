@@ -2910,14 +2910,18 @@ async fn seam_insert(db: &LocalDb, ev: EventInsert) {
                 ev.parent_tool_use_id.as_deref(),
                 &ev.data,
             );
+            let stamps_account = queries::stamps_account(&ev.event_type, ev.cost_usd);
             let count = conn
                 .execute(
-                    "INSERT INTO events(
+                    &format!(
+                        "INSERT INTO events(
                     id, run_id, session_id, sequence, timestamp, event_type, data,
                     parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                     cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd,
-                    reported_model
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    reported_model, account_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, {account})",
+                        account = queries::event_account_sql(2, 18)
+                    ),
                     params![
                         ev.id.as_str(),
                         ev.run_id.as_str(),
@@ -2935,7 +2939,8 @@ async fn seam_insert(db: &LocalDb, ev: EventInsert) {
                         ev.thinking_tokens,
                         ev.turn_id.as_deref(),
                         ev.cost_usd,
-                        reported_model.as_deref()
+                        reported_model.as_deref(),
+                        i64::from(stamps_account)
                     ],
                 )
                 .await?;
@@ -3754,6 +3759,126 @@ async fn a_model_less_job_is_attributed_from_its_selection_then_its_reported_mod
     );
     refold(&db).await;
     assert_eq!(rollup_models(&db).await, expected, "after a re-fold");
+}
+
+/// `(account_id, billable_tokens)` per rollup account.
+async fn rollup_accounts(db: &LocalDb) -> Vec<(Option<String>, i64)> {
+    db.query_all(
+        "SELECT account_id, SUM(billable_tokens) FROM token_rollup
+         GROUP BY account_id ORDER BY account_id",
+        (),
+        |row| Ok((row.opt_text(0)?, row.i64(1)?)),
+    )
+    .await
+    .unwrap()
+}
+
+async fn set_run_account(db: &LocalDb, suffix: &str, account: &str) {
+    db.execute(
+        "UPDATE runs SET account_id = ?1 WHERE id = ?2",
+        (account.to_string(), format!("run-{suffix}")),
+    )
+    .await
+    .unwrap();
+}
+
+async fn event_accounts(db: &LocalDb, suffix: &str) -> Vec<(String, Option<String>)> {
+    db.query_all(
+        "SELECT id, account_id FROM events WHERE run_id = ?1 ORDER BY sequence",
+        (format!("run-{suffix}"),),
+        |row| Ok((row.text(0)?, row.opt_text(1)?)),
+    )
+    .await
+    .unwrap()
+}
+
+/// A subscription session's billable events carry the account its run was
+/// launched on, into the rollup both live and after a re-fold. Events the
+/// rollup does not read are not stamped.
+#[tokio::test]
+async fn billable_events_are_attributed_to_the_serving_account() {
+    let db = cost_db().await;
+    seed_job(
+        &db,
+        "sub",
+        "NULL",
+        r#"'{"chosen":{"backend":"claude","model":"Sonnet","account":"acct-a"}}'"#,
+    )
+    .await;
+    set_run_account(&db, "sub", "acct-a").await;
+
+    seam_insert(&db, assistant("a1", "sub", 1, 100, 10, "{}")).await;
+    let mut user = assistant("u1", "sub", 2, 110, 0, "{}");
+    user.event_type = "user".to_string();
+    seam_insert(&db, user).await;
+    seam_insert(&db, assistant("a2", "sub", 3, 120, 5, "{}")).await;
+
+    assert_eq!(
+        event_accounts(&db, "sub").await,
+        vec![
+            ("a1".to_string(), Some("acct-a".to_string())),
+            ("u1".to_string(), None),
+            ("a2".to_string(), Some("acct-a".to_string())),
+        ]
+    );
+    let expected = vec![(Some("acct-a".to_string()), 15)];
+    assert_eq!(
+        rollup_accounts(&db).await,
+        expected,
+        "through the insert seam"
+    );
+    let incremental = dump_rollup(&db).await;
+    assert_eq!(
+        incremental[0].0,
+        "0:run-sub:sess-sub:sonnet:claude:thread:acct-a"
+    );
+    refold(&db).await;
+    assert_eq!(rollup_accounts(&db).await, expected, "after a re-fold");
+    assert_eq!(incremental, dump_rollup(&db).await);
+}
+
+/// A run that restarted onto another account mid-run splits its spend between
+/// the two, and a re-fold reproduces the split: each event keeps the account
+/// it was served by, not the run's latest.
+#[tokio::test]
+async fn a_mid_run_account_change_splits_the_rollup() {
+    let db = cost_db().await;
+    seed_job(&db, "mv", "'sonnet'", "NULL").await;
+    set_run_account(&db, "mv", "acct-a").await;
+    seam_insert(&db, assistant("m1", "mv", 1, 100, 10, "{}")).await;
+    seam_insert(&db, assistant("m2", "mv", 2, 110, 20, "{}")).await;
+    set_run_account(&db, "mv", "acct-b").await;
+    seam_insert(&db, assistant("m3", "mv", 3, 120, 40, "{}")).await;
+
+    let expected = vec![
+        (Some("acct-a".to_string()), 30),
+        (Some("acct-b".to_string()), 40),
+    ];
+    assert_eq!(
+        rollup_accounts(&db).await,
+        expected,
+        "through the insert seam"
+    );
+    let incremental = dump_rollup(&db).await;
+    refold(&db).await;
+    assert_eq!(rollup_accounts(&db).await, expected, "after a re-fold");
+    assert_eq!(incremental, dump_rollup(&db).await);
+}
+
+/// Events with no account (stored before the column existed, or on a run that
+/// recorded none) keep the rollup id they always had and stay unattributed
+/// through a re-fold.
+#[tokio::test]
+async fn unattributed_events_keep_their_rollup_id() {
+    let db = cost_db().await;
+    seed_job(&db, "leg", "'sonnet'", "NULL").await;
+    seam_insert(&db, assistant("l1", "leg", 1, 100, 7, "{}")).await;
+    let expected_id = "0:run-leg:sess-leg:sonnet:claude:thread".to_string();
+    assert_eq!(dump_rollup(&db).await[0].0, expected_id);
+    assert_eq!(rollup_accounts(&db).await, vec![(None, 7)]);
+    refold(&db).await;
+    assert_eq!(dump_rollup(&db).await[0].0, expected_id);
+    assert_eq!(rollup_accounts(&db).await, vec![(None, 7)]);
 }
 
 /// Events stored before `events.reported_model` existed are attributed by the

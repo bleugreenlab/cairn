@@ -271,6 +271,12 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "rows older than MODEL_REQUEST_RETENTION_MS (90 days), on each insert",
     ),
     owned_by(
+        "usage_window_readings",
+        "cairn-db storage::usage_readings",
+        "rows older than 60 days and outside the last 8 resets per (account, window), pruned on each insert",
+    )
+    .budget(32),
+    owned_by(
         "response_invocations",
         "cairn-db storage::response_invocations",
         "newest RESPONSE_INVOCATION_RETENTION per response",

@@ -58,7 +58,7 @@
 //! # Token rollup
 //!
 //! The `events` section carries every live column, the token columns,
-//! `cost_usd`, the model columns and `reported_model` among them, frozen as of
+//! `cost_usd`, the model columns, `reported_model` and `account_id` among them, frozen as of
 //! pack time. The `token_rollup` fold reads those columns from hot rows, so once
 //! an execution is evicted its runs cannot be re-folded: before C2 evicts, it
 //! must mark tiered runs as not re-foldable and keep their rollups, or a
@@ -101,7 +101,7 @@ pub const FRAME_ROWS: usize = RECONSTRUCT_BATCH_ROWS;
 pub const FRAME_RAW_BYTES: usize = RECONSTRUCT_BATCH_BYTES;
 
 /// The note every manifest carries on what eviction costs the token rollup.
-pub const TOKEN_ROLLUP_NOTE: &str = "the events section carries every token column, cost_usd, the model columns and reported_model as of pack time; once evicted these runs cannot be re-folded, so their token_rollup rows must be kept";
+pub const TOKEN_ROLLUP_NOTE: &str = "the events section carries every token column, cost_usd, the model columns, reported_model and account_id as of pack time; once evicted these runs cannot be re-folded, so their token_rollup rows must be kept";
 
 /// A packed table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -632,6 +632,7 @@ pub fn decode_event_row(object: &Map<String, Json>) -> Result<HistoryRow, PackEr
             reported_model: opt_text("reported_model"),
             change_preview_status: opt_text("change_preview_status"),
             change_applied_at: opt_int("change_applied_at"),
+            account_id: opt_text("account_id"),
         },
     })
 }

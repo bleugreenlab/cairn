@@ -563,17 +563,6 @@ async fn statement_tables(db: &LocalDb, sql: &str) -> Result<Vec<String>, PageCa
     Ok(referenced_tables(sql, &catalog))
 }
 
-/// The most one target of a page read may render, in bytes.
-///
-/// A page read lands in a frame that parses it, not in a model's context, so it
-/// carries every target whole rather than under the agent read budget; this
-/// ceiling bounds only what one response holds in memory and serializes (twice,
-/// with `include_bodies`). [`PAGE_ROW_CAP`] bounds the row count, not a row's
-/// width: 200 rows whose text columns are long (issue descriptions, comment
-/// bodies) can still run to megabytes, and a target past this is refused in
-/// place rather than cut, so the page narrows its columns or its window.
-pub(crate) const PAGE_READ_BYTE_CEILING: usize = 8 << 20;
-
 /// Run the batch as the owner would: deictics already expanded, no run id,
 /// every target whole up to `byte_ceiling` and refused past it.
 pub(crate) async fn dispatch_as_owner(
@@ -714,7 +703,7 @@ pub async fn page_read(
         orch,
         &targets,
         request.include_bodies,
-        PAGE_READ_BYTE_CEILING,
+        crate::storage::render::WHOLE_READ_BYTE_CEILING,
     )
     .await;
     let envelope = match envelope_or_error(&raw) {

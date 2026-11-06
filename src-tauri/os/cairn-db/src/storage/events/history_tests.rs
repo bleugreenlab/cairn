@@ -147,6 +147,7 @@ async fn every_outcome_and_label_survives_the_pack() {
                 reported_model: Some("claude-opus-5-5".to_string()),
                 change_preview_status: Some("applied".to_string()),
                 change_applied_at: Some(99),
+                account_id: Some("acct-a".to_string()),
             }
         );
 

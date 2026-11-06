@@ -454,7 +454,12 @@ async fn live_read_batch_round_trips_through_archival() {
                 cwd: clone.display().to_string(),
                 run_id: None,
                 tool: "read_batch".to_string(),
-                payload: json!({ "paths": paths }),
+                // The archived result is a model's tool result, read under its
+                // context budget.
+                payload: json!({
+                    "paths": paths,
+                    "_cairn_origin": cairn_common::protocol::MODEL_FACING_ORIGIN,
+                }),
                 tool_use_id: None,
                 origin: None,
             };

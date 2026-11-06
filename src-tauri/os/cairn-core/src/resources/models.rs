@@ -58,7 +58,7 @@ const INDEX: &[(&str, &str)] = &[
     ),
     (
         "cairn://models/usage",
-        "each provider's capacity per account and pooled, as Settings → Analytics shows it",
+        "each provider's capacity per account and pooled, as Settings → Analytics shows it; ?history=<account> lists that account's recorded window readings over time",
     ),
     (
         "cairn://models/spend",
@@ -1995,9 +1995,178 @@ fn render_requests(
     out
 }
 
+/// What `cairn://models/usage?history=<account>` asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsageHistoryQuery {
+    pub account: String,
+    pub window: Option<String>,
+    pub json: bool,
+    pub hours: Option<u32>,
+}
+
+impl UsageHistoryQuery {
+    /// The earliest `captured_at` the query reads, given the current time.
+    pub fn since(&self, now: i64) -> Option<i64> {
+        self.hours.map(|hours| now - i64::from(hours) * 3600)
+    }
+}
+
+/// Rows shown per window in the markdown history; JSON returns them all.
+const USAGE_HISTORY_ROWS_SHOWN: usize = 500;
+
+/// Parse a usage-history read, or `None` when the read is not one (no
+/// `history` key), so the caller renders the card instead.
+pub(crate) fn usage_history_query(
+    params: &[QueryParam],
+) -> Option<Result<UsageHistoryQuery, String>> {
+    const URI: &str = "cairn://models/usage?history=ACCOUNT";
+    let account = find_query_value(params, "history")?;
+    if let Some(error) = unsupported(URI, params, &["history", "window", "format", "hours"]) {
+        return Some(Err(error));
+    }
+    if account.is_empty() {
+        return Some(Err(
+            "history names an account id (see cairn://models/accounts).".to_string(),
+        ));
+    }
+    let json = match find_query_value(params, "format") {
+        None | Some("markdown") => false,
+        Some("json") => true,
+        Some(other) => {
+            return Some(Err(format!(
+                "Unknown format '{other}' for usage history; expected markdown or json."
+            )))
+        }
+    };
+    let hours = match find_query_value(params, "hours") {
+        None => None,
+        Some(hours) => match hours.parse::<u32>() {
+            Ok(hours) if hours > 0 => Some(hours),
+            _ => {
+                return Some(Err(format!(
+                    "hours must be a positive whole number (got '{hours}')."
+                )))
+            }
+        },
+    };
+    Some(Ok(UsageHistoryQuery {
+        account: account.to_string(),
+        window: find_query_value(params, "window").map(str::to_string),
+        json,
+        hours,
+    }))
+}
+
+/// An account's recorded usage-window readings, grouped by window.
+pub(crate) fn render_usage_history(
+    query: &UsageHistoryQuery,
+    rows: &[cairn_db::storage::usage_readings::UsageWindowReadingRow],
+) -> String {
+    if query.json {
+        let readings: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "provider": row.provider,
+                    "windowId": row.window_id,
+                    "windowName": row.window_name,
+                    "scope": row.scope,
+                    "scopeTarget": row.scope_target,
+                    "remainingPercent": row.remaining_percent,
+                    "windowDurationMins": row.window_duration_mins,
+                    "resetsAt": row.resets_at,
+                    "capturedAt": row.captured_at,
+                    "source": row.source,
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "account": query.account,
+            "window": query.window,
+            "readings": readings,
+        }))
+        .unwrap_or_default();
+    }
+    let mut out = format!("# Usage history: {}\n\n", query.account);
+    let span = query.hours.map_or_else(
+        || "all retained readings".to_string(),
+        |hours| format!("the last {hours}h"),
+    );
+    let _ = writeln!(
+        out,
+        "Each usage refresh that changed a window, {span}{}. Readings are kept for the last 8 resets or 60 days, whichever is longer.\n",
+        query
+            .window
+            .as_deref()
+            .map(|window| format!(", window `{window}`"))
+            .unwrap_or_default()
+    );
+    if rows.is_empty() {
+        out.push_str("No usage readings recorded for this account yet. A reading is written each time a usage refresh measures it; see cairn://models/accounts.\n");
+        return out;
+    }
+    let mut windows: Vec<(
+        (&str, &str, &str),
+        Vec<&cairn_db::storage::usage_readings::UsageWindowReadingRow>,
+    )> = Vec::new();
+    for row in rows {
+        let key = (
+            row.window_name.as_str(),
+            row.window_id.as_str(),
+            row.provider.as_str(),
+        );
+        match windows.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, group)) => group.push(row),
+            None => windows.push((key, vec![row])),
+        }
+    }
+    windows.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((name, id, provider), group) in windows {
+        let _ = writeln!(out, "## {name} (`{id}`, {provider})\n");
+        let shown = &group[group.len().saturating_sub(USAGE_HISTORY_ROWS_SHOWN)..];
+        if shown.len() < group.len() {
+            let _ = writeln!(
+                out,
+                "Showing the newest {} of {} readings; format=json returns all of them.\n",
+                shown.len(),
+                group.len()
+            );
+        }
+        out.push_str(
+            "| Captured | Remaining | Resets at | Duration | Source |\n|---|---|---|---|---|\n",
+        );
+        for row in shown {
+            let _ = writeln!(
+                out,
+                "| {} | {}% | {} | {} | {} |",
+                when(row.captured_at),
+                row.remaining_percent,
+                row.resets_at.map_or_else(|| "—".to_string(), when),
+                row.window_duration_mins
+                    .map_or_else(|| "—".to_string(), |mins| format!("{mins} min")),
+                row.source
+            );
+        }
+        out.push('\n');
+    }
+    out
+}
+
 pub(crate) fn render_usage(facet: &dyn Models, params: &[QueryParam]) -> String {
     const URI: &str = "cairn://models/usage";
-    if let Some(error) = unsupported(URI, params, &["provider", "view", "client", "hours"]) {
+    if let Some(key) = ["window", "format"]
+        .into_iter()
+        .find(|key| find_query_value(params, key).is_some())
+    {
+        return format!(
+            "{key} reads only with history=<account>, e.g. cairn://models/usage?history=ACCOUNT_ID&window=Opus&format=json (account ids are at cairn://models/accounts)."
+        );
+    }
+    if let Some(error) = unsupported(
+        URI,
+        params,
+        &["provider", "view", "client", "hours", "history"],
+    ) {
         return error;
     }
     let scope = ModelScope::workspace();
@@ -2144,6 +2313,7 @@ mod tests {
         "cairn://models/usage",
         "cairn://models/usage?provider=claude",
         "cairn://models/usage?view=requests",
+        "cairn://models/usage?history=nobody",
         "cairn://models/spend",
         "cairn://models/spend?window=all&format=json",
         "cairn://models/embeddings",
@@ -2733,6 +2903,101 @@ mod tests {
         assert!(
             !out.contains("Exhausted: every account is blocked (every model) until"),
             "{out}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usage_history_lists_an_accounts_readings_per_window() {
+        use cairn_db::storage::usage_readings::{record_usage_readings, UsageReadingInput};
+        let orch = seeded_orchestrator().await;
+        let empty = read(&orch, "cairn://models/usage?history=acct-a").await;
+        assert!(
+            empty.contains("No usage readings recorded for this account yet"),
+            "{empty}"
+        );
+
+        let window =
+            |id: &str, name: &str, target: Option<&str>, remaining: f64| UsageReadingInput {
+                window_id: id.into(),
+                window_name: name.into(),
+                scope: "weekly".into(),
+                scope_target: target.map(str::to_string),
+                remaining_percent: remaining,
+                window_duration_mins: None,
+                resets_at: Some(2_000_000_000),
+            };
+        let now = chrono::Utc::now().timestamp();
+        for (at, remaining) in [(now - 600, 50.0), (now - 300, 45.0)] {
+            record_usage_readings(
+                &orch.db.local,
+                "claude",
+                "acct-a",
+                "claude_usage_oauth",
+                at,
+                vec![
+                    window("weekly_all", "Week", None, remaining + 20.0),
+                    window("weekly_opus-opus", "Opus", Some("Opus"), remaining),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        let page = read(&orch, "cairn://models/usage?history=acct-a").await;
+        assert!(page.contains("# Usage history: acct-a"), "{page}");
+        assert!(
+            page.contains("## Opus (`weekly_opus-opus`, claude)"),
+            "{page}"
+        );
+        assert!(page.contains("## Week (`weekly_all`, claude)"), "{page}");
+        assert!(page.contains("| 45% |"), "{page}");
+        assert!(
+            page.contains("by family name (Session, Week, Opus, 5-hour)"),
+            "the affordance block lists the history keys: {page}"
+        );
+
+        let json = read(
+            &orch,
+            "cairn://models/usage?history=acct-a&window=Opus&format=json",
+        )
+        .await;
+        // The JSON leads the page; the affordance block follows it.
+        let parsed: serde_json::Value = serde_json::Deserializer::from_str(&json)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect(&json)
+            .expect(&json);
+        assert_eq!(parsed["account"], "acct-a");
+        assert_eq!(parsed["window"], "Opus");
+        let readings = parsed["readings"].as_array().unwrap();
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0]["windowId"], "weekly_opus-opus");
+        assert_eq!(readings[0]["windowName"], "Opus");
+        assert_eq!(readings[0]["scopeTarget"], "Opus");
+        assert_eq!(readings[1]["remainingPercent"], 45.0);
+        assert_eq!(readings[1]["source"], "claude_usage_oauth");
+
+        let bounded = read(
+            &orch,
+            "cairn://models/usage?history=acct-a&hours=1&format=json",
+        )
+        .await;
+        assert!(bounded.contains("weekly_all"), "{bounded}");
+
+        let refused = read(&orch, "cairn://models/usage?window=Opus").await;
+        assert!(
+            refused.contains("reads only with history=<account>"),
+            "{refused}"
+        );
+        let refused = read(&orch, "cairn://models/usage?format=json").await;
+        assert!(
+            refused.contains("reads only with history=<account>"),
+            "{refused}"
+        );
+        let refused = read(&orch, "cairn://models/usage?history=acct-a&view=requests").await;
+        assert!(
+            refused.contains("Unsupported query parameter 'view'"),
+            "{refused}"
         );
     }
 

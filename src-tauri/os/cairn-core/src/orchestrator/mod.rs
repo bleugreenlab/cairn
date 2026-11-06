@@ -74,6 +74,7 @@ pub use store_lock::{
     StoreLockClass,
 };
 mod team_attention_push;
+mod usage_readings;
 pub mod usage_refresh;
 pub mod wakes;
 pub mod workflow_configs;
@@ -4226,6 +4227,7 @@ impl Orchestrator {
         else {
             return;
         };
+        self.record_usage_readings(account_id.as_deref(), &stored);
         let _ = self.services.emitter.emit(
             "provider-usage-updated",
             serde_json::json!({
