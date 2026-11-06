@@ -235,6 +235,24 @@ pub(crate) async fn spawn_workflow_process(
             }
             _ => ProcessSandboxMode::CredentialFloor,
         };
+    // The runtime starts wherever acquisition put its environment, which need
+    // not be this runner's machine.
+    let placed = orch.fleet.residency_route_executor(&fence.holder);
+    let routed = match workflow_runtime_env(
+        orch,
+        &fence.holder,
+        placed.as_deref(),
+        secret,
+        &params.run_id,
+        params.args_json,
+        params.output_name,
+    ) {
+        Ok(routed) => routed,
+        Err(error) => {
+            crate::fleet::residency::rollback(orch, &fence, &params.run_id).await;
+            return Err(format!("failed to start workflow process: {error}"));
+        }
+    };
     let result = orch
         .fleet
         .operate_residency(
@@ -269,29 +287,13 @@ pub(crate) async fn spawn_workflow_process(
                     } else {
                         ResidentProcessCwdRoot::ResidencyScratch
                     },
-                    env: vec![
-                        ("CAIRN_RUN_ID".into(), params.run_id.clone()),
-                        ("CAIRN_MCP_SECRET".into(), secret),
-                        (
-                            "CAIRN_CALLBACK_URL".into(),
-                            format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
-                        ),
-                        ("CAIRN_ENV".into(), cairn_common::paths::env_str().into()),
-                        (
-                            "CAIRN_HOME".into(),
-                            cairn_common::paths::cairn_home()
-                                .to_string_lossy()
-                                .into_owned(),
-                        ),
-                        ("CAIRN_WORKFLOW_ARGS".into(), params.args_json),
-                        ("CAIRN_WORKFLOW_OUTPUT".into(), params.output_name),
-                    ],
+                    env: routed.env,
                     sandbox_mode,
                     sandbox_policy: None,
                     runtime_assets: assets,
                     io: ResidentProcessIoMode::Pipe,
                     node_scratch: None,
-                    relay: None,
+                    relay: routed.relay,
                 },
             },
         )
@@ -350,6 +352,56 @@ pub(crate) async fn spawn_workflow_process(
         }
     });
     Ok(())
+}
+
+/// The workflow runtime's environment, routed for the machine `placed` names.
+///
+/// The runtime talks to Cairn only through its callback, so where that callback
+/// goes is the whole question. On this runner's machine it calls the loopback
+/// with the runner's secret. On any other it calls its executor's relay with a
+/// capability minted for this one process, speaking for `run_id`, the way a
+/// terminal or REPL there does; neither the secret nor the loopback leaves this
+/// machine. `CAIRN_HOME` is dropped from a relayed start: it names this
+/// runner's directory, which is no path on the machine the runtime runs on, and
+/// the SDK reads it only to find an on-disk secret that machine does not hold.
+pub(crate) fn workflow_runtime_env(
+    orch: &Orchestrator,
+    holder: &cairn_common::executor_protocol::ResidencyHolder,
+    placed: Option<&str>,
+    secret: String,
+    run_id: &str,
+    args_json: String,
+    output_name: String,
+) -> Result<crate::fleet::residency::RoutedResidentEnv, String> {
+    let env = vec![
+        ("CAIRN_RUN_ID".into(), run_id.to_string()),
+        ("CAIRN_MCP_SECRET".into(), secret),
+        (
+            "CAIRN_CALLBACK_URL".into(),
+            crate::fleet::residency::runner_callback_url(orch),
+        ),
+        ("CAIRN_ENV".into(), cairn_common::paths::env_str().into()),
+        (
+            "CAIRN_HOME".into(),
+            cairn_common::paths::cairn_home()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("CAIRN_WORKFLOW_ARGS".into(), args_json),
+        ("CAIRN_WORKFLOW_OUTPUT".into(), output_name),
+    ];
+    let mut routed = crate::fleet::residency::route_resident_callbacks_on(
+        orch,
+        placed,
+        holder,
+        run_id,
+        Some(run_id),
+        env,
+    )?;
+    if routed.relay.is_some() {
+        routed.env.retain(|(name, _)| name != "CAIRN_HOME");
+    }
+    Ok(routed)
 }
 
 fn workflow_runtime_assets(package: &Path) -> Result<Vec<ResidentRuntimeAsset>, String> {

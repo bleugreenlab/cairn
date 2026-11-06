@@ -1,5 +1,6 @@
 //! The runner's half of the resident-process relay: one context per terminal,
-//! REPL, or service process placed on a machine other than the runner's.
+//! REPL, workflow runtime, or service process placed on a machine other than
+//! the runner's.
 //!
 //! A resident process on a remote cannot reach the runner's loopback callback,
 //! so its executor serves a local URL for that one process and forwards what

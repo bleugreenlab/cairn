@@ -566,7 +566,17 @@ pub(crate) async fn release(orch: &Orchestrator, fence: &ResidencyFence) -> Resu
     .await
 }
 
+/// Undo a process start that did not take: stop the process and release its
+/// residency.
+///
+/// Its relay, if it was given one, is revoked here first. The stop and release
+/// revoke relays only once they are dispatched to a machine, and a start that
+/// failed may have failed because no machine could be reached or because it was
+/// refused before it was sent.
 pub(crate) async fn rollback(orch: &Orchestrator, fence: &ResidencyFence, process_key: &str) {
+    orch.fleet
+        .resident_relays()
+        .revoke_process(&fence.holder, process_key);
     let _ = stop(orch, fence, process_key).await;
     let _ = release(orch, fence).await;
 }
@@ -832,8 +842,8 @@ pub(crate) fn resident_callback(
 const CALLBACK_URL_ENV: &str = "CAIRN_CALLBACK_URL";
 const MCP_SECRET_ENV: &str = "CAIRN_MCP_SECRET";
 
-/// Route a terminal's or REPL's callbacks for the machine its environment is
-/// on. `env` is composed for this machine; for a process on another one, its
+/// Route a terminal's, REPL's or workflow runtime's callbacks for the machine
+/// its environment is on. `env` is composed for this machine; for a process on another one, its
 /// callback address and this runner's secret are taken out, a capability for
 /// this one process speaking for `run_id` is put in, and the grant the
 /// executor relays it under is returned.
@@ -849,7 +859,7 @@ pub(crate) fn route_resident_callbacks(
 }
 
 /// [`route_resident_callbacks`] for a process placed on `placed`.
-fn route_resident_callbacks_on(
+pub(crate) fn route_resident_callbacks_on(
     orch: &Orchestrator,
     placed: Option<&str>,
     holder: &ResidencyHolder,
@@ -1247,6 +1257,104 @@ mod resident_callback_tests {
             assert!(routed.env.contains(&("CAIRN_RUN_ID".into(), "r-1".into())));
             assert_eq!(orch.fleet.resident_relays().len(), index + 1);
         }
+    }
+
+    fn workflow_env(
+        orch: &Orchestrator,
+        placed: Option<&str>,
+    ) -> Result<RoutedResidentEnv, String> {
+        crate::backends::workflow::workflow_runtime_env(
+            orch,
+            &ResidencyHolder::Workflow {
+                run_id: "wf-1".into(),
+            },
+            placed,
+            secret(orch),
+            "wf-1",
+            "{}".into(),
+            "return".into(),
+        )
+    }
+
+    /// A workflow runtime placed on another machine, connected or not, starts
+    /// with a relay and a capability of its own, and carries neither the
+    /// runner's secret, its loopback callback, nor this runner's home path.
+    /// What the runtime itself reads (its run, args and output name) travels.
+    #[tokio::test]
+    async fn a_workflow_placed_on_another_machine_is_relayed_without_the_runners_credentials() {
+        let orch = orchestrator().await;
+        attach(&orch, "machine-b", false);
+        for placed in ["machine-b", "machine-away"] {
+            let routed = workflow_env(&orch, Some(placed)).unwrap();
+            assert!(routed.relay.is_some(), "placed on {placed}");
+            refuse_runner_credentials(&orch, &routed.env).unwrap();
+            let process = ResidentProcessSpec {
+                relay: routed.relay.clone(),
+                ..spec(routed.env.clone())
+            };
+            refuse_unrelayed_runner_secret(false, &process, Some(&secret(&orch))).unwrap();
+            let names: Vec<&str> = routed.env.iter().map(|(name, _)| name.as_str()).collect();
+            assert!(!names.contains(&CALLBACK_URL_ENV), "{names:?}");
+            assert!(!names.contains(&"CAIRN_HOME"), "{names:?}");
+            for kept in [
+                ("CAIRN_RUN_ID", "wf-1"),
+                ("CAIRN_WORKFLOW_ARGS", "{}"),
+                ("CAIRN_WORKFLOW_OUTPUT", "return"),
+            ] {
+                assert!(
+                    routed
+                        .env
+                        .contains(&(kept.0.to_string(), kept.1.to_string())),
+                    "{names:?}"
+                );
+            }
+            let capability = routed
+                .env
+                .iter()
+                .find(|(name, _)| name == MCP_SECRET_ENV)
+                .map(|(_, value)| value.clone())
+                .expect("a capability of its own");
+            assert_ne!(capability, secret(&orch));
+        }
+    }
+
+    /// A workflow runtime on this runner's machine, or not yet placed, keeps
+    /// the loopback callback and the runner's secret and gets no relay.
+    #[tokio::test]
+    async fn a_colocated_workflow_keeps_the_runners_callback_and_gets_no_relay() {
+        let orch = orchestrator().await;
+        attach(&orch, "local", true);
+        for placed in [Some("local"), None] {
+            let routed = workflow_env(&orch, placed).unwrap();
+            assert!(routed.relay.is_none(), "placed on {placed:?}");
+            assert!(routed
+                .env
+                .contains(&(CALLBACK_URL_ENV.into(), runner_callback_url(&orch))));
+            assert!(routed.env.contains(&(MCP_SECRET_ENV.into(), secret(&orch))));
+            assert!(routed.env.iter().any(|(name, _)| name == "CAIRN_HOME"));
+        }
+        assert_eq!(orch.fleet.resident_relays().len(), 0);
+    }
+
+    /// A start that failed before it reached a machine leaves no relay
+    /// behind: rollback revokes it even when the stop and release it sends
+    /// cannot be dispatched.
+    #[tokio::test]
+    async fn rolling_back_a_relayed_start_revokes_its_relay() {
+        let orch = orchestrator().await;
+        let holder = ResidencyHolder::Workflow {
+            run_id: "wf-1".into(),
+        };
+        let routed = workflow_env(&orch, Some("machine-away")).unwrap();
+        assert!(routed.relay.is_some());
+        assert_eq!(orch.fleet.resident_relays().len(), 1);
+        let fence = ResidencyFence {
+            holder,
+            incarnation_id: "inc".into(),
+            cell_epoch: 1,
+        };
+        rollback(&orch, &fence, "wf-1").await;
+        assert_eq!(orch.fleet.resident_relays().len(), 0);
     }
 
     /// An environment bound for another machine is refused if the machine
