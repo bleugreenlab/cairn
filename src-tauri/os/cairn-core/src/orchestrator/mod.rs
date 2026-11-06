@@ -893,6 +893,7 @@ impl OrchestratorBuilder {
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             suspension_resolvers: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            review_deferrals: Arc::default(),
             review_durability_errors: Arc::new(Mutex::new(HashMap::new())),
             review_log_generations: Arc::new(Mutex::new(HashMap::new())),
             recent_turn_end_check_requests: self.recent_turn_end_check_requests,
@@ -1177,7 +1178,7 @@ impl Default for TurnEndCancel {
 
 impl TurnEndCancel {
     /// Signal cancellation. Idempotent.
-    fn cancel(&self, reason: TurnEndCancelReason) {
+    pub(crate) fn cancel(&self, reason: TurnEndCancelReason) {
         if self
             .inner
             .reason
@@ -1201,7 +1202,7 @@ impl TurnEndCancel {
     }
 
     /// Why the wave was cancelled, if it was.
-    fn cancel_reason(&self) -> Option<TurnEndCancelReason> {
+    pub(crate) fn cancel_reason(&self) -> Option<TurnEndCancelReason> {
         TurnEndCancelReason::from_discriminant(self.inner.reason.load(Ordering::SeqCst))
     }
 
@@ -1659,6 +1660,9 @@ pub struct Orchestrator {
         Mutex<HashMap<String, crate::orchestrator::build_services::BuildServiceRuntimeDiagnostic>>,
     >,
     turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
+    /// How long each job's review gate has deferred to its node, across the
+    /// waves that deferred. Runtime-only.
+    pub(crate) review_deferrals: Arc<crate::execution::checks_turn_end::ReviewDeferrals>,
     /// Fault notices outlive a wave's slot, including late detached completion.
     /// Runtime-only: an unfinished observation is rerun after process exit.
     review_durability_errors:

@@ -479,6 +479,16 @@ pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, slot
             }
         }
     }
+    // A head that owes no review ends the job's deferral as surely as a wave
+    // that took admission: there is nothing left for the gate to be waiting on.
+    if matches!(
+        result,
+        Ok(TurnEndDisposition::Skipped(_)
+            | TurnEndDisposition::CacheCovered(_)
+            | TurnEndDisposition::Withdrawn(_))
+    ) {
+        orch.review_deferrals.close(&job_id);
+    }
     let (state, reason) = match result {
         Ok(disposition) => disposition.terminal(),
         Err(error) => {
@@ -847,8 +857,8 @@ async fn issue_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
 /// How often a deferred wave re-asks whether its node has gone quiet.
 const WAVE_SETTLE_POLL_MS: u64 = 3_000;
 
-/// The longest a wave defers to its node's own work before taking admission
-/// anyway.
+/// The longest a job's review gate defers to its node's own work before a wave
+/// takes admission anyway.
 ///
 /// Deferral must never become suppression. Yielding is safe because a node that
 /// is working reaches another turn-end, which arms another wave — but the review
@@ -858,9 +868,66 @@ const WAVE_SETTLE_POLL_MS: u64 = 3_000;
 /// forever. This is a bound on WAITING, never on running: nothing is killed when
 /// it elapses, a wave is released.
 ///
+/// Measured per job across waves, not per wave ([`ReviewDeferrals`]).
+///
 /// Long enough to sit out a full `rust-tests` a builder started itself, and no
 /// longer.
 const WAVE_SETTLE_CEILING_MS: u64 = 10 * 60 * 1_000;
+
+/// When each job's review gate began yielding to its node, carried across the
+/// waves that yield.
+///
+/// The settle ceiling bounds how long a JOB goes without a review wave reaching
+/// admission, not how old one wave is. A wave deferring to a busy node is
+/// withdrawn when the node's branch advances, and its successor plans the new
+/// head. Were the clock the wave's own, a node that is always busy and whose
+/// branch moves more often than the ceiling (its own commits, its tasks'
+/// commits, patch-changing base replays) would restart it on every advance and
+/// never be reviewed at all. So the start of the wait is kept here, keyed by
+/// job: the first wave to defer opens it, a wave withdrawn because its branch
+/// advanced leaves it open for its successor, and a wave that takes admission,
+/// or finds nothing owed, closes it.
+///
+/// Runtime-only: a restart starts the clock again, which costs at most one more
+/// ceiling.
+#[derive(Default)]
+pub(crate) struct ReviewDeferrals {
+    since: std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>,
+}
+
+impl ReviewDeferrals {
+    /// Open the job's deferral now, or keep the one an earlier wave opened.
+    /// Returns how long it has been open.
+    fn open(&self, job_id: &str) -> std::time::Duration {
+        let mut since = self
+            .since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        since
+            .entry(job_id.to_string())
+            .or_insert_with(tokio::time::Instant::now)
+            .elapsed()
+    }
+
+    /// The job's review gate is no longer deferred: a wave took admission, or
+    /// the job's head turned out to owe no review.
+    pub(crate) fn close(&self, job_id: &str) {
+        self.since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(job_id);
+    }
+
+    /// How long the job has gone without a review wave reaching admission while
+    /// its gate deferred to the node, or `None` when it is not deferring.
+    pub(crate) fn unreviewed_for(&self, job_id: &str) -> Option<std::time::Duration> {
+        self.since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(job_id)
+            .map(tokio::time::Instant::elapsed)
+    }
+}
 
 /// One node's own work, as the fleet currently reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1015,41 +1082,97 @@ async fn defer_until_node_settles(
     attempt_id: &str,
     cancel: &TurnEndCancel,
 ) -> WaveSettle {
-    let started = std::time::Instant::now();
+    settle_wave(
+        &orch.review_deferrals,
+        job_id,
+        cancel,
+        move || async move {
+            // Branch membership is re-resolved on every pass rather than fixed
+            // at entry. A wait can last minutes, and the node spawning a
+            // sub-agent task during one is precisely a node that is still
+            // working: a membership set frozen before the wait would see that
+            // task's cell as somebody else's and call the node quiet the moment
+            // the original command cleared.
+            let mut jobs: BTreeSet<String> =
+                crate::execution::checks::jobs_sharing_branch(&orch.db.local, job_id)
+                    .await
+                    .into_iter()
+                    .collect();
+            jobs.insert(job_id.to_string());
+            node_work_in_flight(&orch.fleet.snapshot(), &jobs)
+        },
+        |state, reason| record_settle(orch, job_id, attempt_id, state, reason),
+    )
+    .await
+}
+
+/// The deferral itself, over whatever reports the node's work: the fleet in
+/// production, a script in tests.
+///
+/// The ceiling is read from the job's [`ReviewDeferrals`] entry rather than from
+/// when this wave began waiting, so a wave inherits the wait of the waves its
+/// branch's advances withdrew before it.
+async fn settle_wave<W, F>(
+    deferrals: &ReviewDeferrals,
+    job_id: &str,
+    cancel: &TurnEndCancel,
+    mut node_work: W,
+    mut record: impl FnMut(&str, &str),
+) -> WaveSettle
+where
+    W: FnMut() -> F,
+    F: std::future::Future<Output = Option<NodeWorkInFlight>>,
+{
+    let started = tokio::time::Instant::now();
     let mut deferred = false;
+    let withdrawn = |reason: TurnEndCancelReason| {
+        // Only staleness owes a successor (`TurnEndSlot::release`), and only a
+        // successor can inherit the wait. Any other cause ends the job's
+        // obligation to review this head, so it ends the deferral too.
+        if reason != TurnEndCancelReason::BranchAdvanced {
+            deferrals.close(job_id);
+        }
+        WaveSettle::Cancelled {
+            waited_ms: started.elapsed().as_millis() as u64,
+            reason,
+        }
+    };
     loop {
-        // Branch membership is re-resolved on every pass rather than fixed at
-        // entry. A wait can last minutes, and the node spawning a sub-agent task
-        // during one is precisely a node that is still working: a membership set
-        // frozen before the wait would see that task's cell as somebody else's
-        // and call the node quiet the moment the original command cleared.
-        let mut jobs: BTreeSet<String> =
-            crate::execution::checks::jobs_sharing_branch(&orch.db.local, job_id)
-                .await
-                .into_iter()
-                .collect();
-        jobs.insert(job_id.to_string());
-        let work = node_work_in_flight(&orch.fleet.snapshot(), &jobs);
-        let waited_ms = started.elapsed().as_millis() as u64;
-        match settle_decision(work.is_some(), waited_ms) {
-            SettleDecision::Proceed if !deferred => return WaveSettle::Proceed,
+        // A wave already told its head is stale is never admitted on that head,
+        // even past the ceiling: its successor plans the newest head and takes
+        // admission there, inheriting this wait.
+        if let Some(reason) = cancel.cancel_reason() {
+            return withdrawn(reason);
+        }
+        let work = node_work().await;
+        let unreviewed_ms = match work {
+            Some(_) => deferrals.open(job_id),
+            None => deferrals.unreviewed_for(job_id).unwrap_or_default(),
+        }
+        .as_millis() as u64;
+        match settle_decision(work.is_some(), unreviewed_ms) {
             SettleDecision::Proceed => {
-                let reason = format!(
-                    "the node settled after {}s; taking admission",
-                    waited_ms / 1_000
-                );
-                record_settle(orch, job_id, attempt_id, "runtime_started", &reason);
-                log::info!("turn-end checks for job {}: {reason}", short_id(job_id));
+                deferrals.close(job_id);
+                if deferred {
+                    let reason = format!(
+                        "the node settled after {}s; taking admission",
+                        started.elapsed().as_secs()
+                    );
+                    record("runtime_started", &reason);
+                    log::info!("turn-end checks for job {}: {reason}", short_id(job_id));
+                }
                 return WaveSettle::Proceed;
             }
             SettleDecision::ProceedUnsettled => {
+                deferrals.close(job_id);
                 let work = work.map(|work| work.describe()).unwrap_or_default();
                 let reason = format!(
-                    "the node has been running {work} for {}s; running the review lanes anyway \
-                     rather than letting a deferral become a dropped review gate",
-                    waited_ms / 1_000
+                    "the node is running {work}, but no review wave has reached admission for \
+                     {}s; running the review lanes anyway rather than letting a deferral become \
+                     a dropped review gate",
+                    unreviewed_ms / 1_000
                 );
-                record_settle(orch, job_id, attempt_id, "runtime_started", &reason);
+                record("runtime_started", &reason);
                 log::warn!("turn-end checks for job {}: {reason}", short_id(job_id));
                 return WaveSettle::Proceed;
             }
@@ -1058,15 +1181,18 @@ async fn defer_until_node_settles(
                     let work = work.map(|work| work.describe()).unwrap_or_default();
                     let reason = format!(
                         "deferring: the node is running {work}, which has right of way over its \
-                         own review wave"
+                         own review wave; no review wave has reached admission for {}s, and one \
+                         takes admission regardless at {}s",
+                        unreviewed_ms / 1_000,
+                        WAVE_SETTLE_CEILING_MS / 1_000
                     );
-                    record_settle(orch, job_id, attempt_id, "deferred", &reason);
+                    record("deferred", &reason);
                     log::info!("turn-end checks for job {}: {reason}", short_id(job_id));
                     deferred = true;
                 }
                 tokio::select! {
                     biased;
-                    reason = cancel.cancelled() => return WaveSettle::Cancelled { waited_ms, reason },
+                    reason = cancel.cancelled() => return withdrawn(reason),
                     _ = tokio::time::sleep(std::time::Duration::from_millis(WAVE_SETTLE_POLL_MS)) => {}
                 }
             }
@@ -1524,8 +1650,15 @@ async fn run_turn_end_checks_inner(
             waited_ms / 1_000,
             reason.describe()
         );
+        let carried = match orch.review_deferrals.unreviewed_for(job_id) {
+            Some(unreviewed) => format!(
+                "; its successor inherits the {}s this job has gone without review",
+                unreviewed.as_secs()
+            ),
+            None => String::new(),
+        };
         return Ok(TurnEndDisposition::Cancelled(format!(
-            "withdrawn while deferring to the node's own work because {}, before taking admission",
+            "withdrawn while deferring to the node's own work because {}, before taking admission{carried}",
             reason.describe()
         )));
     }
@@ -2359,9 +2492,17 @@ pub(crate) async fn render_turn_end_checks_section(
         return Some(format_retired_checks_section(&retired, statuses.as_deref()));
     }
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
-    let header = orch
+    let wave = orch
         .turn_end_check_runtime_status(job_id)
         .map(|status| wave_header(&status, now_unix_ms()));
+    let deferral = orch
+        .review_deferrals
+        .unreviewed_for(job_id)
+        .map(|unreviewed| deferral_line(unreviewed.as_millis() as u64));
+    let header = match (wave, deferral) {
+        (Some(wave), Some(deferral)) => Some(format!("{wave}\n\n{deferral}")),
+        (wave, deferral) => wave.or(deferral),
+    };
     format_checks_section_under(
         header.as_deref(),
         &statuses,
@@ -2400,10 +2541,32 @@ fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64
     }
 }
 
+/// Why a job's review lanes are absent while its gate defers to the node's own
+/// work, and when that deferral stops holding them back.
+fn deferral_line(unreviewed_ms: u64) -> String {
+    use crate::execution::checks_status::human_duration;
+    format!(
+        "Review is deferring to this node's own work: no review wave has reached admission for \
+         {}. Once that reaches {}, a wave takes admission at the newest head whether or not the \
+         node is still busy.",
+        human_duration(unreviewed_ms),
+        human_duration(WAVE_SETTLE_CEILING_MS)
+    )
+}
+
 /// Why a node's `/checks` has no section to show: what its latest turn-end
 /// attempt did and how long ago, the head-resolution error that kept the
-/// projection from reading anything, or that no review check applies.
+/// projection from reading anything, or that no review check applies. A job
+/// whose review gate is deferring says so, and for how long.
 pub(crate) async fn turn_end_checks_absence(orch: &Orchestrator, job_id: &str) -> String {
+    let absence = latest_attempt_absence(orch, job_id).await;
+    match orch.review_deferrals.unreviewed_for(job_id) {
+        Some(unreviewed) => format!("{absence} {}", deferral_line(unreviewed.as_millis() as u64)),
+        None => absence,
+    }
+}
+
+async fn latest_attempt_absence(orch: &Orchestrator, job_id: &str) -> String {
     use crate::execution::checks_status::human_duration;
     if let Some(status) = orch.turn_end_check_runtime_status(job_id) {
         if status.plan.applicable_names.is_empty() {
@@ -3576,6 +3739,204 @@ mod tests {
             SettleDecision::ProceedUnsettled,
             "at the ceiling the wave runs rather than waiting further"
         );
+    }
+
+    fn busy() -> Option<NodeWorkInFlight> {
+        Some(NodeWorkInFlight {
+            requests: 1,
+            command: "cargo test".into(),
+        })
+    }
+
+    /// The node never goes quiet and its branch advances every four minutes,
+    /// withdrawing whichever wave is deferring. Each successor inherits the
+    /// job's wait instead of starting its own, so one of them takes admission
+    /// within the ceiling plus one poll, on the head the branch is at then.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_node_whose_branch_keeps_advancing_still_gets_its_review() {
+        use crate::orchestrator::TurnEndCancelReason;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        const ADVANCE_EVERY: Duration = Duration::from_secs(4 * 60);
+        let deferrals = ReviewDeferrals::default();
+        // The branch's head, and the wave currently deferring on it.
+        let branch: Arc<Mutex<(u32, Option<TurnEndCancel>)>> = Arc::default();
+        let advancer = {
+            let branch = branch.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(ADVANCE_EVERY).await;
+                    let mut branch = branch.lock().unwrap();
+                    branch.0 += 1;
+                    if let Some(wave) = branch.1.take() {
+                        wave.cancel(TurnEndCancelReason::BranchAdvanced);
+                    }
+                }
+            })
+        };
+
+        let started = tokio::time::Instant::now();
+        let mut withdrawals = 0;
+        let admitted_head = loop {
+            let cancel = TurnEndCancel::default();
+            let head = {
+                let mut branch = branch.lock().unwrap();
+                branch.1 = Some(cancel.clone());
+                branch.0
+            };
+            match settle_wave(
+                &deferrals,
+                "j-busy",
+                &cancel,
+                || async { busy() },
+                |_, _| {},
+            )
+            .await
+            {
+                WaveSettle::Proceed => break head,
+                WaveSettle::Cancelled { reason, .. } => {
+                    assert_eq!(reason, TurnEndCancelReason::BranchAdvanced);
+                    withdrawals += 1;
+                }
+            }
+        };
+        let waited = started.elapsed();
+        let newest = branch.lock().unwrap().0;
+        advancer.abort();
+
+        assert_eq!(
+            withdrawals, 2,
+            "the advances at 4 and 8 minutes each withdrew a deferring wave"
+        );
+        assert!(
+            waited <= Duration::from_millis(WAVE_SETTLE_CEILING_MS + WAVE_SETTLE_POLL_MS),
+            "a wave reaches admission within the ceiling plus one poll, not {waited:?}"
+        );
+        assert_eq!(
+            admitted_head, newest,
+            "the admitted wave is on the newest head"
+        );
+        assert_eq!(
+            deferrals.unreviewed_for("j-busy"),
+            None,
+            "admission closes the job's deferral"
+        );
+    }
+
+    /// A quiet node is admitted at once and records nothing, even when an
+    /// earlier wave left the job with a deferral open: going quiet answers it.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_node_is_admitted_at_once() {
+        let deferrals = ReviewDeferrals::default();
+        let mut recorded = Vec::new();
+        let started = tokio::time::Instant::now();
+        let settle = settle_wave(
+            &deferrals,
+            "j-quiet",
+            &TurnEndCancel::default(),
+            || async { None },
+            |state, _| recorded.push(state.to_string()),
+        )
+        .await;
+        assert_eq!(settle, WaveSettle::Proceed);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert!(
+            recorded.is_empty(),
+            "a wave that never waited records no deferral"
+        );
+        assert_eq!(deferrals.unreviewed_for("j-quiet"), None);
+
+        deferrals.open("j-quiet");
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        let settle = settle_wave(
+            &deferrals,
+            "j-quiet",
+            &TurnEndCancel::default(),
+            || async { None },
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(settle, WaveSettle::Proceed);
+        assert_eq!(
+            deferrals.unreviewed_for("j-quiet"),
+            None,
+            "admission closes an inherited deferral"
+        );
+    }
+
+    /// A wave whose head went stale is never admitted on it, even past the
+    /// ceiling, and keeps the job's wait open for the successor that plans the
+    /// newest head. Any other cancellation owes no successor and closes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_wave_is_withdrawn_and_hands_its_wait_on() {
+        use crate::orchestrator::TurnEndCancelReason;
+        let deferrals = ReviewDeferrals::default();
+        deferrals.open("j-stale");
+        tokio::time::advance(std::time::Duration::from_millis(WAVE_SETTLE_CEILING_MS * 2)).await;
+
+        let stale = TurnEndCancel::default();
+        stale.cancel(TurnEndCancelReason::BranchAdvanced);
+        let settle = settle_wave(
+            &deferrals,
+            "j-stale",
+            &stale,
+            || async { busy() },
+            |_, _| {},
+        )
+        .await;
+        assert!(matches!(
+            settle,
+            WaveSettle::Cancelled {
+                reason: TurnEndCancelReason::BranchAdvanced,
+                ..
+            }
+        ));
+        assert!(
+            deferrals.unreviewed_for("j-stale").is_some(),
+            "the successor inherits the wait"
+        );
+
+        let successor = settle_wave(
+            &deferrals,
+            "j-stale",
+            &TurnEndCancel::default(),
+            || async { busy() },
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(
+            successor,
+            WaveSettle::Proceed,
+            "past the ceiling the successor takes admission without waiting"
+        );
+
+        deferrals.open("j-stale");
+        let resolved = TurnEndCancel::default();
+        resolved.cancel(TurnEndCancelReason::IssueResolved);
+        settle_wave(
+            &deferrals,
+            "j-stale",
+            &resolved,
+            || async { busy() },
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(
+            deferrals.unreviewed_for("j-stale"),
+            None,
+            "a resolved issue owes no review, so nothing is left deferring"
+        );
+    }
+
+    /// An agent reading `/checks` while its lanes are absent learns why, for how
+    /// long, and when that stops.
+    #[test]
+    fn the_deferral_line_names_the_wait_and_its_bound() {
+        let line = deferral_line(7 * 60 * 1_000 + 12_000);
+        assert!(line.contains("deferring to this node's own work"), "{line}");
+        assert!(line.contains("7m 12s"), "{line}");
+        assert!(line.contains("10m 0s"), "{line}");
     }
 
     /// A deferral nobody can read is indistinguishable from a wave that never

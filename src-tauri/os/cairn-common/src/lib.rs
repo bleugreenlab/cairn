@@ -30,7 +30,6 @@ pub mod maintenance;
 pub mod memory;
 pub mod operator_stop;
 pub mod paths;
-pub mod peer_connection;
 pub mod process_identity;
 pub mod protocol;
 pub mod query;

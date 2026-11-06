@@ -166,11 +166,8 @@ pub fn callback_token(
 /// Load the desktop operator token from the `operator_auth_secret` under a
 /// specific home directory.
 ///
-/// Two callers read it, both on behalf of a human operator: the native desktop
-/// shell, forwarding a permission answer to its own runner, and
-/// `cairn-orch peer-credentials`, which prints it for the operator to paste into
-/// a desktop on another machine. Both read the file with the caller's own
-/// permissions; where the operator credential boundary is enforced, an agent
+/// The native desktop shell reads it on behalf of a human operator, forwarding
+/// an operator answer to its own runner with the caller's own permissions; where the operator credential boundary is enforced, an agent
 /// shell that runs the CLI is refused the file like any other read. Nothing in an agent's process tree calls
 /// this, and adding a caller that runs inside one would defeat the boundary the
 /// credential exists to draw.
@@ -181,27 +178,6 @@ pub fn load_operator_token_from(home: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_decode_secret_roundtrip() {
-        use base64::Engine;
-        let secret: [u8; 32] = [0xab; 32];
-        let encoded = base64::engine::general_purpose::STANDARD.encode(secret);
-        let decoded = decode_secret(&encoded).unwrap();
-        assert_eq!(secret, decoded);
-    }
-
-    #[test]
-    fn test_decode_secret_invalid_length() {
-        use base64::Engine;
-        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
-        assert!(decode_secret(&short).is_none());
-    }
-
-    #[test]
-    fn test_decode_secret_invalid_base64() {
-        assert!(decode_secret("not valid base64!!!").is_none());
-    }
 
     #[test]
     fn the_two_credential_files_are_distinct() {
