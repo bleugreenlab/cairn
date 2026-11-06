@@ -1653,6 +1653,34 @@ mod tests {
         );
     }
 
+    /// The stored value, an override, then the stored value again from the
+    /// cache all register under one id. Every one of them was handed to a
+    /// server that may echo it later, so none may stop being scrubbed when a
+    /// different value registers under the same id.
+    #[test]
+    fn an_override_and_a_cache_hit_keep_every_resolved_value_scrubbed() {
+        use_mock_keychain();
+        let (server, var) = ("broker-rotation-server", "ROTATION_TOKEN");
+        let stored = "stored-Rq83Lx27Vb";
+        let typed = "typed-Mw46Tz19Kc";
+        crate::config::secrets::set_secret(server, var, stored).unwrap();
+        let overrides = HashMap::from([(var.to_string(), typed.to_string())]);
+        let resolve = |overrides: &HashMap<String, String>| {
+            resolve_mcp_var(server, &authored(&[]), overrides, var, "test")
+                .unwrap()
+                .unwrap()
+        };
+
+        assert_eq!(resolve(&HashMap::new()), stored);
+        assert_eq!(resolve(&overrides), typed);
+        assert_eq!(resolve(&HashMap::new()), stored);
+
+        let mut sanitizer = Sanitizer::exact();
+        let echoed = sanitizer.text(&format!("late echo: {stored} and {typed}"));
+        assert!(!echoed.contains(stored), "stored value leaked: {echoed}");
+        assert!(!echoed.contains(typed), "override value leaked: {echoed}");
+    }
+
     /// Every scope the broker mints is a *use* authority. Reveal is not
     /// expressible here, which is the point.
     ///

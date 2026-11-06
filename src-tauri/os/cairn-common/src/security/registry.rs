@@ -12,7 +12,7 @@
 //! prevent.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use zeroize::Zeroizing;
@@ -45,8 +45,11 @@ pub struct SecretMetadata {
     /// knows. Advisory: expiry does not unregister, because output produced
     /// before expiry can still be crossing a boundary after it.
     pub expires_at: Option<i64>,
-    /// How many live guards hold this registration.
+    /// How many live guards hold this registration, across every value.
     pub holders: usize,
+    /// How many distinct values are scrubbed for under this id. More than one
+    /// after a rotation or override while an earlier value is still held.
+    pub values: usize,
 }
 
 /// One recognized byte form of one registered credential.
@@ -310,6 +313,28 @@ struct Entry {
     category: SecretCategory,
     provenance: String,
     expires_at: Option<i64>,
+    /// Every distinct value still held under this id.
+    ///
+    /// An id names a credential *slot*, not a value: a rotated key or a
+    /// settings override resolves under the same id as the value it replaces.
+    /// Each value keeps its own forms and holders, because output carrying an
+    /// earlier value can still be in flight after a newer one registers, and a
+    /// process-retained hold on the earlier value is a promise to keep
+    /// scrubbing *that value*.
+    values: Vec<HeldValue>,
+}
+
+impl Entry {
+    fn holders(&self) -> usize {
+        self.values.iter().map(|value| value.holders).sum()
+    }
+}
+
+/// One registered value under an id, and the guards holding it.
+struct HeldValue {
+    /// Distinguishes this value from the others under the same id, so a guard
+    /// releases only the value it registered.
+    generation: u64,
     holders: usize,
     forms: Vec<(MatchRule, Zeroizing<Vec<u8>>)>,
 }
@@ -321,6 +346,7 @@ pub struct SecretRegistry {
     /// Lock-free fast path: scrubbing an empty registry must not pay for a lock,
     /// because every guarded crossing consults it on every call.
     live: AtomicUsize,
+    next_generation: AtomicU64,
 }
 
 impl Default for SecretRegistry {
@@ -335,6 +361,7 @@ impl SecretRegistry {
             entries: Mutex::new(HashMap::new()),
             snapshot: RwLock::new(Arc::new(RegistrySnapshot::empty())),
             live: AtomicUsize::new(0),
+            next_generation: AtomicU64::new(0),
         }
     }
 
@@ -353,10 +380,12 @@ impl SecretRegistry {
 
     /// Register a resolved credential, returning the guard that keeps it live.
     ///
-    /// Registering the same id twice takes a second hold on it rather than
-    /// replacing it, so two overlapping users of one credential cannot
-    /// unregister each other's protection. The forms are recomputed from the
-    /// newest material, which is what a rotated value needs.
+    /// Registering the same value under the same id twice takes a second hold
+    /// on it, so two overlapping users of one credential cannot unregister each
+    /// other's protection. Registering a *different* value under an id already
+    /// held (a rotation, an override) adds it alongside the earlier one rather
+    /// than replacing it: the earlier value stays scrubbed for as long as its
+    /// own holders last, which for a process-retained hold is the process.
     pub fn register(
         &self,
         id: SecretId,
@@ -371,31 +400,38 @@ impl SecretRegistry {
             return Err(RegistrationRefused::BelowThreshold);
         }
         let forms = material.derived_forms().into_vec();
-        {
+        let generation = {
             let mut entries = self.entries.lock().expect("secret registry poisoned");
-            match entries.get_mut(&id) {
-                Some(entry) => {
-                    entry.holders += 1;
-                    entry.forms = forms;
+            let entry = entries.entry(id.clone()).or_insert_with(|| Entry {
+                category,
+                provenance: provenance.into(),
+                expires_at: None,
+                values: Vec::new(),
+            });
+            // Forms are a deterministic function of the value, so equal forms
+            // mean the same value.
+            let generation = match entry.values.iter_mut().find(|held| held.forms == forms) {
+                Some(held) => {
+                    held.holders += 1;
+                    held.generation
                 }
                 None => {
-                    entries.insert(
-                        id.clone(),
-                        Entry {
-                            category,
-                            provenance: provenance.into(),
-                            expires_at: None,
-                            holders: 1,
-                            forms,
-                        },
-                    );
+                    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                    entry.values.push(HeldValue {
+                        generation,
+                        holders: 1,
+                        forms,
+                    });
+                    generation
                 }
-            }
+            };
             self.rebuild(&entries);
-        }
+            generation
+        };
         Ok(SecretGuard {
             registry: self,
             id,
+            generation,
             release_on_drop: true,
         })
     }
@@ -418,23 +454,31 @@ impl SecretRegistry {
                 category: entry.category,
                 provenance: entry.provenance.clone(),
                 expires_at: entry.expires_at,
-                holders: entry.holders,
+                holders: entry.holders(),
+                values: entry.values.len(),
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
 
-    fn release(&self, id: &SecretId) {
+    fn release(&self, id: &SecretId, generation: u64) {
         let mut entries = self.entries.lock().expect("secret registry poisoned");
-        let drop_entry = match entries.get_mut(id) {
-            Some(entry) => {
-                entry.holders = entry.holders.saturating_sub(1);
-                entry.holders == 0
-            }
-            None => false,
+        let Some(entry) = entries.get_mut(id) else {
+            return;
         };
-        if drop_entry {
+        if let Some(index) = entry
+            .values
+            .iter()
+            .position(|held| held.generation == generation)
+        {
+            let held = &mut entry.values[index];
+            held.holders = held.holders.saturating_sub(1);
+            if held.holders == 0 {
+                entry.values.remove(index);
+            }
+        }
+        if entry.values.is_empty() {
             entries.remove(id);
         }
         self.rebuild(&entries);
@@ -445,7 +489,7 @@ impl SecretRegistry {
     fn rebuild(&self, entries: &HashMap<SecretId, Entry>) {
         let mut needles: Vec<Needle> = Vec::new();
         for (id, entry) in entries {
-            for (rule, bytes) in &entry.forms {
+            for (rule, bytes) in entry.values.iter().flat_map(|held| &held.forms) {
                 needles.push(Needle {
                     id: id.clone(),
                     category: entry.category,
@@ -500,6 +544,7 @@ pub fn registry() -> &'static SecretRegistry {
 pub struct SecretGuard<'a> {
     registry: &'a SecretRegistry,
     id: SecretId,
+    generation: u64,
     release_on_drop: bool,
 }
 
@@ -532,7 +577,7 @@ impl std::fmt::Debug for SecretGuard<'_> {
 impl Drop for SecretGuard<'_> {
     fn drop(&mut self) {
         if self.release_on_drop {
-            self.registry.release(&self.id);
+            self.registry.release(&self.id, self.generation);
         }
     }
 }
@@ -631,6 +676,115 @@ mod tests {
         assert_eq!(registry.metadata()[0].holders, 1);
         assert!(!registry.is_empty());
         drop(second);
+        assert!(registry.is_empty());
+        assert!(registry.metadata().is_empty());
+    }
+
+    fn scrubbed(registry: &SecretRegistry, text: &str) -> String {
+        let mut found = Detections::new();
+        registry
+            .snapshot()
+            .scrub_str(text, &mut found)
+            .unwrap_or_else(|| text.to_string())
+    }
+
+    /// Both values under one id, raw and in a derived form.
+    fn assert_both_scrubbed(registry: &SecretRegistry, first: &str, second: &str) {
+        use base64::Engine;
+        for value in [first, second] {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+            let percent = value.replace('/', "%2F");
+            let out = scrubbed(
+                registry,
+                &format!("raw={value} b64={encoded} pct={percent}"),
+            );
+            assert_eq!(
+                out, "raw=[REDACTED] b64=[REDACTED] pct=[REDACTED]",
+                "a held value under a shared id stopped being scrubbed"
+            );
+        }
+    }
+
+    /// A rotation or override registers a new value under an id whose earlier
+    /// value is still held. Both must stay scrubbed: output carrying the
+    /// earlier value can still arrive after the newer one registers.
+    #[test]
+    fn a_second_value_under_a_held_id_does_not_unprotect_the_first() {
+        let registry = local();
+        let id = SecretId::new("mcp-server:linear:API_KEY");
+        let first = "rot-A/Zx91Qw82Lm73";
+        let second = "rot-B/Pv04Hj62Nq88";
+        registry
+            .register(
+                id.clone(),
+                SecretCategory::ConfiguredMcp,
+                "t",
+                material(first),
+            )
+            .unwrap()
+            .retain_for_process();
+        registry
+            .register(
+                id.clone(),
+                SecretCategory::ConfiguredMcp,
+                "t",
+                material(second),
+            )
+            .unwrap()
+            .retain_for_process();
+        assert_both_scrubbed(&registry, first, second);
+
+        // The cache-hit sequence: the first value resolves again. It takes a
+        // second hold on the first value and must not displace the second.
+        registry
+            .register(
+                id.clone(),
+                SecretCategory::ConfiguredMcp,
+                "t",
+                material(first),
+            )
+            .unwrap()
+            .retain_for_process();
+        assert_both_scrubbed(&registry, first, second);
+        let meta = &registry.metadata()[0];
+        assert_eq!((meta.holders, meta.values), (3, 2));
+    }
+
+    /// Guards release only the value they registered, in any order.
+    #[test]
+    fn overlapping_releases_under_one_id_release_only_their_own_value() {
+        let registry = local();
+        let id = SecretId::new("shared-slot");
+        let first = "gen-A/Zx91Qw82Lm73";
+        let second = "gen-B/Pv04Hj62Nq88";
+        let register = |value: &str| {
+            registry
+                .register(
+                    id.clone(),
+                    SecretCategory::ConfiguredMcp,
+                    "t",
+                    material(value),
+                )
+                .unwrap()
+        };
+        let a1 = register(first);
+        let b = register(second);
+        let a2 = register(first);
+        assert_both_scrubbed(&registry, first, second);
+
+        // Releasing one of the first value's holds keeps both values.
+        drop(a1);
+        assert_both_scrubbed(&registry, first, second);
+
+        // Releasing the second value's only hold removes it and nothing else.
+        drop(b);
+        assert_eq!(
+            scrubbed(&registry, &format!("{first} {second}")),
+            format!("[REDACTED] {second}")
+        );
+        assert_eq!(registry.metadata()[0].values, 1);
+
+        drop(a2);
         assert!(registry.is_empty());
         assert!(registry.metadata().is_empty());
     }
