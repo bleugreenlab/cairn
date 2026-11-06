@@ -383,8 +383,8 @@ pub enum SessionError {
     /// The CLI is not installed on the host.
     CliNotFound(String),
     /// Cairn could not install the CLI it manages (see
-    /// `cairn_models::session::codex::managed::CodexInstallError`); the text
-    /// says what failed and how to retry.
+    /// `cairn_models::managed::ToolInstallError`); the text says what failed
+    /// and how to install by hand.
     CliInstallFailed(String),
     /// Preparing the launch failed (placing a file, an invalid spec).
     Setup(String),
@@ -424,6 +424,20 @@ pub trait SessionHost: Send + Sync {
     fn name(&self) -> &str;
     /// The path of `cli` on this host, checked usable.
     fn resolve_cli(&self, cli: Cli) -> Result<String, SessionError>;
+    /// [`Self::resolve_cli`], telling `on_wait` once, before blocking, when
+    /// the CLI is still being installed and the call waits on the install,
+    /// and giving up the wait (with [`SessionError::Setup`]) once
+    /// `still_wanted` answers false. A host whose CLIs are always in place
+    /// never calls either.
+    fn resolve_cli_waiting(
+        &self,
+        cli: Cli,
+        on_wait: &mut dyn FnMut(crate::managed::InstallProgress),
+        still_wanted: &dyn Fn() -> bool,
+    ) -> Result<String, SessionError> {
+        let _ = (on_wait, still_wanted);
+        self.resolve_cli(cli)
+    }
     fn spawn(&self, config: SpawnConfig) -> Result<Box<dyn ChildProcess>, String>;
     /// Write `contents` to `dir/name` on this host, creating `dir`, and
     /// answer the path the process should be told.

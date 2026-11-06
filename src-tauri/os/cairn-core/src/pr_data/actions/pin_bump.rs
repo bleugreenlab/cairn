@@ -960,6 +960,34 @@ pinBumps:
         base_gate_config(Some(yaml.to_string())).unwrap()
     }
 
+    /// The repository's own `.cairn/config.yaml`: every `pinBumps` entry
+    /// names a pin that exists and resolves the verdicts it requires, so a
+    /// misconfigured spec fails here instead of refusing a real bump.
+    #[test]
+    fn every_repository_pin_bump_resolves_its_required_verdicts() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let text = std::fs::read_to_string(repo.join(".cairn/config.yaml"))
+            .expect("the repository's .cairn/config.yaml");
+        let config = base_gate_config(Some(text)).expect("it parses");
+        for tool in ["codex", "claude"] {
+            assert!(config.pin_bumps.contains_key(tool), "no pinBumps.{tool}");
+        }
+        for (name, spec) in &config.pin_bumps {
+            assert!(
+                repo.join(&spec.pin).is_file(),
+                "pinBumps.{name} names {}, which does not exist",
+                spec.pin
+            );
+            let verdicts = required_verdicts(spec, &config.checks)
+                .unwrap_or_else(|refusal| panic!("pinBumps.{name}: {refusal}"));
+            assert_eq!(
+                verdicts.len(),
+                spec.checks.len() * spec.platforms.len(),
+                "pinBumps.{name}: one verdict per check per platform"
+            );
+        }
+    }
+
     fn pin(version: &str, integration: i64, skip: &[&str]) -> Result<Option<String>, String> {
         Ok(Some(
             serde_json::json!({

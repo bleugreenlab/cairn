@@ -1250,6 +1250,7 @@ dependencies = [
  "cairn-domain",
  "cairn-image-wire",
  "cairn-llm-wire",
+ "cairn-models",
  "cairn-models-types",
  "cairn-platform",
  "cairn-speech-wire",

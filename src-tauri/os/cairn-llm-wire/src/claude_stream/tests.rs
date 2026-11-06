@@ -526,30 +526,156 @@ fn only_a_result_is_terminal() {
 }
 
 #[test]
-fn the_cli_resume_miss_is_recognized_on_stderr() {
+fn the_cli_resume_miss_is_session_unresolvable() {
     // Verbatim from the runner log that opened CAIRN-3104.
-    assert!(stderr_reports_unknown_session(
-        "No conversation found with session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"
-    ));
-    // Merely naming a session is not this failure.
-    assert!(!stderr_reports_unknown_session(
-        "Resuming session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"
-    ));
+    assert_eq!(
+        stderr_failure(
+            "No conversation found with session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"
+        ),
+        Some(StderrFailure::SessionUnresolvable)
+    );
 }
 
 #[test]
-fn the_cli_session_id_collision_is_recognized_on_stderr() {
-    // Verbatim from the runner log that opened cairn/4978.
-    assert!(stderr_reports_session_id_in_use(
-        "Error: Session ID 30fb0390-c508-4345-b87a-fd0f2f10f1b5 is already in use."
-    ));
-    // A resume miss and an ordinary mention are different facts.
-    assert!(!stderr_reports_session_id_in_use(
-        "No conversation found with session ID: 30fb0390-c508-4345-b87a-fd0f2f10f1b5"
-    ));
-    assert!(!stderr_reports_session_id_in_use(
-        "Resuming session ID: 30fb0390-c508-4345-b87a-fd0f2f10f1b5"
-    ));
+fn the_cli_session_id_collision_is_in_use() {
+    // Verbatim from the runner log that opened cairn/4978. Not
+    // SessionUnresolvable: the conversation exists, so no reseed is owed.
+    assert_eq!(
+        stderr_failure("Error: Session ID 30fb0390-c508-4345-b87a-fd0f2f10f1b5 is already in use."),
+        Some(StderrFailure::SessionIdInUse)
+    );
+}
+
+#[test]
+fn ordinary_stderr_proves_no_failure() {
+    assert_eq!(stderr_failure(""), None);
+    assert_eq!(
+        stderr_failure("(node:12345) ExperimentalWarning: stream/web is experimental"),
+        None
+    );
+    // Merely naming a session is neither failure.
+    assert_eq!(
+        stderr_failure("Resuming session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"),
+        None
+    );
+}
+
+fn init_with(tools: Value, servers: Value) -> Init {
+    Init::from_data(&serde_json::json!({"tools": tools, "mcp_servers": servers}))
+}
+
+#[test]
+fn an_init_with_the_core_verbs_misses_none() {
+    let init = init_with(
+        serde_json::json!([
+            "mcp__cairn__read",
+            "mcp__cairn__write",
+            "mcp__cairn__run",
+            "Read"
+        ]),
+        serde_json::json!([{"name": "cairn", "status": "connected"}]),
+    );
+    assert!(init::missing_core_verbs(&init).is_empty());
+    assert_eq!(init.mcp_server_statuses("cairn"), vec![Some("connected")]);
+}
+
+#[test]
+fn missing_core_verbs_are_exact_and_ordered() {
+    for (tools, missing) in [
+        (serde_json::json!([]), init::CORE_VERBS.to_vec()),
+        (
+            serde_json::json!(["mcp__cairn__write"]),
+            vec!["mcp__cairn__read", "mcp__cairn__run"],
+        ),
+        (
+            serde_json::json!(["mcp__cairn__read", "mcp__cairn__write"]),
+            vec!["mcp__cairn__run"],
+        ),
+    ] {
+        let init = init_with(tools.clone(), serde_json::json!([]));
+        assert_eq!(init::missing_core_verbs(&init), missing, "{tools}");
+    }
+}
+
+#[test]
+fn a_malformed_inventory_declares_nothing() {
+    for data in [
+        serde_json::json!({}),
+        serde_json::json!({"tools": null}),
+        serde_json::json!({"tools": "mcp__cairn__read"}),
+        serde_json::json!({"tools": [null, 42, {"name": "mcp__cairn__run"}]}),
+    ] {
+        let init = Init::from_data(&data);
+        assert!(init.tools.is_empty(), "{data}");
+        assert_eq!(init::missing_core_verbs(&init), init::CORE_VERBS.to_vec());
+    }
+}
+
+#[test]
+fn only_bare_names_are_builtins() {
+    let init = init_with(
+        serde_json::json!([
+            "mcp__cairn__read",
+            "mcp__cairn__create_pr",
+            "mcp__axon__look",
+            "StructuredOutput",
+            "ListAgents",
+            "SendMessage",
+        ]),
+        serde_json::json!([]),
+    );
+    // Everything Cairn offers is an MCP tool, whatever the server, and the
+    // schema answer channel is the CLI's own; a bare name can only be a
+    // built-in the CLI declared.
+    assert_eq!(
+        init::builtin_tools(&init),
+        vec!["ListAgents", "SendMessage"]
+    );
+}
+
+/// Claude Code's own init for an agent launch with Cairn's server attached,
+/// recorded by the claude-contract suite's record mode from the pinned CLI.
+#[test]
+fn the_recorded_agent_launch_declares_only_cairn_tools() {
+    let init = Init::from_data(
+        &serde_json::from_str(include_str!(
+            "../../../cairn-models/tests/fixtures/claude_init_tools_none-2.1.311.json"
+        ))
+        .unwrap(),
+    );
+    assert!(init::missing_core_verbs(&init).is_empty(), "{init:?}");
+    assert!(init::builtin_tools(&init).is_empty(), "{init:?}");
+}
+
+/// A schema-constrained call declares StructuredOutput, which is how its
+/// answer arrives, and that is not a built-in.
+#[test]
+fn the_recorded_schema_call_declares_only_structured_output() {
+    let init = Init::from_data(
+        &serde_json::from_str(include_str!(
+            "../../../cairn-models/tests/fixtures/claude_init_json_schema-2.1.311.json"
+        ))
+        .unwrap(),
+    );
+    assert_eq!(init.tools, vec![init::STRUCTURED_OUTPUT.to_string()]);
+    assert!(init::builtin_tools(&init).is_empty());
+}
+
+#[test]
+fn an_init_event_carries_its_session_version_and_model() {
+    let (event, _) = parse_event(
+        r#"{"type":"system","subtype":"init","session_id":"s-1","model":"claude-opus-5-5","claude_code_version":"2.1.311","tools":["mcp__cairn__read"],"mcp_servers":[{"name":"cairn","status":"failed"},{"name":"other"}]}"#,
+    )
+    .unwrap();
+    let init = Init::of(&event).unwrap();
+    assert_eq!(init.session_id.as_deref(), Some("s-1"));
+    assert_eq!(init.model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(init.claude_code_version.as_deref(), Some("2.1.311"));
+    assert_eq!(init.mcp_server_statuses("cairn"), vec![Some("failed")]);
+    assert_eq!(init.mcp_server_statuses("other"), vec![None]);
+    let (status, _) =
+        parse_event(r#"{"type":"system","subtype":"status","session_id":"s-1"}"#).unwrap();
+    assert_eq!(Init::of(&status), None);
 }
 
 #[test]
@@ -716,37 +842,6 @@ fn test_send_user_message_with_parent_tool_use_id() {
 
     assert_eq!(parsed["type"], "user");
     assert_eq!(parsed["parent_tool_use_id"], "toolu_abc123");
-}
-
-#[test]
-fn test_send_control_response_allow() {
-    let mut buffer = Cursor::new(Vec::new());
-
-    send_control_response(&mut buffer, "req-789", true, Some("Approved by user")).unwrap();
-
-    let parsed = parse_buffer(buffer);
-
-    assert_eq!(parsed["type"], "control_response");
-    assert_eq!(parsed["request_id"], "req-789");
-    assert_eq!(parsed["response"]["subtype"], "success");
-    assert_eq!(parsed["response"]["response"]["behavior"], "allow");
-    assert_eq!(
-        parsed["response"]["response"]["message"],
-        "Approved by user"
-    );
-}
-
-#[test]
-fn test_send_control_response_deny() {
-    let mut buffer = Cursor::new(Vec::new());
-
-    send_control_response(&mut buffer, "req-abc", false, None).unwrap();
-
-    let parsed = parse_buffer(buffer);
-
-    assert_eq!(parsed["type"], "control_response");
-    assert_eq!(parsed["response"]["response"]["behavior"], "deny");
-    assert!(parsed["response"]["response"]["message"].is_null());
 }
 
 #[test]

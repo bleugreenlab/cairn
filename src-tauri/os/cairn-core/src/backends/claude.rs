@@ -25,7 +25,7 @@ use super::run_state::{
 use crate::credentials::{AccountBlock, AccountHoldKind, RoutedProvider};
 use crate::models::{ContextTokenState, RunStatus, TurnEndReason};
 use crate::orchestrator::session::{
-    assemble_prompt_segments, flatten_prompt_segments, get_claude_path, insert_error_event,
+    assemble_prompt_segments, flatten_prompt_segments, insert_error_event,
     persist_system_prompt_event, select_routed_serving_identity, system_prompt_placement,
     SelectionMode,
 };
@@ -1412,8 +1412,13 @@ impl AgentBackend for ClaudeBackend {
         "Claude"
     }
 
+    /// Cairn installs Claude Code itself, so it is available wherever
+    /// Anthropic publishes a build for the host.
     fn is_available(&self) -> Result<(), String> {
-        crate::env::find_binary("claude").map(|_| ())
+        cairn_models::managed::claude::CLAUDE
+            .host_supported()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn serves(
@@ -1678,6 +1683,16 @@ impl AgentBackend for ClaudeBackend {
         let spawn_started = std::time::Instant::now();
 
         let runtime = orch.models_runtime();
+        // Resolved here, against the run, so a launch held by the first
+        // install says so on its transcript and a refusal is written there;
+        // `open` then finds the release in place.
+        crate::orchestrator::models::resolve_managed_cli(
+            orch,
+            runtime.host.as_ref(),
+            cairn_models::interface::session::Cli::Claude,
+            &config.run_id,
+            session_id.as_deref(),
+        )?;
         let launched = runtime
             .claude
             .open(runtime.host.as_ref(), spec)
@@ -2114,7 +2129,16 @@ fn usable_claude_credential(orch: &Orchestrator) -> Result<(), String> {
     if profiles.is_empty() {
         return Err(NO_ACCOUNT.to_string());
     }
-    get_claude_path(&orch.process_state)?;
+    // Never installs: a catalog refresh must not wait on a download, and the
+    // follow loop refreshes the catalog once an install lands.
+    let claude = &orch.models_runtime().managed.claude;
+    if claude.installed().is_none() {
+        return Err(match claude.status() {
+            cairn_models::managed::ManagedToolStatus::Failed(refusal) => refusal,
+            _ => "Cairn is still installing Claude Code; its models appear once the install finishes."
+                .to_string(),
+        });
+    }
     let signed_in = profiles.iter().any(|account| {
         orch.subscriptions()
             .claude_home_signed_in(orch, &account.id)
@@ -2430,7 +2454,7 @@ mod launch_contract_tests {
 
 #[cfg(test)]
 mod stderr_failure_tests {
-    use super::{classify_stderr_failure, BackendFailure, StderrWatch};
+    use super::{BackendFailure, StderrWatch};
 
     fn watch_over(lines: &str) -> Option<BackendFailure> {
         StderrWatch::spawn(Box::new(std::io::Cursor::new(lines.to_string()))).settle()
@@ -2499,40 +2523,13 @@ mod stderr_failure_tests {
         assert!(stop.contains("release_and_stop_process(&self.orch, &self.run_id)"));
     }
 
+    /// The drain maps each failure the wire crate recognizes to its own
+    /// backend failure; the wording itself is pinned in `claude_stream`.
     #[test]
-    fn the_cli_resume_miss_classifies_as_session_unresolvable() {
-        // Verbatim from the runner log that opened CAIRN-3104.
+    fn the_drain_records_the_session_id_collision_as_in_use() {
         assert_eq!(
-            classify_stderr_failure(
-                "No conversation found with session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"
-            ),
-            Some(BackendFailure::SessionUnresolvable)
-        );
-    }
-
-    #[test]
-    fn the_cli_session_id_collision_classifies_as_in_use() {
-        // Verbatim from the runner log that opened cairn/4978. Not
-        // SessionUnresolvable: the conversation exists, so no reseed is owed.
-        assert_eq!(
-            classify_stderr_failure(
-                "Error: Session ID 30fb0390-c508-4345-b87a-fd0f2f10f1b5 is already in use."
-            ),
+            watch_over("Error: Session ID 30fb0390-c508-4345-b87a-fd0f2f10f1b5 is already in use."),
             Some(BackendFailure::SessionIdInUse)
-        );
-    }
-
-    #[test]
-    fn ordinary_stderr_classifies_as_nothing() {
-        assert_eq!(classify_stderr_failure(""), None);
-        assert_eq!(
-            classify_stderr_failure("(node:12345) ExperimentalWarning: stream/web is experimental"),
-            None
-        );
-        // Merely naming a session is not this failure.
-        assert_eq!(
-            classify_stderr_failure("Resuming session ID: 5c7fe52a-b0bd-4f3b-8bde-d7af9a2b2b93"),
-            None
         );
     }
 }

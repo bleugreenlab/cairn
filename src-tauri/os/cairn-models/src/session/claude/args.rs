@@ -28,7 +28,7 @@ pub struct ClaudeArgsConfig {
     /// `result` event's `structured_output` (CAIRN-2505). `None` leaves output
     /// unconstrained (every non-call session). StructuredOutput is the CLI's
     /// own mechanism rather than a built-in, so `--tools ""` leaves it in
-    /// place (`tests/claude_cli_contract.rs` pins this).
+    /// place (the claude-contract suite pins this).
     pub json_schema: Option<serde_json::Value>,
     /// A tool-free one-shot: nothing saved to resume
     /// (`--no-session-persistence`, print mode only). Built-in tools are off

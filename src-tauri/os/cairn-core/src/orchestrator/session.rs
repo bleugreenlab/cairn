@@ -1972,38 +1972,6 @@ pub fn insert_error_event(
     );
 }
 
-/// Find the claude binary path, caching the result
-pub fn get_claude_path(
-    state: &crate::agent_process::process::AgentProcessState,
-) -> Result<String, String> {
-    log::debug!("get_claude_path: starting");
-
-    // Check cache first
-    {
-        let cached = state.cli_binary_path.lock().map_err(|e| e.to_string())?;
-        if let Some(path) = cached.as_ref() {
-            log::debug!("get_claude_path: using cached path: {}", path);
-            return Ok(path.clone());
-        }
-    }
-
-    log::debug!("get_claude_path: no cache, resolving...");
-    let path = crate::env::find_binary("claude").map_err(|e| {
-        log::debug!("get_claude_path: {}", e);
-        e
-    })?;
-    log::debug!("get_claude_path: found claude at: {}", path);
-
-    // Cache and return
-    {
-        let mut cached = state.cli_binary_path.lock().map_err(|e| e.to_string())?;
-        *cached = Some(path.clone());
-    }
-
-    log::info!("Resolved claude path: {}", path);
-    Ok(path)
-}
-
 /// Extract session ID from a ClaudeEvent.
 #[allow(dead_code)]
 pub fn extract_session_id(event: &ClaudeEvent) -> Option<String> {
@@ -3074,7 +3042,7 @@ mod tests {
         let host = cairn_models::session::local::LocalSessionHost::new(
             std::sync::Arc::new(crate::services::RealProcessSpawner),
             residence.path().join("codex"),
-            std::sync::Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+            cairn_models::managed::ManagedTools::for_host(),
         );
         let place = |run_id: &str, content: &str| {
             let file = system_prompt_placement(residence.path(), run_id, content.to_string());

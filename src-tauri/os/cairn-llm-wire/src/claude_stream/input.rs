@@ -73,56 +73,6 @@ pub fn send_user_message(
     Ok(())
 }
 
-/// Send a control response to Claude via stdin (for permission prompts).
-///
-/// Format:
-/// ```json
-/// {
-///   "type": "control_response",
-///   "request_id": "...",
-///   "response": {
-///     "subtype": "success",
-///     "response": {"behavior": "allow"|"deny", "message": "..."}
-///   }
-/// }
-/// ```
-///
-/// Cairn answers permissions through its MCP callback today, so nothing sends
-/// this yet; it is the stdin half of the protocol for when that changes.
-pub fn send_control_response(
-    stdin: &mut dyn Write,
-    request_id: &str,
-    allow: bool,
-    message: Option<&str>,
-) -> Result<(), String> {
-    let behavior = if allow { "allow" } else { "deny" };
-
-    let response = json!({
-        "type": "control_response",
-        "request_id": request_id,
-        "response": {
-            "subtype": "success",
-            "response": {
-                "behavior": behavior,
-                "message": message
-            }
-        }
-    });
-
-    writeln!(stdin, "{}", response).map_err(|e| format!("Failed to write to stdin: {}", e))?;
-    stdin
-        .flush()
-        .map_err(|e| format!("Failed to flush stdin: {}", e))?;
-
-    log::info!(
-        "Sent control response via stdin: request_id={}, behavior={}",
-        &request_id[..request_id.len().min(8)],
-        behavior
-    );
-
-    Ok(())
-}
-
 /// Send a control request to Claude via stdin.
 ///
 /// Control requests allow runtime control of the Claude CLI:

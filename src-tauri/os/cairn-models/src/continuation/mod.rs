@@ -30,7 +30,7 @@
 //!      backend on the resume attempt itself, and turned into a rebuild by the
 //!      host's digest-reseed fallback (Cairn's lives in `finalize`), which also
 //!      says so in the transcript. The facet's Claude signal for it is
-//!      [`crate::wire::claude_stream::stderr_reports_unknown_session`]; Codex has
+//!      [`crate::wire::claude_stream::stderr_failure`]; Codex has
 //!      none yet;
 //!   3. the provider's own accounting says the model's window is running out
 //!      ([`window_pressure_reached`]);

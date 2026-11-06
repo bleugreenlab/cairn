@@ -1189,11 +1189,12 @@ async fn open_codex_child_turn(orch: &Orchestrator, child: &str) {
         .unwrap();
     // Goal reconciliation at each turn end talks to the provider; any status
     // reply satisfies it, and the provider's own turns are admitted below.
-    let (stdin, _requests, _provider_turn) = crate::backends::codex::scripted_owned_goal_stdin_for_test(
-        "thread-child",
-        "provider-child-1",
-        (0..32).map(|_| Ok(codex_goal("active"))).collect(),
-    );
+    let (stdin, _requests, _provider_turn) =
+        crate::backends::codex::scripted_owned_goal_stdin_for_test(
+            "thread-child",
+            "provider-child-1",
+            (0..32).map(|_| Ok(codex_goal("active"))).collect(),
+        );
     let mut handle = RunHandle::new(
         Arc::new(Mutex::new(None)),
         Arc::new(Mutex::new(Some(stdin))),
@@ -1247,7 +1248,9 @@ async fn admit_codex_child_turn(orch: &Orchestrator, child: &str, provider_turn:
             "session-child",
             &child,
             &provider_turn,
-            orch.process_state.get_current_turn_id("run-child").as_deref(),
+            orch.process_state
+                .get_current_turn_id("run-child")
+                .as_deref(),
         )
         .expect("a provider turn on the task's live run is admitted");
         let crate::execution::jobs::CodexGoalTurnAdmission::Admitted(turn_id) = admission else {
@@ -1294,7 +1297,10 @@ async fn codex_task_turns_all_run_on_a_live_run_and_the_returning_one_settles_it
         if provider_turn == "provider-after-grandchild" {
             orch.db
                 .local
-                .execute("UPDATE jobs SET status = 'complete' WHERE id = 'j-grandchild'", ())
+                .execute(
+                    "UPDATE jobs SET status = 'complete' WHERE id = 'j-grandchild'",
+                    (),
+                )
                 .await
                 .unwrap();
         }
@@ -1329,9 +1335,12 @@ async fn codex_task_turns_all_run_on_a_live_run_and_the_returning_one_settles_it
     assert!(delivered.contains(RETURNED), "{delivered}");
     for turn in &turns {
         assert_eq!(
-            text(&orch, &format!("SELECT state FROM turns WHERE id = '{turn}'"))
-                .await
-                .as_deref(),
+            text(
+                &orch,
+                &format!("SELECT state FROM turns WHERE id = '{turn}'")
+            )
+            .await
+            .as_deref(),
             Some("complete"),
             "turn {turn} settled"
         );

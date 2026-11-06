@@ -111,18 +111,28 @@ pub fn terminal_provider_depletion(
         })
 }
 
-/// The Claude CLI's wording when `--resume <id>` finds no conversation for the
-/// process's working directory (the CLI keys its conversation store by cwd).
-/// Matched here, at the boundary that emits it; no other layer sees the string.
-pub fn stderr_reports_unknown_session(line: &str) -> bool {
-    line.contains("No conversation found with session ID")
+/// A failure a Claude CLI proves by a line it printed on stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrFailure {
+    /// `--resume <id>` found no conversation for the process's working
+    /// directory (the CLI keys its conversation store by cwd).
+    SessionUnresolvable,
+    /// `--session-id <id>` named a conversation the CLI had already created:
+    /// an earlier launch under the same id got far enough to create it, so a
+    /// fresh start under that id is refused.
+    SessionIdInUse,
 }
 
-/// The Claude CLI's wording when `--session-id <id>` names a conversation the
-/// CLI already created: an earlier launch under the same id got far enough to
-/// create it, so a fresh start under that id is refused.
-pub fn stderr_reports_session_id_in_use(line: &str) -> bool {
-    line.contains("Session ID ") && line.contains(" is already in use")
+/// The failure one stderr line proves, if any. The CLI's wording is matched
+/// here, at the boundary that emits it; no other layer sees the strings.
+pub fn stderr_failure(line: &str) -> Option<StderrFailure> {
+    if line.contains("No conversation found with session ID") {
+        Some(StderrFailure::SessionUnresolvable)
+    } else if line.contains("Session ID ") && line.contains(" is already in use") {
+        Some(StderrFailure::SessionIdInUse)
+    } else {
+        None
+    }
 }
 
 /// The signals a reader needs at stdout EOF that follow purely from the events

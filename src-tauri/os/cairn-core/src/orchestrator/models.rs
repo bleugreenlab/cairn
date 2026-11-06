@@ -14,11 +14,13 @@ use cairn_models::complete::HttpComplete;
 use cairn_models::image::http::HttpImages;
 use cairn_models::interface::complete::Complete;
 use cairn_models::interface::image::ImageTransport;
-use cairn_models::interface::session::{CodexSessionProvider, SessionHost, SessionProvider};
+use cairn_models::interface::session::{
+    Cli, CodexSessionProvider, SessionError, SessionHost, SessionProvider,
+};
 use cairn_models::interface::speak::SpeechTransport;
+use cairn_models::managed::{InstallProgress, ManagedTools, UpdateOutcome, UPDATE_INTERVAL};
 use cairn_models::session::claude::ClaudeCli;
-use cairn_models::session::codex::managed::{UpdateOutcome, UPDATE_INTERVAL};
-use cairn_models::session::codex::{CodexAppServer, ManagedCodex};
+use cairn_models::session::codex::CodexAppServer;
 use cairn_models::speak::HttpSpeech;
 
 use cairn_db::storage::run_db_blocking;
@@ -54,91 +56,254 @@ pub struct ModelRuntime {
     pub codex: Arc<dyn CodexSessionProvider>,
     /// Where session processes run.
     pub host: Arc<dyn SessionHost>,
-    /// The Codex CLI the local host launches, installed and kept on the
-    /// published pin by Cairn.
-    pub codex_cli: Arc<ManagedCodex>,
+    /// The CLIs the local host launches (Codex and Claude Code), installed
+    /// and kept on their published pins by Cairn.
+    pub managed: ManagedTools,
     /// Every outside client's request the served API relays.
     pub relay: Arc<dyn cairn_models::interface::relay::Relay>,
 }
 
 impl ModelRuntime {
     /// The implementations that reach providers, with sessions run as
-    /// children of this runner.
+    /// children of this runner from the CLIs `managed` installs.
     pub(crate) fn local(
         process: Arc<dyn crate::services::ProcessSpawner>,
-        process_state: Arc<crate::agent_process::process::AgentProcessState>,
+        managed: ManagedTools,
     ) -> Self {
-        let codex_cli = Arc::new(ManagedCodex::for_host());
         Self {
             complete: Arc::new(HttpComplete),
             images: Arc::new(HttpImages),
             speech: Arc::new(HttpSpeech),
             claude: Arc::new(ClaudeCli),
             codex: Arc::new(CodexAppServer),
-            host: Arc::new(
-                cairn_models::session::local::LocalSessionHost::new(
-                    process,
-                    crate::backends::codex::cairn_codex_home(),
-                    codex_cli.clone(),
-                )
-                .with_claude_resolver(Arc::new(move || {
-                    crate::orchestrator::session::get_claude_path(&process_state)
-                })),
-            ),
-            codex_cli,
+            host: Arc::new(cairn_models::session::local::LocalSessionHost::new(
+                process,
+                crate::backends::codex::cairn_codex_home(),
+                managed.clone(),
+            )),
+            managed,
             relay: Arc::new(HttpComplete),
         }
     }
 }
 
-impl Orchestrator {
-    /// Keep the managed Codex on the published pin: once now, then every
-    /// [`UPDATE_INTERVAL`]. A swap refreshes the model catalog from the new
-    /// release and retires pooled app-servers on the old one; running
-    /// sessions finish on the release they started with.
-    pub fn spawn_managed_codex_follow(&self) {
-        let orch = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(UPDATE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                orch.follow_managed_codex(false).await;
-            }
+/// Exit reason for an idle provider process retired because its managed CLI
+/// was replaced.
+pub(crate) const MANAGED_CLI_SWAP_EXIT_REASON: &str = "managed_cli_swap";
+
+/// The managed `cli` on the session host for the run `run_id`.
+///
+/// While its first install is still landing, the launch waits on it, and the
+/// run's transcript is told once where the install stands. A launch that is
+/// stopped meanwhile (its run settled, or its admission claim lost) stops
+/// waiting at once, and one that waited is checked again before anything is
+/// spawned, so stopped work never reaches the provider. A refusal (the
+/// install's own text, naming the manual route) is written to the transcript
+/// once. Never a CLI found on the `PATH`.
+pub(crate) fn resolve_managed_cli(
+    orch: &Orchestrator,
+    host: &dyn SessionHost,
+    cli: Cli,
+    run_id: &str,
+    session_id: Option<&str>,
+) -> Result<String, String> {
+    let claim = orch
+        .process_state
+        .admission_claim(run_id)
+        .map(|claim| (claim.request_id, claim.generation));
+    let still_wanted =
+        || crate::orchestrator::lifecycle::launch_still_wanted(orch, run_id, claim.as_ref());
+    let waited = std::cell::Cell::new(false);
+    let mut on_wait = |progress: InstallProgress| {
+        waited.set(true);
+        let raw = serde_json::json!({
+            "type": "system",
+            "subtype": "managed_cli_install_wait",
+            "tool": progress.tool.name,
+            "version": progress.version,
+            "downloaded": progress.downloaded,
+            "total": progress.total,
+            "last_error": progress.last_error,
         });
+        if let Err(error) = crate::messages::transcript::insert_system_message_sync(
+            orch,
+            run_id,
+            session_id,
+            None,
+            &progress.waiting_message(),
+            raw,
+        ) {
+            log::warn!(
+                "managed {}: could not record the wait: {error}",
+                progress.tool.name
+            );
+        }
+    };
+    let resolved = host
+        .resolve_cli_waiting(cli, &mut on_wait, &still_wanted)
+        .map_err(|error| {
+            match &error {
+                SessionError::CliNotFound(reason) => {
+                    crate::orchestrator::session::insert_error_event(
+                        orch,
+                        run_id,
+                        session_id,
+                        &format!("{cli:?} CLI not found: {reason}"),
+                    )
+                }
+                SessionError::CliInstallFailed(reason) => {
+                    crate::orchestrator::session::insert_error_event(
+                        orch, run_id, session_id, reason,
+                    )
+                }
+                _ => {}
+            }
+            error.to_string()
+        })?;
+    if waited.get() {
+        if !still_wanted() {
+            return Err(format!(
+                "run {run_id} was stopped while its {cli:?} CLI installed; nothing was launched"
+            ));
+        }
+        // The wait may have outlived the team lease while the authority was
+        // unreachable; the local claim cannot tell.
+        crate::execution::jobs::confirm_team_lease_blocking(orch, run_id)?;
+        // The confirmation is a network round trip; a stop during it still
+        // wins.
+        if !still_wanted() {
+            return Err(format!(
+                "run {run_id} was stopped while its admission lease was confirmed; nothing was launched"
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+impl Orchestrator {
+    /// Keep every managed CLI on its published pin: each tool once now (an
+    /// install for any tool with no complete release begins here), then
+    /// every [`UPDATE_INTERVAL`]. Each tool follows on its own task, so one
+    /// tool's install waiting out a network fault never holds the other's.
+    /// Running sessions finish on the release they started with.
+    ///
+    /// When `shutdown` turns true (or its sender goes away), every tool is
+    /// told to stop: an install retrying past a network fault ends at its
+    /// next wait, and launches waiting on it return, so an offline first
+    /// install never holds the process open.
+    pub fn spawn_managed_tools_follow(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let managed = self.models_runtime().managed.clone();
+        tokio::spawn(async move {
+            while !*shutdown.borrow_and_update() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+            managed.shutdown();
+        });
+        for cli in [Cli::Codex, Cli::Claude] {
+            let orch = self.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(UPDATE_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    orch.follow_managed_tool(cli, false).await;
+                }
+            });
+        }
     }
 
-    /// Retry an install that failed or never ran, unless one is already in
-    /// progress. Onboarding's "Check again" lands here.
-    pub fn kick_managed_codex_install(&self) {
+    /// Retry `cli`'s install, forgetting a refusal that stands for the
+    /// current pin, unless an install is already in progress. Onboarding's
+    /// "Check again" lands here.
+    pub fn kick_managed_install(&self, cli: Cli) {
         let orch = self.clone();
-        tokio::spawn(async move { orch.follow_managed_codex(true).await });
+        tokio::spawn(async move { orch.follow_managed_tool(cli, true).await });
     }
 
-    async fn follow_managed_codex(&self, only_if_idle: bool) {
-        let codex = self.models_runtime().codex_cli.clone();
+    async fn follow_managed_tool(&self, cli: Cli, retry: bool) {
+        let tool = self.models_runtime().managed.get(cli).clone();
+        let name = tool.spec().name;
         let outcome = tokio::task::spawn_blocking(move || {
-            if only_if_idle {
-                codex.update_if_idle()
+            if retry {
+                tool.retry_if_idle()
             } else {
-                Some(codex.update())
+                Some(tool.update())
             }
         })
         .await;
         match outcome {
             Ok(Some(Ok(UpdateOutcome::Installed { resolved, previous }))) => {
                 log::info!(
-                    "managed codex: now on {} (was {})",
+                    "managed {name}: now on {} (was {})",
                     resolved.version,
                     previous.as_deref().unwrap_or("not installed")
                 );
-                self.codex_pool.retire_versions_except(&resolved.version);
-                self.spawn_model_catalog_refresh();
+                self.on_managed_swap(cli, &resolved.version);
             }
             Ok(Some(Ok(UpdateOutcome::Current(_)))) | Ok(None) => {}
-            // `ManagedCodex` logs and records the refusal; status reports it.
+            // The tool logs and records the refusal; its status reports it.
             Ok(Some(Err(_))) => {}
-            Err(error) => log::warn!("managed codex: the update task failed: {error}"),
+            Err(error) => log::warn!("managed {name}: the update task failed: {error}"),
+        }
+    }
+
+    /// What a newly active release changes, per tool.
+    fn on_managed_swap(&self, cli: Cli, version: &str) {
+        match cli {
+            // Pooled app-servers on the old release retire; the catalog is
+            // the new release's.
+            Cli::Codex => {
+                self.codex_pool.retire_versions_except(version);
+                self.spawn_model_catalog_refresh();
+            }
+            // Every warm Claude process predates the swap. Each one still
+            // idle is retired (provider only: its job's terminals keep
+            // running), so the next session starts on the new release; one a
+            // launch or resume holds is left alone, and a session mid-turn
+            // finishes on the release it started with, which pruning keeps.
+            // The catalog is refreshed because a first install is what makes
+            // a signed-in profile's models visible.
+            Cli::Claude => {
+                let warm: Vec<String> = self
+                    .process_state
+                    .processes
+                    .lock()
+                    .map(|processes| {
+                        processes
+                            .iter()
+                            .filter(|(_, handle)| {
+                                handle.is_warm()
+                                    && handle
+                                        .facts
+                                        .as_ref()
+                                        .map(|facts| facts.provider.as_str())
+                                        .or(handle.backend.as_deref())
+                                        .is_none_or(|provider| provider == "claude")
+                            })
+                            .map(|(run_id, _)| run_id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let retired = warm
+                    .iter()
+                    .filter(|run_id| {
+                        crate::orchestrator::lifecycle::retire_idle_provider(
+                            self,
+                            run_id,
+                            MANAGED_CLI_SWAP_EXIT_REASON,
+                        )
+                    })
+                    .count();
+                if !warm.is_empty() {
+                    log::info!(
+                        "managed claude: retired {retired} of {} warm process(es) from the previous release",
+                        warm.len()
+                    );
+                }
+                self.spawn_model_catalog_refresh();
+            }
         }
     }
 }

@@ -948,7 +948,10 @@ impl cairn_models::subscription::ModelHost for Orchestrator {
     }
 
     fn claude_path(&self) -> Result<String, String> {
-        crate::orchestrator::session::get_claude_path(&self.process_state)
+        self.models_runtime()
+            .host
+            .resolve_cli(cairn_models::interface::session::Cli::Claude)
+            .map_err(String::from)
     }
 
     fn codex_path(&self) -> Result<String, String> {
@@ -1626,24 +1629,25 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn claude_models_follow_configured_accounts_not_the_ambient_login() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let orch = test_orchestrator().await;
-        let claude = orch.config_dir.join("fake-claude");
-        std::fs::write(
-            &claude,
-            r#"#!/bin/sh
-if [ -z "$CLAUDE_CONFIG_DIR" ] || [ -f "$CLAUDE_CONFIG_DIR/.signed-in" ]; then
+        let mut orch = test_orchestrator().await;
+        let claude = cairn_models::managed::testing::installed_release(
+            &cairn_models::managed::claude::CLAUDE,
+            &orch.config_dir.join("managed"),
+            r#"if [ -z "$CLAUDE_CONFIG_DIR" ] || [ -f "$CLAUDE_CONFIG_DIR/.signed-in" ]; then
   echo '{"loggedIn":true}'
 else
   echo '{"loggedIn":false}'
-fi
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        *orch.process_state.cli_binary_path.lock().unwrap() =
-            Some(claude.to_string_lossy().into_owned());
+fi"#,
+        );
+        orch.models_runtime = crate::orchestrator::models::ModelRuntime::local(
+            orch.services.process.clone(),
+            cairn_models::managed::ManagedTools {
+                codex: std::sync::Arc::new(cairn_models::managed::ManagedTool::for_host(
+                    &cairn_models::managed::codex::CODEX,
+                )),
+                claude: std::sync::Arc::new(claude),
+            },
+        );
         let discover = || crate::backends::claude::discover_catalog_blocking(&orch);
 
         let (models, error) = discover();
@@ -1670,9 +1674,8 @@ fi
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_claude_api_key_offers_models_without_probing_the_cli() {
+        // Nothing is installed: an API key needs no CLI to offer models.
         let orch = test_orchestrator().await;
-        *orch.process_state.cli_binary_path.lock().unwrap() =
-            Some("/nonexistent/claude".to_string());
         orch.add_account(
             ApiProvider::Anthropic,
             "Key".to_string(),

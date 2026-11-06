@@ -35,9 +35,9 @@ const CHILD_URI: &str = "cairn://p/coord/2";
 /// session that has no Cairn-managed credential, and it resolves the backend CLI
 /// off the host's PATH. Neither has anything to do with whether a wake routed
 /// correctly, but both turn "the coordinator was resumed" into an assertion about
-/// the machine running the suite. Supplying an API-key account and a pre-resolved
-/// binary path removes both, so a recorded spawn means what these tests read it
-/// as: the wake reached a launch.
+/// the machine running the suite. Supplying an API-key account and a planted
+/// managed Claude release removes both, so a recorded spawn means what these
+/// tests read it as: the wake reached a launch.
 fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> (Orchestrator, RecordingProcessSpawner) {
     orchestrator_with_credential(temp, db, Some(ClaudeAuth::ApiKey("test-key".to_string())))
 }
@@ -70,10 +70,11 @@ fn orchestrator_with_credential(
     std::fs::create_dir_all(config_dir.join("agents")).unwrap();
     std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
 
-    // Pre-resolved so the spawn never shells out to `which claude`. The recording
-    // spawner never executes it, so the path only has to be a path.
+    // A planted managed release, so the launch never waits on an install. The
+    // recording spawner never executes it.
     let process_state = Arc::new(AgentProcessState::default());
-    *process_state.cli_binary_path.lock().unwrap() = Some("/cairn-test/claude".to_string());
+    let managed =
+        cairn_models::managed::testing::tools_with_claude(&temp.path().join("managed"), "exit 0");
 
     let credential_store = claude_auth.map(|claude_auth| {
         CredentialStore::from_user_identity(&UserIdentity {
@@ -89,6 +90,7 @@ fn orchestrator_with_credential(
     (
         Orchestrator::builder(db_state, services, config_dir)
             .process_state(process_state)
+            .managed_tools(managed)
             .credential_store(credential_store)
             .build(),
         recorder,

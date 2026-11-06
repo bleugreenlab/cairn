@@ -26,6 +26,8 @@
 //! and renders the digest a rebuilt session is seeded with.
 //! [`claude::feeds`] keeps live Claude sessions on their account's current
 //! credential, for Cairn's runtime and any other host alike.
+//! [`managed`] installs and resolves the CLIs sessions run (Codex and Claude
+//! Code), each from a pinned, checksum-verified release.
 //!
 //! Subscription mechanics (CLI sign-in, account-home placement, token refresh,
 //! subscription usage probes) are not public; they live in the private
@@ -45,6 +47,7 @@ pub mod decide;
 pub mod embed;
 pub mod image;
 pub mod interface;
+pub mod managed;
 pub mod openrouter;
 pub mod relay;
 pub mod session;

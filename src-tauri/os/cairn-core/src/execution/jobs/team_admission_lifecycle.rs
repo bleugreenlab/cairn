@@ -40,7 +40,7 @@ async fn heartbeat_once_if_current(
     if !process_state.admission_claim_is_current(run_id, request_id, generation) {
         return Ok(false);
     }
-    client
+    match client
         .heartbeat(
             request_id,
             &crate::runtime_admission::HeartbeatAdmissionRequest {
@@ -49,8 +49,87 @@ async fn heartbeat_once_if_current(
             },
         )
         .await
-        .map(|_| true)
-        .map_err(|error| error.to_string())
+    {
+        Ok(_) => Ok(true),
+        Err(error) if lease_lost(&error) => {
+            // A launch still waiting to register its process (say, on a
+            // managed CLI's first install) loses its claim with the lease, so
+            // it never reaches the provider under a generation the authority
+            // has moved past.
+            let revoked =
+                process_state.revoke_pending_admission_claim(run_id, request_id, generation);
+            log::warn!(
+                "team ordinary admission {request_id} generation {generation} is no longer this host's ({error}){}",
+                if revoked { "; its waiting launch will not start" } else { "" }
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Whether the authority's answer says this host no longer holds the lease:
+/// the request was requeued, reassigned or finished (409), or is gone (404,
+/// 410). Anything else (an outage, a bad response) proves nothing.
+fn lease_lost(error: &crate::runtime_admission::AdmissionClientError) -> bool {
+    matches!(
+        error,
+        crate::runtime_admission::AdmissionClientError::Rejected { status, .. }
+            if matches!(status.as_u16(), 404 | 409 | 410)
+    )
+}
+
+/// Before a launch that waited (on a managed CLI's install) reaches its
+/// provider: confirm with the authority, by renewing it, that this host still
+/// holds the team lease the launch was admitted under. The local claim alone
+/// cannot say so: a host cut off from the authority for longer than the lease
+/// still holds it in memory after the authority requeued the request. A
+/// launch with no team claim needs no confirmation.
+pub(crate) fn confirm_team_lease_blocking(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
+    let Some(claim) = orch.process_state.admission_claim(run_id) else {
+        return Ok(());
+    };
+    if claim.team_workspace_id.is_none() {
+        return Ok(());
+    }
+    let client = team_client(orch)?;
+    let process_state = orch.process_state.clone();
+    let run_id = run_id.to_string();
+    crate::storage::run_db_blocking(move || async move {
+        confirm_lease(
+            &process_state,
+            client.as_ref(),
+            &run_id,
+            &claim.request_id,
+            claim.generation,
+        )
+        .await
+    })
+}
+
+async fn confirm_lease(
+    process_state: &AgentProcessState,
+    client: &dyn RuntimeAdmissionClient,
+    run_id: &str,
+    request_id: &str,
+    generation: i64,
+) -> Result<(), String> {
+    let lost = || {
+        format!(
+            "run {run_id} no longer holds team admission {request_id} (generation {generation}); nothing was launched"
+        )
+    };
+    match heartbeat_once_if_current(process_state, client, run_id, request_id, generation).await {
+        // The renewal can take a while; a stop (or a newer claim) that landed
+        // while it was in flight still wins.
+        Ok(true) if process_state.admission_claim_is_current(run_id, request_id, generation) => {
+            Ok(())
+        }
+        Ok(_) => Err(lost()),
+        Err(error) => Err(format!(
+            "could not confirm team admission {request_id} for run {run_id} after its wait, so nothing was launched: {error}"
+        )),
+    }
 }
 
 fn action_from_str(value: &str) -> Option<AdmissionTerminalAction> {
@@ -365,6 +444,13 @@ mod tests {
     #[derive(Default)]
     struct FakeClient {
         unavailable: AtomicBool,
+        /// The authority requeued the lease: heartbeats answer 409.
+        stale: AtomicBool,
+        /// Heartbeats are held in flight until `release`, after signalling
+        /// `entered`.
+        hold: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
         heartbeats: Mutex<Vec<i64>>,
         finishes: Mutex<Vec<i64>>,
         /// Postgres's view of the request, for cancel and status.
@@ -411,8 +497,17 @@ mod tests {
             request: &HeartbeatAdmissionRequest,
         ) -> Result<AdmissionRequest, AdmissionClientError> {
             self.heartbeats.lock().unwrap().push(request.generation);
+            if self.hold.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             if self.unavailable.load(Ordering::SeqCst) {
                 Err(AdmissionClientError::Unavailable("outage".into()))
+            } else if self.stale.load(Ordering::SeqCst) {
+                Err(AdmissionClientError::Rejected {
+                    status: reqwest::StatusCode::CONFLICT,
+                    message: "stale lease".into(),
+                })
             } else {
                 Ok(remote_request(request.generation, "host-1"))
             }
@@ -471,6 +566,117 @@ mod tests {
         async fn reap(&self) -> Result<Vec<AdmissionRequest>, AdmissionClientError> {
             unreachable!()
         }
+    }
+
+    fn pending_team_claim(process_state: &AgentProcessState, generation: i64) {
+        process_state.prepare_admission_claim(
+            "run-1".into(),
+            crate::agent_process::process::ProcessAdmissionClaim {
+                request_id: "request-1".into(),
+                workspace_key: "team-1".into(),
+                launch_key: "ordinary:run-1".into(),
+                owner: "runner-1".into(),
+                generation,
+                team_workspace_id: Some("team-1".into()),
+            },
+        );
+    }
+
+    /// A stop, or a newer claim, that lands while the confirming renewal is
+    /// in flight refuses the launch even though the authority answers the
+    /// renewal with success.
+    #[tokio::test]
+    async fn a_stop_during_the_lease_confirmation_refuses_the_launch() {
+        for replace in [false, true] {
+            let process_state = Arc::new(AgentProcessState::default());
+            let client = Arc::new(FakeClient::default());
+            pending_team_claim(&process_state, 7);
+            client.hold.store(true, Ordering::SeqCst);
+            let confirming = tokio::spawn({
+                let (process_state, client) = (process_state.clone(), client.clone());
+                async move {
+                    confirm_lease(&process_state, client.as_ref(), "run-1", "request-1", 7).await
+                }
+            });
+            client.entered.notified().await;
+            if replace {
+                pending_team_claim(&process_state, 8);
+            } else {
+                // What Stop does to a run with no process yet.
+                process_state.cancel_pending_admission_claim("run-1");
+            }
+            client.release.notify_one();
+            let refused = confirming.await.unwrap().unwrap_err();
+            assert!(
+                refused.contains("no longer holds"),
+                "replace={replace}: {refused}"
+            );
+            assert_eq!(client.heartbeats.lock().unwrap().as_slice(), &[7]);
+        }
+    }
+
+    /// The case a launch waiting on a long install can meet: the runner was
+    /// cut off from the authority past the lease's lifetime, the authority
+    /// requeued it, and the first heartbeat after reconnecting answers 409.
+    /// The waiting launch loses its claim (so `launch_still_wanted` reads
+    /// false and nothing is spawned), and the confirmation the launch makes
+    /// before reaching its provider refuses. An outage proves nothing either
+    /// way: it keeps the claim, and the confirmation refuses too.
+    #[tokio::test]
+    async fn a_lease_the_authority_requeued_revokes_the_waiting_launch() {
+        let process_state = AgentProcessState::default();
+        let client = FakeClient::default();
+        pending_team_claim(&process_state, 7);
+
+        client.unavailable.store(true, Ordering::SeqCst);
+        assert!(
+            heartbeat_once_if_current(&process_state, &client, "run-1", "request-1", 7)
+                .await
+                .is_err()
+        );
+        assert!(process_state.admission_claim_is_current("run-1", "request-1", 7));
+        assert!(
+            confirm_lease(&process_state, &client, "run-1", "request-1", 7)
+                .await
+                .unwrap_err()
+                .contains("could not confirm")
+        );
+        assert!(process_state.admission_claim_is_current("run-1", "request-1", 7));
+
+        // Reconnected, past the lease: the authority has moved on.
+        client.unavailable.store(false, Ordering::SeqCst);
+        client.stale.store(true, Ordering::SeqCst);
+        assert_eq!(
+            heartbeat_once_if_current(&process_state, &client, "run-1", "request-1", 7).await,
+            Ok(false),
+            "the heartbeat stops"
+        );
+        assert!(
+            !process_state.admission_claim_is_current("run-1", "request-1", 7),
+            "the waiting launch no longer holds the claim"
+        );
+        assert!(
+            confirm_lease(&process_state, &client, "run-1", "request-1", 7)
+                .await
+                .unwrap_err()
+                .contains("no longer holds")
+        );
+
+        // A newer claim for the run is not revoked by an older generation's
+        // rejection.
+        pending_team_claim(&process_state, 8);
+        assert_eq!(
+            heartbeat_once_if_current(&process_state, &client, "run-1", "request-1", 7).await,
+            Ok(false)
+        );
+        assert!(process_state.admission_claim_is_current("run-1", "request-1", 8));
+
+        // A healthy authority confirms by renewing.
+        client.stale.store(false, Ordering::SeqCst);
+        confirm_lease(&process_state, &client, "run-1", "request-1", 8)
+            .await
+            .expect("a held lease is confirmed");
+        assert_eq!(client.heartbeats.lock().unwrap().last(), Some(&8));
     }
 
     fn claim(generation: i64) -> ProcessAdmissionClaim {

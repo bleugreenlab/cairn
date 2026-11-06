@@ -44,11 +44,13 @@ pub trait ModelHost: Send + Sync {
     fn store(&self) -> &CredentialStoreHandle;
     /// How child processes (the provider CLIs) are started.
     fn process_spawner(&self) -> &dyn ProcessSpawner;
-    /// The Claude CLI this host runs sessions with.
+    /// The Claude CLI this host signs in and checks sign-in state with: the
+    /// managed copy sessions launch (see `cairn_models::managed`). An `Err`
+    /// is the install refusal's own text.
     fn claude_path(&self) -> Result<String, String>;
     /// The Codex CLI this host signs in and probes usage with: the managed
-    /// copy sessions launch (see `cairn_models::session::codex::managed`). An
-    /// `Err` is the install refusal's own text.
+    /// copy sessions launch (see `cairn_models::managed`). An `Err` is the
+    /// install refusal's own text.
     fn codex_path(&self) -> Result<String, String>;
     /// A credential was published to the store; surfaces that show accounts
     /// should re-read.

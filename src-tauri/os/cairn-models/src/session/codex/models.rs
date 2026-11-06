@@ -540,7 +540,8 @@ done
     #[test]
     fn fresh_home_gets_a_session_catalog_from_a_login_message() {
         use crate::interface::session::{CodexModels, Secret, SessionHost};
-        use crate::session::codex::managed::tests::installed_script;
+        use crate::managed::tests::installed_script;
+        use crate::managed::{ManagedTool, ManagedTools};
         use crate::session::local::LocalSessionHost;
         use std::sync::Arc;
 
@@ -552,7 +553,10 @@ done
         let host = LocalSessionHost::new(
             Arc::new(cairn_platform::services::process::RealProcessSpawner),
             home.path(),
-            Arc::new(codex),
+            ManagedTools {
+                codex: Arc::new(codex),
+                claude: Arc::new(ManagedTool::for_host(&crate::managed::claude::CLAUDE)),
+            },
         );
         // The stand-in never reads the params, so they are not subscription-
         // shaped: real ones come only from `Subscriptions::codex_session_login`.

@@ -9,18 +9,14 @@ mod tests {
     #[test]
     fn a_declared_built_in_trips_the_tool_surface_log_every_time() {
         crate::test_support::capture_log(TOOL_SURFACE_LOG_TARGET);
-        let init: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../cairn-models/tests/fixtures/claude_init_tools_none-2.1.302.json"
-        )))
-        .unwrap();
-        let mut declared: Vec<String> = init["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| tool.as_str().unwrap().to_string())
-            .collect();
-        declared.push("Monitor".to_string());
+        let mut declared = cairn_models::wire::claude_stream::Init::from_data(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../cairn-models/tests/fixtures/claude_init_tools_none-2.1.311.json"
+            )))
+            .unwrap(),
+        );
+        declared.tools.push("Monitor".to_string());
 
         let run = "run-tool-surface-tripwire";
         let logged = || {

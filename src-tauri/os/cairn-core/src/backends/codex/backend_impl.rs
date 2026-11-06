@@ -18,7 +18,8 @@ use cairn_models::interface::session::{
     Cli, CodexModels, CodexNativeTools, CodexServer, CodexSpec, NativeGoal, ProviderSpec, Secret,
     SecretEnv, ServerLaunch, SessionError, SessionEvents, SessionHost, SessionSpec, SessionStart,
 };
-use cairn_models::session::codex::managed::{CodexInstallError, ManagedCodexStatus};
+use cairn_models::managed::codex::CODEX;
+use cairn_models::managed::ManagedToolStatus;
 use cairn_models::session::codex::models::discover_codex_models;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -57,30 +58,15 @@ use cairn_models::types::catalog::{
     DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
 };
 
-/// The Codex CLI on the session host, reporting a missing one on the run's
-/// transcript. A managed install's refusal is written as-is: it already says
-/// what failed and how to retry.
+/// The managed Codex on the session host: waited for while its first
+/// install lands, its refusal written to the run's transcript as-is.
 fn resolve_codex_cli(
     orch: &Orchestrator,
     host: &dyn SessionHost,
     run_id: &str,
     session_id: Option<&str>,
 ) -> Result<String, String> {
-    host.resolve_cli(Cli::Codex).map_err(|error| {
-        match &error {
-            SessionError::CliNotFound(reason) => insert_error_event(
-                orch,
-                run_id,
-                session_id,
-                &format!("Codex CLI not found: {}", reason),
-            ),
-            SessionError::CliInstallFailed(reason) => {
-                insert_error_event(orch, run_id, session_id, reason)
-            }
-            _ => {}
-        }
-        error.to_string()
-    })
+    crate::orchestrator::models::resolve_managed_cli(orch, host, Cli::Codex, run_id, session_id)
 }
 
 /// The Codex catalog, asked of the installed managed Codex. Never installs:
@@ -89,12 +75,12 @@ fn resolve_codex_cli(
 pub(crate) fn discover_catalog_blocking(
     orch: &Orchestrator,
 ) -> (Vec<DiscoveredModel>, Option<String>) {
-    let codex = &orch.models_runtime().codex_cli;
+    let codex = &orch.models_runtime().managed.codex;
     let discovered =
         (|| {
             let Some(installed) = codex.installed() else {
                 return Err(match codex.status() {
-                ManagedCodexStatus::Failed(refusal) => refusal,
+                ManagedToolStatus::Failed(refusal) => refusal,
                 _ => "Cairn is still installing Codex; its models appear once the install finishes."
                     .to_string(),
             });
@@ -190,14 +176,10 @@ impl AgentBackend for CodexBackend {
     /// Cairn installs Codex itself, so it is available wherever OpenAI
     /// publishes a package for the host.
     fn is_available(&self) -> Result<(), String> {
-        match cairn_models::session::codex::pin::host_target() {
-            Some(_) => Ok(()),
-            None => Err(CodexInstallError::UnsupportedPlatform {
-                os: std::env::consts::OS,
-                arch: std::env::consts::ARCH,
-            }
-            .to_string()),
-        }
+        CODEX
+            .host_supported()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn serves(
@@ -850,7 +832,8 @@ fn acquire_pooled_server(
     let pool_key = super::pool::versioned_key(
         &pool_key_for_auth(codex_auth, oauth_state.as_ref()),
         runtime
-            .codex_cli
+            .managed
+            .codex
             .installed()
             .map(|installed| installed.version)
             .as_deref(),

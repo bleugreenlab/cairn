@@ -77,7 +77,8 @@ pub const DEV_INSTANCE_ROUTING_ENV: [&str; 2] = ["CAIRN_INSTANCE", "CARGO_TARGET
 /// Maintain the bundled agent tool shims in `<cairn_home>/bin` — `cairn`
 /// (→ `cairn-cmd`), `jj`, `bun`, and `uv` — so every agent-spawned shell
 /// resolves all four on PATH regardless of the host service's own (possibly
-/// empty) PATH. The fifth, `codex`, is not bundled: `ManagedCodex` installs it
+/// empty) PATH. The fifth, `codex`, is not bundled: the managed Codex
+/// (`cairn_models::managed::ManagedTool`) installs it
 /// and maintains its shim through [`ensure_tool_shim`]. Called at startup by whichever host owns the orchestrator (the
 /// runner and `cairn-server`); the desktop thin host does not maintain them.
 ///
@@ -217,7 +218,7 @@ pub const CAIRN_SHIM_MARKER: &str = "cairn-managed-shim";
 /// Install a plain forwarder shim `<bin_dir>/<name>` → the absolute `target_bin`
 /// (Unix symlink; Windows `<name>.cmd`). For tools that need no interception,
 /// only PATH resolution (`cairn`, `bun`, `uv`, and the managed `codex`, which
-/// `cairn_models::session::codex::ManagedCodex` repoints at each release it
+/// `cairn_models::managed::ManagedTool` repoints at each release it
 /// activates).
 ///
 /// Best-effort and idempotent, mirroring `cli_install`'s semantics: an

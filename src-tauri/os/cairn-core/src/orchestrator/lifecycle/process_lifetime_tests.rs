@@ -445,3 +445,83 @@ async fn process_lifetime_exit_reason_write_failure_still_finalizes() {
         .is_none());
     assert_eq!(run_state(&orch).await, ("exited".into(), None));
 }
+
+/// A managed-CLI swap retires an idle provider process and only it: the
+/// job's running terminal survives, and the run is recorded as retired by the
+/// swap.
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_swap_retires_an_idle_provider_and_keeps_its_terminal() {
+    let orch = fixture("swap-retire", "claude", "open", "running").await;
+    orch.db
+        .local
+        .execute_script(
+            r#"INSERT INTO job_terminals(id,job_id,session_id,command,status,created_at,slug)
+                 VALUES('terminal','job','terminal-session','sleep 100','running',1,'dev');"#,
+        )
+        .await
+        .unwrap();
+    register(&orch, 0);
+
+    assert!(super::retire_idle_provider(
+        &orch,
+        "run",
+        "managed_cli_swap"
+    ));
+
+    assert!(!orch.process_state.is_warm("run"));
+    assert_eq!(
+        run_state(&orch).await,
+        ("exited".into(), Some("managed_cli_swap".into()))
+    );
+    let terminal = orch
+        .db
+        .local
+        .query_opt_text("SELECT status FROM job_terminals WHERE id='terminal'", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal.as_deref(),
+        Some("running"),
+        "the dev server keeps running"
+    );
+}
+
+/// The swap never interrupts a process a message is bringing back to work:
+/// one whose job a launch or resume holds is left alone, and so is one that
+/// is no longer idle by the time the swap reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_swap_leaves_a_process_being_resumed_alone() {
+    let orch = fixture("swap-held", "claude", "open", "running").await;
+    register(&orch, 0);
+    let lock = orch.job_launch_lock("job");
+    let guard = lock.lock().unwrap();
+    assert!(!super::retire_idle_provider(
+        &orch,
+        "run",
+        "managed_cli_swap"
+    ));
+    assert!(orch.process_state.is_warm("run"), "a held launch keeps it");
+    drop(guard);
+
+    // A resume took it out of warm between the swap's snapshot and its turn.
+    let orch = fixture("swap-busy", "claude", "open", "running").await;
+    let handle = RunHandle::test_handle(Some("session"), Some("job"));
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run".into(), handle);
+    assert!(!super::retire_idle_provider(
+        &orch,
+        "run",
+        "managed_cli_swap"
+    ));
+    assert_eq!(run_state(&orch).await, ("live".into(), None));
+    assert!(orch
+        .process_state
+        .processes
+        .lock()
+        .unwrap()
+        .get("run")
+        .is_some());
+}

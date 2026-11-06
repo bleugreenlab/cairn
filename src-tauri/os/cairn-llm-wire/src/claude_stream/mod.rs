@@ -11,6 +11,7 @@
 mod content;
 mod event;
 mod evidence;
+pub mod init;
 mod input;
 mod tool_input;
 
@@ -26,11 +27,12 @@ pub use event::{
     MessageContentInner, OutputTokensDetails, RateLimitInfo, StreamEventInner, Usage,
 };
 pub use evidence::{
-    result_is_rate_limited, stderr_reports_session_id_in_use, stderr_reports_unknown_session,
-    terminal_provider_depletion, terms_acceptance_refusal, ProviderDepletion, StreamEvidence,
+    result_is_rate_limited, stderr_failure, terminal_provider_depletion, terms_acceptance_refusal,
+    ProviderDepletion, StderrFailure, StreamEvidence,
 };
+pub use init::Init;
 pub use input::{
-    build_message_content, send_control_response, send_interrupt_request, send_set_model_request,
+    build_message_content, send_interrupt_request, send_set_model_request,
     send_set_permission_mode_request, send_update_environment_variables, send_user_message,
 };
 pub use tool_input::{InputDefect, RejectedToolInput};

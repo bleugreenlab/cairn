@@ -896,8 +896,6 @@ impl RunnerMemoryBindings {
 pub struct AgentProcessState {
     /// Active processes keyed by run_id
     pub processes: ProcessRegistry,
-    /// Cached path to default CLI binary (resolved once on first use)
-    pub cli_binary_path: Mutex<Option<String>>,
     /// Run ids of workflow processes the user deliberately stopped (CAIRN-2516).
     /// A workflow process has no stdin, so a Stop hard-kills it; without this
     /// marker the supervisor would read the signal-killed exit as a crash and
@@ -1059,6 +1057,28 @@ impl AgentProcessState {
 
     pub fn cancel_pending_admission_claim(&self, run_id: &str) -> Option<ProcessAdmissionClaim> {
         self.pending_admission_claims.lock().ok()?.remove(run_id)
+    }
+
+    /// Drop `run_id`'s pre-registration claim if it is still the one for
+    /// `request_id` at `generation`: the authority no longer grants that
+    /// lease, so the launch holding it must not reach its provider. A newer
+    /// claim, or one already handed to a registered process, is untouched.
+    pub fn revoke_pending_admission_claim(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        generation: i64,
+    ) -> bool {
+        let Ok(mut claims) = self.pending_admission_claims.lock() else {
+            return false;
+        };
+        let current = claims
+            .get(run_id)
+            .is_some_and(|claim| claim.request_id == request_id && claim.generation == generation);
+        if current {
+            claims.remove(run_id);
+        }
+        current
     }
 
     /// Consume the claim from either its pre-registration handoff or live handle.
@@ -1794,7 +1814,6 @@ impl Default for AgentProcessState {
     fn default() -> Self {
         Self {
             processes: ProcessRegistry::default(),
-            cli_binary_path: Mutex::new(None),
             workflow_stop_requested: Mutex::new(std::collections::HashSet::new()),
             workflow_leases: Mutex::new(std::collections::HashMap::new()),
             pending_admission_claims: Mutex::new(HashMap::new()),

@@ -51,7 +51,9 @@ pub(crate) use finalize::{
     release_and_stop_process, settle_provider_turn_failure, stop_processes_for_sessions,
 };
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provider_held_run};
-pub(crate) use process_lifetime::sweep_process_lifetimes;
+pub(crate) use process_lifetime::{
+    launch_still_wanted, retire_idle_provider, sweep_process_lifetimes,
+};
 pub(crate) use review_push::{
     arm_turn_end_successor, arm_turn_end_successor_now, spawn_review_wave_unless_in_flight,
 };

@@ -162,14 +162,10 @@ fn only_the_facet_starts_an_app_server_for_a_session() {
     );
 }
 
-/// Finding a CLI to run. A session's process is spawned only by a provider on
-/// its host, so resolving a CLI elsewhere is either a check that it exists or
-/// a mechanics flow that is not a session.
-const CLI_RESOLUTION: &[&str] = &[
-    "find_binary(\"claude\")",
-    "get_claude_path",
-    "claude_path()",
-];
+/// Asking for the Claude CLI's path. A session's process is spawned only by a
+/// provider on its host, so resolving a CLI elsewhere is a mechanics flow that
+/// is not a session.
+const CLI_RESOLUTION: &[&str] = &["claude_path()"];
 
 #[test]
 fn only_the_session_host_resolves_a_cli_to_launch() {
@@ -177,37 +173,12 @@ fn only_the_session_host_resolves_a_cli_to_launch() {
         CLI_RESOLUTION,
         &[
             (
-                "cairn-models/src/session/local.rs",
-                "LocalSessionHost's default Claude resolver, the launch seam",
-            ),
-            (
-                "cairn-core/src/orchestrator/models.rs",
-                "the LocalSessionHost's Claude resolver, the launch seam",
-            ),
-            (
-                "cairn-core/src/orchestrator/session.rs",
-                "get_claude_path itself",
-            ),
-            (
-                "cairn-core/src/backends/claude.rs",
-                "availability and catalog checks, not launches",
-            ),
-            (
                 "cairn-core/src/orchestrator/identity.rs",
                 "ModelHost::claude_path, for subscription mechanics",
             ),
             (
-                "cairn-transport/src/routes/invoke/sync_commands/config_family.rs",
-                "an installed-Claude-CLI check for onboarding",
-            ),
-            ("src/commands/setup.rs", "an installed-CLI check for setup"),
-            (
                 "cairn-models-subscriptions/src/signin/claude.rs",
                 "sign-in flow",
-            ),
-            (
-                "cairn-models-subscriptions/src/claude_home.rs",
-                "managed-home sign-in state",
             ),
             (
                 "cairn-models/src/subscription.rs",
@@ -223,23 +194,28 @@ fn only_the_session_host_resolves_a_cli_to_launch() {
     );
 }
 
-/// Searching the user's PATH for Codex. Every Codex Cairn runs (sessions,
-/// pooled calls, sign-in, usage, catalog discovery) is the managed copy
-/// `cairn_models::session::codex::ManagedCodex` installed, so no file may look
-/// for another one. No allowlist.
-const CODEX_PATH_SEARCH: &[&str] = &[
+/// Searching the user's PATH for a managed CLI, or the cache that used to
+/// hold Claude's PATH answer. Every Codex and Claude Code Cairn runs
+/// (sessions, pooled calls, sign-in, usage, catalog discovery, onboarding) is
+/// the managed copy `cairn_models::managed::ManagedTool` installed, so no
+/// file may look for another one. No allowlist.
+const MANAGED_TOOL_PATH_SEARCH: &[&str] = &[
     "find_binary(\"codex\")",
     "find_binary_on_agent_path(\"codex\")",
+    "find_binary(\"claude\")",
+    "find_binary_on_agent_path(\"claude\")",
+    "get_claude_path",
+    "cli_binary_path",
 ];
 
 #[test]
-fn codex_resolves_only_through_the_managed_copy() {
-    let found = hits(CODEX_PATH_SEARCH, &[]);
+fn managed_tools_resolve_only_through_the_managed_copy() {
+    let found = hits(MANAGED_TOOL_PATH_SEARCH, &[]);
     assert!(
         found.is_empty(),
-        "a Codex CLI searched for on the PATH; resolve it through the session \
-         host (`models_runtime().host.resolve_cli(Cli::Codex)`) or the \
-         `ManagedCodex` itself instead:\n  {}",
+        "a managed CLI searched for on the PATH; resolve it through the session \
+         host (`models_runtime().host.resolve_cli(..)`) or the `ManagedTool` \
+         itself instead:\n  {}",
         found.join("\n  ")
     );
 }

@@ -24,7 +24,33 @@ use crate::wire::claude_stream;
 use crate::wire::MessageContent;
 use args::{build_claude_args, ClaudeArgsConfig};
 
-/// The environment every Claude session runs with, whoever launches it.
+/// The switches every Claude CLI Cairn starts carries: sessions (interactive
+/// and one-shot), sign-in, `auth status`, and the managed install's version
+/// probe all read this one definition, and the claude-contract suite's
+/// no-egress and no-update cases run under it, never a copy.
+///
+/// `DISABLE_AUTOUPDATER` and `DISABLE_UPDATES` keep the CLI on the release
+/// Cairn installed: its self-updater manages the user's own
+/// `~/.local/bin/claude`, never Cairn's. `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+/// stops the rest of its own traffic; measured on 2.1.311 on macOS and
+/// Linux, a session opened three connections to `api.anthropic.com` beside
+/// its model endpoint without it, and none with it.
+///
+/// Operator decision (harness thread, 2026-11-05): every production Claude
+/// launch sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, beside
+/// `DISABLE_AUTOUPDATER=1` and `DISABLE_UPDATES=1`. Its effect on
+/// server-side feature flags is unverified. If a behavior Cairn relies on
+/// turns out to be flag-gated and disappears, the remedy is to set that
+/// behavior explicitly, through an env var, setting or flag the contract can
+/// see. Re-enabling nonessential traffic is never the remedy.
+pub const CLAUDE_HARDENING_ENV: &[(&str, &str)] = &[
+    ("DISABLE_AUTOUPDATER", "1"),
+    ("DISABLE_UPDATES", "1"),
+    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+];
+
+/// The environment every Claude session runs with, whoever launches it:
+/// [`CLAUDE_HARDENING_ENV`], then the session's own settings.
 ///
 /// Tool search and the CLI's own task list are off because Cairn owns tool
 /// discovery and delegation.
@@ -39,14 +65,18 @@ use args::{build_claude_args, ClaudeArgsConfig};
 /// every held call, which is what keeps the idle bound from firing; the idle
 /// setting is the backstop for a CLI build that stops honoring them. It is not
 /// 0, which would disable the bound even for a wedged socket.
-pub fn claude_session_env() -> [(&'static str, String); 4] {
+pub fn claude_session_env() -> Vec<(&'static str, String)> {
     let tool_timeout_ms = AGENT_MCP_TOOL_TIMEOUT.as_millis().to_string();
-    [
-        ("ENABLE_TOOL_SEARCH", "false".to_string()),
-        ("CLAUDE_CODE_ENABLE_TASKS", "false".to_string()),
-        ("MCP_TOOL_TIMEOUT", tool_timeout_ms.clone()),
-        ("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", tool_timeout_ms),
-    ]
+    CLAUDE_HARDENING_ENV
+        .iter()
+        .map(|(name, value)| (*name, value.to_string()))
+        .chain([
+            ("ENABLE_TOOL_SEARCH", "false".to_string()),
+            ("CLAUDE_CODE_ENABLE_TASKS", "false".to_string()),
+            ("MCP_TOOL_TIMEOUT", tool_timeout_ms.clone()),
+            ("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", tool_timeout_ms),
+        ])
+        .collect()
 }
 
 /// Every way a Claude CLI can be handed a credential through its environment.

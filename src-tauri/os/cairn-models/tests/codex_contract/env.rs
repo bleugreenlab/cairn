@@ -1,4 +1,4 @@
-//! One case's world: the real pinned Codex installed through `ManagedCodex`,
+//! One case's world: the real pinned Codex installed through `ManagedTool`,
 //! Cairn's real session host and rendered config, the fake provider, and the
 //! readers a case asserts with.
 //!
@@ -24,8 +24,10 @@ use cairn_models::interface::session::{
     LaunchedSession, NativeGoal, ProviderSpec, Secret, SecretEnv, ServerLaunch, SessionError,
     SessionEvents, SessionHost, SessionProvider, SessionSpec, SessionStart,
 };
-use cairn_models::session::codex::managed::{ManagedCodex, RefusingSource};
-use cairn_models::session::codex::{pin, CodexAppServer, CodexControl};
+use cairn_models::managed::claude::CLAUDE;
+use cairn_models::managed::codex::CODEX;
+use cairn_models::managed::{ManagedTool, ManagedTools, RefusingSource};
+use cairn_models::session::codex::{CodexAppServer, CodexControl};
 use cairn_models::session::local::LocalSessionHost;
 use cairn_models::session::mcp::{McpServer, McpServers, McpTransport};
 use cairn_models::wire::codex_app_server::{
@@ -538,7 +540,7 @@ pub struct ContractEnv {
     pub fake: FakeResponses,
     staged: PathBuf,
     dir: tempfile::TempDir,
-    managed: Arc<ManagedCodex>,
+    managed: Arc<ManagedTool>,
     codex_home: PathBuf,
     work: PathBuf,
     tap: Tap,
@@ -569,9 +571,10 @@ impl ContractEnv {
         let root = std::env::var_os(ROOT_ENV).ok_or_else(|| {
             format!("{ROOT_ENV} is unset: run `bun run codex:contract`, which stages the pinned Codex package")
         })?;
-        let pin = pin::embedded_pin();
-        let target = pin::host_target().ok_or("OpenAI publishes no Codex package for this host")?;
-        let archive_name = format!("codex-package-{target}-{}.tar.gz", pin.version);
+        let pin = CODEX.embedded();
+        let target =
+            (CODEX.host_target)().ok_or("OpenAI publishes no Codex package for this host")?;
+        let archive_name = (CODEX.download_file_name)(target, &pin.version);
         let staged = Path::new(&root).join("downloads").join(&archive_name);
         if !staged.is_file() {
             return Err(format!(
@@ -642,13 +645,13 @@ impl ContractEnv {
         self.dir.path()
     }
 
-    pub fn managed(&self) -> &Arc<ManagedCodex> {
+    pub fn managed(&self) -> &Arc<ManagedTool> {
         &self.managed
     }
 
-    /// A `ManagedCodex` with nothing installed yet and the staged package in
+    /// A managed Codex with nothing installed yet and the staged package in
     /// its downloads, as a host has after a manual download.
-    pub fn fresh_managed(&self) -> Result<ManagedCodex, String> {
+    pub fn fresh_managed(&self) -> Result<ManagedTool, String> {
         let root = self.dir.path().join("fresh");
         stage(&root, &self.staged)?;
         Ok(install_root(&root))
@@ -671,7 +674,16 @@ impl ContractEnv {
             inner: LocalSessionHost::new(
                 Arc::new(TapSpawner(self.tap.clone())),
                 &self.codex_home,
-                self.managed.clone(),
+                ManagedTools {
+                    codex: self.managed.clone(),
+                    claude: Arc::new(ManagedTool::new(
+                        &CLAUDE,
+                        self.dir.path().join("no-claude"),
+                        self.dir.path().join("bin"),
+                        Arc::new(RefusingSource),
+                        Arc::new(RefusingSource),
+                    )),
+                },
             ),
             provider: Some({
                 let auth = if self.chatgpt_provider {
@@ -848,9 +860,10 @@ impl ContractEnv {
     }
 }
 
-/// A `ManagedCodex` rooted at `root` that can never download.
-fn install_root(root: &Path) -> ManagedCodex {
-    ManagedCodex::new(
+/// A managed Codex rooted at `root` that can never download.
+fn install_root(root: &Path) -> ManagedTool {
+    ManagedTool::new(
+        &CODEX,
         root.join("tools").join("codex"),
         root.join("bin"),
         Arc::new(RefusingSource),
@@ -858,7 +871,7 @@ fn install_root(root: &Path) -> ManagedCodex {
     )
 }
 
-/// Put `staged` in the downloads of the `ManagedCodex` at `root`, where
+/// Put `staged` in the downloads of the managed Codex at `root`, where
 /// `ensure()` installs it from without a download. Never writes over an
 /// existing file: a hard link shares the staged package's inode, so copying
 /// onto it would truncate the package itself.

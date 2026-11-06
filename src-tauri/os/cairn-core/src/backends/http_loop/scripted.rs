@@ -20,7 +20,7 @@
 //! golden would bury the shape these tests exist to watch.
 
 use super::{run_http_turn, Connection, WireAdapter};
-use crate::agent_process::process::{AgentProcessState, RunHandle};
+use crate::agent_process::process::RunHandle;
 use crate::backends::{AgentPermissions, SessionConfig, SessionStart};
 use crate::models::Fence;
 use crate::orchestrator::models::ModelRuntime;
@@ -101,7 +101,7 @@ pub(in crate::backends) async fn orchestrator(
     let services = Arc::new(TestServicesBuilder::new().build());
     let mut runtime = ModelRuntime::local(
         services.process.clone(),
-        Arc::new(AgentProcessState::default()),
+        cairn_models::managed::ManagedTools::for_host(),
     );
     runtime.complete = complete;
     let orch = OrchestratorBuilder::new(db_state, services, config_dir)

@@ -19,10 +19,10 @@ use cairn_models::session::events::SessionEvent;
 use cairn_models::types::catalog::{claude_reported_context_window, claude_session_window};
 use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
 use cairn_models::wire::claude_stream::{
-    extract_tool_start, message_start_usage, parse_thinking_tokens_estimate,
-    result_is_rate_limited, stderr_reports_session_id_in_use, stderr_reports_unknown_session,
-    terminal_provider_depletion, ClaudeEvent, ControlResponseInner, DeltaContent,
-    ProviderDepletion, RateLimitInfo, StreamEventInner, StreamEvidence, Usage,
+    extract_tool_start, init::missing_core_verbs, message_start_usage,
+    parse_thinking_tokens_estimate, result_is_rate_limited, stderr_failure,
+    terminal_provider_depletion, ClaudeEvent, ControlResponseInner, DeltaContent, Init,
+    ProviderDepletion, RateLimitInfo, StderrFailure, StreamEventInner, StreamEvidence, Usage,
 };
 use cairn_platform::services::emitter::EventEmitter;
 use std::{
@@ -327,34 +327,17 @@ pub fn validate_claude_init(
     data: &serde_json::Value,
     stderr_diagnostics: &[String],
 ) -> Result<(), String> {
-    let tools = data
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect::<Vec<_>>();
-    let missing = crate::agent_process::toolkits::CORE_VERBS
-        .iter()
-        .copied()
-        .filter(|required| !tools.contains(required))
-        .collect::<Vec<_>>();
+    let init = Init::from_data(data);
+    let missing = missing_core_verbs(&init);
     if missing.is_empty() {
         return Ok(());
     }
 
-    let server_status = data
-        .get("mcp_servers")
-        .and_then(serde_json::Value::as_array)
+    let tools = init.tools.iter().map(String::as_str).collect::<Vec<_>>();
+    let server_status = init
+        .mcp_server_statuses("cairn")
         .into_iter()
-        .flatten()
-        .filter(|server| server.get("name").and_then(serde_json::Value::as_str) == Some("cairn"))
-        .map(|server| {
-            server
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-        })
+        .map(|status| status.unwrap_or("unknown"))
         .collect::<Vec<_>>();
     let diagnostics = if stderr_diagnostics.is_empty() {
         "Claude reported no MCP startup diagnostics".to_string()
@@ -845,17 +828,13 @@ pub(crate) fn claude_rate_limit_snapshot(info: &RateLimitInfo) -> ProviderUsageS
     }
 }
 
-/// Map a stderr line to the typed backend failure it proves, if any. The CLI's
-/// wording is recognized by the wire crate; this names what it means for the
-/// session: a `--resume` handle the CLI could not find, or a fresh
-/// `--session-id` the CLI had already created a conversation under.
-pub fn classify_stderr_failure(line: &str) -> Option<BackendFailure> {
-    if stderr_reports_unknown_session(line) {
-        Some(BackendFailure::SessionUnresolvable)
-    } else if stderr_reports_session_id_in_use(line) {
-        Some(BackendFailure::SessionIdInUse)
-    } else {
-        None
+/// The backend failure a stderr failure means for the session: a `--resume`
+/// handle the CLI could not find, or a fresh `--session-id` the CLI had
+/// already created a conversation under.
+fn backend_failure(failure: StderrFailure) -> BackendFailure {
+    match failure {
+        StderrFailure::SessionUnresolvable => BackendFailure::SessionUnresolvable,
+        StderrFailure::SessionIdInUse => BackendFailure::SessionIdInUse,
     }
 }
 
@@ -885,7 +864,7 @@ impl StderrWatch {
             log::debug!("stderr_thread: started");
             for line in stderr.lines().map_while(Result::ok) {
                 log::error!("claude stderr: {}", line);
-                if let Some(classified) = classify_stderr_failure(&line) {
+                if let Some(classified) = stderr_failure(&line).map(backend_failure) {
                     if let Ok(mut slot) = thread_failure.lock() {
                         slot.get_or_insert(classified);
                     }
@@ -1518,22 +1497,8 @@ impl ClaudeRuntime {
                     // declared to the model. Under `--tools ""` that is only
                     // MCP tools; anything else means the CLI broke the
                     // contract, and the tripwire logs it.
-                    if let ClaudeEvent::System { subtype, data, .. } = &event {
-                        if subtype == "init" {
-                            let declared: Vec<String> = data
-                                .get("tools")
-                                .and_then(|t| t.as_array())
-                                .map(|tools| {
-                                    tools
-                                        .iter()
-                                        .filter_map(|t| t.as_str().map(str::to_string))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            crate::agent_process::toolkits::report_declared_surface(
-                                run_id, &declared,
-                            );
-                        }
+                    if let Some(init) = Init::of(&event) {
+                        crate::agent_process::toolkits::report_declared_surface(run_id, &init);
                     }
 
                     // Handle control responses

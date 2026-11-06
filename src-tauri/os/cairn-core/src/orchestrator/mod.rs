@@ -131,6 +131,7 @@ pub struct OrchestratorBuilder {
     credential_store: Option<CredentialStore>,
     subscriptions: Arc<dyn cairn_models::subscription::Subscriptions>,
     models_runtime: Option<models::ModelRuntime>,
+    managed_tools: Option<cairn_models::managed::ManagedTools>,
     mcp_binary_path: String,
     jj_binary_path: String,
     config_dir: PathBuf,
@@ -457,6 +458,7 @@ impl OrchestratorBuilder {
             credential_store,
             subscriptions: Arc::new(cairn_models::subscription::Unsubscribed),
             models_runtime: None,
+            managed_tools: None,
             mcp_binary_path: "cairn-cmd".to_string(),
             jj_binary_path: default_jj_binary_path(),
             config_dir,
@@ -619,6 +621,14 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// The managed CLIs the default runtime's sessions launch. Defaults to
+    /// this host's ([`cairn_models::managed::ManagedTools::for_host`]); tests
+    /// install planted releases here.
+    pub fn managed_tools(mut self, tools: cairn_models::managed::ManagedTools) -> Self {
+        self.managed_tools = Some(tools);
+        self
+    }
+
     pub fn mcp_binary_path(mut self, mcp_binary_path: impl Into<String>) -> Self {
         self.mcp_binary_path = mcp_binary_path.into();
         self
@@ -776,8 +786,12 @@ impl OrchestratorBuilder {
         // Its debts reload before any purpose item is admitted, so nothing
         // dispatches beside one.
         fleet.attach_purpose_debt_journal(self.db.local.clone());
+        let managed_tools = self.managed_tools;
         let models_runtime = self.models_runtime.unwrap_or_else(|| {
-            models::ModelRuntime::local(self.services.process.clone(), self.process_state.clone())
+            models::ModelRuntime::local(
+                self.services.process.clone(),
+                managed_tools.unwrap_or_else(cairn_models::managed::ManagedTools::for_host),
+            )
         });
         let credential_store =
             CredentialStoreHandle::new(self.config_dir.clone(), self.credential_store);

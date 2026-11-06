@@ -7,11 +7,11 @@
 use std::time::{Duration, Instant};
 
 use cairn_models::interface::session::CodexNativeTools;
-use cairn_models::session::codex::managed::parse_codex_version;
+use cairn_models::managed::codex::CODEX;
+use cairn_models::managed::parse_cli_version;
 use cairn_models::session::codex::params::{
     build_thread_fork_params, build_thread_resume_params, build_thread_start_params,
 };
-use cairn_models::session::codex::pin;
 use cairn_models::session::codex::thread::reconcile_goal;
 use cairn_models::session::events::codex::EventMapper;
 use cairn_models::session::events::{SessionEvent, TurnStatus};
@@ -80,11 +80,11 @@ fn run_turn(
 
 pub fn managed_install_of_pinned_package(env: &ContractEnv) -> CaseResult {
     let c = Check("managed_install_of_pinned_package");
-    let pin = pin::embedded_pin();
+    let pin = CODEX.embedded();
     let managed = c.setup(env.fresh_managed(), "staging a fresh install root")?;
     let resolved = c.ok(
         managed.ensure(),
-        "installing the staged pinned package through ManagedCodex::ensure",
+        "installing the staged pinned package through ManagedTool::ensure",
     )?;
     c.that(resolved.version == pin.version, || {
         format!(
@@ -100,7 +100,7 @@ pub fn managed_install_of_pinned_package(env: &ContractEnv) -> CaseResult {
     )?;
     let printed = String::from_utf8_lossy(&output.stdout).to_string();
     c.that(
-        parse_codex_version(&printed) == Some(pin.version.as_str()),
+        parse_cli_version(&printed) == Some(pin.version.as_str()),
         || {
             format!(
                 "`codex --version` printed {printed:?}, not codex-cli {}",
@@ -910,7 +910,7 @@ pub fn protocol_surface_against(env: &ContractEnv, fixture: &std::path::Path) ->
     c.that(problems.is_empty(), || {
         format!(
             "Codex {}'s protocol no longer matches what Cairn relies on:\n  {}",
-            pin::embedded_pin().version,
+            CODEX.embedded().version,
             problems.join("\n  ")
         )
     })

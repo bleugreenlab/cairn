@@ -40,8 +40,10 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+# Integration tests plant releases through `managed::testing`.
+cairn-models = { path = ".", features = ["test-utils"] }
 cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
-# The CLI contract test reads a live process's launch environment.
+# The claude-contract suite reads a live process's launch environment.
 libc = "0.2"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
@@ -52,8 +54,16 @@ test-utils = ["cairn-platform/test-utils"]
 # `bun run codex:contract` enables it, so no ordinary test, lint, or
 # full-suite run builds or selects the target.
 codex-contract = []
+# The real-binary Claude Code contract suite (tests/claude_contract), enabled
+# only by `bun run claude:contract`.
+claude-contract = []
 
 [[test]]
 name = "codex_contract"
 path = "tests/codex_contract/main.rs"
 required-features = ["codex-contract"]
+
+[[test]]
+name = "claude_contract"
+path = "tests/claude_contract/main.rs"
+required-features = ["claude-contract"]

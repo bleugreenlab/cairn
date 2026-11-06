@@ -8,53 +8,42 @@ use cairn_platform::services::process::{ChildProcess, ProcessSpawner, SpawnConfi
 
 use crate::interface::session::{Cli, CodexModels, SessionError, SessionHost};
 use crate::interface::LOCAL_HOST;
-use crate::session::codex::{home, models, ManagedCodex};
+use crate::managed::{InstallProgress, ManagedTools};
+use crate::session::codex::{home, models};
 
-/// How a host finds the Claude CLI. Cairn caches the answer; the default
-/// searches the `PATH` each time.
-pub type ClaudeResolver = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
-
-/// The [`SessionHost`] for sessions whose processes run on this machine: CLIs
-/// are found here, spawned through the host's [`ProcessSpawner`], and Codex
-/// runs in the `CODEX_HOME` the host names.
+/// The [`SessionHost`] for sessions whose processes run on this machine:
+/// every CLI is the managed copy Cairn installed, spawned through the host's
+/// [`ProcessSpawner`], and Codex runs in the `CODEX_HOME` the host names.
 pub struct LocalSessionHost {
     process: Arc<dyn ProcessSpawner>,
     codex_home: PathBuf,
-    codex: Arc<ManagedCodex>,
-    claude: ClaudeResolver,
+    managed: ManagedTools,
 }
 
 impl LocalSessionHost {
     /// Spawn through `process`, and keep Codex's home at `codex_home` (which
-    /// must be the host's own, never the user's `~/.codex`; see
-    /// [`home`]). Codex is the one `codex` installs and resolves; the Claude
-    /// CLI is found on the `PATH`.
+    /// must be the host's own, never the user's `~/.codex`; see [`home`]).
+    /// Each CLI resolves to the one `managed` installs; a CLI on the `PATH`
+    /// is never consulted.
     pub fn new(
         process: Arc<dyn ProcessSpawner>,
         codex_home: impl Into<PathBuf>,
-        codex: Arc<ManagedCodex>,
+        managed: ManagedTools,
     ) -> Self {
         Self {
             process,
             codex_home: codex_home.into(),
-            codex,
-            claude: Arc::new(|| cairn_platform::env::find_binary("claude")),
+            managed,
         }
-    }
-
-    /// Find the Claude CLI with `resolver` instead of searching the `PATH`.
-    pub fn with_claude_resolver(mut self, resolver: ClaudeResolver) -> Self {
-        self.claude = resolver;
-        self
     }
 
     pub fn codex_home(&self) -> &Path {
         &self.codex_home
     }
 
-    /// The managed Codex this host launches.
-    pub fn managed_codex(&self) -> &Arc<ManagedCodex> {
-        &self.codex
+    /// The managed CLIs this host launches.
+    pub fn managed(&self) -> &ManagedTools {
+        &self.managed
     }
 }
 
@@ -64,14 +53,28 @@ impl SessionHost for LocalSessionHost {
     }
 
     fn resolve_cli(&self, cli: Cli) -> Result<String, SessionError> {
-        match cli {
-            Cli::Claude => (self.claude)().map_err(SessionError::CliNotFound),
-            Cli::Codex => self
-                .codex
-                .ensure()
-                .map(|resolved| resolved.path.to_string_lossy().into_owned())
-                .map_err(|error| SessionError::CliInstallFailed(error.to_string())),
-        }
+        self.resolve_cli_waiting(cli, &mut |_| {}, &|| true)
+    }
+
+    fn resolve_cli_waiting(
+        &self,
+        cli: Cli,
+        on_wait: &mut dyn FnMut(InstallProgress),
+        still_wanted: &dyn Fn() -> bool,
+    ) -> Result<String, SessionError> {
+        self.managed
+            .get(cli)
+            .ensure_with(on_wait, still_wanted)
+            .map(|resolved| resolved.path.to_string_lossy().into_owned())
+            .map_err(|error| {
+                // An abandoned wait is not a failed install: nothing for the
+                // transcript to report as one.
+                if error.is_cancelled() {
+                    SessionError::Setup(error.to_string())
+                } else {
+                    SessionError::CliInstallFailed(error.to_string())
+                }
+            })
     }
 
     fn spawn(&self, config: SpawnConfig) -> Result<Box<dyn ChildProcess>, String> {

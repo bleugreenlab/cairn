@@ -1,0 +1,11 @@
+{
+  "claude_code_version": "2.1.311",
+  "mcp_servers": [],
+  "model": "claude-sonnet-5-5",
+  "permissionMode": "default",
+  "subtype": "init",
+  "tools": [
+    "StructuredOutput"
+  ],
+  "type": "system"
+}

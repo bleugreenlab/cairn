@@ -246,3 +246,60 @@ pub(crate) fn sweep_process_lifetimes(orch: &Orchestrator) {
         "Process lifetime sweep: inspected={inspected}, session_closed={session_closed}, job_cancelled={job_cancelled}, cache_horizon_idle={cache_horizon_idle}"
     );
 }
+
+/// Retire `run_id`'s provider process because the CLI it runs was replaced
+/// (a managed-CLI swap), if it is still idle.
+///
+/// The same discipline as the lifetime sweep: the job's launch lock is taken
+/// without waiting (a job whose launch or resume holds it is left alone, so
+/// a process a message is resuming is never torn down mid-turn), idleness is
+/// checked again under it, only the provider process is torn down (the
+/// job's terminals keep running), and the run is finalized outside the lock.
+/// Returns whether it was retired.
+pub(crate) fn retire_idle_provider(orch: &Orchestrator, run_id: &str, exit_reason: &str) -> bool {
+    let Some(job_id) = super::common::job_id_for_run(orch, run_id) else {
+        return false;
+    };
+    let launch_lock = orch.job_launch_lock(&job_id);
+    let Ok(guard) = launch_lock.try_lock() else {
+        return false;
+    };
+    if !orch.process_state.is_warm(run_id) {
+        return false;
+    }
+    if let Err(error) = teardown_process(orch, run_id, TerminalPolicy::Keep) {
+        log::warn!("Could not retire idle run {run_id}: {error}");
+        return false;
+    }
+    // Finalization can launch the job's next turn, and the launch lock is not
+    // reentrant.
+    drop(guard);
+    if let Err(error) = set_exit_reason(orch, run_id, exit_reason) {
+        log::error!("Failed to record exit for retired run {run_id}: {error}");
+    }
+    finalize_run(orch, run_id, RunStatus::Exited);
+    true
+}
+
+/// Whether a launch still waiting on its CLI's install still wants it: its
+/// run has not been stopped or settled meanwhile, and the admission claim it
+/// launched under, if any, is still current. A run with no row reads as
+/// wanted.
+pub(crate) fn launch_still_wanted(
+    orch: &Orchestrator,
+    run_id: &str,
+    claim: Option<&(String, i64)>,
+) -> bool {
+    if let Some((request_id, generation)) = claim {
+        if !orch
+            .process_state
+            .admission_claim_is_current(run_id, request_id, *generation)
+        {
+            return false;
+        }
+    }
+    !matches!(
+        super::common::run_status(orch, run_id).as_deref(),
+        Some(status) if status != "starting" && status != "live"
+    )
+}

@@ -176,10 +176,11 @@ fn orchestrator_with_spawn_failure(
     std::fs::create_dir_all(config_dir.join("agents")).unwrap();
     std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
 
-    // Pre-resolved so the spawn never shells out to `which claude`. The recording
-    // spawner never executes it, so the path only has to be a path.
+    // A planted managed release, so the launch never waits on an install. The
+    // recording spawner never executes it.
     let process_state = Arc::new(AgentProcessState::default());
-    *process_state.cli_binary_path.lock().unwrap() = Some("/cairn-test/claude".to_string());
+    let managed =
+        cairn_models::managed::testing::tools_with_claude(&temp.path().join("managed"), "exit 0");
 
     let credential_store = claude_auth.map(|claude_auth| {
         CredentialStore::from_user_identity(&UserIdentity {
@@ -196,6 +197,7 @@ fn orchestrator_with_spawn_failure(
         Orchestrator::builder(db_state, services, config_dir)
             .boot_at(0)
             .process_state(process_state)
+            .managed_tools(managed)
             .credential_store(credential_store)
             .build(),
         recorder,

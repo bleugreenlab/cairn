@@ -10,37 +10,29 @@
 //!
 //! Every backend calls [`resolve_tools`] from its `resolve_tools()`.
 
+use cairn_models::wire::claude_stream::init::builtin_tools;
+use cairn_models::wire::claude_stream::Init;
+
+/// The three core verbs, the entire working Cairn surface. Defined beside the
+/// `init` predicate that requires them.
+pub use cairn_models::wire::claude_stream::init::CORE_VERBS;
+
 /// The log target of a Claude session whose declared tools broke the
 /// `--tools ""` contract.
 pub const TOOL_SURFACE_LOG_TARGET: &str = "cairn::claude_tool_surface";
 
-/// The CLI-internal tool through which a `--json-schema` answer arrives. It is
-/// declared only under `--json-schema`, and `--tools ""` rightly leaves it.
-const STRUCTURED_OUTPUT: &str = "StructuredOutput";
-
-/// Does this declared tool name sit outside Cairn's surface?
-///
-/// Every tool Cairn offers is an MCP tool: the three verbs (`mcp__cairn__*`),
-/// the corpus tools, and any external server reached through the `cairn://mcp`
-/// gateway. Every launch passes `--tools ""`, so the CLI declares no built-in,
-/// and a bare name in a session's declared surface means that contract broke.
-fn is_native_leak(tool: &str) -> bool {
-    !tool.starts_with("mcp__") && tool != STRUCTURED_OUTPUT
-}
-
 /// Check the tool surface a Claude session declared in its `init` event,
-/// returning every name outside Cairn's surface and logging an error when
-/// there is any.
+/// returning every name outside Cairn's surface ([`builtin_tools`]) and
+/// logging an error when there is any.
 ///
 /// This is a tripwire, not a fence: `--tools ""` is what keeps built-ins off,
 /// and nothing here feeds a later launch. It holds no memory, so every
 /// violating session is reported. The `init` event itself is persisted as the
 /// run's `system:init` event row, which keeps the evidence queryable.
-pub fn report_declared_surface(run_id: &str, declared: &[String]) -> Vec<String> {
-    let violations: Vec<String> = declared
-        .iter()
-        .filter(|tool| is_native_leak(tool))
-        .cloned()
+pub fn report_declared_surface(run_id: &str, init: &Init) -> Vec<String> {
+    let violations: Vec<String> = builtin_tools(init)
+        .into_iter()
+        .map(str::to_string)
         .collect();
     if !violations.is_empty() {
         log::error!(
@@ -118,9 +110,6 @@ pub fn resolve_tools(tools: &[String]) -> Vec<String> {
     allowed
 }
 
-/// The three core verbs — the entire working Cairn surface.
-pub const CORE_VERBS: [&str; 3] = ["mcp__cairn__read", "mcp__cairn__write", "mcp__cairn__run"];
-
 /// Ensure the three core verbs are present in an allow-list, appending any that
 /// are missing (order preserved, deduped).
 ///
@@ -141,58 +130,6 @@ pub fn ensure_core_verbs(allowed: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_bare_names_count_as_leaks() {
-        // Everything Cairn offers is an MCP tool, whatever the server.
-        assert!(!is_native_leak("mcp__cairn__read"));
-        assert!(!is_native_leak("mcp__cairn__create_pr"));
-        assert!(!is_native_leak("mcp__axon__look"));
-        // The schema answer channel is the CLI's own, not a built-in.
-        assert!(!is_native_leak("StructuredOutput"));
-        // A bare name can only have come from the host harness.
-        assert!(is_native_leak("ListAgents"));
-        assert!(is_native_leak("SendMessage"));
-    }
-
-    /// The `tools` of an `init` event the real CLI emitted.
-    fn recorded_init_tools(init: &str) -> Vec<String> {
-        let init: serde_json::Value = serde_json::from_str(init).unwrap();
-        init["tools"]
-            .as_array()
-            .expect("an init event lists its tools")
-            .iter()
-            .map(|tool| tool.as_str().unwrap().to_string())
-            .collect()
-    }
-
-    /// Claude Code, launched with Cairn's own arguments and Cairn's MCP
-    /// server, declared only Cairn's verbs, so the tripwire stays quiet.
-    #[test]
-    fn the_recorded_agent_launch_declares_only_cairn_tools() {
-        let tools = recorded_init_tools(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../cairn-models/tests/fixtures/claude_init_tools_none-2.1.302.json"
-        )));
-        assert!(!tools.is_empty());
-        assert!(
-            tools.iter().all(|tool| tool.starts_with("mcp__cairn__")),
-            "{tools:?}"
-        );
-        assert!(report_declared_surface("fixture", &tools).is_empty());
-    }
-
-    /// A schema-constrained call declares StructuredOutput, which is how its
-    /// answer arrives, and that is not a violation.
-    #[test]
-    fn the_recorded_schema_call_declares_only_structured_output() {
-        let tools = recorded_init_tools(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../cairn-models/tests/fixtures/claude_init_json_schema-2.1.302.json"
-        )));
-        assert_eq!(tools, vec!["StructuredOutput".to_string()]);
-        assert!(report_declared_surface("fixture", &tools).is_empty());
-    }
 
     #[test]
     fn read_aliases_to_cairn_read() {

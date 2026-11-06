@@ -656,7 +656,7 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     for (provider, label, auth) in [
@@ -1292,7 +1292,7 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
@@ -1544,7 +1544,7 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
         claude: Arc::new(TermsRefusingClaude(recorder.clone(), None)),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
@@ -1676,7 +1676,7 @@ async fn a_terms_refused_claude_one_shot_is_served_on_the_next_account() {
         claude: Arc::new(TermsRefusingClaude(recorder.clone(), Some(fresh.clone()))),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
     };
 
@@ -1723,7 +1723,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
@@ -2067,5 +2067,464 @@ async fn a_refused_claude_start_settles_on_its_own_run() {
     assert_eq!(
         *claude.launched_ids.lock().unwrap(),
         ["sess-a-rejected", "sess-a-rejected", "sess-b"]
+    );
+}
+
+/// A package download held at its start until opened, then serving `bytes`.
+struct GatedDownload {
+    bytes: Vec<u8>,
+    /// `(open, downloads begun)`.
+    state: Mutex<(bool, usize)>,
+    changed: Condvar,
+}
+
+impl GatedDownload {
+    fn new(bytes: Vec<u8>, open: bool) -> Arc<Self> {
+        Arc::new(Self {
+            bytes,
+            state: Mutex::new((open, 0)),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn open(&self) {
+        self.state.lock().unwrap().0 = true;
+        self.changed.notify_all();
+    }
+
+    fn begun(&self) -> usize {
+        self.state.lock().unwrap().1
+    }
+
+    fn wait_for_a_download(&self) {
+        let state = self.state.lock().unwrap();
+        let (_state, timeout) = self
+            .changed
+            .wait_timeout_while(state, WAIT, |(_, begun)| *begun == 0)
+            .unwrap();
+        assert!(!timeout.timed_out(), "the install never began its download");
+    }
+}
+
+impl cairn_models::managed::Fetch for GatedDownload {
+    fn download(
+        &self,
+        _url: &str,
+        dest: &std::path::Path,
+        _max_bytes: u64,
+        _stop: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), cairn_models::managed::FetchError> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.1 += 1;
+            self.changed.notify_all();
+            let _open = self.changed.wait_while(state, |(open, _)| !*open).unwrap();
+        }
+        std::fs::write(dest, &self.bytes)
+            .map_err(|error| cairn_models::managed::FetchError::refused(error.to_string()))
+    }
+}
+
+/// A host whose `cli` is a real managed install (the engine Cairn ships,
+/// downloading through a test [`cairn_models::managed::Fetch`]), and
+/// otherwise inert.
+struct InstallingHost {
+    cli: Cli,
+    tool: Arc<cairn_models::managed::ManagedTool>,
+}
+
+impl SessionHost for InstallingHost {
+    fn name(&self) -> &str {
+        "coverage-host"
+    }
+    fn resolve_cli(&self, cli: Cli) -> Result<String, SessionError> {
+        self.resolve_cli_waiting(cli, &mut |_| {}, &|| true)
+    }
+    fn resolve_cli_waiting(
+        &self,
+        cli: Cli,
+        on_wait: &mut dyn FnMut(cairn_models::managed::InstallProgress),
+        still_wanted: &dyn Fn() -> bool,
+    ) -> Result<String, SessionError> {
+        if cli != self.cli {
+            return InertHost.resolve_cli(cli);
+        }
+        self.tool
+            .ensure_with(on_wait, still_wanted)
+            .map(|resolved| resolved.path.to_string_lossy().into_owned())
+            .map_err(|error| {
+                if error.is_cancelled() {
+                    SessionError::Setup(error.to_string())
+                } else {
+                    SessionError::CliInstallFailed(error.to_string())
+                }
+            })
+    }
+    fn spawn(
+        &self,
+        config: cairn_platform::services::process::SpawnConfig,
+    ) -> Result<Box<dyn cairn_platform::services::process::ChildProcess>, String> {
+        InertHost.spawn(config)
+    }
+    fn place_file(&self, dir: &str, name: &str, contents: &[u8]) -> Result<String, String> {
+        InertHost.place_file(dir, name, contents)
+    }
+    fn prepare_codex_home(&self, models: CodexModels<'_>) -> Result<String, SessionError> {
+        InertHost.prepare_codex_home(models)
+    }
+}
+
+/// A managed `spec` under `dir` whose pin names `pinned` and whose downloads
+/// go through `fetch`, with no published pin to follow.
+fn managed_tool(
+    spec: &'static cairn_models::managed::ToolSpec,
+    dir: &std::path::Path,
+    pinned: &[u8],
+    fetch: Arc<GatedDownload>,
+) -> Arc<cairn_models::managed::ManagedTool> {
+    use cairn_models::managed::{testing, ManagedTool, RefusingSource};
+    Arc::new(
+        ManagedTool::new(
+            spec,
+            dir.join("tools").join(spec.name),
+            dir.join("bin"),
+            Arc::new(RefusingSource),
+            fetch,
+        )
+        .with_target(Some(
+            (spec.host_target)().unwrap_or(spec.supported_targets[0]),
+        ))
+        .with_embedded_pin(testing::pin_for(spec, "9.1.0", pinned))
+        .with_backoff(vec![Duration::ZERO]),
+    )
+}
+
+/// How many of `run_id`'s events of `event_type` contain `needle`.
+async fn events_like(orch: &Orchestrator, run_id: &str, event_type: &str, needle: &str) -> i64 {
+    let (run, kind, like) = (
+        run_id.to_string(),
+        event_type.to_string(),
+        format!("%{needle}%"),
+    );
+    orch.db
+        .local
+        .read(move |conn| {
+            let (run, kind, like) = (run.clone(), kind.clone(), like.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = ?2 AND data LIKE ?3",
+                        (run.as_str(), kind.as_str(), like.as_str()),
+                    )
+                    .await?;
+                Ok(rows.next().await?.expect("a count").get::<i64>(0)?)
+            })
+        })
+        .await
+        .unwrap()
+}
+
+async fn wait_for_events(orch: &Orchestrator, run_id: &str, event_type: &str, needle: &str) {
+    let deadline = Instant::now() + WAIT;
+    while events_like(orch, run_id, event_type, needle).await == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{run_id} never recorded a {event_type} event containing {needle:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn seed_claude_session(orch: &Orchestrator, session_id: &str) {
+    orch.db
+        .local
+        .execute_script(&format!(
+            "INSERT OR IGNORE INTO workspaces(id, name, created_at, updated_at)
+               VALUES ('ws-5106', 'Workspace', 1, 1);
+             INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-5106', 'ws-5106', 'Project', 'p5106', '/tmp/p5106', 1, 1);
+             INSERT OR IGNORE INTO jobs(id, project_id, status, created_at, updated_at)
+               VALUES ('job-5106', 'proj-5106', 'running', 1, 1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('{session_id}', 'job-5106', 'claude', 'open', 1, 1, 1);"
+        ))
+        .await
+        .unwrap();
+}
+
+/// cairn/5106, section 1a. A Claude launch issued while the first install of
+/// the pinned CLI is still downloading waits on that install, tells its
+/// transcript so once, starts when the install lands, and completes its
+/// turn: no failed turn, no second download.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_launch_during_first_install_completes_its_turn() {
+    use cairn_models::managed::{claude::CLAUDE, testing};
+    let recorder = Arc::new(Recorder::default());
+    let (mut orch, _) = orchestrator(&recorder).await;
+    orch.models_runtime.claude = Arc::new(ScriptedClaude::default());
+    let dir = tempfile::tempdir().unwrap();
+    let package = testing::package_for(&CLAUDE, "9.1.0", "echo '9.1.0 (Claude Code)'");
+    let gate = GatedDownload::new(package.clone(), false);
+    let tool = managed_tool(&CLAUDE, dir.path(), &package, gate.clone());
+    orch.models_runtime.host = Arc::new(InstallingHost {
+        cli: Cli::Claude,
+        tool: tool.clone(),
+    });
+    seed_claude_session(&orch, "sess-install").await;
+
+    // The install the follow loop starts at boot, held mid-download.
+    let installer = std::thread::spawn({
+        let tool = tool.clone();
+        move || tool.ensure()
+    });
+    gate.wait_for_a_download();
+
+    let launch = tokio::spawn({
+        let orch = orch.clone();
+        async move { launch_claude(&orch, "run-install", "sess-install").await }
+    });
+    wait_for_events(
+        &orch,
+        "run-install",
+        "system:message",
+        "managed_cli_install_wait",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!launch.is_finished(), "the launch waits on the install");
+
+    gate.open();
+    launch.await.unwrap();
+    let installed = installer.join().unwrap().expect("the install lands");
+    assert_eq!(installed.version, "9.1.0");
+    let (status, exit_reason, error) = settled_run(&orch, "run-install").await;
+    assert_eq!(
+        (status.as_str(), exit_reason, error),
+        ("exited", None, None),
+        "the turn completes"
+    );
+    assert_eq!(
+        events_like(
+            &orch,
+            "run-install",
+            "system:message",
+            "managed_cli_install_wait"
+        )
+        .await,
+        1,
+        "told once"
+    );
+    assert_eq!(
+        events_like(&orch, "run-install", "system:error", "").await,
+        0
+    );
+    assert_eq!(gate.begun(), 1, "one install, not two");
+}
+
+/// The Codex twin, through the same launch helper both backends resolve
+/// their CLI with: the wait is told once and the launch resolves the release
+/// the install lands.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_launch_during_first_install_waits_then_resolves() {
+    use cairn_models::managed::{codex::CODEX, testing};
+    let recorder = Arc::new(Recorder::default());
+    let (orch, _) = orchestrator(&recorder).await;
+    let dir = tempfile::tempdir().unwrap();
+    let package = testing::package_for(&CODEX, "9.1.0", "echo 'codex-cli 9.1.0'");
+    let gate = GatedDownload::new(package.clone(), false);
+    let tool = managed_tool(&CODEX, dir.path(), &package, gate.clone());
+    let host: Arc<dyn SessionHost> = Arc::new(InstallingHost {
+        cli: Cli::Codex,
+        tool: tool.clone(),
+    });
+    seed_run(&orch, "run-codex-install", "sess-codex-install").await;
+
+    let installer = std::thread::spawn({
+        let tool = tool.clone();
+        move || tool.ensure()
+    });
+    gate.wait_for_a_download();
+    let resolve = tokio::task::spawn_blocking({
+        let (orch, host) = (orch.clone(), host.clone());
+        move || {
+            super::models::resolve_managed_cli(
+                &orch,
+                host.as_ref(),
+                Cli::Codex,
+                "run-codex-install",
+                Some("sess-codex-install"),
+            )
+        }
+    });
+    wait_for_events(
+        &orch,
+        "run-codex-install",
+        "system:message",
+        "managed_cli_install_wait",
+    )
+    .await;
+    assert!(!resolve.is_finished(), "the launch waits on the install");
+
+    gate.open();
+    let path = resolve.await.unwrap().expect("the launch resolves");
+    assert_eq!(
+        path,
+        installer.join().unwrap().unwrap().path.to_string_lossy()
+    );
+    assert!(path.ends_with("/bin/codex"), "{path}");
+    assert_eq!(
+        events_like(
+            &orch,
+            "run-codex-install",
+            "system:message",
+            "managed_cli_install_wait"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        events_like(&orch, "run-codex-install", "system:error", "").await,
+        0
+    );
+}
+
+/// A download that does not match the pin is refused typed, once per launch
+/// on the launch's own transcript with the manual route, and the next
+/// launch is refused at once without downloading again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_launch_after_digest_mismatch_refuses_typed() {
+    use cairn_models::managed::{claude::CLAUDE, testing};
+    let recorder = Arc::new(Recorder::default());
+    let (mut orch, _) = orchestrator(&recorder).await;
+    orch.models_runtime.claude = Arc::new(ScriptedClaude::default());
+    let dir = tempfile::tempdir().unwrap();
+    let pinned = testing::package_for(&CLAUDE, "9.1.0", "echo '9.1.0 (Claude Code)'");
+    let tampered = testing::package_for(&CLAUDE, "9.1.0", "echo '6.6.6 (Claude Code)'");
+    let gate = GatedDownload::new(tampered, true);
+    let tool = managed_tool(&CLAUDE, dir.path(), &pinned, gate.clone());
+    orch.models_runtime.host = Arc::new(InstallingHost {
+        cli: Cli::Claude,
+        tool,
+    });
+
+    for (run_id, session_id) in [("run-bad-1", "sess-bad-1"), ("run-bad-2", "sess-bad-2")] {
+        seed_claude_session(&orch, session_id).await;
+        seed_run(&orch, run_id, session_id).await;
+        let (launch_orch, launch_config) =
+            (orch.clone(), config(run_id, session_id, "sonnet", false));
+        let error = tokio::task::spawn_blocking(move || {
+            launch::start_session(
+                &launch_orch,
+                "claude",
+                backend_for_name(Some("claude")).as_ref(),
+                launch_config,
+            )
+        })
+        .await
+        .unwrap()
+        .expect_err("a refused install refuses the launch");
+        assert!(
+            error.contains("did not match its pinned checksum"),
+            "{run_id}: {error}"
+        );
+        assert_eq!(
+            events_like(
+                &orch,
+                run_id,
+                "system:error",
+                "did not match its pinned checksum"
+            )
+            .await,
+            1,
+            "{run_id}: the refusal is recorded once"
+        );
+        assert_eq!(
+            events_like(&orch, run_id, "system:error", "To install by hand").await,
+            1,
+            "{run_id}: it names the manual route"
+        );
+    }
+    assert_eq!(gate.begun(), 1, "the second launch did not download again");
+}
+
+/// A launch stopped while it waits on the first install never reaches the
+/// provider: it detaches from the wait at once, and when the install lands
+/// nothing is spawned and no prompt is sent. The install itself goes on.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_stopped_while_its_cli_installs_never_spawns() {
+    use cairn_models::managed::{claude::CLAUDE, testing};
+    let recorder = Arc::new(Recorder::default());
+    let (mut orch, _) = orchestrator(&recorder).await;
+    let claude = Arc::new(ScriptedClaude::default());
+    orch.models_runtime.claude = claude.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let package = testing::package_for(&CLAUDE, "9.1.0", "echo '9.1.0 (Claude Code)'");
+    let gate = GatedDownload::new(package.clone(), false);
+    let tool = managed_tool(&CLAUDE, dir.path(), &package, gate.clone());
+    orch.models_runtime.host = Arc::new(InstallingHost {
+        cli: Cli::Claude,
+        tool: tool.clone(),
+    });
+    seed_claude_session(&orch, "sess-stop").await;
+    seed_run(&orch, "run-stop", "sess-stop").await;
+
+    let installer = std::thread::spawn({
+        let tool = tool.clone();
+        move || tool.ensure()
+    });
+    gate.wait_for_a_download();
+    let launch = tokio::task::spawn_blocking({
+        let (orch, config) = (
+            orch.clone(),
+            config("run-stop", "sess-stop", "sonnet", false),
+        );
+        move || {
+            launch::start_session(
+                &orch,
+                "claude",
+                backend_for_name(Some("claude")).as_ref(),
+                config,
+            )
+        }
+    });
+    wait_for_events(
+        &orch,
+        "run-stop",
+        "system:message",
+        "managed_cli_install_wait",
+    )
+    .await;
+
+    // What an operator Stop leaves on a run that has no process yet.
+    orch.db
+        .local
+        .execute(
+            "UPDATE runs SET status = 'exited' WHERE id = 'run-stop'",
+            (),
+        )
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), launch)
+        .await
+        .expect("the stopped launch stops waiting")
+        .unwrap()
+        .expect_err("a stopped launch does not start");
+    assert!(error.contains("stopped"), "{error}");
+    assert!(claude.launched_ids.lock().unwrap().is_empty());
+
+    gate.open();
+    assert_eq!(installer.join().unwrap().unwrap().version, "9.1.0");
+    assert!(
+        claude.launched_ids.lock().unwrap().is_empty(),
+        "nothing was spawned once the install landed"
+    );
+    assert_eq!(
+        events_like(&orch, "run-stop", "system:error", "").await,
+        0,
+        "a stop is not reported as a failed install"
     );
 }

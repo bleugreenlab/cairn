@@ -9,14 +9,10 @@
  * through untouched, so a negative fails for its own reason only.
  */
 import { connect } from "node:net";
+import { startRelay } from "../support/stdio_relay.ts";
 
 const [surface, codex, ...args] = process.argv.slice(2);
-const child = Bun.spawn([codex, ...args], {
-  stdin: "pipe",
-  stdout: "pipe",
-  stderr: "inherit",
-  env: process.env,
-});
+const io = startRelay([codex, ...args]);
 
 type Message = {
   id?: unknown;
@@ -33,11 +29,7 @@ let clientAnswered = false;
 const held: string[] = [];
 let heldThreadStart: unknown = undefined;
 
-const toClient = (line: string) => process.stdout.write(`${line}\n`);
-const toCodex = (line: string) => {
-  child.stdin.write(`${line}\n`);
-  child.stdin.flush();
-};
+const toClient = io.toClient;
 
 function replaceAll(line: string, from: string, to: string): string {
   return line.split(from).join(to);
@@ -154,29 +146,4 @@ if (surface === "egress") {
   socket.on("error", () => {});
 }
 
-async function relay(stream: ReadableStream<Uint8Array>, each: (line: string) => void) {
-  const decoder = new TextDecoder();
-  let buffered = "";
-  for await (const chunk of stream) {
-    buffered += decoder.decode(chunk, { stream: true });
-    let end = buffered.indexOf("\n");
-    while (end >= 0) {
-      const line = buffered.slice(0, end);
-      buffered = buffered.slice(end + 1);
-      if (line.trim()) each(line);
-      end = buffered.indexOf("\n");
-    }
-  }
-  if (buffered.trim()) each(buffered);
-}
-
-const fromClient = relay(Bun.stdin.stream(), (line) => {
-  for (const out of upstream(line)) toCodex(out);
-}).then(() => child.stdin.end());
-const fromCodex = relay(child.stdout, (line) => {
-  for (const out of downstream(line)) toClient(out);
-});
-
-await fromCodex;
-void fromClient;
-process.exit(await child.exited);
+await io.run({ stdout: downstream, stdin: upstream });

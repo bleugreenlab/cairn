@@ -716,7 +716,10 @@ async fn a_pick_below_threshold_is_acknowledged_with_the_closest_thread_and_deli
         &routed,
         &inbound,
         ACK_BELOW_THRESHOLD,
-        &format!("No thread claimed this (closest: {}). {HINT}", citation("devops", "0.4", "native")),
+        &format!(
+            "No thread claimed this (closest: {}). {HINT}",
+            citation("devops", "0.4", "native")
+        ),
     );
     assert_eq!(asked_options(&record), chartered_options());
     assert_route_floors(&record);
@@ -800,7 +803,10 @@ async fn a_logprobs_pick_under_its_own_floor_is_below_threshold_though_it_would_
         &routed,
         &inbound,
         ACK_BELOW_THRESHOLD,
-        &format!("No thread claimed this (closest: {}). {HINT}", citation("devops", "0.5", "logprobs")),
+        &format!(
+            "No thread claimed this (closest: {}). {HINT}",
+            citation("devops", "0.5", "logprobs")
+        ),
     );
     assert_eq!(asked_options(&record), chartered_options());
     assert_route_floors(&record);

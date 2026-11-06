@@ -69,7 +69,9 @@ pub(crate) use calls::{
 pub(crate) use ordinary_admission::{
     promote_private_lane, recover_on_startup as recover_ordinary_admissions_on_startup,
 };
-pub(crate) use team_admission_lifecycle::journal_and_retry_terminal;
+pub(crate) use team_admission_lifecycle::{
+    confirm_team_lease_blocking, journal_and_retry_terminal,
+};
 // The per-call Restart action reaches this via
 // `cairn_core::internal::execution::jobs::restart_call`.
 pub use calls::restart_call;

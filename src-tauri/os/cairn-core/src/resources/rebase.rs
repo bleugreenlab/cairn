@@ -1581,6 +1581,15 @@ fn numeric_prefix(name: &str) -> Option<(u64, usize)> {
     digits.parse().ok().map(|value| (value, digits.len()))
 }
 
+/// The provisional spelling the landing binds: `0284_x.sql` becomes
+/// `NEXT_x.sql`. A name without a numeric prefix is returned as it is.
+fn provisional_name(name: &str) -> String {
+    match numeric_prefix(name) {
+        Some((_, width)) => format!("NEXT{}", &name[width..]),
+        None => name.to_string(),
+    }
+}
+
 fn split_directory(path: &str) -> (&str, &str) {
     match path.rsplit_once('/') {
         Some((directory, name)) => (directory, name),
@@ -1726,22 +1735,31 @@ fn collision_section(
     render_collisions(&collisions, &bound)
 }
 
-/// The collision section. A directory the landing binds (`landing.identifiers`
-/// in the destination's config) needs nothing from the agent: the landing
-/// numbers the branch's file against the tip it lands on. Only a numbering
-/// convention nobody declared is renumbered by hand.
+/// The collision section. In a directory the landing binds
+/// (`landing.identifiers` in the destination's config) the agent never picks a
+/// number, but it cannot leave the collision standing either: the replayed tree
+/// holds two files with one number until the branch lands, and a consumer of
+/// the directory may refuse that (cairn-db's build does). Renaming the branch's
+/// own file to its provisional `NEXT_` spelling clears the collision and leaves
+/// the numbering to the landing. Only a numbering convention nobody declared is
+/// renumbered by hand.
 fn render_collisions(collisions: &[NumberCollision], bound: &BTreeSet<String>) -> String {
     let mut out = String::from("\n## Numbered-file collisions\n\n");
     let mut by_hand = false;
     for collision in collisions {
         if bound.contains(&collision.directory) {
             out.push_str(&format!(
-                "`{}/` — incoming claims `{}`; your branch adds `{}`. Leave it as it is: this \
-                 directory's numbers are bound when a branch lands on the default branch, so \
-                 yours takes the next free number then and its name is rewritten wherever your \
-                 branch uses it. Name a new file here `NEXT_<name>`, and never renumber one by \
-                 hand.\n",
-                collision.directory, collision.incoming, collision.ours
+                "`{}/` — incoming claims `{}`; your branch adds `{}`. Rename yours to `{}` \
+                 (content unchanged) and update anything on your branch that names its old \
+                 stem. Two files with one number do not build until the landing binds them, \
+                 and this directory's numbers are bound when a branch lands on the default \
+                 branch: the provisional file takes the next free number then. Rename only the \
+                 file your branch added; the incoming one is already on the default branch and \
+                 keeps its number. Never pick a number by hand.\n",
+                collision.directory,
+                collision.incoming,
+                collision.ours,
+                provisional_name(&collision.ours)
             ));
         } else {
             by_hand = true;
@@ -2782,11 +2800,12 @@ mod tests {
         );
     }
 
-    /// A directory the landing binds tells the agent to leave its number alone;
-    /// one nobody declared still says to renumber. The page never offers both
-    /// for one directory.
+    /// A directory the landing binds tells the agent to rename its own file to
+    /// the provisional `NEXT_` spelling cairn-db's build demands, never to pick
+    /// a number; one nobody declared still says to renumber. The page never
+    /// offers both for one directory.
     #[test]
-    fn a_bound_directory_is_left_to_the_landing_and_an_undeclared_one_is_renumbered() {
+    fn a_bound_directory_is_made_provisional_and_an_undeclared_one_is_renumbered() {
         let collision = |directory: &str| NumberCollision {
             directory: directory.to_string(),
             incoming: "0284_theirs.sql".to_string(),
@@ -2795,8 +2814,13 @@ mod tests {
         };
         let bound = BTreeSet::from(["src-tauri/turso_migrations".to_string()]);
         let page = render_collisions(&[collision("src-tauri/turso_migrations")], &bound);
-        assert!(page.contains("Leave it as it is"), "{page}");
-        assert!(page.contains("NEXT_<name>"), "{page}");
+        assert!(page.contains("Rename yours to `NEXT_ours.sql`"), "{page}");
+        assert!(
+            page.contains("Rename only the file your branch added"),
+            "{page}"
+        );
+        assert!(page.contains("Never pick a number by hand"), "{page}");
+        assert!(!page.contains("Leave it as it is"), "{page}");
         assert!(!page.contains("Renumber yours"), "{page}");
         assert!(!page.contains("not something the merge resolves"), "{page}");
 

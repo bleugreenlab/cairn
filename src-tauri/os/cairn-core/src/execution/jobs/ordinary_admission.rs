@@ -1359,8 +1359,12 @@ fn start_leased_inner(
             team_workspace_id: lease.team_workspace_id(),
         },
     );
-    if let OrdinaryLease::Private(request) = &lease {
-        spawn_private_heartbeat(
+    // Both lanes renew their lease from here, before the backend call: a
+    // launch can wait there for minutes (a managed CLI's first install), and
+    // its lease must outlive that wait. Each heartbeat stops once the
+    // admission claim prepared above is no longer current.
+    match &lease {
+        OrdinaryLease::Private(request) => spawn_private_heartbeat(
             orch.process_state.clone(),
             orch.db.local.clone(),
             snapshot.run_id.clone(),
@@ -1370,7 +1374,13 @@ fn start_leased_inner(
                 .clone()
                 .ok_or_else(|| "private ordinary lease has no owner".to_string())?,
             request.lease_generation,
-        );
+        ),
+        OrdinaryLease::Team { request, .. } => super::team_admission_lifecycle::start_heartbeat(
+            orch,
+            snapshot.run_id.clone(),
+            request.id.clone(),
+            request.lease_generation,
+        ),
     }
     let claim = orch.claim_job_launch(&snapshot.job_id, &snapshot.run_id);
     let result = start_ordinary_session(
@@ -1399,14 +1409,6 @@ fn start_leased_inner(
                 &snapshot.turn_id,
             );
             transition(orch, lease, "starting", "active")?;
-            if let OrdinaryLease::Team { request, .. } = lease {
-                super::team_admission_lifecycle::start_heartbeat(
-                    orch,
-                    snapshot.run_id.clone(),
-                    request.id.clone(),
-                    request.lease_generation,
-                );
-            }
             Ok(true)
         }
         Err(error) => Err(error),

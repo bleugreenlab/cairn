@@ -16138,9 +16138,19 @@ cairn-common = { path = "../cairn-common" }
             );
             let expected: &[&str] = match name.as_str() {
                 "infra-stacks" => &["bun", "node", "npm"],
-                "rust-fmt" | "lockfile" | "licenses" | "rust-lint" | "rust-tests"
-                | "external-host" | "codex-pin" | "codex-contract" | "rust-write-pins"
-                | "tls-sole-loader" | "plan-audit" | "workspace-compile" => &["bun", "rust"],
+                "rust-fmt"
+                | "lockfile"
+                | "licenses"
+                | "rust-lint"
+                | "rust-tests"
+                | "external-host"
+                | "codex-pin"
+                | "codex-contract"
+                | "rust-write-pins"
+                | "tls-sole-loader"
+                | "plan-audit"
+                | "workspace-compile"
+                | "third-party-notices" => &["bun", "rust"],
                 "executor-windows-check" | "executor-linux-check" | "executor-macos-check" => {
                     &["rust"]
                 }
