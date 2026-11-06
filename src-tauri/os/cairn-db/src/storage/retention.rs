@@ -352,6 +352,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "window observations (newest per check and input plus 90 days); children cascade",
     )
     .budget(256),
+    owned("manual_check_handles", "projects"),
     owned("check_test_results", "check_result_observations").budget(1_100),
     owned("check_deferred_tests", "check_result_observations"),
     owned("check_audit_findings", "check_result_observations"),

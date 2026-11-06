@@ -6999,7 +6999,15 @@ pub struct LearnedResourceEstimate {
 /// executor carries it. What a runner gets wrong talking to an older executor:
 /// nothing; that executor contributes no process peak and no standing use, so
 /// its fit falls back to the reservation cap, which is no worse than before.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 165;
+///
+/// Version 166 (cairn/6139) preserves Unix resident PTY signal deaths in the
+/// existing exit-code field as `128 + signal`, leaving normal exit codes intact.
+/// An older executor sends 1 for SIGKILL or SIGTERM, so a runner would mistake
+/// terminal teardown for an ordinary command failure instead of observing 137
+/// or 143. The wire shape is unchanged, but the exit-status semantics require
+/// both peers to agree. Manual-check handle persistence and result recovery are
+/// runner-local and add no wire fields or executor expectations.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 166;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].

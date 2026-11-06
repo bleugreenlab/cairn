@@ -60,7 +60,7 @@ impl CheckPlacementOverride {
 
 /// Where one check lane may run and whose answer counts, after a request's
 /// override has been applied to the configured check.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EffectiveCheckPlacement {
     /// The selector placement is asked with: the configured capability
     /// requirements, with the request's name or platform.

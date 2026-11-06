@@ -20,7 +20,10 @@ mod http_sink;
 mod invoke_client;
 mod shell;
 
-use cli::{default_callback_url, run_cli_change, run_cli_check, run_cli_read, run_cli_watch};
+use cli::{
+    default_callback_url, run_cli_change, run_cli_check, run_cli_check_watch, run_cli_read,
+    run_cli_watch,
+};
 
 cairn_common::sidecar_version_stamp!();
 
@@ -58,6 +61,15 @@ external MCP setup to rewrite the registration.";
 #[cfg(test)]
 mod cli_parse_tests {
     use super::*;
+
+    #[test]
+    fn check_watch_accepts_a_request_handle_without_a_suite() {
+        let args = Args::try_parse_from(["cairn", "check", "watch", "request-1"]).unwrap();
+        assert!(
+            matches!(args.command, Some(Command::Check { command: CheckCommand::Watch { handle } }) if handle == "request-1")
+        );
+        assert!(Args::try_parse_from(["cairn", "check", "watch"]).is_err());
+    }
 
     #[test]
     fn check_run_accepts_one_or_more_suites_and_optional_branch() {
@@ -368,6 +380,11 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum CheckCommand {
+    /// Read an existing manual observation to completion without executing a check.
+    Watch {
+        /// Request handle printed by cairn check run.
+        handle: String,
+    },
     /// Run one or more named configured suites, reusing exact immutable observations when possible.
     Run {
         /// Suite names from the project's `.cairn/config.yaml` `checks` contract.
@@ -459,6 +476,11 @@ async fn async_main() -> Result<()> {
             )
             .await;
             std::process::exit(code);
+        }
+        Some(Command::Check {
+            command: CheckCommand::Watch { handle },
+        }) => {
+            std::process::exit(run_cli_check_watch(handle.clone()).await);
         }
         Some(Command::Executor { command }) => {
             let ok = executor::run(command.clone()).await;

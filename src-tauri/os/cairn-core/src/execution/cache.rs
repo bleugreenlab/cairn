@@ -2104,6 +2104,8 @@ pub(crate) struct CheckAuditFindingRow {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct FreshCheckObservationWrite {
+    pub manual_handle: Option<String>,
+    pub publication_id: Option<String>,
     pub sealed_coordinate: SealedCheckCoordinate,
     pub id: String,
     pub public_handle: String,
@@ -2191,6 +2193,7 @@ pub(crate) struct FreshCheckObservationWrite {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CachedCheckObservationWrite {
+    pub manual_handle: Option<String>,
     pub project_id: String,
     /// The commit the reused verdict is being aliased ONTO.
     pub commit_sha: String,
@@ -2644,6 +2647,8 @@ pub(crate) fn record_fresh_check_observation(
                 let trailing_provenance = serde_json::json!({
                     "definedByCommitSha": observation.defined_by_commit_sha,
                     "publicHandle": observation.public_handle,
+                    "publicationId": observation.publication_id,
+                    "verdictResultJson": compact_verdict_result(observation.target_results_json.as_deref()),
                     "verdictPlatform": observation.verdict_platform,
                     "verdictArch": observation.verdict_arch,
                     "verdictEnvironmentHash": observation.verdict_environment_hash,
@@ -2688,6 +2693,8 @@ pub(crate) fn record_fresh_check_observation(
                            AND toolchain_fingerprint IS ?29 AND output_tail=?30
                            AND defined_by_commit_sha IS json_extract(?31,'$.definedByCommitSha')
                            AND public_handle IS json_extract(?31,'$.publicHandle')
+                           AND publication_id IS json_extract(?31,'$.publicationId')
+                           AND verdict_result_json IS json_extract(?31,'$.verdictResultJson')
                            AND verdict_platform IS json_extract(?31,'$.verdictPlatform')
                            AND verdict_arch IS json_extract(?31,'$.verdictArch')
                            AND verdict_environment_hash IS json_extract(?31,'$.verdictEnvironmentHash')
@@ -2757,6 +2764,9 @@ pub(crate) fn record_fresh_check_observation(
                             observation.id
                         )));
                     }
+                    attach_manual_check_observation_conn(conn, &observation.project_id,
+                        observation.manual_handle.as_deref(), &observation.id, &observation.commit_sha,
+                        &observation.tree_hash, &observation.input_hash, "fresh").await?;
                     return Ok(());
                 }
 
@@ -2775,7 +2785,7 @@ pub(crate) fn record_fresh_check_observation(
                         phase_publish_ms, phase_origin, compiled_units, phase_passes_json,
                         execution_warmth, cell_origin_kind, cell_origin_distance_files,
                         cell_origin_distance_crates, build_jobs, build_jobs_json,
-                        failure_signature, placement_facts, substrate_shape,
+                        failure_signature, placement_facts, substrate_shape, verdict_result_json, publication_id,
                         plan_audit_state, plan_audit_note
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
@@ -2803,6 +2813,8 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.failureSignature'),
                               json_extract(?31,'$.placementFacts'),
                               json_extract(?31,'$.substrateShape'),
+                              json_extract(?31,'$.verdictResultJson'),
+                              json_extract(?31,'$.publicationId'),
                               json_extract(?31,'$.planAuditState'),
                               json_extract(?31,'$.planAuditNote'))
                        ON CONFLICT(id) DO NOTHING",
@@ -2985,12 +2997,131 @@ pub(crate) fn record_fresh_check_observation(
                     );
                     conn.execute(&reset_sql, values).await?;
                 }
+                attach_manual_check_observation_conn(conn, &observation.project_id,
+                    observation.manual_handle.as_deref(), &observation.id, &observation.commit_sha,
+                    &observation.tree_hash, &observation.input_hash, "fresh").await?;
                 Ok(())
             })
         }).await.map_err(|e| format!("Failed to record fresh check observation: {e}"))
     })?;
     crate::execution::gates::sweep::notify_gate_evidence_changed();
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attach_manual_check_observation_conn(
+    conn: &crate::storage::TrackedConnection,
+    project_id: &str,
+    handle: Option<&str>,
+    observation_id: &str,
+    commit_sha: &str,
+    tree_hash: &str,
+    input_hash: &str,
+    disposition: &str,
+) -> DbResult<()> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    let changed = conn
+        .execute(
+            "UPDATE manual_check_handles
+         SET observation_id=?3,commit_sha=?4,tree_hash=?5,input_hash=?6,disposition=?7
+         WHERE project_id=?1 AND handle=?2 AND response_json IS NULL
+           AND (observation_id IS NULL OR observation_id=?3)
+           AND EXISTS (SELECT 1 FROM check_result_observations WHERE project_id=?1 AND id=?3)",
+            params![
+                project_id,
+                handle,
+                observation_id,
+                commit_sha,
+                tree_hash,
+                input_hash,
+                disposition
+            ],
+        )
+        .await?;
+    if changed != 1 {
+        return Err(crate::storage::DbError::internal(format!(
+            "persist manual check source for {handle}: handle or project-owned observation is missing, or already settled"
+        )));
+    }
+    Ok(())
+}
+
+/// Attach a coalesced request once the publisher names its canonical source.
+/// Fresh execution and cache reuse call the connection form inside their own
+/// recorder transaction, so recording cannot leave those handles unassociated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn attach_manual_check_observation(
+    db: &LocalDb,
+    project_id: &str,
+    handle: &str,
+    observation_id: &str,
+    commit_sha: &str,
+    tree_hash: &str,
+    input_hash: &str,
+    disposition: &str,
+) -> Result<(), String> {
+    let values = (
+        project_id.to_string(),
+        handle.to_string(),
+        observation_id.to_string(),
+        commit_sha.to_string(),
+        tree_hash.to_string(),
+        input_hash.to_string(),
+        disposition.to_string(),
+    );
+    db.write(|conn| {
+        let values = values.clone();
+        Box::pin(async move {
+            attach_manual_check_observation_conn(
+                conn,
+                &values.0,
+                Some(&values.1),
+                &values.2,
+                &values.3,
+                &values.4,
+                &values.5,
+                &values.6,
+            )
+            .await
+        })
+    })
+    .await
+    .map_err(|error| format!("persist manual check source for {handle}: {error}"))
+}
+
+/// Preserve only the facts the manual verdict classifier reads. Deserializing a
+/// small projection skips the per-test arrays without allocating a second
+/// manifest, and an absent or malformed parse stays absent.
+fn compact_verdict_result(json: Option<&str>) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Summary {
+        parser: String,
+        #[serde(default)]
+        complete: bool,
+        #[serde(default)]
+        selection: Option<String>,
+        passed: usize,
+        failed: usize,
+        skipped: usize,
+        #[serde(default)]
+        deferred: usize,
+        #[serde(default)]
+        unverified: Option<String>,
+    }
+    let summary: Summary = serde_json::from_str(json?).ok()?;
+    Some(
+        serde_json::json!({
+            "parser": summary.parser, "complete": summary.complete,
+            "selection": summary.selection.unwrap_or_else(|| "unknown".into()),
+            "passed": summary.passed, "failed": summary.failed,
+            "skipped": summary.skipped, "deferred": summary.deferred,
+            "unverified": summary.unverified, "failures": [],
+        })
+        .to_string(),
+    )
 }
 
 /// Record reuse at another commit without mutating either the source observation
@@ -3029,6 +3160,17 @@ pub(crate) fn record_cached_check_observation(
                         observation.evaluated_at,
                         observation.defined_by_commit_sha.as_str()
                     ],
+                )
+                .await?;
+                attach_manual_check_observation_conn(
+                    conn,
+                    &observation.project_id,
+                    observation.manual_handle.as_deref(),
+                    &observation.source_observation_id,
+                    &observation.commit_sha,
+                    &observation.tree_hash,
+                    &observation.input_hash,
+                    "cached",
                 )
                 .await?;
                 Ok(())
@@ -3721,8 +3863,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shared_publication_has_one_immutable_source() {
+        let db = cache_db().await;
+        let mut source = observation("publication-source", "commit-1", "env-a");
+        source.publication_id = Some(uuid::Uuid::new_v4().to_string());
+        record_fresh_check_observation(db.clone(), source.clone()).unwrap();
+        record_fresh_check_observation(db.clone(), source.clone()).unwrap();
+        let mut conflicting = source.clone();
+        conflicting.id = "another-source".into();
+        conflicting.public_handle = "another-public-handle".into();
+        assert!(record_fresh_check_observation(db.clone(), conflicting).is_err());
+        let mut changed_identity = source;
+        changed_identity.publication_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(record_fresh_check_observation(db.clone(), changed_identity)
+            .unwrap_err()
+            .contains("different immutable fields"));
+        let rows = db
+            .query_all(
+                "SELECT id FROM check_result_observations WHERE publication_id IS NOT NULL",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows, vec!["publication-source".to_string()]);
+    }
+
     fn observation(id: &str, commit: &str, environment: &str) -> FreshCheckObservationWrite {
         let mut observation = FreshCheckObservationWrite {
+            manual_handle: None,
+            publication_id: None,
             sealed_coordinate: SealedCheckCoordinate::new(
                 commit,
                 commit,
@@ -6170,6 +6341,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_handle_migration_compacts_valid_legacy_parses_and_skips_malformed_json() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        let root = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(root.path().join("manual-migration.db"))
+            .await
+            .unwrap();
+        let position = TURSO_MIGRATIONS
+            .iter()
+            .position(|migration| migration.name() == "manual_check_handles")
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS[..position].to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','default','P','proj','/unused',1,1);
+             INSERT INTO check_result_observations(id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,result_schema_version,ran_at,duration_ms,cadence,output_tail)
+               VALUES('valid','p','commit','tree','rust','valid','env',0,'passed',1,1,1,1,1,1,'manual','ok'),
+                     ('invalid','p','commit','tree','rust','invalid','env',0,'passed',1,1,1,1,1,1,'manual','ok'),
+                     ('missing','p','commit','tree','rust','missing','env',0,'passed',1,1,1,1,1,1,'manual','ok');"
+        ).await.unwrap();
+        let valid = serde_json::json!({
+            "parser":"nextest","complete":true,"selection":"fast","passed":9,"failed":0,
+            "skipped":0,"deferred":3,"failures":[],
+            "tests":[{"output":"x".repeat(100_000)}],"unknownLargeField":"x".repeat(100_000),
+        })
+        .to_string();
+        for (id, parse) in [
+            ("valid", valid.as_str()),
+            ("invalid", "{broken"),
+            ("missing", "{}"),
+        ] {
+            db.execute(
+                "INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,environment_fingerprint,result_schema_version,source_observation_id,exit_code,passed,output_tail,duration_ms,ran_at,target_results_json)
+                 VALUES('p','tree',?1,'rust','env',1,?1,0,1,'ok',1,1,?2)",
+                params![id,parse],
+            ).await.unwrap();
+        }
+        MigrationRunner::new(vec![TURSO_MIGRATIONS[position]])
+            .run(&db)
+            .await
+            .unwrap();
+        let compact = db
+            .query_one(
+                "SELECT verdict_result_json FROM check_result_observations WHERE id='valid'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert!(compact.len() < 512, "{} bytes", compact.len());
+        let parsed: crate::execution::check_parsers::ParsedCheckResult =
+            serde_json::from_str(&compact).unwrap();
+        assert_eq!(
+            parsed.fast_tier_label().as_deref(),
+            Some("fast tier: 9 ran, 3 deferred")
+        );
+        assert!(db
+            .query_one(
+                "SELECT verdict_result_json FROM check_result_observations WHERE id='missing'",
+                (),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .query_one(
+                "SELECT verdict_result_json FROM check_result_observations WHERE id='invalid'",
+                (),
+                |row| row.opt_text(0)
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            db.execute(
+                "UPDATE check_result_observations SET output_tail='changed' WHERE id='valid'",
+                ()
+            )
+            .await
+            .is_err(),
+            "the immutable ledger trigger must be restored after backfill"
+        );
+    }
+
+    #[test]
+    fn manual_verdict_summary_preserves_classification_without_the_manifest() {
+        let json = serde_json::json!({
+            "parser":"nextest","complete":true,"selection":"fast","passed":9,"failed":0,
+            "skipped":2,"deferred":3,"unverified":null,"failures":[],
+            "tests":[{"name":"large","output":"x".repeat(100_000)}],
+            "report":"x".repeat(100_000),
+        })
+        .to_string();
+        let compact = compact_verdict_result(Some(&json)).unwrap();
+        assert!(compact.len() < 512, "{} bytes", compact.len());
+        let parsed: crate::execution::check_parsers::ParsedCheckResult =
+            serde_json::from_str(&compact).unwrap();
+        assert_eq!(
+            parsed.fast_tier_label().as_deref(),
+            Some("fast tier: 9 ran, 3 deferred, 2 skipped")
+        );
+        assert!(matches!(
+            crate::execution::checks_status::verdict_evidence(true, Some(&parsed)),
+            crate::execution::checks_status::VerdictEvidence::Verified
+        ));
+        let unverified = json.replace("\"unverified\":null", "\"unverified\":\"wrong runtime\"");
+        let compact = compact_verdict_result(Some(&unverified)).unwrap();
+        let parsed: crate::execution::check_parsers::ParsedCheckResult =
+            serde_json::from_str(&compact).unwrap();
+        assert!(matches!(
+            crate::execution::checks_status::verdict_evidence(true, Some(&parsed)),
+            crate::execution::checks_status::VerdictEvidence::Unverified(_)
+        ));
+        assert!(compact_verdict_result(Some("{broken")).is_none());
+        assert!(compact_verdict_result(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_fresh_handle_attachment_is_atomic_with_the_ledger() {
+        let db = cache_db().await;
+        db.execute_script(
+            "INSERT INTO manual_check_handles(handle,project_id,created_at)
+               VALUES('fresh-handle','project-a',1),('foreign-handle','project-b',1);",
+        )
+        .await
+        .unwrap();
+        let mut write = observation("manual-source", "commit-manual", "env-a");
+        write.manual_handle = Some("fresh-handle".into());
+        record_fresh_check_observation(db.clone(), write).unwrap();
+        let attached = db
+            .query_one(
+                "SELECT observation_id,commit_sha,disposition,response_json
+             FROM manual_check_handles WHERE handle='fresh-handle'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.opt_text(3)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            attached,
+            (
+                "manual-source".into(),
+                "commit-manual".into(),
+                "fresh".into(),
+                None
+            )
+        );
+        let mut refused = observation("must-rollback", "commit-refused", "env-a");
+        refused.manual_handle = Some("foreign-handle".into());
+        let error = record_fresh_check_observation(db.clone(), refused).unwrap_err();
+        assert!(error.contains("persist manual check source"), "{error}");
+        let count = db
+            .query_one(
+                "SELECT COUNT(*) FROM check_result_observations WHERE id='must-rollback'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a durable verdict cannot commit without its handle association"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_cached_handle_attachment_keeps_the_exact_source() {
+        let db = cache_db().await;
+        record_fresh_check_observation(
+            db.clone(),
+            observation("source-first", "commit-1", "env-a"),
+        )
+        .unwrap();
+        db.execute_script(
+            "INSERT INTO manual_check_handles(handle,project_id,created_at)
+               VALUES('cached-handle','project-a',1);",
+        )
+        .await
+        .unwrap();
+        record_cached_check_observation(
+            db.clone(),
+            CachedCheckObservationWrite {
+                manual_handle: Some("cached-handle".into()),
+                project_id: "project-a".into(),
+                commit_sha: "commit-2".into(),
+                defined_by_commit_sha: "commit-2".into(),
+                tree_hash: "tree-commit-2".into(),
+                check_name: "rust".into(),
+                input_hash: "input-rust".into(),
+                environment_fingerprint: "env-a".into(),
+                result_schema_version: 1,
+                source_observation_id: "source-first".into(),
+                evaluated_at: 200,
+            },
+        )
+        .unwrap();
+        // A later run at the same content must not change this request's answer.
+        record_fresh_check_observation(
+            db.clone(),
+            observation("source-later", "commit-1", "env-a"),
+        )
+        .unwrap();
+        let attached = db
+            .query_one(
+                "SELECT observation_id,commit_sha,tree_hash,disposition,response_json
+             FROM manual_check_handles WHERE handle='cached-handle'",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.text(3)?,
+                        row.opt_text(4)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            attached,
+            (
+                "source-first".into(),
+                "commit-2".into(),
+                "tree-commit-2".into(),
+                "cached".into(),
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn cache_hit_adds_alias_without_rewriting_source_provenance() {
         let db = cache_db().await;
         record_fresh_check_observation(db.clone(), observation("obs-1", "commit-1", "env-a"))
@@ -6177,6 +6583,7 @@ mod tests {
         record_cached_check_observation(
             db.clone(),
             CachedCheckObservationWrite {
+                manual_handle: None,
                 project_id: "project-a".to_string(),
                 commit_sha: "commit-2".to_string(),
                 defined_by_commit_sha: "commit-2".to_string(),
@@ -6222,6 +6629,7 @@ mod tests {
         record_cached_check_observation(
             db.clone(),
             CachedCheckObservationWrite {
+                manual_handle: None,
                 project_id: "project-a".to_string(),
                 commit_sha: "commit-2".to_string(),
                 defined_by_commit_sha: "commit-2".to_string(),

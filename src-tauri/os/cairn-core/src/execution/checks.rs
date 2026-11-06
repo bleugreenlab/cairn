@@ -1820,7 +1820,7 @@ pub async fn manual_check_cache_context(
 /// requesting machine computes does not describe a verdict another machine
 /// produced, so a lookup-derived reply calls a spilled check unrecorded while its
 /// row sits in the database.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualConfiguredCheckResult {
     pub check_name: String,
@@ -1851,7 +1851,8 @@ pub struct ManualConfiguredCheckResult {
     /// verdict came from a placement this request did not demand.
     pub disposition: String,
     pub passed: bool,
-    /// Whether a successful exit carried canonical evidence that work ran.
+    /// Whether the successful exit is a verdict under the shared lane
+    /// classification, including an exit-code-only validator.
     pub verified: bool,
     pub unverified_reason: Option<String>,
     /// `fast tier: N ran, D deferred` when the run was the rust-tests fast
@@ -1881,7 +1882,7 @@ pub struct ManualConfiguredCheckResult {
 }
 
 /// A machine as a check result names it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckMachine {
     /// The public name `cairn://executors` lists.
@@ -1895,7 +1896,7 @@ pub struct CheckMachine {
 /// about the caller's change. Each has to render as itself: reporting either as a
 /// red — or as a complaint about recording — hides the only thing the reader can
 /// act on.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualCheckNoVerdict {
     /// `infrastructure` when Cairn's own machinery failed around the check,
@@ -1919,25 +1920,51 @@ pub(crate) const NO_VERDICT_SUPPRESSED: &str = "suppressed";
 /// observation its recorder wrote. A second lookup could only re-derive a key the
 /// recorder may not have used, which is exactly how a verdict that ran on another
 /// machine came back as "not recorded".
+///
+/// `command` is the configured command the run executed. A green with no
+/// structured result is verified only for a command that is not a test runner
+/// (a build, a type check, a validator script): a test runner must show its
+/// tests ran. An unknown command (a request recorded before its command was
+/// kept) is held to the test runner's bar.
 fn manual_configured_check_result(
     check_name: &str,
     project_key: &str,
     commit_sha: String,
     tree_hash: String,
     input_hash: String,
+    command: Option<&str>,
     outcome: CheckOutcome,
 ) -> ManualConfiguredCheckResult {
+    use crate::execution::checks_status::{row_existence, LaneExistence, VerdictEvidence};
+
     let no_verdict = manual_check_no_verdict(&outcome);
-    let unverified_reason = match crate::execution::checks_status::verdict_evidence(
+    let existence = row_existence(
         outcome.passed,
-        outcome.parsed.as_ref(),
-    ) {
-        crate::execution::checks_status::VerdictEvidence::Unverified(reason) => {
-            Some(reason.to_string())
-        }
-        _ => None,
+        outcome.failure_kind.map(CheckFailureKind::as_str),
+        outcome.suppressed_after,
+        outcome
+            .parsed
+            .as_ref()
+            .map(ParsedCheckResult::verdict_facts)
+            .as_ref(),
+    );
+    let unparsed_test_run = outcome.parsed.is_none()
+        && command.is_none_or(crate::execution::check_parsers::is_test_runner_command);
+    let verified =
+        outcome.passed && matches!(existence, LaneExistence::Complete) && !unparsed_test_run;
+    let unverified_reason = if outcome.passed && !verified {
+        Some(
+            match crate::execution::checks_status::verdict_evidence(
+                outcome.passed,
+                outcome.parsed.as_ref(),
+            ) {
+                VerdictEvidence::Unverified(reason) => reason.to_string(),
+                _ => existence.describe(),
+            },
+        )
+    } else {
+        None
     };
-    let verified = outcome.passed && unverified_reason.is_none();
     let tier = outcome
         .parsed
         .as_ref()
@@ -2043,10 +2070,13 @@ pub async fn run_manual_configured_check(
     run_manual_configured_check_with_progress(
         orch,
         run_id,
-        check_name,
-        branch,
-        placement,
-        false,
+        ManualCheckRequest {
+            check_name,
+            branch,
+            placement,
+            retry: false,
+            manual_handle: None,
+        },
         Arc::new(|_| {}),
     )
     .await
@@ -2095,15 +2125,27 @@ fn manual_progress_update(
     }
 }
 
-pub async fn run_manual_configured_check_with_progress(
+pub(crate) struct ManualCheckRequest<'a> {
+    pub check_name: &'a str,
+    pub branch: Option<&'a str>,
+    pub placement: Option<crate::execution::check_placement::CheckPlacementOverride>,
+    pub retry: bool,
+    pub manual_handle: Option<&'a str>,
+}
+
+pub(crate) async fn run_manual_configured_check_with_progress(
     orch: &Orchestrator,
     run_id: &str,
-    check_name: &str,
-    branch: Option<&str>,
-    placement: Option<crate::execution::check_placement::CheckPlacementOverride>,
-    retry: bool,
+    request: ManualCheckRequest<'_>,
     progress: ManualCheckProgress,
 ) -> Result<ManualConfiguredCheckResult, String> {
+    let ManualCheckRequest {
+        check_name,
+        branch,
+        placement,
+        retry,
+        manual_handle,
+    } = request;
     let contract = resolve_manual_check_contract_snapshot(
         orch,
         run_id,
@@ -2116,12 +2158,44 @@ pub async fn run_manual_configured_check_with_progress(
         .await
         .map_err(|error| error.to_string())?;
     let job_id = contract.context.job_id.clone();
+    if let Some(handle) = manual_handle {
+        let recovery = ManualCheckRecoveryContext {
+            project_key: contract.context.project_key.clone(),
+            command: Some(contract.plan.command.clone()),
+            placement: contract.placement.clone(),
+            runtime_instruments: contract
+                .plan
+                .verdict_runtime
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        };
+        let context = serde_json::to_string(&recovery).map_err(|error| error.to_string())?;
+        let updated = db
+            .execute(
+                "UPDATE manual_check_handles SET context_json=?1,commit_sha=?4,tree_hash=?5,input_hash=?6,disposition='fresh'
+                 WHERE project_id=?2 AND handle=?3",
+                cairn_db::turso::params![
+                    context, contract.context.project_id.as_str(), handle,
+                    contract.context.commit_sha.as_str(), contract.context.tree_hash.as_str(),
+                    contract.context.input_hash.as_str(),
+                ],
+            )
+            .await
+            .map_err(|error| format!("could not persist manual check request context: {error}"))?;
+        if updated != 1 {
+            return Err("manual check request has no durable handle".into());
+        }
+    }
     execute_check_contract(
         orch,
         db,
         contract,
         CheckRunProducer {
-            tool_use_id: format!("manual-check:{run_id}:{check_name}"),
+            tool_use_id: match manual_handle {
+                Some(handle) => format!("manual-check:{run_id}:handle={handle}:{check_name}"),
+                None => format!("manual-check:{run_id}:{check_name}"),
+            },
             node_kind: "manual-check".to_string(),
             owner_job_id: Some(job_id),
             purpose: None,
@@ -2322,49 +2396,144 @@ pub(crate) async fn execute_check_contract(
         commit_sha,
         context.tree_hash,
         context.input_hash,
+        Some(plan.command.as_str()),
         outcome,
     );
-    // A reused verdict's observation id is its source's, so this names the
-    // machine that actually produced the answer.
-    if let Some(crate::execution::cache::ObservationMachine {
-        executor_id,
-        verdict_platform,
-        toolchain_fingerprint,
-    }) = result.observation_id.as_deref().and_then(|id| {
+    let machine = result.observation_id.as_deref().and_then(|id| {
         crate::execution::cache::get_check_observation_machine(db.clone(), &project_id, id)
             .ok()
             .flatten()
-    }) {
-        result.executor = executor_id.map(|executor_id| CheckMachine {
-            name: orch.fleet.executor_name_for_text(&executor_id),
-            os: verdict_platform
+    });
+    let instruments = keyed[0]
+        .0
+        .verdict_runtime
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    enrich_manual_check_result(orch, &mut result, machine, &placement, &instruments);
+    Ok(result)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ManualCheckRecoveryContext {
+    project_key: String,
+    /// The configured command the request ran, so a recovered reply judges its
+    /// green by the same bar the live one did. Absent from requests recorded
+    /// before it was kept; those recover as if it were a test runner.
+    #[serde(default)]
+    command: Option<String>,
+    placement: crate::execution::check_placement::EffectiveCheckPlacement,
+    runtime_instruments: Vec<String>,
+}
+
+fn enrich_manual_check_result(
+    orch: &Orchestrator,
+    result: &mut ManualConfiguredCheckResult,
+    machine: Option<crate::execution::cache::ObservationMachine>,
+    placement: &crate::execution::check_placement::EffectiveCheckPlacement,
+    instruments: &[String],
+) {
+    if let Some(machine) = machine {
+        result.executor = machine.executor_id.map(|id| CheckMachine {
+            name: orch.fleet.executor_name_for_text(&id),
+            os: machine
+                .verdict_platform
                 .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
+                .unwrap_or_else(|| "unknown".into()),
         });
-        result.verdict_platform = verdict_platform;
-        let runtime = keyed
-            .first()
-            .map(|(plan, _)| {
-                cairn_checkenv::runtime_versions(
-                    plan.verdict_runtime
-                        .iter()
-                        .map(|(instrument, _)| instrument.as_str()),
-                    toolchain_fingerprint.as_deref(),
-                )
-            })
-            .unwrap_or_default();
+        result.verdict_platform = machine.verdict_platform;
+        let runtime = cairn_checkenv::runtime_versions(
+            instruments.iter().map(String::as_str),
+            machine.toolchain_fingerprint.as_deref(),
+        );
         result.runtime = (!runtime.is_empty())
             .then(|| crate::execution::check_identity::runtime_label(&runtime));
     }
     result.placement_unmet = unmet_placement(
-        &placement,
+        placement,
         result.executor.as_ref(),
         result.verdict_platform.as_deref(),
     );
     if result.placement_unmet.is_some() {
-        result.disposition = "unmet".to_string();
+        result.disposition = "unmet".into();
     }
-    result.placement_note = placement.note;
+    result.placement_note = placement.note.clone();
+}
+
+/// Recover the exact source attached directly or by shared publication identity.
+/// A commit alias can move on retry, so coordinates cannot answer a handle.
+pub(crate) async fn recover_manual_check_result(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    project_id: &str,
+    handle: &str,
+) -> Result<ManualConfiguredCheckResult, String> {
+    let project = project_id.to_string();
+    let handle = handle.to_string();
+    let (mut result, machine, context) = db.read(move |conn| Box::pin(async move {
+        let mut rows = conn.query(
+            "SELECT h.commit_sha,h.tree_hash,h.input_hash,h.disposition,h.context_json,
+                    o.id,o.public_handle,o.check_name,o.environment_fingerprint,o.reusable,o.ran_at,
+                    o.exit_code,o.verdict,o.failure_kind,o.verdict_result_json,o.output_tail,o.duration_ms,
+                    o.executor_id,o.verdict_platform,o.toolchain_fingerprint
+               FROM manual_check_handles h
+               JOIN check_result_observations o ON o.project_id=h.project_id
+                AND o.id=COALESCE(h.observation_id, (
+                    SELECT p.id FROM check_result_observations p
+                     WHERE p.project_id=h.project_id AND p.publication_id=h.publication_id
+                       AND p.publication_id IS NOT NULL
+                ))
+              WHERE h.project_id=?1 AND h.handle=?2",
+            cairn_db::turso::params![project, handle],
+        ).await?;
+        let row = rows.next().await?.ok_or_else(|| crate::storage::DbError::internal(
+            "manual check request has no attached recorded observation",
+        ))?;
+        let context: ManualCheckRecoveryContext = serde_json::from_str(&row.text(4)?)
+            .map_err(|error| crate::storage::DbError::internal(format!("invalid manual check recovery context: {error}")))?;
+        let parsed = row.opt_text(14)?.map(|json| serde_json::from_str::<ParsedCheckResult>(&json))
+            .transpose().map_err(|error| crate::storage::DbError::internal(format!("invalid recorded check result: {error}")))?;
+        let executor_id = row.opt_text(17)?;
+        let environment_fingerprint = row.text(8)?;
+        let not_recorded = executor_id.as_deref()
+            .is_some_and(|id| id != crate::fleet::COLOCATED_EXECUTOR_ID)
+            .then_some(environment_fingerprint.is_empty())
+            .filter(|empty| *empty)
+            .map(|_| "the selected legacy executor did not report a complete verdict environment identity".to_string());
+        let check_name = row.text(7)?;
+        let outcome = CheckOutcome {
+            name: check_name.clone(),
+            passed: row.text(12)? == "passed",
+            exit_code: Some(row.i64(11)? as i32),
+            failure_kind: row.opt_text(13)?.as_deref().and_then(CheckFailureKind::from_stored),
+            parsed,
+            output_tail: row.text(15)?,
+            cached: row.text(3)? == "cached",
+            duration_ms: row.i64(16)?,
+            suppressed_after: None,
+            recorded: Some(crate::execution::cache::RecordedCheckObservation {
+                id: row.text(5)?, public_handle: row.text(6)?,
+                ran_at: row.i64(10)?, environment_fingerprint,
+                executor_id: executor_id.clone(), reusable: row.i64(9)? != 0,
+            }),
+            not_recorded,
+        };
+        let result = manual_configured_check_result(
+            &check_name, &context.project_key, row.text(0)?, row.text(1)?, row.text(2)?,
+            context.command.as_deref(), outcome,
+        );
+        let machine = crate::execution::cache::ObservationMachine {
+            executor_id, verdict_platform: row.opt_text(18)?, toolchain_fingerprint: row.opt_text(19)?,
+        };
+        Ok((result, machine, context))
+    })).await.map_err(|error| format!("could not recover recorded manual check: {error}"))?;
+    enrich_manual_check_result(
+        orch,
+        &mut result,
+        Some(machine),
+        &context.placement,
+        &context.runtime_instruments,
+    );
     Ok(result)
 }
 
@@ -9815,6 +9984,8 @@ fn fresh_observation_write(
             })
         });
     FreshCheckObservationWrite {
+        manual_handle: manual_check_handle(tool_use_id).map(str::to_string),
+        publication_id: None,
         sealed_coordinate: sealed_coordinate.clone(),
         id: uuid::Uuid::new_v4().to_string(),
         public_handle: uuid::Uuid::new_v4().simple().to_string()[..24].to_string(),
@@ -9940,6 +10111,17 @@ fn observed_verdict_environment_hash(
 /// `cadence = 'main'` and `job_id = 'main:{project_id}'`; see
 /// [`crate::execution::checks_main`].
 pub(crate) const MAIN_CADENCE_STREAM_PREFIX: &str = "main-cadence:";
+
+/// A manual request's own identity, not its suite or run's reusable coordinate.
+pub(crate) fn manual_check_handle(tool_use_id: &str) -> Option<&str> {
+    let handle = tool_use_id
+        .strip_prefix("manual-check:")?
+        .split(':')
+        .nth(1)?
+        .strip_prefix("handle=")?;
+    uuid::Uuid::parse_str(handle).ok()?;
+    Some(handle)
+}
 
 /// The `cadence` an observation records, decided by its producer's stream prefix.
 fn observation_cadence(tool_use_id: &str) -> &'static str {
@@ -10679,6 +10861,7 @@ where
         let cached_recorded = record_cached_check_observation(
             db.clone(),
             CachedCheckObservationWrite {
+                manual_handle: manual_check_handle(tool_use_id).map(str::to_string),
                 project_id: project_id.to_string(),
                 commit_sha: commit.evaluated.to_string(),
                 // The reused verdict came from another commit's observation, but
@@ -11057,20 +11240,42 @@ where
                 // A corruption result is provisional. The publisher retains the
                 // original execution's guard across the one uncached retry, keeping
                 // every coalesced sibling blocked until the retry is recorded.
-                let publication_role = if let Some(guard) = pending_publication.take() {
-                    Some(crate::fleet::PublicationRole::Publisher(guard))
-                } else {
-                    match publication {
-                        Some(publication) => Some(publication.acquire().await),
-                        None => None,
-                    }
-                };
+                let (publication_role, publication_id) =
+                    if let Some((guard, id)) = pending_publication.take() {
+                        (Some(crate::fleet::PublicationRole::Publisher(guard)), id)
+                    } else {
+                        match publication {
+                            Some(publication) => {
+                                let id = Some(publication.id().to_string());
+                                (Some(publication.acquire().await), id)
+                            }
+                            None => (None, None),
+                        }
+                    };
                 if cache_corruption && !uncached_retry {
                     match publication_role {
                         Some(crate::fleet::PublicationRole::Publisher(guard)) => {
-                            pending_publication = Some(guard);
+                            pending_publication = Some((guard, publication_id));
                         }
                         Some(crate::fleet::PublicationRole::Published(recorded)) => {
+                            let attachment_error =
+                                match (manual_check_handle(tool_use_id), recorded.as_ref()) {
+                                    (Some(handle), Some(source)) => {
+                                        crate::execution::cache::attach_manual_check_observation(
+                                            db,
+                                            project_id,
+                                            handle,
+                                            &source.id,
+                                            commit.evaluated,
+                                            tree_hash,
+                                            input_hash,
+                                            "fresh",
+                                        )
+                                        .await
+                                        .err()
+                                    }
+                                    _ => None,
+                                };
                             let entry = get_check_result(
                                 db.clone(),
                                 project_id,
@@ -11098,7 +11303,7 @@ where
                                 duration_ms: entry.duration_ms,
                                 suppressed_after: None,
                                 recorded,
-                                not_recorded: None,
+                                not_recorded: attachment_error,
                             };
                             board.transition(
                                 index,
@@ -11122,7 +11327,25 @@ where
                 // verdict's durable identity", which is what the caller reports.
                 let (recorded, published_here, not_recorded) = match publication_role {
                     Some(crate::fleet::PublicationRole::Published(recorded)) => {
-                        (recorded, false, None)
+                        let attachment_error =
+                            match (manual_check_handle(tool_use_id), recorded.as_ref()) {
+                                (Some(handle), Some(source)) => {
+                                    crate::execution::cache::attach_manual_check_observation(
+                                        db,
+                                        project_id,
+                                        handle,
+                                        &source.id,
+                                        commit.evaluated,
+                                        tree_hash,
+                                        input_hash,
+                                        "fresh",
+                                    )
+                                    .await
+                                    .err()
+                                }
+                                _ => None,
+                            };
+                        (recorded, false, attachment_error)
                     }
                     role => {
                         // A failure with no executor provenance may still have
@@ -11196,6 +11419,7 @@ where
                                     .and_then(|meta| meta.verdict_platform.as_deref()),
                             ),
                         );
+                        observation.publication_id = publication_id;
                         if let Some(kind) = failure_kind {
                             let (cause, evidence) = failure_cause_and_evidence(
                                 substrate_failure.as_ref(),
@@ -21114,6 +21338,8 @@ cairn-common = { path = "../cairn-common" }
         environment_fingerprint: String,
     ) -> FreshCheckObservationWrite {
         FreshCheckObservationWrite {
+            manual_handle: None,
+            publication_id: None,
             sealed_coordinate: crate::execution::cache::SealedCheckCoordinate::new(
                 "commit-source",
                 "commit-source",
@@ -21329,6 +21555,7 @@ cairn-common = { path = "../cairn-common" }
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-remote".to_string(),
+            Some("bunx tsc --noEmit"),
             results.into_iter().next().unwrap(),
         );
         assert!(reply.passed, "a remote green reaches the caller as a green");
@@ -21491,6 +21718,7 @@ cairn-common = { path = "../cairn-common" }
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-local".to_string(),
+            Some("bunx tsc --noEmit"),
             results.into_iter().next().unwrap(),
         );
         assert!(reply.passed && reply.reusable);
@@ -21694,6 +21922,209 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     }
 
     #[tokio::test]
+    async fn an_exit_code_only_manual_pass_cites_a_readable_public_observation() {
+        let db = cache_db().await;
+        let outcome =
+            run_rust_lint(db.clone(), "ih-script-pass", 0, "validator passed".into()).await;
+        assert!(outcome.parsed.is_none());
+        let reply = manual_configured_check_result(
+            "rust-lint",
+            "project-a",
+            "commit-target".into(),
+            "tree-target".into(),
+            "ih-script-pass".into(),
+            Some("bun run check:rust"),
+            outcome,
+        );
+        let reference = reply.observation_ref.as_deref().expect("a public citation");
+        let handle = reference.rsplit('/').next().unwrap();
+        assert_eq!(handle.len(), 24, "{reference}");
+        assert!(handle.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let stored = crate::execution::cache::get_check_result_observation_by_handle(
+            db,
+            "project-a",
+            handle,
+        )
+        .unwrap()
+        .expect("the printed citation reads back from the ledger");
+        assert_eq!(stored.verdict, "passed");
+        assert_eq!(stored.exit_code, 0);
+        assert!(reply.passed && reply.verified, "{reply:?}");
+        assert_eq!(reply.unverified_reason, None);
+    }
+
+    #[tokio::test]
+    async fn a_vite_build_without_test_counts_is_a_verified_manual_pass() {
+        let db = cache_db().await;
+        let plans = vec![(
+            plan("frontend-build", "bunx --bun vite build"),
+            "ih-vite".into(),
+        )];
+        let outcome = run_planned_checks_at_commit(
+            db.clone(),
+            "project-a",
+            CheckRunCommit { evaluated: "commit-target", defined_by: "commit-target" },
+            "tree-target",
+            "job-a",
+            &plans,
+            "manual-check:run-a:frontend-build",
+            CheckExecMode::Shared,
+            None,
+            |_, _, _| async { exec_ok(Some(0), "vite v7.0.0 building for production...\n✓ 2048 modules transformed.\n✓ built in 23.27s") },
+            |_| {},
+        )
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+        assert!(outcome.parsed.is_none());
+        let reply = manual_configured_check_result(
+            "frontend-build",
+            "project-a",
+            "commit-target".into(),
+            "tree-target".into(),
+            "ih-vite".into(),
+            Some("bunx --bun vite build"),
+            outcome,
+        );
+        assert!(
+            reply.passed && reply.verified && reply.reusable,
+            "{reply:?}"
+        );
+        let reference = reply
+            .observation_ref
+            .as_deref()
+            .expect("the build has a public citation");
+        let handle = reference.rsplit('/').next().unwrap();
+        let stored = crate::execution::cache::get_check_result_observation_by_handle(
+            db,
+            "project-a",
+            handle,
+        )
+        .unwrap()
+        .expect("the citation reads back");
+        assert_eq!(stored.check_name, "frontend-build");
+        assert_eq!(stored.verdict, "passed");
+        assert_eq!(stored.exit_code, 0);
+        assert!(stored.complete && stored.reusable);
+    }
+
+    /// One exit-zero manual run of `command` whose output no parser reads.
+    async fn run_parse_less_green(
+        db: Arc<LocalDb>,
+        name: &str,
+        command: &str,
+        input_hash: &str,
+    ) -> CheckOutcome {
+        let plans = vec![(plan(name, command), input_hash.to_string())];
+        run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            &format!("manual-check:run-a:{name}"),
+            CheckExecMode::Shared,
+            None,
+            |_, _, _| async { exec_ok(Some(0), "the runner exited before its summary") },
+            |_| {},
+        )
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    /// A test runner that exits zero without a summary any parser reads has not
+    /// shown that a test ran. Its green stays unverified and unreusable, while
+    /// the observation it recorded stays readable at its public citation.
+    #[tokio::test]
+    async fn a_parse_less_test_runner_exit_zero_stays_an_unverified_manual_pass() {
+        let db = cache_db().await;
+        for (name, command) in [
+            ("rust-tests", "bun run test:rust"),
+            ("frontend-tests", "bun run test:frontend"),
+            ("bun-tests", "bun test"),
+        ] {
+            let input_hash = format!("ih-parse-less-{name}");
+            let outcome = run_parse_less_green(db.clone(), name, command, &input_hash).await;
+            assert!(outcome.passed && outcome.parsed.is_none(), "{command}");
+            let reply = manual_configured_check_result(
+                name,
+                "project-a",
+                "commit-target".into(),
+                "tree-target".into(),
+                input_hash.clone(),
+                Some(command),
+                outcome.clone(),
+            );
+            // A request recorded before its command was kept recovers with
+            // none, and must not be promoted to verified by the omission.
+            let legacy = manual_configured_check_result(
+                name,
+                "project-a",
+                "commit-target".into(),
+                "tree-target".into(),
+                input_hash,
+                None,
+                outcome,
+            );
+            assert_eq!(
+                (legacy.verified, &legacy.unverified_reason),
+                (reply.verified, &reply.unverified_reason),
+                "{command}"
+            );
+            assert!(reply.passed && !reply.verified, "{command}: {reply:?}");
+            assert_eq!(
+                reply.unverified_reason.as_deref(),
+                Some("the command produced no structured coverage result"),
+                "{command}"
+            );
+            assert!(!reply.reusable, "{command}: {reply:?}");
+            let reference = reply.observation_ref.as_deref().expect("a public citation");
+            let stored = crate::execution::cache::get_check_result_observation_by_handle(
+                db.clone(),
+                "project-a",
+                reference.rsplit('/').next().unwrap(),
+            )
+            .unwrap()
+            .expect("the citation reads back");
+            assert_eq!(stored.verdict, "passed", "{command}");
+            assert_eq!(stored.exit_code, 0, "{command}");
+            assert!(!stored.reusable, "{command}");
+        }
+        // The same parse-less green from a command that is not a test runner
+        // is a complete answer.
+        for (name, command) in [
+            ("frontend-build", "bunx --bun vite build"),
+            ("workspace-compile", "cargo check --workspace --locked"),
+            ("rust-lint", "bun run check:rust"),
+        ] {
+            let input_hash = format!("ih-parse-less-{name}");
+            let outcome = run_parse_less_green(db.clone(), name, command, &input_hash).await;
+            assert!(outcome.parsed.is_none(), "{command}");
+            let reply = manual_configured_check_result(
+                name,
+                "project-a",
+                "commit-target".into(),
+                "tree-target".into(),
+                input_hash,
+                Some(command),
+                outcome,
+            );
+            assert!(
+                reply.passed && reply.verified && reply.reusable,
+                "{command}: {reply:?}"
+            );
+            assert_eq!(reply.unverified_reason, None, "{command}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_complete_rust_lint_pass_is_a_verified_manual_verdict() {
         let db = cache_db().await;
         let body = format!(
@@ -21709,6 +22140,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-lint-pass".to_string(),
+            Some("bun run check:rust"),
             outcome,
         );
         assert!(
@@ -21751,6 +22183,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-lint-empty".to_string(),
+            Some("bun run check:rust"),
             outcome,
         );
         assert!(reply.passed && !reply.verified);
@@ -21826,6 +22259,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-infra".to_string(),
+            Some("bunx tsc --noEmit"),
             outcome,
         );
         let no_verdict = reply
@@ -21953,6 +22387,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-suppressed".to_string(),
+            Some("bun run test:rust"),
             suppressed,
         );
         let no_verdict = reply.no_verdict.expect("a suppressed check has no verdict");
@@ -21989,6 +22424,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-red".to_string(),
+            Some("bun run test:rust"),
             red,
         );
         assert!(
@@ -22028,6 +22464,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "same-commit".into(),
             "tree".into(),
             "input".into(),
+            Some("bun run test:rust"),
             make(first_id, "111111111111111111111111", 1_754_246_320_000),
         );
         let second = manual_configured_check_result(
@@ -22036,6 +22473,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "same-commit".into(),
             "tree".into(),
             "input".into(),
+            Some("bun run test:rust"),
             make(second_id, "222222222222222222222222", 1_754_246_321_000),
         );
         assert_ne!(first.observation_ref, second.observation_ref);

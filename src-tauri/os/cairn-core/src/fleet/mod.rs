@@ -876,6 +876,7 @@ pub(crate) struct PublicationCoordination {
 
 #[derive(Debug)]
 struct PublicationState {
+    id: String,
     claimed: AtomicBool,
     published: AtomicBool,
     /// What the publisher recorded, so every coalesced sibling can name the same
@@ -1121,16 +1122,58 @@ pub(crate) struct PureVerdictBatchItem {
     pub process: ProcessBatchItem,
 }
 
+async fn register_manual_check_publications(
+    db: &crate::storage::LocalDb,
+    project_id: String,
+    publications: Vec<(String, String)>,
+) -> Result<(), String> {
+    db.write(move |conn| {
+        let project_id = project_id.clone();
+        let publications = publications.clone();
+        Box::pin(async move {
+            for (handle, publication_id) in publications {
+                // An unfinished request can retry on a new shared execution.
+                // Once its source or response is attached, admission cannot move it.
+                let changed = conn
+                    .execute(
+                        "UPDATE manual_check_handles SET publication_id=?3
+                     WHERE project_id=?1 AND handle=?2
+                       AND observation_id IS NULL AND response_json IS NULL",
+                        cairn_db::turso::params![
+                            project_id.as_str(),
+                            handle.as_str(),
+                            publication_id
+                        ],
+                    )
+                    .await?;
+                if changed != 1 {
+                    return Err(crate::storage::DbError::internal(format!(
+                        "manual check publication registration failed for {handle}"
+                    )));
+                }
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 impl PublicationCoordination {
     fn new() -> Self {
         Self {
             state: Arc::new(PublicationState {
+                id: uuid::Uuid::new_v4().to_string(),
                 claimed: AtomicBool::new(false),
                 published: AtomicBool::new(false),
                 observation: std::sync::Mutex::new(None),
                 notify: Notify::new(),
             }),
         }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.state.id
     }
 
     pub(crate) async fn acquire(&self) -> PublicationRole {
@@ -12278,6 +12321,7 @@ impl Fleet {
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
         let mut receivers = Vec::with_capacity(items.len());
         let mut newly_claimed = Vec::new();
+        let mut manual_publications = Vec::new();
         let mut keys = Vec::new();
         let demand = PlacementDemand::of(&request);
         {
@@ -12299,6 +12343,12 @@ impl Fleet {
                         requesting_job_id: request.requesting_job_id.clone(),
                     },
                 );
+                if let Some(handle) =
+                    crate::execution::checks::manual_check_handle(&item.process.stream_id)
+                {
+                    let publication = &registry.by_key[&key].publication;
+                    manual_publications.push((handle.to_string(), publication.id().to_string()));
+                }
                 if opened {
                     keys.push(key);
                     newly_claimed.push(item);
@@ -12311,6 +12361,67 @@ impl Fleet {
                     }
                 }
                 receivers.push((public_identity, rx));
+            }
+        }
+        // Admission records the actual shared execution before this caller can
+        // wait for it. The publisher may already be committing its source; recovery
+        // joins this identity even if we never receive its direct observation ID.
+        if !manual_publications.is_empty() {
+            let mut subscribers: Vec<_> = receivers
+                .iter()
+                .map(|(identity, _)| CoalescedSubscriberDropGuard {
+                    pool: self.clone(),
+                    identity: identity.clone(),
+                    armed: true,
+                })
+                .collect();
+            let mut leader_guard = CoalescedLeaderCompletionGuard {
+                pool: self.clone(),
+                leader: leader.clone(),
+                work_class: request.placement_work_class,
+                keys: keys.clone(),
+                runner_context_id: None,
+                armed: !keys.is_empty(),
+            };
+            let registration = async {
+                let db =
+                    crate::execution::routing::owning_db_for_project(&orch.db, &request.project_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                register_manual_check_publications(
+                    &db,
+                    request.project_id.clone(),
+                    manual_publications,
+                )
+                .await
+            }
+            .await;
+            for subscriber in &mut subscribers {
+                subscriber.disarm();
+            }
+            leader_guard.disarm();
+            if let Err(error) = registration {
+                let diagnostic = format!("persist manual check publication: {error}");
+                for (identity, _) in &receivers {
+                    self.detach_coalesced_subscriber(identity, None);
+                }
+                for key in &keys {
+                    self.complete_coalesced_for_leader(
+                        key,
+                        executor_unavailable(diagnostic.clone()),
+                    );
+                }
+                if !keys.is_empty() {
+                    self.cancelled_leaders.lock().unwrap().remove(&leader);
+                }
+                return receivers
+                    .into_iter()
+                    .map(|_| {
+                        Err(CoalescedWaitError::refused(executor_unavailable(
+                            diagnostic.clone(),
+                        )))
+                    })
+                    .collect();
             }
         }
         // An item whose every check joined an execution another leader opened
@@ -20676,6 +20787,7 @@ const NOW: u64 = 1_000_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::RowExt;
     use cairn_common::executor_protocol::{
         AllocatorState, LivenessRefreshBlocked, LivenessRefreshPhase, RemoteConnectionPhase,
         LIVENESS_REFRESH_BOUND_MS,
@@ -37006,6 +37118,115 @@ mod tests {
             admit_request(&mut registry, &check_request_on("macos-2", Some("macos")));
         assert!(!opened);
         assert_eq!(joined, macos_key);
+    }
+
+    #[tokio::test]
+    async fn shared_publication_registration_allows_pending_retry_but_not_settled_movement() {
+        let db = crate::storage::migrated_test_db("publication-registration.db").await;
+        db.execute_script(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('p','default','P','pub','/unused',1,1);
+             INSERT INTO manual_check_handles(handle,project_id,created_at)
+             VALUES('pending','p',1),('receipt','p',1),('attached','p',1);
+             INSERT INTO check_result_observations(
+               id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,
+               exit_code,verdict,complete,reusable,parser_version,result_schema_version,
+               ran_at,duration_ms,cadence,output_tail)
+             VALUES('source','p','commit','tree','suite','input','env',0,'passed',1,1,1,1,1,1,'review','ok');
+             UPDATE manual_check_handles SET response_json='{}',publication_id='receipt-group' WHERE handle='receipt';
+             UPDATE manual_check_handles SET observation_id='source',publication_id='attached-group' WHERE handle='attached';"
+        ).await.unwrap();
+        let first = PublicationCoordination::new();
+        let retry = PublicationCoordination::new();
+        for publication in [&first, &retry] {
+            register_manual_check_publications(
+                &db,
+                "p".into(),
+                vec![("pending".into(), publication.id().into())],
+            )
+            .await
+            .unwrap();
+        }
+        let registered = db
+            .query_one(
+                "SELECT publication_id FROM manual_check_handles WHERE handle='pending'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered, retry.id());
+        for handle in ["receipt", "attached"] {
+            assert!(register_manual_check_publications(
+                &db,
+                "p".into(),
+                vec![(handle.into(), retry.id().into())]
+            )
+            .await
+            .is_err());
+        }
+        let bindings = db.query_all(
+            "SELECT publication_id FROM manual_check_handles WHERE handle IN ('receipt','attached') ORDER BY handle",
+            (), |row| row.text(0),
+        ).await.unwrap();
+        assert_eq!(bindings, vec!["attached-group", "receipt-group"]);
+        // A malformed batch cannot partially move the first pending handle.
+        assert!(register_manual_check_publications(
+            &db,
+            "p".into(),
+            vec![
+                ("pending".into(), first.id().into()),
+                ("missing".into(), first.id().into()),
+            ]
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            db.query_one(
+                "SELECT publication_id FROM manual_check_handles WHERE handle='pending'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap(),
+            retry.id()
+        );
+    }
+
+    #[test]
+    fn shared_publication_identity_tracks_the_actual_execution_not_its_content() {
+        let mut registry = InFlightRegistry::default();
+        let linux = check_request_on("linux-leader", Some("linux"));
+        let (linux_key, _) = admit_request(&mut registry, &linux);
+        let linux_publication = registry.by_key[&linux_key].publication.clone();
+        uuid::Uuid::parse_str(linux_publication.id()).unwrap();
+        let (joined, opened) = admit_request(
+            &mut registry,
+            &check_request_on("linux-follower", Some("linux")),
+        );
+        assert!(!opened);
+        assert_eq!(
+            linux_publication.id(),
+            registry.by_key[&joined].publication.id()
+        );
+        let (macos_key, opened) = admit_request(
+            &mut registry,
+            &check_request_on("macos-leader", Some("macos")),
+        );
+        assert!(opened);
+        assert_eq!(linux_key.result, macos_key.result);
+        assert_ne!(
+            linux_publication.id(),
+            registry.by_key[&macos_key].publication.id()
+        );
+        registry.by_key.remove(&linux_key);
+        let (retry_key, opened) = admit_request(&mut registry, &linux);
+        assert!(opened);
+        assert_ne!(
+            linux_publication.id(),
+            registry.by_key[&retry_key].publication.id(),
+            "even an identical request retry is a new publication"
+        );
     }
 
     /// The existing behaviour stays: requests without a demand share one

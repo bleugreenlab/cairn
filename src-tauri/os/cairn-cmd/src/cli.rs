@@ -28,8 +28,12 @@ pub(crate) fn default_callback_url() -> String {
 }
 
 fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|error| format!("invalid observation response: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+        format!(
+            "invalid observation response: {error}; body: {:?}",
+            cairn_mcp_server::output::truncate_chars(raw, 1000)
+        )
+    })?;
     if !value
         .get("ok")
         .and_then(serde_json::Value::as_bool)
@@ -594,7 +598,12 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
                  below before treating it as a result about your change."
             ),
         };
-        return Ok((format!("{cache}\n{headline}\n{cause}"), false));
+        let reference = result
+            .get("observationRef")
+            .and_then(serde_json::Value::as_str)
+            .map(|reference| format!("\n{reference}"))
+            .unwrap_or_default();
+        return Ok((format!("{cache}\n{headline}\n{cause}{reference}"), false));
     }
 
     let passed = result
@@ -614,9 +623,14 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
             .get("unverifiedReason")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("the runner supplied no coverage evidence");
+        let reference = result
+            .get("observationRef")
+            .and_then(serde_json::Value::as_str)
+            .map(|reference| format!(" · {reference}"))
+            .unwrap_or_default();
         return Ok((
             format!(
-                "{cache}\n⚠ {suite} is unverified on {short_commit} ({disposition}){machine} — {reason}"
+                "{cache}\n⚠ {suite} is unverified on {short_commit} ({disposition}){machine} — {reason}{reference}"
             ),
             false,
         ));
@@ -688,31 +702,96 @@ pub(crate) async fn run_cli_check(
     let callback_url = cli_callback_url();
     if !ensure_callback_reachable(&callback_url).await {
         print_unreachable_callback(&callback_url);
-        return 1;
+        return 2;
     }
     let client = build_cli_client(callback_url);
     let requests = suites
+        .into_iter()
+        .map(|suite| {
+            let request = check_run_request(
+                &client,
+                suite.clone(),
+                branch.clone(),
+                retry,
+                placement.as_ref(),
+            );
+            (suite, request)
+        })
+        .collect();
+    let stop = stop_requested();
+    tokio::pin!(stop);
+    let starts = match start_check_runs(&client, requests, retry, &mut stop, |line| {
+        eprintln!("cairn check run: {line}");
+    })
+    .await
+    {
+        Ok(starts) => starts,
+        Err(exit_code) => return exit_code,
+    };
+    follow_check_runs_until_stop(&client, &starts.started, starts.exit_code, &mut stop).await
+}
+
+struct CheckStarts {
+    started: Vec<(String, String)>,
+    exit_code: i32,
+}
+
+async fn start_check_runs(
+    client: &CairnMcpServer,
+    requests: Vec<(String, CallbackRequest)>,
+    retry: bool,
+    stop: &mut (impl std::future::Future<Output = i32> + Unpin),
+    mut report: impl FnMut(String),
+) -> Result<CheckStarts, i32> {
+    use futures::{stream::FuturesUnordered, StreamExt};
+
+    let mut pending: Vec<_> = requests
         .iter()
-        .cloned()
-        .map(|suite| check_run_request(&client, suite, branch.clone(), retry, placement.as_ref()));
-    let outcomes = futures::future::join_all(requests.map(|request| {
-        let client = &client;
-        async move { client.callback(&request).await }
-    }))
-    .await;
-    let mut all_passed = true;
-    let mut started = Vec::new();
-    for (suite, outcome) in suites.into_iter().zip(outcomes) {
+        .map(|(suite, _)| Some(suite.clone()))
+        .collect();
+    let mut starts: FuturesUnordered<_> =
+        requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, (suite, request))| async move {
+                (index, suite, client.callback(&request).await)
+            })
+            .collect();
+    let mut exit_code = 0;
+    let mut started: Vec<(String, String)> = Vec::new();
+    while !starts.is_empty() {
+        let next = tokio::select! {
+            biased;
+            code = &mut *stop => {
+                for (suite, handle) in &started {
+                    report(check_run_stop_line(None, suite, handle, unix_now_ms()));
+                }
+                for suite in pending.iter().flatten() {
+                    report(format!(
+                        "stopped waiting for {suite} start acknowledgement; the start may have been admitted, but no observation handle was received; stopping this client does not stop admitted checks"
+                    ));
+                }
+                return Err(code);
+            }
+            next = starts.next() => next,
+        };
+        let Some((index, suite, outcome)) = next else {
+            break;
+        };
+        pending[index] = None;
         if !outcome.transport_ok {
-            eprintln!("cairn check run: {}", outcome.result.trim_end());
-            all_passed = false;
+            report(outcome.result.trim_end().to_string());
+            exit_code = 2;
             continue;
         }
         let start: serde_json::Value = match serde_json::from_str(&outcome.result) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("cairn check run: invalid start response: {error}");
-                all_passed = false;
+                report(format!(
+                    "invalid start response: {error}; body: {:?}",
+                    cairn_mcp_server::output::truncate_chars(&outcome.result, 1000)
+                ));
+                exit_code = 2;
                 continue;
             }
         };
@@ -723,67 +802,154 @@ pub(crate) async fn run_cli_check(
             .and_then(|_| start.get("error"))
             .and_then(serde_json::Value::as_str)
         {
-            eprintln!("cairn check run: {error}");
-            all_passed = false;
+            report(error.to_string());
+            exit_code = 2;
             continue;
         }
         let Some(handle) = start
             .get("observationHandle")
             .and_then(serde_json::Value::as_str)
         else {
-            eprintln!("cairn check run: start response did not contain an observation handle");
-            all_passed = false;
+            report("start response did not contain an observation handle".into());
+            exit_code = 2;
             continue;
         };
-        eprintln!(
-            "cairn check run: {}",
-            check_run_start_line(&suite, handle, retry)
+        let line = check_run_start_line(&suite, handle, retry);
+        report(
+            match start
+                .get("observationRef")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(reference) => format!("{line}; read resource: {reference}"),
+                None => line,
+            },
         );
         started.push((suite, handle.to_string()));
     }
+    Ok(CheckStarts { started, exit_code })
+}
+
+/// Resume observation without starting or retrying an execution.
+pub(crate) async fn run_cli_check_watch(handle: String) -> i32 {
+    let callback_url = cli_callback_url();
+    if !ensure_callback_reachable(&callback_url).await {
+        print_unreachable_callback(&callback_url);
+        eprintln!("cairn check watch: stopped waiting; resume with cairn check watch {handle}");
+        return 2;
+    }
+    let client = build_cli_client(callback_url);
+    follow_check_runs(&client, &[("check".into(), handle)], 0).await
+}
+
+/// Exit 1 requires an observed failed check. Exit 2 means the requested
+/// evidence was not obtained, including an abandoned or broken observation.
+async fn follow_check_runs(
+    client: &CairnMcpServer,
+    started: &[(String, String)],
+    exit_code: i32,
+) -> i32 {
     let stop = stop_requested();
     tokio::pin!(stop);
-    for (position, (suite, handle)) in started.iter().enumerate() {
-        let last = std::sync::Mutex::new(None);
-        let final_response = tokio::select! {
-            settled = watch_check_run(&client, suite, handle, &last) => settled,
-            exit_code = &mut stop => {
+    follow_check_runs_until_stop(client, started, exit_code, &mut stop).await
+}
+
+async fn follow_check_runs_until_stop(
+    client: &CairnMcpServer,
+    started: &[(String, String)],
+    exit_code: i32,
+    stop: &mut (impl std::future::Future<Output = i32> + Unpin),
+) -> i32 {
+    follow_check_runs_reporting(client, started, exit_code, stop, |line| {
+        eprintln!("cairn check run: {line}");
+    })
+    .await
+}
+
+async fn follow_check_runs_reporting(
+    client: &CairnMcpServer,
+    started: &[(String, String)],
+    mut exit_code: i32,
+    stop: &mut (impl std::future::Future<Output = i32> + Unpin),
+    mut report: impl FnMut(String),
+) -> i32 {
+    use futures::{stream::FuturesUnordered, StreamExt};
+
+    let states: Vec<_> = started
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    let mut unsettled = vec![true; started.len()];
+    let mut follows: FuturesUnordered<_> = started
+        .iter()
+        .zip(&states)
+        .enumerate()
+        .map(|(index, ((suite, handle), last))| async move {
+            (index, watch_check_run(client, suite, handle, last).await)
+        })
+        .collect();
+    while !follows.is_empty() {
+        let (index, final_response) = tokio::select! {
+            settled = follows.next() => settled.expect("an outstanding check"),
+            code = &mut *stop => {
                 let now = unix_now_ms();
-                let last = last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                eprintln!(
-                    "cairn check run: {}",
-                    check_run_stop_line(last.as_ref(), suite, handle, now)
-                );
-                for (suite, handle) in &started[position + 1..] {
-                    eprintln!(
-                        "cairn check run: {}",
-                        check_run_stop_line(None, suite, handle, now)
-                    );
+                for (index, (suite, handle)) in started.iter().enumerate() {
+                    if unsettled[index] {
+                        let last = states[index]
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        report(check_run_stop_line(last.as_ref(), suite, handle, now));
+                    }
                 }
-                // The signal's conventional code, never 1: an abandoned wait
-                // is not a failed check.
-                return exit_code;
+                // The signal describes this client, never a backend verdict.
+                return code;
             }
         };
-        let Some(final_response) = final_response else {
-            all_passed = false;
-            continue;
+        unsettled[index] = false;
+        let (suite, handle) = &started[index];
+        let final_response = match final_response {
+            Ok(response) => response,
+            Err(error) => {
+                let last = states[index]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                report(format!(
+                    "{error}\n{}",
+                    check_run_stop_line(last.as_ref(), suite, handle, unix_now_ms())
+                ));
+                exit_code = 2;
+                continue;
+            }
         };
         match render_check_run_response(&final_response) {
             Ok((summary, passed)) => {
                 println!("{summary}");
-                all_passed &= passed;
+                exit_code = exit_code.max(check_response_exit_code(&final_response, passed));
             }
             Err(error) => {
-                eprintln!("cairn check run: {error}");
-                all_passed = false;
+                report(format!(
+                    "{error}\n{}",
+                    check_run_stop_line(None, suite, handle, unix_now_ms())
+                ));
+                exit_code = 2;
             }
         }
     }
-    if all_passed {
-        0
-    } else {
+    exit_code
+}
+
+fn check_response_exit_code(raw: &str, passed: bool) -> i32 {
+    if passed {
+        return 0;
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    let result = &value["result"];
+    if result["passed"] == false
+        && result["noVerdict"].is_null()
+        && result["placementUnmet"].is_null()
+    {
         1
+    } else {
+        2
     }
 }
 
@@ -868,7 +1034,7 @@ fn check_run_start_line(suite: &str, handle: &str, retry: bool) -> String {
         "re-running the same command joins it while it runs, and reuses its verdict once recorded where that verdict is reusable"
     };
     format!(
-        "{suite} observation {handle}; the check runs to its recorded row even if this command is stopped; {rejoin}"
+        "{suite} observation {handle}; the check runs to its recorded row even if this command is stopped; {rejoin}; read without rerunning: cairn check watch {handle}"
     )
 }
 
@@ -883,41 +1049,34 @@ fn check_run_stop_line(
         |watch| format!("is {}", watch.standing(now_unix_ms)),
     );
     format!(
-        "stopped waiting; {suite} {standing}; its row will still be recorded (observation {handle})"
+        "stopped waiting; {suite} {standing}; stopping this client does not stop the check (observation {handle}); read its outcome with: cairn check watch {handle}"
     )
 }
 
-/// Poll one observation until it settles: the result to render, or `None`
-/// once a failure has been reported. `last` always holds the latest unsettled
+/// Poll one observation until it settles, or return why observation stopped.
+/// `last` always holds the latest unsettled
 /// observation, for the line printed if the wait is abandoned.
 async fn watch_check_run(
     client: &CairnMcpServer,
     suite: &str,
     handle: &str,
     last: &std::sync::Mutex<Option<CheckWatch>>,
-) -> Option<String> {
+) -> Result<String, String> {
     let mut last_printed = tokio::time::Instant::now();
     loop {
         let status = client
             .callback(&check_run_status_request(client, handle))
             .await;
         if !status.transport_ok {
-            eprintln!("cairn check run: {}", status.result.trim_end());
-            return None;
+            return Err(status.result.trim_end().to_string());
         }
-        let observation = match parse_check_run_observation(&status.result) {
-            Ok(observation) => observation,
-            Err(error) => {
-                eprintln!("cairn check run: {error}");
-                return None;
-            }
-        };
+        let observation = parse_check_run_observation(&status.result)?;
         if let Some(watch) = CheckWatch::from_observation(&observation) {
             let mut last = last
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if watch.is_news_after(last.as_ref()) {
-                eprintln!("cairn check run: {}", watch.diagnostic);
+                eprintln!("cairn check run: {suite}: {}", watch.diagnostic);
                 last_printed = tokio::time::Instant::now();
             } else if last_printed.elapsed() >= CHECK_RUN_HEARTBEAT {
                 eprintln!(
@@ -930,23 +1089,18 @@ async fn watch_check_run(
         }
         match observation.get("state").and_then(serde_json::Value::as_str) {
             Some("complete") => {
-                return Some(
-                    serde_json::json!({
-                        "ok": true,
-                        "result": observation.get("result").cloned().unwrap_or_default()
-                    })
-                    .to_string(),
-                )
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "result": observation.get("result").cloned().unwrap_or_default()
+                })
+                .to_string())
             }
             Some("failed") => {
-                eprintln!(
-                    "cairn check run: {}",
-                    observation
-                        .get("error")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("manual check failed")
-                );
-                return None;
+                return Err(observation
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("manual check ended without a result")
+                    .to_string());
             }
             _ => tokio::time::sleep(Duration::from_secs(1)).await,
         }
@@ -1252,6 +1406,359 @@ mod tests {
         );
     }
 
+    struct CheckPolls(std::sync::Mutex<std::collections::VecDeque<(bool, String)>>);
+
+    #[async_trait::async_trait]
+    impl cairn_mcp_server::CallbackSink for CheckPolls {
+        fn describe(&self) -> &str {
+            "manual check test"
+        }
+
+        async fn call(&self, request: &CallbackRequest) -> cairn_mcp_server::CallbackOutcome {
+            assert_eq!(request.tool, "check_run");
+            assert!(request.payload.get("observationHandle").is_some());
+            assert!(
+                request.payload.get("suite").is_none(),
+                "watch must never start work"
+            );
+            let (transport_ok, result) = self.0.lock().unwrap().pop_front().expect("one poll");
+            cairn_mcp_server::CallbackOutcome {
+                result,
+                transport_ok,
+                reminders: Vec::new(),
+                failure: None,
+            }
+        }
+    }
+
+    fn check_poll_client(responses: Vec<(bool, String)>) -> CairnMcpServer {
+        CairnMcpServer::new(
+            std::sync::Arc::new(CheckPolls(std::sync::Mutex::new(responses.into()))),
+            cairn_mcp_server::Caller::Fixed {
+                run_id: Some("run-1".into()),
+                cwd: "/repo".into(),
+            },
+        )
+    }
+
+    struct CheckStartsCallback {
+        delayed_started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl cairn_mcp_server::CallbackSink for CheckStartsCallback {
+        fn describe(&self) -> &str {
+            "delayed check start test"
+        }
+
+        async fn call(&self, request: &CallbackRequest) -> cairn_mcp_server::CallbackOutcome {
+            assert_eq!(request.tool, "check_run");
+            assert!(request.payload.get("observationHandle").is_none());
+            let suite = request.payload["suite"].as_str().unwrap();
+            if suite == "delayed" {
+                self.delayed_started.notify_one();
+                return std::future::pending().await;
+            }
+            cairn_mcp_server::CallbackOutcome {
+                result: serde_json::json!({
+                    "ok": true, "observationHandle": format!("obs-{suite}"),
+                    "observationRef": format!("cairn://p/proj/check-observations/obs-{suite}")
+                })
+                .to_string(),
+                transport_ok: true,
+                reminders: Vec::new(),
+                failure: None,
+            }
+        }
+    }
+
+    fn check_start_client(delayed_started: std::sync::Arc<tokio::sync::Notify>) -> CairnMcpServer {
+        CairnMcpServer::new(
+            std::sync::Arc::new(CheckStartsCallback { delayed_started }),
+            cairn_mcp_server::Caller::Fixed {
+                run_id: Some("run-1".into()),
+                cwd: "/repo".into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn check_run_interrupted_start_preserves_acknowledged_handle() {
+        for signal_code in [130, 143] {
+            let delayed_started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let acknowledged = tokio::sync::Notify::new();
+            let client = check_start_client(delayed_started.clone());
+            // Put the stalled request first so ordered collection would lose
+            // the later suite's acknowledged handle.
+            let requests = ["delayed", "validator"]
+                .into_iter()
+                .map(|suite| {
+                    (
+                        suite.to_string(),
+                        check_run_request(&client, suite.into(), None, false, None),
+                    )
+                })
+                .collect();
+            let stop = async {
+                delayed_started.notified().await;
+                acknowledged.notified().await;
+                signal_code
+            };
+            tokio::pin!(stop);
+            let mut lines = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                start_check_runs(&client, requests, false, &mut stop, |line| {
+                    if line.starts_with("validator observation obs-validator;") {
+                        acknowledged.notify_one();
+                    }
+                    lines.push(line);
+                }),
+            )
+            .await
+            .expect("stop must not wait for the delayed start");
+            assert!(matches!(result, Err(code) if code == signal_code));
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            assert_eq!(
+                lines[0],
+                format!(
+                    "{}; read resource: cairn://p/proj/check-observations/obs-validator",
+                    check_run_start_line("validator", "obs-validator", false)
+                )
+            );
+            assert_eq!(
+                lines[1],
+                check_run_stop_line(None, "validator", "obs-validator", 0)
+            );
+            assert!(lines[2].contains("delayed start acknowledgement"));
+            assert!(lines[2].contains("may have been admitted"));
+            assert!(lines[2].contains("no observation handle was received"));
+        }
+    }
+
+    #[tokio::test]
+    async fn check_run_completed_starts_retain_all_handles() {
+        let client = check_start_client(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let requests = ["validator", "lint"]
+            .into_iter()
+            .map(|suite| {
+                (
+                    suite.to_string(),
+                    check_run_request(&client, suite.into(), None, true, None),
+                )
+            })
+            .collect();
+        let mut stop = std::future::pending();
+        let mut lines = Vec::new();
+        let starts = start_check_runs(&client, requests, true, &mut stop, |line| lines.push(line))
+            .await
+            .unwrap_or_else(|code| panic!("unexpected stop {code}"));
+        assert_eq!(starts.exit_code, 0);
+        assert_eq!(starts.started.len(), 2);
+        for suite in ["validator", "lint"] {
+            let handle = format!("obs-{suite}");
+            assert!(starts.started.contains(&(suite.into(), handle.clone())));
+            assert!(lines.contains(&format!(
+                "{}; read resource: cairn://p/proj/check-observations/{handle}",
+                check_run_start_line(suite, &handle, true)
+            )));
+        }
+    }
+
+    fn settled_check(passed: bool) -> String {
+        serde_json::json!({
+            "ok": true, "observation": {
+                "state": "complete", "result": {
+                    "checkName": "validator", "commitSha": "1234567890abcdef",
+                    "disposition": "fresh", "passed": passed, "verified": true,
+                    "reusable": true, "observationRef": "cairn://p/cairn/check-observations/1234567890abcdef12345678"
+                }
+            }
+        }).to_string()
+    }
+
+    #[tokio::test]
+    async fn check_run_interruption_names_every_unsettled_suite_and_its_latest_state() {
+        struct ConcurrentPolls;
+        #[async_trait::async_trait]
+        impl cairn_mcp_server::CallbackSink for ConcurrentPolls {
+            fn describe(&self) -> &str {
+                "concurrent check follow test"
+            }
+
+            async fn call(&self, request: &CallbackRequest) -> cairn_mcp_server::CallbackOutcome {
+                let handle = request.payload["observationHandle"].as_str().unwrap();
+                let result = match handle {
+                    "request-fast" => settled_check(true),
+                    "request-slow" | "request-other" => serde_json::json!({
+                        "ok": true,
+                        "observation": {
+                            "state": "running",
+                            "executor": format!("machine-{handle}"),
+                            "sinceUnixMs": CLAIMED_AT,
+                            "diagnostic": "running"
+                        }
+                    })
+                    .to_string(),
+                    _ => panic!("unexpected handle {handle}"),
+                };
+                cairn_mcp_server::CallbackOutcome {
+                    result,
+                    transport_ok: true,
+                    reminders: Vec::new(),
+                    failure: None,
+                }
+            }
+        }
+
+        for code in [130, 143] {
+            let client = CairnMcpServer::new(
+                std::sync::Arc::new(ConcurrentPolls),
+                cairn_mcp_server::Caller::Fixed {
+                    run_id: Some("run-1".into()),
+                    cwd: "/repo".into(),
+                },
+            );
+            let stop = async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                code
+            };
+            tokio::pin!(stop);
+            let mut lines = Vec::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                follow_check_runs_reporting(
+                    &client,
+                    &[
+                        ("slow".into(), "request-slow".into()),
+                        ("other".into(), "request-other".into()),
+                        ("fast".into(), "request-fast".into()),
+                    ],
+                    0,
+                    &mut stop,
+                    |line| lines.push(line),
+                ),
+            )
+            .await
+            .expect("stopping a client must not wait for its checks");
+            assert_eq!(result, code);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            for (suite, handle) in [("slow", "request-slow"), ("other", "request-other")] {
+                let line = lines
+                    .iter()
+                    .find(|line| line.contains(&format!("{suite} is RUNNING")))
+                    .unwrap();
+                assert!(line.contains(&format!("machine-{handle}")), "{line}");
+                assert!(
+                    line.contains(&format!("cairn check watch {handle}")),
+                    "{line}"
+                );
+            }
+            assert!(lines.iter().all(|line| !line.contains("request-fast")));
+        }
+    }
+
+    #[tokio::test]
+    async fn check_run_a_lost_wait_is_not_a_failed_check() {
+        for response in [
+            (true, "Refused: callback context expired".into()),
+            (false, "Error calling runner: connection lost".into()),
+            (
+                true,
+                r#"{"ok":false,"error":"observation unavailable"}"#.into(),
+            ),
+        ] {
+            let client = check_poll_client(vec![response]);
+            assert_eq!(
+                follow_check_runs(&client, &[("validator".into(), "request-1".into())], 0).await,
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_run_an_interrupted_request_after_restart_is_not_a_check_failure() {
+        let response = serde_json::json!({
+            "ok": true,
+            "observation": {
+                "state": "failed",
+                "error": "manual check was interrupted before its terminal answer was persisted; no recorded answer is available for this handle"
+            }
+        }).to_string();
+        let client = check_poll_client(vec![(true, response.clone())]);
+        let last = std::sync::Mutex::new(None);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            watch_check_run(&client, "rust-tests", "request-1", &last),
+        )
+        .await
+        .expect("an interrupted request must terminate the wait")
+        .unwrap_err();
+        assert!(error.contains("interrupted"), "{error}");
+        assert!(error.contains("no recorded answer"), "{error}");
+
+        let client = check_poll_client(vec![(true, response)]);
+        assert_eq!(
+            follow_check_runs(&client, &[("rust-tests".into(), "request-1".into())], 0).await,
+            2
+        );
+        let recovery = check_run_stop_line(None, "rust-tests", "request-1", unix_now_ms());
+        assert!(recovery.contains("stopped waiting"));
+        assert!(recovery.contains("cairn check watch request-1"));
+    }
+
+    #[tokio::test]
+    async fn check_run_a_missing_outcome_takes_precedence_over_an_observed_red() {
+        let client = check_poll_client(vec![
+            (true, settled_check(false)),
+            (false, "connection lost".into()),
+        ]);
+        assert_eq!(
+            follow_check_runs(
+                &client,
+                &[
+                    ("validator".into(), "request-1".into()),
+                    ("tests".into(), "request-2".into()),
+                ],
+                0
+            )
+            .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn check_run_only_an_observed_red_exits_one() {
+        for (passed, expected) in [(true, 0), (false, 1)] {
+            let client = check_poll_client(vec![(true, settled_check(passed))]);
+            assert_eq!(
+                follow_check_runs(&client, &[("validator".into(), "request-1".into())], 0).await,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn check_run_no_verdict_exits_two() {
+        let response = serde_json::json!({"result": {
+            "passed": false, "noVerdict": {"kind":"infrastructure", "cause":"machine lost"}
+        }})
+        .to_string();
+        assert_eq!(check_response_exit_code(&response, false), 2);
+        assert_eq!(
+            check_response_exit_code(r#"{"result":{"passed":true,"verified":false}}"#, false),
+            2
+        );
+    }
+
+    #[test]
+    fn check_run_invalid_observation_keeps_the_runner_body() {
+        let body = "Refused: callback context expired";
+        let error = parse_check_run_observation(body).unwrap_err();
+        assert!(error.contains("invalid observation response"), "{error}");
+        assert!(error.contains(body), "{error}");
+    }
+
     #[test]
     fn check_run_unknown_handle_is_terminal() {
         let error = parse_check_run_observation(
@@ -1279,7 +1786,7 @@ mod tests {
         let line = check_run_start_line("rust-tests", "obs-1", false);
         assert_eq!(
             line,
-            "rust-tests observation obs-1; the check runs to its recorded row even if this command is stopped; re-running the same command joins it while it runs, and reuses its verdict once recorded where that verdict is reusable"
+            "rust-tests observation obs-1; the check runs to its recorded row even if this command is stopped; re-running the same command joins it while it runs, and reuses its verdict once recorded where that verdict is reusable; read without rerunning: cairn check watch obs-1"
         );
         assert!(check_run_start_line("rust-tests", "obs-1", true)
             .contains("runs it afresh once its row is recorded"));
@@ -1333,12 +1840,12 @@ mod tests {
         );
         assert_eq!(
             line,
-            "stopped waiting; rust-tests is RUNNING on fedora since 09:48:09Z (3h5m elapsed); its row will still be recorded (observation obs-1)"
+            "stopped waiting; rust-tests is RUNNING on fedora since 09:48:09Z (3h5m elapsed); stopping this client does not stop the check (observation obs-1); read its outcome with: cairn check watch obs-1"
         );
         assert!(!line.contains("timed out"));
         assert_eq!(
             check_run_stop_line(None, "lint", "obs-2", CLAIMED_AT),
-            "stopped waiting; lint was started; its row will still be recorded (observation obs-2)"
+            "stopped waiting; lint was started; stopping this client does not stop the check (observation obs-2); read its outcome with: cairn check watch obs-2"
         );
     }
 
@@ -1364,6 +1871,35 @@ mod tests {
         let error = parse_check_run_observation(r#"{"ok":true,"observation":{"state":"mystery"}}"#)
             .unwrap_err();
         assert!(error.contains("unknown state"));
+    }
+
+    #[test]
+    fn check_run_response_prints_a_script_verdict_public_handle() {
+        let reference = "cairn://p/cairn/check-observations/1234567890abcdef12345678";
+        for (suite, disposition) in ["licenses", "frontend-build"]
+            .into_iter()
+            .flat_map(|suite| {
+                ["fresh", "cached"]
+                    .into_iter()
+                    .map(move |disposition| (suite, disposition))
+            })
+        {
+            let (summary, passed) = render_check_run_response(
+                &serde_json::json!({
+                    "ok": true, "result": {
+                        "checkName": suite, "commitSha": "1234567890abcdef",
+                        "disposition": disposition, "passed": true, "verified": true,
+                        "exitCode": 0, "reusable": true, "observationRef": reference
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert!(passed, "{summary}");
+            assert!(summary.contains(&format!("{suite} ✓")), "{summary}");
+            assert!(summary.contains(reference), "{summary}");
+            assert!(!summary.contains("unverified"), "{summary}");
+        }
     }
 
     #[test]
@@ -1543,6 +2079,7 @@ mod tests {
                     "passed": true,
                     "verified": false,
                     "unverifiedReason": "no tests matched the selection",
+                    "observationRef": "cairn://p/cairn/check-observations/1234567890abcdef12345678",
                     "reusable": false
                 }
             })
@@ -1552,6 +2089,10 @@ mod tests {
         assert!(!passed);
         assert!(summary.contains("⚠ rust-tests is unverified"), "{summary}");
         assert!(!summary.contains("rust-tests ✓"), "{summary}");
+        assert!(
+            summary.contains("cairn://p/cairn/check-observations/1234567890abcdef12345678"),
+            "{summary}"
+        );
     }
 
     #[test]

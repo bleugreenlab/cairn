@@ -432,6 +432,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("memory_triage_issue_memories", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR memory_id IN (SELECT id FROM memories WHERE project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("search_outbox", "source_id = ?1 OR source_id IN (SELECT id FROM issues WHERE project_id = ?1) OR source_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR source_id IN (SELECT id FROM runs WHERE project_id = ?1) OR source_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
     delete_only("check_result_observations", "project_id = ?1"),
+    delete_only("manual_check_handles", "project_id = ?1"),
     delete_only("check_test_results", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_observation_relabels", "project_id = ?1 OR observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_deferred_tests", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
@@ -1647,6 +1648,9 @@ pub(super) mod tests {
               VALUES ('project-delete', 'project', '', 1, 'attachment-hash', 'file', 'file.txt', 1);
             INSERT INTO check_result_observations(id, project_id, commit_sha, tree_hash, check_name, input_hash, environment_fingerprint, exit_code, verdict, complete, reusable, parser_version, result_schema_version, ran_at, duration_ms, cadence, output_tail)
               VALUES ('observation-delete', 'project-delete', 'commit', 'tree', 'check', 'input', 'env', 0, 'passed', 1, 1, 1, 1, 1, 1, 'write', 'ok');
+            INSERT INTO manual_check_handles(handle, project_id, observation_id, created_at)
+              VALUES ('recorded-handle-delete', 'project-delete', 'observation-delete', 1),
+                     ('unrecorded-handle-delete', 'project-delete', NULL, 1);
             INSERT INTO check_test_results(observation_id, test_id, status, flaky)
               VALUES ('observation-delete', 'test', 'passed', 0);
             INSERT INTO check_deferred_tests(observation_id, test_id, duration_ms)
@@ -1665,6 +1669,8 @@ pub(super) mod tests {
               VALUES ('intent-delete', 'bookmark', 'completed', 1);
             INSERT INTO jj_reconcile_quarantines(project_id, store_path, bookmark, failure_kind, fingerprint, created_at, updated_at)
               VALUES ('project-delete', '/store', 'bookmark', 'permanent', 'fingerprint', 1, 1);
+            INSERT INTO jj_branch_recoveries(id, project_id, store_path, scope, status, phase, budget_class, operation, affected, coordinates, diagnostic, next_repair_at, created_at, updated_at)
+              VALUES ('recovery-delete', 'project-delete', '/store', 'branch', 'fenced', 'replay', 'interactive', 'operation', '[]', '{}', 'repair pending', 1, 1, 1);
             INSERT INTO job_browsers(id, job_id, project_id, slug, webview_label, status, created_at)
               VALUES ('browser-delete', 'job-delete', 'project-delete', 'browser', 'browser', 'closed', 1);
             INSERT INTO job_repls(id, job_id, project_id, slug, interpreter, generation, status, created_at)

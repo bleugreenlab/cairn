@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
+use crate::storage::RowExt;
 
 /// Why a caller with no run cannot have an observation.
 ///
@@ -69,7 +70,7 @@ impl CheckRunPayload {
 
 /// `executor` and `sinceUnixMs` are optional so a CLI that predates them reads
 /// the diagnostic alone, as it always did.
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
@@ -152,6 +153,119 @@ fn load_observation(handle: &str) -> Result<ManualCheckObservation, String> {
         .ok_or_else(|| format!("manual check observation {handle} is unknown or expired"))
 }
 
+fn registry_key(project_id: &str, handle: &str) -> String {
+    format!("{project_id}/{handle}")
+}
+
+/// A terminal reply preserves request-specific facts (notably the evaluated
+/// commit on a cache hit) while its foreign key names the immutable source
+/// observation. Never search for the latest verdict at the same coordinate.
+async fn persist_terminal_observation(
+    db: &crate::storage::LocalDb,
+    project_id: &str,
+    handle: &str,
+    observation: &ManualCheckObservation,
+) -> Result<(), String> {
+    let observation_id = match observation {
+        ManualCheckObservation::Complete { result } => result.observation_id.as_deref(),
+        _ => None,
+    };
+    let response = serde_json::to_string(observation).map_err(|error| error.to_string())?;
+    let changed = db
+        .execute(
+            "UPDATE manual_check_handles SET observation_id=?3,response_json=?4
+         WHERE project_id=?1 AND handle=?2 AND response_json IS NULL
+           AND (?3 IS NULL OR EXISTS (
+             SELECT 1 FROM check_result_observations WHERE project_id=?1 AND id=?3))",
+            cairn_db::turso::params![project_id, handle, observation_id, response],
+        )
+        .await
+        .map_err(|error| format!("persist manual check observation {handle}: {error}"))?;
+    if changed != 1 {
+        return Err(format!("persist manual check observation {handle}: handle or project-owned source observation is missing, or the handle already settled"));
+    }
+    Ok(())
+}
+
+async fn recover_observation(
+    orch: &Orchestrator,
+    db: Arc<crate::storage::LocalDb>,
+    project_id: &str,
+    handle: &str,
+) -> Result<ManualCheckObservation, String> {
+    // Authenticate against durable ownership even while the progress cache is
+    // warm: an opaque UUID is not authority to read another project's result.
+    let row = db
+        .query_opt(
+            "SELECT h.response_json, COALESCE(h.observation_id,p.id),
+                CASE WHEN h.observation_id IS NOT NULL
+                     THEN COALESCE(o.project_id=h.project_id,0)
+                     ELSE p.id IS NOT NULL END
+         FROM manual_check_handles h
+         LEFT JOIN check_result_observations o ON o.id=h.observation_id
+         LEFT JOIN check_result_observations p
+           ON p.project_id=h.project_id AND p.publication_id=h.publication_id
+             AND p.publication_id IS NOT NULL
+         WHERE h.project_id=?1 AND h.handle=?2",
+            cairn_db::turso::params![project_id, handle],
+            |row| Ok((row.opt_text(0)?, row.opt_text(1)?, row.i64(2)? != 0)),
+        )
+        .await
+        .map_err(|error| format!("load durable manual check observation {handle}: {error}"))?
+        .ok_or_else(|| format!("manual check observation {handle} is unknown in this project"))?;
+    if row.1.is_some() && !row.2 {
+        return Err(format!(
+            "manual check observation {handle} has no project-owned source observation"
+        ));
+    }
+    if let Some(response) = row.0 {
+        return serde_json::from_str(&response)
+            .map_err(|error| format!("decode durable manual check observation {handle}: {error}"));
+    }
+    if row.1.is_some() {
+        return crate::execution::checks::recover_manual_check_result(orch, db, project_id, handle)
+            .await
+            .map(|result| ManualCheckObservation::Complete {
+                result: Box::new(result),
+            });
+    }
+    if let Ok(observation) = load_observation(&registry_key(project_id, handle)) {
+        return Ok(observation);
+    }
+    Ok(ManualCheckObservation::Failed {
+        error: "manual check was interrupted before its terminal answer was persisted; no recorded answer is available for this handle".into(),
+    })
+}
+
+/// One request handle's answer as JSON, through the same resolver and project
+/// fence `cairn check run` polls with, so the `check-observations` resource
+/// renders a request handle without a second account of its states.
+pub(crate) async fn request_observation_value(
+    orch: &Orchestrator,
+    db: Arc<crate::storage::LocalDb>,
+    project_id: &str,
+    handle: &str,
+) -> Result<serde_json::Value, String> {
+    let observation = recover_observation(orch, db, project_id, handle).await?;
+    serde_json::to_value(&observation)
+        .map_err(|error| format!("encode manual check observation {handle}: {error}"))
+}
+
+/// Records in-memory progress for `handle` as a running request would, for
+/// tests outside this module that read a pending request.
+#[cfg(test)]
+pub(crate) fn record_progress_for_test(
+    project_id: &str,
+    handle: &str,
+    update: crate::execution::checks::ManualCheckProgressUpdate,
+) {
+    retain_observation(
+        &mut MANUAL_CHECKS.lock().unwrap(),
+        registry_key(project_id, handle),
+        observation_from_progress(update),
+    );
+}
+
 fn observation_from_progress(
     update: crate::execution::checks::ManualCheckProgressUpdate,
 ) -> ManualCheckObservation {
@@ -186,14 +300,19 @@ type ManualProgressSink =
 /// could cancel: a requester that stops polling, by its own timeout or by being
 /// killed, leaves the run going and its observation settling, and the row the
 /// run records is unaffected.
-fn spawn_manual_observation<F>(handle: String, run: impl FnOnce(ManualProgressSink) -> F)
-where
+fn spawn_manual_observation<F>(
+    db: Arc<crate::storage::LocalDb>,
+    project_id: String,
+    handle: String,
+    run: impl FnOnce(ManualProgressSink) -> F,
+) where
     F: std::future::Future<
             Output = Result<crate::execution::checks::ManualConfiguredCheckResult, String>,
         > + Send
         + 'static,
 {
-    let progress_handle = handle.clone();
+    let key = registry_key(&project_id, &handle);
+    let progress_handle = key.clone();
     let progress: ManualProgressSink = Arc::new(move |update| {
         let next = observation_from_progress(update);
         if let Ok(mut checks) = MANUAL_CHECKS.lock() {
@@ -202,14 +321,31 @@ where
     });
     let running = run(progress);
     tokio::spawn(async move {
-        let final_state = match running.await {
+        let mut final_state = match running.await {
             Ok(result) => ManualCheckObservation::Complete {
                 result: Box::new(result),
             },
             Err(error) => ManualCheckObservation::Failed { error },
         };
+        if let Err(error) =
+            persist_terminal_observation(&db, &project_id, &handle, &final_state).await
+        {
+            log::error!("{error}");
+            match &mut final_state {
+                ManualCheckObservation::Complete { result } => {
+                    result.not_recorded = Some(match result.not_recorded.take() {
+                        Some(cause) => format!("{cause}; {error}"),
+                        None => error,
+                    });
+                }
+                ManualCheckObservation::Failed { error: cause } => {
+                    *cause = format!("{cause}; {error}");
+                }
+                _ => {}
+            }
+        }
         if let Ok(mut checks) = MANUAL_CHECKS.lock() {
-            retain_observation(&mut checks, handle, final_state);
+            retain_observation(&mut checks, key, final_state);
         }
     });
 }
@@ -223,8 +359,21 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
             .ok_or_else(|| MISSING_RUN.to_string())?;
         let payload: CheckRunPayload = serde_json::from_value(request.payload.clone())
             .map_err(|error| format!("invalid check_run payload: {error}"))?;
+        let db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (project_id, project_key) = db
+            .query_one(
+                "SELECT r.project_id,p.key FROM runs r JOIN projects p ON p.id=r.project_id WHERE r.id=?1",
+                cairn_db::turso::params![run_id],
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .map_err(|error| format!("resolve manual check request project: {error}"))?;
         if let Some(handle) = payload.observation_handle.as_deref() {
-            return load_observation(handle).map(|observation| (None, observation));
+            return recover_observation(orch, db, &project_id, handle)
+                .await
+                .map(|observation| (None, observation));
         }
         let suite = payload
             .suite
@@ -244,11 +393,21 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
             None => None,
         };
         let handle = uuid::Uuid::new_v4().to_string();
+        db.execute(
+            "INSERT INTO manual_check_handles(handle,project_id,created_at) VALUES(?1,?2,?3)",
+            cairn_db::turso::params![
+                handle.as_str(),
+                project_id.as_str(),
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .await
+        .map_err(|error| format!("persist manual check handle {handle}: {error}"))?;
         retain_observation(
             &mut *MANUAL_CHECKS
                 .lock()
                 .map_err(|_| "manual check observation registry is unavailable".to_string())?,
-            handle.clone(),
+            registry_key(&project_id, &handle),
             ManualCheckObservation::Queued {
                 diagnostic: format!("queued {suite}"),
             },
@@ -258,20 +417,24 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
         let task_suite = suite.to_string();
         let task_branch = commit;
         let task_retry = payload.retry;
-        spawn_manual_observation(handle.clone(), move |progress| async move {
+        let task_handle = handle.clone();
+        spawn_manual_observation(db, project_id, handle.clone(), move |progress| async move {
             crate::execution::checks::run_manual_configured_check_with_progress(
                 &task_orch,
                 &task_run_id,
-                &task_suite,
-                task_branch.as_deref(),
-                placement,
-                task_retry,
+                crate::execution::checks::ManualCheckRequest {
+                    check_name: &task_suite,
+                    branch: task_branch.as_deref(),
+                    placement,
+                    retry: task_retry,
+                    manual_handle: Some(task_handle.as_str()),
+                },
                 progress,
             )
             .await
         });
         Ok((
-            Some(handle),
+            Some((handle.clone(), format!("cairn://p/{project_key}/check-observations/{handle}"))),
             ManualCheckObservation::Queued {
                 diagnostic: format!("queued {suite}"),
             },
@@ -280,8 +443,8 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
     .await;
 
     match result {
-        Ok((Some(handle), observation)) => serde_json::json!({
-            "ok": true, "observationHandle": handle, "observation": observation
+        Ok((Some((handle, reference)), observation)) => serde_json::json!({
+            "ok": true, "observationHandle": handle, "observationRef": reference, "observation": observation
         })
         .to_string(),
         Ok((None, observation)) => {
@@ -420,18 +583,26 @@ mod tests {
     /// to its end state with no poll at all.
     #[tokio::test]
     async fn an_observation_settles_without_its_requester_polling() {
+        let (_root, orch) = manual_fixture().await;
         let handle = format!("unpolled-{}", uuid::Uuid::new_v4());
+        insert_handle(&orch.db.local, &handle).await;
+        let key = registry_key("p", &handle);
         let (finish, finished) = tokio::sync::oneshot::channel::<()>();
-        spawn_manual_observation(handle.clone(), |progress| async move {
-            progress(crate::execution::checks::ManualCheckProgressUpdate {
-                state: "running".into(),
-                diagnostic: "running on fedora since 09:48:09Z".into(),
-                executor: Some("fedora".into()),
-                since_unix_ms: Some(1_792_403_289_000),
-            });
-            let _ = finished.await;
-            Err("settled with nobody polling".to_string())
-        });
+        spawn_manual_observation(
+            orch.db.local.clone(),
+            "p".into(),
+            handle.clone(),
+            |progress| async move {
+                progress(crate::execution::checks::ManualCheckProgressUpdate {
+                    state: "running".into(),
+                    diagnostic: "running on fedora since 09:48:09Z".into(),
+                    executor: Some("fedora".into()),
+                    since_unix_ms: Some(1_792_403_289_000),
+                });
+                let _ = finished.await;
+                Err("settled with nobody polling".to_string())
+            },
+        );
         let observed = |handle: &str| {
             MANUAL_CHECKS
                 .lock()
@@ -440,7 +611,7 @@ mod tests {
                 .map(|retained| retained.observation.clone())
         };
         let until = |wanted: fn(&ManualCheckObservation) -> bool| {
-            let handle = handle.clone();
+            let handle = key.clone();
             tokio::time::timeout(Duration::from_secs(5), async move {
                 while !observed(&handle).as_ref().is_some_and(wanted) {
                     tokio::task::yield_now().await;
@@ -619,6 +790,499 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("another project"), "{error}");
+    }
+
+    async fn manual_fixture() -> (tempfile::TempDir, Orchestrator) {
+        let db = crate::storage::migrated_test_db("manual-handle-recovery.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','proj','/unused',1,1),('q','w','Q','other','/unused',1,1);
+             INSERT INTO runs(id,project_id,status,created_at,updated_at)
+               VALUES('run-1','p','running',1,1),('run-other','q','running',1,1);
+             INSERT INTO check_result_observations(id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,result_schema_version,ran_at,duration_ms,cadence,output_tail,public_handle,verdict_result_json)
+               VALUES('source','p','source-commit','source-tree','rust-tests','input','env',0,'passed',1,1,1,1,1,1,'manual','source output','source-public',
+                 '{\"parser\":\"nextest\",\"complete\":true,\"selection\":\"fast\",\"passed\":9,\"failed\":0,\"skipped\":0,\"deferred\":3,\"failures\":[]}');"
+        ).await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(Arc::new(db), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        (root, orch)
+    }
+
+    async fn insert_handle(db: &crate::storage::LocalDb, handle: &str) {
+        db.execute(
+            "INSERT INTO manual_check_handles(handle,project_id,created_at) VALUES(?1,'p',1)",
+            cairn_db::turso::params![handle],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn poll_handle(orch: &Orchestrator, handle: &str, run: &str) -> serde_json::Value {
+        let mut request = check_run_request("main");
+        request.run_id = Some(run.into());
+        request.payload = serde_json::json!({"observationHandle":handle});
+        serde_json::from_str(&handle_check_run(orch, &request).await).unwrap()
+    }
+
+    fn specimen(disposition: &str) -> ManualCheckObservation {
+        let mut result: crate::execution::checks::ManualConfiguredCheckResult =
+            serde_json::from_value(serde_json::json!({
+                "checkName":"rust-tests","commitSha":"evaluated-commit","treeHash":"evaluated-tree",
+                "inputHash":"input","environmentFingerprint":"env",
+                "observationRef":"cairn://p/proj/check-observations/source",
+                "ranAt":"1970-01-01 00:00:00 UTC","reusable":true,"notRecorded":null,
+                "disposition":disposition,"passed":true,"verified":true,"unverifiedReason":null,
+                "tier":"fast tier: 9 ran, 3 deferred","exitCode":0,"noVerdict":null,
+                "outputTail":"source output","executor":{"name":"machine","os":"linux"},
+                "verdictPlatform":"linux","runtime":"bun 1.4.4","placementNote":null,"placementUnmet":null
+            })).unwrap();
+        result.observation_id = Some("source".into());
+        ManualCheckObservation::Complete {
+            result: Box::new(result),
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_manual_handle_recovers_without_memory() {
+        let (_root, orch) = manual_fixture().await;
+        for disposition in ["fresh", "cached"] {
+            // Multiple handles may coalesce onto the same immutable source.
+            for _ in 0..2 {
+                let handle = uuid::Uuid::new_v4().to_string();
+                insert_handle(&orch.db.local, &handle).await;
+                let expected = specimen(disposition);
+                persist_terminal_observation(&orch.db.local, "p", &handle, &expected)
+                    .await
+                    .unwrap();
+                let response = poll_handle(&orch, &handle, "run-1").await;
+                assert_eq!(response["ok"], true, "{response}");
+                assert_eq!(
+                    response["observation"],
+                    serde_json::to_value(&expected).unwrap()
+                );
+                let foreign = poll_handle(&orch, &handle, "run-other").await;
+                assert_eq!(foreign["ok"], false, "{foreign}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attached_ledger_source_recovers_when_receipt_and_memory_are_absent() {
+        let (_root, orch) = manual_fixture().await;
+        for disposition in ["fresh", "cached", "fresh"] {
+            let handle = uuid::Uuid::new_v4().to_string();
+            insert_handle(&orch.db.local, &handle).await;
+            let context = serde_json::json!({
+                "project_key":"proj",
+                "placement":{"selector":null,"verdict_platforms":[],"executor_name":null,"note":null},
+                "runtime_instruments":[],
+            }).to_string();
+            orch.db
+                .local
+                .execute(
+                    "UPDATE manual_check_handles SET context_json=?2 WHERE handle=?1",
+                    cairn_db::turso::params![handle.as_str(), context],
+                )
+                .await
+                .unwrap();
+            crate::execution::cache::attach_manual_check_observation(
+                &orch.db.local,
+                "p",
+                &handle,
+                "source",
+                "evaluated-commit",
+                "evaluated-tree",
+                "input",
+                disposition,
+            )
+            .await
+            .unwrap();
+            let response = poll_handle(&orch, &handle, "run-1").await;
+            assert_eq!(response["ok"], true, "{response}");
+            let result = &response["observation"]["result"];
+            assert_eq!(result["commitSha"], "evaluated-commit");
+            assert_eq!(result["treeHash"], "evaluated-tree");
+            assert_eq!(result["disposition"], disposition);
+            assert_eq!(result["outputTail"], "source output");
+            assert_eq!(
+                result["observationRef"],
+                "cairn://p/proj/check-observations/source-public"
+            );
+            assert_eq!(result["passed"], true);
+            assert_eq!(result["verified"], true);
+            assert_eq!(result["tier"], "fast tier: 9 ran, 3 deferred");
+            assert_eq!(poll_handle(&orch, &handle, "run-other").await["ok"], false);
+        }
+    }
+
+    /// A recovered reply judges a green that carries no structured result by
+    /// the command the request ran, exactly as the live reply did: a test
+    /// runner's stays unverified, a build's is verified, and a request recorded
+    /// before its command was kept is held to the test runner's bar.
+    #[tokio::test]
+    async fn recovery_keeps_a_parse_less_test_runner_green_unverified() {
+        let (_root, orch) = manual_fixture().await;
+        orch.db.local.execute_script(
+            "INSERT INTO check_result_observations(id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,result_schema_version,ran_at,duration_ms,cadence,output_tail,public_handle,verdict_result_json)
+               VALUES('runner-source','p','c','t','rust-tests','runner-input','env',0,'passed',1,0,1,1,2,1,'manual','no summary','runner-public',NULL),
+                     ('build-source','p','c','t','frontend-build','build-input','env',0,'passed',1,1,1,1,3,1,'manual','built','build-public',NULL);"
+        ).await.unwrap();
+        for (source, command, verified) in [
+            ("runner-source", Some("bun run test:rust"), false),
+            ("runner-source", None, false),
+            ("build-source", Some("bunx --bun vite build"), true),
+        ] {
+            let handle = uuid::Uuid::new_v4().to_string();
+            insert_handle(&orch.db.local, &handle).await;
+            let mut context = serde_json::json!({
+                "project_key":"proj",
+                "placement":{"selector":null,"verdict_platforms":[],"executor_name":null,"note":null},
+                "runtime_instruments":[],
+            });
+            if let Some(command) = command {
+                context["command"] = command.into();
+            }
+            orch.db
+                .local
+                .execute(
+                    "UPDATE manual_check_handles SET context_json=?2 WHERE handle=?1",
+                    cairn_db::turso::params![handle.as_str(), context.to_string()],
+                )
+                .await
+                .unwrap();
+            crate::execution::cache::attach_manual_check_observation(
+                &orch.db.local,
+                "p",
+                &handle,
+                source,
+                "c",
+                "t",
+                "input",
+                "fresh",
+            )
+            .await
+            .unwrap();
+            let response = poll_handle(&orch, &handle, "run-1").await;
+            assert_eq!(response["ok"], true, "{response}");
+            let result = &response["observation"]["result"];
+            assert_eq!(result["passed"], true, "{command:?}: {result}");
+            assert_eq!(result["verified"], verified, "{command:?}: {result}");
+            assert_eq!(result["reusable"], verified, "{command:?}: {result}");
+            assert_eq!(
+                result["observationRef"],
+                format!(
+                    "cairn://p/proj/check-observations/{}",
+                    source.replace("-source", "-public")
+                )
+            );
+            if !verified {
+                assert_eq!(
+                    result["unverifiedReason"],
+                    "the command produced no structured coverage result",
+                    "{command:?}: {result}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_only_recovery_does_not_confuse_same_coordinate_platform_groups() {
+        let (_root, orch) = manual_fixture().await;
+        for (source, publication, platform, passed) in [
+            ("linux-source", "publication-linux", "linux", true),
+            ("macos-source", "publication-macos", "macos", false),
+        ] {
+            orch.db.local.execute(
+                "INSERT INTO check_result_observations(id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,exit_code,verdict,complete,reusable,parser_version,result_schema_version,ran_at,duration_ms,cadence,output_tail,public_handle,verdict_result_json,publication_id,verdict_platform)
+                 SELECT ?1,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,
+                        ?4,?5,complete,reusable,parser_version,result_schema_version,ran_at+?4+1,
+                        duration_ms,cadence,?1,?1 || '-public',verdict_result_json,?2,?3
+                 FROM check_result_observations WHERE id='source'",
+                cairn_db::turso::params![source,publication,platform,if passed {0} else {1},if passed {"passed"} else {"failed"}],
+            ).await.unwrap();
+        }
+        // Both publishers have recorded, but neither follower has attached the
+        // direct source or saved its terminal reply before the simulated restart.
+        for (source, publication, platform, passed) in [
+            ("linux-source", "publication-linux", "linux", true),
+            ("macos-source", "publication-macos", "macos", false),
+        ] {
+            let handle = uuid::Uuid::new_v4().to_string();
+            insert_handle(&orch.db.local, &handle).await;
+            orch.db.local.execute(
+                "UPDATE manual_check_handles SET publication_id=?2,commit_sha='requested-commit',
+                 tree_hash='requested-tree',input_hash='input',disposition='fresh',context_json=?3 WHERE handle=?1",
+                cairn_db::turso::params![handle.as_str(),publication,serde_json::json!({
+                    "project_key":"proj",
+                    "placement":{"selector":null,"verdict_platforms":[],"executor_name":null,"note":null},
+                    "runtime_instruments":[],
+                }).to_string()],
+            ).await.unwrap();
+            let response = poll_handle(&orch, &handle, "run-1").await;
+            assert_eq!(response["ok"], true, "{response}");
+            let result = &response["observation"]["result"];
+            assert_eq!(result["commitSha"], "requested-commit");
+            assert_eq!(result["treeHash"], "requested-tree");
+            assert_eq!(result["passed"], passed);
+            assert_eq!(result["outputTail"], source);
+            assert_eq!(result["verdictPlatform"], platform);
+            assert_eq!(
+                result["observationRef"],
+                format!("cairn://p/proj/check-observations/{source}-public")
+            );
+            assert_eq!(poll_handle(&orch, &handle, "run-other").await["ok"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_and_slow_checks_recover_past_retention() {
+        let (_root, orch) = manual_fixture().await;
+        let old = Instant::now() - SETTLED_OBSERVATION_RETENTION - Duration::from_secs(1);
+        for slow in [false, true] {
+            let handle = uuid::Uuid::new_v4().to_string();
+            insert_handle(&orch.db.local, &handle).await;
+            let key = registry_key("p", &handle);
+            MANUAL_CHECKS.lock().unwrap().insert(
+                key.clone(),
+                RetainedObservation {
+                    observation: ManualCheckObservation::Running {
+                        diagnostic: "still running".into(),
+                        executor: None,
+                        since_unix_ms: None,
+                    },
+                    updated_at: if slow { old } else { Instant::now() },
+                },
+            );
+            assert_eq!(
+                poll_handle(&orch, &handle, "run-1").await["observation"]["state"],
+                "running"
+            );
+            assert_eq!(poll_handle(&orch, &handle, "run-other").await["ok"], false);
+            let expected = specimen("fresh");
+            persist_terminal_observation(&orch.db.local, "p", &handle, &expected)
+                .await
+                .unwrap();
+            MANUAL_CHECKS.lock().unwrap().insert(
+                key.clone(),
+                RetainedObservation {
+                    observation: expected.clone(),
+                    updated_at: old,
+                },
+            );
+            // Force the same pruning used by normal registry lookup.
+            assert!(load_observation(&key).is_err());
+            let response = poll_handle(&orch, &handle, "run-1").await;
+            assert_eq!(
+                response["observation"],
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawned_fast_check_survives_retention_while_a_slow_check_finishes() {
+        let (_root, orch) = manual_fixture().await;
+        let fast = uuid::Uuid::new_v4().to_string();
+        let slow = uuid::Uuid::new_v4().to_string();
+        insert_handle(&orch.db.local, &fast).await;
+        insert_handle(&orch.db.local, &slow).await;
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        spawn_manual_observation(orch.db.local.clone(), "p".into(), fast.clone(), |_| async {
+            let ManualCheckObservation::Complete { result } = specimen("fresh") else {
+                unreachable!()
+            };
+            Ok(*result)
+        });
+        spawn_manual_observation(
+            orch.db.local.clone(),
+            "p".into(),
+            slow.clone(),
+            |progress| async move {
+                progress(crate::execution::checks::ManualCheckProgressUpdate {
+                    state: "running".into(),
+                    diagnostic: "slow suite".into(),
+                    executor: None,
+                    since_unix_ms: None,
+                });
+                released.await.unwrap();
+                let ManualCheckObservation::Complete { result } = specimen("fresh") else {
+                    unreachable!()
+                };
+                Ok(*result)
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while poll_handle(&orch, &fast, "run-1").await["observation"]["state"] != "complete" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let mut checks = MANUAL_CHECKS.lock().unwrap();
+            checks
+                .get_mut(&registry_key("p", &fast))
+                .unwrap()
+                .updated_at =
+                Instant::now() - SETTLED_OBSERVATION_RETENTION - Duration::from_secs(1);
+        }
+        assert_eq!(
+            poll_handle(&orch, &slow, "run-1").await["observation"]["state"],
+            "running"
+        );
+        assert!(!MANUAL_CHECKS
+            .lock()
+            .unwrap()
+            .contains_key(&registry_key("p", &fast)));
+        assert_eq!(
+            poll_handle(&orch, &fast, "run-1").await["observation"]["state"],
+            "complete"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while poll_handle(&orch, &slow, "run-1").await["observation"]["state"] != "complete" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        MANUAL_CHECKS
+            .lock()
+            .unwrap()
+            .remove(&registry_key("p", &slow));
+        assert_eq!(
+            poll_handle(&orch, &slow, "run-1").await["observation"]["state"],
+            "complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_write_failure_preserves_both_recorded_and_unrecorded_verdicts() {
+        let (_root, orch) = manual_fixture().await;
+        orch.db.local.execute_batch(
+            "CREATE TRIGGER reject_manual_receipt BEFORE UPDATE OF response_json ON manual_check_handles
+             BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;"
+        ).await.unwrap();
+        for attached in [false, true] {
+            let handle = uuid::Uuid::new_v4().to_string();
+            insert_handle(&orch.db.local, &handle).await;
+            if attached {
+                orch.db.local.execute(
+                    "UPDATE manual_check_handles SET observation_id='source',commit_sha='evaluated-commit',
+                     tree_hash='evaluated-tree',input_hash='input',disposition='fresh',context_json=?2 WHERE handle=?1",
+                    cairn_db::turso::params![handle.as_str(), serde_json::json!({
+                        "project_key":"proj",
+                        "placement":{"selector":null,"verdict_platforms":[],"executor_name":null,"note":null},
+                        "runtime_instruments":[],
+                    }).to_string()],
+                ).await.unwrap();
+            }
+            let ManualCheckObservation::Complete { mut result } = specimen("fresh") else {
+                unreachable!()
+            };
+            if !attached {
+                result.observation_id = None;
+                result.observation_ref = None;
+                result.not_recorded = Some("original recording failure".into());
+            }
+            spawn_manual_observation(
+                orch.db.local.clone(),
+                "p".into(),
+                handle.clone(),
+                |_| async move { Ok(*result) },
+            );
+            let key = registry_key("p", &handle);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let settled = MANUAL_CHECKS
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .is_some_and(|value| is_settled(&value.observation));
+                    if settled {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let response = poll_handle(&orch, &handle, "run-1").await;
+            assert_eq!(response["observation"]["state"], "complete", "{response}");
+            assert_eq!(
+                response["observation"]["result"]["passed"], true,
+                "{response}"
+            );
+            assert_eq!(
+                response["observation"]["result"]["outputTail"],
+                "source output"
+            );
+            if !attached {
+                let cause = response["observation"]["result"]["notRecorded"]
+                    .as_str()
+                    .unwrap();
+                assert!(cause.contains("original recording failure"), "{cause}");
+                assert!(cause.contains("injected receipt failure"), "{cause}");
+            } else {
+                MANUAL_CHECKS.lock().unwrap().remove(&key);
+                assert_eq!(
+                    poll_handle(&orch, &handle, "run-1").await["observation"]["state"],
+                    "complete"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_errors_and_interrupted_checks_are_explicit() {
+        let (_root, orch) = manual_fixture().await;
+        let handle = uuid::Uuid::new_v4().to_string();
+        insert_handle(&orch.db.local, &handle).await;
+        let response = poll_handle(&orch, &handle, "run-1").await;
+        assert!(response["observation"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted"));
+        let failed = ManualCheckObservation::Failed {
+            error: "runner refused".into(),
+        };
+        persist_terminal_observation(&orch.db.local, "p", &handle, &failed)
+            .await
+            .unwrap();
+        assert_eq!(
+            poll_handle(&orch, &handle, "run-1").await["observation"]["error"],
+            "runner refused"
+        );
+        let error = persist_terminal_observation(&orch.db.local, "q", &handle, &specimen("fresh"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("persist manual check observation"),
+            "{error}"
+        );
+        orch.db
+            .local
+            .execute_batch(
+                "CREATE TRIGGER reject_manual_handle_settle BEFORE UPDATE ON manual_check_handles
+             BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END;",
+            )
+            .await
+            .unwrap();
+        let another = uuid::Uuid::new_v4().to_string();
+        insert_handle(&orch.db.local, &another).await;
+        let error = persist_terminal_observation(&orch.db.local, "p", &another, &specimen("fresh"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected persistence failure"), "{error}");
     }
 
     #[test]

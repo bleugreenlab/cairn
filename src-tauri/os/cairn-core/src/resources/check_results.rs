@@ -35,14 +35,30 @@ pub(super) async fn read_project_check_observation(
     project: &str,
     handle: &str,
 ) -> String {
-    if handle.len() != 24 || !handle.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return "Invalid check observation handle".to_string();
+    let request = request_handle(handle);
+    if request.is_none()
+        && (handle.len() != 24 || !handle.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return "Invalid check observation handle: expected a 24-hex ledger handle or the UUID request handle `cairn check run` printed".to_string();
     }
     let db = orch.db.for_project(project).await;
     let project_id = match project_id_by_key(&db, project).await {
         Ok(project_id) => project_id,
         Err(error) => return error,
     };
+    if let Some(request) = request {
+        return match crate::mcp::handlers::check_run::request_observation_value(
+            orch,
+            db,
+            &project_id,
+            &request,
+        )
+        .await
+        {
+            Ok(value) => render_request_observation(project, &request, &value),
+            Err(error) => format!("Unable to read check request {request}: {error}"),
+        };
+    }
     match get_check_result_observation_by_handle(db, &project_id, handle) {
         Ok(Some(observation)) => {
             let environment = if observation.environment_fingerprint.is_empty() {
@@ -73,6 +89,129 @@ pub(super) async fn read_project_check_observation(
         Ok(None) => "Check observation not found".to_string(),
         Err(error) => format!("Unable to read check observation: {error}"),
     }
+}
+
+/// The lowercase hyphenated form of a `cairn check run` request handle, or
+/// `None` when `handle` is not a 36-character UUID. Ledger handles are 24 hex
+/// characters, so the two never collide.
+fn request_handle(handle: &str) -> Option<String> {
+    if handle.len() != 36 {
+        return None;
+    }
+    uuid::Uuid::try_parse(handle)
+        .ok()
+        .map(|uuid| uuid.hyphenated().to_string())
+}
+
+/// A request handle's answer: pending progress, a settled verdict with its
+/// ledger citation when one was recorded, or the request's error.
+fn render_request_observation(project: &str, handle: &str, value: &serde_json::Value) -> String {
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_string);
+    let state = value["state"].as_str().unwrap_or("unknown");
+    let mut lines = vec![
+        format!("# Check request {handle}"),
+        String::new(),
+        format!("- Project: {project}"),
+        format!("- Request: cairn://p/{project}/check-observations/{handle}"),
+    ];
+    match state {
+        "queued" | "running" | "parked" => {
+            lines.push(format!("- State: {state} (pending, no verdict yet)"));
+            if let Some(diagnostic) = text(&value["diagnostic"]) {
+                lines.push(format!("- Progress: {diagnostic}"));
+            }
+            if let Some(executor) = text(&value["executor"]) {
+                lines.push(format!("- Executor: {executor}"));
+            }
+            if let Some(since) = value["sinceUnixMs"].as_i64() {
+                lines.push(format!("- Since: {}", millis_stamp(since)));
+            }
+            lines.push(String::new());
+            lines.push("The check is still in flight. Read this resource again for its answer; once it settles, the recorded ledger observation is linked here.".into());
+        }
+        "complete" => {
+            let result = &value["result"];
+            let suite = text(&result["checkName"]).unwrap_or_default();
+            lines.push("- State: complete".into());
+            lines.push(format!("- Suite: {suite}"));
+            let verdict = match (&result["noVerdict"], result["passed"].as_bool()) {
+                _ if result["placementUnmet"].as_str().is_some() => format!(
+                    "no verdict for the requested placement: {}",
+                    result["placementUnmet"].as_str().unwrap_or_default()
+                ),
+                (no_verdict, _) if no_verdict.is_object() => format!(
+                    "no verdict ({}): {}",
+                    no_verdict["kind"].as_str().unwrap_or("unknown"),
+                    no_verdict["cause"].as_str().unwrap_or("")
+                ),
+                (_, Some(true)) if result["verified"] == false => format!(
+                    "passed, unverified: {}",
+                    result["unverifiedReason"]
+                        .as_str()
+                        .unwrap_or("no verdict witness")
+                ),
+                (_, Some(true)) => "passed".into(),
+                _ => "failed".into(),
+            };
+            lines.push(format!("- Verdict: {verdict}"));
+            for (label, key) in [
+                ("Disposition", "disposition"),
+                ("Commit", "commitSha"),
+                ("Tree", "treeHash"),
+                ("Tier", "tier"),
+                ("Verdict platform", "verdictPlatform"),
+                ("Runtime", "runtime"),
+                ("Ran at", "ranAt"),
+                ("Placement note", "placementNote"),
+                ("Placement unmet", "placementUnmet"),
+            ] {
+                if let Some(value) = text(&result[key]).filter(|value| !value.is_empty()) {
+                    lines.push(format!("- {label}: {value}"));
+                }
+            }
+            if let Some(code) = result["exitCode"].as_i64() {
+                lines.push(format!("- Exit code: {code}"));
+            }
+            if let Some(name) = text(&result["executor"]["name"]) {
+                let os = text(&result["executor"]["os"]).unwrap_or_default();
+                lines.push(format!("- Ran on: {name} ({os})"));
+            }
+            match text(&result["observationRef"]) {
+                Some(reference) => lines.push(format!("- Ledger observation: {reference}")),
+                None => lines.push(format!(
+                    "- Ledger observation: none. {}",
+                    text(&result["notRecorded"])
+                        .unwrap_or_else(|| "This verdict was not recorded.".into())
+                )),
+            }
+            if let (Some(_), Some(cause)) = (
+                text(&result["observationRef"]),
+                text(&result["notRecorded"]),
+            ) {
+                lines.push(format!("- Not recorded: {cause}"));
+            }
+            let output = text(&result["outputTail"]).unwrap_or_default();
+            if !output.is_empty() {
+                let fence = output_fence(&output);
+                lines.push(String::new());
+                lines.push("## Output tail".into());
+                lines.push(String::new());
+                lines.push(format!("{fence}\n{output}\n{fence}"));
+            }
+        }
+        "failed" => {
+            lines.push("- State: failed".into());
+            lines.push(format!(
+                "- Error: {}",
+                text(&value["error"]).unwrap_or_default()
+            ));
+        }
+        other => {
+            lines.push(format!("- State: {other}"));
+            lines.push(format!("- Answer: {value}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn parse_query(params: &[QueryParam]) -> Result<CheckResultsQuery, String> {
@@ -838,6 +977,241 @@ mod tests {
             key: key.into(),
             value: value.into(),
         }
+    }
+
+    async fn request_fixture() -> (tempfile::TempDir, Orchestrator) {
+        let db = crate::storage::migrated_test_db("check-request-resource.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','proj','/unused',1,1),('q','w','Q','other','/unused',1,1);
+             INSERT INTO runs(id,project_id,status,created_at,updated_at)
+               VALUES('run-1','p','running',1,1);",
+        )
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            std::sync::Arc::new(crate::db::DbState::new(std::sync::Arc::new(db), search)),
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        (root, orch)
+    }
+
+    async fn request_handle_row(
+        orch: &Orchestrator,
+        response: Option<serde_json::Value>,
+    ) -> String {
+        let handle = uuid::Uuid::new_v4().to_string();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO manual_check_handles(handle,project_id,created_at,response_json) VALUES(?1,'p',1,?2)",
+                cairn_db::turso::params![
+                    handle.as_str(),
+                    response.map(|value| value.to_string())
+                ],
+            )
+            .await
+            .unwrap();
+        handle
+    }
+
+    #[tokio::test]
+    async fn request_handle_reads_pending_progress_and_is_project_fenced() {
+        let (_root, orch) = request_fixture().await;
+        let handle = request_handle_row(&orch, None).await;
+        crate::mcp::handlers::check_run::record_progress_for_test(
+            "p",
+            &handle,
+            crate::execution::checks::ManualCheckProgressUpdate {
+                state: "running".into(),
+                diagnostic: "running rust-tests".into(),
+                executor: Some("fedora".into()),
+                since_unix_ms: Some(1_700_000_000_000),
+            },
+        );
+        let page = read_project_check_observation(&orch, "proj", &handle).await;
+        assert!(
+            page.contains("- State: running (pending, no verdict yet)"),
+            "{page}"
+        );
+        assert!(page.contains("- Progress: running rust-tests"), "{page}");
+        assert!(page.contains("- Executor: fedora"), "{page}");
+        assert!(page.contains("- Since: "), "{page}");
+        // An uppercase spelling names the same request.
+        let upper = read_project_check_observation(&orch, "proj", &handle.to_uppercase()).await;
+        assert!(upper.contains("running (pending"), "{upper}");
+        // A warm progress cache is not authority to read another project's request.
+        let foreign = read_project_check_observation(&orch, "other", &handle).await;
+        assert!(foreign.contains("unknown in this project"), "{foreign}");
+        assert!(!foreign.contains("running"), "{foreign}");
+    }
+
+    /// The reference a start acknowledgement prints is the resource a reader
+    /// can open: it parses as this resource, names the run's own project, and
+    /// reads as the request rather than as an invalid or unknown handle.
+    #[tokio::test]
+    async fn start_ack_observation_ref_reads_back_as_its_request() {
+        let (_root, orch) = request_fixture().await;
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: String::new(),
+            run_id: Some("run-1".into()),
+            tool: "check_run".into(),
+            payload: serde_json::json!({ "suite": "no-such-suite" }),
+            tool_use_id: None,
+            origin: None,
+        };
+        let ack: serde_json::Value = serde_json::from_str(
+            &crate::mcp::handlers::check_run::handle_check_run(&orch, &request).await,
+        )
+        .unwrap();
+        assert_eq!(ack["ok"], true, "{ack}");
+        let handle = ack["observationHandle"].as_str().unwrap();
+        assert!(uuid::Uuid::try_parse(handle).is_ok(), "{ack}");
+        let reference = ack["observationRef"].as_str().unwrap();
+        let Some(cairn_common::uri::CairnResource::ProjectCheckObservation {
+            project,
+            handle: parsed,
+        }) = cairn_common::uri::parse_uri(reference)
+        else {
+            panic!("{reference} is not a check observation resource");
+        };
+        assert_eq!(project, "proj");
+        assert_eq!(parsed, handle);
+        let page = read_project_check_observation(&orch, &project, &parsed).await;
+        assert!(
+            page.starts_with(&format!("# Check request {handle}")),
+            "{page}"
+        );
+        assert!(!page.contains("Invalid check observation handle"), "{page}");
+        assert!(!page.contains("unknown in this project"), "{page}");
+        assert!(page.contains(&format!("- Request: {reference}")), "{page}");
+        // The unknown suite settles as an explicit failure or is still in
+        // flight; either way the request reads as itself.
+        assert!(
+            ["- State: queued", "- State: running", "- State: failed"]
+                .iter()
+                .any(|state| page.contains(state)),
+            "{page}"
+        );
+        let foreign = read_project_check_observation(&orch, "other", &parsed).await;
+        assert!(foreign.contains("unknown in this project"), "{foreign}");
+    }
+
+    #[tokio::test]
+    async fn request_handle_without_memory_or_answer_reads_as_interrupted() {
+        let (_root, orch) = request_fixture().await;
+        let handle = request_handle_row(&orch, None).await;
+        let page = read_project_check_observation(&orch, "proj", &handle).await;
+        assert!(page.contains("- State: failed"), "{page}");
+        assert!(page.contains("interrupted"), "{page}");
+        let failed = request_handle_row(
+            &orch,
+            Some(serde_json::json!({"state":"failed","error":"runner refused"})),
+        )
+        .await;
+        let page = read_project_check_observation(&orch, "proj", &failed).await;
+        assert!(page.contains("- Error: runner refused"), "{page}");
+        let unknown = uuid::Uuid::new_v4().to_string();
+        let page = read_project_check_observation(&orch, "proj", &unknown).await;
+        assert!(page.contains("unknown in this project"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn request_handle_reads_a_complete_exit_code_only_verdict_with_its_ledger_link() {
+        let (_root, orch) = request_fixture().await;
+        let ledger = "cairn://p/proj/check-observations/0123456789abcdef01234567";
+        let handle = request_handle_row(
+            &orch,
+            Some(serde_json::json!({"state":"complete","result":{
+                "checkName":"typecheck","commitSha":"evaluated-commit","treeHash":"evaluated-tree",
+                "inputHash":"input","environmentFingerprint":"env","observationRef":ledger,
+                "ranAt":"1970-01-01 00:00:00 UTC","reusable":true,"notRecorded":null,
+                "disposition":"fresh","passed":true,"verified":true,"unverifiedReason":null,
+                "tier":null,"exitCode":0,"noVerdict":null,"outputTail":"tsc ok",
+                "executor":{"name":"fedora","os":"linux"},"verdictPlatform":"linux",
+                "runtime":null,"placementNote":null,"placementUnmet":null
+            }})),
+        )
+        .await;
+        let page = read_project_check_observation(&orch, "proj", &handle).await;
+        for line in [
+            "- State: complete",
+            "- Suite: typecheck",
+            "- Verdict: passed",
+            "- Commit: evaluated-commit",
+            "- Exit code: 0",
+            "- Ran on: fedora (linux)",
+            &format!("- Ledger observation: {ledger}"),
+            "tsc ok",
+        ] {
+            assert!(page.contains(line), "missing {line:?} in {page}");
+        }
+        assert!(!page.contains("Tier"), "{page}");
+        let foreign = read_project_check_observation(&orch, "other", &handle).await;
+        assert!(foreign.contains("unknown in this project"), "{foreign}");
+    }
+
+    #[tokio::test]
+    async fn ledger_handles_keep_their_shape_and_other_handles_are_refused() {
+        let (_root, orch) = request_fixture().await;
+        let page = read_project_check_observation(&orch, "proj", "0123456789abcdef01234567").await;
+        assert_eq!(page, "Check observation not found");
+        let page = read_project_check_observation(&orch, "proj", "not-a-handle").await;
+        assert!(
+            page.starts_with("Invalid check observation handle"),
+            "{page}"
+        );
+        // A 32-hex UUID spelling is neither shape: request handles are hyphenated.
+        let simple = uuid::Uuid::new_v4().simple().to_string();
+        let page = read_project_check_observation(&orch, "proj", &simple).await;
+        assert!(
+            page.starts_with("Invalid check observation handle"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn request_answer_with_unmet_placement_is_not_a_pass() {
+        let page = render_request_observation(
+            "proj",
+            "h",
+            &serde_json::json!({"state":"complete","result":{
+                "checkName":"build","passed":true,"verified":true,
+                "placementUnmet":"requested windows; recorded linux"
+            }}),
+        );
+        assert!(
+            page.contains("- Verdict: no verdict for the requested placement"),
+            "{page}"
+        );
+        assert!(!page.contains("- Verdict: passed"), "{page}");
+    }
+
+    #[test]
+    fn request_answer_without_a_ledger_row_names_why() {
+        let page = render_request_observation(
+            "proj",
+            "h",
+            &serde_json::json!({"state":"complete","result":{
+                "checkName":"lint","passed":false,"verified":true,"exitCode":1,
+                "observationRef":null,"notRecorded":"ledger write failed","outputTail":""
+            }}),
+        );
+        assert!(page.contains("- Verdict: failed"), "{page}");
+        assert!(
+            page.contains("- Ledger observation: none. ledger write failed"),
+            "{page}"
+        );
+        assert!(!page.contains("## Output tail"), "{page}");
     }
 
     #[test]

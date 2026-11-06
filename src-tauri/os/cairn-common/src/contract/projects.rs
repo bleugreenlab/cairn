@@ -68,7 +68,7 @@ pub(crate) const PROJECT_CHECK_OBSERVATION_CONTRACT: ResourceContract = Resource
     uri_template: "cairn://p/{project}/check-observations/{handle}",
     name: "Check observation",
     description:
-        "One immutable check observation addressed by its stable public handle (read-only)",
+        "One check observation (read-only). A 24-hex handle names one immutable ledger row; the UUID request handle `cairn check run` prints names that request and reads its pending progress, its settled verdict with the ledger row it recorded, or its error",
     read_projections: &[],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

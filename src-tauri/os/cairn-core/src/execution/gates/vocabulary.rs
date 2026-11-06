@@ -1477,6 +1477,8 @@ pub(crate) mod test_support {
         environment: &str,
     ) -> FreshCheckObservationWrite {
         FreshCheckObservationWrite {
+            manual_handle: None,
+            publication_id: None,
             sealed_coordinate: SealedCheckCoordinate::new(
                 "commit-gated",
                 "commit-gated",
