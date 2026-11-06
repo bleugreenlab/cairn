@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cairn_common::executor_protocol::{
-    ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, NodeScratchGrant,
-    NodeScratchReplica, ObjectChannelCredential, ScratchSyncReport, ScratchWriteBackOutcome,
-    SCRATCH_STAGE_CREDENTIAL_REFUSED,
+    ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, ExecutorMessage,
+    NodeScratchGrant, NodeScratchReplica, ObjectChannelCredential, ScratchSyncReport,
+    ScratchWriteBackOutcome, SCRATCH_STAGE_CREDENTIAL_REFUSED,
 };
 use cairn_exec::node_scratch::{self as replica, Replicas, ScratchTransport};
 
@@ -519,16 +519,13 @@ async fn a_call_refused_while_a_newer_credential_arrived_is_sent_once_more() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
-    let world = world(None).await;
-    super::lifecycle::ensure_subscribed(&world.orch);
+fn advertisement(scratch_id: &str) -> ExecutorAdvertisement {
     let identity = ExecutorIdentity {
         device_id: "machine-d-device".into(),
         executor_id: "machine-d".into(),
         display_name: "machine-d".into(),
     };
-    let advertisement = ExecutorAdvertisement {
+    ExecutorAdvertisement {
         identity,
         capabilities: ExecutorCapabilities {
             os: "linux".into(),
@@ -554,13 +551,20 @@ async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
         facts_stale_refresh_blocked: None,
         last_refresh: None,
         node_scratches: vec![NodeScratchReplica {
-            scratch_id: world.scratch_id.clone(),
+            scratch_id: scratch_id.to_owned(),
             synced_commit: None,
             bytes: 5,
             dirty: true,
             in_use: false,
         }],
-    };
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
+    let world = world(None).await;
+    super::lifecycle::ensure_subscribed(&world.orch);
+    let advertisement = advertisement(&world.scratch_id);
     let (sender, _frames) = tokio::sync::mpsc::unbounded_channel();
     let generation = world
         .orch
@@ -575,4 +579,46 @@ async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
         .object_plane
         .scratch
         .authorizes("machine-d", generation, &world.scratch_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn advertised_unknown_scratch_is_retained_but_known_closed_scratch_is_deleted() {
+    let world = world(None).await;
+    world
+        .orch
+        .db
+        .local
+        .execute(
+            "UPDATE node_scratches SET closed_at = 1 WHERE id = ?1",
+            (world.scratch_id.clone(),),
+        )
+        .await
+        .unwrap();
+    let mut advertisement = advertisement(&world.scratch_id);
+    let mut unknown = advertisement.node_scratches[0].clone();
+    unknown.scratch_id = "unknown-to-this-authority".into();
+    // Closed comes last: receiving its delete proves the preceding unknown
+    // advertisement was processed, without relying on a sleep for absence.
+    advertisement.node_scratches.insert(0, unknown);
+    super::lifecycle::ensure_subscribed(&world.orch);
+    let (sender, mut frames) = tokio::sync::mpsc::unbounded_channel();
+    world
+        .orch
+        .fleet
+        .attach_advertised_executor(advertisement, sender, true, None, None)
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let ExecutorMessage::DeleteNodeScratch { scratch_id } = frames.recv().await.unwrap()
+            {
+                assert_eq!(scratch_id, world.scratch_id);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("known closed scratch receives a deletion request");
+    while let Ok(frame) = frames.try_recv() {
+        assert!(!matches!(frame, ExecutorMessage::DeleteNodeScratch { .. }));
+    }
 }

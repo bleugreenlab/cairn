@@ -56,7 +56,8 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
         id.as_str(),
         id.secret_var(),
         "web search request",
-    ) else {
+    )?
+    else {
         return Ok(missing_key_message(id));
     };
 

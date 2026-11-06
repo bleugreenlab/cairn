@@ -133,15 +133,17 @@ pub(crate) async fn handle_mcp_read(
             if let Some(refusal) = &target.machine_service_refusal {
                 return refusal.clone();
             }
+            let config = match entry
+                .config
+                .brokered(&target.credential_key, "read mcp resource")
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    return format!("Failed to read {uri} from MCP server '{server}': {error}")
+                }
+            };
             match gateway
-                .read_resource(
-                    session_key,
-                    &target.credential_key,
-                    &entry
-                        .config
-                        .brokered(&target.credential_key, "read mcp resource"),
-                    &uri,
-                )
+                .read_resource(session_key, &target.credential_key, &config, &uri)
                 .await
             {
                 Ok(body) => body,
@@ -396,16 +398,15 @@ fn catalog_context(
                 )
             }
             StaticWitness::Absent => return Err("its credential witness is missing".to_string()),
-            StaticWitness::Unavailable(e) => return Err(e),
+            StaticWitness::Corrupt(e) | StaticWitness::Unavailable(e) => return Err(e),
         };
-        if let Some(var) = vars
-            .iter()
-            .find(|var| !secrets::has_witnessed_value(&target.credential_key, var))
-        {
-            return Err(format!(
-                "${{{var}}} is not stored in Cairn, and values from the process environment \
-                 are not witnessed"
-            ));
+        for var in &vars {
+            if !secrets::has_witnessed_value(&target.credential_key, var)? {
+                return Err(format!(
+                    "${{{var}}} is not stored in Cairn, and values from the process environment \
+                     are not witnessed"
+                ));
+            }
         }
         Some(generation)
     };
@@ -574,7 +575,7 @@ async fn discover_tools(
         })?;
     let config = target
         .authored
-        .brokered(&target.credential_key, "list mcp tools");
+        .brokered(&target.credential_key, "list mcp tools")?;
     let (before, withdrawal_epoch) = match before {
         Ok(before) => before,
         Err(reason) => {
@@ -697,9 +698,16 @@ async fn describe_server(
     }
 
     out.push_str("\n## Resources\n");
-    let config = target
+    let config = match target
         .authored
-        .brokered(&target.credential_key, "describe mcp server");
+        .brokered(&target.credential_key, "describe mcp server")
+    {
+        Ok(config) => config,
+        Err(error) => {
+            out.push_str(&format!("(failed to list resources: {error})\n"));
+            return out;
+        }
+    };
     match gateway
         .list_resources(read.session_key, &target.credential_key, &config)
         .await
@@ -1179,6 +1187,30 @@ mod tests {
                 CatalogSource::Live { reason } => reason,
                 _ => panic!("expected a live, unrecorded listing"),
             }
+        }
+
+        #[tokio::test]
+        async fn unavailable_credentials_refuse_discovery_before_connecting() {
+            let f = Fixture::new("discovery-unavailable");
+            let mut gateway = ScriptedGateway::new();
+            // Even without catalog caching, expansion must not treat a store
+            // failure as permission to send empty credentials.
+            gateway.protocols.clear();
+            let service = format!("computer.cairn.mcp.{}", cairn_common::paths::env_str());
+            let _gate = secrets::mock_keychain::block_reads(
+                &service,
+                &format!("{}/DISCOVERY_TOKEN", f.name),
+            );
+            let read = f.read();
+            let target = read.target(&f.name, &f.entry);
+
+            let error = match discover_tools(&gateway, &read, &target).await {
+                Err(error) => error,
+                Ok(_) => panic!("discovery connected despite unreadable credentials"),
+            };
+            assert!(error.contains("DISCOVERY_TOKEN"), "{error}");
+            assert_eq!(gateway.counts(), (0, 0));
+            assert!(!f.recorded());
         }
 
         #[tokio::test]

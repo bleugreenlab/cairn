@@ -327,6 +327,19 @@ impl std::fmt::Display for Site {
     }
 }
 
+/// ` (for <who>)` after a site, for an ad hoc read that said who it runs
+/// for; nothing otherwise.
+struct OnBehalfOf(Option<Arc<str>>);
+
+impl std::fmt::Display for OnBehalfOf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(who) => write!(f, " (for {who})"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// `<file>:<line> <first 80 chars of sql, whitespace collapsed>`.
 fn statement_label(at: Caller, sql: Option<&str>) -> Arc<str> {
     use std::fmt::Write as _;
@@ -386,6 +399,9 @@ struct HolderShared {
     /// Set by [`TrackedConnection::exempt_from_plan_audit`] for the rest of
     /// this call.
     plan_audit_exempt: AtomicBool,
+    /// Set for a read opened through [`LocalDb::read_ad_hoc`]: its own bound,
+    /// and who it runs for.
+    ad_hoc: Option<AdHocRead>,
 }
 
 struct HolderState {
@@ -415,6 +431,14 @@ pub struct HolderActivity {
 
 impl Holder {
     pub(super) fn new(caller: Caller, sql: Option<&str>) -> Self {
+        Self::build(caller, sql, None)
+    }
+
+    fn ad_hoc(caller: Caller, read: AdHocRead) -> Self {
+        Self::build(caller, None, Some(read))
+    }
+
+    fn build(caller: Caller, sql: Option<&str>, ad_hoc: Option<AdHocRead>) -> Self {
         Self(Arc::new(HolderShared {
             state: Mutex::new(HolderState {
                 statement: statement_label(caller, sql),
@@ -423,7 +447,13 @@ impl Holder {
             }),
             in_flight: AtomicUsize::new(0),
             plan_audit_exempt: AtomicBool::new(false),
+            ad_hoc,
         }))
+    }
+
+    /// Who an ad hoc read runs for, when it said.
+    fn on_behalf_of(&self) -> Option<Arc<str>> {
+        self.0.ad_hoc.as_ref()?.on_behalf_of.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, HolderState> {
@@ -583,6 +613,26 @@ pub struct OverdueHolder {
     /// borrowed the raw connection.
     pub statement: Arc<str>,
     pub activity: HolderActivity,
+    /// Who an ad hoc read runs for (see [`AdHocRead::on_behalf_of`]).
+    pub on_behalf_of: Option<Arc<str>>,
+}
+
+/// A pooled read of SQL the codebase did not write, such as an agent's
+/// `cairn://db?sql=` statement, opened with [`LocalDb::read_ad_hoc`].
+///
+/// The product's own statements are planned, pinned, and audited; an ad hoc
+/// one is none of those, and whoever wrote it cannot see that it holds a
+/// snapshot of the live database open, keeping every later row version in
+/// memory and the log from folding until it ends. So it runs under its own
+/// bound, and the cut and the gate watch name who asked for it.
+#[derive(Debug, Clone)]
+pub struct AdHocRead {
+    /// The read's bound, applied exactly as [`READ_STATEMENT_BOUND`] is: the
+    /// engine deadline per statement, and the outer timeout
+    /// [`PARKED_READ_SLACK`] past it. It only ever narrows the handle's bound.
+    pub bound: Duration,
+    /// Who the read runs for, typically the requesting node's URI.
+    pub on_behalf_of: Option<Arc<str>>,
 }
 
 impl OverdueHolder {
@@ -1144,7 +1194,6 @@ impl LocalDb {
     /// the interrupt is logged, because reaching it means one of those failed.
     pub fn overdue_holders(&self, threshold: Duration, rewarn: Duration) -> Vec<OverdueHolder> {
         let now = Instant::now();
-        let backstop = self.read_bound + READ_BACKSTOP_SLACK;
         let mut overdue = Vec::new();
         let mut runaway = Vec::new();
         {
@@ -1157,9 +1206,13 @@ impl LocalDb {
                 // Pooled reads only. A `connect` holder could be interrupted
                 // only while a statement runs, and one parked in a transaction
                 // is unaffected by an interrupt; it is named, not cut.
-                if live.kind == HolderKind::PooledRead && age >= backstop && !live.interrupted {
+                let bound = self.read_bound_for(&live.holder);
+                if live.kind == HolderKind::PooledRead
+                    && age >= bound + READ_BACKSTOP_SLACK
+                    && !live.interrupted
+                {
                     live.interrupted = true;
-                    runaway.push((live.caller, age, live.holder.clone()));
+                    runaway.push((live.caller, bound, age, live.holder.clone()));
                 }
                 if live
                     .last_warned
@@ -1174,10 +1227,11 @@ impl LocalDb {
                     age,
                     statement: live.holder.statement(),
                     activity: live.holder.activity(),
+                    on_behalf_of: live.holder.on_behalf_of(),
                 });
             }
         }
-        for (caller, age, holder) in runaway {
+        for (caller, bound, age, holder) in runaway {
             let executing = holder.activity().executing;
             let outcome = if holder.interrupt() {
                 format!(
@@ -1188,10 +1242,11 @@ impl LocalDb {
                 "had no handle".to_owned()
             };
             log::warn!(
-                "pooled read at {} outlived the {:?} read bound and its timeout ({:?} held); \
+                "pooled read at {}{} outlived the {:?} read bound and its timeout ({:?} held); \
                  gate sweep {outcome}: {}",
                 Site(caller),
-                self.read_bound,
+                OnBehalfOf(holder.on_behalf_of()),
+                bound,
                 age,
                 holder.statement(),
             );
@@ -1377,7 +1432,7 @@ impl LocalDb {
             self.gate
                 .read_checkout_count
                 .fetch_add(1, Ordering::Relaxed);
-            conn.set_query_timeout(self.read_bound)?;
+            conn.set_query_timeout(self.read_bound_for(holder))?;
             holder.arm(conn.clone());
         } else {
             conn.set_query_timeout(Duration::ZERO)?;
@@ -1391,8 +1446,18 @@ impl LocalDb {
     /// ends a read that parks between statements, which no per-statement
     /// deadline sees. Dropping the read on expiry drops its connection
     /// unreleased, and the engine rolls its transaction back.
-    fn parked_read_limit(&self) -> Duration {
-        self.read_bound + PARKED_READ_SLACK
+    fn parked_read_limit(&self, holder: &Holder) -> Duration {
+        self.read_bound_for(holder) + PARKED_READ_SLACK
+    }
+
+    /// The bound a pooled read runs under: the handle's, or an ad hoc read's
+    /// own when that is shorter.
+    fn read_bound_for(&self, holder: &Holder) -> Duration {
+        holder
+            .0
+            .ad_hoc
+            .as_ref()
+            .map_or(self.read_bound, |read| read.bound.min(self.read_bound))
     }
 
     /// A pooled read's result from its run under [`Self::parked_read_limit`],
@@ -1412,11 +1477,11 @@ impl LocalDb {
         }
         let error = DbError::ReadBoundExceeded {
             caller,
-            bound: self.read_bound,
+            bound: self.read_bound_for(holder),
             elapsed: started.elapsed(),
             statement: holder.statement(),
         };
-        log::warn!("{error}");
+        log::warn!("{error}{}", OnBehalfOf(holder.on_behalf_of()));
         Err(error)
     }
 
@@ -1486,12 +1551,34 @@ impl LocalDb {
         f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>> + Send + 's,
     ) -> DbCall<'s, T> {
         let caller = Location::caller();
-        let holder = Holder::new(caller, None);
+        self.pooled_read(caller, Holder::new(caller, None), f)
+    }
+
+    /// [`Self::read`] for SQL the codebase did not write, under the
+    /// [`AdHocRead`]'s own bound. The cut is the same
+    /// [`DbError::ReadBoundExceeded`], naming that bound; it and the gate
+    /// watch also name who the read ran for.
+    #[track_caller]
+    pub fn read_ad_hoc<'s, T: Send + 's>(
+        &'s self,
+        read: AdHocRead,
+        f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>> + Send + 's,
+    ) -> DbCall<'s, T> {
+        let caller = Location::caller();
+        self.pooled_read(caller, Holder::ad_hoc(caller, read), f)
+    }
+
+    fn pooled_read<'s, T: Send + 's>(
+        &'s self,
+        caller: Caller,
+        holder: Holder,
+        f: impl for<'a> FnOnce(&'a TrackedConnection) -> BoxFuture<'a, DbResult<T>> + Send + 's,
+    ) -> DbCall<'s, T> {
         DbCall::new(holder.clone(), move || async move {
             #[cfg(any(test, feature = "test-utils"))]
             self.read_transaction_count.fetch_add(1, Ordering::Relaxed);
             let started = Instant::now();
-            let outcome = timeout(self.parked_read_limit(), async {
+            let outcome = timeout(self.parked_read_limit(&holder), async {
                 let conn = self
                     .checkout(caller, HolderKind::PooledRead, &holder)
                     .await?;
@@ -1565,7 +1652,7 @@ impl LocalDb {
         let holder = Holder::new(caller, Some(&sql));
         DbCall::new(holder.clone(), move || async move {
             let started = Instant::now();
-            let outcome = timeout(self.parked_read_limit(), async {
+            let outcome = timeout(self.parked_read_limit(&holder), async {
                 let conn = self
                     .checkout(caller, HolderKind::PooledRead, &holder)
                     .await?;
@@ -1645,7 +1732,7 @@ impl LocalDb {
         let holder = Holder::new(caller, Some(&sql));
         DbCall::new(holder.clone(), move || async move {
             let started = Instant::now();
-            let outcome = timeout(self.parked_read_limit(), async {
+            let outcome = timeout(self.parked_read_limit(&holder), async {
                 let conn = self
                     .checkout(caller, HolderKind::PooledRead, &holder)
                     .await?;
@@ -5213,6 +5300,106 @@ mod tests {
             before + 1,
             "the interrupted connection must be retired, so the next checkout opens a fresh one"
         );
+    }
+
+    const AD_HOC_REQUESTER: &str = "cairn://p/proj/1/1/builder";
+
+    fn ad_hoc(bound: Duration) -> AdHocRead {
+        AdHocRead {
+            bound,
+            on_behalf_of: Some(AD_HOC_REQUESTER.into()),
+        }
+    }
+
+    async fn run_ad_hoc(db: &LocalDb, read: AdHocRead, sql: &'static str) -> DbResult<()> {
+        db.read_ad_hoc(read, move |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(sql, ()).await?;
+                rows.next().await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    /// An ad hoc read is cut at its own bound on a handle whose product
+    /// reads keep the full one, names that bound, and its connection is
+    /// retired rather than released, as every interrupted read's is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ad_hoc_read_is_cut_at_its_own_bound_and_retired() {
+        let db = test_db().await.unwrap();
+        db.query_one("SELECT 1", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        let before = db.connections_created.load(Ordering::Relaxed);
+
+        let error = run_ad_hoc(&db, ad_hoc(TEST_READ_BOUND), RUNAWAY_COUNT)
+            .await
+            .unwrap_err();
+        let DbError::ReadBoundExceeded { bound, elapsed, .. } = &error else {
+            panic!("expected ReadBoundExceeded, got {error:?}");
+        };
+        assert_eq!(*bound, TEST_READ_BOUND);
+        assert!(*elapsed < Duration::from_secs(10), "{elapsed:?}");
+        assert_eq!(db.live_connections(), 0);
+
+        db.query_one("SELECT 1", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.connections_created.load(Ordering::Relaxed),
+            before + 1,
+            "the interrupted ad hoc connection must be retired, not released"
+        );
+        run_ad_hoc(&db, ad_hoc(TEST_READ_BOUND), "SELECT 1")
+            .await
+            .unwrap();
+        // Last: the checkpoint opens a connection of its own.
+        assert_checkpoint_wins(&db).await;
+    }
+
+    /// An ad hoc bound narrows the handle's and never widens it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ad_hoc_bound_cannot_widen_the_handles() {
+        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
+        let error = run_ad_hoc(&db, ad_hoc(Duration::from_secs(3600)), RUNAWAY_COUNT)
+            .await
+            .unwrap_err();
+        let DbError::ReadBoundExceeded { bound, .. } = &error else {
+            panic!("expected ReadBoundExceeded, got {error:?}");
+        };
+        assert_eq!(*bound, TEST_READ_BOUND);
+    }
+
+    /// The gate watch names who an ad hoc read runs for; a product read
+    /// carries no requester.
+    #[tokio::test]
+    async fn the_gate_watch_names_an_ad_hoc_reads_requester() {
+        let db = test_db().await.unwrap();
+        let read = db.read_ad_hoc(ad_hoc(Duration::from_secs(60)), |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query("SELECT COUNT(*) FROM counters", ()).await?;
+                rows.next().await?;
+                drop(rows);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        });
+        let mut read = std::pin::pin!(read);
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        let held = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].kind, HolderKind::PooledRead);
+        assert_eq!(held[0].on_behalf_of.as_deref(), Some(AD_HOC_REQUESTER));
+
+        let conn = db.connect().await.unwrap();
+        let held = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        let connect = held
+            .iter()
+            .find(|holder| holder.kind == HolderKind::Connect)
+            .unwrap();
+        assert_eq!(connect.on_behalf_of, None);
+        drop(conn);
     }
 
     /// The bound is for pooled READS. A write, or a `connect` connection, on

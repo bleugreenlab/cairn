@@ -11,9 +11,9 @@ pub(crate) const DB_CONTRACT: ResourceContract =
         kind: ResourceKind::Db,
         uri_template: "cairn://db",
         name: "Live database SQL projection",
-        description: "Read-only access to the running app's existing local database connection. Read it bare for a compact schema overview (tables, columns with types, each table's max rowid as a size that costs a seek rather than a count, index counts), or use ?sql= with offset/limit row windows. EXPLAIN and EXPLAIN QUERY PLAN are permitted for inspecting query plans. Write SQL verbatim: the sql value is taken literally, so a `%` (a LIKE wildcard) and spaces need no URL-encoding.",
+        description: "Read-only access to the running app's existing local database connection. Read it bare for a compact schema overview (tables, columns with types, each table's max rowid as a size that costs a seek rather than a count, index counts), or use ?sql= with offset/limit row windows. A ?sql= read is cut after 60 s (product reads keep a 10-minute bound), because a long read holds a snapshot of the live database open, keeping every later row version in memory and blocking the log fold; a cut read is refused naming its elapsed time and statement. Size a table from the overview's max rowid, read ?table= for its shape, and run EXPLAIN QUERY PLAN first on anything that might scan a large table. EXPLAIN and EXPLAIN QUERY PLAN are permitted for inspecting query plans. Write SQL verbatim: the sql value is taken literally, so a `%` (a LIKE wildcard) and spaces need no URL-encoding.",
         read_projections: &[
-            ProjectionSpec { key: "sql", values: "read-only SELECT/WITH, EXPLAIN [QUERY PLAN], or schema PRAGMA (verbatim; a literal % LIKE wildcard needs no encoding)" },
+            ProjectionSpec { key: "sql", values: "read-only SELECT/WITH, EXPLAIN [QUERY PLAN], or schema PRAGMA (verbatim; a literal % LIKE wildcard needs no encoding); cut after 60 s" },
             ProjectionSpec { key: "table", values: "NAME — one table's full column list and every index on it (columns or expressions, unique/partial marks, a partial index's WHERE predicate), no elision (overview only)" },
             ProjectionSpec { key: "offset", values: "N rows to skip (default 0)" },
             ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },

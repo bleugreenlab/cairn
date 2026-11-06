@@ -635,6 +635,8 @@ pub enum NotReady {
     MissingVars { vars: Vec<String> },
     /// OAuth is configured but no usable token is stored.
     NeedsAuth,
+    /// A credential store could not be read; absence has not been established.
+    CredentialUnavailable { error: String },
     /// No machine has this service's resident ready. `machines` lists every
     /// selected machine and its state; empty means it is selected on none.
     MachineService {
@@ -651,6 +653,7 @@ impl NotReady {
         match self {
             NotReady::MissingVars { vars } => format!("missing_vars({})", vars.join(", ")),
             NotReady::NeedsAuth => "needs_auth".to_string(),
+            NotReady::CredentialUnavailable { error } => format!("credential_unavailable({error})"),
             NotReady::MachineService { machines, .. } if machines.is_empty() => {
                 "machine_service(not installed on any machine)".to_string()
             }

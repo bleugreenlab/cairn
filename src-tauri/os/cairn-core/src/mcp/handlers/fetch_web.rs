@@ -52,7 +52,7 @@ async fn regular_fetch(target: &str) -> Result<String, String> {
 /// Jina Reader: GET `https://r.jina.ai/<url>` with the API key, returning the
 /// page already rendered as markdown.
 async fn jina_fetch(target: &str) -> Result<String, String> {
-    let key = match provider_key(FetchProviderId::Jina) {
+    let key = match provider_key(FetchProviderId::Jina)? {
         Some(k) => k,
         None => return Ok(missing_key_message(FetchProviderId::Jina)),
     };
@@ -73,7 +73,7 @@ async fn firecrawl_fetch(
     target: &str,
     options: &HashMap<String, serde_yaml::Value>,
 ) -> Result<String, String> {
-    let key = match provider_key(FetchProviderId::Firecrawl) {
+    let key = match provider_key(FetchProviderId::Firecrawl)? {
         Some(k) => k,
         None => return Ok(missing_key_message(FetchProviderId::Firecrawl)),
     };
@@ -135,7 +135,7 @@ async fn cloudflare_fetch(
     // failure, and Cloudflare's error envelope quotes the request it rejected.
     let Some(token) =
         crate::security::broker::mcp_oauth_token("web-fetch/cloudflare", "cloudflare web fetch")
-            .await
+            .await?
     else {
         return Ok(
             "Cloudflare web fetch is not authorized. Connect it in Settings → Web Services."
@@ -286,7 +286,7 @@ pub(crate) async fn bmd_fetch(orch: &Orchestrator, source: &str) -> Result<Strin
         return Ok(bmd_setup_message());
     };
     let credential_key = crate::config::secrets::credential_key("bmd", None);
-    let expanded = config.brokered(&credential_key, "bmd web fetch");
+    let expanded = config.brokered(&credential_key, "bmd web fetch")?;
     bmd_fetch_via(gateway.as_ref(), &expanded, &credential_key, source).await
 }
 
@@ -324,8 +324,10 @@ fn bmd_setup_message() -> String {
 /// `Authorization` header. A fetch provider returns page content the agent
 /// reads directly; an error body that quotes the rejected key would otherwise
 /// surface it verbatim.
-fn provider_key(id: FetchProviderId) -> Option<crate::security::BrokeredSecret> {
-    let var = id.auth().secret_var()?;
+fn provider_key(id: FetchProviderId) -> Result<Option<crate::security::BrokeredSecret>, String> {
+    let Some(var) = id.auth().secret_var() else {
+        return Ok(None);
+    };
     crate::security::broker::web_provider_key(id.as_str(), var, "web fetch request")
 }
 
@@ -498,7 +500,7 @@ mod tests {
             serde_json::json!({"type": "http", "url": "https://bmd.example/mcp"}),
         )
         .unwrap();
-        authored.brokered("bmd", "test")
+        authored.brokered("bmd", "test").unwrap()
     }
 
     #[tokio::test]

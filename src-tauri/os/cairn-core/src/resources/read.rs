@@ -34,7 +34,7 @@ use super::paging::{paging, RecordPage};
 use super::progress::read_node_progress;
 use super::rebase::read_node_rebase;
 use super::symbols::{read_node_symbols, read_project_symbols};
-use crate::storage::LocalDb;
+use crate::storage::{AdHocRead, LocalDb};
 
 use super::actions::{read_action, read_actions_collection};
 use super::agents::{read_agent, read_agents_collection};
@@ -92,6 +92,18 @@ pub(crate) struct RenderedResource {
     pub images: Vec<ImageBlock>,
 }
 
+/// How long one agent-written SQL read (`cairn://db?sql=`, a thread database's
+/// `?sql=`, a wake condition) may run, in place of the ten-minute
+/// [`crate::storage::READ_STATEMENT_BOUND`] the product's own reads keep.
+///
+/// The product's statements are planned and pinned; an agent's ad hoc
+/// grouping over a multi-million-row table is neither, and while it steps it
+/// holds a snapshot of the live database: every later row version stays in
+/// memory and the periodic fold waits on it. A minute is past every
+/// `?sql=` read production has logged that finished on its own, and far short
+/// of the folds that failed waiting on one.
+pub(crate) const DB_SQL_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(crate) async fn run_condition_sql(
     db: &LocalDb,
     sql: &str,
@@ -103,6 +115,10 @@ pub(crate) async fn run_condition_sql(
             offset: 0,
             limit: 3,
             format: DbSqlFormat::Text,
+        },
+        AdHocRead {
+            bound: DB_SQL_READ_BOUND,
+            on_behalf_of: None,
         },
     )
     .await
@@ -427,6 +443,7 @@ async fn produce_sql_resource(
     affordance: Option<Affordance>,
     resource: &str,
     writable: bool,
+    read: AdHocRead,
 ) -> RenderedResource {
     if find_query_value(params, "sql").is_none() {
         return produce_schema_overview(db, params, affordance, resource, writable).await;
@@ -435,7 +452,7 @@ async fn produce_sql_resource(
         Ok(projection) => projection,
         Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
-    match run_sql_projection(db, &projection).await {
+    match run_sql_projection(db, &projection, read).await {
         Ok(page) => RenderedResource {
             content: page.body,
             natural_unit: NaturalUnit::Record,
@@ -451,18 +468,87 @@ async fn produce_sql_resource(
             affordance,
             images: Vec::new(),
         },
+        Err(crate::storage::DbError::ReadBoundExceeded { bound, elapsed, .. }) => {
+            RenderedResource::line(
+                sql_read_bound_refusal(resource, &projection.sql, bound, elapsed),
+                affordance,
+                None,
+                None,
+            )
+        }
         Err(error) => {
             RenderedResource::line(format!("SQL query failed: {error}"), affordance, None, None)
         }
     }
 }
 
+/// What a reader gets when its SQL ran past its bound: what happened, why the
+/// bound exists, which statement it was, and the cheaper reads that answer
+/// the usual questions.
+fn sql_read_bound_refusal(
+    resource: &str,
+    sql: &str,
+    bound: std::time::Duration,
+    elapsed: std::time::Duration,
+) -> String {
+    const HEAD_CHARS: usize = 80;
+    let collapsed = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut head: String = collapsed.chars().take(HEAD_CHARS).collect();
+    if collapsed.chars().count() > HEAD_CHARS {
+        head.push('…');
+    }
+    format!(
+        "SQL query stopped after {elapsed:.1?}: {resource}?sql= reads are bounded at {bound:?}. \
+         A read that runs long holds a snapshot of the live database open, which keeps every \
+         later row version in memory and stops the log from folding until it ends.\n\
+         Statement: {head}\n\
+         Instead: read {resource}?table=NAME for a table's columns and indexes, and the bare \
+         {resource} overview for its size (its max rowid costs a seek, not a count); narrow the \
+         predicate to an indexed column or a rowid range; or read \
+         {resource}?sql=EXPLAIN QUERY PLAN <statement> first to see whether it scans."
+    )
+}
+
+/// The bounded read an agent's `?sql=` runs as, naming the requesting run's
+/// home (or its run id, when that does not resolve) for the cut and the gate
+/// watch. The lookup is made only when there is SQL to run, so an overview
+/// read costs nothing extra.
+async fn agent_sql_read(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    params: &[QueryParam],
+) -> AdHocRead {
+    let on_behalf_of = match (find_query_value(params, "sql"), request.run_id.as_deref()) {
+        (Some(_), Some(run_id)) => Some(
+            crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
+                .await
+                .unwrap_or_else(|_| format!("run {run_id}"))
+                .into(),
+        ),
+        _ => None,
+    };
+    AdHocRead {
+        bound: DB_SQL_READ_BOUND,
+        on_behalf_of,
+    }
+}
+
 async fn produce_db_sql_resource(
     orch: &Orchestrator,
+    request: &McpCallbackRequest,
     params: &[QueryParam],
     affordance: Option<Affordance>,
 ) -> RenderedResource {
-    produce_sql_resource(&orch.db.local, params, affordance, "cairn://db", false).await
+    let read = agent_sql_read(orch, request, params).await;
+    produce_sql_resource(
+        &orch.db.local,
+        params,
+        affordance,
+        "cairn://db",
+        false,
+        read,
+    )
+    .await
 }
 
 /// Resolve a thread by name and open its existing database. `Ok(None)` when the
@@ -484,6 +570,7 @@ pub(crate) async fn open_thread_store(
 
 async fn produce_thread_db_resource(
     orch: &Orchestrator,
+    request: &McpCallbackRequest,
     project: &str,
     name: &str,
     params: &[QueryParam],
@@ -506,12 +593,14 @@ async fn produce_thread_db_resource(
         }
         Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
+    let read = agent_sql_read(orch, request, params).await;
     produce_sql_resource(
         &db,
         params,
         affordance,
         &format!("cairn://p/{project}/{name}/db"),
         true,
+        read,
     )
     .await
 }
@@ -682,6 +771,7 @@ struct SqlPage {
 async fn run_sql_projection(
     db: &LocalDb,
     projection: &DbSqlProjection,
+    read: AdHocRead,
 ) -> crate::storage::DbResult<SqlPage> {
     let sql = projection
         .sql
@@ -692,7 +782,7 @@ async fn run_sql_projection(
     let offset = projection.offset;
     let limit = projection.limit;
     let format = projection.format;
-    db.read(move |conn| {
+    db.read_ad_hoc(read, move |conn| {
         Box::pin(async move {
             enter_query_only(conn).await;
             let mut rows = conn.query(&sql, ()).await?;
@@ -1473,11 +1563,12 @@ pub(crate) async fn produce_cairn_resource(
     }
 
     if matches!(resource, CairnResource::Db) {
-        return produce_db_sql_resource(orch, &split.params, affordance).await;
+        return produce_db_sql_resource(orch, request, &split.params, affordance).await;
     }
 
     if let CairnResource::ThreadDb { project, name } = &resource {
-        return produce_thread_db_resource(orch, project, name, &split.params, affordance).await;
+        return produce_thread_db_resource(orch, request, project, name, &split.params, affordance)
+            .await;
     }
 
     if let CairnResource::ThreadDbSchema { project, name } = &resource {
@@ -1983,9 +2074,13 @@ async fn render_resource_body(
     };
     let db = &*routed_db;
     match resource.clone() {
-        CairnResource::Db => produce_db_sql_resource(orch, &params, None).await.content,
+        CairnResource::Db => {
+            produce_db_sql_resource(orch, request, &params, None)
+                .await
+                .content
+        }
         CairnResource::ThreadDb { project, name } => {
-            produce_thread_db_resource(orch, &project, &name, &params, None)
+            produce_thread_db_resource(orch, request, &project, &name, &params, None)
                 .await
                 .content
         }
@@ -3884,6 +3979,20 @@ mod tests {
         parse_query_params(query).unwrap()
     }
 
+    /// A read from outside any run, so no requester is looked up.
+    fn read_request() -> McpCallbackRequest {
+        McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+            origin: None,
+        }
+    }
+
     #[test]
     fn structured_transcript_char_offset_resumes_inside_event_line() {
         let body = "{\"payload\":{\"content\":\"abcdef\"}}\n{\"payload\":{\"content\":\"next\"}}";
@@ -4155,7 +4264,16 @@ line2', X'0001020AFF', 2.5),
             limit: 10,
             format: DbSqlFormat::Text,
         };
-        run_sql_projection(&db, &projection).await.unwrap();
+        run_sql_projection(
+            &db,
+            &projection,
+            AdHocRead {
+                bound: DB_SQL_READ_BOUND,
+                on_behalf_of: None,
+            },
+        )
+        .await
+        .unwrap();
         // Sequential pooled calls reuse one connection, so this write draws the
         // connection the projection just released.
         db.exclusive(|conn| {
@@ -4169,6 +4287,66 @@ line2', X'0001020AFF', 2.5),
         .unwrap();
     }
 
+    /// An agent's SQL that runs past its bound is cut, and the reader is told
+    /// how long it ran, the bound, which statement it was, and what to read
+    /// instead. The statement is a cross join far too large to finish, so the
+    /// test cannot pass by being fast; nothing sleeps. Multi-threaded because
+    /// the statement never yields the worker it runs on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_db_sql_read_past_its_bound_is_cut_and_refused_instructively() {
+        let db = crate::storage::migrated_test_db("db-sql-bound.db").await;
+        let sql =
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000) \
+                   SELECT count(*) FROM n a, n b";
+        let bound = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let rendered = produce_sql_resource(
+            &db,
+            &db_params(&format!("sql={sql}")),
+            None,
+            "cairn://db",
+            false,
+            AdHocRead {
+                bound,
+                on_behalf_of: Some("cairn://p/proj/1/1/builder".into()),
+            },
+        )
+        .await;
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let body = &rendered.content;
+        assert!(body.starts_with("SQL query stopped after "), "{body}");
+        assert!(
+            body.contains("cairn://db?sql= reads are bounded at 200ms."),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "\nStatement: WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000…\n"
+            ),
+            "{body}"
+        );
+        for instead in ["cairn://db?table=NAME", "max rowid", "EXPLAIN QUERY PLAN"] {
+            assert!(body.contains(instead), "missing {instead}: {body}");
+        }
+        assert_eq!(db.live_connections(), 0);
+
+        // The bare overview is not an ad hoc read and is unaffected.
+        let overview = produce_sql_resource(
+            &db,
+            &[],
+            None,
+            "cairn://db",
+            false,
+            AdHocRead {
+                bound,
+                on_behalf_of: None,
+            },
+        )
+        .await;
+        assert_eq!(overview.unit_noun, Some("tables"), "{}", overview.content);
+    }
+
     #[tokio::test]
     async fn db_sql_projection_renders_rows_and_record_metadata() {
         let (orch, _db_dir) = db_projection_orch().await;
@@ -4176,7 +4354,7 @@ line2', X'0001020AFF', 2.5),
             "sql=SELECT id, label, note, data FROM db_projection_rows ORDER BY id&offset=1&limit=2",
         );
 
-        let rendered = produce_db_sql_resource(&orch, &params, None).await;
+        let rendered = produce_db_sql_resource(&orch, &read_request(), &params, None).await;
 
         assert_eq!(rendered.natural_unit, NaturalUnit::Record);
         assert_eq!(rendered.unit_noun, Some("rows"));
@@ -4194,7 +4372,7 @@ line2', X'0001020AFF', 2.5),
         let (orch, _db_dir) = db_projection_orch().await;
         let params = db_params("sql=SELECT id, label FROM db_projection_rows WHERE id > 99");
 
-        let rendered = produce_db_sql_resource(&orch, &params, None).await;
+        let rendered = produce_db_sql_resource(&orch, &read_request(), &params, None).await;
 
         assert_eq!(rendered.shown_units, Some(0));
         assert_eq!(rendered.content, "id\tlabel\n(0 rows)");
@@ -4213,7 +4391,7 @@ line2', X'0001020AFF', 2.5),
             "sql=SELECT a.id, b.id, a.note, 'null', 'NULL', a.amount, a.data FROM db_projection_rows a JOIN db_projection_rows b ON b.id = a.id WHERE a.id = 2&format=json",
         );
 
-        let rendered = produce_db_sql_resource(&orch, &params, None).await;
+        let rendered = produce_db_sql_resource(&orch, &read_request(), &params, None).await;
         let lines = parse_db_json_lines(&rendered.content);
 
         assert_eq!(rendered.shown_units, Some(1));
@@ -4252,7 +4430,7 @@ line2', X'0001020AFF', 2.5),
             "sql=SELECT note, 'null', 'tab'||char(9)||'line'||char(10)||'\"quoted\"' FROM db_projection_rows WHERE id = 1&format=json",
         );
 
-        let rendered = produce_db_sql_resource(&orch, &params, None).await;
+        let rendered = produce_db_sql_resource(&orch, &read_request(), &params, None).await;
         let lines = parse_db_json_lines(&rendered.content);
 
         assert_eq!(
@@ -4266,6 +4444,7 @@ line2', X'0001020AFF', 2.5),
         let (orch, _db_dir) = db_projection_orch().await;
         let rendered = produce_db_sql_resource(
             &orch,
+            &read_request(),
             &db_params("sql=SELECT 1e999, -1e999&format=json"),
             None,
         )
@@ -4286,6 +4465,7 @@ line2', X'0001020AFF', 2.5),
         let (orch, _db_dir) = db_projection_orch().await;
         let page = produce_db_sql_resource(
             &orch,
+            &read_request(),
             &db_params("sql=SELECT id FROM db_projection_rows ORDER BY id&limit=0&format=json"),
             None,
         )
@@ -4435,6 +4615,7 @@ line2', X'0001020AFF', 2.5),
         let (orch, _db_dir) = db_projection_orch().await;
         let empty = produce_db_sql_resource(
             &orch,
+            &read_request(),
             &db_params("sql=SELECT id, label FROM db_projection_rows WHERE id > 99&format=json"),
             None,
         )
@@ -4451,6 +4632,7 @@ line2', X'0001020AFF', 2.5),
 
         let page = produce_db_sql_resource(
             &orch,
+            &read_request(),
             &db_params(
                 "sql=SELECT id FROM db_projection_rows ORDER BY id&offset=1&limit=1&format=json",
             ),

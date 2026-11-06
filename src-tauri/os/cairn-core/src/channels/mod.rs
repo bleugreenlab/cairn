@@ -32,6 +32,37 @@ const ADMISSION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 const DESKTOP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_RESUME_WINDOW: Duration = Duration::from_secs(5 * 60);
 
+fn channel_token_error(
+    channel: &str,
+    token: &Result<Option<crate::security::broker::BrokeredSecret>, String>,
+) -> Option<String> {
+    match token {
+        Err(error) => Some(error.clone()),
+        Ok(None) => Some(format!(
+            "{channel} channel token is missing from the keychain"
+        )),
+        Ok(Some(_)) => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn channel_token_validation_preserves_unavailability() {
+    for channel in ["Discord", "Telegram"] {
+        let error = "Keychain unavailable: unlock the login keychain".to_string();
+        assert_eq!(
+            channel_token_error(channel, &Err(error.clone())),
+            Some(error)
+        );
+        assert_eq!(
+            channel_token_error(channel, &Ok(None)),
+            Some(format!(
+                "{channel} channel token is missing from the keychain"
+            ))
+        );
+    }
+}
+
 #[derive(Default)]
 struct SessionContinuity {
     config: Option<Vec<u8>>,
@@ -226,12 +257,7 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
                     .err()
                     .map(|_| "Discord allowlist entries must be numeric user IDs".to_string())
             })
-            .or_else(|| {
-                token
-                    .as_ref()
-                    .is_none()
-                    .then(|| "Discord channel token is missing from the keychain".to_string())
-            });
+            .or_else(|| channel_token_error("Discord", &token));
         if let Some(error) = validation {
             set_admission_state("discord", Some(("stopped", error)));
             tokio::select! {
@@ -244,7 +270,7 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
         // the boot-time root load here rather than inside the constructor.
         cairn_tls::ready().await;
         let provider = discord::DiscordProvider::new(
-            token.unwrap().expose().to_string(),
+            token.unwrap().unwrap().expose().to_string(),
             config
                 .guild_id
                 .parse::<u64>()
@@ -1377,17 +1403,16 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
                     .err()
                     .map(|_| "Telegram allowlist entries must be numeric user IDs".to_string())
             })
-            .or_else(|| {
-                token
-                    .as_ref()
-                    .is_none()
-                    .then(|| "Telegram channel token is missing from the keychain".to_string())
-            })
+            .or_else(|| channel_token_error("Telegram", &token))
             .or_else(|| {
                 telegram_identity_error(
                     &config.chat_id,
                     &config.allow_from,
-                    token.as_ref()?.expose(),
+                    token
+                        .as_ref()
+                        .expect("validated token lookup")
+                        .as_ref()?
+                        .expose(),
                 )
             });
         if let Some(error) = validation {
@@ -1406,7 +1431,7 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
         // the boot-time root load here rather than inside the constructor.
         cairn_tls::ready().await;
         let provider = telegram::TelegramProvider::new(
-            token.unwrap().expose().to_string(),
+            token.unwrap().unwrap().expose().to_string(),
             chat_id,
             allowed.unwrap(),
         );

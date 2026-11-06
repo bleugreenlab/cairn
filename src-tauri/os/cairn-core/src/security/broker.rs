@@ -381,7 +381,7 @@ pub(super) fn register(
 /// The only caller of the keychain accessor in the codebase; a source-structure
 /// test keeps it that way, because a second caller is a second place a
 /// credential becomes an unregistered `String`.
-fn keychain(credential_key: &str, var: &str) -> Option<String> {
+fn keychain(credential_key: &str, var: &str) -> Result<Option<String>, String> {
     crate::config::secrets::get_secret(credential_key, var)
 }
 
@@ -390,8 +390,89 @@ fn keychain(credential_key: &str, var: &str) -> Option<String> {
 /// Separate from [`keychain`] because the namespace a value was written to IS
 /// its declaration — see [`crate::config::secrets::set_config_value`] for why
 /// that has to be durable rather than sniffed from the value.
-fn keychain_config(credential_key: &str, var: &str) -> Option<String> {
+fn keychain_config(credential_key: &str, var: &str) -> Result<Option<String>, String> {
     crate::config::secrets::get_config_value(credential_key, var)
+}
+
+const MCP_VALUE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+type McpValue = Option<(String, Origin)>;
+
+struct CachedMcpValue {
+    value: Option<(Zeroizing<String>, Origin)>,
+    expires: std::time::Instant,
+}
+
+#[derive(Default)]
+struct McpValueCache {
+    values: HashMap<(String, String), CachedMcpValue>,
+    epochs: HashMap<String, u64>,
+}
+
+fn mcp_values() -> &'static std::sync::Mutex<McpValueCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<McpValueCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Invalidates before and after a mutation, including one that fails part way.
+/// The odd epoch also prevents a racing reader from caching an intermediate value.
+pub(crate) struct McpValueMutation<'a>(&'a str);
+
+fn advance_mcp_epoch(server: &str) {
+    let mut cache = mcp_values().lock().unwrap_or_else(|e| e.into_inner());
+    *cache.epochs.entry(server.to_string()).or_default() += 1;
+    cache.values.retain(|(key, _), _| key != server);
+}
+
+pub(crate) fn invalidate_mcp_values(server: &str) -> McpValueMutation<'_> {
+    advance_mcp_epoch(server);
+    McpValueMutation(server)
+}
+
+impl Drop for McpValueMutation<'_> {
+    fn drop(&mut self) {
+        advance_mcp_epoch(self.0);
+    }
+}
+
+fn cached_mcp_value(server: &str, var: &str) -> Result<McpValue, String> {
+    let key = (server.to_string(), var.to_string());
+    let epoch = {
+        let mut cache = mcp_values().lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .values
+            .retain(|_, entry| entry.expires > std::time::Instant::now());
+        if let Some(entry) = cache.values.get(&key) {
+            return Ok(entry
+                .value
+                .as_ref()
+                .map(|(value, origin)| (value.to_string(), *origin)));
+        }
+        *cache.epochs.get(server).unwrap_or(&0)
+    };
+    // Only absence permits the next store. Errors are never cached here.
+    let value = match keychain(server, var)? {
+        Some(value) => Some((value, Origin::Keychain)),
+        None => match keychain_config(server, var)? {
+            Some(value) => Some((value, Origin::KeychainConfig)),
+            None => std::env::var(var)
+                .ok()
+                .map(|value| (value, Origin::Environment)),
+        },
+    };
+    let mut cache = mcp_values().lock().unwrap_or_else(|e| e.into_inner());
+    if epoch % 2 == 0 && *cache.epochs.get(server).unwrap_or(&0) == epoch {
+        cache.values.insert(
+            key,
+            CachedMcpValue {
+                value: value
+                    .as_ref()
+                    .map(|(value, origin)| (Zeroizing::new(value.clone()), *origin)),
+                expires: std::time::Instant::now() + MCP_VALUE_TTL,
+            },
+        );
+    }
+    Ok(value)
 }
 
 /// Resolve one `${VAR}` for a configured MCP server: settings-UI override, then
@@ -407,19 +488,14 @@ fn resolve_mcp_var(
     overrides: &HashMap<String, String>,
     var: &str,
     purpose: &str,
-) -> Option<String> {
-    let (value, origin) = match overrides.get(var).filter(|value| !value.is_empty()) {
-        Some(value) => (value.clone(), Origin::Override),
-        None => match keychain(credential_key, var) {
-            Some(value) => (value, Origin::Keychain),
-            // The declared-configuration namespace of the same keychain, read
-            // only after the secret namespace, so nothing here can shadow a
-            // credential the user stored under the same name.
-            None => match keychain_config(credential_key, var) {
-                Some(value) => (value, Origin::KeychainConfig),
-                None => (std::env::var(var).ok()?, Origin::Environment),
-            },
-        },
+) -> Result<Option<String>, String> {
+    let resolved = match overrides.get(var).filter(|value| !value.is_empty()) {
+        Some(value) => Some((value.clone(), Origin::Override)),
+        None => cached_mcp_value(credential_key, var)
+            .map_err(|cause| format!("Cannot resolve MCP variable `{var}`: {cause}"))?,
+    };
+    let Some((value, origin)) = resolved else {
+        return Ok(None);
     };
     let declared = match origin {
         Origin::Override | Origin::Keychain => Declared::Secret,
@@ -432,7 +508,7 @@ fn resolve_mcp_var(
         var: var.to_string(),
     };
     register(&source, declared, purpose, value.clone());
-    Some(value)
+    Ok(Some(value))
 }
 
 /// Expand a configured MCP server's `${VAR}` references for connecting.
@@ -448,7 +524,7 @@ pub fn mcp_server(
     authored: &McpServerConfig,
     overrides: &HashMap<String, String>,
     purpose: &str,
-) -> BrokeredMcpConfig {
+) -> Result<BrokeredMcpConfig, String> {
     // A declaration that names nothing protects nothing, and the operator has no
     // way to tell: the whole value of the field is their belief that the
     // credential is scrubbed. A typo in `secrets:` would otherwise parse, save,
@@ -463,10 +539,28 @@ pub fn mcp_server(
             );
         }
     }
-    let resolved = authored.expand_vars(&|var| {
-        resolve_mcp_var(credential_key, authored, overrides, var, purpose).unwrap_or_default()
-    });
-    BrokeredMcpConfig { resolved }
+    let mut values = HashMap::new();
+    for var in &referenced {
+        let value = resolve_mcp_var(credential_key, authored, overrides, var, purpose)
+            .map_err(|cause| format!("Refusing MCP server `{credential_key}`: {cause}"))?;
+        values.insert(var.clone(), value.unwrap_or_default());
+    }
+    let resolved = authored.expand_vars(&|var| values.get(var).cloned().unwrap_or_default());
+    Ok(BrokeredMcpConfig { resolved })
+}
+
+/// Whether the secret namespace contains this key, without config/env fallback.
+/// A status probe still registers material it reads, and retains unavailability.
+pub fn mcp_secret_is_set(credential_key: &str, var: &str) -> Result<bool, String> {
+    let Some(value) = keychain(credential_key, var)? else {
+        return Ok(false);
+    };
+    let source = CredentialSource::McpVar {
+        credential_key: credential_key.to_string(),
+        var: var.to_string(),
+    };
+    register(&source, Declared::Secret, "mcp secret status", value);
+    Ok(true)
 }
 
 /// Whether `var` resolves to a non-empty value for this server.
@@ -475,15 +569,19 @@ pub fn mcp_server(
 /// server reported ready is a server whose credentials actually resolve — and a
 /// value materialized here is registered on the same terms as one materialized
 /// at connect.
-pub fn mcp_var_is_set(credential_key: &str, authored: &McpServerConfig, var: &str) -> bool {
-    resolve_mcp_var(
+pub fn mcp_var_is_set(
+    credential_key: &str,
+    authored: &McpServerConfig,
+    var: &str,
+) -> Result<bool, String> {
+    Ok(resolve_mcp_var(
         credential_key,
         authored,
         &HashMap::new(),
         var,
         "mcp readiness probe",
-    )
-    .is_some_and(|value| !value.trim().is_empty())
+    )?
+    .is_some_and(|value| !value.trim().is_empty()))
 }
 
 /// A currently-valid OAuth access token for a configured MCP server, refreshing
@@ -494,34 +592,46 @@ pub fn mcp_var_is_set(credential_key: &str, authored: &McpServerConfig, var: &st
 /// server Cairn does not control, and a server that echoes its own
 /// `Authorization` header back in an error body would otherwise put a live token
 /// straight into a tool result.
-pub async fn mcp_oauth_token(credential_key: &str, purpose: &str) -> Option<BrokeredSecret> {
-    let value = crate::mcp::oauth::store::get_valid_access_token(credential_key).await?;
+pub async fn mcp_oauth_token(
+    credential_key: &str,
+    purpose: &str,
+) -> Result<Option<BrokeredSecret>, String> {
+    let Some(value) = crate::mcp::oauth::store::get_valid_access_token(credential_key).await?
+    else {
+        return Ok(None);
+    };
     let source = CredentialSource::McpOAuth {
         credential_key: credential_key.to_string(),
     };
     register(&source, Declared::Secret, purpose, value.clone());
-    Some(BrokeredSecret {
+    Ok(Some(BrokeredSecret {
         value: Zeroizing::new(value),
         id: source.secret_id(),
-    })
+    }))
 }
 
 /// The stored API key for a web search or web fetch provider.
 ///
 /// Returns `None` when no key is stored or the stored value is blank, which is
 /// the "provider not configured" case rather than a failure.
-pub fn web_provider_key(provider: &str, var: &str, purpose: &str) -> Option<BrokeredSecret> {
+pub fn web_provider_key(
+    provider: &str,
+    var: &str,
+    purpose: &str,
+) -> Result<Option<BrokeredSecret>, String> {
     let credential_key = crate::config::secrets::credential_key(provider, None);
-    let value = keychain(&credential_key, var).filter(|key| !key.trim().is_empty())?;
+    let Some(value) = keychain(&credential_key, var)?.filter(|key| !key.trim().is_empty()) else {
+        return Ok(None);
+    };
     let source = CredentialSource::WebProvider {
         provider: provider.to_string(),
         var: var.to_string(),
     };
     register(&source, Declared::Secret, purpose, value.clone());
-    Some(BrokeredSecret {
+    Ok(Some(BrokeredSecret {
         value: Zeroizing::new(value),
         id: source.secret_id(),
-    })
+    }))
 }
 
 /// GitHub App authentication, performed by the broker rather than handed out.
@@ -1261,14 +1371,131 @@ mod tests {
         crate::config::secrets::set_secret(server, var, value).unwrap();
 
         let resolved = resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test");
-        assert_eq!(resolved.as_deref(), Some(value));
+        assert_eq!(resolved.unwrap().as_deref(), Some(value));
         assert!(is_registered(&format!("mcp-server:{server}:{var}")));
+    }
+
+    #[test]
+    fn unavailable_keychain_refuses_even_with_an_environment_value() {
+        use_mock_keychain();
+        let server = "broker-unavailable-env";
+        let var = "CAIRN_TEST_UNAVAILABLE_KEYCHAIN_TOKEN";
+        // SAFETY: this test alone owns this unique name, which is never removed.
+        unsafe { std::env::set_var(var, "must-not-reach-the-server") };
+        let service = format!("computer.cairn.mcp.{}", cairn_common::paths::env_str());
+        let gate = crate::config::secrets::mock_keychain::block_reads(
+            &service,
+            &format!("{server}/{var}"),
+        );
+        let witnessed =
+            std::thread::spawn(move || crate::config::secrets::has_witnessed_value(server, var));
+        let settings_status = std::thread::spawn(move || mcp_secret_is_set(server, var));
+        let provider_key = std::thread::spawn(move || web_provider_key(server, var, "test"));
+        let mut config = authored(&[var]);
+        config.env.insert(var.to_string(), format!("${{{var}}}"));
+        let start = std::time::Instant::now();
+        let error = match mcp_server(server, &config, &HashMap::new(), "test") {
+            Ok(_) => panic!("an unavailable keychain must not connect using the environment"),
+            Err(error) => error,
+        };
+        assert!(start.elapsed() < std::time::Duration::from_secs(6));
+        assert!(error.contains("Keychain") || error.contains("keychain"));
+        assert!(error.contains("desktop"));
+        assert!(witnessed
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("Keychain unavailable"));
+        assert!(settings_status
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("Keychain unavailable"));
+        assert!(
+            matches!(provider_key.join().unwrap(), Err(cause) if cause.contains("Keychain unavailable"))
+        );
+        assert!(!is_registered(&format!("mcp-server:{server}:{var}")));
+        gate.release();
+    }
+
+    #[test]
+    fn cairn_mutation_invalidates_a_pending_resolution_before_it_can_fill_the_cache() {
+        use_mock_keychain();
+        let (server, var) = (
+            "broker-pending-mutation",
+            "CAIRN_TEST_PENDING_MUTATION_TOKEN",
+        );
+        crate::config::secrets::set_secret(server, var, "before-mutation-token").unwrap();
+        let service = format!("computer.cairn.mcp.{}", cairn_common::paths::env_str());
+        let gate = crate::config::secrets::mock_keychain::block_reads(
+            &service,
+            &format!("{server}/{var}"),
+        );
+        let caller = std::thread::spawn(move || {
+            resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test")
+        });
+        assert!(gate.wait_for_reads(1, std::time::Duration::from_secs(5)));
+        crate::config::secrets::set_secret(server, var, "after-mutation-token").unwrap();
+        assert!(caller.join().unwrap().unwrap_err().contains("changed"));
+        assert!(resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test").is_err());
+        gate.release();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(value) = resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test")
+            {
+                assert_eq!(value.as_deref(), Some("after-mutation-token"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "invalidated backend did not recover"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn mcp_value_cache_is_memory_only_expires_and_mutations_invalidate() {
+        use_mock_keychain();
+        let (server, var) = (
+            "broker-cache-invalidation",
+            "CAIRN_TEST_CACHE_INVALIDATION_TOKEN",
+        );
+        let config = authored(&[]);
+        let resolve = || resolve_mcp_var(server, &config, &HashMap::new(), var, "test").unwrap();
+        let secrets = crate::config::secrets::set_secret;
+        secrets(server, var, "cache-first-token").unwrap();
+        assert_eq!(resolve().as_deref(), Some("cache-first-token"));
+        let service = format!("computer.cairn.mcp.{}", cairn_common::paths::env_str());
+        // An external edit is invisible only until the process-local TTL.
+        keyring::Entry::new(&service, &format!("{server}/{var}"))
+            .unwrap()
+            .set_password("external-second-token")
+            .unwrap();
+        assert_eq!(resolve().as_deref(), Some("cache-first-token"));
+        {
+            let mut cache = mcp_values().lock().unwrap();
+            let entry = cache.values.get_mut(&(server.into(), var.into())).unwrap();
+            assert!(entry.expires <= std::time::Instant::now() + MCP_VALUE_TTL);
+            // Advance this entry past its deadline without a wall-clock sleep.
+            entry.expires = std::time::Instant::now();
+        }
+        assert_eq!(resolve().as_deref(), Some("external-second-token"));
+        secrets(server, var, "cairn-third-token").unwrap();
+        assert_eq!(resolve().as_deref(), Some("cairn-third-token"));
+        crate::config::secrets::delete_secret(server, var).unwrap();
+        assert_eq!(resolve(), None);
+        crate::config::secrets::set_config_value(server, var, "/opt/cache-test").unwrap();
+        assert_eq!(resolve().as_deref(), Some("/opt/cache-test"));
+        crate::config::secrets::delete_config_value(server, var).unwrap();
+        assert_eq!(resolve(), None);
     }
 
     /// The gap CAIRN-3822 deliberately left open: an environment-resolved
     /// credential the config declares is now a scrub target.
     #[test]
     fn a_declared_environment_value_is_registered() {
+        use_mock_keychain();
         let (server, var) = ("broker-declared-server", "CAIRN_TEST_DECLARED_TOKEN");
         let value = "env-Rt48Km19Zc03Qb";
         // SAFETY: a process-unique variable name, set once and never removed, so
@@ -1276,7 +1503,7 @@ mod tests {
         unsafe { std::env::set_var(var, value) };
 
         let resolved = resolve_mcp_var(server, &authored(&[var]), &HashMap::new(), var, "test");
-        assert_eq!(resolved.as_deref(), Some(value));
+        assert_eq!(resolved.unwrap().as_deref(), Some(value));
         assert!(is_registered(&format!("mcp-server:{server}:{var}")));
 
         let mut sanitizer = Sanitizer::exact();
@@ -1290,6 +1517,7 @@ mod tests {
     /// it would make every model-authored write mentioning it refused.
     #[test]
     fn an_undeclared_environment_value_resolves_without_being_registered() {
+        use_mock_keychain();
         let (server, var) = ("broker-plain-server", "CAIRN_TEST_UNDECLARED_PATH");
         let value = "/Users/somebody/Documents";
         // SAFETY: as above.
@@ -1297,7 +1525,7 @@ mod tests {
 
         let resolved = resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test");
         assert_eq!(
-            resolved.as_deref(),
+            resolved.unwrap().as_deref(),
             Some(value),
             "expansion must still work"
         );
@@ -1331,12 +1559,12 @@ mod tests {
 
         // Configured before the binary is installed — an ordinary order of
         // events, and the one that used to poison the value permanently.
-        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert_eq!(resolve().unwrap().as_deref(), Some(value.as_str()));
         assert!(!is_registered(&id), "absent target: still not a credential");
 
         // Installed.
         std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
-        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert_eq!(resolve().unwrap().as_deref(), Some(value.as_str()));
         assert!(
             !is_registered(&id),
             "present target: still not a credential"
@@ -1344,13 +1572,13 @@ mod tests {
 
         // Gone mid-upgrade, then back.
         std::fs::remove_file(&executable).unwrap();
-        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert_eq!(resolve().unwrap().as_deref(), Some(value.as_str()));
         assert!(
             !is_registered(&id),
             "vanished target: still not a credential"
         );
         std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
-        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert_eq!(resolve().unwrap().as_deref(), Some(value.as_str()));
         assert!(
             !is_registered(&id),
             "restored target: still not a credential"
@@ -1372,7 +1600,7 @@ mod tests {
         let value = file.to_string_lossy().to_string();
         crate::config::secrets::set_secret(server, var, &value).unwrap();
 
-        resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test");
+        resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test").unwrap();
         assert!(
             is_registered(&format!("mcp-server:{server}:{var}")),
             "the secret store's declaration must never be second-guessed"
@@ -1391,7 +1619,7 @@ mod tests {
         crate::config::secrets::set_config_value(server, var, "/opt/thing").unwrap();
 
         let resolved = resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test");
-        assert_eq!(resolved.as_deref(), Some("secret-Zx91Qw82Lm"));
+        assert_eq!(resolved.unwrap().as_deref(), Some("secret-Zx91Qw82Lm"));
         assert!(is_registered(&format!("mcp-server:{server}:{var}")));
     }
 
@@ -1404,7 +1632,7 @@ mod tests {
         let overrides = HashMap::from([(var.to_string(), value.to_string())]);
 
         let resolved = resolve_mcp_var(server, &authored(&[]), &overrides, var, "test");
-        assert_eq!(resolved.as_deref(), Some(value));
+        assert_eq!(resolved.unwrap().as_deref(), Some(value));
         assert!(is_registered(&format!("mcp-server:{server}:{var}")));
     }
 
@@ -1418,7 +1646,9 @@ mod tests {
         let overrides = HashMap::from([(var.to_string(), "typed-Gh56Ij78Kl".to_string())]);
 
         assert_eq!(
-            resolve_mcp_var(server, &authored(&[]), &overrides, var, "test").as_deref(),
+            resolve_mcp_var(server, &authored(&[]), &overrides, var, "test")
+                .unwrap()
+                .as_deref(),
             Some("typed-Gh56Ij78Kl")
         );
     }

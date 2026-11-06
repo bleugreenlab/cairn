@@ -5,8 +5,8 @@
 //! every connected machine holding a replica is told to remove it. The row
 //! stays as a tombstone until each of those machines acknowledges, and a
 //! machine that was offline is told the next time its advertisement names the
-//! closed scratch. An advertisement naming a scratch this runner never had is
-//! answered the same way, so nothing outlives the authority that described it.
+//! closed scratch. An unknown scratch is retained: absence from this runner's
+//! database is not evidence that the owner has ended.
 //! A node that ended while the runner was down has its scratch closed by
 //! [`close_ended`] at the next start.
 
@@ -62,8 +62,8 @@ pub fn ensure_subscribed(orch: &Orchestrator) {
             // the executor retries the write-backs it owes the moment Ready's
             // credential arrives, which a spawned grant could trail. A grant
             // for a closed or unknown scratch confers nothing, because every
-            // scratch route refuses one, and the reconcile tells the machine
-            // to delete it.
+            // scratch route refuses one. Reconciliation deletes only known
+            // closed scratches; unknown replicas remain untouched.
             if let NodeScratchEvent::Advertised {
                 executor_id,
                 generation,
@@ -110,7 +110,7 @@ async fn handle_event(lifecycle: &Lifecycle, fleet: &Fleet, event: NodeScratchEv
 /// A replica of an open scratch has its state recorded; the connection was
 /// granted it when the advertisement arrived (see [`ensure_subscribed`]), so a
 /// dirty replica can finish its write-back after a link bounce. A replica of a
-/// closed or unknown scratch is told to go.
+/// known closed scratch is told to go; an unknown one is left alone.
 async fn reconcile_advertised(
     lifecycle: &Lifecycle,
     fleet: &Fleet,
@@ -130,7 +130,19 @@ async fn reconcile_advertised(
                 continue;
             }
         };
-        let Some(scratch) = scratch.filter(|scratch| scratch.closed_at.is_none()) else {
+        let Some(scratch) = scratch else {
+            log::warn!(
+                "leaving unknown node scratch {} on {executor_id} generation {generation} untouched; authority {} has no closure record",
+                replica.scratch_id,
+                lifecycle.config_dir.display()
+            );
+            continue;
+        };
+        if scratch.closed_at.is_some() {
+            log::info!(
+                "authority {} requesting deletion of closed node scratch {} of {} on {executor_id} generation {generation}",
+                lifecycle.config_dir.display(), scratch.id, scratch.owner_uri
+            );
             fleet.send_to_connected(
                 executor_id,
                 ExecutorMessage::DeleteNodeScratch {
@@ -138,7 +150,7 @@ async fn reconcile_advertised(
                 },
             );
             continue;
-        };
+        }
         let known = owner::replicas(local, &scratch.id)
             .await
             .unwrap_or_default()
@@ -242,6 +254,12 @@ pub async fn close_scratch(orch: &Orchestrator, scratch: &NodeScratch) {
         }
     }
     for executor_id in &holders {
+        log::info!(
+            "authority {} requesting deletion of closed node scratch {} of {} on {executor_id}",
+            lifecycle.config_dir.display(),
+            scratch.id,
+            scratch.owner_uri
+        );
         orch.fleet.send_to_connected(
             executor_id,
             ExecutorMessage::DeleteNodeScratch {

@@ -116,15 +116,8 @@ pub fn set_config_value(server: &str, var: &str, value: &str) -> Result<(), Stri
 }
 
 /// Read the non-credential value for `var` referenced by `server`, if stored.
-pub fn get_config_value(server: &str, var: &str) -> Option<String> {
-    match config_entry(server, var).ok()?.get_password() {
-        Ok(value) => Some(value),
-        Err(Error::NoEntry) => None,
-        Err(e) => {
-            log::warn!("Failed to read MCP value {server}/{var} from keychain: {e}");
-            None
-        }
-    }
+pub fn get_config_value(server: &str, var: &str) -> Result<Option<String>, String> {
+    super::keychain_read::read(&service(), &config_account(server, var))
 }
 
 /// Remove the stored non-credential value for `var` referenced by `server`.
@@ -148,23 +141,14 @@ pub fn set_secret(server: &str, var: &str, value: &str) -> Result<(), String> {
 
 /// Read the secret value for `var` referenced by `server`, if one is stored.
 ///
-/// Returns `None` when no secret exists or the keychain is unavailable — a
-/// missing secret degrades to the env fallback / empty string at expand time
-/// rather than failing the whole connection here.
-pub fn get_secret(server: &str, var: &str) -> Option<String> {
-    match entry(server, var).ok()?.get_password() {
-        Ok(value) => Some(value),
-        Err(Error::NoEntry) => None,
-        Err(e) => {
-            log::warn!("Failed to read MCP secret {server}/{var} from keychain: {e}");
-            None
-        }
-    }
+/// Absence permits fallback; an unavailable keychain refuses resolution.
+pub fn get_secret(server: &str, var: &str) -> Result<Option<String>, String> {
+    super::keychain_read::read(&service(), &account(server, var))
 }
 
-/// Whether a secret is stored for `var` referenced by `server`.
-pub fn has_secret(server: &str, var: &str) -> bool {
-    get_secret(server, var).is_some()
+/// Whether a secret is stored, retaining a keychain availability failure.
+pub fn has_secret(server: &str, var: &str) -> Result<bool, String> {
+    Ok(get_secret(server, var)?.is_some())
 }
 
 /// Remove the stored secret for `var` referenced by `server`. Succeeds when no
@@ -179,8 +163,8 @@ pub fn delete_secret(server: &str, var: &str) -> Result<(), String> {
 /// Whether `var` resolves from a witnessed Cairn store rather than from the
 /// process environment. Environment values are not covered by the witness, so a
 /// server depending on one is never cached.
-pub fn has_witnessed_value(server: &str, var: &str) -> bool {
-    get_secret(server, var).is_some() || get_config_value(server, var).is_some()
+pub fn has_witnessed_value(server: &str, var: &str) -> Result<bool, String> {
+    Ok(get_secret(server, var)?.is_some() || get_config_value(server, var)?.is_some())
 }
 
 fn witness_service() -> String {
@@ -233,7 +217,9 @@ pub enum StaticWitness {
     /// A mutation began and did not commit, or is committing now. Nothing may be
     /// cached, and only an explicit reconcile clears it.
     Updating(CredentialGeneration),
-    /// The keychain could not be read, or the witness is corrupt. Fail closed.
+    /// The stored witness is corrupt. Fail closed until explicit reconciliation.
+    Corrupt(String),
+    /// The keychain could not be read. Fail closed without changing the witness.
     Unavailable(String),
 }
 
@@ -245,12 +231,7 @@ enum RawWitness {
 }
 
 fn read_witness(server: &str) -> RawWitness {
-    let raw = match witness_entry(server).and_then(|entry| {
-        entry.get_password().map(Some).or_else(|e| match e {
-            Error::NoEntry => Ok(None),
-            e => Err(format!("Failed to read MCP credential witness: {e}")),
-        })
-    }) {
+    let raw = match super::keychain_read::read(&witness_service(), server) {
         Ok(Some(raw)) => raw,
         Ok(None) => return RawWitness::Absent,
         Err(e) => return RawWitness::Unavailable(e),
@@ -270,9 +251,12 @@ fn write_witness(
 ) -> Result<(), String> {
     let blob = serde_json::to_string(record)
         .map_err(|e| format!("Failed to serialize MCP credential witness: {e}"))?;
-    witness_entry(server)?
+    super::keychain_read::invalidate(&witness_service(), server);
+    let result = witness_entry(server)?
         .set_password(&blob)
-        .map_err(|e| format!("Failed to store MCP credential witness: {e}"))
+        .map_err(|e| format!("Failed to store MCP credential witness: {e}"));
+    super::keychain_read::invalidate(&witness_service(), server);
+    result
 }
 
 /// The current witness for `server`'s static values, without taking the lock.
@@ -284,7 +268,7 @@ pub fn static_witness(server: &str) -> StaticWitness {
             WitnessState::Stable => StaticWitness::Stable(record.generation()),
             WitnessState::Updating => StaticWitness::Updating(record.generation()),
         },
-        RawWitness::Corrupt => StaticWitness::Unavailable(
+        RawWitness::Corrupt => StaticWitness::Corrupt(
             "MCP credential witness is unreadable; reconcile it in Settings".to_string(),
         ),
         RawWitness::Unavailable(e) => StaticWitness::Unavailable(e),
@@ -324,10 +308,38 @@ fn exhausted(server: &str) -> String {
     format!("MCP credential generation for `{server}` is exhausted")
 }
 
+struct SecretReadMutation<'a> {
+    server: &'a str,
+    _cache: crate::security::broker::McpValueMutation<'a>,
+}
+
+fn invalidate_value_reads(server: &str) {
+    super::keychain_read::invalidate_prefix(&service(), &format!("{server}/"));
+    super::keychain_read::invalidate_prefix(&service(), &format!("config:{server}/"));
+}
+
+impl<'a> SecretReadMutation<'a> {
+    fn new(server: &'a str) -> Self {
+        let cache = crate::security::broker::invalidate_mcp_values(server);
+        invalidate_value_reads(server);
+        Self {
+            server,
+            _cache: cache,
+        }
+    }
+}
+
+impl Drop for SecretReadMutation<'_> {
+    fn drop(&mut self) {
+        invalidate_value_reads(self.server);
+    }
+}
+
 /// Change `server`'s values under the witness protocol. A failure after the
 /// witness reads `Updating` leaves it there: the values may have changed.
 fn mutate_values(server: &str, change: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     let guard = credential_witness::acquire()?;
+    let _cache_change = SecretReadMutation::new(server);
     let base = match read_witness(server) {
         RawWitness::Absent => WitnessRecord {
             v: WITNESS_RECORD_VERSION,
@@ -391,6 +403,7 @@ pub(crate) fn interrupt_mutation_for_test(server: &str) {
 /// fresh incarnation, which is equally unmatched by any recorded catalog.
 pub fn reconcile_static_witness(server: &str) -> Result<CredentialGeneration, String> {
     let guard = credential_witness::acquire()?;
+    let _cache_change = SecretReadMutation::new(server);
     let next = match read_witness(server) {
         RawWitness::Record(record) => WitnessRecord {
             counter: record
@@ -425,7 +438,104 @@ pub mod mock_keychain {
     use keyring::credential::{Credential, CredentialApi, CredentialBuilder, CredentialBuilderApi};
     use std::any::Any;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct ReadControls {
+        gates: HashMap<String, Arc<Gate>>,
+        counts: HashMap<String, usize>,
+    }
+
+    #[derive(Debug, Default)]
+    struct Gate {
+        state: Mutex<(bool, usize)>,
+        changed: Condvar,
+    }
+
+    fn controls() -> &'static Mutex<ReadControls> {
+        static CONTROLS: OnceLock<Mutex<ReadControls>> = OnceLock::new();
+        CONTROLS.get_or_init(|| Mutex::new(ReadControls::default()))
+    }
+
+    /// A per-key backend read gate. Dropping it releases every blocked reader.
+    pub struct ReadGate {
+        key: String,
+        gate: Arc<Gate>,
+    }
+
+    impl ReadGate {
+        /// Wait until at least `count` backend reads have entered this gate.
+        pub fn wait_for_reads(&self, count: usize, timeout: Duration) -> bool {
+            let state = self.gate.state.lock().unwrap();
+            let (state, _) = self
+                .gate
+                .changed
+                .wait_timeout_while(state, timeout, |state| state.1 < count)
+                .unwrap();
+            state.1 >= count
+        }
+
+        pub fn release(&self) {
+            self.gate.state.lock().unwrap().0 = true;
+            self.gate.changed.notify_all();
+        }
+    }
+
+    impl Drop for ReadGate {
+        fn drop(&mut self) {
+            self.release();
+            let mut controls = controls().lock().unwrap();
+            if controls
+                .gates
+                .get(&self.key)
+                .is_some_and(|gate| Arc::ptr_eq(gate, &self.gate))
+            {
+                controls.gates.remove(&self.key);
+            }
+        }
+    }
+
+    /// Block reads for only this service/account; unrelated keys keep working.
+    pub fn block_reads(service: &str, account: &str) -> ReadGate {
+        install();
+        let key = format!("{service}\u{0}{account}");
+        let gate = Arc::new(Gate::default());
+        let mut controls = controls().lock().unwrap();
+        assert!(
+            !controls.gates.contains_key(&key),
+            "read gate already installed"
+        );
+        controls.gates.insert(key.clone(), gate.clone());
+        ReadGate { key, gate }
+    }
+
+    /// Number of backend reads of this service/account since installation.
+    pub fn read_count(service: &str, account: &str) -> usize {
+        controls()
+            .lock()
+            .unwrap()
+            .counts
+            .get(&format!("{service}\u{0}{account}"))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn before_read(key: &str) {
+        let gate = {
+            let mut controls = controls().lock().unwrap();
+            *controls.counts.entry(key.to_owned()).or_default() += 1;
+            controls.gates.get(key).cloned()
+        };
+        if let Some(gate) = gate {
+            let mut state = gate.state.lock().unwrap();
+            state.1 += 1;
+            gate.changed.notify_all();
+            while !state.0 {
+                state = gate.changed.wait(state).unwrap();
+            }
+        }
+    }
 
     type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
@@ -444,6 +554,7 @@ pub mod mock_keychain {
             Ok(())
         }
         fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            before_read(&self.key);
             self.store
                 .lock()
                 .unwrap()
@@ -509,22 +620,63 @@ mod tests {
         use_mock_keychain();
         let (server, var) = ("roundtrip-server", "TOKEN");
 
-        assert_eq!(get_secret(server, var), None);
-        assert!(!has_secret(server, var));
+        assert_eq!(get_secret(server, var).unwrap(), None);
+        assert!(!has_secret(server, var).unwrap());
 
         set_secret(server, var, "s3cr3t").unwrap();
-        assert_eq!(get_secret(server, var).as_deref(), Some("s3cr3t"));
-        assert!(has_secret(server, var));
+        assert_eq!(get_secret(server, var).unwrap().as_deref(), Some("s3cr3t"));
+        assert!(has_secret(server, var).unwrap());
 
         // Replace in place.
         set_secret(server, var, "rotated").unwrap();
-        assert_eq!(get_secret(server, var).as_deref(), Some("rotated"));
+        assert_eq!(get_secret(server, var).unwrap().as_deref(), Some("rotated"));
 
         delete_secret(server, var).unwrap();
-        assert_eq!(get_secret(server, var), None);
-        assert!(!has_secret(server, var));
+        assert_eq!(get_secret(server, var).unwrap(), None);
+        assert!(!has_secret(server, var).unwrap());
         // Deleting an absent secret is a no-op success.
         delete_secret(server, var).unwrap();
+    }
+
+    #[test]
+    fn secret_config_and_witness_reads_share_the_bound_and_recover() {
+        use_mock_keychain();
+        let (server, var) = ("bounded-static-stores", "TOKEN");
+        set_secret(server, var, "stored-token").unwrap();
+        let secret_gate = mock_keychain::block_reads(&service(), &account(server, var));
+        let config_gate = mock_keychain::block_reads(&service(), &config_account(server, var));
+        let witness_gate = mock_keychain::block_reads(&witness_service(), server);
+        let started = std::time::Instant::now();
+        let secret = std::thread::spawn(move || get_secret(server, var));
+        let config = std::thread::spawn(move || get_config_value(server, var));
+        let witness = std::thread::spawn(move || static_witness(server));
+        for gate in [&secret_gate, &config_gate, &witness_gate] {
+            assert!(gate.wait_for_reads(1, std::time::Duration::from_secs(5)));
+        }
+        assert!(secret
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("Keychain unavailable"));
+        assert!(config
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("Keychain unavailable"));
+        assert!(matches!(
+            witness.join().unwrap(),
+            StaticWitness::Unavailable(_)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(6));
+        secret_gate.release();
+        config_gate.release();
+        witness_gate.release();
+        assert_eq!(
+            get_secret(server, var).unwrap().as_deref(),
+            Some("stored-token")
+        );
+        assert_eq!(get_config_value(server, var).unwrap(), None);
+        assert!(matches!(static_witness(server), StaticWitness::Stable(_)));
     }
 
     #[test]
@@ -532,8 +684,14 @@ mod tests {
         use_mock_keychain();
         set_secret("server-a", "KEY", "a-value").unwrap();
         set_secret("server-b", "KEY", "b-value").unwrap();
-        assert_eq!(get_secret("server-a", "KEY").as_deref(), Some("a-value"));
-        assert_eq!(get_secret("server-b", "KEY").as_deref(), Some("b-value"));
+        assert_eq!(
+            get_secret("server-a", "KEY").unwrap().as_deref(),
+            Some("a-value")
+        );
+        assert_eq!(
+            get_secret("server-b", "KEY").unwrap().as_deref(),
+            Some("b-value")
+        );
     }
 
     fn stable(server: &str) -> CredentialGeneration {
@@ -638,13 +796,10 @@ mod tests {
             .unwrap()
             .set_password("{not json")
             .unwrap();
-        assert!(matches!(
-            static_witness(server),
-            StaticWitness::Unavailable(_)
-        ));
+        assert!(matches!(static_witness(server), StaticWitness::Corrupt(_)));
         assert!(matches!(
             establish_static_witness(server),
-            StaticWitness::Unavailable(_)
+            StaticWitness::Corrupt(_)
         ));
         assert!(set_secret(server, "TOKEN", "value").is_err());
         let reconciled = reconcile_static_witness(server).unwrap();
@@ -671,7 +826,7 @@ mod tests {
         assert!(set_secret(server, "TOKEN", "value").is_err());
         // Refused before anything was written: still stable, value untouched.
         assert_eq!(stable(server).counter, u64::MAX - 1);
-        assert_eq!(get_secret(server, "TOKEN"), None);
+        assert_eq!(get_secret(server, "TOKEN").unwrap(), None);
     }
 
     #[test]

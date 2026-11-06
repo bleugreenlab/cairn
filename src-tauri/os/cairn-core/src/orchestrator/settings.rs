@@ -10,12 +10,12 @@ use super::Orchestrator;
 // token can open a keychain authorization dialog and block headless runners.
 fn validate_telegram_channel_update(
     channels: Option<&ChannelsConfig>,
-    token: impl FnOnce() -> Option<crate::security::broker::BrokeredSecret>,
+    token: impl FnOnce() -> Result<Option<crate::security::broker::BrokeredSecret>, String>,
 ) -> Result<(), String> {
     let Some(channels) = channels else {
         return Ok(());
     };
-    let Some(token) = token() else {
+    let Some(token) = token()? else {
         return Ok(());
     };
 
@@ -335,12 +335,21 @@ mod tests {
     }
 
     #[test]
+    fn settings_update_with_channels_preserves_token_lookup_failure() {
+        let error = "Keychain unavailable: unlock the login keychain".to_string();
+        let result = validate_telegram_channel_update(Some(&ChannelsConfig::default()), || {
+            Err(error.clone())
+        });
+        assert_eq!(result, Err(error));
+    }
+
+    #[test]
     fn settings_update_with_channels_requests_telegram_token() {
         let mut requested = false;
 
         validate_telegram_channel_update(Some(&ChannelsConfig::default()), || {
             requested = true;
-            None
+            Ok(None)
         })
         .unwrap();
 

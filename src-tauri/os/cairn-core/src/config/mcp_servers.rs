@@ -14,9 +14,10 @@
 //! Expansion goes through the credential broker
 //! ([`crate::security::broker`]), which is the only thing in the system that
 //! turns one of these references into plaintext: it resolves from the OS
-//! keychain first (see [`super::secrets`]) and then from the app process
-//! environment, and registers whatever it resolved for scrubbing before the
-//! value can be injected anywhere. The keychain path is what lets a
+//! secret namespace first, then stored configuration values (see
+//! [`super::secrets`]), and then the app process environment. An unavailable
+//! store refuses expansion rather than falling through. The broker registers
+//! resolved credentials for scrubbing before they can be injected anywhere. The keychain path is what lets a
 //! Finder/Dock-launched app — which inherits a minimal environment — reach
 //! token-bearing servers: the user enters the secret in the settings UI, it is
 //! stored in the keychain, and `settings.yaml` keeps only the `${VAR}`
@@ -30,7 +31,11 @@ use std::path::Path;
 use super::machine_services::MachineServiceSnapshot;
 
 pub(crate) trait McpServerConfigExt {
-    fn brokered(&self, credential_key: &str, purpose: &str) -> crate::security::BrokeredMcpConfig;
+    fn brokered(
+        &self,
+        credential_key: &str,
+        purpose: &str,
+    ) -> Result<crate::security::BrokeredMcpConfig, String>;
     fn readiness(&self, credential_key: &str) -> Option<NotReady>;
 }
 impl McpServerConfigExt for McpServerConfig {
@@ -39,13 +44,18 @@ impl McpServerConfigExt for McpServerConfig {
     /// Every `${VAR}` resolves through the credential broker, which is what
     /// makes a resolved credential a scrub target before it can be injected
     /// anywhere. A missing secret expands to an empty string and surfaces as a
-    /// connect/auth failure from the server, not a panic here.
+    /// connect/auth failure from the server, not a panic here. An unavailable
+    /// credential store instead refuses expansion; it must not be treated as absent.
     ///
     /// The result deliberately is not an `McpServerConfig`: an expanded config
     /// carries credentials, and `McpServerConfig` is `Serialize` because the
     /// *authored* form lives in `settings.yaml`. See
     /// [`crate::security::BrokeredMcpConfig`].
-    fn brokered(&self, credential_key: &str, purpose: &str) -> crate::security::BrokeredMcpConfig {
+    fn brokered(
+        &self,
+        credential_key: &str,
+        purpose: &str,
+    ) -> Result<crate::security::BrokeredMcpConfig, String> {
         crate::security::broker::mcp_server(credential_key, self, &HashMap::new(), purpose)
     }
     /// Why this server cannot connect yet, or `None` when it can.
@@ -60,19 +70,31 @@ impl McpServerConfigExt for McpServerConfig {
     /// Content the user did not author must be inert until it can actually
     /// work; configuration the user DID author still fails loudly.
     fn readiness(&self, credential_key: &str) -> Option<NotReady> {
-        let missing: Vec<String> = self
-            .referenced_vars()
-            .into_iter()
-            .filter(|var| !crate::security::broker::mcp_var_is_set(credential_key, self, var))
-            .collect();
+        let mut missing = Vec::new();
+        for var in self.referenced_vars() {
+            match crate::security::broker::mcp_var_is_set(credential_key, self, &var) {
+                Ok(true) => {}
+                Ok(false) => missing.push(var),
+                Err(error) => return Some(NotReady::CredentialUnavailable { error }),
+            }
+        }
         if !missing.is_empty() {
             return Some(NotReady::MissingVars { vars: missing });
         }
 
-        if self.oauth.is_some()
-            && crate::mcp::oauth::store::status(credential_key).state == "needs_auth"
-        {
-            return Some(NotReady::NeedsAuth);
+        if self.oauth.is_some() {
+            let status = crate::mcp::oauth::store::status(credential_key);
+            match status.state.as_str() {
+                "needs_auth" => return Some(NotReady::NeedsAuth),
+                "error" => {
+                    return Some(NotReady::CredentialUnavailable {
+                        error: status
+                            .detail
+                            .unwrap_or_else(|| "OAuth credential store unavailable".to_string()),
+                    })
+                }
+                _ => {}
+            }
         }
 
         None
@@ -1097,6 +1119,32 @@ mod tests {
             &crate::config::machine_services::MachineServiceSnapshot::empty()
         )
         .contains_key("demo"));
+    }
+
+    #[test]
+    fn unavailable_credentials_are_not_reported_as_missing_setup() {
+        mock_keychain::install();
+        let server = "readiness-unavailable";
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "tool",
+            "env": {"TOKEN": "${READINESS_UNAVAILABLE_TOKEN}"}
+        }))
+        .unwrap();
+        let service = format!("computer.cairn.mcp.{}", cairn_common::paths::env_str());
+        let _gate =
+            mock_keychain::block_reads(&service, &format!("{server}/READINESS_UNAVAILABLE_TOKEN"));
+
+        let Some(NotReady::CredentialUnavailable { error }) = config.readiness(server) else {
+            panic!("an unreadable store must not look absent or ready");
+        };
+        assert!(error.contains("READINESS_UNAVAILABLE_TOKEN"), "{error}");
+        assert!(
+            error.contains("unavailable") || error.contains("timed out"),
+            "{error}"
+        );
+        assert!(NotReady::CredentialUnavailable { error }
+            .summary()
+            .starts_with("credential_unavailable("));
     }
 
     #[test]

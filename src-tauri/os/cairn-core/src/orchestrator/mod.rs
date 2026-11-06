@@ -4049,6 +4049,9 @@ impl Orchestrator {
             self.credential_store.clone(),
         ));
         self.register_hold_source(sign_in_notices.clone());
+        self.register_hold_source(crate::config::keychain_read::health_source(
+            self.services.emitter.clone(),
+        ));
         tokio::spawn(async move {
             {
                 let orch = orch.clone();

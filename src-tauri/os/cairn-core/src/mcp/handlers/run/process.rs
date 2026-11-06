@@ -765,7 +765,10 @@ async fn run_mcp_call(
     // the one that fires.
     let bound = super::mcp_item_bound(timeout);
     let limit_ms = u32::try_from(bound.limit.as_millis()).unwrap_or(u32::MAX);
-    let brokered = config.brokered(&credential_key, "mcp tool call");
+    let brokered = match config.brokered(&credential_key, "mcp tool call") {
+        Ok(config) => config,
+        Err(error) => return ItemOutcome::failed(header, error),
+    };
     let call = gateway.call_tool_once(
         &session_key,
         &credential_key,

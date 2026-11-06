@@ -378,8 +378,8 @@ async fn a_resolution_inserts_one_event_per_resolution_generation() {
         "a reopened and re-closed issue is a new conclusion"
     );
 
-    // `complete` never reaches `resolve_terminal`, and still snapshots.
-    crud::complete(&db, &FixedClock(540), "i2", B)
+    // Merging snapshots the same evidence with the resolving device as owner.
+    crud::resolve(&db, &FixedClock(540), "i2", Resolution::Merged, B)
         .await
         .unwrap();
     let owner = db

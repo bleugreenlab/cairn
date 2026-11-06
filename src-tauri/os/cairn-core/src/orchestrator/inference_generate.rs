@@ -1422,31 +1422,18 @@ pub(crate) fn close_anchor_when_done(orch: &Orchestrator, generation: &Generatio
             }
             tokio::time::sleep(POLL).await;
         }
-        let db = match crate::issues::crud::owning_db_for_issue(&orch.db, &issue_id).await {
-            Ok(db) => db,
-            Err(error) => {
-                log::warn!("inference: a generation's anchor issue could not be found: {error}");
-                return;
-            }
-        };
-        match crate::issues::crud::resolve(
-            &db,
-            &*orch.services.clock,
+        // This automatic cleanup deliberately stops any work left on the anchor.
+        // Use the same gate and lifecycle cascade as an explicit status update.
+        if let Err(error) = crate::issues::status::update_status(
+            &orch,
             &issue_id,
-            crate::transitions::Resolution::Closed,
-            &orch.anon_device_manager.device_id(),
+            "closed",
+            crate::issues::status::ResolutionActor::Agent,
+            crate::issues::status::Confirmation::Given,
         )
         .await
         {
-            Ok(_) => {
-                if let Ok(Some(issue)) = crate::issues::crud::get(&db, &issue_id).await {
-                    let _ = orch.services.emitter.emit(
-                        "db-change",
-                        crate::notify::issue_db_change(&issue, "update"),
-                    );
-                }
-            }
-            Err(error) => log::warn!("inference: closing a generation's anchor failed: {error}"),
+            log::warn!("inference: closing a generation's anchor failed: {error}");
         }
     });
 }

@@ -43,7 +43,7 @@
 //! again and a fresh record replaces it.
 
 use cairn_packs::server_config::{CatalogOAuthContext, CredentialGeneration};
-use keyring::{Entry, Error};
+use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
 use super::{refresh_access_token, TokenRequestError, TokenSet, EXPIRY_SKEW_SECS};
@@ -61,19 +61,19 @@ pub struct PendingAuthorization {
 pub fn save_pending(key: &str, pending: &PendingAuthorization) -> Result<(), String> {
     let blob = serde_json::to_string(pending)
         .map_err(|e| format!("Failed to serialize pending OAuth authorization: {e}"))?;
+    let _mutation = KeychainMutation::new(key);
     entry(key)?
         .set_password(&blob)
         .map_err(|e| format!("Failed to store pending OAuth authorization: {e}"))
 }
 
 pub fn take_pending(key: &str) -> Result<Option<PendingAuthorization>, String> {
-    let Some(raw) = (match entry(key)?.get_password() {
-        Ok(value) => Some(value),
-        Err(Error::NoEntry) => None,
-        Err(e) => return Err(format!("Failed to read pending OAuth authorization: {e}")),
-    }) else {
+    let Some(raw) = crate::config::keychain_read::read(&service(), key)
+        .map_err(|e| format!("Failed to read pending OAuth authorization: {e}"))?
+    else {
         return Ok(None);
     };
+    let _mutation = KeychainMutation::new(key);
     entry(key)?
         .delete_credential()
         .map_err(|e| format!("Failed to clear pending OAuth authorization: {e}"))?;
@@ -156,7 +156,7 @@ pub struct OAuthStatus {
     /// `authorized`, `needs_auth`, or `error`.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scopes: Vec<String>,
     /// Scopes a step-up (`403 insufficient_scope`) is waiting on, if any.
@@ -200,6 +200,16 @@ impl OAuthStatus {
         }
     }
 
+    /// The stored authorization could not be read or used.
+    pub fn error(detail: String) -> Self {
+        Self {
+            state: "error".to_string(),
+            detail: Some(detail),
+            scopes: Vec::new(),
+            needs_scopes: Vec::new(),
+        }
+    }
+
     /// The server does not require OAuth (no authorization affordance shown).
     pub fn none() -> Self {
         Self {
@@ -221,6 +231,23 @@ fn service() -> String {
 
 fn entry(server: &str) -> Result<Entry, String> {
     Entry::new(&service(), server).map_err(|e| format!("Failed to open keychain entry: {e}"))
+}
+
+// A reader already in flight may hold the pre-mutation value. Refuse that
+// flight both before and after writes, including unwinding and failed writes.
+struct KeychainMutation<'a>(&'a str);
+
+impl<'a> KeychainMutation<'a> {
+    fn new(account: &'a str) -> Self {
+        crate::config::keychain_read::invalidate(&service(), account);
+        Self(account)
+    }
+}
+
+impl Drop for KeychainMutation<'_> {
+    fn drop(&mut self) {
+        crate::config::keychain_read::invalidate(&service(), self.0);
+    }
 }
 
 /// The keychain value. Untagged so records written before witnesses existed
@@ -259,14 +286,9 @@ enum Current {
 }
 
 fn read_current(server: &str) -> (Current, Option<String>) {
-    let raw = match entry(server).and_then(|entry| {
-        entry.get_password().map(Some).or_else(|e| match e {
-            Error::NoEntry => Ok(None),
-            e => Err(format!(
-                "Failed to read OAuth tokens for {server} from keychain: {e}"
-            )),
-        })
-    }) {
+    let raw = match crate::config::keychain_read::read(&service(), server)
+        .map_err(|e| format!("Failed to read OAuth tokens for {server} from keychain: {e}"))
+    {
         Ok(Some(raw)) => raw,
         Ok(None) => return (Current::Absent, None),
         Err(e) => return (Current::Unavailable(e), None),
@@ -309,6 +331,7 @@ fn write_entry(
 ) -> Result<(), String> {
     let blob = serde_json::to_string(value)
         .map_err(|e| format!("Failed to serialize OAuth record: {e}"))?;
+    let _mutation = KeychainMutation::new(server);
     entry(server)?
         .set_password(&blob)
         .map_err(|e| format!("Failed to store OAuth tokens in keychain: {e}"))
@@ -332,18 +355,12 @@ fn write_auth(
 }
 
 /// Load the stored OAuth record for `server`, if one exists.
-pub fn load(server: &str) -> Option<StoredAuth> {
+pub fn load(server: &str) -> Result<Option<StoredAuth>, String> {
     match read_current(server).0 {
-        Current::Witnessed(auth, _) | Current::Legacy(auth) => Some(auth),
-        Current::Absent | Current::Tombstone(_) => None,
-        Current::Corrupt => {
-            log::warn!("Stored OAuth record for {server} is corrupt");
-            None
-        }
-        Current::Unavailable(e) => {
-            log::warn!("{e}");
-            None
-        }
+        Current::Witnessed(auth, _) | Current::Legacy(auth) => Ok(Some(auth)),
+        Current::Absent | Current::Tombstone(_) => Ok(None),
+        Current::Corrupt => Err(format!("Stored OAuth record for {server} is corrupt")),
+        Current::Unavailable(e) => Err(e),
     }
 }
 
@@ -399,6 +416,9 @@ fn commit_unless_superseded(
 ) -> Result<bool, String> {
     let guard = credential_witness::acquire()?;
     let (current, raw) = read_current(server);
+    if let Current::Unavailable(error) = &current {
+        return Err(error.clone());
+    }
     if raw.as_deref() != Some(started_from) {
         return Ok(false);
     }
@@ -452,12 +472,13 @@ pub fn witness(server: &str) -> OAuthWitness {
 /// connection failed. Surfaces any pending step-up scopes.
 pub fn status(server: &str) -> OAuthStatus {
     match load(server) {
-        Some(auth) if auth.rejected_at.is_some() => OAuthStatus::rejected(),
-        Some(auth) if auth.is_expired() && auth.refresh_token.is_none() => {
+        Ok(Some(auth)) if auth.rejected_at.is_some() => OAuthStatus::rejected(),
+        Ok(Some(auth)) if auth.is_expired() && auth.refresh_token.is_none() => {
             OAuthStatus::needs_auth()
         }
-        Some(auth) => OAuthStatus::authorized(auth.scopes, auth.needs_scopes),
-        None => OAuthStatus::needs_auth(),
+        Ok(Some(auth)) => OAuthStatus::authorized(auth.scopes, auth.needs_scopes),
+        Ok(None) => OAuthStatus::needs_auth(),
+        Err(error) => OAuthStatus::error(error),
     }
 }
 
@@ -485,7 +506,7 @@ pub fn record_scope_step_up(server: &str, required: &[String]) {
 }
 
 /// What became of a stored credential that a protected resource refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejection {
     /// A different access token is stored now: renewed here by the refresh
     /// grant, or replaced by a sign-in while the request was in flight. Worth
@@ -500,6 +521,8 @@ pub enum Rejection {
     /// unreadable keychain, no live credential to reject), so the record is
     /// untouched.
     Unchanged,
+    /// The credential could not be read or updated. The caller must retain the cause.
+    Unavailable(String),
 }
 
 /// The protected resource answered `401` to a request authenticated as
@@ -522,6 +545,10 @@ pub enum Rejection {
 pub async fn reject(server: &str, presented: Option<&str>, may_refresh: bool) -> Rejection {
     let (mut auth, started_from) = match read_current(server) {
         (Current::Witnessed(auth, _) | Current::Legacy(auth), Some(raw)) => (auth, raw),
+        (Current::Unavailable(error), _) => return Rejection::Unavailable(error),
+        (Current::Corrupt, _) => {
+            return Rejection::Unavailable(format!("Stored OAuth record for {server} is corrupt"))
+        }
         _ => return Rejection::Unchanged,
     };
     if auth.rejected_at.is_some() {
@@ -559,7 +586,7 @@ pub async fn reject(server: &str, presented: Option<&str>, may_refresh: bool) ->
                     Ok(_) => Rejection::Retry,
                     Err(e) => {
                         log::warn!("Failed to persist refreshed OAuth tokens for {server}: {e}");
-                        Rejection::Unchanged
+                        Rejection::Unavailable(e)
                     }
                 };
             }
@@ -584,7 +611,7 @@ pub async fn reject(server: &str, presented: Option<&str>, may_refresh: bool) ->
         Ok(false) => Rejection::Retry,
         Err(e) => {
             log::warn!("Failed to record the OAuth rejection for {server}: {e}");
-            Rejection::Unchanged
+            Rejection::Unavailable(e)
         }
     }
 }
@@ -592,19 +619,23 @@ pub async fn reject(server: &str, presented: Option<&str>, may_refresh: bool) ->
 /// Resolve a currently-valid access token for `server`, refreshing via the
 /// refresh-token grant when the stored token is expired (or within the skew
 /// window). Returns `None` when the server has no stored authorization, the
-/// server has [rejected](reject) it, or a refresh is impossible/failed — the
-/// gateway then surfaces "authorization required".
-pub async fn get_valid_access_token(server: &str) -> Option<String> {
+/// server has [rejected](reject) it, or a refresh is impossible/refused.
+/// Unreadable credentials and transient refresh failures preserve their cause
+/// as errors, rather than sending an unauthenticated request.
+pub async fn get_valid_access_token(server: &str) -> Result<Option<String>, String> {
     let (current, raw) = read_current(server);
     let mut auth = match current {
         Current::Witnessed(auth, _) | Current::Legacy(auth) if auth.rejected_at.is_none() => auth,
-        _ => return None,
+        Current::Unavailable(error) => return Err(error),
+        Current::Corrupt => return Err(format!("Stored OAuth record for {server} is corrupt")),
+        _ => return Ok(None),
     };
     if !auth.is_expired() {
-        return Some(auth.access_token);
+        return Ok(Some(auth.access_token));
     }
-    let started_from = raw?;
-    let refresh_token = auth.refresh_token.clone()?;
+    let (Some(started_from), Some(refresh_token)) = (raw, auth.refresh_token.clone()) else {
+        return Ok(None);
+    };
     match refresh_access_token(
         &auth.token_endpoint,
         &auth.client_id,
@@ -617,28 +648,21 @@ pub async fn get_valid_access_token(server: &str) -> Option<String> {
     {
         Ok(tokens) => {
             auth.apply_tokens(tokens);
-            match commit_unless_superseded(server, &started_from, &auth) {
-                Ok(true) => Some(auth.access_token),
-                // Signed out or replaced while the refresh was in flight. The
-                // refreshed tokens belong to the old credential and are dropped;
-                // whatever is stored now is what the user chose.
-                Ok(false) => {
-                    log::info!("Discarded a superseded OAuth refresh for {server}");
-                    load(server)
-                        .filter(|current| !current.is_expired())
-                        .map(|current| current.access_token)
-                }
-                // An unpersisted token would authenticate a connection under a
-                // generation that never advanced, so it is not used either.
-                Err(e) => {
-                    log::warn!("Failed to persist refreshed OAuth tokens for {server}: {e}");
-                    None
-                }
+            match commit_unless_superseded(server, &started_from, &auth)? {
+                true => Ok(Some(auth.access_token)),
+                // A sign-out or sign-in superseded the refresh. Never resurrect
+                // the old credential or return a newer rejected credential.
+                false => Ok(load(server)?
+                    .filter(|current| !current.is_expired() && current.rejected_at.is_none())
+                    .map(|current| current.access_token)),
             }
         }
-        Err(e) => {
-            log::warn!("OAuth token refresh for {server} failed: {e}");
-            None
+        Err(TokenRequestError::Refused(error)) => {
+            log::warn!("OAuth token refresh for {server} was refused: {error}");
+            Ok(None)
+        }
+        Err(TokenRequestError::Failed(error)) => {
+            Err(format!("OAuth token refresh for {server} failed: {error}"))
         }
     }
 }
@@ -655,6 +679,99 @@ fn scope_param(scopes: &[String]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::secrets::mock_keychain;
+
+    #[tokio::test]
+    async fn unavailable_reads_are_not_missing_authorization() {
+        mock_keychain::install();
+        let server = "oauth-unavailable-read";
+        entry(server).unwrap().set_secret(&[255]).unwrap();
+        assert!(load(server).unwrap_err().contains("Keychain unavailable"));
+        let status = status(server);
+        assert_eq!(status.state, "error");
+        assert!(status.detail.unwrap().contains("Keychain unavailable"));
+        assert!(get_valid_access_token(server)
+            .await
+            .unwrap_err()
+            .contains("Keychain unavailable"));
+        assert!(matches!(
+            reject(server, Some("token"), false).await,
+            Rejection::Unavailable(_)
+        ));
+        assert!(commit_unless_superseded(server, "old", &sample("new")).is_err());
+        assert!(save(server, &sample("new")).is_err());
+        assert!(delete(server).is_err());
+    }
+
+    #[test]
+    fn blocked_current_and_pending_reads_are_bounded_and_single_flight() {
+        use std::time::{Duration, Instant};
+        mock_keychain::install();
+        let server = "oauth-blocked-current";
+        let pending = "oauth-blocked-pending";
+        let state = PendingAuthorization {
+            state: "state".into(),
+            code_verifier: "verifier".into(),
+            created_at: 123,
+        };
+        save_pending(pending, &state).unwrap();
+        save(server, &sample("token")).unwrap();
+        let svc = service();
+        let current_before = mock_keychain::read_count(&svc, server);
+        let pending_before = mock_keychain::read_count(&svc, pending);
+        let current_gate = mock_keychain::block_reads(&svc, server);
+        let pending_gate = mock_keychain::block_reads(&svc, pending);
+        let started = Instant::now();
+        let current = std::thread::spawn(move || load(server));
+        let pending_read = std::thread::spawn(move || take_pending(pending));
+        assert!(current_gate.wait_for_reads(1, Duration::from_secs(2)));
+        assert!(pending_gate.wait_for_reads(1, Duration::from_secs(2)));
+        let status_read = std::thread::spawn(move || status(server));
+        assert!(current
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("Keychain unavailable"));
+        assert!(pending_read
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("Keychain unavailable"));
+        assert_eq!(status_read.join().unwrap().state, "error");
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(mock_keychain::read_count(&svc, server), current_before + 1);
+        assert_eq!(mock_keychain::read_count(&svc, pending), pending_before + 1);
+        current_gate.release();
+        pending_gate.release();
+        // Pending read failure must not consume the authorization.
+        assert_eq!(take_pending(pending).unwrap(), Some(state));
+        assert_eq!(load(server).unwrap().unwrap().access_token, "token");
+    }
+
+    #[test]
+    fn sign_out_invalidates_a_read_that_started_after_its_comparison() {
+        use std::time::Duration;
+        mock_keychain::install();
+        let server = "oauth-signout-inflight-read";
+        save(server, &sample("old-token")).unwrap();
+        // The sign-out's read completed before a competing reader started.
+        let guard = credential_witness::acquire().unwrap();
+        let (current, _) = read_current(server);
+        let tombstone = next_generation(server, &current).unwrap();
+        let svc = service();
+        let gate = mock_keychain::block_reads(&svc, server);
+        let reader = std::thread::spawn(move || load(server));
+        assert!(gate.wait_for_reads(1, Duration::from_secs(2)));
+        write_entry(
+            &guard,
+            server,
+            &StoredEntry::Tombstone(Tombstone { tombstone }),
+        )
+        .unwrap();
+        // Neither the original reader nor a post-signout caller can use that flight.
+        assert!(load(server).unwrap_err().contains("changed"));
+        assert!(reader.join().unwrap().unwrap_err().contains("changed"));
+        gate.release();
+    }
 
     fn sample(server_token: &str) -> StoredAuth {
         StoredAuth {
@@ -693,18 +810,18 @@ mod tests {
     fn save_load_delete_roundtrip() {
         mock_keychain::install();
         let server = "store-roundtrip";
-        assert!(load(server).is_none());
+        assert!(load(server).unwrap().is_none());
         assert_eq!(status(server).state, "needs_auth");
 
         let auth = sample("access-1");
         save(server, &auth).unwrap();
-        assert_eq!(load(server), Some(auth.clone()));
+        assert_eq!(load(server).unwrap(), Some(auth.clone()));
         let st = status(server);
         assert_eq!(st.state, "authorized");
         assert_eq!(st.scopes, vec!["read".to_string()]);
 
         delete(server).unwrap();
-        assert!(load(server).is_none());
+        assert!(load(server).unwrap().is_none());
         // Deleting an absent record is a no-op success.
         delete(server).unwrap();
     }
@@ -746,8 +863,8 @@ mod tests {
         second.issuer = Some("https://issuer-b.example.com".to_string());
         save("store-a", &first).unwrap();
         save("store-b", &second).unwrap();
-        let loaded_first = load("store-a").unwrap();
-        let loaded_second = load("store-b").unwrap();
+        let loaded_first = load("store-a").unwrap().unwrap();
+        let loaded_second = load("store-b").unwrap().unwrap();
         assert_eq!(loaded_first.access_token, "a-token");
         assert_eq!(
             loaded_first.issuer.as_deref(),
@@ -803,7 +920,7 @@ mod tests {
         let server = "store-stepup";
         save(server, &sample("t")).unwrap();
         record_scope_step_up(server, &["read".to_string(), "admin".to_string()]);
-        let auth = load(server).unwrap();
+        let auth = load(server).unwrap().unwrap();
         // `read` already granted; only `admin` is pending.
         assert_eq!(auth.needs_scopes, vec!["admin".to_string()]);
         assert_eq!(status(server).needs_scopes, vec!["admin".to_string()]);
@@ -815,7 +932,7 @@ mod tests {
         let server = "store-valid";
         save(server, &sample("still-good")).unwrap();
         assert_eq!(
-            get_valid_access_token(server).await.as_deref(),
+            get_valid_access_token(server).await.unwrap().as_deref(),
             Some("still-good")
         );
     }
@@ -823,7 +940,10 @@ mod tests {
     #[tokio::test]
     async fn missing_server_yields_none() {
         mock_keychain::install();
-        assert!(get_valid_access_token("store-absent").await.is_none());
+        assert!(get_valid_access_token("store-absent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     fn signed_in(server: &str) -> CatalogOAuthContext {
@@ -882,7 +1002,7 @@ mod tests {
             panic!("sign-out must keep its generation in the witness");
         };
         assert!(tombstone.counter > a.generation.counter);
-        assert!(load(server).is_none());
+        assert!(load(server).unwrap().is_none());
         assert_eq!(status(server).state, "needs_auth");
         // Signing out twice changes nothing; a step-up cannot resurrect a
         // signed-out record.
@@ -934,7 +1054,7 @@ mod tests {
         let mut refreshed = sample("account-a");
         refreshed.access_token = "account-a-refreshed".into();
         assert!(!commit_unless_superseded(server, &started_from, &refreshed).unwrap());
-        assert_eq!(load(server).unwrap().access_token, "account-b");
+        assert_eq!(load(server).unwrap().unwrap().access_token, "account-b");
         assert_eq!(signed_in(server), b);
         // Likewise after a sign-out: the refresh must not sign A back in.
         let (_, started_from) = read_current(server);
@@ -956,7 +1076,10 @@ mod tests {
             &sample("token-refreshed")
         )
         .unwrap());
-        assert_eq!(load(server).unwrap().access_token, "token-refreshed");
+        assert_eq!(
+            load(server).unwrap().unwrap().access_token,
+            "token-refreshed"
+        );
         assert_eq!(
             signed_in(server).generation.counter,
             before.generation.counter + 1
@@ -972,7 +1095,7 @@ mod tests {
             .unwrap()
             .set_password(&serde_json::to_string(&legacy).unwrap())
             .unwrap();
-        assert_eq!(load(server), Some(legacy.clone()));
+        assert_eq!(load(server).unwrap(), Some(legacy.clone()));
         assert_eq!(witness(server), OAuthWitness::Unwitnessed);
         save(server, &legacy).unwrap();
         assert!(matches!(witness(server), OAuthWitness::SignedIn(_)));
@@ -986,7 +1109,8 @@ mod tests {
         let original = signed_in(server);
         entry(server).unwrap().set_password("{corrupt").unwrap();
         assert!(matches!(witness(server), OAuthWitness::Unavailable(_)));
-        assert!(load(server).is_none());
+        assert!(load(server).is_err());
+        assert_eq!(status(server).state, "error");
         delete(server).unwrap();
         save(server, &sample("token")).unwrap();
         assert_ne!(
@@ -1052,10 +1176,10 @@ mod tests {
         assert_eq!(st.state, "needs_auth");
         assert!(st.detail.is_some(), "the UI should say why: {st:?}");
         // Never presented again, and the generation moved so caches notice.
-        assert!(get_valid_access_token(server).await.is_none());
+        assert!(get_valid_access_token(server).await.unwrap().is_none());
         assert!(signed_in(server).generation.counter > before.counter);
         // Kept, not signed out: a re-authorize may reuse its client identity.
-        assert_eq!(load(server).unwrap().client_id, "client-123");
+        assert_eq!(load(server).unwrap().unwrap().client_id, "client-123");
         // Recorded once, so a caller announces the transition once.
         assert_eq!(
             reject(server, Some("revoked"), true).await,
@@ -1067,7 +1191,7 @@ mod tests {
         save(server, &sample("fresh")).unwrap();
         assert_eq!(status(server).state, "authorized");
         assert_eq!(
-            get_valid_access_token(server).await.as_deref(),
+            get_valid_access_token(server).await.unwrap().as_deref(),
             Some("fresh")
         );
     }
@@ -1118,7 +1242,7 @@ mod tests {
             Rejection::Retry
         );
         assert_eq!(hits(&requests), 1);
-        assert_eq!(load(server).unwrap().access_token, "renewed");
+        assert_eq!(load(server).unwrap().unwrap().access_token, "renewed");
         assert_eq!(status(server).state, "authorized");
 
         // The renewed token is refused too: that is definitive, and a second

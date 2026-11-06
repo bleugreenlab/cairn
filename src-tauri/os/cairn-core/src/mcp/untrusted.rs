@@ -475,7 +475,7 @@ mod tests {
 
     fn config() -> BrokeredMcpConfig {
         let authored: McpServerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        crate::security::broker::mcp_server("test", &authored, &HashMap::new(), "test")
+        crate::security::broker::mcp_server("test", &authored, &HashMap::new(), "test").unwrap()
     }
 
     /// A server that puts the credential it was given into every field the

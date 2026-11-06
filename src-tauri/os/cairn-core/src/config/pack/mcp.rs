@@ -109,13 +109,12 @@ mod tests {
         )
         .expect("a path is accepted");
         assert_eq!(
-            crate::config::secrets::get_config_value("store-matlab", "STORE_MATLAB_BIN").as_deref(),
+            crate::config::secrets::get_config_value("store-matlab", "STORE_MATLAB_BIN")
+                .unwrap()
+                .as_deref(),
             Some("/opt/mcp/matlab")
         );
-        assert!(!crate::config::secrets::has_secret(
-            "store-matlab",
-            "STORE_MATLAB_BIN"
-        ));
+        assert!(!crate::config::secrets::has_secret("store-matlab", "STORE_MATLAB_BIN").unwrap());
 
         // An undeclared variable defaults to secret, which is the safe way to
         // be wrong: a value treated as a credential that isn't costs a mask.
@@ -126,12 +125,10 @@ mod tests {
             "tok-Zx91Qw82",
         )
         .expect("a secret is accepted");
-        assert!(crate::config::secrets::has_secret(
-            "store-matlab",
-            "STORE_MATLAB_TOKEN"
-        ));
+        assert!(crate::config::secrets::has_secret("store-matlab", "STORE_MATLAB_TOKEN").unwrap());
         assert!(
             crate::config::secrets::get_config_value("store-matlab", "STORE_MATLAB_TOKEN")
+                .unwrap()
                 .is_none()
         );
     }
@@ -161,7 +158,9 @@ mod tests {
         .expect_err("a bare token is not a path");
         assert!(error.contains("full path"), "{error}");
         assert!(
-            crate::config::secrets::get_config_value("store-matlab", "STORE_MATLAB_BIN").is_none()
+            crate::config::secrets::get_config_value("store-matlab", "STORE_MATLAB_BIN")
+                .unwrap()
+                .is_none()
         );
 
         // A path to something not yet installed is accepted: waiting for the
@@ -215,7 +214,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !crate::config::secrets::has_secret("store-matlab", "STORE_MATLAB_BIN"),
+            !crate::config::secrets::has_secret("store-matlab", "STORE_MATLAB_BIN").unwrap(),
             "the stale secret would shadow the value just supplied"
         );
     }

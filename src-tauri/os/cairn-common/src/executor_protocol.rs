@@ -6960,6 +6960,15 @@ pub struct LearnedResourceEstimate {
 /// The shared sampler also reports incomplete RSS as absent live resident bytes,
 /// without invalidating independently measured CPU or storage windows.
 ///
+/// cairn/6138 does not move the number. Build-root ownership is a local
+/// process-lifetime kernel lock acquired before executor storage maintenance.
+/// Tenant commands no longer inherit supervisor-only build-root declarations.
+/// Scratch reconciliation retains unknown replicas, and deletion refuses a live
+/// hold; both use the existing advertisement and DeleteNodeScratch frames.
+/// No frame, field, or acknowledgement changes. An older peer decodes the same
+/// messages, but needs the updated build to enforce these local storage guards.
+/// The existing build-hash update directive delivers that implementation.
+///
 /// cairn/5997 does not move the number. A cell's records no longer make their
 /// authority directory, so a write caught by a build volume leaving fails where it
 /// used to rebuild the build root under the mount point. No frame, variant or

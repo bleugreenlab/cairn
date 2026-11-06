@@ -716,19 +716,6 @@ async fn set_dismissed(
     .map_err(CairnError::from)
 }
 
-/// Mark an issue merged. `device_id` is this machine's stable id, which owns
-/// the tenet evidence event the resolution snapshots.
-pub async fn complete(
-    db: &LocalDb,
-    clock: &dyn Clock,
-    id: &str,
-    device_id: &str,
-) -> Result<(), CairnError> {
-    resolve(db, clock, id, Resolution::Merged, device_id)
-        .await
-        .map(|_| ())
-}
-
 /// What [`resolve`] recorded.
 #[derive(Debug)]
 pub struct ResolveOutcome {
@@ -745,6 +732,7 @@ pub struct ResolveOutcome {
 
 /// Record an issue's terminal resolution, and in the same write snapshot it as
 /// a tenet evidence event owned by `device_id` (this machine's stable id).
+/// Production callers must use `status::resolve_terminal` for the lifecycle cascade.
 pub async fn resolve(
     db: &LocalDb,
     clock: &dyn Clock,
@@ -824,8 +812,7 @@ pub async fn resolve(
                 .await?;
             }
 
-            // Every terminal resolution passes through here, including the
-            // `complete_issue` command that never reaches `resolve_terminal`.
+            // Snapshot evidence atomically with the terminal resolution.
             crate::tenets::evidence::events::insert_issue_event_conn(
                 conn, &id, resolution, &device_id, now,
             )

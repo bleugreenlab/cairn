@@ -52,7 +52,7 @@ async fn dispatch_pending_operation(
                 .call_tool_once(
                     &state.session_key,
                     &state.server,
-                    &state.brokered("mcp continuation round"),
+                    &state.brokered("mcp continuation round")?,
                     &state.tool,
                     state.arguments.clone(),
                     Some(input_responses),
@@ -73,7 +73,7 @@ async fn dispatch_pending_operation(
                 .update_task(
                     &state.session_key,
                     &state.server,
-                    &state.brokered("mcp task input"),
+                    &state.brokered("mcp task input")?,
                     &task_id,
                     input_responses,
                     Some(&operation_id),
@@ -147,7 +147,7 @@ impl McpContinuationState {
     /// `server` is the scoped credential key, which is also what the gateway
     /// receives, so the config is resolved against exactly the credentials the
     /// call will authenticate with.
-    fn brokered(&self, purpose: &str) -> crate::security::BrokeredMcpConfig {
+    fn brokered(&self, purpose: &str) -> Result<crate::security::BrokeredMcpConfig, String> {
         self.config.brokered(&self.server, purpose)
     }
 }
@@ -506,7 +506,7 @@ async fn drive_inner(
         .get_task(
             &state.session_key,
             &state.server,
-            &state.brokered("mcp task poll"),
+            &state.brokered("mcp task poll")?,
             &task.id,
         )
         .await?
@@ -836,7 +836,7 @@ mod tests {
         );
 
         // And the reference still resolves when the call actually happens.
-        let brokered = state.brokered("test");
+        let brokered = state.brokered("test").unwrap();
         assert_eq!(
             brokered
                 .resolved_for_connect()

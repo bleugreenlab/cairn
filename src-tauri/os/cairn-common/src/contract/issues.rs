@@ -122,7 +122,7 @@ pub(crate) const THREAD_DB_CONTRACT: ResourceContract = ResourceContract {
     name: "Thread database",
     description: "This thread's own durable SQL store: a private database that survives compaction, session teardown, and executor placement. SQL is the whole grammar — CREATE TABLE declares the schema. Read it bare for a compact schema overview (tables, columns with types, each table's max rowid as a size that costs a seek rather than a count, index counts), or with ?sql= (SELECT / read-only WITH / EXPLAIN / schema PRAGMA) — from any thread, by canonical URI. There is no per-task database: cairn:~/db from a spawned task resolves to this owning thread's store. Only the owning thread (and tasks it spawned) may write, and the operator, through a page the thread owns or the app's database browser, may write rows. Contents never enter the thread's compaction seed — the seed carries a one-line census instead. Not synced.",
     read_projections: &[
-        ProjectionSpec { key: "sql", values: "read-only SELECT/WITH, EXPLAIN [QUERY PLAN], or schema PRAGMA (verbatim; omit for the schema overview)" },
+        ProjectionSpec { key: "sql", values: "read-only SELECT/WITH, EXPLAIN [QUERY PLAN], or schema PRAGMA (verbatim; omit for the schema overview); cut after 60 s" },
         ProjectionSpec { key: "table", values: "NAME — one table's full column list and every index on it (columns or expressions, unique/partial marks, a partial index's WHERE predicate), no elision (overview only)" },
         ProjectionSpec { key: "offset", values: "N rows (or tables) to skip (default 0)" },
         ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000); N tables in the overview (default 40, max 200)" },
