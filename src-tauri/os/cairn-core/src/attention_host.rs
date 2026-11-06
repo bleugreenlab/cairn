@@ -145,6 +145,15 @@ impl AttentionHost for CoreAttentionHost {
                 )
                 .await
             }
+            ContentRequest::ChildUnowned {
+                recipient,
+                reference,
+            } => {
+                crate::orchestrator::lifecycle::render_unowned_push_body(
+                    &self.0, recipient, reference,
+                )
+                .await
+            }
         }
     }
     /// Record that a terminal child makes a watching thread's turns compactable.

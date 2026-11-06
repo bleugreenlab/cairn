@@ -1529,6 +1529,25 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
         }
     }
 
+    // A `child-unowned:` push says a child is marked running with nothing moving
+    // it and Cairn could not continue it, and why. Re-derived at delivery for the
+    // same reason as `child-unresumed:`.
+    if push
+        .key
+        .starts_with(&format!("{}:", crate::push::CHILD_UNOWNED_PUSH_PREFIX))
+    {
+        if let Some(body) = runtime
+            .host
+            .render_content(ContentRequest::ChildUnowned {
+                recipient: &push.recipient,
+                reference: &push.content_ref,
+            })
+            .await
+        {
+            return format!("{header}\n\n{body}");
+        }
+    }
+
     // A `direct:` push carries frozen message content, not an idempotent
     // resolvable referent. Resolve it from the durable `messages` row rather
     // than from `content_ref` (which is the conversation surface the wake card

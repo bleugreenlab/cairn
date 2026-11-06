@@ -282,6 +282,26 @@ async fn an_open_pr_resolves_when_closed_or_when_its_issue_resolves() {
     assert_resolved(&entries(&db).await, "pr:mr1", 820);
 }
 
+/// A turn the provider failed while its process lived on is still a failure the
+/// operator should see, named as what it was rather than as a crash.
+#[tokio::test]
+async fn a_provider_failed_turn_opens_an_agent_failure_named_for_its_provider() {
+    let db = fixture().await;
+    exec(
+        &db,
+        &format!(
+            "UPDATE turns SET state = 'interrupted', end_reason = 'provider_failure', ended_at = {}
+              WHERE id = 't1'",
+            NOW - AGENT_FAILURE_SETTLE_SECS - 5
+        ),
+    )
+    .await;
+    let listed = entries(&db).await;
+    let failed = find(&listed, "agent_failed:t1");
+    assert!(failed.is_open());
+    assert_eq!(failed.summary, "#7 builder turn failed at its provider");
+}
+
 #[tokio::test]
 async fn a_crashed_agent_opens_and_its_next_turn_resolves_it() {
     let db = fixture().await;

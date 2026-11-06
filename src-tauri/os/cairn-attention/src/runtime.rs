@@ -87,4 +87,8 @@ pub enum ContentRequest<'a> {
         recipient: &'a str,
         reference: &'a str,
     },
+    ChildUnowned {
+        recipient: &'a str,
+        reference: &'a str,
+    },
 }

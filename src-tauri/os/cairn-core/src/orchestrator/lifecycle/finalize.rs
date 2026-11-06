@@ -25,6 +25,52 @@ pub fn warm_provider_held_run(orch: &Orchestrator, run_id: &str) -> bool {
     warmed
 }
 
+/// End a persistent provider session's failed turn without ending its process.
+///
+/// A provider that refuses or errors one turn (Codex's "selected model is at
+/// capacity", a fatal turn error) has lost neither its process nor its native
+/// conversation, so the run stays `Live` and only the turn ends. It ends
+/// interrupted with [`TurnEndReason::ProviderFailure`], never completed, so the
+/// recompute derives no finished work and advances nothing. `Crashed` stays
+/// reserved for evidence that the process itself died.
+///
+/// Returns `false` and touches nothing when this host holds no process for the
+/// run (or cannot tell); the caller then takes the ordinary crash path.
+///
+/// What happens next belongs to the caller: a capacity retry claims its
+/// successor, and any other failure is left to the queued-content flush and to
+/// the unowned-running sweep, which resumes or reports a job nothing owns.
+pub(crate) fn settle_provider_turn_failure(orch: &Orchestrator, run_id: &str) -> bool {
+    if orch.process_state.has_process(run_id) != Some(true) {
+        return false;
+    }
+    let turn_id = orch
+        .process_state
+        .get_current_turn_id(run_id)
+        .or_else(|| current_turn_id_for_run(orch, run_id));
+    if let Some(turn_id) = turn_id.as_deref() {
+        if turn_state(orch, turn_id).as_deref() == Some("running") {
+            if let Err(error) = interrupt_turn(orch, turn_id, Some(TurnEndReason::ProviderFailure))
+            {
+                log::warn!(
+                    "Failed to settle provider-failed turn {turn_id} for run {run_id}: {error}"
+                );
+            }
+        }
+    }
+    orch.process_state.transition_to_warm(run_id);
+    if let Some(job_id) = job_id_for_run(orch, run_id) {
+        if let Err(error) = crate::execution::advancement::recompute_job(orch, &job_id) {
+            log::error!("Failed to recompute job {job_id} after a provider turn failure: {error}");
+        }
+    }
+    log::info!(
+        "Run {} kept live after a provider turn failure (process retained)",
+        &run_id[..run_id.len().min(8)]
+    );
+    true
+}
+
 /// Transition a run to warm state after successful turn completion.
 ///
 /// The Run stays `Live` in the DB — no durable status change.
@@ -684,7 +730,7 @@ fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
 /// `parent_job_id` yet is a terminal top-level run, not a resumable agent job.
 /// Every other top-level agent job stays resumable (the existing
 /// `finalize_run(Crashed)` interruption).
-fn run_fails_terminally(orch: &Orchestrator, run_id: &str) -> bool {
+pub(super) fn run_fails_terminally(orch: &Orchestrator, run_id: &str) -> bool {
     blocking_text_lookup(
         orch,
         run_id,

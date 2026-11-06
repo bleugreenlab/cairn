@@ -37,6 +37,10 @@ pub const FACT_KIND_CHILD_STALLED: &str = "child_stalled";
 /// [`FACT_KIND_CHILD_STALLED`], and independent of it: this one never looks at
 /// sessions.
 pub const FACT_KIND_CHILD_UNRESUMED: &str = "child_unresumed";
+/// A child node is marked running, nothing owns its next transition, and Cairn
+/// could not continue it on its own: its automatic continuations are spent, the
+/// one it dispatched did not start, or its provider's liveness is unknown.
+pub const FACT_KIND_CHILD_UNOWNED: &str = "child_unowned";
 
 /// Whether a job status is one the projection will never move again on its own.
 ///
@@ -62,6 +66,7 @@ pub const DEFAULT_CHILD_FACT_KINDS: &[&str] = &[
     FACT_KIND_MESSAGE,
     FACT_KIND_CHILD_STALLED,
     FACT_KIND_CHILD_UNRESUMED,
+    FACT_KIND_CHILD_UNOWNED,
 ];
 pub const REVIEW_LEGACY_FACT_KINDS: &[&str] = &["agent_idle_with_work", "pr_state_change"];
 

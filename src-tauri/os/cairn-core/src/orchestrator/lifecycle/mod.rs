@@ -31,6 +31,9 @@ mod process_lifetime_tests;
 mod review_push;
 mod stop;
 mod unanswered_calls;
+mod unowned_running;
+#[cfg(test)]
+mod unowned_running_tests;
 mod watchdog_recovery;
 
 pub(crate) use backend_turn::{
@@ -45,7 +48,7 @@ pub(crate) use common::set_exit_reason;
 pub(crate) use finalize::{
     current_session_closed, finalize_run_for_operator_compact, finalize_run_for_recovery,
     interrupt_run_for_provider_depletion, memory_review_turn_ended, record_run_failure_if_active,
-    release_and_stop_process, stop_processes_for_sessions,
+    release_and_stop_process, settle_provider_turn_failure, stop_processes_for_sessions,
 };
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provider_held_run};
 pub(crate) use process_lifetime::sweep_process_lifetimes;
@@ -74,6 +77,7 @@ pub(crate) use unanswered_calls::{
 pub(crate) use unanswered_calls::{
     restart_answered_calls_note, settle_unanswered_calls, InterruptCause,
 };
+pub(crate) use unowned_running::{render_unowned_push_body, sweep_unowned_running};
 pub(crate) use watchdog_recovery::notify_watchdog_successor_started;
 pub(crate) use watchdog_recovery::sweep_stranded_watchdog_jobs;
 pub(crate) use watchdog_recovery::{

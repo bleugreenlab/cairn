@@ -159,6 +159,12 @@ pub enum TurnEndReason {
     /// boot, and tells that resume to warn the agent that any tool call in
     /// flight has an unknown outcome.
     HostRestart,
+    /// The provider ended the turn with an error (a capacity refusal, a fatal
+    /// turn error) while its process stayed alive. The turn produced no
+    /// finished work, the native conversation is intact, and the job resumes
+    /// on that same process. Distinct from [`Self::Crash`], which claims the
+    /// process itself failed.
+    ProviderFailure,
 }
 
 impl std::fmt::Display for TurnEndReason {
@@ -175,6 +181,7 @@ impl std::fmt::Display for TurnEndReason {
             TurnEndReason::QuestionResumeRefused => write!(f, "question_resume_refused"),
             TurnEndReason::OperatorCompact => write!(f, "operator_compact"),
             TurnEndReason::HostRestart => write!(f, "host_restart"),
+            TurnEndReason::ProviderFailure => write!(f, "provider_failure"),
         }
     }
 }
@@ -195,6 +202,7 @@ impl std::str::FromStr for TurnEndReason {
             "question_resume_refused" => Ok(TurnEndReason::QuestionResumeRefused),
             "operator_compact" => Ok(TurnEndReason::OperatorCompact),
             "host_restart" => Ok(TurnEndReason::HostRestart),
+            "provider_failure" => Ok(TurnEndReason::ProviderFailure),
             _ => Err(format!("Unknown turn end reason: {}", s)),
         }
     }
@@ -323,6 +331,7 @@ mod tests {
             TurnEndReason::ArtifactHandoff,
             TurnEndReason::UserStop,
             TurnEndReason::Crash,
+            TurnEndReason::ProviderFailure,
             TurnEndReason::PermissionResumeRefused,
             TurnEndReason::QuestionResumeRefused,
         ] {

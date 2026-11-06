@@ -4135,6 +4135,10 @@ impl Orchestrator {
                     // trim and promotion measure the lanes.
                     crate::execution::jobs::heal_settled_call_admissions(&orch, None);
                     crate::orchestrator::lifecycle::sweep_stranded_watchdog_jobs(&orch);
+                    // Before the warm trim, so a job whose warm process is the
+                    // only thing that can continue it is continued on that
+                    // process rather than evicted out from under it.
+                    crate::orchestrator::lifecycle::sweep_unowned_running(&orch);
                     crate::orchestrator::lifecycle::sweep_process_lifetimes(&orch);
                     orch.collect_warm(crate::agent_process::gc::SpawnRoom::None);
                     // After the warm trim, so a queue head measures the memory

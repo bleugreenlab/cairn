@@ -27,6 +27,11 @@ pub const CHILD_STALL_PUSH_PREFIX: &str = "child-stalled";
 /// on an issue is its own episode, and two sharing a key would overwrite each
 /// other's fingerprint and re-wake the parent on every sweep.
 pub const CHILD_UNRESUMED_PUSH_PREFIX: &str = "child-unresumed";
+/// Push source for a child node that is marked running while nothing owns its
+/// next transition, and which Cairn could not continue on its own (cairn/6189).
+/// Keyed by the child NODE uri, for the same reason as
+/// [`CHILD_UNRESUMED_PUSH_PREFIX`].
+pub const CHILD_UNOWNED_PUSH_PREFIX: &str = "child-unowned";
 
 use std::collections::{HashMap, HashSet};
 
@@ -500,6 +505,9 @@ pub(crate) async fn source_mute_downgrade(
         }
         crate::push::CHILD_UNRESUMED_PUSH_PREFIX => {
             (SOURCE_KIND_ISSUE, crate::wakes::FACT_KIND_CHILD_UNRESUMED)
+        }
+        crate::push::CHILD_UNOWNED_PUSH_PREFIX => {
+            (SOURCE_KIND_ISSUE, crate::wakes::FACT_KIND_CHILD_UNOWNED)
         }
         _ => return Ok(requested),
     };

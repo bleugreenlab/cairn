@@ -739,13 +739,17 @@ fn direct_message_reply(
             "It cannot take a turn: {}; the message stays queued.",
             refusal.describe()
         ),
-        Some(Ok(NudgeOutcome::DeliveredToLiveTurn)) => {
-            "It is mid-turn and will read it at its next tool call.".to_string()
+        Some(Ok(NudgeOutcome::QueuedForActiveTurn)) => {
+            "Your message is queued. The recipient currently has an active turn; delivery is not \
+             yet confirmed."
+                .to_string()
         }
         Some(Ok(NudgeOutcome::Interrupted)) => {
             "Its turn was interrupted and it is resuming with your message.".to_string()
         }
-        Some(Ok(NudgeOutcome::Resumed)) => "It started a turn.".to_string(),
+        Some(Ok(NudgeOutcome::Resumed)) => {
+            "A turn was dispatched for it, carrying your message.".to_string()
+        }
         Some(Ok(NudgeOutcome::SupersededWait { labels })) => format!(
             "Its wait ({}) was ended early and it is resuming with your message.",
             labels.join(", ")
@@ -799,10 +803,13 @@ mod reply_tests {
     #[test]
     fn every_outcome_tells_the_sender_what_happened() {
         let cases = [
-            (Some(Ok(NudgeOutcome::Resumed)), "It started a turn."),
             (
-                Some(Ok(NudgeOutcome::DeliveredToLiveTurn)),
-                "will read it at its next tool call",
+                Some(Ok(NudgeOutcome::Resumed)),
+                "A turn was dispatched for it, carrying your message.",
+            ),
+            (
+                Some(Ok(NudgeOutcome::QueuedForActiveTurn)),
+                "delivery is not yet confirmed",
             ),
             (
                 Some(Ok(NudgeOutcome::SupersededWait {

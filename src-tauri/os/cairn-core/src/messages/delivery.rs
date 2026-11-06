@@ -925,14 +925,21 @@ struct PendingFlush {
 /// `continue_job_impl` resume claims and injects pending notices for the job,
 /// so the flush only needs their presence to decide whether to resume. Building
 /// them in here as well would deliver each notice twice.
-fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush, FlushDecline> {
+fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush, DeclinedFlush> {
     let run_id_owned = run_id.to_string();
     let job_id = run_db_blocking(move || async move {
         Ok(crate::messages::side_channel::job_id_for_run(db, &run_id_owned).await)
     })
     .ok()
     .flatten()
-    .ok_or(FlushDecline::NoJob)?;
+    .ok_or(DeclinedFlush {
+        job_id: None,
+        decline: FlushDecline::NoJob,
+    })?;
+    let declined = |decline| DeclinedFlush {
+        job_id: Some(job_id.clone()),
+        decline,
+    };
 
     // A recipient no turn can reach is not resumed by anything queued for it —
     // pushes, queued user messages, or notices. Taken here, at the one gate the
@@ -952,14 +959,14 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush,
                 &job_id[..job_id.len().min(8)],
                 refusal.describe()
             );
-            return Err(FlushDecline::Refused(refusal));
+            return Err(declined(FlushDecline::Refused(refusal)));
         }
         Err(error) => {
             log::debug!(
                 "flush-on-idle: job {} declined resume (deliverability unknown): {error}",
                 &job_id[..job_id.len().min(8)]
             );
-            return Err(FlushDecline::Unknown(error));
+            return Err(declined(FlushDecline::Unknown(error)));
         }
     }
 
@@ -1028,11 +1035,11 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush,
                 keys.join(", "),
             );
         }
-        return Err(if self_suspended {
+        return Err(declined(if self_suspended {
             FlushDecline::SelfSuspended
         } else {
             FlushDecline::NothingPending
-        });
+        }));
     }
 
     Ok(PendingFlush {
@@ -1055,6 +1062,29 @@ enum FlushDecline {
     SelfSuspended,
     /// Nothing queued for the job is a reason to resume it.
     NothingPending,
+}
+
+impl FlushDecline {
+    /// The decline as the idle-flush timing event records it.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::NoJob => "no_job",
+            Self::Refused(DeliveryRefusal::DormantThread) => "refused_dormant_thread",
+            Self::Refused(DeliveryRefusal::Superseded) => "refused_superseded",
+            Self::Refused(DeliveryRefusal::Cancelled) => "refused_cancelled",
+            Self::Refused(DeliveryRefusal::SessionRefusesTurns) => "refused_session_closed",
+            Self::Unknown(_) => "deliverability_unknown",
+            Self::SelfSuspended => "self_suspended",
+            Self::NothingPending => "nothing_pending",
+        }
+    }
+}
+
+/// A decline, with the job it was about when the run resolved to one.
+#[derive(Debug)]
+struct DeclinedFlush {
+    job_id: Option<String>,
+    decline: FlushDecline,
 }
 
 /// What the idle flush did.
@@ -1102,11 +1132,13 @@ fn flush_on_idle(orch: &Orchestrator, run_id: &str) -> Result<FlushOutcome, Stri
     };
     let pending = match collect_pending_for_flush(&db, run_id) {
         Ok(pending) => pending,
-        Err(decline) => {
+        Err(DeclinedFlush { job_id, decline }) => {
             let mut event = crate::resume_timing::ResumeTimingEvent::new("idle_flush_decision")
                 .elapsed(timing_started);
             event.run_id = Some(run_id);
+            event.job_id = job_id.as_deref();
             event.mode = Some("skip");
+            event.reason = Some(decline.reason());
             event.emit();
             return Ok(FlushOutcome::Declined(decline));
         }
@@ -1158,8 +1190,14 @@ pub enum NudgeOutcome {
     NotWaking,
     /// No turn can reach the job.
     Refused(DeliveryRefusal),
-    /// The job is mid-turn and reads the content at its next tool or turn boundary.
-    DeliveredToLiveTurn,
+    /// The job's head turn was active when the content was queued, so it was
+    /// left queued rather than delivered. Either that turn drains it at a later
+    /// boundary, or, once the turn has ended, the turn-end flush (or whatever
+    /// continues the job) does: the content is persisted before the head is read
+    /// and every turn end is made durable before its flush peeks, so one of the
+    /// two always sees it. Nothing here knows the turn will reach another
+    /// boundary, so this is not a confirmed delivery.
+    QueuedForActiveTurn,
     /// The job's active turn was stopped, and it resumes with the content.
     Interrupted,
     /// A continuation was dispatched; it takes the content as it starts.
@@ -1242,7 +1280,7 @@ fn nudge(
     let live_run_id = crate::orchestrator::lifecycle::live_run_id_for_job(orch, job_id);
     let head_active = head_turn_active_sync(&db, job_id);
     if head_active && urgency != DeliveryUrgency::Interrupt {
-        return Ok(NudgeOutcome::DeliveredToLiveTurn);
+        return Ok(NudgeOutcome::QueuedForActiveTurn);
     }
 
     if urgency == DeliveryUrgency::Interrupt && head_active {
@@ -1770,7 +1808,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_plain_direct_to_a_live_turn_is_read_at_its_next_tool_call() {
+    async fn a_plain_direct_to_a_live_turn_is_left_queued_for_it() {
         let orch = test_orchestrator(migrated_db().await);
         let db = orch.db.local.clone();
         seed_run(&db, "run-1", "job-1").await;
@@ -1779,7 +1817,68 @@ mod tests {
         assert_eq!(
             nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Steer, &escalation())
                 .unwrap(),
-            NudgeOutcome::DeliveredToLiveTurn
+            NudgeOutcome::QueuedForActiveTurn
+        );
+    }
+
+    /// cairn/6189: a direct queued just before the recipient's turn ends must
+    /// not be stranded by the "active turn" answer. The push stays pending, and
+    /// the turn-end flush that follows the settlement finds it and resumes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_direct_queued_against_an_ending_turn_is_left_for_the_turn_end_flush() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+        seed_waking_push(&db, "job-1").await;
+
+        assert_eq!(
+            nudge_job_for_urgency(&orch, "job-1", DeliveryUrgency::Steer).unwrap(),
+            NudgeOutcome::QueuedForActiveTurn
+        );
+        // The turn the nudge saw ends without reaching another boundary.
+        db.execute(
+            "UPDATE turns SET state = 'interrupted', end_reason = 'provider_failure', ended_at = 2
+              WHERE id = 't-head'",
+            (),
+        )
+        .await
+        .unwrap();
+        let pending = collect_pending_for_flush(&db, "run-1")
+            .expect("the turn-end flush must see the push the nudge left queued");
+        assert_eq!(pending.job_id, "job-1");
+        assert_eq!(
+            crate::orchestrator::attention_push::list_pending(&db, "job-1")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "nothing sealed it into the ended turn"
+        );
+    }
+
+    /// The other order: the turn has already ended and its flush found nothing
+    /// when the direct arrives. The nudge must not answer "active turn" and
+    /// leave it; it takes the idle path itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_direct_arriving_after_the_turn_end_flush_takes_the_idle_path() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "interrupted", None).await;
+        assert_eq!(
+            collect_pending_for_flush(&db, "run-1")
+                .err()
+                .unwrap()
+                .decline,
+            FlushDecline::NothingPending
+        );
+        seed_waking_push(&db, "job-1").await;
+
+        let outcome = nudge_job_for_urgency(&orch, "job-1", DeliveryUrgency::Steer);
+        assert!(
+            !matches!(outcome, Ok(NudgeOutcome::QueuedForActiveTurn)),
+            "{outcome:?}"
         );
     }
 

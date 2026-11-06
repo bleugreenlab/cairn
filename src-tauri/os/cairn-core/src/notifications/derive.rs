@@ -588,10 +588,13 @@ pub(super) async fn agent_failures(
     since: i64,
     now: i64,
 ) -> Result<(Vec<OperatorNotification>, Option<i64>), String> {
-    const FAILED_TURN: &str =
-        "(t.state = 'failed' OR (t.state = 'interrupted' AND t.end_reason = 'crash'))";
+    const FAILED_TURN: &str = "(t.state = 'failed' OR (t.state = 'interrupted' AND t.end_reason IN ('crash', 'provider_failure')))";
+    // What the entry calls the ending: a failure, a crash, or a turn the
+    // provider failed while its process lived on.
+    const ENDING: &str =
+        "CASE WHEN t.end_reason = 'provider_failure' THEN 'provider_failure' ELSE t.state END";
     let open_sql = format!(
-        "SELECT t.id, t.run_id, t.state, COALESCE(t.ended_at, t.updated_at), NULL,
+        "SELECT t.id, t.run_id, {ENDING}, COALESCE(t.ended_at, t.updated_at), NULL,
                 {PLACE_COLUMNS}
            FROM jobs j
            JOIN turns t ON t.id = j.current_turn_id
@@ -601,7 +604,7 @@ pub(super) async fn agent_failures(
     // Recent failures only, through the turn-time index: older ones have no
     // resolution inside the window, and an open one is found above.
     let recent_sql = format!(
-        "SELECT t.id, t.run_id, t.state, COALESCE(t.ended_at, t.updated_at),
+        "SELECT t.id, t.run_id, {ENDING}, COALESCE(t.ended_at, t.updated_at),
                 (SELECT MIN(n.created_at) FROM turns n
                   WHERE n.job_id = t.job_id AND n.created_at > t.created_at),
                 {PLACE_COLUMNS}
@@ -636,10 +639,10 @@ pub(super) async fn agent_failures(
                 settles_at = Some(settles_at.map_or(at, |earliest| earliest.min(at)));
                 return None;
             }
-            let what = if state == "failed" {
-                "failed"
-            } else {
-                "crashed"
+            let what = match state.as_str() {
+                "failed" => "failed",
+                "provider_failure" => "turn failed at its provider",
+                _ => "crashed",
             };
             // Per turn: a warm run hosts many turns, and a dismissal closes one
             // failure, not every later one in the same run.

@@ -113,8 +113,6 @@ fn capacity_retry_target(
                                FROM runs r
                                JOIN jobs j ON j.id = r.job_id
                               WHERE r.id = ?1
-                                AND j.parent_job_id IS NULL
-                                AND j.recipe_node_id IS NULL
                                 AND COALESCE(j.agent_config_id, '') != 'workflow'
                               LIMIT 1",
                             (run_id.as_str(),),
@@ -183,11 +181,11 @@ fn handle_selected_model_capacity_failure(
             session_id,
             "The selected Codex model remained at capacity after three automatic retries. You can continue this job manually to try again.",
         );
-        crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
+        settle_capacity_failed_turn(orch, run_db, run_id, "turn_failed");
         return true;
     }
 
-    crate::orchestrator::lifecycle::fail_run(orch, run_id, "capacity_retry");
+    settle_capacity_failed_turn(orch, run_db, run_id, "capacity_retry");
     let retry_turn_id = match crate::execution::jobs::claim_retry_successor_if_head_matches(
         orch,
         run_db.clone(),
@@ -286,6 +284,41 @@ fn handle_selected_model_capacity_failure(
         }
     }
     true
+}
+
+/// End the turn the provider refused for capacity.
+///
+/// A capacity refusal says nothing about the process, so a top-level or recipe
+/// job keeps its live run and native conversation and only the turn ends, as
+/// `provider_failure`. A delegated child or workflow goes through `fail_run`,
+/// which records `reason`: once its retries are spent that is what tells the
+/// waiting parent, and while they remain the retry successor claimed next keeps
+/// the child's job running. A run this host holds no process for has nothing to
+/// keep and takes the same path.
+fn settle_capacity_failed_turn(
+    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
+    run_id: &str,
+    reason: &str,
+) {
+    let exhausted = reason == "turn_failed";
+    let delegated = crate::backends::is_task_spawned_run(super::CODEX_BACKEND_NAME, run_db, run_id);
+    if !(exhausted && delegated)
+        && crate::orchestrator::lifecycle::settle_provider_turn_failure(orch, run_id)
+    {
+        crate::backends::codex::emit_codex_run_turn_completed(&orch.services.emitter, run_id);
+        // With retries left, the retry claimed next drains whatever is queued.
+        // Once they are spent nothing else will, so the turn end flushes it.
+        if exhausted {
+            if let Err(error) =
+                crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id)
+            {
+                log::warn!("capacity-exhausted queued delivery flush failed: {error}");
+            }
+        }
+        return;
+    }
+    crate::orchestrator::lifecycle::fail_run(orch, run_id, reason);
 }
 
 struct CapacityRetryTarget {
@@ -1051,6 +1084,312 @@ mod tests {
                 "a refused turn binds nothing"
             );
         }
+    }
+
+    /// A Codex job mid-turn on a warm persistent session: job `j` (shaped by
+    /// `job_sql`), session `s` on native thread `native-thread`, live run `r`
+    /// serving Cairn turn `t`, which maps to provider turn `p1`.
+    async fn persistent_codex_turn(name: &str, job_sql: &str) -> (Arc<LocalDb>, Orchestrator) {
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        db.execute_script(format!(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO jobs(id,project_id,status,node_name,created_at,updated_at) VALUES('pj','p','running','parent',1,1);
+             INSERT INTO jobs(id,project_id,status,node_name,created_at,updated_at) VALUES('j','p','running','planner',1,1);
+             {job_sql}
+             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at) VALUES('s','j','codex','native-thread','open',1,1,1);
+             INSERT INTO runs(id,project_id,job_id,status,session_id,created_at,updated_at) VALUES('r','p','j','live','s',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,started_at,updated_at) VALUES('t','s','r','j',1,'running','prompt_response',1,1,1);
+             UPDATE jobs SET current_turn_id='t',current_session_id='s' WHERE id='j';"
+        ))
+        .await
+        .unwrap();
+        let orch = scripted_test_orchestrator(db.clone());
+        let mut handle = RunHandle::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(
+                cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+            ))),
+            Some("s".into()),
+            Some("j".into()),
+        );
+        handle.begin_turn("t");
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("r".into(), handle);
+        orch.process_state.set_current_turn_id("r", Some("t"));
+        (db, orch)
+    }
+
+    /// Run the dedicated-session reader over `notifications` to the end.
+    fn read_notifications(orch: &Orchestrator, db: &Arc<LocalDb>, notifications: Vec<Value>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for notification in notifications {
+            tx.send(notification).unwrap();
+        }
+        drop(tx);
+        CodexBackend::reader_thread_app_server(
+            orch,
+            &orch.services.emitter,
+            "r",
+            Some("s".into()),
+            rx,
+            Arc::new(AppServerClient::for_test_scripted(
+                vec![],
+                Arc::new(Mutex::new(Vec::new())),
+            )),
+            Arc::new(Mutex::new(Some("p1".into()))),
+            None,
+            "codex".into(),
+            db.clone(),
+            None,
+        );
+    }
+
+    async fn text(db: &LocalDb, sql: &str) -> Option<String> {
+        db.query_opt_text(sql, ()).await.unwrap()
+    }
+
+    fn provider_error(message: &str) -> Value {
+        json!({"method": "error", "params": {
+            "turnId": "p1",
+            "error": {"message": message},
+            "willRetry": false,
+        }})
+    }
+
+    const CAPACITY: &str = "Selected model is at capacity. Please try a different model.";
+
+    /// cairn/6189's specimen: a recipe planner's turn reads a tool result, then
+    /// the provider refuses the next sampling for capacity, without retrying. The
+    /// process is alive and was reused hours later, so the turn must not read as
+    /// a crash, the run must stay live on its warm process, and one automatic
+    /// retry must be reserved on the same session and native thread. Current main
+    /// excluded recipe nodes from the capacity retry, crashed the run and
+    /// interrupted the turn as `crash`, and nothing resumed it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recipe_planner_refused_for_capacity_keeps_its_process_and_retries_on_it() {
+        let (db, orch) = persistent_codex_turn(
+            "codex-capacity-recipe-planner",
+            "UPDATE jobs SET recipe_node_id='planner' WHERE id='j';",
+        )
+        .await;
+        read_notifications(
+            &orch,
+            &db,
+            vec![
+                json!({"method":"item/agentMessage/delta","params":{"turnId":"p1","delta":"Read the plan."}}),
+                provider_error(CAPACITY),
+            ],
+        );
+
+        assert_eq!(
+            text(
+                &db,
+                "SELECT state || '/' || COALESCE(end_reason,'') FROM turns WHERE id='t'"
+            )
+            .await
+            .as_deref(),
+            Some("interrupted/provider_failure"),
+            "a provider refusal is not a crash"
+        );
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id='r'")
+                .await
+                .as_deref(),
+            Some("live"),
+            "the run keeps its live process"
+        );
+        assert!(
+            orch.process_state.is_warm("r"),
+            "the process is parked warm"
+        );
+        assert_eq!(
+            text(&db, "SELECT start_reason || '/' || state || '/' || session_id FROM turns WHERE predecessor_id='t'").await.as_deref(),
+            Some("retry/pending/s"),
+            "one retry is reserved on the same session"
+        );
+        assert_eq!(
+            text(&db, "SELECT backend_id FROM sessions WHERE id='s'")
+                .await
+                .as_deref(),
+            Some("native-thread")
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE data LIKE '%selected_model_capacity_retry%'",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1),
+            "the retry is announced once"
+        );
+    }
+
+    /// A delegated agent gets the same retry on its own warm conversation,
+    /// rather than failing its parent's wait on a transient refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_agent_refused_for_capacity_retries_instead_of_failing() {
+        let (db, orch) = persistent_codex_turn(
+            "codex-capacity-delegated",
+            "UPDATE jobs SET parent_job_id='pj' WHERE id='j';",
+        )
+        .await;
+        read_notifications(&orch, &db, vec![provider_error(CAPACITY)]);
+
+        assert_eq!(
+            text(
+                &db,
+                "SELECT state || '/' || COALESCE(end_reason,'') FROM turns WHERE id='t'"
+            )
+            .await
+            .as_deref(),
+            Some("interrupted/provider_failure")
+        );
+        assert_ne!(
+            text(&db, "SELECT status FROM jobs WHERE id='j'")
+                .await
+                .as_deref(),
+            Some("failed"),
+            "a retry is still owed, so the child has not failed"
+        );
+        assert_eq!(
+            text(
+                &db,
+                "SELECT start_reason FROM turns WHERE predecessor_id='t'"
+            )
+            .await
+            .as_deref(),
+            Some("retry")
+        );
+    }
+
+    /// Once its retries are spent, a delegated agent fails terminally, which is
+    /// what tells the waiting parent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_agent_whose_capacity_retries_are_spent_fails_for_its_parent() {
+        let (db, orch) = persistent_codex_turn(
+            "codex-capacity-delegated-spent",
+            "UPDATE jobs SET parent_job_id='pj' WHERE id='j';",
+        )
+        .await;
+        // `t` is already the third retry in a row.
+        db.execute_script(
+            "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('t0','s','j',-2,'interrupted','initial',0,0);
+             INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at) VALUES('ta','s','j',-1,'t0','interrupted','retry',0,0);
+             INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at) VALUES('tb','s','j',0,'ta','interrupted','retry',0,0);
+             UPDATE turns SET start_reason='retry', predecessor_id='tb' WHERE id='t';",
+        )
+        .await
+        .unwrap();
+        read_notifications(&orch, &db, vec![provider_error(CAPACITY)]);
+
+        assert_eq!(
+            text(&db, "SELECT state FROM turns WHERE id='t'")
+                .await
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM turns WHERE predecessor_id='t'", ())
+                .await
+                .unwrap(),
+            Some(0),
+            "no fourth retry"
+        );
+        let errors = text(
+            &db,
+            "SELECT group_concat(json_extract(data,'$.content'), ' | ') FROM events WHERE event_type='system:error'",
+        )
+        .await
+        .unwrap_or_default();
+        assert!(errors.contains("remained at capacity"), "{errors}");
+    }
+
+    /// Any other fatal provider error on a top-level job ends the turn, not the
+    /// process: the diagnostic is kept, and the job is left for the queued-content
+    /// flush and the unowned-running sweep to continue.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fatal_provider_error_ends_the_turn_not_the_process() {
+        let (db, orch) = persistent_codex_turn("codex-fatal-top-level", "").await;
+        read_notifications(
+            &orch,
+            &db,
+            vec![provider_error("stream disconnected before completion")],
+        );
+
+        assert_eq!(
+            text(
+                &db,
+                "SELECT state || '/' || COALESCE(end_reason,'') FROM turns WHERE id='t'"
+            )
+            .await
+            .as_deref(),
+            Some("interrupted/provider_failure")
+        );
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id='r'")
+                .await
+                .as_deref(),
+            Some("live")
+        );
+        assert!(orch.process_state.is_warm("r"));
+        let errors = text(
+            &db,
+            "SELECT group_concat(json_extract(data,'$.content'), ' | ') FROM events WHERE event_type='system:error'",
+        )
+        .await
+        .unwrap_or_default();
+        assert!(errors.contains("stream disconnected"), "{errors}");
+        assert_eq!(
+            text(
+                &db,
+                "SELECT COALESCE(exit_reason, '') FROM runs WHERE id='r'"
+            )
+            .await
+            .as_deref(),
+            Some(""),
+            "no exit is recorded for a process that did not exit"
+        );
+    }
+
+    /// The post-tool shape the issue first suspected: Codex ends a turn normally
+    /// with no assistant item after a tool result. That is a completed turn on a
+    /// live process, never a crash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_completed_right_after_a_tool_result_is_not_a_crash() {
+        let (db, orch) = persistent_codex_turn(
+            "codex-post-tool-complete",
+            "UPDATE jobs SET recipe_node_id='planner' WHERE id='j';",
+        )
+        .await;
+        read_notifications(
+            &orch,
+            &db,
+            vec![
+                json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}}),
+            ],
+        );
+
+        assert_eq!(
+            text(
+                &db,
+                "SELECT state || '/' || COALESCE(end_reason,'') FROM turns WHERE id='t'"
+            )
+            .await
+            .as_deref(),
+            Some("complete/")
+        );
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id='r'")
+                .await
+                .as_deref(),
+            Some("live")
+        );
+        assert!(orch.process_state.is_warm("r"));
     }
 
     #[tokio::test]

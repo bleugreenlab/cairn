@@ -2593,9 +2593,9 @@ fn continue_job_launch_locked(
         .as_ref()
         .is_some_and(|context| context.answers_open_tool_call);
     if let Some(retry_turn_id) = preclaimed_retry_turn_id.as_deref() {
-        if job.parent_job_id.is_some()
-            || job.recipe_node_id.is_some()
-            || job.agent_config_id.as_deref() == Some("workflow")
+        // A recipe node or delegated agent retries on its own warm conversation
+        // like any other job; a workflow's run is one-shot and never retried.
+        if job.agent_config_id.as_deref() == Some("workflow")
             || !pending_retry_head_matches(owning_db.clone(), job_id, retry_turn_id)?
         {
             return Err("automatic retry was superseded or is ineligible".to_string());

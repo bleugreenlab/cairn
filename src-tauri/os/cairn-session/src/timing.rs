@@ -62,6 +62,9 @@ pub struct ResumeTimingEvent<'a> {
     pub stream_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<&'a str>,
+    /// Why a decision went the way it did, when `mode` alone does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]

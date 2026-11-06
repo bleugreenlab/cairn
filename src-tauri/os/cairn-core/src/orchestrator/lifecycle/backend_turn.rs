@@ -101,6 +101,22 @@ pub(crate) fn apply_codex_turn_completion(
                     &format!("Codex turn failed: {}", status),
                 );
             }
+            // A failed provider turn on a persistent session ends the turn, not
+            // the process: the run stays live and the native conversation is
+            // kept. A delegated child or workflow still fails terminally, so the
+            // parent waiting on it hears the failure instead of a stranded child.
+            if completion.session_lifetime == SessionLifetime::Persistent
+                && !super::finalize::run_fails_terminally(orch, run_id)
+                && super::settle_provider_turn_failure(orch, run_id)
+            {
+                emit_codex_run_turn_completed(emitter, run_id);
+                if let Err(error) =
+                    crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id)
+                {
+                    log::warn!("provider-failure queued delivery flush failed: {error}");
+                }
+                return;
+            }
             // A genuine turn failure: finalize task-aware so a delegated child
             // fails terminally (its parent resumes) rather than stranding it.
             super::fail_run(orch, run_id, "turn_failed");
