@@ -45,6 +45,7 @@ pub mod threads;
 pub mod todos;
 pub mod token_meters;
 pub mod turns;
+pub mod web_providers;
 pub mod workflow_journal;
 pub mod workflow_progress;
 

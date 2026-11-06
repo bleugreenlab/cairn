@@ -113,7 +113,9 @@ impl PackMutationSnapshot {
             .chain(new_manifest.items())
         {
             if let Some(path) = item.path {
-                paths.insert(config_dir.join(path));
+                paths.insert(pack::item_destination(
+                    config_dir, pack_id, item.kind, &path,
+                ));
             }
         }
 
@@ -383,9 +385,13 @@ pub fn reset_pack_item(
     // just as much the user's copy, and the catalog already offers its reset.
     let unrecorded_edit = kind != PackItemKind::Mcp
         && item.path.as_deref().is_some_and(|path| {
-            pack::hash_item_path(kind, &orch.config_dir, &orch.config_dir.join(path))
-                .and_then(|current| pack::matches_baseline(&orch.config_dir, &item, &current))
-                .is_ok_and(|matches| !matches)
+            pack::hash_item_path(
+                kind,
+                &orch.config_dir,
+                &pack::item_destination(&orch.config_dir, pack_id, kind, path),
+            )
+            .and_then(|current| pack::matches_baseline(&orch.config_dir, &item, &current))
+            .is_ok_and(|matches| !matches)
         });
     if !item.forked && !unrecorded_edit {
         return Err(format!(
@@ -409,7 +415,11 @@ pub fn reset_pack_item(
                 .path
                 .as_deref()
                 .ok_or_else(|| format!("{} `{item_id}` has no materialized path", kind.as_str()))?;
-            match pack::hash_item_path(kind, &orch.config_dir, &orch.config_dir.join(path))? {
+            match pack::hash_item_path(
+                kind,
+                &orch.config_dir,
+                &pack::item_destination(&orch.config_dir, pack_id, kind, path),
+            )? {
                 ContentHash::Present(hash) => hash,
                 ContentHash::Missing => {
                     return Err(format!(
@@ -980,6 +990,15 @@ pub fn apply_pack_item_removal(
         }
         PackItemKind::Service => {
             crate::config::machine_services::delete_pack_service(orch, pack_id, item_id)?;
+        }
+        // A provider and the credential it reads live in the pack's own layer
+        // and are one capability: they leave by uninstalling the pack.
+        PackItemKind::Credential | PackItemKind::Provider => {
+            return Err(format!(
+                "{} `{item_id}` cannot be removed on its own; uninstall pack '{pack_id}' to \
+                 remove it",
+                kind.as_str()
+            ))
         }
         PackItemKind::Mcp => crate::config::mcp_tools::withdraw_and_unregister(
             config_dir,
@@ -1579,6 +1598,95 @@ mod tests {
 
     /// An edit saved between syncs is the user's copy at once: the catalog
     /// says so, says the app ships something different, shows both sides,
+    /// A provider pack shipped beside `core`, installed into `ws`.
+    fn install_provider_fixture(ws: &Workspace) -> PathBuf {
+        let root = source_pack(&ws.resources, "search-fixture");
+        write(
+            &root.join("cairn-pack.yaml"),
+            "id: search-fixture\nname: Search\nversion: 1.0.0\ndefault: false\n",
+        );
+        write(
+            &root.join("credentials/api-key.yaml"),
+            "label: Key\nkind: secret\nvar: SEARCH_FIXTURE_KEY\nhosts: [api.search.test]\naccessors: [provider:web-search]\n",
+        );
+        write(
+            &root.join("providers/web-search.yaml"),
+            "label: Search\nprovides: web-search\ncredential: api-key\nadapter:\n  http:\n    request:\n      method: GET\n      url: https://api.search.test/?q=${query|query}\n      headers: { X-Key: \"${credential}\" }\n    response:\n      results: results\n      fields: { url: [url] }\n",
+        );
+        apply_pack_action(&ws.orch, "install", "search-fixture").unwrap();
+        root
+    }
+
+    /// Reset reads a provider's and a credential's real home, the pack layer.
+    #[tokio::test]
+    async fn reset_restores_edited_provider_and_credential_declarations() {
+        let ws = workspace().await;
+        let shipped = install_provider_fixture(&ws);
+        for (kind, id, rel) in [
+            (
+                PackItemKind::Provider,
+                "web-search",
+                "providers/web-search.yaml",
+            ),
+            (
+                PackItemKind::Credential,
+                "api-key",
+                "credentials/api-key.yaml",
+            ),
+        ] {
+            let installed = ws.home.join("packs/search-fixture").join(rel);
+            let original = std::fs::read_to_string(shipped.join(rel)).unwrap();
+            std::fs::write(&installed, format!("{original}# edited\n")).unwrap();
+            assert_eq!(
+                item_state(&ws, "search-fixture", kind.as_str(), id),
+                Some(PackItemState::EditedByUser)
+            );
+            reset_pack_item(&ws.orch, "search-fixture", kind, id).unwrap();
+            assert_eq!(std::fs::read_to_string(&installed).unwrap(), original);
+            assert_eq!(
+                item_state(&ws, "search-fixture", kind.as_str(), id),
+                Some(PackItemState::PackOwned)
+            );
+        }
+    }
+
+    /// A failed mutation's rollback covers the declarations in the pack layer,
+    /// not just the lock.
+    #[tokio::test]
+    async fn a_rollback_restores_installed_provider_declarations() {
+        let ws = workspace().await;
+        install_provider_fixture(&ws);
+        let lock = pack::lock::read_lock(&ws.home, "search-fixture").unwrap();
+        let manifest = pack::available_pack(&ws.resources, "search-fixture").unwrap();
+        let provider = ws
+            .home
+            .join("packs/search-fixture/providers/web-search.yaml");
+        let credential = ws
+            .home
+            .join("packs/search-fixture/credentials/api-key.yaml");
+        let before = (
+            std::fs::read(&provider).unwrap(),
+            std::fs::read(&credential).unwrap(),
+            std::fs::read(pack::lock::lock_path(&ws.home, "search-fixture")).unwrap(),
+        );
+
+        let snapshot =
+            PackMutationSnapshot::capture(&ws.home, "search-fixture", Some(&lock), &manifest)
+                .unwrap();
+        // What a half-applied update leaves behind.
+        std::fs::write(&provider, "label: half-written\n").unwrap();
+        std::fs::remove_file(&credential).unwrap();
+        std::fs::write(pack::lock::lock_path(&ws.home, "search-fixture"), "garbage").unwrap();
+        snapshot.restore().unwrap();
+
+        assert_eq!(std::fs::read(&provider).unwrap(), before.0);
+        assert_eq!(std::fs::read(&credential).unwrap(), before.1);
+        assert_eq!(
+            std::fs::read(pack::lock::lock_path(&ws.home, "search-fixture")).unwrap(),
+            before.2
+        );
+    }
+
     /// and its reset works before any sync has recorded the fork.
     #[tokio::test]
     async fn an_unsynced_edit_reads_as_a_copy_behind_shipped_and_resets() {

@@ -21,6 +21,8 @@ pub mod library;
 pub mod lock;
 pub mod manifest;
 pub mod mcp;
+pub mod provider;
+pub mod provider_options;
 pub mod restore;
 pub mod server_config;
 
@@ -103,6 +105,8 @@ pub fn hash_item_path(kind: PackItemKind, root: &Path, path: &Path) -> Result<Co
         PackItemKind::Service | PackItemKind::Skill | PackItemKind::Workflow => hash_tree(path),
         PackItemKind::Mcp => Err("MCP items must be hashed from their server definition".into()),
         PackItemKind::Agent
+        | PackItemKind::Credential
+        | PackItemKind::Provider
         | PackItemKind::Recipe
         | PackItemKind::Response
         | PackItemKind::Route => {
@@ -157,6 +161,31 @@ pub const CONTENT_DIRS: [&str; 7] = [
     "skills",
     "workflows",
 ];
+
+/// Content directories a pack may ship that install into the pack's own
+/// `packs/<id>/` layer instead of the flat workspace (see
+/// [`PackItemKind::in_pack_layer`]).
+pub const PACK_LAYER_DIRS: [&str; 2] = [provider::CREDENTIALS_DIR, provider::PROVIDERS_DIR];
+
+/// Where an installed file item lives, relative to the workspace config home:
+/// its own path for a flat kind, under `packs/<id>/` for a pack-layer kind.
+pub fn item_destination_rel(pack_id: &str, kind: PackItemKind, path: &str) -> String {
+    if kind.in_pack_layer() {
+        format!("{}/{pack_id}/{path}", lock::PACKS_DIR)
+    } else {
+        path.to_string()
+    }
+}
+
+/// [`item_destination_rel`] joined onto `config_dir`.
+pub fn item_destination(
+    config_dir: &Path,
+    pack_id: &str,
+    kind: PackItemKind,
+    path: &str,
+) -> PathBuf {
+    config_dir.join(item_destination_rel(pack_id, kind, path))
+}
 
 /// Subdirectory of the app's resource directory holding shipped packs.
 pub const PACKS_SOURCE_DIR: &str = "packs";

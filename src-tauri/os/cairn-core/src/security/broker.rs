@@ -119,8 +119,15 @@ pub enum CredentialSource {
     },
     /// The OAuth access token for a configured MCP server.
     McpOAuth { credential_key: String },
-    /// A web search or web fetch provider's API key.
+    /// A compiled web fetch provider's API key, or a channel token.
     WebProvider { provider: String, var: String },
+    /// A credential a pack declares for its own providers, stored under
+    /// [`crate::config::secrets::pack_credential_key`].
+    PackCredential {
+        pack: String,
+        credential: String,
+        var: String,
+    },
     /// The GitHub App's RSA private key. Cairn signs with it and never sends
     /// it: see [`github`].
     GitHubApp { app_id: i64 },
@@ -176,6 +183,12 @@ impl CredentialSource {
                 provider: provider.clone(),
                 account_id: provider.clone(),
             },
+            Self::PackCredential {
+                pack, credential, ..
+            } => AuthorityPlace::ExternalAccount {
+                provider: pack.clone(),
+                account_id: credential.clone(),
+            },
             Self::GitHubApp { app_id } => AuthorityPlace::ExternalAccount {
                 provider: GITHUB_PROVIDER.to_string(),
                 account_id: format!("app/{app_id}"),
@@ -223,6 +236,11 @@ impl CredentialSource {
             } => format!("mcp-server:{credential_key}:{var}"),
             Self::McpOAuth { credential_key } => format!("mcp-oauth:{credential_key}"),
             Self::WebProvider { provider, var } => format!("web-provider:{provider}:{var}"),
+            Self::PackCredential {
+                pack,
+                credential,
+                var,
+            } => format!("pack-credential:{pack}/{credential}:{var}"),
             Self::GitHubApp { app_id } => format!("github-app:{app_id}"),
             Self::GitHubInstallation { installation_id } => {
                 format!("github-installation:{installation_id}")
@@ -246,7 +264,7 @@ impl CredentialSource {
         match self {
             Self::McpVar { .. } => SecretCategory::ConfiguredMcp,
             Self::McpOAuth { .. } => SecretCategory::OAuthToken,
-            Self::WebProvider { .. } => SecretCategory::ProviderKey,
+            Self::WebProvider { .. } | Self::PackCredential { .. } => SecretCategory::ProviderKey,
             Self::GitHubApp { .. } => SecretCategory::ProviderSigningKey,
             Self::GitHubInstallation { .. } | Self::TeamSync { .. } => {
                 SecretCategory::ProviderToken
@@ -625,10 +643,79 @@ pub async fn mcp_oauth_token(
     }))
 }
 
-/// The stored API key for a web search or web fetch provider.
+/// A credential a pack declares, for that pack's provider to send.
+///
+/// Registered before it is returned, so the value is a scrub target before it
+/// is put in a header: a provider that quotes a rejected key in its error body
+/// would otherwise hand it straight to the agent reading the result. Returns
+/// `None` when nothing is stored or the stored value is blank.
+pub fn pack_credential(
+    pack: &str,
+    credential: &str,
+    var: &str,
+    purpose: &str,
+) -> Result<Option<BrokeredSecret>, String> {
+    let credential_key = crate::config::secrets::pack_credential_key(pack, credential);
+    let Some(value) = keychain(&credential_key, var)?.filter(|key| !key.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let source = CredentialSource::PackCredential {
+        pack: pack.to_string(),
+        credential: credential.to_string(),
+        var: var.to_string(),
+    };
+    register(&source, Declared::Secret, purpose, value.clone());
+    Ok(Some(BrokeredSecret {
+        value: Zeroizing::new(value),
+        id: source.secret_id(),
+    }))
+}
+
+/// What [`adopt_legacy_key`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyKeyAdoption {
+    /// No legacy value was stored; nothing changed.
+    Absent,
+    /// The legacy value now lives in the pack account and the old entry is gone.
+    Moved,
+    /// The pack account already held a value; the old entry was deleted.
+    Superseded,
+}
+
+/// Move a key stored under a compiled provider's account (`{owner}/{var}`) to
+/// the pack credential account, deleting the old entry once the new one holds
+/// a value. One stored truth: after this, nothing reads the old account.
+///
+/// The value is moved keychain to keychain inside the broker and never
+/// returned, which is why this lives here rather than with its caller.
+pub(crate) fn adopt_legacy_key(
+    owner: &str,
+    pack: &str,
+    credential: &str,
+    var: &str,
+) -> Result<LegacyKeyAdoption, String> {
+    let legacy = crate::config::secrets::credential_key(owner, None);
+    let Some(value) = keychain(&legacy, var)? else {
+        return Ok(LegacyKeyAdoption::Absent);
+    };
+    let target = crate::config::secrets::pack_credential_key(pack, credential);
+    let outcome = match keychain(&target, var)?.filter(|v| !v.trim().is_empty()) {
+        Some(_) => LegacyKeyAdoption::Superseded,
+        None if value.trim().is_empty() => LegacyKeyAdoption::Superseded,
+        None => {
+            crate::config::secrets::set_secret(&target, var, &value)?;
+            LegacyKeyAdoption::Moved
+        }
+    };
+    crate::config::secrets::delete_secret(&legacy, var)?;
+    Ok(outcome)
+}
+
+/// The stored API key for a compiled web fetch provider, or a channel token.
 ///
 /// Returns `None` when no key is stored or the stored value is blank, which is
-/// the "provider not configured" case rather than a failure.
+/// the "provider not configured" case rather than a failure. Pack-declared
+/// providers read [`pack_credential`] instead.
 pub fn web_provider_key(
     provider: &str,
     var: &str,
@@ -1697,6 +1784,66 @@ mod tests {
         assert!(!echoed.contains(typed), "override value leaked: {echoed}");
     }
 
+    /// A pack credential is registered before it is returned, and blank means
+    /// unset rather than an empty key in a header.
+    #[test]
+    fn a_pack_credential_is_scrubbed_before_use_and_blank_is_unset() {
+        use_mock_keychain();
+        let (pack, credential, var) = ("broker-pack", "api-key", "BROKER_PACK_KEY");
+        let key = crate::config::secrets::pack_credential_key(pack, credential);
+        assert_eq!(key, "pack:broker-pack/api-key");
+        assert!(pack_credential(pack, credential, var, "test")
+            .unwrap()
+            .is_none());
+
+        crate::config::secrets::set_secret(&key, var, "   ").unwrap();
+        assert!(pack_credential(pack, credential, var, "test")
+            .unwrap()
+            .is_none());
+
+        let value = "pk-Qe71Ws38Ux";
+        crate::config::secrets::set_secret(&key, var, value).unwrap();
+        let resolved = pack_credential(pack, credential, var, "test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.expose(), value);
+        let echo = format!("provider said: bad key {value}");
+        let mut sanitizer = Sanitizer::exact();
+        let scrubbed = sanitizer.text(&echo);
+        assert!(!scrubbed.contains(value), "{scrubbed}");
+    }
+
+    /// The legacy account is emptied once the pack account holds the value, and
+    /// a value already in the pack account is never overwritten.
+    #[test]
+    fn a_legacy_provider_key_moves_once_and_never_overwrites() {
+        use_mock_keychain();
+        let (owner, var) = ("broker-legacy", "BROKER_LEGACY_KEY");
+        let target = crate::config::secrets::pack_credential_key(owner, "api-key");
+        assert_eq!(
+            adopt_legacy_key(owner, owner, "api-key", var).unwrap(),
+            LegacyKeyAdoption::Absent
+        );
+        crate::config::secrets::set_secret(owner, var, "old-Ka82").unwrap();
+        assert_eq!(
+            adopt_legacy_key(owner, owner, "api-key", var).unwrap(),
+            LegacyKeyAdoption::Moved
+        );
+        assert!(!crate::config::secrets::has_secret(owner, var).unwrap());
+        assert!(crate::config::secrets::has_secret(&target, var).unwrap());
+
+        crate::config::secrets::set_secret(owner, var, "stale-Zp19").unwrap();
+        assert_eq!(
+            adopt_legacy_key(owner, owner, "api-key", var).unwrap(),
+            LegacyKeyAdoption::Superseded
+        );
+        assert!(!crate::config::secrets::has_secret(owner, var).unwrap());
+        let kept = pack_credential(owner, "api-key", var, "test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.expose(), "old-Ka82");
+    }
+
     /// Every scope the broker mints is a *use* authority. Reveal is not
     /// expressible here, which is the point.
     ///
@@ -1716,6 +1863,11 @@ mod tests {
             CredentialSource::WebProvider {
                 provider: "tavily".into(),
                 var: "API_KEY".into(),
+            },
+            CredentialSource::PackCredential {
+                pack: "tavily".into(),
+                credential: "api-key".into(),
+                var: "TAVILY_API_KEY".into(),
             },
             CredentialSource::GitHubApp { app_id: 42 },
             CredentialSource::GitHubInstallation {
@@ -1759,6 +1911,15 @@ mod tests {
     #[test]
     fn every_credential_source_has_its_own_identity() {
         let sources = [
+            CredentialSource::WebProvider {
+                provider: "tavily".into(),
+                var: "TAVILY_API_KEY".into(),
+            },
+            CredentialSource::PackCredential {
+                pack: "tavily".into(),
+                credential: "api-key".into(),
+                var: "TAVILY_API_KEY".into(),
+            },
             CredentialSource::GitHubApp { app_id: 42 },
             CredentialSource::GitHubInstallation {
                 installation_id: 42,

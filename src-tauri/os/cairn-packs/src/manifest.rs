@@ -65,7 +65,9 @@ pub enum PackFormat {
 #[serde(rename_all = "lowercase")]
 pub enum PackItemKind {
     Agent,
+    Credential,
     Mcp,
+    Provider,
     Recipe,
     Response,
     Route,
@@ -78,7 +80,9 @@ impl PackItemKind {
     pub fn as_str(self) -> &'static str {
         match self {
             PackItemKind::Agent => "agent",
+            PackItemKind::Credential => "credential",
             PackItemKind::Mcp => "mcp",
+            PackItemKind::Provider => "provider",
             PackItemKind::Recipe => "recipe",
             PackItemKind::Response => "response",
             PackItemKind::Route => "route",
@@ -93,7 +97,9 @@ impl PackItemKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "agent" => Some(PackItemKind::Agent),
+            "credential" => Some(PackItemKind::Credential),
             "mcp" => Some(PackItemKind::Mcp),
+            "provider" => Some(PackItemKind::Provider),
             "recipe" => Some(PackItemKind::Recipe),
             "response" => Some(PackItemKind::Response),
             "route" => Some(PackItemKind::Route),
@@ -105,9 +111,11 @@ impl PackItemKind {
     }
 
     /// Every kind, for error text that enumerates the alternatives.
-    pub const ALL: [PackItemKind; 8] = [
+    pub const ALL: [PackItemKind; 10] = [
         PackItemKind::Agent,
+        PackItemKind::Credential,
         PackItemKind::Mcp,
+        PackItemKind::Provider,
         PackItemKind::Recipe,
         PackItemKind::Response,
         PackItemKind::Route,
@@ -115,6 +123,14 @@ impl PackItemKind {
         PackItemKind::Skill,
         PackItemKind::Workflow,
     ];
+
+    /// Whether this kind is installed into the pack's own `packs/<id>/` layer
+    /// rather than the flat workspace. Every provider pack ships the same file
+    /// names (`providers/web-search.yaml`, `credentials/api-key.yaml`), so the
+    /// pack id is their namespace, as it is for `packs/<id>/mcp.yaml`.
+    pub fn in_pack_layer(self) -> bool {
+        matches!(self, PackItemKind::Credential | PackItemKind::Provider)
+    }
 }
 
 /// What installing an item lets happen on this machine.
@@ -132,7 +148,9 @@ pub enum ItemRuns {
     /// skill's `scripts/` stay content, because running them is an agent act.
     #[default]
     Content,
-    /// A remote MCP server (`http`/`sse`) the workspace connects to.
+    /// Something that reaches an external host: a remote MCP server
+    /// (`http`/`sse`) the workspace connects to, or a web-service provider and
+    /// its credential, which send a stored secret to the host they name.
     Endpoint,
     /// Something that executes on this machine: a stdio MCP server, a workflow,
     /// whose `main.ts` runs, or a machine service.
@@ -146,6 +164,7 @@ impl ItemRuns {
     ) -> Self {
         match kind {
             PackItemKind::Workflow | PackItemKind::Service => ItemRuns::Here,
+            PackItemKind::Credential | PackItemKind::Provider => ItemRuns::Endpoint,
             PackItemKind::Mcp => match mcp.map(|config| config.transport.as_str()) {
                 Some("http" | "sse") => ItemRuns::Endpoint,
                 // An MCP item with no readable definition is assumed to spawn.
@@ -470,6 +489,7 @@ fn dir_id(dir: &Path) -> Result<String, String> {
 fn has_conventional_content(dir: &Path) -> bool {
     super::CONTENT_DIRS
         .iter()
+        .chain(super::PACK_LAYER_DIRS.iter())
         .any(|name| dir.join(name).is_dir())
         || dir.join(PACK_MCP_FILE).is_file()
         || dir.join(CLAUDE_MCP_FILE).is_file()
@@ -568,7 +588,10 @@ impl PackManifest {
 /// File-backed items only; MCP servers come from the manifest's `mcp.yaml`.
 pub fn discover_items(root: &Path) -> Vec<PackItem> {
     let mut items = Vec::new();
-    for dir_name in super::CONTENT_DIRS {
+    for dir_name in super::CONTENT_DIRS
+        .into_iter()
+        .chain(super::PACK_LAYER_DIRS)
+    {
         let dir = root.join(dir_name);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -599,13 +622,15 @@ pub fn discover_items(root: &Path) -> Vec<PackItem> {
                         items.push(PackItem::file(PackItemKind::Service, file_name, rel));
                     }
                 }
-                "agents" | "recipes" | "responses" | "routes" => {
+                "agents" | "credentials" | "providers" | "recipes" | "responses" | "routes" => {
                     if !path.is_file() {
                         continue;
                     }
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let (kind, matches) = match dir_name {
                         "agents" => (PackItemKind::Agent, ext == "md"),
+                        "credentials" => (PackItemKind::Credential, ext == "yaml"),
+                        "providers" => (PackItemKind::Provider, ext == "yaml"),
                         "responses" => (PackItemKind::Response, ext == "md"),
                         // The route loader reads `.yaml` only, so a `.yml` route
                         // would install and then never load.
@@ -868,6 +893,13 @@ mod tests {
             "`type` defaults to stdio, which spawns a process"
         );
         assert_eq!(ItemRuns::classify(PackItemKind::Mcp, None), ItemRuns::Here);
+        for kind in [PackItemKind::Credential, PackItemKind::Provider] {
+            assert_eq!(
+                ItemRuns::classify(kind, None),
+                ItemRuns::Endpoint,
+                "{kind:?} sends a stored secret to an external host"
+            );
+        }
         assert_eq!(
             ItemRuns::classify(PackItemKind::Workflow, None),
             ItemRuns::Here
@@ -882,6 +914,43 @@ mod tests {
             assert_eq!(ItemRuns::classify(kind, None), ItemRuns::Content);
         }
         assert!(ItemRuns::Here > ItemRuns::Endpoint && ItemRuns::Endpoint > ItemRuns::Content);
+    }
+
+    #[test]
+    fn providers_and_credentials_are_discovered_and_live_in_the_pack_layer() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("search");
+        write(&root.join("providers/web-search.yaml"), "label: S\n");
+        write(&root.join("credentials/api-key.yaml"), "label: K\n");
+        write(&root.join("providers/notes.md"), "not a provider\n");
+
+        let manifest = load(&root).unwrap();
+        assert_eq!(manifest.format, PackFormat::Conventional);
+        let items = manifest.items();
+        assert_eq!(
+            items,
+            vec![
+                PackItem::file(
+                    PackItemKind::Credential,
+                    "api-key",
+                    "credentials/api-key.yaml"
+                ),
+                PackItem::file(
+                    PackItemKind::Provider,
+                    "web-search",
+                    "providers/web-search.yaml"
+                ),
+            ]
+        );
+        assert!(items.iter().all(|item| item.kind.in_pack_layer()));
+        assert_eq!(
+            PackItemKind::parse("provider"),
+            Some(PackItemKind::Provider)
+        );
+        assert_eq!(
+            PackItemKind::parse("credential"),
+            Some(PackItemKind::Credential)
+        );
     }
 
     #[test]

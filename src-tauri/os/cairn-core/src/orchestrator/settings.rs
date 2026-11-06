@@ -86,6 +86,35 @@ impl Orchestrator {
         Ok(migrated)
     }
 
+    /// Move a workspace configured against the retired compiled web-provider
+    /// catalogs onto pack providers: stored keys move to the pack credential
+    /// namespace and a selected bundled provider pack is installed, so search
+    /// and fetch keep working with no click. A no-op once done, and a no-op
+    /// before the desktop has recorded where the app's packs live.
+    pub fn migrate_web_providers(&self) {
+        let Some(resource_dir) = cairn_packs::source_dir(&self.config_dir) else {
+            return;
+        };
+        let report = crate::web_providers::migrate_workspace(
+            &crate::services::RealGitClient,
+            &crate::services::RealFileSystem,
+            &self.config_dir,
+            &resource_dir,
+        );
+        for account in &report.keys_moved {
+            log::info!("web providers: moved the key at {account} to its pack credential");
+        }
+        for pack in &report.installed {
+            log::info!("web providers: installed `{pack}`, which this workspace had selected");
+        }
+        for skipped in &report.skipped {
+            log::info!("web providers: left alone: {skipped}");
+        }
+        if report.changed() {
+            self.emit_pack_registry_change();
+        }
+    }
+
     /// Write down the conversion of the retired desktop-automation toggles into
     /// machine-service selections, if it has not been written yet, and log what
     /// did not carry over exactly. Idempotent.

@@ -96,6 +96,17 @@ pub fn rotation_hook(secret_id: &SecretId, category: Option<SecretCategory>) -> 
             revocation_suffices: false,
         };
     }
+    if id.starts_with("pack-credential:") {
+        return RotationHook {
+            provider: "pack-credential",
+            configured_at: "the Library, on the providing pack's credential",
+            guidance:
+                "Issue a new key at the service the pack's provider calls, revoke the disclosed \
+                 one there, and store the replacement on the pack's credential. The provider \
+                 reads it on its next request.",
+            revocation_suffices: false,
+        };
+    }
     if id.starts_with("web-provider:") {
         return RotationHook {
             provider: "web-provider",
@@ -219,6 +230,11 @@ mod tests {
                 provider: "bmd".to_string(),
                 var: "BMD_KEY".to_string(),
             },
+            CredentialSource::PackCredential {
+                pack: "tavily".to_string(),
+                credential: "api-key".to_string(),
+                var: "TAVILY_API_KEY".to_string(),
+            },
             CredentialSource::GitHubApp { app_id: 1 },
             CredentialSource::GitHubInstallation { installation_id: 2 },
             CredentialSource::ModelBackend {
@@ -246,6 +262,7 @@ mod tests {
                 CredentialSource::McpVar { .. }
                 | CredentialSource::McpOAuth { .. }
                 | CredentialSource::WebProvider { .. }
+                | CredentialSource::PackCredential { .. }
                 | CredentialSource::GitHubApp { .. }
                 | CredentialSource::GitHubInstallation { .. }
                 | CredentialSource::ModelBackend { .. }

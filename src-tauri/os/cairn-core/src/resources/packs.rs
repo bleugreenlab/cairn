@@ -264,6 +264,38 @@ pub struct PackCatalogItem {
     /// on and how each stands. The Library renders this; it never derives it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_service: Option<MachineServiceItem>,
+    /// For a web-service provider: the slot it fills, whether it is selected,
+    /// and its credential's presence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_provider: Option<WebProviderItem>,
+    /// For a credential: where its value may be sent and whether one is stored.
+    /// Never the value, in any presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialItem>,
+}
+
+/// A pack's web-service provider, as the Library and `cairn://packs` show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebProviderItem {
+    pub slot: String,
+    pub label: String,
+    /// Whether the slot's scalar selects this pack. Always false for a pack
+    /// that is not installed.
+    pub active: bool,
+    pub credential: CredentialItem,
+}
+
+/// A pack credential's declaration and presence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialItem {
+    pub name: String,
+    pub label: String,
+    pub var: String,
+    /// Whether a value is stored. False for a pack that is not installed.
+    pub present: bool,
+    pub hosts: Vec<String>,
 }
 
 /// A machine service's standing across the fleet, as of this read.
@@ -454,7 +486,20 @@ pub const PACK_ENTRY_KIND: &str = "pack";
 /// Every item counts, tombstoned ones included, because the grouping follows
 /// what the manifest ships rather than what this workspace currently holds:
 /// removing one skill from a two-item pack must not reclassify it.
+///
+/// A web-service provider is the one exception: it reads a credential, so a
+/// pack holding only providers and the credentials they read is a provider,
+/// not a pack of two. The day it also ships a skill it becomes a pack.
 fn entry_kind(items: &[PackCatalogItem]) -> String {
+    let provider = PackItemKind::Provider.as_str();
+    let credential = PackItemKind::Credential.as_str();
+    if items.iter().any(|item| item.kind == provider)
+        && items
+            .iter()
+            .all(|item| item.kind == provider || item.kind == credential)
+    {
+        return provider.to_string();
+    }
     match items {
         [only] => only.kind.clone(),
         _ => PACK_ENTRY_KIND.to_string(),
@@ -690,6 +735,9 @@ fn project(
                 entry.machine_service =
                     machine_service_item(config_dir, &view.id, &entry.id, machines);
             }
+            if kind.in_pack_layer() {
+                describe_web_service_item(config_dir, view, &mut entry, kind);
+            }
             entry
         })
         .collect();
@@ -853,6 +901,78 @@ struct ItemVerdict {
 /// Read live from content hashes against the lock baseline and the shipped
 /// source -- never from Git -- so an edit saved a moment ago reads as the
 /// user's copy before the next sync records the fork.
+/// Fill a provider or credential item from its declaration: the installed
+/// layer when the pack is installed (with the credential's presence and the
+/// provider's readiness), else the shipped source (presence always false).
+fn describe_web_service_item(
+    config_dir: &Path,
+    view: &PackView,
+    entry: &mut PackCatalogItem,
+    kind: PackItemKind,
+) {
+    let installed = view.installed.is_some();
+    let root = if installed {
+        Some(pack::lock::pack_dir(config_dir, &view.id))
+    } else {
+        view.shipped_root(config_dir)
+    };
+    let Some(root) = root else {
+        return;
+    };
+    let present = |credential: &pack::provider::CredentialDecl| {
+        installed
+            && crate::web_providers::credential_present(&view.id, &credential.name, &credential.var)
+                .unwrap_or(false)
+    };
+    let credential_item = |credential: &pack::provider::CredentialDecl| CredentialItem {
+        name: credential.name.clone(),
+        label: credential.label.clone(),
+        var: credential.var.clone(),
+        present: present(credential),
+        hosts: credential.hosts.clone(),
+    };
+    match kind {
+        PackItemKind::Provider => {
+            let Some(slot) = pack::provider::Slot::parse(&entry.id) else {
+                return;
+            };
+            let Ok(Some(provider)) = pack::provider::load_pack_provider(&root, &view.id, slot)
+            else {
+                return;
+            };
+            entry.connects_to = Some(provider.provider.adapter.request.host.clone());
+            if installed {
+                entry.not_ready = crate::web_providers::readiness(&provider);
+            }
+            entry.web_provider = Some(WebProviderItem {
+                slot: slot.as_str().to_string(),
+                label: provider.provider.label.clone(),
+                active: installed
+                    && crate::web_providers::active_name(config_dir, slot).as_deref()
+                        == Some(view.id.as_str()),
+                credential: credential_item(&provider.credential),
+            });
+        }
+        PackItemKind::Credential => {
+            let Ok(credentials) = pack::provider::load_pack_credentials(&root, &view.id) else {
+                return;
+            };
+            let Some(credential) = credentials.iter().find(|c| c.name == entry.id) else {
+                return;
+            };
+            entry.connects_to = Some(credential.hosts.join(", "));
+            let item = credential_item(credential);
+            if installed && !item.present {
+                entry.not_ready = Some(NotReady::MissingVars {
+                    vars: vec![credential.var.clone()],
+                });
+            }
+            entry.credential = Some(item);
+        }
+        _ => {}
+    }
+}
+
 fn file_item_verdict(config_dir: &Path, view: &PackView, item: &PackItem) -> ItemVerdict {
     let Some(locked) = view
         .installed
@@ -867,8 +987,12 @@ fn file_item_verdict(config_dir: &Path, view: &PackView, item: &PackItem) -> Ite
             behind: false,
         };
     };
-    let current = pack::hash_item_path(item.kind, config_dir, &config_dir.join(path))
-        .unwrap_or(ContentHash::Missing);
+    let current = pack::hash_item_path(
+        item.kind,
+        config_dir,
+        &pack::item_destination(config_dir, &view.id, item.kind, path),
+    )
+    .unwrap_or(ContentHash::Missing);
     if current == ContentHash::Missing {
         return ItemVerdict {
             edited: locked.forked,
@@ -1000,6 +1124,8 @@ fn catalog_item(
         runs: ItemRuns::Content,
         connects_to: None,
         machine_service: None,
+        web_provider: None,
+        credential: None,
     }
 }
 
@@ -1065,7 +1191,7 @@ pub fn pack_item_diff(
         .path
         .ok_or_else(|| format!("{} `{item_id}` has no file to compare", kind.as_str()))?;
     let shipped_root = manifest.root.join(&path);
-    let yours_root = config_dir.join(&path);
+    let yours_root = pack::item_destination(config_dir, pack_id, kind, &path);
 
     let mut files = Vec::new();
     if matches!(
@@ -1230,6 +1356,63 @@ fn render_machine_services(out: &mut String, entry: &PackCatalogEntry) {
     }
 }
 
+/// A pack's web-service providers and credentials: which slot each fills,
+/// whether it is selected, and whether its key is set. Presence only; the
+/// value is never read here.
+fn render_web_services(out: &mut String, entry: &PackCatalogEntry) {
+    let installed = entry.state == PackState::Installed;
+    let providers: Vec<&WebProviderItem> = entry
+        .items
+        .iter()
+        .filter_map(|item| item.web_provider.as_ref())
+        .collect();
+    if !providers.is_empty() {
+        out.push_str("## Web services\n\n");
+        for provider in providers {
+            let selected = if provider.active {
+                format!(" · active for {}", provider.slot.replace('-', " "))
+            } else {
+                String::new()
+            };
+            let key = match (installed, provider.credential.present) {
+                (false, _) => "not installed".to_string(),
+                (true, true) => "ready".to_string(),
+                (true, false) => format!("needs key ({})", provider.credential.var),
+            };
+            out.push_str(&format!(
+                "- `{}` — {}{selected} · {key}\n",
+                provider.slot, provider.label
+            ));
+        }
+        out.push_str(&format!(
+            "\nSelecting a provider and setting its key are done in {}.\n\n",
+            crate::web_providers::LIBRARY_LOCATION
+        ));
+    }
+    let credentials: Vec<&CredentialItem> = entry
+        .items
+        .iter()
+        .filter_map(|item| item.credential.as_ref())
+        .collect();
+    if !credentials.is_empty() {
+        out.push_str("## Credentials\n\n");
+        for credential in credentials {
+            let state = match (installed, credential.present) {
+                (false, _) => "not installed",
+                (true, true) => "set",
+                (true, false) => "not set",
+            };
+            out.push_str(&format!(
+                "- `{}` — {} · sent only to {} · {state}\n",
+                credential.name,
+                credential.var,
+                credential.hosts.join(", ")
+            ));
+        }
+        out.push('\n');
+    }
+}
+
 fn render_items(out: &mut String, entry: &PackCatalogEntry) {
     if entry.items.is_empty() {
         out.push_str("No contents.\n\n");
@@ -1375,6 +1558,8 @@ fn describe_definition(definition: &McpServerConfig) -> String {
 const SECTIONS: &[(&str, &str, &str)] = &[
     (PACK_ENTRY_KIND, "Packs", "pack"),
     ("mcp", "MCP servers", "MCP server"),
+    ("provider", "Web services", "web-service provider"),
+    ("credential", "Credentials", "credential"),
     ("service", "Machine services", "machine service"),
     ("skill", "Skills", "skill"),
     ("agent", "Agents", "agent"),
@@ -1644,6 +1829,7 @@ fn render_pack(entry: &PackCatalogEntry) -> String {
     out.push_str("## Contents\n\n");
     render_items(&mut out, entry);
     render_machine_services(&mut out, entry);
+    render_web_services(&mut out, entry);
 
     let edited = entry.edited_items();
     if !edited.is_empty() {
@@ -1707,6 +1893,8 @@ mod tests {
             runs: ItemRuns::Content,
             connects_to: None,
             machine_service: None,
+            web_provider: None,
+            credential: None,
         }
     }
 

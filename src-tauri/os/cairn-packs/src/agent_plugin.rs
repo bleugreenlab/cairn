@@ -452,6 +452,14 @@ pub fn export(
             service.id
         ));
     }
+    if let Some(item) = items.iter().find(|i| i.kind.in_pack_layer()) {
+        return Err(format!(
+            "{} '{}' is not portable: an Agent Plugin has no web-service providers or the \
+             credentials they send; remove it from the pack to export the rest",
+            item.kind.as_str(),
+            item.id
+        ));
+    }
     let mut out = Map::new();
     out.insert("$schema".into(), PLUGIN_SCHEMA_URI.into());
     out.insert("name".into(), manifest.id.clone().into());
@@ -511,7 +519,10 @@ pub fn export(
             PackItemKind::Workflow => PathBuf::from(CAIRN_EXTENSION)
                 .join("workflows")
                 .join(&item.id),
-            PackItemKind::Mcp | PackItemKind::Service => unreachable!(),
+            PackItemKind::Credential
+            | PackItemKind::Mcp
+            | PackItemKind::Provider
+            | PackItemKind::Service => unreachable!(),
         };
         copy_tree(&source, &stage.path().join(target))?;
     }

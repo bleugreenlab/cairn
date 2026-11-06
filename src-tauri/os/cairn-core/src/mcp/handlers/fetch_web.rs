@@ -4,10 +4,13 @@
 //! becomes markdown. Each provider is a real adapter that knows its own request
 //! and response shape:
 //!
+//! - **A pack provider** (when `activeWebFetch` names an installed pack that
+//!   provides `web-fetch`): the pack's declaration run by the declarative HTTP
+//!   engine, its response handed to the same markdown conversion as Regular.
 //! - **Regular** (the default, depending on nothing): an async reqwest GET,
 //!   content-type aware — `text/html` is converted via `htmd`, while JSON / text
 //!   / markdown pass through unchanged.
-//! - **Jina / Firecrawl**: provider API-key requests normalized to markdown.
+//! - **Firecrawl**: a provider API-key request normalized to markdown.
 //! - **Cloudflare**: Browser Run with a refreshed provider OAuth token.
 //! - **bmd**: calls bmd's `fetch` tool through the host MCP gateway, reusing the
 //!   OAuth connection the user established for the bmd MCP server. No pasteable
@@ -19,23 +22,72 @@ use crate::config::mcp_servers::McpServerConfigExt;
 use crate::config::web_fetch::{self, ActiveFetch, FetchProviderId};
 use crate::mcp::gateway::McpGateway;
 use crate::orchestrator::Orchestrator;
+use crate::web_providers::{self, Resolved, LIBRARY_LOCATION};
+use cairn_packs::provider::http::{self, Inputs};
+use cairn_packs::provider::Slot;
 use serde::Deserialize;
 use std::collections::HashMap;
 
 /// Convert an `http(s)://` target to markdown via the active fetch provider.
+///
+/// An installed pack provider named by `activeWebFetch` answers first; any
+/// other name goes to the compiled providers, which fall back to Regular.
 pub(crate) async fn read_fetch_markdown(
     orch: &Orchestrator,
     target: &str,
 ) -> Result<String, String> {
+    match web_providers::resolve(&orch.config_dir, Slot::WebFetch) {
+        Resolved::Provider(active) => return pack_fetch(&active, target).await,
+        Resolved::Invalid { name, error } => {
+            return Err(format!(
+                "The web-fetch provider `{name}` is installed, but its declaration does not \
+                 load: {error}. Update or reinstall it from {LIBRARY_LOCATION}."
+            ))
+        }
+        Resolved::Unconfigured | Resolved::NotInstalled { .. } => {}
+    }
     match web_fetch::resolve_active_fetch(&orch.config_dir) {
         ActiveFetch::Regular => regular_fetch(target).await,
         ActiveFetch::Provider { id, options } => match id {
-            FetchProviderId::Jina => jina_fetch(target).await,
             FetchProviderId::Firecrawl => firecrawl_fetch(target, &options).await,
             FetchProviderId::Cloudflare => cloudflare_fetch(target, &options).await,
             FetchProviderId::Bmd => bmd_fetch(orch, target).await,
         },
     }
+}
+
+/// A pack's web-fetch provider: its declared request, the credential sent only
+/// to the hosts it lists, and the response read by the slot's markdown
+/// conversion.
+async fn pack_fetch(active: &web_providers::Active, target: &str) -> Result<String, String> {
+    let provider = &active.provider;
+    let label = provider.provider.label.as_str();
+    // Brokered, so the key is a scrub target before it reaches a header: page
+    // content and error bodies flow straight to the agent.
+    let Some(key) = crate::security::broker::pack_credential(
+        &provider.pack,
+        &provider.credential.name,
+        &provider.credential.var,
+        "web fetch request",
+    )?
+    else {
+        return Ok(format!(
+            "No API key set for {label} web fetch. Add it in {LIBRARY_LOCATION}."
+        ));
+    };
+    let prepared = http::prepare(
+        &provider.provider,
+        &Inputs {
+            query: None,
+            target: Some(target),
+            credential: key.expose(),
+            options: &active.options,
+        },
+    );
+    let resp = web_providers::send(provider, &prepared)
+        .await
+        .map_err(|e| format!("Failed to fetch `{target}` via {label}: {e}"))?;
+    read_markdown_response(resp, target).await
 }
 
 /// The built-in plain-HTTP fetch: an async reqwest GET with content-type-aware
@@ -46,24 +98,6 @@ async fn regular_fetch(target: &str) -> Result<String, String> {
         .send()
         .await
         .map_err(|e| format!("Failed to fetch `{target}`: {e}"))?;
-    read_markdown_response(resp, target).await
-}
-
-/// Jina Reader: GET `https://r.jina.ai/<url>` with the API key, returning the
-/// page already rendered as markdown.
-async fn jina_fetch(target: &str) -> Result<String, String> {
-    let key = match provider_key(FetchProviderId::Jina)? {
-        Some(k) => k,
-        None => return Ok(missing_key_message(FetchProviderId::Jina)),
-    };
-    let url = format!("https://r.jina.ai/{target}");
-    let resp = cairn_tls::client()
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", key.expose()))
-        .header("X-Return-Format", "markdown")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch `{target}` via Jina: {e}"))?;
     read_markdown_response(resp, target).await
 }
 

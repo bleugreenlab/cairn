@@ -59,6 +59,8 @@ pub fn bundled_resource_ids(
 ) -> Result<Vec<String>, String> {
     let kind = match dir_name {
         "agents" => pack::PackItemKind::Agent,
+        "credentials" => pack::PackItemKind::Credential,
+        "providers" => pack::PackItemKind::Provider,
         "recipes" => pack::PackItemKind::Recipe,
         "responses" => pack::PackItemKind::Response,
         "routes" => pack::PackItemKind::Route,

@@ -1,0 +1,342 @@
+{
+  "errors": {
+    "http_500": "Web search via Tavily failed (HTTP 500): oops",
+    "non_json": "Web search via Tavily returned an unexpected response shape (expected ident at line 1 column 2). Raw response:\n\nnot json"
+  },
+  "renders": [
+    {
+      "label": "Tavily",
+      "provider": "tavily",
+      "query": "rust",
+      "raw": "{\"results\":[\n            {\"title\":\"Rust\",\"url\":\"https://rust-lang.org\",\"content\":\"systems language\",\"score\":0.9},\n            {\"title\":\"Tokio\",\"url\":\"https://tokio.rs\",\"content\":\"async runtime\"}\n        ]}",
+      "render": "Web search · \"rust\" · via Tavily · 2 result(s)\n\n1. Rust\n   https://rust-lang.org\n   systems language\n\n2. Tokio\n   https://tokio.rs\n   async runtime",
+      "results": [
+        {
+          "score": 0.9,
+          "snippet": "systems language",
+          "title": "Rust",
+          "url": "https://rust-lang.org"
+        },
+        {
+          "score": null,
+          "snippet": "async runtime",
+          "title": "Tokio",
+          "url": "https://tokio.rs"
+        }
+      ]
+    },
+    {
+      "label": "Tavily",
+      "provider": "tavily",
+      "query": "rust",
+      "raw": "{\"results\":[{\"title\":\"  \",\"url\":\"https://blank.test\",\"content\":\"line one\\nline two  \"}]}",
+      "render": "Web search · \"rust\" · via Tavily · 1 result(s)\n\n1. https://blank.test\n   https://blank.test\n   line one line two",
+      "results": [
+        {
+          "score": null,
+          "snippet": "line one\nline two  ",
+          "title": "https://blank.test",
+          "url": "https://blank.test"
+        }
+      ]
+    },
+    {
+      "label": "Tavily",
+      "provider": "tavily",
+      "query": "none",
+      "raw": "{\"results\":[]}",
+      "render": "Web search for \"none\" via Tavily returned no results.",
+      "results": []
+    },
+    {
+      "label": "Tavily",
+      "provider": "tavily",
+      "query": "none",
+      "raw": "{}",
+      "render": "Web search for \"none\" via Tavily returned no results.",
+      "results": []
+    },
+    {
+      "label": "Exa",
+      "provider": "exa",
+      "query": "x",
+      "raw": "{\"results\":[{\"title\":null,\"url\":\"https://x.test\",\"text\":\"hi\"},{\"title\":\"Second\",\"url\":\"https://y.test\",\"text\":\"\",\"score\":0.5}]}",
+      "render": "Web search · \"x\" · via Exa · 2 result(s)\n\n1. https://x.test\n   https://x.test\n   hi\n\n2. Second\n   https://y.test",
+      "results": [
+        {
+          "score": null,
+          "snippet": "hi",
+          "title": "https://x.test",
+          "url": "https://x.test"
+        },
+        {
+          "score": 0.5,
+          "snippet": "",
+          "title": "Second",
+          "url": "https://y.test"
+        }
+      ]
+    },
+    {
+      "label": "Brave",
+      "provider": "brave",
+      "query": "b",
+      "raw": "{\"web\":{\"results\":[{\"title\":\"Brave\",\"url\":\"https://brave.com\",\"description\":\"a browser\"},{\"title\":\"\",\"url\":\"https://search.brave.com\",\"description\":\"\"}]}}",
+      "render": "Web search · \"b\" · via Brave · 2 result(s)\n\n1. Brave\n   https://brave.com\n   a browser\n\n2. https://search.brave.com\n   https://search.brave.com",
+      "results": [
+        {
+          "score": null,
+          "snippet": "a browser",
+          "title": "Brave",
+          "url": "https://brave.com"
+        },
+        {
+          "score": null,
+          "snippet": "",
+          "title": "https://search.brave.com",
+          "url": "https://search.brave.com"
+        }
+      ]
+    },
+    {
+      "label": "Brave",
+      "provider": "brave",
+      "query": "b",
+      "raw": "{\"query\":{\"original\":\"b\"}}",
+      "render": "Web search for \"b\" via Brave returned no results.",
+      "results": []
+    },
+    {
+      "label": "Jina",
+      "provider": "jina",
+      "query": "doc",
+      "raw": "{\"data\":[\n            {\"title\":\"Doc\",\"url\":\"https://e.com/doc\",\"description\":\"\",\"content\":\"body text\"},\n            {\"title\":\"Two\",\"url\":\"https://e.com/two\",\"description\":\"desc wins\",\"content\":\"ignored\"},\n            {\"title\":\"Three\",\"url\":\"https://e.com/three\",\"description\":\"   \",\"content\":\"\"}\n        ]}",
+      "render": "Web search · \"doc\" · via Jina · 3 result(s)\n\n1. Doc\n   https://e.com/doc\n   body text\n\n2. Two\n   https://e.com/two\n   desc wins\n\n3. Three\n   https://e.com/three",
+      "results": [
+        {
+          "score": null,
+          "snippet": "body text",
+          "title": "Doc",
+          "url": "https://e.com/doc"
+        },
+        {
+          "score": null,
+          "snippet": "desc wins",
+          "title": "Two",
+          "url": "https://e.com/two"
+        },
+        {
+          "score": null,
+          "snippet": "",
+          "title": "Three",
+          "url": "https://e.com/three"
+        }
+      ]
+    },
+    {
+      "label": "Tavily",
+      "provider": "tavily",
+      "query": "long",
+      "raw": "{\"results\":[{\"title\":\"Long\",\"url\":\"https://l.test\",\"content\":\"word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word \"}]}",
+      "render": "Web search · \"long\" · via Tavily · 1 result(s)\n\n1. Long\n   https://l.test\n   word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word …",
+      "results": [
+        {
+          "score": null,
+          "snippet": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+          "title": "Long",
+          "url": "https://l.test"
+        }
+      ]
+    }
+  ],
+  "requests": [
+    {
+      "body": {
+        "max_results": 5,
+        "query": "rust async",
+        "search_depth": "basic",
+        "topic": "general"
+      },
+      "headers": [
+        [
+          "Authorization",
+          "Bearer tok-123"
+        ],
+        [
+          "Content-Type",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "POST",
+      "options": {},
+      "provider": "tavily",
+      "query": "rust async",
+      "url": "https://api.tavily.com/search"
+    },
+    {
+      "body": {
+        "max_results": 3,
+        "query": "rust async",
+        "search_depth": "advanced",
+        "topic": "news"
+      },
+      "headers": [
+        [
+          "Authorization",
+          "Bearer tok-123"
+        ],
+        [
+          "Content-Type",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "POST",
+      "options": {
+        "maxResults": 3,
+        "searchDepth": "advanced",
+        "topic": "news"
+      },
+      "provider": "tavily",
+      "query": "rust async",
+      "url": "https://api.tavily.com/search"
+    },
+    {
+      "body": {
+        "contents": {
+          "text": true
+        },
+        "numResults": 10,
+        "query": "q",
+        "type": "auto"
+      },
+      "headers": [
+        [
+          "x-api-key",
+          "tok-123"
+        ],
+        [
+          "Content-Type",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "POST",
+      "options": {},
+      "provider": "exa",
+      "query": "q",
+      "url": "https://api.exa.ai/search"
+    },
+    {
+      "body": {
+        "contents": {
+          "text": true
+        },
+        "numResults": 4,
+        "query": "neural nets",
+        "type": "neural"
+      },
+      "headers": [
+        [
+          "x-api-key",
+          "tok-123"
+        ],
+        [
+          "Content-Type",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "POST",
+      "options": {
+        "numResults": 4,
+        "type": "neural"
+      },
+      "provider": "exa",
+      "query": "neural nets",
+      "url": "https://api.exa.ai/search"
+    },
+    {
+      "body": null,
+      "headers": [
+        [
+          "X-Subscription-Token",
+          "tok-123"
+        ],
+        [
+          "Accept",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "GET",
+      "options": {},
+      "provider": "brave",
+      "query": "a b&c",
+      "url": "https://api.search.brave.com/res/v1/web/search?q=a%20b%26c&count=10&safesearch=moderate"
+    },
+    {
+      "body": null,
+      "headers": [
+        [
+          "X-Subscription-Token",
+          "tok-123"
+        ],
+        [
+          "Accept",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "GET",
+      "options": {
+        "count": 7,
+        "safesearch": "strict"
+      },
+      "provider": "brave",
+      "query": "café ~x",
+      "url": "https://api.search.brave.com/res/v1/web/search?q=caf%C3%A9%20~x&count=7&safesearch=strict"
+    },
+    {
+      "body": null,
+      "headers": [
+        [
+          "Authorization",
+          "Bearer tok-123"
+        ],
+        [
+          "Accept",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "GET",
+      "options": {},
+      "provider": "jina",
+      "query": "doc",
+      "url": "https://s.jina.ai/?q=doc&count=10"
+    },
+    {
+      "body": null,
+      "headers": [
+        [
+          "Authorization",
+          "Bearer tok-123"
+        ],
+        [
+          "Accept",
+          "application/json"
+        ]
+      ],
+      "key": "tok-123",
+      "method": "GET",
+      "options": {
+        "count": 3
+      },
+      "provider": "jina",
+      "query": "what is? #1",
+      "url": "https://s.jina.ai/?q=what%20is%3F%20%231&count=3"
+    }
+  ]
+}

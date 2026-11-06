@@ -71,6 +71,19 @@ pub fn credential_key(server: &str, project_path: Option<&Path>) -> String {
     }
 }
 
+/// The credential key a pack-declared credential is stored under, making its
+/// account `pack:{pack}/{credential}/{var}`.
+///
+/// The `pack:` prefix keeps the pack namespace disjoint from MCP server
+/// accounts (`{server}/{var}`, `project/{path}/{server}/{var}`), the way
+/// `config:` keeps the configuration namespace apart: a pack named `project`
+/// could otherwise collide with a project-scoped server's key. Operator-owned
+/// credentials that belong to no pack take the reserved owner `workspace`,
+/// which no pack id may use.
+pub fn pack_credential_key(pack: &str, credential: &str) -> String {
+    format!("pack:{pack}/{credential}")
+}
+
 fn entry(server: &str, var: &str) -> Result<Entry, String> {
     Entry::new(&service(), &account(server, var))
         .map_err(|e| format!("Failed to open keychain entry: {e}"))

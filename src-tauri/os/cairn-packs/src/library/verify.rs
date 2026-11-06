@@ -217,7 +217,9 @@ fn check_entry(entry: &IndexEntry) -> Result<(), String> {
                 return Err(format!("{label} names no path"));
             };
             let dir = path.split('/').next().unwrap_or_default();
-            if !is_safe_relative(path) || !crate::CONTENT_DIRS.contains(&dir) {
+            if !is_safe_relative(path)
+                || !(crate::CONTENT_DIRS.contains(&dir) || crate::PACK_LAYER_DIRS.contains(&dir))
+            {
                 return Err(format!("{label} has an unsafe path `{path}`"));
             }
             if item

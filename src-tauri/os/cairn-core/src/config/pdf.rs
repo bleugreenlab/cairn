@@ -11,7 +11,7 @@
 //! - **bmd** — routes remote PDF URLs through the configured `bmd` MCP server's
 //!   `fetch` tool.
 
-use super::provider_options::{validate_options, ProviderOption};
+use cairn_packs::provider_options::{validate_options, ProviderOption};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -171,30 +171,29 @@ mod tests {
         let ws = TempDir::new().unwrap();
         upsert_pdf_options(ws.path(), PdfProviderId::Bmd, &HashMap::new()).unwrap();
         set_active_pdf(ws.path(), Some("bmd")).unwrap();
-        super::super::web_search::upsert_web_search_options(
-            ws.path(),
-            super::super::web_search::SearchProviderId::Brave,
-            &HashMap::from([("count".to_string(), serde_yaml::Value::from(7))]),
-        )
+        crate::config::settings::mutate_workspace_settings(ws.path(), "test", |root| {
+            let search: serde_yaml::Value =
+                serde_yaml::from_str("{search-pack: {count: 7}}").unwrap();
+            root.insert("webSearch".into(), search);
+            root.insert("activeWebSearch".into(), "search-pack".into());
+            Ok(())
+        })
         .unwrap();
-        super::super::web_search::set_active_web_search(ws.path(), Some("brave")).unwrap();
 
         let settings = super::super::settings::load_settings(ws.path());
         super::super::settings::save_settings(ws.path(), &settings).unwrap();
 
+        use cairn_packs::provider::Slot;
         assert_eq!(active_pdf_name(ws.path()).as_deref(), Some("bmd"));
         assert!(load_pdf_options(ws.path(), PdfProviderId::Bmd).is_empty());
         assert_eq!(
-            super::super::web_search::active_web_search_name(ws.path()).as_deref(),
-            Some("brave")
+            crate::web_providers::active_name(ws.path(), Slot::WebSearch).as_deref(),
+            Some("search-pack")
         );
         assert_eq!(
-            super::super::web_search::load_web_search_options(
-                ws.path(),
-                super::super::web_search::SearchProviderId::Brave
-            )
-            .get("count")
-            .and_then(serde_yaml::Value::as_i64),
+            crate::web_providers::load_options(ws.path(), Slot::WebSearch, "search-pack")
+                .get("count")
+                .and_then(serde_yaml::Value::as_i64),
             Some(7)
         );
     }

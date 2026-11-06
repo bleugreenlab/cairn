@@ -1,12 +1,11 @@
-//! Shared provider-option descriptors for the typed web-service catalogs.
+//! Provider-option descriptors, shared by every web-service slot.
 //!
-//! Web fetch ([`super::web_fetch`]), web search ([`super::web_search`]), and PDF
-//! ([`super::pdf`]) all present per-provider options to the settings UI through
-//! one model: a [`ProviderOption`] carries a key, a label, and an
-//! [`OptionControl`] (text / select / number / bool) that drives how the UI renders and
-//! how [`validate_options`] checks a submitted value. Keeping this in one module
-//! means the three services validate and render options identically, and the
-//! frontend mirrors a single `OptionControl` type.
+//! A [`ProviderOption`] carries a key, a label, and an [`OptionControl`] (text /
+//! select / number / bool) that drives how the settings UI renders it and how
+//! [`validate_options`] checks a submitted value. Pack-declared providers
+//! deserialize their options into this model, and the compiled fetch and PDF
+//! providers construct it directly, so every provider validates and renders
+//! options identically and the frontend mirrors a single `OptionControl` type.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -15,8 +14,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Choice {
-    pub(crate) value: String,
-    label: String,
+    pub value: String,
+    pub label: String,
 }
 
 /// The control type for a provider option, driving how the settings UI renders
@@ -36,6 +35,10 @@ pub enum OptionControl {
         min: f64,
         max: f64,
         default: f64,
+        /// Only whole numbers are accepted, and the value reaches a request as an
+        /// integer rather than a float.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        integer: bool,
     },
     Bool {
         default: bool,
@@ -46,14 +49,14 @@ pub enum OptionControl {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderOption {
-    pub(crate) key: String,
-    label: String,
-    pub(crate) control: OptionControl,
+    pub key: String,
+    pub label: String,
+    pub control: OptionControl,
 }
 
 impl ProviderOption {
     /// A free-text option.
-    pub(crate) fn text(key: &str, label: &str, default: &str, placeholder: &str) -> Self {
+    pub fn text(key: &str, label: &str, default: &str, placeholder: &str) -> Self {
         ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
@@ -65,7 +68,7 @@ impl ProviderOption {
     }
 
     /// A single-choice dropdown option.
-    pub(crate) fn select(key: &str, label: &str, choices: &[(&str, &str)], default: &str) -> Self {
+    pub fn select(key: &str, label: &str, choices: &[(&str, &str)], default: &str) -> Self {
         ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
@@ -83,16 +86,21 @@ impl ProviderOption {
     }
 
     /// A bounded numeric option.
-    pub(crate) fn number(key: &str, label: &str, min: f64, max: f64, default: f64) -> Self {
+    pub fn number(key: &str, label: &str, min: f64, max: f64, default: f64) -> Self {
         ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
-            control: OptionControl::Number { min, max, default },
+            control: OptionControl::Number {
+                min,
+                max,
+                default,
+                integer: false,
+            },
         }
     }
 
     /// A boolean toggle option.
-    pub(crate) fn bool(key: &str, label: &str, default: bool) -> Self {
+    pub fn bool(key: &str, label: &str, default: bool) -> Self {
         ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
@@ -104,8 +112,8 @@ impl ProviderOption {
 /// Validate submitted options against a provider's descriptor. Unknown keys and
 /// type/range/choice mismatches are rejected so only well-formed options reach
 /// `settings.yaml`. `context` names the service in error messages (e.g.
-/// "Jina web fetch").
-pub(crate) fn validate_options(
+/// "Firecrawl web fetch").
+pub fn validate_options(
     descriptors: &[ProviderOption],
     options: &HashMap<String, serde_yaml::Value>,
     context: &str,
@@ -139,7 +147,9 @@ pub(crate) fn validate_options(
                     return Err(format!("Option `{key}` must be one of: {allowed}"));
                 }
             }
-            OptionControl::Number { min, max, .. } => {
+            OptionControl::Number {
+                min, max, integer, ..
+            } => {
                 let n = value
                     .as_f64()
                     .or_else(|| value.as_i64().map(|i| i as f64))
@@ -147,6 +157,9 @@ pub(crate) fn validate_options(
                     .ok_or_else(|| format!("Option `{key}` must be a number"))?;
                 if n < *min || n > *max {
                     return Err(format!("Option `{key}` must be between {min} and {max}"));
+                }
+                if *integer && value.as_i64().is_none() && value.as_u64().is_none() {
+                    return Err(format!("Option `{key}` must be a whole number"));
                 }
             }
             OptionControl::Bool { .. } => {
@@ -188,9 +201,28 @@ mod tests {
         );
         assert!(validate_options(&descriptors, &opts(&[("mode", "b".into())]), "x").is_ok());
         assert!(validate_options(&descriptors, &opts(&[("count", 7.into())]), "x").is_ok());
+        assert!(validate_options(&descriptors, &opts(&[("count", 7.5.into())]), "x").is_ok());
         assert!(validate_options(&descriptors, &opts(&[("flag", true.into())]), "x").is_ok());
         assert!(
             validate_options(&descriptors, &opts(&[("account", "abc123".into())]), "x").is_ok()
         );
+    }
+
+    #[test]
+    fn an_integer_option_refuses_a_fraction() {
+        let descriptors = vec![ProviderOption {
+            key: "count".into(),
+            label: "Count".into(),
+            control: OptionControl::Number {
+                min: 1.0,
+                max: 10.0,
+                default: 5.0,
+                integer: true,
+            },
+        }];
+        let error =
+            validate_options(&descriptors, &opts(&[("count", 2.5.into())]), "x").unwrap_err();
+        assert!(error.contains("whole number"), "{error}");
+        assert!(validate_options(&descriptors, &opts(&[("count", 3.into())]), "x").is_ok());
     }
 }

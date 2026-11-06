@@ -17,15 +17,18 @@
 //! providers differ in how they authenticate ([`FetchAuth`]):
 //!
 //! - **Regular** — no auth; the built-in default.
-//! - **Jina / Firecrawl** — an API key in the OS keychain keyed by provider id.
+//! - **Firecrawl** — an API key in the OS keychain keyed by provider id.
 //! - **Cloudflare** — OAuth 2.0 Authorization Code with PKCE.
 //! - **bmd** — no pasteable key: it reuses the configured `bmd` MCP server's
 //!   OAuth connection, calling bmd's `fetch` tool through the host gateway.
 //!
+//! A pack that provides `web-fetch` (see [`crate::web_providers`]) is selected
+//! through the same `activeWebFetch` scalar and resolved before this catalog.
+//!
 //! PDF extraction is a separate service ([`super::pdf`]); `.pdf` targets route
 //! there rather than through a fetch provider.
 
-use super::provider_options::{validate_options, ProviderOption};
+use cairn_packs::provider_options::{validate_options, ProviderOption};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,16 +42,14 @@ pub const REGULAR: &str = "regular";
 #[serde(rename_all = "lowercase")]
 pub enum FetchProviderId {
     Bmd,
-    Jina,
     Firecrawl,
     Cloudflare,
 }
 
 impl FetchProviderId {
     /// Every shipped provider, in display order.
-    pub const ALL: [FetchProviderId; 4] = [
+    pub const ALL: [FetchProviderId; 3] = [
         FetchProviderId::Bmd,
-        FetchProviderId::Jina,
         FetchProviderId::Firecrawl,
         FetchProviderId::Cloudflare,
     ];
@@ -57,7 +58,6 @@ impl FetchProviderId {
     pub fn as_str(self) -> &'static str {
         match self {
             FetchProviderId::Bmd => "bmd",
-            FetchProviderId::Jina => "jina",
             FetchProviderId::Firecrawl => "firecrawl",
             FetchProviderId::Cloudflare => "cloudflare",
         }
@@ -67,7 +67,6 @@ impl FetchProviderId {
     pub fn from_id(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "bmd" => Some(FetchProviderId::Bmd),
-            "jina" => Some(FetchProviderId::Jina),
             "firecrawl" => Some(FetchProviderId::Firecrawl),
             "cloudflare" => Some(FetchProviderId::Cloudflare),
             _ => None,
@@ -78,7 +77,6 @@ impl FetchProviderId {
     pub fn label(self) -> &'static str {
         match self {
             FetchProviderId::Bmd => "bmd",
-            FetchProviderId::Jina => "Jina",
             FetchProviderId::Firecrawl => "Firecrawl",
             FetchProviderId::Cloudflare => "Cloudflare Browser Run",
         }
@@ -88,9 +86,6 @@ impl FetchProviderId {
     pub fn auth(self) -> FetchAuth {
         match self {
             FetchProviderId::Bmd => FetchAuth::Mcp { server: "bmd" },
-            FetchProviderId::Jina => FetchAuth::ApiKey {
-                secret_var: "JINA_API_KEY",
-            },
             FetchProviderId::Firecrawl => FetchAuth::ApiKey {
                 secret_var: "FIRECRAWL_API_KEY",
             },
@@ -101,7 +96,7 @@ impl FetchProviderId {
     /// The per-provider option descriptors the settings UI renders generically.
     pub fn options(self) -> Vec<ProviderOption> {
         match self {
-            FetchProviderId::Bmd | FetchProviderId::Jina => Vec::new(),
+            FetchProviderId::Bmd => Vec::new(),
             FetchProviderId::Firecrawl => vec![ProviderOption::bool(
                 "onlyMainContent",
                 "Main content only",
@@ -292,8 +287,8 @@ mod tests {
             assert_eq!(FetchProviderId::from_id(id.as_str()), Some(id));
         }
         assert_eq!(
-            FetchProviderId::from_id("JINA"),
-            Some(FetchProviderId::Jina)
+            FetchProviderId::from_id("FIRECRAWL"),
+            Some(FetchProviderId::Firecrawl)
         );
         assert_eq!(FetchProviderId::from_id("ghost"), None);
     }
@@ -305,11 +300,11 @@ mod tests {
             FetchAuth::Mcp { server: "bmd" }
         );
         assert_eq!(
-            FetchProviderId::Jina.auth().secret_var(),
-            Some("JINA_API_KEY")
+            FetchProviderId::Firecrawl.auth().secret_var(),
+            Some("FIRECRAWL_API_KEY")
         );
         assert_eq!(FetchProviderId::Bmd.auth().mcp_server(), Some("bmd"));
-        assert_eq!(FetchProviderId::Jina.auth().kind(), "apiKey");
+        assert_eq!(FetchProviderId::Firecrawl.auth().kind(), "apiKey");
         assert_eq!(FetchProviderId::Cloudflare.auth(), FetchAuth::OAuth);
         assert_eq!(FetchProviderId::Cloudflare.auth().kind(), "oauth");
         assert_eq!(FetchProviderId::Cloudflare.auth().secret_var(), None);
