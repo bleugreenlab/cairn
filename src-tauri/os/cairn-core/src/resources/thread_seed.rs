@@ -4813,7 +4813,8 @@ mod tests {
     /// Tenet 1260's acceptance for digests, on a real history: composing the
     /// seed of the job with the most events leaves every checkpoint pass able
     /// to drain, no holder older than five seconds, and the log under its
-    /// ceiling. Run against an APFS clone of the live database set, never the
+    /// ceiling. Run against an APFS clone of the live database set, taken on
+    /// its volume and not kept (docs/database.md "Taking a census"), never the
     /// live file:
     ///
     /// ```text

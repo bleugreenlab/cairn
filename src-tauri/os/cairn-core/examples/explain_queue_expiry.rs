@@ -1,6 +1,7 @@
 //! Diagnostic probe: plan and time the runner-start queue expiry sweep against
 //! a (copied) Cairn database. Never open a live database; APFS-clone the db
-//! file (`cp -c`) and point this at the clone.
+//! file (`cp -c`, on the database's own volume) and point this at the clone,
+//! deleting it afterwards (docs/database.md "Taking a census").
 //!
 //! Usage: cargo run -p cairn-core --example explain_queue_expiry -- /path/to/db MODE...
 //!

@@ -4,8 +4,10 @@
 //! (`cairn_core::projects::export`), driven against a database file instead of
 //! the live instance. Use it when the app is quit, or against a copy-on-write
 //! clone of the live file set (`cp -c cairn.db cairn.db-log cairn.db-wal DIR/`
-//! on APFS), which costs no space and never opens the live file from a second
-//! process. The export holds no transaction across its run, but until its
+//! on APFS, with `DIR` on the database's volume), which never opens the live
+//! file from a second process. It is free only at first: it pins every page the
+//! live file rewrites afterwards, so do not keep it (docs/database.md "Taking a
+//! census"). The export holds no transaction across its run, but until its
 //! production-copy probe has passed, a cairn-sized project belongs on a clone
 //! rather than the live instance.
 //!

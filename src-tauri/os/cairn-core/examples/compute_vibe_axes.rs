@@ -25,7 +25,9 @@
 //!
 //! Without `CAIRN_DEVICE_JWT`, the anonymous device token stored in the copy
 //! is used; it decrypts only on the machine whose install wrote it. On macOS a
-//! copy-on-write clone (`cp -c`) of a large database costs no disk.
+//! copy-on-write clone (`cp -c`) on the database's own volume costs no disk at
+//! first, but pins the live file's rewritten pages for as long as it is kept
+//! (docs/database.md "Taking a census").
 
 use std::sync::{Arc, Mutex};
 

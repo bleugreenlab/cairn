@@ -1854,7 +1854,8 @@ mod tests {
     /// Tenet 1260's acceptance for export, on a real project: every checkpoint
     /// pass during the export drains, no holder is older than five seconds, the
     /// log stays under its ceiling, and no table's longest transaction reaches
-    /// two seconds. Run against an APFS clone of the live database set:
+    /// two seconds. Run against an APFS clone of the live database set, taken on
+    /// its volume and not kept (docs/database.md "Taking a census"):
     ///
     /// ```text
     /// cp -c cairn.db cairn.db-wal cairn.db-log /tmp/probe/

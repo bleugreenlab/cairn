@@ -7,7 +7,9 @@
 //!   cp -c ~/.cairn/cairn.db ~/.cairn/cairn.db-log ~/.cairn/cairn.db-wal <dir>/
 //!
 //! taken with the app quit (exact) or while it runs (approximate: the three
-//! files are cloned at slightly different instants). Every subcommand refuses
+//! files are cloned at slightly different instants), with `<dir>` on
+//! `~/.cairn`'s volume and then copied off it at once (docs/database.md
+//! "Taking a census"). Every subcommand refuses
 //! a database inside a live Cairn data directory. `fold` checkpoints the clone
 //! it is given; `delete-probe` clones its input again and deletes only from
 //! that sibling copy. `scripts/db-census.ts` drives every subcommand, caps

@@ -4459,7 +4459,8 @@ mod tests {
     /// The same three sidebar projections priced against a real database.
     ///
     /// Point `CAIRN_MEASURE_DB` at an APFS clone of a production database
-    /// (`cp -c ~/.cairn/cairn.db{,-log,-wal} $TMPDIR/...`), never at a live file:
+    /// (`cp -c ~/.cairn/cairn.db{,-log,-wal} $TMPDIR/...`; same volume, not kept:
+    /// docs/database.md "Taking a census"), never at a live file:
     ///
     /// ```text
     /// CAIRN_MEASURE_DB=$TMPDIR/clone/cairn.db \

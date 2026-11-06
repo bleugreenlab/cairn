@@ -5,6 +5,9 @@
 //!
 //!   cp -c ~/.cairn/cairn.db ~/.cairn/cairn.db-log ~/.cairn/cairn.db-wal <dir>/
 //!
+//! `<dir>` must be on `~/.cairn`'s volume, and the clone must not be kept beside
+//! the running database; docs/database.md "Taking a census" has the sequence.
+//!
 //! Every subcommand refuses a database inside a live Cairn data directory, any
 //! path not ending in `.db` (Turso names the logical log from the extension;
 //! cairn/5590), and an archive inside a live data directory. Each opens the

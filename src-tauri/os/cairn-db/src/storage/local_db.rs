@@ -3983,7 +3983,8 @@ mod tests {
     /// concurrent readers for D seconds each. Reports per-call p50/p99,
     /// connections opened, the peak live count (sampled every 10 ms), and what
     /// the free-list retains afterwards. Run against an APFS clone of a real
-    /// database, never the live file:
+    /// database, taken on its volume and not kept (docs/database.md "Taking a
+    /// census"), never the live file:
     ///
     /// ```text
     /// cp -c ~/.cairn/cairn.db* /tmp/probe/
