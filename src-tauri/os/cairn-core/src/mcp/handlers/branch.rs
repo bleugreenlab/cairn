@@ -289,6 +289,248 @@ pub(crate) struct RunBranchResolution {
     pub default_branch: String,
 }
 
+/// The stable code a retired-branch refusal leads with, so a tool report, a
+/// batch result and a held-commit note can all be recognised as the same
+/// refusal.
+pub(crate) const BRANCH_RETIRED: &str = "branch_retired";
+
+/// Why a job may no longer publish to the branch it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetirementCause {
+    /// The job's issue was merged.
+    IssueMerged,
+    /// The job's issue was closed without merging.
+    IssueClosed,
+    /// The job itself was archived: stopped for good rather than parked, which
+    /// is what a terminal resolution does to the work it settles, the work of
+    /// dependent issues included.
+    JobCancelled,
+    /// The session the publishing run belongs to was closed by a resolution.
+    /// A reopen continues the job in a successor session and leaves this one
+    /// closed, so work this run prepared before the resolution stays refused
+    /// after the reopen.
+    SessionClosed,
+}
+
+impl RetirementCause {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::IssueMerged => "issue_merged",
+            Self::IssueClosed => "issue_closed",
+            Self::JobCancelled => "job_cancelled",
+            Self::SessionClosed => "session_closed",
+        }
+    }
+}
+
+/// The refusal a stale writer gets instead of a sealed commit its branch will
+/// never carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchRetired {
+    pub branch: String,
+    pub job_id: String,
+    /// `project/number` of the job's issue, when it has one.
+    pub issue: Option<String>,
+    pub cause: RetirementCause,
+}
+
+impl std::fmt::Display for BranchRetired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let issue = self.issue.as_deref().unwrap_or("its issue");
+        let why = match self.cause {
+            RetirementCause::IssueMerged => format!("issue {issue} was merged"),
+            RetirementCause::IssueClosed => format!("issue {issue} was closed"),
+            RetirementCause::JobCancelled => {
+                "this session's work was stopped for good when its issue (or the issue it \
+                 builds on) resolved"
+                    .to_string()
+            }
+            RetirementCause::SessionClosed => format!(
+                "the session this work was prepared in was closed when {issue} resolved; if the \
+                 issue was reopened since, its work continues in a new session"
+            ),
+        };
+        // Written for a model that would otherwise retry, like `OwnBranchLost`:
+        // the terminal fact, that nothing moved, and what still works.
+        write!(
+            f,
+            "{BRANCH_RETIRED} ({cause}): branch `{branch}` no longer accepts commits from this \
+             session because {why}. Nothing was committed: no commit was sealed and the branch \
+             did not move. Retrying will not change this. Reading files and reading or writing \
+             cairn:// resources still work; put anything worth keeping in a comment on the \
+             issue, then end your turn.",
+            cause = self.cause.as_str(),
+            branch = self.branch,
+        )
+    }
+}
+
+/// Whether a job may still publish to its managed branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PublicationAuthority {
+    Authorized,
+    Retired(BranchRetired),
+    /// The job's lifecycle could not be read. Publication must not proceed on
+    /// an unknown answer, but nothing is retired either: the caller fails the
+    /// way it fails any retryable publication.
+    Unknown(String),
+}
+
+/// The one publication authority for a managed branch: may `job_id`, acting
+/// through `run_id`, still seal a commit onto, or advance the bookmark of,
+/// `branch`?
+///
+/// Every seal and bookmark advance asks this **under the store lock, right
+/// before it acts**. Terminal resolution records itself under that same lock
+/// (`issues::status::resolve_terminal`), so the two are ordered: a publication
+/// that holds the lock first completes before the issue resolves, and one that
+/// takes it after sees the resolution and is refused before anything moves.
+/// Asking anywhere earlier only narrows the window; it was a task's commit
+/// arriving minutes after its issue merged that stranded a bookmark the git
+/// export could no longer follow (cairn/6147). The commit-posture gate also
+/// asks it before a committing batch resolves its coordinate, so a branch whose
+/// coordinate cleanup already removed still answers with this refusal.
+///
+/// Job status alone is not the authority across a reopen: a reopen lifts the
+/// jobs a resolution cancelled and continues them in successor sessions on the
+/// same job ids. What stays retired is the session the resolution closed, so
+/// the originating run's session is checked as well. A run with no session,
+/// and a held delta recorded before held rows named their run, are judged by
+/// the job and issue alone.
+///
+/// A job with no row has no lifecycle to enforce here; every agent path reaches
+/// this with a job its authenticated run already resolved. `branch` names the
+/// branch in the refusal; `None` uses the job's own.
+pub(crate) async fn publication_authority(
+    dbs: &crate::db::DbState,
+    job_id: &str,
+    run_id: Option<&str>,
+    branch: Option<&str>,
+) -> PublicationAuthority {
+    match crate::execution::routing::routing_db_for_id(dbs, job_id).await {
+        Ok(db) => publication_authority_in(&db, job_id, run_id, branch).await,
+        Err(error) => PublicationAuthority::Unknown(error.to_string()),
+    }
+}
+
+pub(crate) async fn publication_authority_in(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    run_id: Option<&str>,
+    branch: Option<&str>,
+) -> PublicationAuthority {
+    let found = db
+        .query_opt(
+            "SELECT j.status, i.status, p.key, i.number, COALESCE(j.branch, j.base_branch)
+               FROM jobs j
+               JOIN projects p ON p.id = j.project_id
+               LEFT JOIN issues i ON i.id = j.issue_id
+              WHERE j.id = ?1",
+            params![job_id.to_string()],
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.opt_text(1)?,
+                    row.text(2)?,
+                    row.opt_i64(3)?,
+                    row.opt_text(4)?,
+                ))
+            },
+        )
+        .await;
+    let (job_status, issue_status, project_key, issue_number, job_branch) = match found {
+        Ok(Some(found)) => found,
+        Ok(None) => return PublicationAuthority::Authorized,
+        Err(error) => return PublicationAuthority::Unknown(error.to_string()),
+    };
+    let mut cause = match issue_status.as_deref() {
+        Some("merged") => Some(RetirementCause::IssueMerged),
+        Some("closed") => Some(RetirementCause::IssueClosed),
+        _ if job_status == "cancelled" => Some(RetirementCause::JobCancelled),
+        _ => None,
+    };
+    if let (None, Some(run_id)) = (cause, run_id) {
+        let session = db
+            .query_opt(
+                "SELECT s.status, s.terminal_reason
+                   FROM runs r JOIN sessions s ON s.id = r.session_id
+                  WHERE r.id = ?1",
+                params![run_id.to_string()],
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await;
+        match session {
+            Ok(Some((status, reason)))
+                if status == "closed"
+                    && matches!(reason.as_deref(), Some("issue_merged" | "issue_closed")) =>
+            {
+                cause = Some(RetirementCause::SessionClosed)
+            }
+            Ok(_) => {}
+            Err(error) => return PublicationAuthority::Unknown(error.to_string()),
+        }
+    }
+    match cause {
+        None => PublicationAuthority::Authorized,
+        Some(cause) => PublicationAuthority::Retired(BranchRetired {
+            branch: branch
+                .map(str::to_string)
+                .or(job_branch)
+                .unwrap_or_else(|| "this session's branch".to_string()),
+            job_id: job_id.to_string(),
+            issue: issue_number.map(|number| format!("{project_key}/{number}")),
+            cause,
+        }),
+    }
+}
+
+/// The authority for a held delta that does not name the run that sealed it
+/// (rows held before `held_publications.run_id` existed).
+///
+/// Its originating session cannot be proven. The row's `created_at` is when
+/// publication failed, not when the work began, so a batch that started before
+/// a resolution and outlived it is held after the session closed and no
+/// timestamp separates it from the successor's work. Every such row predates
+/// the column (new holds always name their run), so the fallback is
+/// conservative: once any resolution has closed a session of the job, the
+/// row's origin is ambiguous and it is refused. It keeps its recovery ref, so
+/// the work stays reachable by hand. Asked in addition to
+/// [`publication_authority`], which still judges job and issue.
+pub(crate) async fn unattributed_held_authority(
+    dbs: &crate::db::DbState,
+    job_id: &str,
+    branch: &str,
+) -> PublicationAuthority {
+    let db = match crate::execution::routing::routing_db_for_id(dbs, job_id).await {
+        Ok(db) => db,
+        Err(error) => return PublicationAuthority::Unknown(error.to_string()),
+    };
+    let closed = db
+        .query_opt(
+            "SELECT p.key, i.number
+               FROM sessions s
+               JOIN jobs j ON j.id = s.job_id
+               JOIN projects p ON p.id = j.project_id
+               LEFT JOIN issues i ON i.id = j.issue_id
+              WHERE s.job_id = ?1 AND s.status = 'closed'
+                AND s.terminal_reason IN ('issue_merged', 'issue_closed')
+              LIMIT 1",
+            params![job_id.to_string()],
+            |row| Ok((row.text(0)?, row.opt_i64(1)?)),
+        )
+        .await;
+    match closed {
+        Ok(None) => PublicationAuthority::Authorized,
+        Ok(Some((project_key, number))) => PublicationAuthority::Retired(BranchRetired {
+            branch: branch.to_string(),
+            job_id: job_id.to_string(),
+            issue: number.map(|number| format!("{project_key}/{number}")),
+            cause: RetirementCause::SessionClosed,
+        }),
+        Err(error) => PublicationAuthority::Unknown(error.to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BranchRefResolutionError {
     Invalid {
@@ -827,7 +1069,87 @@ fn job_context_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<
 
 #[cfg(test)]
 mod tests {
-    use super::{map_own_coordinate_error, resolve_job_rev, BranchRefResolutionError};
+    use super::{
+        map_own_coordinate_error, publication_authority_in, resolve_job_rev,
+        BranchRefResolutionError, PublicationAuthority, RetirementCause, BRANCH_RETIRED,
+    };
+
+    async fn authority_db(issue_status: &str, job_status: &str) -> crate::storage::LocalDb {
+        let db = crate::storage::migrated_test_db("publication-authority.db").await;
+        db.execute_script(&format!(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p-1', 'w', 'Proj', 'proj', '/tmp/proj', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('issue-1', 'p-1', 7, 'Issue', '{issue_status}', 'idle', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, node_name, status, branch, created_at, updated_at)
+             VALUES('job-1', 'p-1', 'issue-1', 'builder', '{job_status}', 'agent/proj-7-builder-0', 1, 1);
+            "
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    /// A live job on an open issue publishes; nothing about the branch changed.
+    #[tokio::test]
+    async fn a_live_job_on_an_open_issue_may_publish() {
+        let db = authority_db("active", "running").await;
+        assert_eq!(
+            publication_authority_in(&db, "job-1", None, Some("agent/proj-7-builder-0")).await,
+            PublicationAuthority::Authorized
+        );
+    }
+
+    /// A merged or closed issue retires its branch for every job on it, the
+    /// ones the resolution only parked as much as the ones it cancelled.
+    #[tokio::test]
+    async fn a_resolved_issue_retires_the_branch_with_its_resolution_as_cause() {
+        for (status, job_status, cause) in [
+            ("merged", "complete", RetirementCause::IssueMerged),
+            ("merged", "cancelled", RetirementCause::IssueMerged),
+            ("closed", "running", RetirementCause::IssueClosed),
+        ] {
+            let db = authority_db(status, job_status).await;
+            let PublicationAuthority::Retired(retired) =
+                publication_authority_in(&db, "job-1", None, Some("agent/proj-7-builder-0")).await
+            else {
+                panic!("{status}/{job_status}: expected the branch to be retired");
+            };
+            assert_eq!(retired.cause, cause, "{status}/{job_status}");
+            assert_eq!(retired.issue.as_deref(), Some("proj/7"));
+            let text = retired.to_string();
+            assert!(text.starts_with(BRANCH_RETIRED), "{text}");
+            assert!(text.contains("Nothing was committed"), "{text}");
+            assert!(text.contains("agent/proj-7-builder-0"), "{text}");
+        }
+    }
+
+    /// An archived job on an open issue is refused: archival is how a
+    /// resolution settles a dependent issue's work, whose own issue stays open.
+    /// (A reopen lifts resolution cancellations; what then stays refused is the
+    /// closed session, pinned in `issues::status` tests.)
+    #[tokio::test]
+    async fn a_cancelled_job_on_an_open_issue_is_refused() {
+        let db = authority_db("active", "cancelled").await;
+        let PublicationAuthority::Retired(retired) =
+            publication_authority_in(&db, "job-1", None, Some("agent/proj-7-builder-0")).await
+        else {
+            panic!("a cancelled job must not publish");
+        };
+        assert_eq!(retired.cause, RetirementCause::JobCancelled);
+    }
+
+    /// A job with no row has no lifecycle to enforce.
+    #[tokio::test]
+    async fn an_unknown_job_is_not_refused() {
+        let db = authority_db("active", "running").await;
+        assert_eq!(
+            publication_authority_in(&db, "job-missing", None, Some("main")).await,
+            PublicationAuthority::Authorized
+        );
+    }
 
     fn absent(coordinate: &str) -> cairn_vcs::CoordinateResolutionError {
         cairn_vcs::CoordinateResolutionError::Absent {

@@ -2,11 +2,8 @@
 //! store initialization and bounded command execution.
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-#[cfg(test)]
-use std::sync::Mutex;
 
 use crate::PublicationIdentity;
 
@@ -21,6 +18,19 @@ pub const BACKGROUND_RECONCILE_BUDGET: Duration = Duration::from_secs(10);
 /// Rollback has its own allowance: an expired forward budget cannot prevent undo.
 const RECONCILE_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
 
+/// Do not start another forward subprocess with only a scheduling sliver left.
+/// Cleanup is deliberately exempt so this guard cannot prevent rollback.
+pub const JJ_FORWARD_SUBPROCESS_MINIMUM: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct OperationPhase {
+    context: String,
+    duration: Duration,
+    cleanup: bool,
+    spawned: bool,
+    outcome: String,
+}
+
 pub(crate) const JJ_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) use cairn_platform::process::{
     bounded_command_output, NETWORK_TIMEOUT as JJ_NETWORK_TIMEOUT,
@@ -32,6 +42,7 @@ pub struct JjEnv {
     pub(super) operation_deadline: Option<Instant>,
     cleanup_deadline: Arc<OnceLock<Instant>>,
     is_cleanup: bool,
+    operation_phases: Option<Arc<Mutex<Vec<OperationPhase>>>>,
     bin: String,
     config_path: PathBuf,
     pub(super) checkout_repair_policy: crate::checkout::CheckoutRepairPolicy,
@@ -54,15 +65,91 @@ impl JjEnv {
         scoped.operation_deadline = Some(Instant::now() + budget);
         scoped.cleanup_deadline = Default::default();
         scoped.is_cleanup = false;
+        scoped.operation_phases = Some(Default::default());
         scoped
     }
 
-    pub(super) fn check_operation_budget(&self, ctx: &str) -> Result<(), String> {
-        if self
+    /// Start a distinct transaction after a conflict was successfully rolled back.
+    /// The caller must prove rollback and export completed, not merely started;
+    /// this environment cannot establish that store-level fact. Never use this
+    /// after a failed or timed-out transaction or an incomplete rollback.
+    ///
+    /// The successor shares the original absolute forward deadline and trace,
+    /// but owns a new cleanup scope. Old transaction clones remain barred.
+    pub fn next_transaction_after_restored_conflict(&self) -> Result<Self, String> {
+        if self.is_cleanup {
+            return Err(
+                "cannot start a successor transaction from a cleanup environment".to_string(),
+            );
+        }
+        let deadline = self
             .operation_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(format!("{ctx} timed out: operation budget exhausted"));
+            .ok_or_else(|| "a successor transaction requires an operation budget".to_string())?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < JJ_FORWARD_SUBPROCESS_MINIMUM {
+            return Err(format!(
+                "next transaction timed out: operation budget exhausted before spawning; remaining {:.3}ms, minimum {:.3}ms",
+                remaining.as_secs_f64() * 1000.0,
+                JJ_FORWARD_SUBPROCESS_MINIMUM.as_secs_f64() * 1000.0,
+            ));
+        }
+        if self.cleanup_deadline.get().is_none() {
+            return Err("a successor transaction requires a prior conflict rollback".to_string());
+        }
+        let mut successor = self.clone();
+        successor.cleanup_deadline = Default::default();
+        Ok(successor)
+    }
+
+    /// Completed subprocess phases for this operation, including rejected admission
+    /// and cleanup. Clones share the trace; a new operation budget starts a new one.
+    /// Unbudgeted environments do not accumulate an unbounded lifetime trace.
+    pub fn operation_phase_summary(&self) -> String {
+        let Some(phases) = &self.operation_phases else {
+            return "no subprocess phases recorded".to_string();
+        };
+        let phases = phases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if phases.is_empty() {
+            return "no subprocess phases recorded".to_string();
+        }
+        phases
+            .iter()
+            .map(|phase| {
+                format!(
+                    "{} [{}; {}] {:.3}ms: {}",
+                    phase.context,
+                    if phase.cleanup { "cleanup" } else { "forward" },
+                    if phase.spawned {
+                        "spawn attempted"
+                    } else {
+                        "not spawned"
+                    },
+                    phase.duration.as_secs_f64() * 1000.0,
+                    phase.outcome,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    pub(super) fn check_operation_budget(&self, ctx: &str) -> Result<(), String> {
+        if let Some(deadline) = self.operation_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // Outer transaction checks must agree with subprocess admission:
+            // classification cannot fail at the minimum and leave a rewrite
+            // committed merely because the absolute deadline has not passed.
+            if !self.is_cleanup && remaining < JJ_FORWARD_SUBPROCESS_MINIMUM {
+                return Err(format!(
+                    "{ctx} timed out: operation budget exhausted; remaining {:.3}ms, minimum {:.3}ms",
+                    remaining.as_secs_f64() * 1000.0,
+                    JJ_FORWARD_SUBPROCESS_MINIMUM.as_secs_f64() * 1000.0,
+                ));
+            }
+            if remaining.is_zero() {
+                return Err(format!("{ctx} timed out: operation budget exhausted"));
+            }
         }
         Ok(())
     }
@@ -90,28 +177,56 @@ impl JjEnv {
         timeout: Duration,
         ctx: &str,
     ) -> Result<std::process::Output, String> {
-        let timeout = match self.operation_deadline {
-            Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(format!(
-                        "{ctx} timed out: operation budget exhausted before spawning"
-                    ));
+        let started = Instant::now();
+        let mut spawned = false;
+        let result = (|| {
+            let timeout = match self.operation_deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if !self.is_cleanup && remaining < JJ_FORWARD_SUBPROCESS_MINIMUM {
+                        return Err(format!(
+                            "{ctx} timed out: operation budget exhausted before spawning; insufficient remainder: remaining {:.3}ms, minimum {:.3}ms",
+                            remaining.as_secs_f64() * 1000.0,
+                            JJ_FORWARD_SUBPROCESS_MINIMUM.as_secs_f64() * 1000.0,
+                        ));
+                    }
+                    if remaining.is_zero() {
+                        return Err(format!(
+                            "{ctx} timed out: operation budget exhausted before spawning"
+                        ));
+                    }
+                    timeout.min(remaining)
                 }
-                timeout.min(remaining)
+                None => timeout,
+            };
+            if !self.is_cleanup && self.cleanup_deadline.get().is_some() {
+                return Err(format!(
+                    "{ctx} timed out: operation budget exhausted; cleanup has started before spawning"
+                ));
             }
-            None => timeout,
-        };
-        if !self.is_cleanup && self.cleanup_deadline.get().is_some() {
-            return Err(format!(
-                "{ctx} timed out: operation budget exhausted; cleanup has started before spawning"
-            ));
+            self.check_operation_budget(ctx)
+                .map_err(|error| format!("{error} before spawning"))?;
+            spawned = true;
+            let output = bounded_command_output(command, timeout, ctx)?;
+            self.check_operation_budget(ctx)?;
+            Ok(output)
+        })();
+        if let Some(phases) = &self.operation_phases {
+            phases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(OperationPhase {
+                    context: ctx.to_string(),
+                    duration: started.elapsed(),
+                    cleanup: self.is_cleanup,
+                    spawned,
+                    outcome: match &result {
+                        Ok(output) => format!("exit {}", output.status),
+                        Err(error) => error.clone(),
+                    },
+                });
         }
-        self.check_operation_budget(ctx)
-            .map_err(|error| format!("{error} before spawning"))?;
-        let output = bounded_command_output(command, timeout, ctx)?;
-        self.check_operation_budget(ctx)?;
-        Ok(output)
+        result
     }
 
     /// Set the host's policy for repairing a checkout detached by an export.
@@ -135,6 +250,7 @@ impl JjEnv {
             operation_deadline: None,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
+            operation_phases: None,
             checkout_repair_policy: Default::default(),
         }
     }
@@ -152,6 +268,7 @@ impl JjEnv {
             operation_deadline: None,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
+            operation_phases: None,
             checkout_repair_policy: Default::default(),
         }
     }
@@ -961,6 +1078,7 @@ mod tests {
             operation_deadline: None,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
+            operation_phases: None,
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -1013,6 +1131,7 @@ mod tests {
             operation_deadline: None,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
+            operation_phases: None,
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -1054,6 +1173,7 @@ mod tests {
             operation_deadline: None,
             cleanup_deadline: Default::default(),
             is_cleanup: false,
+            operation_phases: None,
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -1191,6 +1311,7 @@ mod operation_budget_tests {
     #[test]
     #[serial_test::serial(jj)]
     fn operation_budget_stderr_and_shorter_command_timeout_are_bounded() {
+        let _ = cairn_platform::env::get_user_path();
         let home = TempDir::new().unwrap();
         let script = home.path().join("slow");
         std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
@@ -1198,7 +1319,7 @@ mod operation_budget_tests {
         let original = JjEnv::with_binary(script.to_string_lossy(), home.path());
         let started = Instant::now();
         let error = original
-            .with_operation_budget(Duration::from_millis(100))
+            .with_operation_budget(Duration::from_millis(250))
             .run_capturing_stderr(home.path(), &[], "bounded stderr")
             .unwrap_err();
         assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
@@ -1265,6 +1386,9 @@ mod cleanup_transition_tests {
 
     #[test]
     fn operation_budget_cleanup_stops_forward_retries_on_existing_clones() {
+        // Command construction resolves the login-shell PATH once per process;
+        // that cold probe must not consume the cleanup window under test.
+        let _ = cairn_platform::env::get_user_path();
         let temp = tempfile::tempdir().unwrap();
         let original = JjEnv::with_binary("unused-jj", temp.path());
         let forward = original.with_operation_budget(Duration::from_secs(30));

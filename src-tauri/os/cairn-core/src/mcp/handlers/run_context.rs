@@ -305,9 +305,23 @@ pub(crate) async fn commit_posture_refusal(
     if required_run_id(request).is_err() {
         return None;
     }
-    match lookup_run_routed(dbs, request).await {
-        Ok((context, db)) => crate::threads::commit_refusal_for_job(&db, &context.job_id).await,
-        Err(error) => Some(unresolvable_identity_refusal(&error)),
+    let (context, db) = match lookup_run_routed(dbs, request).await {
+        Ok(routed) => routed,
+        Err(error) => return Some(unresolvable_identity_refusal(&error)),
+    };
+    if let Some(refusal) = crate::threads::commit_refusal_for_job(&db, &context.job_id).await {
+        return Some(refusal);
+    }
+    // Early feedback only: a committing batch whose branch is already retired
+    // is told so before it resolves a coordinate that cleanup may have removed
+    // (which would otherwise answer as a lost or unresolvable branch). The
+    // authoritative check still runs under the store lock before any seal; an
+    // unreadable lifecycle is left to it.
+    match super::branch::publication_authority_in(&db, &context.job_id, Some(&context.run_id), None)
+        .await
+    {
+        super::branch::PublicationAuthority::Retired(retired) => Some(retired.to_string()),
+        _ => None,
     }
 }
 
@@ -576,6 +590,29 @@ mod tests {
                 .await
                 .is_none(),
             "an ordinary issue job still commits"
+        );
+    }
+
+    /// A committing batch on a retired branch hears so at the gate, before it
+    /// resolves a coordinate that cleanup may already have removed.
+    #[tokio::test]
+    async fn a_run_on_a_resolved_issue_is_told_its_branch_retired_before_resolution() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+        dbs.local
+            .execute("UPDATE issues SET status = 'merged' WHERE id = 'i'", ())
+            .await
+            .unwrap();
+        let refusal = commit_posture_refusal(&dbs, &request_for_run("r"))
+            .await
+            .expect("a merged issue's branch takes no commits");
+        assert!(
+            refusal.starts_with("branch_retired (issue_merged)"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("agent/test") && refusal.contains("prj/7"),
+            "{refusal}"
         );
     }
 

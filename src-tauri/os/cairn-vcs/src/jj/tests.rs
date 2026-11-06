@@ -13349,3 +13349,405 @@ fn operation_budget_killed_seal_restores_preseal_graph_without_orphan() {
 fn operation_budget_committed_lock_failure_is_restored_once_without_forward_retry() {
     assert_rebase_deadline_is_safe("committed-lock-error");
 }
+
+#[cfg(unix)]
+fn admission_marker_env(home: &Path) -> (JjEnv, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    // A fresh test process can spend three seconds probing its login-shell PATH.
+    // Resolve it before callers start budgets meant to measure the marker child.
+    let _ = cairn_platform::env::get_user_path();
+    let script = home.join("admission-jj");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf x >> \"$1\"\nsleep \"$2\"\nexit \"$3\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (
+        JjEnv::with_binary(script.to_string_lossy(), home),
+        home.join("spawn-marker"),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_minimum_rejects_before_spawn_and_records_admission() {
+    let home = tempfile::tempdir().unwrap();
+    let (original, marker) = admission_marker_env(home.path());
+    let budgeted = original.with_operation_budget(Duration::from_millis(18));
+    let error = budgeted
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0", "0"],
+            "forward below minimum",
+        )
+        .unwrap_err();
+    assert!(is_jj_timeout_error(&error), "{error}");
+    assert!(error.contains("forward below minimum"), "{error}");
+    assert!(
+        error.contains("remaining") && error.contains("minimum 100.000ms"),
+        "{error}"
+    );
+    assert!(error.contains("before spawning"), "{error}");
+    let outer_error = budgeted
+        .check_operation_budget("outer final check")
+        .unwrap_err();
+    assert!(is_jj_timeout_error(&outer_error), "{outer_error}");
+    assert!(outer_error.contains("minimum 100.000ms"), "{outer_error}");
+    assert!(
+        !marker.exists(),
+        "admission must reject before executing the marker"
+    );
+    let summary = budgeted.operation_phase_summary();
+    assert!(
+        summary.contains("forward below minimum [forward; not spawned]"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("ms:") && summary.contains("minimum 100.000ms"),
+        "{summary}"
+    );
+    assert_eq!(
+        original.operation_phase_summary(),
+        "no subprocess phases recorded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_phase_trace_is_shared_reset_and_measures_completed_commands() {
+    let home = tempfile::tempdir().unwrap();
+    let (original, marker) = admission_marker_env(home.path());
+    let scoped = original.with_operation_budget(Duration::from_secs(30));
+    let clone = scoped.clone();
+    assert_eq!(scoped.operation_deadline, clone.operation_deadline);
+    clone
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0.05", "0"],
+            "measured forward",
+        )
+        .unwrap();
+    let error = scoped
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0", "7"],
+            "failed forward",
+        )
+        .unwrap_err();
+    assert!(error.contains("failed forward failed"), "{error}");
+    let cleanup = scoped.cleanup_env();
+    cleanup
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0", "0"],
+            "measured rollback",
+        )
+        .unwrap();
+    let summary = clone.operation_phase_summary();
+    assert_eq!(summary, scoped.operation_phase_summary());
+    assert_eq!(summary, cleanup.operation_phase_summary());
+    assert!(
+        summary.contains("measured rollback [cleanup; spawn attempted]"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("failed forward [forward; spawn attempted]"),
+        "{summary}"
+    );
+    let duration: f64 = summary
+        .split("measured forward [forward; spawn attempted] ")
+        .nth(1)
+        .unwrap()
+        .split("ms:")
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        duration >= 50.0,
+        "phase must measure subprocess execution: {summary}"
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), b"xxx");
+    assert_eq!(
+        clone.operation_deadline, scoped.operation_deadline,
+        "commands must not renew the deadline"
+    );
+    assert_eq!(
+        scoped
+            .with_operation_budget(Duration::from_secs(30))
+            .operation_phase_summary(),
+        "no subprocess phases recorded",
+    );
+    assert_eq!(
+        original.operation_phase_summary(),
+        "no subprocess phases recorded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_cleanup_below_forward_minimum_still_attempts_spawn() {
+    let home = tempfile::tempdir().unwrap();
+    let forward = JjEnv::with_binary("unused", home.path()).with_operation_budget(Duration::ZERO);
+    let mut cleanup = forward.cleanup_env();
+    // A missing executable gives deterministic evidence of reaching spawn even
+    // when a loaded executor cannot schedule a marker process in this interval.
+    cleanup.operation_deadline =
+        Some(std::time::Instant::now() + JJ_FORWARD_SUBPROCESS_MINIMUM / 2);
+    let mut command = std::process::Command::new(home.path().join("missing-executable"));
+    let error = cleanup
+        .command_output(&mut command, Duration::from_secs(30), "short cleanup")
+        .unwrap_err();
+    assert!(
+        !is_jj_timeout_error(&error),
+        "cleanup must reach spawn, not minimum admission: {error}"
+    );
+    let summary = forward.operation_phase_summary();
+    assert!(
+        summary.contains("short cleanup [cleanup; spawn attempted]"),
+        "{summary}"
+    );
+    assert!(!summary.contains("minimum"), "{summary}");
+    cleanup.operation_deadline = Some(std::time::Instant::now() + Duration::from_millis(18));
+    assert!(cleanup
+        .check_operation_budget("cleanup final check")
+        .is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_phase_trace_includes_timeout_and_expired_clone_admission() {
+    let home = tempfile::tempdir().unwrap();
+    let (original, marker) = admission_marker_env(home.path());
+    let budgeted = original.with_operation_budget(Duration::from_secs(3));
+    let clone = budgeted.clone();
+    let error = budgeted
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "30", "0"],
+            "timed subprocess",
+        )
+        .unwrap_err();
+    assert!(is_jj_timeout_error(&error), "{error}");
+    assert!(marker.exists(), "the timeout must follow an admitted spawn");
+    let error = clone
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0", "0"],
+            "expired clone",
+        )
+        .unwrap_err();
+    assert!(error.contains("before spawning"), "{error}");
+    assert_eq!(
+        std::fs::read(marker).unwrap(),
+        b"x",
+        "clone must not renew deadline"
+    );
+    let summary = budgeted.operation_phase_summary();
+    assert!(
+        summary.contains("timed subprocess [forward; spawn attempted]"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("expired clone [forward; not spawned]"),
+        "{summary}"
+    );
+    assert!(summary.contains("timed out"), "{summary}");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_successor_preserves_deadline_trace_and_old_cleanup_barriers() {
+    let home = tempfile::tempdir().unwrap();
+    let (original, marker) = admission_marker_env(home.path());
+    let forward = original.with_operation_budget(Duration::from_secs(30));
+    let old_clone = forward.clone();
+    let cleanup = forward.cleanup_env();
+    cleanup
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0", "0"],
+            "first restored conflict",
+        )
+        .unwrap();
+    let successor = forward.next_transaction_after_restored_conflict().unwrap();
+    assert_eq!(successor.operation_deadline, forward.operation_deadline);
+    assert_eq!(
+        successor.operation_phase_summary(),
+        cleanup.operation_phase_summary()
+    );
+    assert!(
+        successor
+            .next_transaction_after_restored_conflict()
+            .is_err(),
+        "successor has not rolled back"
+    );
+    successor
+        .clone()
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0", "0"],
+            "structural successor",
+        )
+        .unwrap();
+    for old in [&forward, &old_clone] {
+        let error = old
+            .run(
+                home.path(),
+                &[marker.to_str().unwrap(), "0", "0"],
+                "old transaction retry",
+            )
+            .unwrap_err();
+        assert!(error.contains("cleanup has started"), "{error}");
+    }
+    assert_eq!(std::fs::read(&marker).unwrap(), b"xx");
+    assert_eq!(
+        successor.operation_phase_summary(),
+        old_clone.operation_phase_summary()
+    );
+    let summary = forward.operation_phase_summary();
+    assert!(
+        summary.contains("first restored conflict [cleanup; spawn attempted]"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("structural successor [forward; spawn attempted]"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("old transaction retry [forward; not spawned]"),
+        "{summary}"
+    );
+
+    let successor_cleanup = successor.cleanup_env();
+    let next = successor
+        .next_transaction_after_restored_conflict()
+        .unwrap();
+    assert_eq!(next.operation_deadline, forward.operation_deadline);
+    assert_eq!(
+        next.operation_phase_summary(),
+        successor_cleanup.operation_phase_summary()
+    );
+    assert!(successor
+        .run(
+            home.path(),
+            &[marker.to_str().unwrap(), "0", "0"],
+            "closed successor retry",
+        )
+        .unwrap_err()
+        .contains("cleanup has started"));
+}
+
+#[test]
+fn operation_budget_successor_rejects_cleanup_expiry_and_insufficient_remainder() {
+    let home = tempfile::tempdir().unwrap();
+    let original = JjEnv::with_binary("unused", home.path());
+    assert!(original.next_transaction_after_restored_conflict().is_err());
+    let forward = original.with_operation_budget(Duration::from_secs(30));
+    assert!(forward.next_transaction_after_restored_conflict().is_err());
+    assert!(forward
+        .cleanup_env()
+        .next_transaction_after_restored_conflict()
+        .is_err());
+    for budget in [Duration::ZERO, Duration::from_millis(18)] {
+        let short = original.with_operation_budget(budget);
+        let _cleanup = short.cleanup_env();
+        let error = match short.next_transaction_after_restored_conflict() {
+            Ok(_) => panic!("an exhausted or subminimum operation must not be revived"),
+            Err(error) => error,
+        };
+        assert!(is_jj_timeout_error(&error), "{error}");
+        assert!(
+            error.contains("remaining") && error.contains("minimum 100.000ms"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_subminimum_classification_restores_successful_rebase() {
+    let Some(bin) = jj_bin() else {
+        panic!("jj required for rollback regression")
+    };
+    let fx = replay_lock_fixture(&bin);
+    let before = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
+    let before_git = git_stdout(fx.proj.path(), &["rev-parse", fx.branch]);
+    let count_before = count_commits(&fx.jj, &fx.store, "all()");
+    let budgeted = fx.jj.with_operation_budget(Duration::from_secs(10));
+    let deadline = budgeted.operation_deadline.unwrap();
+    let probe = budgeted.clone();
+    let unbudgeted = fx.jj.clone();
+    let store = fx.store.clone();
+    let project = fx.proj.path().to_path_buf();
+    let branch = fx.branch.to_string();
+    let pre_tip = before.clone();
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = reached.clone();
+    at_step("reconcile: before classification", move || {
+        let moved = bookmark_commit(&unbudgeted, &store, &branch).unwrap();
+        assert_ne!(
+            moved, pre_tip,
+            "rebase must actually mutate before classification"
+        );
+        assert_eq!(
+            git_stdout(&project, &["rev-parse", &branch]),
+            moved,
+            "export must also complete"
+        );
+        let target = deadline - Duration::from_millis(80);
+        std::thread::sleep(target.saturating_duration_since(std::time::Instant::now()));
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero() && remaining < JJ_FORWARD_SUBPROCESS_MINIMUM,
+            "must exercise a positive subminimum remainder, not ordinary deadline expiry: {remaining:?}");
+        let error = probe
+            .check_operation_budget("outer classification budget")
+            .unwrap_err();
+        assert!(is_jj_timeout_error(&error), "{error}");
+        observed.set(true);
+    });
+    let report = reconcile_siblings_without_publication(
+        &budgeted,
+        &fx.store,
+        "main",
+        &[fx.branch.to_string()],
+    )
+    .unwrap();
+    assert!(reached.get(), "must reach classification after mutation");
+    assert!(
+        report.rebased_clean.is_empty() && report.conflicted.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(
+        reconcile_failure_kind(&report.failed[0].error),
+        RECONCILE_TIMEOUT,
+        "{report:?}"
+    );
+    assert!(
+        !report.failed[0].error.contains(ROLLBACK_INCOMPLETE),
+        "{report:?}"
+    );
+    assert_eq!(bookmark_commit(&fx.jj, &fx.store, fx.branch), Some(before));
+    assert_eq!(
+        git_stdout(fx.proj.path(), &["rev-parse", fx.branch]),
+        before_git
+    );
+    assert_eq!(
+        count_commits(&fx.jj, &fx.store, "all()"),
+        count_before,
+        "rollback must not leave the rewritten commit visible"
+    );
+    let summary = budgeted.operation_phase_summary();
+    assert!(
+        summary.contains("[forward; not spawned]") && summary.contains("minimum 100.000ms"),
+        "{summary}"
+    );
+    assert!(summary.contains("[cleanup; spawn attempted]"), "{summary}");
+}

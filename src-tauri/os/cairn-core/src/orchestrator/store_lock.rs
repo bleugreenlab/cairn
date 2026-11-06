@@ -598,6 +598,16 @@ impl Drop for JjStoreWaiterRegistration {
     }
 }
 
+/// How a lifecycle edge is ordered against a store's publications
+/// ([`Orchestrator::acquire_jj_store_lock_for_edge`]).
+#[must_use = "the edge is ordered only while the hold lives"]
+pub enum EdgeHold {
+    /// This call took the lock; the edge is ordered while this lives.
+    Acquired(JjStoreGuard),
+    /// The calling task already holds the lock, which orders the edge.
+    HeldByThisTask,
+}
+
 pub struct JjStoreGuard {
     _guard: PriorityGuard,
     trace: JjStoreOperationTrace,
@@ -608,6 +618,13 @@ pub struct JjStoreGuard {
 impl JjStoreGuard {
     pub(crate) fn trace(&self) -> JjStoreOperationTrace {
         self.trace.clone()
+    }
+
+    /// Snapshot the same ledger used by the hold log for a durable requester
+    /// diagnostic, before dropping the guard consumes it.
+    pub(crate) fn phase_summary(&self) -> String {
+        let hold = self.trace.hold.lock().unwrap();
+        describe_hold(self.acquired_at.elapsed(), self.waited, &hold.phases)
     }
 
     pub(crate) fn phase(&self, phase: impl Into<Arc<str>>) -> JjStorePhaseTimer {
@@ -775,8 +792,38 @@ impl Orchestrator {
         .await
     }
 
+    /// Take `store_dir`'s lock to order a lifecycle edge against publication,
+    /// for a caller that may already be inside a hold of it.
+    ///
+    /// Either way the edge is ordered: it waits for the lock, without a
+    /// timeout, or this task already holds it, and then every publication on
+    /// the store is ordered against the edge by that same hold (acquiring again
+    /// would panic on the reentrancy guard). There is no third answer. A
+    /// timeout cannot prove the holder is waiting on this edge, and recording
+    /// the edge without the lock is exactly the unordered state it exists to
+    /// prevent: a publisher that took the lock and passed its authority check
+    /// would still be sealing.
+    pub(crate) async fn acquire_jj_store_lock_for_edge(
+        &self,
+        store_dir: &Path,
+        operation: impl Into<String>,
+    ) -> EdgeHold {
+        let store = store_dir.to_string_lossy().into_owned();
+        let current_task = tokio::task::try_id();
+        let held_by_this_task = current_task.is_some() && {
+            let metrics = self.jj_store_lock_metrics.lock().unwrap();
+            metrics.get(&store).and_then(|metrics| metrics.current_task) == current_task
+        };
+        if held_by_this_task {
+            return EdgeHold::HeldByThisTask;
+        }
+        EdgeHold::Acquired(
+            self.acquire_jj_store_lock(store_dir, StoreLockClass::Foreground, operation)
+                .await,
+        )
+    }
+
     /// The operations queued on a store's lock, in service order.
-    #[cfg(feature = "test-utils")]
     pub fn jj_store_lock_waiters_for_test(&self, store_dir: &Path) -> Vec<String> {
         self.store_lock_status(store_dir)
             .map(|status| {

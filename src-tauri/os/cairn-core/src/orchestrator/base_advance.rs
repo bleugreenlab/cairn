@@ -514,8 +514,8 @@ impl CarryPlan {
 /// that still parses. An incoming hunk is therefore always kept: merged in,
 /// merged structurally, or the replay is refused.
 ///
-/// The committed side is the tip the request was assessed at; the rebase
-/// refuses if the branch has moved off it since.
+/// The committed side is the assessed tip. Deferred requests re-assess the
+/// current tip before constructing this plan; the rebase still pins that tip.
 fn plan_resolution_carry(
     jj: &crate::jj::JjEnv,
     store: &Path,
@@ -629,7 +629,107 @@ fn plan_resolution_carry(
     })
 }
 
+/// A deferred ask authorizes a new assessment, not reuse of an old tip's proof.
+/// Run under the mutation guard so the assessed tip is the one carried.
+fn plan_current_requested_resolution(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    session: &crate::orchestrator::conflict_session::ConflictSession,
+    destination: &str,
+    live_tip: &str,
+    drop_incoming_reason: Option<&str>,
+) -> Result<
+    (
+        CarryPlan,
+        crate::orchestrator::conflict_session::ResolutionBasis,
+    ),
+    String,
+> {
+    use crate::orchestrator::conflict_session::{ReplayDecision, RestoreProof};
+    let proof = crate::orchestrator::conflict_session::assess_session_tip_exhaustively(
+        jj,
+        store,
+        session,
+        drop_incoming_reason,
+    );
+    match crate::orchestrator::conflict_session::decide_replay(&proof, drop_incoming_reason) {
+        ReplayDecision::Refuse(refusal) => return Err(refusal),
+        ReplayDecision::Proceed => {}
+        ReplayDecision::ProceedOnStatedReason(caveat) => {
+            log::warn!(
+                "requested replay of `{}` proceeds on its retained statement: {caveat}",
+                session.bookmark
+            );
+        }
+    }
+    let mut current = session.clone();
+    if let RestoreProof::Assessed(assessment) = proof {
+        if assessment.tip != live_tip {
+            return Err(
+                "the branch moved during its resolution assessment; no resolution was carried"
+                    .into(),
+            );
+        }
+        current.resolution_basis.extend(assessment.attested);
+    }
+    current.replay_requested_tip = Some(live_tip.to_string());
+    let basis = current.resolution_basis_at(jj, store, live_tip)?;
+    plan_resolution_carry(jj, store, &current, destination, live_tip).map(|plan| (plan, basis))
+}
+
 const ROLLED_BACK_CONFLICT: &str = "rolled_back_conflict";
+
+/// One cumulative allowance for owner-requested resolution carry, rebase,
+/// export and ancestry healing, rather than renewing the old command limit.
+const EXPLICIT_REPLAY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn replay_is_explicit_for(label: &str, branch: &str) -> bool {
+    label.strip_prefix("replay requested for ") == Some(branch)
+        || label.strip_prefix("resolved replay requested for ") == Some(branch)
+}
+
+#[cfg(test)]
+static EXPLICIT_REPLAY_TEST_BUDGETS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, std::time::Duration>>,
+> = std::sync::OnceLock::new();
+
+fn explicit_replay_budget_for_store(_store: &Path) -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = EXPLICIT_REPLAY_TEST_BUDGETS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(_store)
+        .copied()
+    {
+        return budget;
+    }
+    EXPLICIT_REPLAY_BUDGET
+}
+
+fn replay_budget(explicit: bool) -> std::time::Duration {
+    if explicit {
+        EXPLICIT_REPLAY_BUDGET
+    } else {
+        crate::jj::BACKGROUND_RECONCILE_BUDGET
+    }
+}
+
+fn replay_lock_operation(
+    label: &str,
+    branch: &str,
+    phase: &str,
+    budget: std::time::Duration,
+) -> String {
+    if replay_is_explicit_for(label, branch) {
+        format!(
+            "explicit replay {phase} (budget={}s; {label}): {branch}",
+            budget.as_secs_f64()
+        )
+    } else {
+        format!("{phase} ({label}): {branch}")
+    }
+}
 
 fn replay_is_explicit(label: &str) -> bool {
     label.starts_with("replay requested for ")
@@ -643,7 +743,8 @@ fn quarantine_blocks_automatic_replay(
 ) -> bool {
     if quarantine.failure_kind == RECONCILE_TIMEOUT {
         // A new destination does not make the unchanged stack any cheaper.
-        return quarantine.observed_tip() == current_tip.unwrap_or("missing")
+        return !replay_is_explicit(label)
+            && quarantine.observed_tip() == current_tip.unwrap_or("missing")
             && chrono::Utc::now().timestamp() < quarantine.retry_at();
     }
     quarantine.failure_kind != "ambiguous_divergence"
@@ -1180,9 +1281,10 @@ async fn record_reconcile_timeout(
                 "{error}\nAutomatic reconcile timed out for branch `{branch}` at `{tip}` onto `{destination}`. \
                  This branch is outside automatic reconcile until it changes or the cooldown expires at \
                  Unix time {retry_at} ({delay}s; timeout strike {strikes}). A new main tip does not bypass \
-                 this cooldown. Other branches continue. The owner should assess the stack and coordinate \
-                 a controlled store-side recovery with execution; do not reset, force-push, or repeatedly \
-                 request replay. Inspect the timeout/rollback diagnostic before assuming the branch moved."
+                 this cooldown. Other branches continue. An owner-requested store-side replay bypasses \
+                 this automatic cooldown and uses its own cumulative forward budget. Inspect the \
+                 timeout/rollback diagnostic before requesting it: an incomplete rollback needs \
+                 controlled store-side recovery with execution, not reset or force-push."
             );
             conn.execute(
                 "INSERT INTO jj_reconcile_quarantines
@@ -1476,6 +1578,8 @@ struct BranchAdvanceOutcome {
     /// The intent a coalesced call folded into, so a requester can be told
     /// which already-running work absorbed it rather than that it was queued.
     coalesced_intent: Option<String>,
+    /// The completed explicit pass's failure, also persisted for the rebase page.
+    replay_diagnostic: Option<String>,
 }
 
 /// Project conflict markers into every live checkout holding this branch, and
@@ -2475,6 +2579,13 @@ async fn claim_next_reconcile_intent(db: &LocalDb) -> Result<Option<DurableRecon
                      FROM jj_reconcile_intents
                      WHERE status = 'pending'
                         OR (status = 'running' AND COALESCE(lease_expires_at, 0) <= ?1)
+                        OR (status IN ('completed', 'superseded') AND EXISTS (
+                            SELECT 1 FROM jj_reconcile_items i
+                            WHERE i.intent_id = jj_reconcile_intents.id
+                              AND i.replay_request_id IS NOT NULL
+                              AND i.replay_served_at IS NULL
+                              AND i.replay_requested_at IS NOT NULL
+                        ))
                      ORDER BY updated_at ASC LIMIT 1",
                     (now,),
                 )
@@ -2495,7 +2606,14 @@ async fn claim_next_reconcile_intent(db: &LocalDb) -> Result<Option<DurableRecon
                      SET status = 'running', lease_owner = ?2, lease_expires_at = ?3,
                          updated_at = ?4
                      WHERE id = ?1 AND (status = 'pending'
-                        OR (status = 'running' AND COALESCE(lease_expires_at, 0) <= ?4))",
+                        OR (status = 'running' AND COALESCE(lease_expires_at, 0) <= ?4)
+                        OR (status IN ('completed', 'superseded') AND EXISTS (
+                            SELECT 1 FROM jj_reconcile_items i
+                            WHERE i.intent_id = jj_reconcile_intents.id
+                              AND i.replay_request_id IS NOT NULL
+                              AND i.replay_served_at IS NULL
+                              AND i.replay_requested_at IS NOT NULL
+                        )))",
                     params![
                         id.as_str(),
                         owner.as_str(),
@@ -2582,6 +2700,22 @@ async fn execute_durable_reconcile_work(
         let existing_bookmarks = crate::jj::query_local_bookmarks(&jj, &work.store, &specs).ok();
         (current_dest, existing_bookmarks)
     };
+    // Retargeting must not coalesce an unserved ask into a pass that already
+    // completed before it arrived. This is the same destination reopen as a
+    // fresh request, without changing the sweep's ordering or admission policy.
+    for branch in &specs {
+        if crate::orchestrator::conflict_session::load_pending_replay_request(
+            db,
+            &work.store,
+            branch,
+        )
+        .await?
+        .is_some()
+        {
+            reopen_reconcile_intent(db, &work.store, &work.target_branch, &pinned_dest, branch)
+                .await?;
+        }
+    }
     // This is database bookkeeping, not a local-view mutation. The worker
     // revalidates the destination under its mutation guard before acting.
     let Some(claim) = refresh_stale_durable_intent(
@@ -3209,12 +3343,15 @@ async fn reconcile_base_advance(
     let worker_label = label.to_string();
     let worker_repo_path = repo_path.to_string();
     let worker_rebase_dest = rebase_dest.to_string();
-    tokio::spawn(async move {
+    let explicit = specs
+        .iter()
+        .any(|branch| replay_is_explicit_for(label, branch));
+    let worker = tokio::spawn(async move {
         let worker_db = match owning_db_for_project(&worker_orch.db, &worker_project_id).await {
             Ok(db) => db,
             Err(error) => {
                 log::warn!("jj reconcile worker ({worker_label}) could not reopen its owning database: {error}");
-                return;
+                return Err(error.to_string());
             }
         };
         let retry_claim = ReconcileClaim {
@@ -3222,7 +3359,7 @@ async fn reconcile_base_advance(
             owner: claim.owner.clone(),
             project_id: claim.project_id.clone(),
         };
-        if let Err(error) = execute_reconcile_claim(
+        let result = execute_reconcile_claim(
             &worker_orch,
             worker_db.as_ref(),
             &worker_project_id,
@@ -3236,12 +3373,21 @@ async fn reconcile_base_advance(
             pinned_dest,
             claim,
         )
-        .await
-        {
+        .await;
+        if let Err(error) = &result {
             log::warn!("jj reconcile worker ({worker_label}) failed: {error}");
             release_reconcile_claim(worker_db.as_ref(), &retry_claim).await;
         }
+        result
     });
+
+    // Awaiting a JoinHandle does not cancel the durable worker if the caller
+    // disconnects. Explicit callers receive the actual verdict, not just "queued".
+    if explicit {
+        return worker
+            .await
+            .map_err(|error| format!("explicit replay worker failed: {error}"))?;
+    }
 
     Ok(BranchAdvanceOutcome {
         eligible,
@@ -3326,9 +3472,8 @@ pub(crate) async fn request_branch_replay(
     // than before it is done. The refusal is not a dead end — it hands back the
     // exact content that makes the same request correct.
     let mut caveats: Vec<String> = Vec::new();
-    // The tip the guard judged. The worker carries THIS tip's content and
-    // refuses a branch that has moved off it, so a resolution is never applied
-    // to commits nobody assessed.
+    // The tip the request guard judged. It is recorded for the page; a deferred
+    // worker re-assesses the current tip under its mutation guard before carry.
     let mut request_tip: Option<String> = None;
     if let Some(session) = session.as_ref().filter(|_| take_committed_tip) {
         // Read-only, and deliberately outside the store lock: every object it
@@ -3505,10 +3650,8 @@ pub(crate) async fn request_branch_replay(
     // after the base moves to a new destination.
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs((RECONCILE_LEASE_SECONDS + 30) as u64);
-    // Recorded BEFORE the work is queued: the worker reads the requested tip
-    // back, and must never find the previous request's, or none at all. A
-    // sessionless request has no item row to carry it yet; the reconcile pass
-    // it queues writes one.
+    // Project the accepted ask onto an existing session before queueing its
+    // authoritative token. Queueing also creates an item for a sessionless ask.
     if let Some(session) = session.as_ref() {
         crate::orchestrator::conflict_session::record_replay_request(
             db,
@@ -3519,6 +3662,20 @@ pub(crate) async fn request_branch_replay(
         )
         .await;
     }
+    let replay_request = crate::orchestrator::conflict_session::queue_replay_request(
+        db,
+        &project.id,
+        &store,
+        &base_branch,
+        &destination,
+        branch,
+        request_tip.as_deref(),
+        take_committed_tip,
+        drop_incoming_reason,
+    )
+    .await?;
+    #[cfg(test)]
+    replay_request_test_hook(&store, "queued").await;
     let mut reopen_destination = destination.clone();
     // Every destination this request was re-aimed at, so the summary can name a
     // race instead of leaving it to look like a failed resolution.
@@ -3527,9 +3684,28 @@ pub(crate) async fn request_branch_replay(
     // destination it was running for. Reported, because a request absorbed by
     // work already under way is not the fresh action "queued" describes.
     let mut coalesced: Option<(Option<String>, String)> = None;
-    loop {
+    let replay_outcome = loop {
+        if let Some((outcome, served_destination)) =
+            completed_replay_request(db, &replay_request).await?
+        {
+            if served_destination != reopen_destination {
+                retargets.push((reopen_destination, served_destination.clone()));
+                reopen_destination = served_destination;
+            }
+            break outcome;
+        }
+        #[cfg(test)]
+        replay_request_test_hook(&store, "pending_observed").await;
         let attempted_destination = reopen_destination.clone();
-        reopen_reconcile_intent(db, &store, &base_branch, &reopen_destination, branch).await?;
+        if !crate::orchestrator::conflict_session::prepare_pending_replay_request(
+            db,
+            &replay_request,
+            &reopen_destination,
+        )
+        .await?
+        {
+            continue;
+        }
         let outcome = reconcile_base_advance(
             orch,
             db,
@@ -3542,8 +3718,17 @@ pub(crate) async fn request_branch_replay(
             notes.clone(),
         )
         .await?;
+        if let Some((served, served_destination)) =
+            completed_replay_request(db, &replay_request).await?
+        {
+            if served_destination != reopen_destination {
+                retargets.push((reopen_destination, served_destination.clone()));
+                reopen_destination = served_destination;
+            }
+            break served;
+        }
         if outcome.eligible > 0 {
-            break;
+            break outcome;
         }
         if coalesced.is_none() {
             if let Some(destination) = outcome.coalesced_destination.clone() {
@@ -3563,7 +3748,7 @@ pub(crate) async fn request_branch_replay(
             retargets.push((attempted_destination, reopen_destination.clone()));
         }
         wait_for_reconcile_slot(db, &store, &base_branch, &reopen_destination, deadline).await?;
-    }
+    };
 
     // Re-aimed at a newer base while queued: the page names where it went.
     if let Some(session) = session
@@ -3589,22 +3774,87 @@ pub(crate) async fn request_branch_replay(
              failed resolution — your content resolution still stands.\n\n"
         ));
     }
-    // Read after the pass is queued, so it describes the boundary that pass
-    // will meet. The batch may still end first; the wording allows for that.
-    let hold = inflight_run_batch_on_branch(db, job_id, branch).await;
-    summary.push_str(&replay_queued_summary(
-        branch,
-        &base_branch,
-        &reopen_destination,
-        coalesced.as_ref(),
-        job_id,
-        &hold,
-    ));
+    if let Some(diagnostic) = replay_outcome.replay_diagnostic {
+        summary.push_str(&format!(
+            "Explicit replay of `{branch}` failed.\n\n{diagnostic}"
+        ));
+    } else if replay_outcome.conflicted > 0 {
+        summary.push_str(&format!(
+            "Explicit replay of `{branch}` onto `{base_branch}` still conflicts. \
+             The rebase was rolled back; cairn:~/rebase records the fresh conflict coordinates."
+        ));
+    } else if replay_outcome.rebased_clean > 0 {
+        summary.push_str(&format!(
+            "Explicit replay of `{branch}` onto `{base_branch}` completed. \
+             The replay and verified export landed, and the rebase session is closed."
+        ));
+    } else {
+        // A pass held at an unsafe mutation boundary remains queued work.
+        let hold = inflight_run_batch_on_branch(db, job_id, branch).await;
+        summary.push_str(&replay_queued_summary(
+            branch,
+            &base_branch,
+            &reopen_destination,
+            coalesced.as_ref(),
+            job_id,
+            &hold,
+        ));
+    }
     for caveat in &caveats {
         summary.push_str("\n\n⚠️ ");
         summary.push_str(caveat);
     }
     Ok(summary)
+}
+
+#[cfg(test)]
+type ReplayRequestHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+#[cfg(test)]
+static REPLAY_REQUEST_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(std::path::PathBuf, &'static str), ReplayRequestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+async fn replay_request_test_hook(store: &Path, stage: &'static str) {
+    let hook = REPLAY_REQUEST_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&(store.to_path_buf(), stage));
+    if let Some(hook) = hook {
+        hook().await;
+    }
+}
+
+async fn completed_replay_request(
+    db: &LocalDb,
+    request: &crate::orchestrator::conflict_session::PendingReplayRequest,
+) -> Result<Option<(BranchAdvanceOutcome, String)>, String> {
+    use crate::orchestrator::conflict_session::ReplayRequestState;
+    match crate::orchestrator::conflict_session::replay_request_state(db, request).await? {
+        ReplayRequestState::Pending => Ok(None),
+        ReplayRequestState::Superseded => Err(format!(
+            "Replay request `{}` was superseded by a newer request. No further replay was attempted for this request.",
+            request.id
+        )),
+        ReplayRequestState::Served { pass, destination } => {
+            let mut outcome = BranchAdvanceOutcome { eligible: 1, ..Default::default() };
+            match pass.outcome_kind.as_deref() {
+                Some("rebased_clean" | "silent") => outcome.rebased_clean = 1,
+                Some("conflicted") => outcome.conflicted = 1,
+                _ => {
+                    outcome.failed = 1;
+                    outcome.replay_diagnostic = Some(pass.diagnostic.unwrap_or_else(|| format!(
+                        "The completed replay recorded {} ({}); inspect cairn:~/rebase.",
+                        pass.outcome_kind.as_deref().unwrap_or("no outcome"),
+                        pass.failure_kind.as_deref().unwrap_or("no failure kind"),
+                    )));
+                }
+            }
+            Ok(Some((outcome, destination)))
+        }
+    }
 }
 
 /// What an accepted replay request did and what it is about to meet.
@@ -3785,6 +4035,12 @@ fn failed_reconcile_report(branch: &str, error: String) -> crate::jj::ReconcileR
     report
 }
 
+struct ExplicitReplayTrace {
+    branch: String,
+    environment: crate::jj::JjEnv,
+    request: Option<crate::orchestrator::conflict_session::PendingReplayRequest>,
+}
+
 async fn defer_run_batch_reconcile(
     db: &LocalDb,
     intent_id: &str,
@@ -3833,6 +4089,97 @@ async fn execute_reconcile_claim(
     pinned_dest: String,
     claim: ReconcileClaim,
 ) -> Result<BranchAdvanceOutcome, String> {
+    let intent_id = claim.id.clone();
+    let owner = claim.owner.clone();
+    let candidate_count = specs.len();
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+    let mut explicit_trace = None;
+    let started = std::time::Instant::now();
+    let result = execute_reconcile_claim_body(
+        orch,
+        db,
+        project_id,
+        label,
+        repo_path,
+        rebase_dest,
+        siblings,
+        notes,
+        specs,
+        existing_bookmarks,
+        pinned_dest,
+        claim,
+        &mut explicit_trace,
+    )
+    .await;
+    // A timeout before a report exists is still a completed explicit attempt.
+    // These exits are at read/admission boundaries: no mutation is in flight,
+    // and an earlier conflicting rebase has already restored its transaction.
+    if let (Some(attempt), Err(error)) = (explicit_trace, &result) {
+        let branch = attempt.branch;
+        if crate::jj::is_jj_timeout_error(error)
+            || error.contains("reconcile timed out")
+            || error.contains("replay timed out")
+        {
+            let trace = attempt.environment.operation_phase_summary();
+            let diagnostic = format!(
+                "Explicit replay preflight timed out: operation budget exhausted. {error}\n\
+                 Explicit replay timed out under its {:.3}s cumulative forward budget \
+                 ({:.3}s elapsed including admission). No automatic cooldown was recorded. \
+                 No replay mutation was left in flight at this boundary; a preceding conflicting \
+                 rebase, if any, was already rolled back. A new explicit request may run immediately.\n{trace}",
+                explicit_replay_budget_for_store(&store).as_secs_f64(),
+                started.elapsed().as_secs_f64(),
+            );
+            persist_reconcile_item(
+                db,
+                ReconcileItemUpdate {
+                    intent_id: &intent_id,
+                    bookmark: &branch,
+                    observed_tip: None,
+                    status: "completed",
+                    failure_kind: Some(RECONCILE_TIMEOUT),
+                    outcome_kind: Some("failed"),
+                    fingerprint: None,
+                    diagnostic: Some(&diagnostic),
+                },
+            )
+            .await?;
+            if let Some(request) = attempt.request.as_ref() {
+                crate::orchestrator::conflict_session::mark_replay_request_served(
+                    db, request, &intent_id,
+                )
+                .await?;
+            }
+            // Other siblings may still be owed work. The completed failed
+            // item is skipped on that retry, rather than becoming automatic.
+            finish_reconcile_intent(db, &intent_id, &owner, candidate_count > 1).await?;
+            return Ok(BranchAdvanceOutcome {
+                eligible: 1,
+                failed: 1,
+                replay_diagnostic: Some(diagnostic),
+                ..BranchAdvanceOutcome::default()
+            });
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_reconcile_claim_body(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    label: &str,
+    repo_path: &str,
+    rebase_dest: &str,
+    siblings: Vec<SiblingJob>,
+    notes: BaseAdvanceNotes,
+    specs: Vec<String>,
+    existing_bookmarks: Option<std::collections::HashSet<String>>,
+    pinned_dest: String,
+    claim: ReconcileClaim,
+    explicit_trace: &mut Option<ExplicitReplayTrace>,
+) -> Result<BranchAdvanceOutcome, String> {
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
     let intent_id = claim.id.as_str();
@@ -3861,6 +4208,7 @@ async fn execute_reconcile_claim(
     let mut carry_notes: HashMap<String, String> = HashMap::new();
     let mut report = crate::jj::ReconcileReport::default();
     let mut any_branch_deferred = false;
+    let mut explicit_branches = HashSet::new();
     // Set once a branch's rewrite gave up on `packed-refs.lock`. Every rewrite
     // waits out the lock while holding the store lock, so a long contention
     // spell must not cost that wait once per branch; the branches after it are
@@ -3868,20 +4216,54 @@ async fn execute_reconcile_claim(
     let mut ref_lock_deferral: Option<String> = None;
 
     for branch in &specs {
+        *explicit_trace = None;
         heartbeat_reconcile_intent(db, &claim).await?;
+        let pending_request =
+            crate::orchestrator::conflict_session::load_pending_replay_request(db, &store, branch)
+                .await?;
         let progress = reconcile_item_status(db, intent_id, branch).await?;
-        if progress.as_ref().is_some_and(|progress| {
-            progress.status == "completed"
-                || (progress.status == "graph_moved" && progress.notification_sent)
-        }) {
+        if pending_request.is_none()
+            && progress.as_ref().is_some_and(|progress| {
+                progress.status == "completed"
+                    || (progress.status == "graph_moved" && progress.notification_sent)
+            })
+        {
             log::debug!("jj reconcile ({label}): resumed past completed {branch}");
             continue;
         }
+        let requested_label = pending_request.as_ref().map(|request| {
+            if request.take_committed_tip {
+                format!("resolved replay requested for {branch}")
+            } else {
+                format!("replay requested for {branch}")
+            }
+        });
+        let label = requested_label.as_deref().unwrap_or(label);
+        if pending_request.is_none() && replay_is_explicit_for(label, branch) {
+            // A different worker already served or superseded this caller's ask.
+            // Its label cannot grant another mutation or renew its allowance.
+            continue;
+        }
+        let explicit = pending_request.is_some();
+        if explicit {
+            explicit_branches.insert(branch.clone());
+        }
+        // An intent may contain several siblings, but only the branch named by
+        // this request receives its authority and foreground allowance.
+        let automatic_label = "automatic reconcile";
+        let item_label = if explicit { label } else { automatic_label };
+        let budget = if explicit {
+            explicit_replay_budget_for_store(&store)
+        } else {
+            replay_budget(false)
+        };
+        let mut replay_phases = Vec::new();
         // This read needs no store lock. In particular, do not inspect a held
         // bookmark or prepare its resolution basis just to decide not to replay
         // it. Admission is rechecked under each mutation guard below.
         let branch_siblings = siblings_for_branch(&siblings, branch);
-        if progress.as_ref().is_none_or(|p| !resumes_past_mutation(p)) {
+        if pending_request.is_some() || progress.as_ref().is_none_or(|p| !resumes_past_mutation(p))
+        {
             if let Some(batch) = inflight_run_batch(db, &branch_siblings).await? {
                 defer_run_batch_reconcile(
                     db,
@@ -3895,21 +4277,34 @@ async fn execute_reconcile_claim(
                 continue;
             }
         }
-        let current_tip = {
+        let (current_tip, branch_jj, explicit_deadline) = {
             let guard = orch
                 .acquire_jj_store_lock(
                     &store,
                     crate::orchestrator::StoreLockClass::Background,
-                    format!("sibling reconcile inspect ({label}): {branch}"),
+                    replay_lock_operation(label, branch, "sibling reconcile inspect", budget),
                 )
                 .await;
-            let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+            let scoped = jj.with_operation_budget(budget);
+            if explicit {
+                *explicit_trace = Some(ExplicitReplayTrace {
+                    branch: branch.clone(),
+                    environment: scoped.clone(),
+                    request: pending_request.clone(),
+                });
+            }
+            let deadline = tokio::time::Instant::now() + budget;
             let _phase = guard.phase(format!("bookmark suppression probe branch={branch}"));
-            crate::jj::bookmark_commit_checked(&jj, &store, branch)
+            let tip = crate::jj::bookmark_commit_checked(&scoped, &store, branch);
+            (tip, scoped, deadline)
         };
+        let jj = &branch_jj;
         let current_tip = match current_tip {
             Ok(tip) => tip,
             Err(error) => {
+                if explicit && crate::jj::is_jj_timeout_error(&error) {
+                    return Err(error);
+                }
                 log::warn!("jj reconcile ({label}): deferring {branch}; tip unreadable, keeping any timeout cooldown: {error}");
                 any_branch_deferred = true;
                 continue;
@@ -3939,7 +4334,7 @@ async fn execute_reconcile_claim(
             quarantine = None;
         }
         if let Some(existing) = quarantine.as_ref() {
-            if quarantine_blocks_automatic_replay(existing, current_tip.as_deref(), label) {
+            if quarantine_blocks_automatic_replay(existing, current_tip.as_deref(), item_label) {
                 if existing.failure_kind == RECONCILE_TIMEOUT {
                     defer_timeout_reconcile(
                         db,
@@ -3977,6 +4372,18 @@ async fn execute_reconcile_claim(
                 log::debug!(
                     "jj reconcile ({label}): skipped quarantined unchanged bookmark {branch}"
                 );
+                if explicit {
+                    report.failed.push(crate::jj::ReconcileFailure {
+                        branch: branch.clone(),
+                        error: diagnostic,
+                    });
+                    if let Some(request) = pending_request.as_ref() {
+                        crate::orchestrator::conflict_session::mark_replay_request_served(
+                            db, request, intent_id,
+                        )
+                        .await?;
+                    }
+                }
                 continue;
             }
             if existing.failure_kind != "ambiguous_divergence"
@@ -4029,11 +4436,21 @@ async fn execute_reconcile_claim(
         // both measure from it; only an explicit one may carry content.
         let open_session =
             crate::orchestrator::conflict_session::load_active_session(db, branch).await?;
+        if let (Some(request), Some(session)) = (pending_request.as_ref(), open_session.as_ref()) {
+            crate::orchestrator::conflict_session::project_pending_replay_request(
+                db,
+                request,
+                &session.intent_id,
+                &pinned_dest,
+                current_tip.as_deref(),
+            )
+            .await?;
+        }
         // What a structural merge measures each path from if this replay
         // conflicts: the live fork, or the side the open session's resolution
         // was made against.
         let replay_baseline = current_tip.as_deref().and_then(|pre_tip| {
-            let fork = branch_fork_point(&jj, &store, pre_tip, &pinned_dest)?;
+            let fork = branch_fork_point(jj, &store, pre_tip, &pinned_dest)?;
             Some(
                 ReplayBaseline {
                     fork,
@@ -4041,12 +4458,12 @@ async fn execute_reconcile_claim(
                         .as_ref()
                         .map(|session| {
                             session
-                                .resolution_basis_at(&jj, &store, pre_tip)
+                                .resolution_basis_at(jj, &store, pre_tip)
                                 .unwrap_or_else(|_| session.resolution_basis.clone())
                         })
                         .unwrap_or_default(),
                 }
-                .verified(&jj, &store, pre_tip),
+                .verified(jj, &store, pre_tip),
             )
         });
 
@@ -4056,16 +4473,21 @@ async fn execute_reconcile_claim(
         // and therefore retains the fail-closed rollback. A previous failed retry
         // may already name the resolved tip as `ours`, so tip inequality cannot
         // identify resolution intent reliably (the live CAIRN-3412 shape).
-        let resolution_session = if label.starts_with("resolved replay requested for ") {
+        let resolved_request = explicit && label.starts_with("resolved replay requested for ");
+        let resolution_session = if resolved_request {
             open_session.clone()
         } else {
             None
         };
 
+        // A conflict rollback stops this environment. Retain the immutable
+        // resolution evidence before mutation rather than re-reading afterward.
+        let mut resolution_basis_for_conflict = None;
         let mut ambiguous_item = None;
         let mut divergence_resolved = false;
-        let mut item_report = if let Some(progress) =
-            progress.as_ref().filter(|p| resumes_past_mutation(p))
+        let mut item_report = if let Some(progress) = progress
+            .as_ref()
+            .filter(|p| resumes_past_mutation(p) && pending_request.is_none())
         {
             let mut resumed = crate::jj::ReconcileReport::default();
             match progress.outcome_kind.as_deref() {
@@ -4090,12 +4512,19 @@ async fn execute_reconcile_claim(
                 .acquire_jj_store_lock(
                     &store,
                     crate::orchestrator::StoreLockClass::Background,
-                    format!("sibling reconcile ({label}): {branch}"),
+                    replay_lock_operation(label, branch, "sibling reconcile", budget),
                 )
                 .await;
-            let lock_deadline =
-                tokio::time::Instant::now() + crate::jj::BACKGROUND_RECONCILE_BUDGET;
-            let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+            let lock_deadline = if explicit {
+                explicit_deadline
+            } else {
+                tokio::time::Instant::now() + budget
+            };
+            let jj = if explicit {
+                jj.clone()
+            } else {
+                jj.with_operation_budget(budget)
+            };
             // RunBatch suspension admission takes this same store lock while
             // inserting its durable row. Revalidating under the guard makes the
             // row check and bookmark mutation one exclusive bracket.
@@ -4163,7 +4592,11 @@ async fn execute_reconcile_claim(
             })??;
             if let Some(existing) = locked_quarantine.as_ref().filter(|existing| {
                 existing.failure_kind == RECONCILE_TIMEOUT
-                    && quarantine_blocks_automatic_replay(existing, locked_tip.as_deref(), label)
+                    && quarantine_blocks_automatic_replay(
+                        existing,
+                        locked_tip.as_deref(),
+                        item_label,
+                    )
             }) {
                 drop(guard);
                 defer_timeout_reconcile(
@@ -4177,6 +4610,25 @@ async fn execute_reconcile_claim(
                 .await?;
                 any_branch_deferred = true;
                 continue;
+            }
+            if let Some(request) = pending_request.as_ref() {
+                let _phase = guard.phase("revalidate explicit replay request");
+                let current_request = tokio::time::timeout_at(
+                    lock_deadline,
+                    crate::orchestrator::conflict_session::load_pending_replay_request(
+                        db, &store, branch,
+                    ),
+                )
+                .await
+                .map_err(|_| "explicit replay timed out revalidating its request".to_string())??;
+                if current_request.as_ref().map(|current| current.id.as_str())
+                    != Some(request.id.as_str())
+                {
+                    drop(_phase);
+                    drop(guard);
+                    any_branch_deferred = true;
+                    continue;
+                }
             }
             let settled = precheck.as_ref().filter(|precheck| precheck.is_settled());
 
@@ -4280,20 +4732,40 @@ async fn execute_reconcile_claim(
                 if let Some(commit) = tip {
                     before.insert(branch.clone(), commit);
                 }
+                if let Some(tip) = before.get(branch) {
+                    resolution_basis_for_conflict =
+                        Some(guard.blocking_phase("capture resolution inheritance", || {
+                            crate::orchestrator::conflict_session::inherited_basis(
+                                &jj,
+                                &store,
+                                open_session.as_ref(),
+                                Some(tip),
+                            )
+                        }));
+                }
             }
             // Carry the committed resolution onto THIS destination, under the
             // same lock as the rebase it feeds, so nothing can move between
             // the plan and its use.
-            let carry_plan = match (resolution_session.as_ref(), before.get(branch)) {
-                (Some(session), Some(live_tip))
-                    if session.conflicting().next().is_some()
-                        || !session.resolution_basis.is_empty() =>
-                {
-                    Some(guard.blocking_phase("plan resolution carry", || {
-                        plan_resolution_carry(&jj, &store, session, &pinned_dest, live_tip)
-                    }))
-                }
-                _ => None,
+            let already_landed = resolved_request
+                && resolution_session.is_none()
+                && crate::jj::branch_carries_commit(&jj, &store, branch, &pinned_dest);
+            let carry_plan = if resolved_request && !already_landed {
+                Some(match (resolution_session.as_ref(), before.get(branch)) {
+                    (Some(session), Some(live_tip)) => guard.blocking_phase("plan resolution carry", || {
+                        plan_current_requested_resolution(
+                            &jj, &store, session, &pinned_dest, live_tip,
+                            pending_request.as_ref().and_then(|request| request.drop_incoming_reason.as_deref()),
+                        ).map(|(plan, basis)| {
+                            resolution_basis_for_conflict = Some(basis);
+                            plan
+                        })
+                    }),
+                    (None, _) => Err("the requested take-committed-tip replay no longer has an open conflict session; re-read cairn:~/rebase".to_string()),
+                    (_, None) => Err("the current committed tip could not be read; no resolution was carried".to_string()),
+                })
+            } else {
+                None
             };
             let mut item_report = if ambiguous_item.is_some() {
                 crate::jj::ReconcileReport::default()
@@ -4363,16 +4835,17 @@ async fn execute_reconcile_claim(
                 .get(branch)
                 .or(locked_tip.as_ref())
                 .map_or("missing", String::as_str);
-            if persist_report_timeouts(
-                db,
-                &claim.project_id,
-                &store,
-                branch,
-                tip,
-                &pinned_dest,
-                &mut item_report,
-            )
-            .await?
+            if !explicit
+                && persist_report_timeouts(
+                    db,
+                    &claim.project_id,
+                    &store,
+                    branch,
+                    tip,
+                    &pinned_dest,
+                    &mut item_report,
+                )
+                .await?
             {
                 let _ = orch.services.emitter.emit(
                     "db-change",
@@ -4380,6 +4853,9 @@ async fn execute_reconcile_claim(
                 );
             }
             drop(timeout_persistence);
+            if explicit {
+                replay_phases.push(guard.phase_summary());
+            }
             if after.contains_key(branch) && before.get(branch) != after.get(branch) {
                 if let Some(sibling) = siblings
                     .iter()
@@ -4420,19 +4896,29 @@ async fn execute_reconcile_claim(
             item_report
         };
 
-        if item_report.conflicted.contains(branch) {
+        if item_report.conflicted.contains(branch) && item_report.failed.is_empty() {
             if let Some(diagnostic) = item_report.conflict_diagnostics.get(branch).cloned() {
+                // A reported conflict proves the first transaction was restored.
+                // Structural repair is a new transaction, but NOT a new forward deadline.
+                let structural_jj = if explicit {
+                    jj.next_transaction_after_restored_conflict()?
+                } else {
+                    jj.clone()
+                };
                 // These immutable-side reads and CPU-heavy proofs must not hold
                 // the writer lock. The application revalidates both coordinates.
-                let prepare_jj = jj.clone();
+                let prepare_jj = if explicit {
+                    structural_jj.clone()
+                } else {
+                    structural_jj.with_operation_budget(budget)
+                };
                 let prepare_store = store.clone();
                 let prepare_dest = pinned_dest.clone();
                 let baseline = replay_baseline.clone().unwrap_or_else(|| {
                     ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default())
                 });
                 let prepared = tokio::task::spawn_blocking(move || {
-                    let jj =
-                        prepare_jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+                    let jj = prepare_jj;
                     let rules = crate::orchestrator::landing::merge_rules_at(
                         &jj,
                         &prepare_store,
@@ -4449,12 +4935,20 @@ async fn execute_reconcile_claim(
                         .acquire_jj_store_lock(
                             &store,
                             crate::orchestrator::StoreLockClass::Background,
-                            format!("structural merge ({label}): {branch}"),
+                            replay_lock_operation(label, branch, "structural merge", budget),
                         )
                         .await;
-                    let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
-                    let deadline =
-                        tokio::time::Instant::now() + crate::jj::BACKGROUND_RECONCILE_BUDGET;
+                    let jj = if explicit {
+                        structural_jj.clone()
+                    } else {
+                        structural_jj.with_operation_budget(budget)
+                    };
+                    let deadline = if explicit {
+                        explicit_deadline
+                    } else {
+                        tokio::time::Instant::now() + budget
+                    };
+
                     // A run may have been admitted while the pure candidate was
                     // prepared. Revalidate at this second mutation boundary.
                     let branch_siblings = siblings_for_branch(&siblings, branch);
@@ -4486,7 +4980,11 @@ async fn execute_reconcile_claim(
                     .map_err(|_| "structural replay timed out checking cooldown".to_string())??;
                     if let Some(existing) = quarantine.as_ref().filter(|existing| {
                         existing.failure_kind == RECONCILE_TIMEOUT
-                            && quarantine_blocks_automatic_replay(existing, tip.as_deref(), label)
+                            && quarantine_blocks_automatic_replay(
+                                existing,
+                                tip.as_deref(),
+                                item_label,
+                            )
                     }) {
                         drop(guard);
                         defer_timeout_reconcile(
@@ -4525,22 +5023,46 @@ async fn execute_reconcile_claim(
                         }
                     }
                     let _phase = guard.phase("structural timeout cooldown persistence");
-                    if persist_report_timeouts(
-                        db,
-                        &claim.project_id,
-                        &store,
-                        branch,
-                        tip.as_deref().unwrap_or("missing"),
-                        &pinned_dest,
-                        &mut item_report,
-                    )
-                    .await?
+                    if !explicit
+                        && persist_report_timeouts(
+                            db,
+                            &claim.project_id,
+                            &store,
+                            branch,
+                            tip.as_deref().unwrap_or("missing"),
+                            &pinned_dest,
+                            &mut item_report,
+                        )
+                        .await?
                     {
                         let _ = orch.services.emitter.emit(
                             "db-change",
                             serde_json::json!({"table":"comments", "action":"insert"}),
                         );
                     }
+                    if explicit {
+                        replay_phases.push(guard.phase_summary());
+                    }
+                }
+            }
+        }
+
+        if explicit {
+            for failure in &mut item_report.failed {
+                if crate::jj::is_jj_timeout_error(&failure.error) {
+                    let retry = if crate::jj::reconcile_failure_kind(&failure.error)
+                        == crate::jj::ROLLBACK_FAILED
+                    {
+                        "Rollback did not complete. Do not publish this branch; recover the store before retrying."
+                    } else {
+                        "A new explicit request may run immediately."
+                    };
+                    failure.error = format!(
+                        "{}\nExplicit replay timed out under its {:.3}s cumulative forward budget. \
+                         No automatic cooldown was recorded. {retry}\nStore-lock phases: {}\n{}",
+                        failure.error, budget.as_secs_f64(), replay_phases.join("; "),
+                        branch_jj.operation_phase_summary()
+                    );
                 }
             }
         }
@@ -4583,6 +5105,18 @@ async fn execute_reconcile_claim(
                     diagnostic: Some(diagnostic.to_string()),
                 });
                 ambiguous.push(item);
+            }
+            if explicit {
+                report.failed.push(crate::jj::ReconcileFailure {
+                    branch: branch.clone(),
+                    error: diagnostic.to_string(),
+                });
+                if let Some(request) = pending_request.as_ref() {
+                    crate::orchestrator::conflict_session::mark_replay_request_served(
+                        db, request, intent_id,
+                    )
+                    .await?;
+                }
             }
             continue;
         }
@@ -4710,6 +5244,8 @@ async fn execute_reconcile_claim(
                     .map(String::as_str),
                 status: if permanent {
                     "suppressed"
+                } else if explicit && reported_failure.is_some() {
+                    "completed"
                 } else if item_diagnostic.is_some() {
                     "pending"
                 } else {
@@ -4743,12 +5279,14 @@ async fn execute_reconcile_claim(
         if let Some(diagnostic) = item_report.conflict_diagnostics.get(branch) {
             // Inherited from the session open before this pass: which paths of
             // the tip that just failed were resolved against what.
-            let basis = crate::orchestrator::conflict_session::inherited_basis(
-                &jj,
-                &store,
-                open_session.as_ref(),
-                diagnostic.ours.as_deref(),
-            );
+            let basis = resolution_basis_for_conflict.clone().unwrap_or_else(|| {
+                crate::orchestrator::conflict_session::inherited_basis(
+                    jj,
+                    &store,
+                    open_session.as_ref(),
+                    diagnostic.ours.as_deref(),
+                )
+            });
             record_conflict_session(db, intent_id, branch, diagnostic, &notes.incoming, &basis)
                 .await?;
             supersede_stale_sessions(db, branch, intent_id).await?;
@@ -4782,6 +5320,23 @@ async fn execute_reconcile_claim(
             }
         }
 
+        // A wait is not service. Only a pass that produced a terminal replay
+        // verdict consumes this request; the compare token protects newer asks.
+        if item_report.rebased_clean.contains(branch)
+            || item_report.conflicted.contains(branch)
+            || item_report.silent.contains(branch)
+            || item_report
+                .failed
+                .iter()
+                .any(|failure| failure.branch == *branch)
+        {
+            if let Some(request) = pending_request.as_ref() {
+                crate::orchestrator::conflict_session::mark_replay_request_served(
+                    db, request, intent_id,
+                )
+                .await?;
+            }
+        }
         // The blocking note goes out with the session that justifies it, not
         // after the loop: a pass that dies on a later branch (the base
         // routinely moves again mid-pass) must not take this one's note with
@@ -4910,7 +5465,12 @@ async fn execute_reconcile_claim(
     // its item stays pending/deferred, and `reopen_released_deferrals` returns
     // the intent to the sweep once the batch ends. The other deferrals (an
     // unreadable tip, a timeout cooldown, the ref-store lock) still retry.
-    let retry_transient = any_branch_deferred || reconcile_has_transient_failures(&report.failed);
+    let retry_transient = any_branch_deferred
+        || report.failed.iter().any(|failure| {
+            !explicit_branches.contains(&failure.branch)
+                && reconcile_has_transient_failures(std::slice::from_ref(failure))
+        });
+
     // Fan a lifetime-cell refresh out to every sibling this reconcile actually
     // rewrote. A running cell on a rebased job branch must follow the logical
     // coordinate to the new tip or it keeps serving pre-rebase source. This is the
@@ -4935,6 +5495,11 @@ async fn execute_reconcile_claim(
         failed: report.failed.len() + terminal_failed,
         coalesced_destination: None,
         coalesced_intent: None,
+        replay_diagnostic: report
+            .failed
+            .iter()
+            .find(|failure| explicit_branches.contains(&failure.branch))
+            .map(|failure| failure.error.clone()),
     })
 }
 
@@ -11664,6 +12229,119 @@ mod real_store_collision_tests {
         assert!(open_session(&r).await.is_none());
     }
 
+    /// An automatic advance that conflicts and rolls back records its fresh
+    /// session's basis from the tip it actually found, so a requester's
+    /// statement for a deleted file survives intact. A narrower structural
+    /// proof subset must not stand in for that inheritance and erase it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn automatic_conflict_rollback_preserves_an_attested_deletion() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(
+            &bin,
+            "replay-automatic-attested-deletion.db",
+            &[(LIST, "head\n"), (FENCE, FENCE_BASE)],
+        )
+        .await;
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nX\n")],
+            "branch appends X",
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[
+                (LIST, "head\nA\n"),
+                (FENCE, "fn fence() {}\nfn grant() {}\n"),
+            ],
+            "D1 appends A and tightens the fence",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        let session = open_session(&r)
+            .await
+            .expect("D1 conflicts on the list and records a session");
+        assert_eq!(session.theirs.as_deref(), Some(d1.as_str()));
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nA\nX\n")],
+            "resolve the list against D1",
+        );
+        let deleted = delete(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            FENCE,
+            "retire fence.rs; grant moved into policy",
+        );
+
+        let reason = "grant moved into policy::grant";
+        let attested = crate::orchestrator::conflict_session::ResolvedSide {
+            base: session
+                .base
+                .clone()
+                .expect("the D1 session records its merge base"),
+            theirs: d1.clone(),
+            attested: Some(reason.to_string()),
+        };
+        let mut basis = session.resolution_basis.clone();
+        basis.insert(FENCE.to_string(), attested.clone());
+        crate::orchestrator::conflict_session::record_attested_basis(
+            &r.db,
+            &session.intent_id,
+            BRANCH,
+            &basis,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            open_session(&r).await.unwrap().resolution_basis.get(FENCE),
+            Some(&attested),
+            "the statement is seeded on the open session"
+        );
+
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "head\nA\nB\n")],
+            "D2 appends B at the resolved spot",
+        );
+        set_main(&r.fx, &d2);
+        automatic_advance(&r).await;
+
+        assert_eq!(
+            branch_tip(&r),
+            deleted,
+            "the conflicting advance rolled back"
+        );
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &d2
+        ));
+        assert!(fence_is_absent_at(&r, BRANCH));
+        let fresh = open_session(&r)
+            .await
+            .expect("the automatic conflict records a fresh session against D2");
+        assert_eq!(fresh.theirs.as_deref(), Some(d2.as_str()));
+        assert_eq!(fresh.ours.as_deref(), Some(deleted.as_str()));
+        assert_eq!(
+            fresh.resolution_basis.get(FENCE),
+            Some(&attested),
+            "the exact statement and the side it covered survive the rollback"
+        );
+    }
+
     /// Scenario 2, the specimen's own file: the branch resolved D1's migration
     /// registration and renumbered its own, then D2 registered a migration at
     /// the number the branch took. The replayed registry holds every entry
@@ -11816,6 +12494,1114 @@ mod real_store_collision_tests {
             Some(pre_tip.as_str())
         );
         assert_eq!(text_at(&fx, branch, "outside.txt"), "branch\n");
+    }
+
+    #[test]
+    fn explicit_replay_bypasses_unchanged_automatic_timeout_cooldown() {
+        let quarantine = ReconcileQuarantine {
+            failure_kind: RECONCILE_TIMEOUT.to_string(),
+            fingerprint: "tip-a:main-a".to_string(),
+            last_diagnostic: Some("rebase timed out".to_string()),
+            strike_count: 1,
+            updated_at: chrono::Utc::now().timestamp(),
+        };
+        assert!(quarantine_blocks_automatic_replay(
+            &quarantine,
+            Some("tip-a"),
+            "external advance main-b"
+        ));
+        for label in [
+            "replay requested for agent/replay",
+            "resolved replay requested for agent/replay",
+        ] {
+            assert!(
+                !quarantine_blocks_automatic_replay(&quarantine, Some("tip-a"), label),
+                "an explicit request must bypass automatic cooldown: {label}"
+            );
+        }
+        assert!(!quarantine_blocks_automatic_replay(
+            &quarantine,
+            Some("tip-b"),
+            "external advance main-b"
+        ));
+    }
+
+    #[test]
+    fn explicit_replay_budget_and_hold_name_select_only_the_exact_requested_branch() {
+        for prefix in ["replay requested for ", "resolved replay requested for "] {
+            let label = format!("{prefix}{BRANCH}");
+            for branch in [BRANCH, "agent/replay-child", "agent/repla", "agent/other"] {
+                let explicit = replay_is_explicit_for(&label, branch);
+                assert_eq!(explicit, branch == BRANCH);
+                assert_eq!(
+                    replay_budget(explicit),
+                    if branch == BRANCH {
+                        EXPLICIT_REPLAY_BUDGET
+                    } else {
+                        crate::jj::BACKGROUND_RECONCILE_BUDGET
+                    }
+                );
+                let hold = replay_lock_operation(
+                    &label,
+                    branch,
+                    "rebase and export",
+                    replay_budget(explicit),
+                );
+                assert_eq!(
+                    hold.starts_with("explicit replay "),
+                    branch == BRANCH,
+                    "{hold}"
+                );
+                if branch == BRANCH {
+                    assert!(
+                        hold.contains(&format!("budget={}s", EXPLICIT_REPLAY_BUDGET.as_secs())),
+                        "{hold}"
+                    );
+                    assert!(hold.ends_with(BRANCH), "{hold}");
+                } else {
+                    assert!(!hold.contains("budget="), "{hold}");
+                }
+            }
+        }
+        assert!(!replay_is_explicit_for("merged job (test)", BRANCH));
+        assert!(EXPLICIT_REPLAY_BUDGET > crate::jj::BACKGROUND_RECONCILE_BUDGET);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_carries_and_heals_past_automatic_budget_despite_cooldown() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        const STORE_LOCK_TARGET: &str = "cairn_core::orchestrator::store_lock";
+        crate::test_support::capture_log(STORE_LOCK_TARGET);
+
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for explicit replay regression");
+        let home = tempfile::tempdir().unwrap();
+        let wrapper = home.path().join("jj-explicit-delay");
+        let gate = home.path().join("enabled");
+        let attempts = home.path().join("attempts");
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        std::fs::write(&wrapper, format!(
+            "#!/bin/sh\nif test -f {}; then\n case \" $* \" in\n *' rebase -b {BRANCH} '*) echo rebase >> {}; sleep 11 ;;\n *' restore --from '*) echo restore >> {} ;;\n esac\nfi\nexec {} \"$@\"\n",
+            quote(&gate.to_string_lossy()), quote(&attempts.to_string_lossy()),
+            quote(&attempts.to_string_lossy()), quote(&bin),
+        )).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (r, d1, resolved) =
+            same_spot_resolution(wrapper.to_str().unwrap(), "explicit-past-background.db").await;
+        // The capture sink is shared by the whole test binary; only this
+        // fixture's store attributes a hold line to this test.
+        let store_marker = format!("store={}, ", r.fx.store.to_string_lossy());
+        let hold_lines = || -> Vec<String> {
+            crate::test_support::captured_log(STORE_LOCK_TARGET)
+                .into_iter()
+                .filter(|line| {
+                    line.starts_with("jj store lock hold exceeded ")
+                        && line.contains(&store_marker)
+                        && line.contains(BRANCH)
+                })
+                .collect()
+        };
+        let phases_listed = |line: &str| line.contains("phases=[") && !line.contains("phases=[]");
+        std::fs::write(&gate, "delay").unwrap();
+        reopen_reconcile_intent(&r.db, &r.fx.store, "main", &d1, BRANCH)
+            .await
+            .unwrap();
+
+        automatic_advance(&r).await;
+        let automatic_holds = hold_lines();
+        assert!(
+            !automatic_holds.is_empty(),
+            "the automatic attempt past its budget logs its store hold"
+        );
+        for hold in &automatic_holds {
+            assert!(!hold.contains("operation=explicit replay "), "{hold}");
+            assert!(!hold.contains("budget="), "{hold}");
+            assert!(phases_listed(hold), "{hold}");
+        }
+        let cooldown = load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+            .await
+            .unwrap()
+            .expect("automatic timeout records cooldown");
+        assert_eq!(cooldown.failure_kind, RECONCILE_TIMEOUT);
+        assert_eq!(cooldown.fingerprint, format!("{resolved}:{d1}"));
+        assert_eq!(branch_tip(&r), resolved);
+        let attempts_before = std::fs::read_to_string(&attempts).unwrap();
+        assert_eq!(
+            attempts_before.lines().filter(|s| *s == "rebase").count(),
+            1
+        );
+        automatic_advance(&r).await;
+        assert_eq!(
+            std::fs::read_to_string(&attempts).unwrap(),
+            attempts_before,
+            "automatic cooldown must suppress unchanged work"
+        );
+
+        let started = Instant::now();
+        let answer = request_take_committed_tip(&r).await;
+        assert!(started.elapsed() > crate::jj::BACKGROUND_RECONCILE_BUDGET);
+        assert!(started.elapsed() < EXPLICIT_REPLAY_BUDGET);
+        assert!(!answer.contains("exhausted"), "{answer}");
+        assert_ne!(branch_tip(&r), resolved);
+        assert!(crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &d1
+        ));
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+        assert!(!crate::jj::branch_has_conflict(&r.fx.jj, &r.fx.store, BRANCH).unwrap());
+        assert!(
+            r.fx.jj
+                .run(
+                    &r.fx.store,
+                    &[
+                        "log",
+                        "-r",
+                        &format!("(({d1})..bookmarks(exact:{BRANCH:?})) & conflicts()"),
+                        "--no-graph",
+                        "-T",
+                        "commit_id"
+                    ],
+                    "verify replay healed intermediate history",
+                )
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "the committed resolution also heals conflicted intermediate history"
+        );
+        let attempts_after = std::fs::read_to_string(&attempts).unwrap();
+        assert_eq!(attempts_after.lines().filter(|s| *s == "rebase").count(), 2);
+        assert!(
+            attempts_after.contains("restore"),
+            "resolution carry/heal was exercised"
+        );
+        assert!(
+            load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                .await
+                .unwrap()
+                .is_none(),
+            "successful explicit replay clears automatic cooldown"
+        );
+        let git_tip = crate::jj::tests::git_stdout(
+            &r.fx.repo,
+            &["rev-parse", &format!("refs/heads/{BRANCH}")],
+        );
+        assert_eq!(git_tip.trim(), branch_tip(&r));
+        let all_holds = hold_lines();
+        let explicit_holds = &all_holds[automatic_holds.len()..];
+        assert!(
+            !explicit_holds.is_empty(),
+            "the explicit replay past the automatic budget logs its store hold"
+        );
+        let explicit_budget = format!("(budget={}s; ", EXPLICIT_REPLAY_BUDGET.as_secs());
+        for hold in explicit_holds {
+            assert!(hold.contains("operation=explicit replay "), "{hold}");
+            assert!(hold.contains(&explicit_budget), "{hold}");
+            assert!(phases_listed(hold), "{hold}");
+        }
+        for hold in &automatic_holds {
+            eprintln!("automatic store hold: {hold}");
+        }
+        for hold in explicit_holds {
+            eprintln!("explicit store hold: {hold}");
+        }
+        eprintln!(
+            "explicit replay completed after {:?}: {answer}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() >= Duration::from_secs(11));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_budget_overrun_restores_refs_reports_phases_and_retries_immediately() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for explicit timeout regression");
+        let home = tempfile::tempdir().unwrap();
+        let wrapper = home.path().join("jj-explicit-overrun");
+        let gate = home.path().join("enabled");
+        let attempts = home.path().join("attempts");
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        std::fs::write(&wrapper, format!(
+            "#!/bin/sh\nif test -f {}; then\n case \" $* \" in\n *' rebase -b {BRANCH} '*) echo rebase >> {} ;;\n *' restore --from '*) echo restore >> {}; exec sleep 30 ;;\n esac\nfi\nexec {} \"$@\"\n",
+            quote(&gate.to_string_lossy()), quote(&attempts.to_string_lossy()),
+            quote(&attempts.to_string_lossy()), quote(&bin),
+        )).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (r, d1, resolved) =
+            same_spot_resolution(wrapper.to_str().unwrap(), "explicit-overrun.db").await;
+        let refs_before = crate::jj::tests::git_stdout(
+            &r.fx.repo,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ],
+        );
+        // The deterministic element is the wrapper's hanging `restore --from`;
+        // the window only has to be wide enough that the hang, not the real
+        // work before it, is what expires. The explicit deadline is absolute
+        // from branch admission, and the ~40 jj commands ahead of the rebase
+        // take ~2.75 s nominal, with a single `jj log` observed stalling 2.25 s
+        // under a loaded full suite. 20 s leaves the hang as the only plausible
+        // expiry. cairn/6173's injected-deadline discipline is the structural
+        // replacement for sizing this window by hand.
+        EXPLICIT_REPLAY_TEST_BUDGETS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(r.fx.store.clone(), Duration::from_secs(20));
+        assert_eq!(
+            explicit_replay_budget_for_store(&r.fx.store),
+            Duration::from_secs(20)
+        );
+        std::fs::write(&gate, "delay").unwrap();
+
+        let answer = request_take_committed_tip(&r).await;
+        assert_eq!(
+            branch_tip(&r),
+            resolved,
+            "the entire replay, not only the failed carry, is undone"
+        );
+        assert_eq!(
+            crate::jj::tests::git_stdout(
+                &r.fx.repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname) %(refname)",
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/tags"
+                ]
+            ),
+            refs_before,
+            "rollback restores every exported Git ref"
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &d1
+        ));
+        assert!(
+            load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                .await
+                .unwrap()
+                .is_none(),
+            "explicit failure never records automatic cooldown"
+        );
+        let commands = std::fs::read_to_string(&attempts).unwrap();
+        assert!(
+            commands.contains("rebase") && commands.contains("restore"),
+            "{commands}"
+        );
+        let diagnostic = r.db.query_text(
+            "SELECT last_diagnostic FROM jj_reconcile_items WHERE bookmark = 'agent/replay' AND failure_kind = 'reconcile_timeout' ORDER BY updated_at DESC LIMIT 1", ()
+        ).await.unwrap().expect("durable rebase-page diagnostic");
+        for rendered in [&answer, &diagnostic] {
+            assert!(
+                rendered.contains("20.000s cumulative forward budget"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("jj restore (committed conflict resolution) timed out after"),
+                "the budget must cut the injected restore hang, not the work before it: {rendered}"
+            );
+            assert!(rendered.contains("No automatic cooldown"), "{rendered}");
+            assert!(
+                rendered.contains("restore")
+                    && rendered.contains("ms:")
+                    && rendered.contains("forward")
+                    && rendered.contains("cleanup"),
+                "{rendered}"
+            );
+        }
+        std::fs::remove_file(&gate).unwrap();
+        EXPLICIT_REPLAY_TEST_BUDGETS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&r.fx.store);
+        let retry = request_take_committed_tip(&r).await;
+        assert_ne!(
+            branch_tip(&r),
+            resolved,
+            "the next request runs without waiting for cooldown"
+        );
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d1),
+            "{retry}"
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+        assert_eq!(
+            crate::jj::tests::git_stdout(
+                &r.fx.repo,
+                &["rev-parse", &format!("refs/heads/{BRANCH}")]
+            )
+            .trim(),
+            branch_tip(&r)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_plain_request_applies_structural_fallback_after_conflict_rollback() {
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for structural replay regression");
+        let r = replay_harness(&bin, "explicit-structural-fallback.db", &[]).await;
+        add_migration(&r.branch_ws, "0230_branch");
+        let original = commit(&r.fx, &r.branch_ws, BRANCH, &[], "branch registry");
+        add_migration(&r.main_ws, "0228_main");
+        let destination = commit(&r.fx, &r.main_ws, MAIN_LINE, &[], "main registry");
+        set_main(&r.fx, &destination);
+        let answer = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, false, None)
+            .await
+            .unwrap();
+        wait_for_worker(&r).await;
+        assert_ne!(branch_tip(&r), original, "{answer}");
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &destination),
+            "{answer}"
+        );
+        let registry = text_at(&r.fx, BRANCH, MIGRATIONS);
+        for stem in ["0227_before", "0228_main", "0230_branch", "0229_after"] {
+            assert_eq!(
+                registry.matches(&format!("migration!(\"{stem}\")")).count(),
+                1,
+                "{registry}"
+            );
+        }
+        assert!(!crate::jj::branch_has_conflict(&r.fx.jj, &r.fx.store, BRANCH).unwrap());
+        assert!(open_session(&r).await.is_none());
+        assert!(answer.contains("completed"), "{answer}");
+        assert_eq!(
+            crate::jj::tests::git_stdout(
+                &r.fx.repo,
+                &["rev-parse", &format!("refs/heads/{BRANCH}")]
+            )
+            .trim(),
+            branch_tip(&r)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_preflight_expiry_is_terminal_diagnosed_and_immediately_retryable() {
+        use std::time::Duration;
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for preflight replay regression");
+        let (r, destination, original) =
+            same_spot_resolution(&bin, "explicit-preflight-expiry.db").await;
+        let refs_before = crate::jj::tests::git_stdout(
+            &r.fx.repo,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+                "refs/remotes",
+                "refs/tags",
+            ],
+        );
+        EXPLICIT_REPLAY_TEST_BUDGETS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(r.fx.store.clone(), Duration::ZERO);
+        let answer = request_take_committed_tip(&r).await;
+        assert_eq!(branch_tip(&r), original);
+        assert_eq!(
+            crate::jj::tests::git_stdout(
+                &r.fx.repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname) %(refname)",
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/tags"
+                ]
+            ),
+            refs_before
+        );
+        assert!(
+            load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                .await
+                .unwrap()
+                .is_none_or(|quarantine| quarantine.failure_kind != RECONCILE_TIMEOUT),
+            "preflight expiry does not create an automatic timeout cooldown"
+        );
+        assert_eq!(r.db.query_text(
+            "SELECT status FROM jj_reconcile_intents WHERE store_path = ?1 ORDER BY updated_at DESC LIMIT 1",
+            [r.fx.store.to_string_lossy().to_string()],
+        ).await.unwrap().as_deref(), Some("completed"), "a failed explicit request must not become an automatic retry");
+        let diagnostic = r.db.query_text(
+            "SELECT last_diagnostic FROM jj_reconcile_items WHERE bookmark = 'agent/replay' AND failure_kind = 'reconcile_timeout' ORDER BY updated_at DESC LIMIT 1",
+            (),
+        ).await.unwrap().expect("preflight failure is durable for the rebase page");
+        for rendered in [&answer, &diagnostic] {
+            assert!(rendered.contains("cumulative forward budget"), "{rendered}");
+            assert!(rendered.contains("No automatic cooldown"), "{rendered}");
+            assert!(rendered.contains("ms:"), "{rendered}");
+        }
+        EXPLICIT_REPLAY_TEST_BUDGETS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&r.fx.store);
+        let retry = request_take_committed_tip(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &destination),
+            "{retry}"
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_deferred_request_retains_budget_carry_and_consumes_exact_marker() {
+        use crate::orchestrator::conflict_session::load_pending_replay_request;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for deferred replay regression");
+        for mode in ["success", "timeout", "invalid"] {
+            let home = tempfile::tempdir().unwrap();
+            let wrapper = home.path().join("jj-deferred-replay");
+            let gate = home.path().join("enabled");
+            let attempts = home.path().join("attempts");
+            let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            let delay = if mode == "timeout" { 30 } else { 11 };
+            std::fs::write(&wrapper, format!(
+                "#!/bin/sh\nif test -f {}; then\n case \" $* \" in\n *' rebase -b {BRANCH} '*) echo rebase >> {}; sleep {delay} ;;\n esac\nfi\nexec {} \"$@\"\n",
+                quote(&gate.to_string_lossy()), quote(&attempts.to_string_lossy()), quote(&bin),
+            )).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (r, destination, resolved) = same_spot_resolution(
+                wrapper.to_str().unwrap(),
+                &format!("explicit-deferred-{mode}.db"),
+            )
+            .await;
+            for sql in [
+                "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-deferred','job-replay','open','backend',1,1)",
+                "UPDATE runs SET session_id='session-deferred' WHERE id='run-replay'",
+                "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-deferred','session-deferred','run-replay','job-replay',1,'yielded','initial',1,1)",
+                "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-deferred','job-replay','run-replay','session-deferred','turn-deferred','tool-deferred','{\"kind\":\"run_batch\",\"request_id\":\"deferred-batch\",\"commits\":true}','pending',1)",
+            ] {
+                r.db.execute(sql, ()).await.unwrap();
+            }
+            let answer = request_take_committed_tip(&r).await;
+            assert!(answer.contains("deferred"), "{answer}");
+            assert_eq!(branch_tip(&r), resolved);
+            let pending = load_pending_replay_request(&r.db, &r.fx.store, BRANCH)
+                .await
+                .unwrap()
+                .expect("own run batch leaves typed explicit authority pending");
+            assert!(pending.take_committed_tip);
+            assert_eq!(pending.requested_tip.as_deref(), Some(resolved.as_str()));
+
+            let files: Vec<(&str, &str)> = if mode == "invalid" {
+                vec![(LIST, "head\nX\n"), ("later.txt", "new work\n")]
+            } else {
+                vec![("later.txt", "new work\n")]
+            };
+            let latest = commit(
+                &r.fx,
+                &r.branch_ws,
+                BRANCH,
+                &files,
+                "new commit after deferred request",
+            );
+            assert_ne!(latest, resolved);
+            let refs_before = crate::jj::tests::git_stdout(
+                &r.fx.repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname) %(refname)",
+                    "refs/heads",
+                    "refs/remotes",
+                    "refs/tags",
+                ],
+            );
+            if mode == "success" {
+                r.db.execute(
+                    "UPDATE jj_reconcile_items SET status = 'graph_moved', outcome_kind = 'rebased_clean', notification_sent = 0 WHERE intent_id = ?1 AND bookmark = ?2",
+                    params![pending.intent_id.as_str(), BRANCH],
+                ).await.unwrap();
+            }
+            r.db.execute("DELETE FROM agent_waits WHERE id='wait-deferred'", ())
+                .await
+                .unwrap();
+            if mode == "timeout" {
+                EXPLICIT_REPLAY_TEST_BUDGETS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .insert(r.fx.store.clone(), Duration::from_secs(5));
+            }
+            std::fs::write(&gate, "delay").unwrap();
+            let started = Instant::now();
+            let work = claim_next_reconcile_intent(&r.db)
+                .await
+                .unwrap()
+                .expect("deferred intent remains durable work");
+            execute_durable_reconcile_work(&r.orch, &r.db, work)
+                .await
+                .unwrap();
+            wait_for_worker(&r).await;
+            assert!(
+                load_pending_replay_request(&r.db, &r.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "serving pass consumes the exact request for {mode}"
+            );
+            assert_eq!(r.db.query_opt_i64(
+                "SELECT COUNT(*) FROM jj_reconcile_items WHERE replay_request_id = ?1 AND replay_served_at IS NOT NULL",
+                [pending.id.clone()],
+            ).await.unwrap(), Some(1));
+            assert!(
+                load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+                    .is_none_or(|q| q.failure_kind != RECONCILE_TIMEOUT),
+                "retained explicit authority must not record automatic timeout cooldown for {mode}"
+            );
+            assert_eq!(text_at(&r.fx, BRANCH, "later.txt"), "new work\n");
+
+            if mode == "success" {
+                assert!(started.elapsed() > crate::jj::BACKGROUND_RECONCILE_BUDGET);
+                assert!(started.elapsed() < EXPLICIT_REPLAY_BUDGET);
+                assert!(crate::jj::branch_carries_commit(
+                    &r.fx.jj,
+                    &r.fx.store,
+                    BRANCH,
+                    &destination
+                ));
+                assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+                assert!(std::fs::read_to_string(&attempts)
+                    .unwrap()
+                    .contains("rebase"));
+            } else {
+                assert_eq!(
+                    branch_tip(&r),
+                    latest,
+                    "failure reassesses and preserves the current tip"
+                );
+                assert_eq!(
+                    crate::jj::tests::git_stdout(
+                        &r.fx.repo,
+                        &[
+                            "for-each-ref",
+                            "--format=%(objectname) %(refname)",
+                            "refs/heads",
+                            "refs/remotes",
+                            "refs/tags"
+                        ]
+                    ),
+                    refs_before
+                );
+                assert!(!crate::jj::branch_carries_commit(
+                    &r.fx.jj,
+                    &r.fx.store,
+                    BRANCH,
+                    &destination
+                ));
+                let diagnostic = r.db.query_text(
+                    "SELECT last_diagnostic FROM jj_reconcile_items WHERE bookmark = 'agent/replay' AND outcome_kind = 'failed' ORDER BY updated_at DESC LIMIT 1", ()
+                ).await.unwrap().expect("retained explicit request failure is diagnosed");
+                if mode == "timeout" {
+                    assert!(
+                        diagnostic.contains("5.000s cumulative forward budget"),
+                        "{diagnostic}"
+                    );
+                    assert!(diagnostic.contains("No automatic cooldown"), "{diagnostic}");
+                    EXPLICIT_REPLAY_TEST_BUDGETS
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .remove(&r.fx.store);
+                } else {
+                    assert!(
+                        !attempts.exists(),
+                        "invalid current resolution is refused before rebase"
+                    );
+                    assert!(
+                        diagnostic.contains("resolution") || diagnostic.contains("one-sided"),
+                        "{diagnostic}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A jj wrapper that, while `gate` exists, logs every `rebase -b BRANCH`
+    /// and every `restore --from` to `attempts`, and holds each restore for
+    /// 30s when `stall_restore` is set so an explicit 5s budget expires after
+    /// the rebase has mutated the store.
+    #[cfg(unix)]
+    fn logging_jj_wrapper(
+        bin: &str,
+        home: &Path,
+        stall_restore: bool,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let wrapper = home.join("jj-request-race");
+        let gate = home.join("enabled");
+        let attempts = home.join("attempts");
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let stall = if stall_restore { "; exec sleep 30" } else { "" };
+        std::fs::write(&wrapper, format!(
+            "#!/bin/sh\nif test -f {}; then\n case \" $* \" in\n *' rebase -b {BRANCH} '*) echo rebase >> {} ;;\n *' restore --from '*) echo restore >> {}{stall} ;;\n esac\nfi\nexec {} \"$@\"\n",
+            quote(&gate.to_string_lossy()), quote(&attempts.to_string_lossy()),
+            quote(&attempts.to_string_lossy()), quote(bin),
+        )).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (wrapper, gate, attempts)
+    }
+
+    /// The refs a replay exports and its rollback must restore. jj's internal
+    /// `refs/jj/keep/*` pins are excluded: they retain every attempted object
+    /// by design and grow across a rolled-back attempt.
+    fn exported_refs(r: &Replay) -> String {
+        crate::jj::tests::git_stdout(
+            &r.fx.repo,
+            &["for-each-ref", "refs/heads", "refs/remotes", "refs/tags"],
+        )
+    }
+
+    fn logged(attempts: &Path, command: &str) -> usize {
+        std::fs::read_to_string(attempts)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == command)
+            .count()
+    }
+
+    fn install_replay_request_hook<F>(store: &Path, stage: &'static str, hook: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        REPLAY_REQUEST_HOOKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(
+                (store.to_path_buf(), stage),
+                Box::new(
+                    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                        Box::pin(hook)
+                    },
+                ),
+            );
+    }
+
+    fn replay_request_hook_installed(store: &Path, stage: &'static str) -> bool {
+        REPLAY_REQUEST_HOOKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .contains_key(&(store.to_path_buf(), stage))
+    }
+
+    /// A worker that serves the caller's queued request before the caller
+    /// claims it — right after the queue, or between the caller's Pending read
+    /// and its atomic prepare — decides the request. The caller returns that
+    /// worker's first terminal timeout verdict and never makes a second
+    /// attempt on its stale explicit label.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_request_served_by_another_worker_returns_its_first_timeout_verdict() {
+        use crate::orchestrator::conflict_session::{
+            load_pending_replay_request, replay_request_state, PendingReplayRequest,
+            ReplayRequestState,
+        };
+        use std::time::Duration;
+
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for request race regression");
+        for stage in ["queued", "pending_observed"] {
+            let home = tempfile::tempdir().unwrap();
+            let (wrapper, gate, attempts) = logging_jj_wrapper(&bin, home.path(), true);
+            let (r, d1, resolved) = same_spot_resolution(
+                wrapper.to_str().unwrap(),
+                &format!("request-race-served-{stage}.db"),
+            )
+            .await;
+            let r = Arc::new(r);
+            let refs_before = exported_refs(&r);
+            EXPLICIT_REPLAY_TEST_BUDGETS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(r.fx.store.clone(), Duration::from_secs(5));
+            std::fs::write(&gate, "delay").unwrap();
+
+            let seen: Arc<std::sync::Mutex<Option<PendingReplayRequest>>> = Default::default();
+            let (worker, record) = (r.clone(), seen.clone());
+            install_replay_request_hook(&r.fx.store, stage, async move {
+                let request = load_pending_replay_request(&worker.db, &worker.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+                    .expect("the caller's request is durably queued before the hook");
+                let work = claim_next_reconcile_intent(&worker.db)
+                    .await
+                    .unwrap()
+                    .expect("the queued request is claimable durable work");
+                execute_durable_reconcile_work(&worker.orch, &worker.db, work)
+                    .await
+                    .unwrap();
+                wait_for_worker(&worker).await;
+                *record.lock().unwrap() = Some(request);
+            });
+
+            let answer = request_take_committed_tip(&r).await;
+            let request =
+                seen.lock().unwrap().take().unwrap_or_else(|| {
+                    panic!("the competing worker never ran at {stage}: {answer}")
+                });
+            assert!(!replay_request_hook_installed(&r.fx.store, stage));
+
+            let ReplayRequestState::Served { pass, destination } =
+                replay_request_state(&r.db, &request).await.unwrap()
+            else {
+                panic!("the competing worker must have served the request at {stage}")
+            };
+            assert_eq!(destination, d1, "{stage}");
+            assert_eq!(pass.outcome_kind.as_deref(), Some("failed"), "{stage}");
+            assert_eq!(
+                pass.failure_kind.as_deref(),
+                Some(RECONCILE_TIMEOUT),
+                "{stage}"
+            );
+            let first = pass
+                .diagnostic
+                .expect("the served snapshot carries the first diagnostic");
+            assert!(
+                first.contains("5.000s cumulative forward budget"),
+                "{first}"
+            );
+            assert!(first.contains("No automatic cooldown"), "{first}");
+            assert!(
+                answer.contains(&format!("Explicit replay of `{BRANCH}` failed.")),
+                "{stage}: {answer}"
+            );
+            assert!(
+                answer.contains(&first),
+                "the caller returns the competing worker's first verdict at {stage}: {answer}"
+            );
+
+            assert_eq!(
+                logged(&attempts, "rebase"),
+                1,
+                "no second attempt at {stage}"
+            );
+            assert_eq!(
+                logged(&attempts, "restore"),
+                1,
+                "no second attempt at {stage}"
+            );
+            assert_eq!(
+                branch_tip(&r),
+                resolved,
+                "the timed-out attempt rolled back"
+            );
+            assert_eq!(exported_refs(&r), refs_before);
+            assert!(!crate::jj::branch_carries_commit(
+                &r.fx.jj,
+                &r.fx.store,
+                BRANCH,
+                &d1
+            ));
+            assert!(
+                load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+                    .is_none_or(|q| q.failure_kind != RECONCILE_TIMEOUT),
+                "an explicit timeout records no automatic cooldown at {stage}"
+            );
+            assert!(
+                load_pending_replay_request(&r.db, &r.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no fresh request marker is left pending at {stage}"
+            );
+            assert_eq!(
+                r.db.query_opt_i64(
+                    "SELECT COUNT(*) FROM jj_reconcile_items
+                     WHERE bookmark = ?1 AND replay_request_id IS NOT NULL",
+                    [BRANCH.to_string()],
+                )
+                .await
+                .unwrap(),
+                Some(1),
+                "only the caller's one request was ever queued at {stage}"
+            );
+            assert_eq!(
+                r.db.query_opt_i64(
+                    "SELECT COUNT(*) FROM jj_reconcile_intents WHERE status IN ('pending', 'running')",
+                    (),
+                )
+                .await
+                .unwrap(),
+                Some(0),
+                "a served explicit failure leaves no queued retry at {stage}"
+            );
+
+            std::fs::remove_file(&gate).unwrap();
+            EXPLICIT_REPLAY_TEST_BUDGETS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .remove(&r.fx.store);
+        }
+    }
+
+    /// The label is never authority: a pass carrying the exact explicit label
+    /// for a branch with no pending typed request makes no replay mutation.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_label_without_a_pending_request_grants_no_mutation() {
+        use crate::orchestrator::conflict_session::load_pending_replay_request;
+
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for label authority regression");
+        let home = tempfile::tempdir().unwrap();
+        let (wrapper, gate, attempts) = logging_jj_wrapper(&bin, home.path(), false);
+        let (r, _d1, resolved) =
+            same_spot_resolution(wrapper.to_str().unwrap(), "label-without-request.db").await;
+        assert!(load_pending_replay_request(&r.db, &r.fx.store, BRANCH)
+            .await
+            .unwrap()
+            .is_none());
+        // A fresh destination, so the labelled call claims a new intent and
+        // reaches the per-branch body rather than coalescing.
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("other.txt", "unrelated\n")],
+            "D2 touches another file",
+        );
+        set_main(&r.fx, &d2);
+        let refs_before = exported_refs(&r);
+        let quarantine = |q: Option<ReconcileQuarantine>| {
+            q.map(|q| {
+                (
+                    q.failure_kind.clone(),
+                    q.fingerprint.clone(),
+                    q.strike_count,
+                    q.updated_at,
+                )
+            })
+        };
+        let cooldown_before = quarantine(
+            load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                .await
+                .unwrap(),
+        );
+        std::fs::write(&gate, "log").unwrap();
+
+        let label = format!("resolved replay requested for {BRANCH}");
+        assert!(replay_is_explicit_for(&label, BRANCH));
+        let outcome = reconcile_base_advance(
+            &r.orch,
+            &r.db,
+            "proj-1",
+            &label,
+            &r.fx.repo.to_string_lossy(),
+            "main",
+            "main",
+            vec![SiblingJob {
+                id: JOB.to_string(),
+                branch: Some(BRANCH.to_string()),
+                base_commit: None,
+            }],
+            BaseAdvanceNotes {
+                conflict: build_jj_conflict_note("main", None, None),
+                clean: build_jj_clean_note("main", None, None),
+                incoming: IncomingIdentity {
+                    base_branch: "main".to_string(),
+                    ..IncomingIdentity::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_worker(&r).await;
+
+        assert!(
+            outcome.coalesced_destination.is_none(),
+            "the labelled call claimed a fresh intent and ran its body"
+        );
+        assert_eq!(
+            (outcome.rebased_clean, outcome.conflicted, outcome.failed),
+            (0, 0, 0),
+            "no attempt was made on label alone"
+        );
+        assert!(outcome.replay_diagnostic.is_none());
+        assert_eq!(logged(&attempts, "rebase"), 0);
+        assert_eq!(logged(&attempts, "restore"), 0);
+        assert_eq!(branch_tip(&r), resolved);
+        assert_eq!(exported_refs(&r), refs_before);
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &d2
+        ));
+        assert_eq!(
+            r.db.query_opt_i64(
+                "SELECT COUNT(*) FROM jj_reconcile_items i
+                 JOIN jj_reconcile_intents n ON n.id = i.intent_id
+                 WHERE n.destination_commit = ?1 AND i.bookmark = ?2
+                   AND i.outcome_kind IS NOT NULL",
+                params![d2.clone(), BRANCH.to_string()],
+            )
+            .await
+            .unwrap(),
+            Some(0),
+            "no verdict was recorded for a pass that had no authority"
+        );
+        assert!(load_pending_replay_request(&r.db, &r.fx.store, BRANCH)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            quarantine(
+                load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+            ),
+            cooldown_before
+        );
+    }
+
+    /// A newer request queued while the original caller waits supersedes it.
+    /// The old caller reports that, makes no attempt, and leaves the newer
+    /// request pending for the worker that serves it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn explicit_replay_superseded_request_reports_superseded_and_leaves_the_newer_pending() {
+        use crate::orchestrator::conflict_session::{
+            load_pending_replay_request, queue_replay_request, replay_request_state,
+            PendingReplayRequest, ReplayRequestState,
+        };
+
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for supersede regression");
+        for stage in ["queued", "pending_observed"] {
+            let home = tempfile::tempdir().unwrap();
+            let (wrapper, gate, attempts) = logging_jj_wrapper(&bin, home.path(), false);
+            let (r, d1, resolved) = same_spot_resolution(
+                wrapper.to_str().unwrap(),
+                &format!("request-race-superseded-{stage}.db"),
+            )
+            .await;
+            let r = Arc::new(r);
+            let refs_before = exported_refs(&r);
+            std::fs::write(&gate, "log").unwrap();
+
+            let seen: Arc<std::sync::Mutex<Option<(PendingReplayRequest, PendingReplayRequest)>>> =
+                Default::default();
+            let (worker, record, tip, destination) =
+                (r.clone(), seen.clone(), resolved.clone(), d1.clone());
+            install_replay_request_hook(&r.fx.store, stage, async move {
+                let old = load_pending_replay_request(&worker.db, &worker.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+                    .expect("the caller's request is durably queued before the hook");
+                let newer = queue_replay_request(
+                    &worker.db,
+                    "proj-1",
+                    &worker.fx.store,
+                    "main",
+                    &destination,
+                    BRANCH,
+                    Some(&tip),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_ne!(old.id, newer.id);
+                *record.lock().unwrap() = Some((old, newer));
+            });
+
+            let result = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None).await;
+            wait_for_worker(&r).await;
+            let (old, newer) =
+                seen.lock().unwrap().take().unwrap_or_else(|| {
+                    panic!("the superseding request was never queued at {stage}")
+                });
+            let error = result.expect_err("a superseded caller must not report a verdict");
+            assert!(
+                error.contains("superseded") && error.contains(&old.id),
+                "{stage}: {error}"
+            );
+            assert_eq!(
+                replay_request_state(&r.db, &old).await.unwrap(),
+                ReplayRequestState::Superseded
+            );
+            assert_eq!(
+                replay_request_state(&r.db, &newer).await.unwrap(),
+                ReplayRequestState::Pending,
+                "the old caller neither served nor consumed the newer request at {stage}"
+            );
+            assert_eq!(
+                load_pending_replay_request(&r.db, &r.fx.store, BRANCH)
+                    .await
+                    .unwrap()
+                    .map(|request| request.id),
+                Some(newer.id.clone())
+            );
+            assert_eq!(logged(&attempts, "rebase"), 0, "no attempt at {stage}");
+            assert_eq!(branch_tip(&r), resolved);
+            assert_eq!(exported_refs(&r), refs_before);
+
+            // The newer request keeps its authority for the next worker.
+            let work = claim_next_reconcile_intent(&r.db)
+                .await
+                .unwrap()
+                .expect("the newer request remains durable work");
+            execute_durable_reconcile_work(&r.orch, &r.db, work)
+                .await
+                .unwrap();
+            wait_for_worker(&r).await;
+            assert!(
+                matches!(
+                    replay_request_state(&r.db, &newer).await.unwrap(),
+                    ReplayRequestState::Served { .. }
+                ),
+                "{stage}"
+            );
+            assert_eq!(logged(&attempts, "rebase"), 1, "{stage}");
+            assert!(crate::jj::branch_carries_commit(
+                &r.fx.jj,
+                &r.fx.store,
+                BRANCH,
+                &d1
+            ));
+            assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+        }
     }
 
     #[cfg(unix)]

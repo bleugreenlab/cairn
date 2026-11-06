@@ -172,7 +172,7 @@ pub(crate) struct ConflictSession {
 }
 
 /// What the reconcile row that processes a replay request last recorded.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ReplayPass {
     pub(crate) item_status: Option<String>,
     pub(crate) intent_status: Option<String>,
@@ -1348,10 +1348,14 @@ pub(crate) async fn record_conflict_session(
            resolution_state = ?13,
            -- A fresh conflict means any earlier replay request has resolved into
            -- a new situation, so a surviving timestamp would describe a request
-           -- nobody is waiting on.
-           replay_requested_at = NULL,
-           replay_requested_tip = NULL,
-           replay_requested_destination = NULL,
+           -- nobody is waiting on. An unserved typed request is the exception:
+           -- only the pass that serves it may withdraw it.
+           replay_requested_at = CASE WHEN replay_request_id IS NOT NULL
+             AND replay_served_at IS NULL THEN replay_requested_at END,
+           replay_requested_tip = CASE WHEN replay_request_id IS NOT NULL
+             AND replay_served_at IS NULL THEN replay_requested_tip END,
+           replay_requested_destination = CASE WHEN replay_request_id IS NOT NULL
+             AND replay_served_at IS NULL THEN replay_requested_destination END,
            resolution_basis_json = ?14
          WHERE intent_id = ?1 AND bookmark = ?2",
         params![
@@ -1489,6 +1493,518 @@ pub(crate) async fn record_replay_request(
     {
         log::warn!("replay request for `{bookmark}`: could not record the request: {error}");
     }
+}
+
+const REPLAY_RESOLUTION_PLAIN: &str = "plain";
+const REPLAY_RESOLUTION_TAKE_COMMITTED_TIP: &str = "take-committed-tip";
+
+/// An explicit replay request that no completed pass has served yet.
+///
+/// It lives on the reconcile item at the destination it was queued onto, and
+/// it outlives every pass that defers: lock contention, a held mutation
+/// boundary, a missing branch and a crash all leave it pending. Only
+/// [`mark_replay_request_served`], called by a pass that actually attempted the
+/// replay (landed or failed), consumes it. A commit to the branch after the
+/// request does not withdraw it: the serving pass assesses the tip it finds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingReplayRequest {
+    /// The compare token: a pass consumes exactly the request it loaded.
+    pub(crate) id: String,
+    pub(crate) intent_id: String,
+    pub(crate) project_id: String,
+    pub(crate) store_path: String,
+    pub(crate) target_branch: String,
+    pub(crate) destination_commit: String,
+    pub(crate) bookmark: String,
+    /// The tip the request was assessed at. Informational: the serving pass
+    /// re-assesses whatever tip the branch holds when it runs.
+    pub(crate) requested_tip: Option<String>,
+    pub(crate) take_committed_tip: bool,
+    pub(crate) drop_incoming_reason: Option<String>,
+    /// Unix seconds.
+    pub(crate) requested_at: i64,
+}
+
+/// Durably queue an explicit replay request for `bookmark` onto `destination`.
+///
+/// Ensures the reconcile intent at these coordinates exists (a running or
+/// completed one is left as it is; reopening it is the caller's) and the
+/// branch's item under it, then writes the request onto that item. An item that
+/// already exists keeps its status, notification and pass history: the request
+/// is a fact about what was asked, not about what the last pass did. A
+/// completed intent is reopened to pending in the same transaction, so a
+/// request queued onto it is always discovered by the sweep even if the caller
+/// dies before running it; a pending or running intent (and its lease) is left
+/// alone. Every
+/// older unserved request for the same store and branch is stamped served in
+/// the same transaction, so the newest request is the only authority.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn queue_replay_request(
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    target_branch: &str,
+    destination: &str,
+    bookmark: &str,
+    tip: Option<&str>,
+    take_committed_tip: bool,
+    drop_incoming_reason: Option<&str>,
+) -> Result<PendingReplayRequest, String> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let fresh_intent_id = uuid::Uuid::new_v4().to_string();
+    let requested_at = chrono::Utc::now().timestamp();
+    let resolution = if take_committed_tip {
+        REPLAY_RESOLUTION_TAKE_COMMITTED_TIP
+    } else {
+        REPLAY_RESOLUTION_PLAIN
+    };
+    let sources = serde_json::to_string(&[format!("replay requested for {bookmark}")])
+        .map_err(|error| format!("encode replay request source: {error}"))?;
+    let mut request = PendingReplayRequest {
+        id: request_id,
+        intent_id: String::new(),
+        project_id: project_id.to_string(),
+        store_path: store.to_string_lossy().into_owned(),
+        target_branch: target_branch.to_string(),
+        destination_commit: destination.to_string(),
+        bookmark: bookmark.to_string(),
+        requested_tip: tip.map(str::to_string),
+        take_committed_tip,
+        drop_incoming_reason: drop_incoming_reason.map(str::to_string),
+        requested_at,
+    };
+    let queued = request.clone();
+    let intent_id = db
+        .write(|conn| {
+            let request = queued.clone();
+            let fresh_intent_id = fresh_intent_id.clone();
+            let sources = sources.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO jj_reconcile_intents
+                       (id, project_id, store_path, target_branch, destination_commit,
+                        trigger_sources_json, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)
+                     ON CONFLICT(project_id, store_path, target_branch, destination_commit)
+                     DO NOTHING",
+                    params![
+                        fresh_intent_id.as_str(),
+                        request.project_id.as_str(),
+                        request.store_path.as_str(),
+                        request.target_branch.as_str(),
+                        request.destination_commit.as_str(),
+                        sources.as_str(),
+                        request.requested_at
+                    ],
+                )
+                .await?;
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM jj_reconcile_intents
+                         WHERE project_id = ?1 AND store_path = ?2
+                           AND target_branch = ?3 AND destination_commit = ?4",
+                        params![
+                            request.project_id.as_str(),
+                            request.store_path.as_str(),
+                            request.target_branch.as_str(),
+                            request.destination_commit.as_str()
+                        ],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                let intent_id = row.text(0)?;
+                drop(rows);
+
+                conn.execute(
+                    "UPDATE jj_reconcile_intents
+                     SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+                         updated_at = ?2
+                     WHERE id = ?1 AND status = 'completed'",
+                    params![intent_id.as_str(), request.requested_at],
+                )
+                .await?;
+
+                conn.execute(
+                    "UPDATE jj_reconcile_items SET replay_served_at = ?3
+                     WHERE bookmark = ?1
+                       AND replay_request_id IS NOT NULL AND replay_served_at IS NULL
+                       AND intent_id IN (SELECT id FROM jj_reconcile_intents WHERE store_path = ?2)",
+                    params![
+                        request.bookmark.as_str(),
+                        request.store_path.as_str(),
+                        request.requested_at
+                    ],
+                )
+                .await?;
+
+                conn.execute(
+                    "INSERT INTO jj_reconcile_items
+                       (intent_id, bookmark, observed_tip, status, updated_at,
+                        replay_request_id, replay_resolution, replay_drop_incoming_reason,
+                        replay_served_at, replay_requested_at, replay_requested_tip,
+                        replay_requested_destination)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, NULL, ?4, ?3, ?8)
+                     ON CONFLICT(intent_id, bookmark) DO UPDATE SET
+                       replay_request_id = excluded.replay_request_id,
+                       replay_resolution = excluded.replay_resolution,
+                       replay_drop_incoming_reason = excluded.replay_drop_incoming_reason,
+                       replay_served_at = NULL,
+                       replay_result_json = NULL,
+                       replay_requested_at = excluded.replay_requested_at,
+                       replay_requested_tip = excluded.replay_requested_tip,
+                       replay_requested_destination = excluded.replay_requested_destination",
+                    params![
+                        intent_id.as_str(),
+                        request.bookmark.as_str(),
+                        request.requested_tip.as_deref(),
+                        request.requested_at,
+                        request.id.as_str(),
+                        resolution,
+                        request.drop_incoming_reason.as_deref(),
+                        request.destination_commit.as_str()
+                    ],
+                )
+                .await?;
+                Ok(Some(intent_id))
+            })
+        })
+        .await
+        .map_err(|error| format!("queue replay request: {error}"))?;
+    request.intent_id = intent_id.ok_or_else(|| {
+        format!(
+            "queue replay request for `{bookmark}`: the reconcile intent at `{destination}` \
+             vanished while it was being ensured"
+        )
+    })?;
+    Ok(request)
+}
+
+/// The newest unserved explicit replay request for `bookmark` in `store`.
+///
+/// Not filtered by destination: a request retargeted onto a newer base keeps
+/// its authority. A row with a request timestamp but no request id predates
+/// typed requests and is never authority.
+pub(crate) async fn load_pending_replay_request(
+    db: &LocalDb,
+    store: &Path,
+    bookmark: &str,
+) -> Result<Option<PendingReplayRequest>, String> {
+    let store = store.to_string_lossy().into_owned();
+    let bookmark = bookmark.to_string();
+    db.read(move |conn| {
+        let (store, bookmark) = (store.clone(), bookmark.clone());
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT i.replay_request_id, i.intent_id, n.project_id, n.store_path,
+                            n.target_branch, n.destination_commit, i.bookmark,
+                            i.replay_requested_tip, i.replay_resolution,
+                            i.replay_drop_incoming_reason, i.replay_requested_at
+                     FROM jj_reconcile_items i
+                     JOIN jj_reconcile_intents n ON n.id = i.intent_id
+                     WHERE i.bookmark = ?1 AND n.store_path = ?2
+                       AND i.replay_request_id IS NOT NULL AND i.replay_served_at IS NULL
+                       AND i.replay_requested_at IS NOT NULL
+                     ORDER BY i.replay_requested_at DESC, i.rowid DESC LIMIT 1",
+                    params![bookmark, store],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            Ok(Some((
+                PendingReplayRequest {
+                    id: row.text(0)?,
+                    intent_id: row.text(1)?,
+                    project_id: row.text(2)?,
+                    store_path: row.text(3)?,
+                    target_branch: row.text(4)?,
+                    destination_commit: row.text(5)?,
+                    bookmark: row.text(6)?,
+                    requested_tip: row.opt_text(7)?,
+                    take_committed_tip: false,
+                    drop_incoming_reason: row.opt_text(9)?,
+                    requested_at: row.opt_i64(10)?.unwrap_or(0),
+                },
+                row.opt_text(8)?,
+            )))
+        })
+    })
+    .await
+    .map_err(|error| format!("load pending replay request: {error}"))?
+    .map(|(mut request, resolution)| {
+        request.take_committed_tip = match resolution.as_deref() {
+            Some(REPLAY_RESOLUTION_TAKE_COMMITTED_TIP) => true,
+            Some(REPLAY_RESOLUTION_PLAIN) => false,
+            other => {
+                return Err(format!(
+                    "pending replay request `{}` for `{}` has an unknown resolution {other:?}",
+                    request.id, request.bookmark
+                ))
+            }
+        };
+        Ok(request)
+    })
+    .transpose()
+}
+
+/// Reopen the reconcile work at `destination` for `request`, only while the
+/// request is still unserved.
+///
+/// The same reopen an explicit request has always performed (a completed
+/// intent back to pending with its lease cleared, the branch's item back to
+/// pending with its notification unsent), but behind the request's compare
+/// token in one transaction: a request another worker served between the
+/// caller's read and this write is not reopened over its terminal result.
+/// Returns `false` when the request was already served or superseded; the
+/// caller reads [`replay_request_state`] instead.
+pub(crate) async fn prepare_pending_replay_request(
+    db: &LocalDb,
+    request: &PendingReplayRequest,
+    destination: &str,
+) -> Result<bool, String> {
+    let request = request.clone();
+    let destination = destination.to_string();
+    db.write(|conn| {
+        let request = request.clone();
+        let destination = destination.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM jj_reconcile_items
+                     WHERE intent_id = ?1 AND bookmark = ?2 AND replay_request_id = ?3
+                       AND replay_served_at IS NULL",
+                    params![
+                        request.intent_id.as_str(),
+                        request.bookmark.as_str(),
+                        request.id.as_str()
+                    ],
+                )
+                .await?;
+            let unserved = rows.next().await?.is_some();
+            drop(rows);
+            if !unserved {
+                return Ok(false);
+            }
+            conn.execute(
+                "UPDATE jj_reconcile_intents
+                 SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL
+                 WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3
+                   AND status = 'completed'",
+                params![
+                    request.store_path.as_str(),
+                    request.target_branch.as_str(),
+                    destination.as_str()
+                ],
+            )
+            .await?;
+            conn.execute(
+                "UPDATE jj_reconcile_items SET status = 'pending', notification_sent = 0
+                 WHERE bookmark = ?1 AND intent_id IN (
+                     SELECT id FROM jj_reconcile_intents
+                     WHERE store_path = ?2 AND target_branch = ?3 AND destination_commit = ?4
+                 )",
+                params![
+                    request.bookmark.as_str(),
+                    request.store_path.as_str(),
+                    request.target_branch.as_str(),
+                    destination.as_str()
+                ],
+            )
+            .await?;
+            Ok(true)
+        })
+    })
+    .await
+    .map_err(|error| format!("prepare pending replay request: {error}"))
+}
+
+/// The verdict frozen onto a request when it was served.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ServedReplay {
+    pass: ReplayPass,
+    destination: String,
+}
+
+/// Where one explicit replay request stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplayRequestState {
+    /// No completed pass has served it.
+    Pending,
+    /// A pass attempted it; `pass` is what that pass recorded on the item it
+    /// ran, onto `destination`, frozen at the moment it was served.
+    Served {
+        pass: ReplayPass,
+        destination: String,
+    },
+    /// A newer request replaced it, or its row is gone. Whatever happens next
+    /// answers the newer request, not this one.
+    Superseded,
+}
+
+/// Consume exactly `request`, once a pass has attempted it (landed or failed).
+///
+/// `current_intent_id` is the intent the attempting pass ran, which may differ
+/// from the request's own after a retarget. That pass's item verdict is
+/// snapshotted onto the request's row in the same transaction, so a later pass
+/// over either item cannot rewrite the first result. A serving row that is
+/// missing or carries no outcome or failure is refused with an error and the
+/// request stays pending. Compared by request id, so
+/// a newer request queued while this pass ran is left pending. Returns whether
+/// this call consumed it; `false` means it was already served, superseded, or
+/// overwritten by a newer request.
+pub(crate) async fn mark_replay_request_served(
+    db: &LocalDb,
+    request: &PendingReplayRequest,
+    current_intent_id: &str,
+) -> Result<bool, String> {
+    let request = request.clone();
+    let current_intent_id = current_intent_id.to_string();
+    db.write(|conn| {
+        let request = request.clone();
+        let current_intent_id = current_intent_id.clone();
+        Box::pin(async move {
+            let now = chrono::Utc::now().timestamp();
+            let mut rows = conn
+                .query(
+                    "SELECT i.status, n.status, i.outcome_kind, i.failure_kind,
+                            i.last_diagnostic, i.updated_at, n.destination_commit
+                     FROM jj_reconcile_items i
+                     JOIN jj_reconcile_intents n ON n.id = i.intent_id
+                     WHERE i.intent_id = ?1 AND i.bookmark = ?2",
+                    params![current_intent_id.as_str(), request.bookmark.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(Err(format!(
+                    "mark replay request `{}` served: the serving pass `{current_intent_id}` \
+                     recorded nothing for `{}`; the request stays pending",
+                    request.id, request.bookmark
+                )));
+            };
+            let served = ServedReplay {
+                pass: ReplayPass {
+                    item_status: row.opt_text(0)?,
+                    intent_status: row.opt_text(1)?,
+                    outcome_kind: row.opt_text(2)?,
+                    failure_kind: row.opt_text(3)?,
+                    diagnostic: row.opt_text(4)?,
+                    updated_at: row.opt_i64(5)?.unwrap_or(now),
+                },
+                destination: row.text(6)?,
+            };
+            drop(rows);
+            // Only a pass that reached a verdict serves a request: a deferral
+            // records neither an outcome nor a failure.
+            if served.pass.outcome_kind.is_none() && served.pass.failure_kind.is_none() {
+                return Ok(Err(format!(
+                    "mark replay request `{}` served: the serving pass `{current_intent_id}` \
+                     has no terminal outcome for `{}`; the request stays pending",
+                    request.id, request.bookmark
+                )));
+            }
+            // Serializing plain strings and integers cannot fail.
+            let served = serde_json::to_string(&served).unwrap_or_default();
+            let consumed = conn
+                .execute(
+                    "UPDATE jj_reconcile_items SET replay_served_at = ?4, replay_result_json = ?5
+                     WHERE intent_id = ?1 AND bookmark = ?2 AND replay_request_id = ?3
+                       AND replay_served_at IS NULL",
+                    params![
+                        request.intent_id.as_str(),
+                        request.bookmark.as_str(),
+                        request.id.as_str(),
+                        now,
+                        served.as_str()
+                    ],
+                )
+                .await?;
+            Ok(Ok(consumed > 0))
+        })
+    })
+    .await
+    .map_err(|error| format!("mark replay request served: {error}"))?
+}
+
+/// Where `request` stands, read from the row that owns it.
+pub(crate) async fn replay_request_state(
+    db: &LocalDb,
+    request: &PendingReplayRequest,
+) -> Result<ReplayRequestState, String> {
+    let (intent_id, bookmark) = (request.intent_id.clone(), request.bookmark.clone());
+    let row = db
+        .read(move |conn| {
+            let (intent_id, bookmark) = (intent_id.clone(), bookmark.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT replay_request_id, replay_served_at, replay_result_json
+                         FROM jj_reconcile_items WHERE intent_id = ?1 AND bookmark = ?2",
+                        params![intent_id, bookmark],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                Ok(Some((row.opt_text(0)?, row.opt_i64(1)?, row.opt_text(2)?)))
+            })
+        })
+        .await
+        .map_err(|error| format!("load replay request state: {error}"))?;
+    let Some((Some(id), served_at, result)) = row else {
+        return Ok(ReplayRequestState::Superseded);
+    };
+    if id != request.id {
+        return Ok(ReplayRequestState::Superseded);
+    }
+    if served_at.is_none() {
+        return Ok(ReplayRequestState::Pending);
+    }
+    let Some(result) = result else {
+        return Ok(ReplayRequestState::Superseded);
+    };
+    let served: ServedReplay = serde_json::from_str(&result).map_err(|error| {
+        format!(
+            "replay request `{}` for `{}` has an unreadable result: {error}",
+            request.id, request.bookmark
+        )
+    })?;
+    Ok(ReplayRequestState::Served {
+        pass: served.pass,
+        destination: served.destination,
+    })
+}
+
+/// Point the session row's advisory request projection at where `request` is
+/// actually being served, so `cairn:~/rebase` follows a retarget.
+///
+/// Writes only `replay_requested_at` (the request's own time, not now),
+/// `replay_requested_tip` and `replay_requested_destination` on the
+/// `session_intent` item. Never consumes or rewrites the typed request.
+pub(crate) async fn project_pending_replay_request(
+    db: &LocalDb,
+    request: &PendingReplayRequest,
+    session_intent: &str,
+    current_destination: &str,
+    tip: Option<&str>,
+) -> Result<(), String> {
+    db.execute(
+        "UPDATE jj_reconcile_items SET replay_requested_at = ?3, replay_requested_tip = ?4,
+           replay_requested_destination = ?5
+         WHERE intent_id = ?1 AND bookmark = ?2",
+        params![
+            session_intent,
+            request.bookmark.as_str(),
+            request.requested_at,
+            tip,
+            current_destination
+        ],
+    )
+    .await
+    .map_err(|error| format!("project pending replay request: {error}"))?;
+    Ok(())
 }
 
 /// Supersede every other open session for this branch, so exactly one is active.
@@ -2612,5 +3128,537 @@ mod tests {
             decide_replay(&clean, Some("just in case")),
             ReplayDecision::Proceed
         );
+    }
+
+    mod pending_replay {
+        use super::super::*;
+
+        const STORE: &str = "/store";
+        const BRANCH: &str = "agent/replay";
+
+        async fn seeded(path: &Path) -> LocalDb {
+            let db = LocalDb::open_migrated_for_test(path.to_path_buf())
+                .await
+                .unwrap();
+            db.execute(
+                "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                 VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)
+                 ON CONFLICT(id) DO NOTHING",
+                (),
+            )
+            .await
+            .unwrap();
+            db
+        }
+
+        async fn fresh() -> LocalDb {
+            let dir = tempfile::tempdir().unwrap().keep();
+            seeded(&dir.join("pending-replay.db")).await
+        }
+
+        async fn queue(
+            db: &LocalDb,
+            destination: &str,
+            take_committed_tip: bool,
+        ) -> PendingReplayRequest {
+            queue_replay_request(
+                db,
+                "proj-1",
+                Path::new(STORE),
+                "main",
+                destination,
+                BRANCH,
+                Some("tip-1"),
+                take_committed_tip,
+                take_committed_tip.then_some("incoming change is obsolete"),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn pending(db: &LocalDb) -> Option<PendingReplayRequest> {
+            load_pending_replay_request(db, Path::new(STORE), BRANCH)
+                .await
+                .unwrap()
+        }
+
+        async fn item_state(db: &LocalDb, intent_id: &str) -> (String, i64, String) {
+            let intent_id = intent_id.to_string();
+            db.read(move |conn| {
+                let intent_id = intent_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT i.status, i.notification_sent, n.status
+                             FROM jj_reconcile_items i
+                             JOIN jj_reconcile_intents n ON n.id = i.intent_id
+                             WHERE i.intent_id = ?1 AND i.bookmark = ?2",
+                            params![intent_id, BRANCH],
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("item exists");
+                    Ok((row.text(0)?, row.opt_i64(1)?.unwrap_or(0), row.text(2)?))
+                })
+            })
+            .await
+            .unwrap()
+        }
+
+        /// A queued request is durable: it reads back whole from a reopened
+        /// database, onto an intent and item the queue created.
+        #[tokio::test]
+        async fn a_queued_request_survives_reopening_the_database() {
+            let path = tempfile::tempdir().unwrap().keep().join("reload.db");
+            let db = seeded(&path).await;
+            let queued = queue(&db, "dest-a", true).await;
+            assert_eq!(
+                item_state(&db, &queued.intent_id).await,
+                ("pending".to_string(), 0, "pending".to_string())
+            );
+            drop(db);
+
+            let reopened = seeded(&path).await;
+            let loaded = pending(&reopened).await.expect("request is pending");
+            assert_eq!(loaded, queued);
+            assert!(loaded.take_committed_tip);
+            assert_eq!(
+                loaded.drop_incoming_reason.as_deref(),
+                Some("incoming change is obsolete")
+            );
+            assert_eq!(loaded.destination_commit, "dest-a");
+        }
+
+        /// Queueing onto an intent a worker already owns writes the request
+        /// without disturbing the intent or the item's pass state.
+        #[tokio::test]
+        async fn queueing_leaves_an_existing_intent_and_item_as_they_are() {
+            let db = fresh().await;
+            db.execute_script(format!(
+                "INSERT INTO jj_reconcile_intents
+                   (id, project_id, store_path, target_branch, destination_commit, status,
+                    created_at, updated_at)
+                 VALUES ('intent-run', 'proj-1', '{STORE}', 'main', 'dest-a', 'running', 1, 1);
+                 INSERT INTO jj_reconcile_items
+                   (intent_id, bookmark, status, notification_sent, updated_at)
+                 VALUES ('intent-run', '{BRANCH}', 'graph_moved', 1, 5);"
+            ))
+            .await
+            .unwrap();
+
+            let queued = queue(&db, "dest-a", false).await;
+            assert_eq!(queued.intent_id, "intent-run");
+            assert_eq!(
+                item_state(&db, "intent-run").await,
+                ("graph_moved".to_string(), 1, "running".to_string())
+            );
+            assert_eq!(pending(&db).await, Some(queued));
+        }
+
+        /// A pass that defers, a fresh commit on the branch, and a conflict
+        /// re-recorded on the item all leave the request pending; only serving
+        /// it consumes it, and only the exact request.
+        #[tokio::test]
+        async fn only_serving_the_exact_request_consumes_it() {
+            let db = fresh().await;
+            let queued = queue(&db, "dest-a", true).await;
+
+            db.execute(
+                "UPDATE jj_reconcile_items SET status = 'pending', observed_tip = 'tip-2',
+                   last_diagnostic = 'deferred: ref lock held', attempt_count = attempt_count + 1,
+                   updated_at = updated_at + 10
+                 WHERE intent_id = ?1 AND bookmark = ?2",
+                params![queued.intent_id.as_str(), BRANCH],
+            )
+            .await
+            .unwrap();
+            record_conflict_session(
+                &db,
+                &queued.intent_id,
+                BRANCH,
+                &ConflictDiagnostic {
+                    condition: ConflictCondition::ContentConflict,
+                    base: Some("base".to_string()),
+                    ours: Some("tip-2".to_string()),
+                    theirs: Some("dest-a".to_string()),
+                    conflicted_tip: None,
+                    incoming: Vec::new(),
+                    ..Default::default()
+                },
+                &IncomingIdentity::default(),
+                &ResolutionBasis::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(pending(&db).await, Some(queued.clone()));
+
+            assert!(
+                mark_replay_request_served(&db, &queued, &queued.intent_id)
+                    .await
+                    .is_err(),
+                "a deferred pass has no verdict to serve the request with"
+            );
+            assert_eq!(pending(&db).await, Some(queued.clone()));
+
+            finish_pass(&db, &queued.intent_id, "published", 60).await;
+            let mut stranger = queued.clone();
+            stranger.id = "someone-else".to_string();
+            assert!(!serve(&db, &stranger, &queued.intent_id).await);
+            assert_eq!(pending(&db).await, Some(queued.clone()));
+            assert_eq!(
+                replay_request_state(&db, &queued).await.unwrap(),
+                ReplayRequestState::Pending
+            );
+
+            assert!(serve(&db, &queued, &queued.intent_id).await);
+            assert_eq!(pending(&db).await, None);
+            assert!(!serve(&db, &queued, &queued.intent_id).await);
+        }
+
+        async fn serve(db: &LocalDb, request: &PendingReplayRequest, current: &str) -> bool {
+            mark_replay_request_served(db, request, current)
+                .await
+                .unwrap()
+        }
+
+        async fn finish_pass(db: &LocalDb, intent_id: &str, outcome: &str, at: i64) {
+            db.execute(
+                "UPDATE jj_reconcile_items SET status = 'completed', outcome_kind = ?3,
+                   last_diagnostic = ?3, updated_at = ?4
+                 WHERE intent_id = ?1 AND bookmark = ?2",
+                params![intent_id, BRANCH, outcome, at],
+            )
+            .await
+            .unwrap();
+        }
+
+        /// A completed destination intent is reopened by the queue itself, so
+        /// the sweep finds the request even if the requester dies; an intent a
+        /// worker holds keeps its lease.
+        #[tokio::test]
+        async fn queueing_reopens_a_completed_intent_but_not_a_running_one() {
+            let db = fresh().await;
+            db.execute_script(format!(
+                "INSERT INTO jj_reconcile_intents
+                   (id, project_id, store_path, target_branch, destination_commit, status,
+                    lease_owner, lease_expires_at, created_at, updated_at)
+                 VALUES ('intent-done', 'proj-1', '{STORE}', 'main', 'dest-a', 'completed',
+                         'old-owner', 50, 1, 1),
+                        ('intent-held', 'proj-1', '{STORE}', 'main', 'dest-b', 'running',
+                         'worker', 9999999999, 1, 1);"
+            ))
+            .await
+            .unwrap();
+            queue(&db, "dest-a", false).await;
+            queue(&db, "dest-b", false).await;
+
+            let intents = db
+                .read(|conn| {
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT id, status, lease_owner, lease_expires_at
+                                 FROM jj_reconcile_intents ORDER BY id",
+                                (),
+                            )
+                            .await?;
+                        let mut intents = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            intents.push((
+                                row.text(0)?,
+                                row.text(1)?,
+                                row.opt_text(2)?,
+                                row.opt_i64(3)?,
+                            ));
+                        }
+                        Ok(intents)
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                intents,
+                vec![
+                    ("intent-done".to_string(), "pending".to_string(), None, None),
+                    (
+                        "intent-held".to_string(),
+                        "running".to_string(),
+                        Some("worker".to_string()),
+                        Some(9999999999)
+                    ),
+                ]
+            );
+        }
+
+        /// A serving pass that left no row on its intent cannot serve the
+        /// request: nothing is consumed and nothing is frozen.
+        #[tokio::test]
+        async fn a_missing_serving_row_consumes_nothing() {
+            let db = fresh().await;
+            let request = queue(&db, "dest-a", false).await;
+            assert!(mark_replay_request_served(&db, &request, "intent-gone")
+                .await
+                .is_err());
+            assert_eq!(pending(&db).await, Some(request.clone()));
+            assert_eq!(
+                replay_request_state(&db, &request).await.unwrap(),
+                ReplayRequestState::Pending
+            );
+        }
+
+        /// A failed pass is a verdict too: its failure kind and diagnostic are
+        /// frozen and returned after a later pass rewrites the item.
+        #[tokio::test]
+        async fn a_rollback_failure_is_frozen_as_the_served_result() {
+            let db = fresh().await;
+            let request = queue(&db, "dest-a", true).await;
+            let unsafe_diagnostic =
+                "rollback failed: branch left at conflicted tip; not safe to retry";
+            db.execute(
+                "UPDATE jj_reconcile_items SET status = 'suppressed', failure_kind = 'rollback_failed',
+                   last_diagnostic = ?3, updated_at = 70
+                 WHERE intent_id = ?1 AND bookmark = ?2",
+                params![request.intent_id.as_str(), BRANCH, unsafe_diagnostic],
+            )
+            .await
+            .unwrap();
+            assert!(serve(&db, &request, &request.intent_id).await);
+
+            db.execute(
+                "UPDATE jj_reconcile_items SET status = 'completed', failure_kind = NULL,
+                   outcome_kind = 'rebased_clean', last_diagnostic = NULL, updated_at = 99
+                 WHERE intent_id = ?1 AND bookmark = ?2",
+                params![request.intent_id.as_str(), BRANCH],
+            )
+            .await
+            .unwrap();
+            let ReplayRequestState::Served { pass, destination } =
+                replay_request_state(&db, &request).await.unwrap()
+            else {
+                panic!("request is served");
+            };
+            assert_eq!(destination, "dest-a");
+            assert_eq!(pass.item_status.as_deref(), Some("suppressed"));
+            assert_eq!(pass.failure_kind.as_deref(), Some("rollback_failed"));
+            assert_eq!(pass.outcome_kind, None);
+            assert_eq!(pass.diagnostic.as_deref(), Some(unsafe_diagnostic));
+            assert_eq!(pass.updated_at, 70);
+            assert_eq!(pending(&db).await, None);
+        }
+
+        /// Preparation reopens terminal work for an unserved request and refuses
+        /// once the request is served, leaving the served result's work alone.
+        #[tokio::test]
+        async fn preparing_reopens_only_while_the_request_is_unserved() {
+            let db = fresh().await;
+            let request = queue(&db, "dest-a", false).await;
+            finish_pass(&db, &request.intent_id, "published", 40).await;
+            db.execute(
+                "UPDATE jj_reconcile_intents SET status = 'completed' WHERE id = ?1",
+                params![request.intent_id.as_str()],
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE jj_reconcile_items SET notification_sent = 1
+                 WHERE intent_id = ?1 AND bookmark = ?2",
+                params![request.intent_id.as_str(), BRANCH],
+            )
+            .await
+            .unwrap();
+
+            assert!(prepare_pending_replay_request(&db, &request, "dest-a")
+                .await
+                .unwrap());
+            assert_eq!(
+                item_state(&db, &request.intent_id).await,
+                ("pending".to_string(), 0, "pending".to_string())
+            );
+
+            finish_pass(&db, &request.intent_id, "published", 50).await;
+            db.execute(
+                "UPDATE jj_reconcile_intents SET status = 'completed' WHERE id = ?1",
+                params![request.intent_id.as_str()],
+            )
+            .await
+            .unwrap();
+            assert!(serve(&db, &request, &request.intent_id).await);
+            assert!(!prepare_pending_replay_request(&db, &request, "dest-a")
+                .await
+                .unwrap());
+            assert_eq!(
+                item_state(&db, &request.intent_id).await,
+                ("completed".to_string(), 0, "completed".to_string())
+            );
+        }
+
+        /// The first terminal verdict is frozen onto the request: a later pass
+        /// over the same item, or a newer request, does not rewrite it.
+        #[tokio::test]
+        async fn a_served_result_survives_later_passes_and_newer_requests() {
+            let db = fresh().await;
+            let first = queue(&db, "dest-a", false).await;
+            let retargeted_intent = {
+                let other = queue(&db, "dest-b", false).await;
+                finish_pass(&db, &other.intent_id, "rebased_clean", 30).await;
+                assert!(serve(&db, &other, &other.intent_id).await);
+                other.intent_id
+            };
+            // `first` was superseded by the dest-b request, served without a result.
+            assert_eq!(
+                replay_request_state(&db, &first).await.unwrap(),
+                ReplayRequestState::Superseded
+            );
+
+            let request = queue(&db, "dest-a", true).await;
+            finish_pass(&db, &retargeted_intent, "published", 40).await;
+            assert!(serve(&db, &request, &retargeted_intent).await);
+            let expected = ReplayRequestState::Served {
+                pass: ReplayPass {
+                    item_status: Some("completed".to_string()),
+                    intent_status: Some("pending".to_string()),
+                    outcome_kind: Some("published".to_string()),
+                    failure_kind: None,
+                    diagnostic: Some("published".to_string()),
+                    updated_at: 40,
+                },
+                destination: "dest-b".to_string(),
+            };
+            assert_eq!(replay_request_state(&db, &request).await.unwrap(), expected);
+
+            finish_pass(&db, &retargeted_intent, "conflicted", 90).await;
+            finish_pass(&db, &request.intent_id, "conflicted", 90).await;
+            assert!(!serve(&db, &request, &retargeted_intent).await);
+            assert_eq!(replay_request_state(&db, &request).await.unwrap(), expected);
+
+            let newer = queue(&db, "dest-b", false).await;
+            assert_eq!(replay_request_state(&db, &request).await.unwrap(), expected);
+            assert_eq!(
+                replay_request_state(&db, &newer).await.unwrap(),
+                ReplayRequestState::Pending
+            );
+            let renewed = queue(&db, "dest-a", false).await;
+            assert_eq!(
+                replay_request_state(&db, &request).await.unwrap(),
+                ReplayRequestState::Superseded,
+                "a newer request on the same row replaces the old one"
+            );
+            assert_eq!(pending(&db).await, Some(renewed));
+        }
+
+        /// The newest request wins, on the same item or retargeted onto a new
+        /// destination, and a pass still holding the older one cannot consume it.
+        #[tokio::test]
+        async fn a_newer_request_survives_the_older_ones_consumption() {
+            let db = fresh().await;
+            let first = queue(&db, "dest-a", false).await;
+            let same_item = queue(&db, "dest-a", true).await;
+            assert_eq!(same_item.intent_id, first.intent_id);
+            finish_pass(&db, &first.intent_id, "published", 40).await;
+            assert!(!serve(&db, &first, &first.intent_id).await);
+            assert_eq!(pending(&db).await, Some(same_item.clone()));
+
+            let retargeted = queue(&db, "dest-b", false).await;
+            assert_ne!(retargeted.intent_id, same_item.intent_id);
+            finish_pass(&db, &retargeted.intent_id, "published", 50).await;
+            assert!(!serve(&db, &same_item, &retargeted.intent_id).await);
+            assert_eq!(pending(&db).await, Some(retargeted.clone()));
+
+            assert!(serve(&db, &retargeted, &retargeted.intent_id).await);
+            assert_eq!(pending(&db).await, None);
+        }
+
+        /// The page projection follows the served destination and keeps the
+        /// request's own time, without touching the typed request.
+        #[tokio::test]
+        async fn projecting_a_request_moves_only_the_advisory_fields() {
+            let db = fresh().await;
+            db.execute_script(format!(
+                "INSERT INTO jj_reconcile_intents
+                   (id, project_id, store_path, target_branch, destination_commit, status,
+                    created_at, updated_at)
+                 VALUES ('intent-session', 'proj-1', '{STORE}', 'main', 'dest-old', 'completed', 1, 1);
+                 INSERT INTO jj_reconcile_items (intent_id, bookmark, status, updated_at)
+                 VALUES ('intent-session', '{BRANCH}', 'completed', 5);"
+            ))
+            .await
+            .unwrap();
+            let queued = queue(&db, "dest-a", true).await;
+            project_pending_replay_request(&db, &queued, "intent-session", "dest-b", Some("tip-9"))
+                .await
+                .unwrap();
+
+            let projected = db
+                .read(|conn| {
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT replay_requested_at, replay_requested_tip,
+                                        replay_requested_destination, replay_request_id
+                                 FROM jj_reconcile_items
+                                 WHERE intent_id = 'intent-session' AND bookmark = ?1",
+                                params![BRANCH],
+                            )
+                            .await?;
+                        let row = rows.next().await?.expect("session row");
+                        Ok((
+                            row.opt_i64(0)?,
+                            row.opt_text(1)?,
+                            row.opt_text(2)?,
+                            row.opt_text(3)?,
+                        ))
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                projected,
+                (
+                    Some(queued.requested_at),
+                    Some("tip-9".to_string()),
+                    Some("dest-b".to_string()),
+                    None
+                )
+            );
+            assert_eq!(pending(&db).await, Some(queued));
+        }
+
+        /// Requests are scoped by store and branch.
+        #[tokio::test]
+        async fn another_store_or_branch_does_not_see_the_request() {
+            let db = fresh().await;
+            queue(&db, "dest-a", false).await;
+            assert!(
+                load_pending_replay_request(&db, Path::new("/other-store"), BRANCH)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                load_pending_replay_request(&db, Path::new(STORE), "agent/other")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        /// A request timestamp written before typed requests carries no
+        /// identity, so it never becomes authority.
+        #[tokio::test]
+        async fn a_legacy_request_timestamp_is_not_authority() {
+            let db = fresh().await;
+            db.execute_script(format!(
+                "INSERT INTO jj_reconcile_intents
+                   (id, project_id, store_path, target_branch, destination_commit, status,
+                    created_at, updated_at)
+                 VALUES ('intent-old', 'proj-1', '{STORE}', 'main', 'dest-a', 'pending', 1, 1);
+                 INSERT INTO jj_reconcile_items
+                   (intent_id, bookmark, status, updated_at, replay_requested_at,
+                    replay_requested_tip, replay_requested_destination)
+                 VALUES ('intent-old', '{BRANCH}', 'pending', 5, 100, 'tip-1', 'dest-a');"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(pending(&db).await, None);
+        }
     }
 }

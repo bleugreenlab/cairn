@@ -1810,6 +1810,16 @@ fn status_line(
                      Do not publish or force-push this branch; report the diagnostic below.{quoted}",
                     when(at)
                 )
+            } else if diagnostic
+                .as_deref()
+                .is_some_and(|text| text.contains("No automatic cooldown was recorded."))
+            {
+                format!(
+                    "\n**Status:** explicit replay onto `{destination}`{requested} TIMED OUT{}. \
+                     No automatic cooldown was recorded. Inspect the phase and rollback diagnostic \
+                     below before requesting it again; the explicit attempt is not retried automatically.{quoted}",
+                    when(at)
+                )
             } else {
                 format!(
                     "\n**Status:** replay onto `{destination}`{requested} was attempted{} and \
@@ -2388,6 +2398,61 @@ mod tests {
         assert!(
             !unsafe_rollback.contains("nothing needs repair"),
             "{unsafe_rollback}"
+        );
+    }
+
+    #[test]
+    fn explicit_replay_timeout_shows_phases_without_promising_an_automatic_retry() {
+        let mut session = recorded_session();
+        session.replay_requested_at = Some(100);
+        session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
+            item_status: Some("pending".into()),
+            intent_status: Some("completed".into()),
+            outcome_kind: Some("failed".into()),
+            failure_kind: Some("reconcile_timeout".into()),
+            diagnostic: Some(
+                "jj restore (ancestry heal) timed out: operation budget exhausted before spawning; remaining 18ms, minimum 100ms. \
+                 The rebase was rolled back, so the branch is unchanged.\n\
+                 Explicit replay timed out under its cumulative forward budget. No automatic cooldown was recorded. \
+                 A new explicit request may run immediately.\n\
+                 Store-lock phases: plan resolution carry 1.4s, rebase and export 9.9s; jj op restore [cleanup] 100ms"
+                    .into(),
+            ),
+            updated_at: 130,
+        });
+        let line = status_line(&session, &Ok(None));
+        for expected in [
+            "explicit replay",
+            "TIMED OUT",
+            "No automatic cooldown",
+            "not retried automatically",
+            "ancestry heal",
+            "remaining 18ms",
+            "plan resolution carry 1.4s",
+            "jj op restore [cleanup]",
+            "rebase was rolled back",
+            "may run immediately",
+        ] {
+            assert!(line.contains(expected), "{expected}: {line}");
+        }
+        assert!(
+            !line.contains("A transient failure is retried automatically"),
+            "{line}"
+        );
+
+        let pass = session.replay_pass.as_mut().unwrap();
+        pass.failure_kind = Some(crate::jj::ROLLBACK_FAILED.into());
+        pass.diagnostic = Some("jj restore timed out: operation budget exhausted; rollback incomplete. \
+            No automatic cooldown was recorded. Do not publish this branch; recover the store before retrying.".into());
+        let unsafe_line = status_line(&session, &Ok(None));
+        assert!(
+            unsafe_line.contains("rollback did NOT complete"),
+            "{unsafe_line}"
+        );
+        assert!(unsafe_line.contains("Do not publish"), "{unsafe_line}");
+        assert!(
+            !unsafe_line.contains("may run immediately"),
+            "{unsafe_line}"
         );
     }
 

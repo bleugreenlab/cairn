@@ -924,6 +924,10 @@ pub(crate) enum SlotPublicationError {
     /// The branch moved while the batch ran and its changes conflict with what
     /// moved onto it. The delta is kept under a stranded ref.
     Straddled(String),
+    /// The branch was retired before the delta could land: its issue resolved,
+    /// or the job publishing it was archived. Nothing was sealed onto the
+    /// branch; the delta is kept under a stranded ref so the work is not lost.
+    Retired(String),
 }
 
 impl std::fmt::Display for SlotPublicationError {
@@ -933,7 +937,7 @@ impl std::fmt::Display for SlotPublicationError {
                 f.write_str(&held::not_in_store_message(delta, error))
             }
             Self::Held { held, .. } => f.write_str(&held.message()),
-            Self::Straddled(text) => f.write_str(text),
+            Self::Straddled(text) | Self::Retired(text) => f.write_str(text),
         }
     }
 }
@@ -943,6 +947,10 @@ impl std::fmt::Display for SlotPublicationError {
 enum PublishFailure {
     /// Its changes conflict with what the branch now holds.
     Conflicted { head: String, paths: Vec<String> },
+    /// The job publishing it may no longer write to the branch. Not retryable:
+    /// unlike [`Self::Failed`], holding the delta for a later barrier would only
+    /// replay the same refusal.
+    Retired(super::branch::BranchRetired),
     /// Anything else. The delta is still in the store and can be retried.
     Failed(String),
 }
@@ -976,6 +984,10 @@ struct DeltaPublication<'a> {
     author: Option<&'a PublicationIdentity>,
     /// The job whose check status a landing invalidates.
     job_id: Option<&'a str>,
+    /// The run that sealed the delta, whose session the publication authority
+    /// checks. `None` for system publications and held rows recorded before
+    /// held rows named their run.
+    run_id: Option<&'a str>,
     /// The enclosing store-lock hold, whose phases this publication reports.
     trace: Option<&'a JjStoreOperationTrace>,
 }
@@ -1059,6 +1071,10 @@ fn make_delta_available(
 struct PreparedSlot {
     available: AvailableDelta,
     plan: Option<IntegrationPlan>,
+    /// The agent run publishing it, set by the run barrier. Carried to the
+    /// locked publication authority and into a hold, so the run's session is
+    /// judged however late the delta lands.
+    run_id: Option<String>,
 }
 
 fn slot_delta_publication<'a>(
@@ -1068,6 +1084,7 @@ fn slot_delta_publication<'a>(
     message: &'a str,
     author: Option<&'a PublicationIdentity>,
     trace: Option<&'a JjStoreOperationTrace>,
+    run_id: Option<&'a str>,
 ) -> DeltaPublication<'a> {
     DeltaPublication {
         repository: &target.repository,
@@ -1082,6 +1099,7 @@ fn slot_delta_publication<'a>(
             .owner
             .as_ref()
             .and_then(|owner| owner.job_id.as_deref()),
+        run_id,
         trace,
     }
 }
@@ -1110,12 +1128,16 @@ async fn prepare_slot_publication(
                 error,
             }
         })?;
-    let publication = slot_delta_publication(target, request, delta, message, author, None);
+    let publication = slot_delta_publication(target, request, delta, message, author, None, None);
     let plan = match cairn_vcs::resolve_coordinate(&target.store_dir, &target.branch).await {
         Ok(head) => plan_integration(orch, &publication, head).await.ok(),
         Err(_) => None,
     };
-    Ok(PreparedSlot { available, plan })
+    Ok(PreparedSlot {
+        available,
+        plan,
+        run_id: None,
+    })
 }
 
 /// Land a prepared delta. Caller holds the store lock; on a failure that
@@ -1134,8 +1156,20 @@ async fn land_prepared_slot_delta(
 ) -> Result<SlotPublication, SlotPublicationError> {
     // Kept to the end of this function: its pin protects the delta's objects
     // until the landing transaction has committed or a held ref has taken over.
-    let PreparedSlot { available, plan } = prepared;
-    let publication = slot_delta_publication(target, request, delta, message, author, trace);
+    let PreparedSlot {
+        available,
+        plan,
+        run_id,
+    } = prepared;
+    let publication = slot_delta_publication(
+        target,
+        request,
+        delta,
+        message,
+        author,
+        trace,
+        run_id.as_deref(),
+    );
     match publish_available_delta(orch, &publication, plan).await {
         Ok(outcome) => Ok(SlotPublication {
             consume_receipt: available.consume_receipt,
@@ -1151,6 +1185,14 @@ async fn land_prepared_slot_delta(
                 &paths,
             )))
         }
+        Err(PublishFailure::Retired(retired)) => {
+            let _phase = trace.map(|trace| trace.phase("strand retired delta"));
+            let reference = stranded_ref_name(publication.job_id, &request.attempt_id);
+            Err(SlotPublicationError::Retired(format!(
+                "{retired} {}",
+                keep_stranded_delta(&target.repository, &reference, &delta.delta_commit)
+            )))
+        }
         Err(PublishFailure::Failed(error)) => {
             let _phase = trace.map(|trace| trace.phase("hold delta"));
             // Written while `available` still pins the objects, so the ref
@@ -1163,6 +1205,7 @@ async fn land_prepared_slot_delta(
                     repository: &target.repository,
                     branch: &target.branch,
                     job_id: publication.job_id,
+                    run_id: publication.run_id,
                     attempt_id: &request.attempt_id,
                     base_commit: &delta.base_commit,
                     delta_commit: &delta.delta_commit,
@@ -1380,9 +1423,29 @@ async fn publish_available_delta(
         branch,
         author,
         job_id,
+        run_id,
         trace,
         ..
     } = *publication;
+
+    // The authority check belongs here, inside the caller's store-lock hold and
+    // before the head is even read: a batch prepared while its issue was open
+    // may reach this lock after the issue resolved, and a batch whose process
+    // outlived its own cancellation still arrives here with a sealed delta.
+    if let Some(job_id) = job_id {
+        let _checking = trace.map(|trace| trace.phase("publication authority"));
+        match super::branch::publication_authority(&orch.db, job_id, run_id, Some(branch)).await {
+            super::branch::PublicationAuthority::Authorized => {}
+            super::branch::PublicationAuthority::Retired(retired) => {
+                return Err(PublishFailure::Retired(retired))
+            }
+            super::branch::PublicationAuthority::Unknown(error) => {
+                return Err(PublishFailure::Failed(format!(
+                    "could not confirm that this job may still publish to `{branch}`: {error}"
+                )))
+            }
+        }
+    }
 
     // A delta declares as its parent the commit the batch was routed against,
     // and the logical-head transaction refuses a parent the bookmark no longer
@@ -1663,27 +1726,41 @@ fn strand_conflicted_delta(
             .and_then(|owner| owner.job_id.as_deref()),
         &request.attempt_id,
     );
-    // This ref is the only thing standing between the agent's sealed work and
-    // the next prune, and it contends for the repository's one
-    // `packed-refs.lock` like every other ref transaction. Patience is what
-    // keeps a lost race from turning a recoverable straddle into lost work.
-    if let Err(error) = crate::jj::with_packed_refs_patience(
+    keep_stranded_delta(repository, &reference, &delta.delta_commit);
+    straddled_conflict_message(head, &delta.delta_commit, paths)
+}
+
+/// Record `delta_commit` under `reference` so a delta that will not land is not
+/// pruned, and say where it was kept.
+///
+/// This ref is the only thing standing between the agent's sealed work and the
+/// next prune, and it contends for the repository's one `packed-refs.lock` like
+/// every other ref transaction. Patience is what keeps a lost race from turning
+/// recoverable work into lost work.
+fn keep_stranded_delta(
+    repository: &std::path::Path,
+    reference: &str,
+    delta_commit: &str,
+) -> String {
+    match crate::jj::with_packed_refs_patience(
         crate::jj::PackedRefs::Checkout(repository),
         "record the stranded delta",
         || {
             git_output(
                 repository,
-                &["update-ref", &reference, &delta.delta_commit],
+                &["update-ref", reference, delta_commit],
                 "record the stranded delta",
             )
         },
     ) {
-        log::warn!(
-            "stranded delta {} was not recorded under {reference}: {error}",
-            delta.delta_commit
-        );
+        Ok(_) => format!(
+            "The batch's sealed changes are kept as commit {delta_commit} under {reference}."
+        ),
+        Err(error) => {
+            log::warn!("stranded delta {delta_commit} was not recorded under {reference}: {error}");
+            format!("The batch's sealed changes are commit {delta_commit}; it could not be kept under a ref ({error}).")
+        }
     }
-    straddled_conflict_message(head, &delta.delta_commit, paths)
 }
 
 /// Where a stranded delta is kept: `refs/cairn/stranded/<job>/<attempt>` when the
@@ -7733,7 +7810,10 @@ async fn settle_run_batch(
                     )
                     .await
                     {
-                        Ok(prepared) => Ok((prepared, target, message, delta, request)),
+                        Ok(mut prepared) => {
+                            prepared.run_id = s.request.run_id.clone();
+                            Ok((prepared, target, message, delta, request))
+                        }
                         Err(error) => Err((error, Some(target))),
                     },
                     Err(error) => Err((

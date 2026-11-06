@@ -632,6 +632,24 @@ async fn commit_triage_ledger_if_needed(
             "memory triage logical publication",
         )
         .await;
+    match crate::mcp::handlers::branch::publication_authority_in(
+        &db,
+        parent_job_id,
+        None,
+        Some(&branch),
+    )
+    .await
+    {
+        crate::mcp::handlers::branch::PublicationAuthority::Authorized => {}
+        crate::mcp::handlers::branch::PublicationAuthority::Retired(retired) => {
+            return Err(retired.to_string())
+        }
+        crate::mcp::handlers::branch::PublicationAuthority::Unknown(error) => {
+            return Err(format!(
+            "could not confirm the memory triage branch `{branch}` still accepts commits: {error}"
+        ))
+        }
+    }
     let expected = cairn_vcs::resolve_coordinate(&store, &branch)
         .await
         .map_err(|error| error.to_string())?;

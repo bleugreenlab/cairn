@@ -63,6 +63,9 @@ pub(crate) struct Hold<'a> {
     pub(crate) repository: &'a Path,
     pub(crate) branch: &'a str,
     pub(crate) job_id: Option<&'a str>,
+    /// The run that sealed the delta; republication asks whether its session
+    /// may still publish.
+    pub(crate) run_id: Option<&'a str>,
     pub(crate) attempt_id: &'a str,
     pub(crate) base_commit: &'a str,
     pub(crate) delta_commit: &'a str,
@@ -202,8 +205,8 @@ async fn record_hold(
         "INSERT INTO held_publications
               (attempt_id, project_id, store_path, repository_path, branch, job_id, base_commit,
                delta_commit, commit_message, author_name, author_email, reference, status,
-               last_error, attempts, created_at, updated_at)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'held', ?13, 1, ?14, ?14)
+               last_error, attempts, created_at, updated_at, run_id)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'held', ?13, 1, ?14, ?14, ?15)
          ON CONFLICT(attempt_id) DO UPDATE SET
               status = 'held',
               last_error = excluded.last_error,
@@ -223,7 +226,8 @@ async fn record_hold(
             hold.author.map(|author| author.email.as_str()),
             reference.map(String::as_str),
             hold.error,
-            now
+            now,
+            hold.run_id
         ],
     )
     .await
@@ -240,6 +244,7 @@ pub(crate) struct HeldRow {
     pub(crate) repository_path: PathBuf,
     pub(crate) branch: String,
     pub(crate) job_id: Option<String>,
+    pub(crate) run_id: Option<String>,
     pub(crate) base_commit: String,
     pub(crate) delta_commit: String,
     pub(crate) commit_message: String,
@@ -301,7 +306,7 @@ async fn rows_with_status(
     db.query_all(
         "SELECT attempt_id, project_id, store_path, repository_path, branch, job_id, base_commit,
                 delta_commit, commit_message, author_name, author_email, reference, last_error,
-                status, landed_head
+                status, landed_head, run_id
            FROM held_publications
           WHERE project_id = ?1 AND branch = ?2
             AND (status = 'held' OR (?3 AND status = 'unpublished'))
@@ -328,6 +333,7 @@ async fn rows_with_status(
                 last_error: row.text(12)?,
                 status: row.text(13)?,
                 landed_head: row.opt_text(14)?,
+                run_id: row.opt_text(15)?,
             })
         },
     )
@@ -489,6 +495,17 @@ pub(crate) async fn drain_held_publications(
                 settle_row(&orch.db.local, &row.attempt_id, "stranded", None).await;
                 drained.push(Drained::Note(stranded_held_message(&row, &head, &paths)));
             }
+            // Retrying a retired branch only replays the refusal, so the row
+            // stops waiting. Its ref stays, exactly as a stranded one does: it
+            // is the route back to the work.
+            Err(PublishFailure::Retired(retired)) => {
+                settle_row(&orch.db.local, &row.attempt_id, "stranded", None).await;
+                drained.push(Drained::Note(format!(
+                    "⚠️ Held commit {} ({}) was not published. {retired}",
+                    row.delta_commit,
+                    row.origin()
+                )));
+            }
             Err(PublishFailure::Failed(error)) => {
                 record_retry(&orch.db.local, &row.attempt_id, &error).await;
                 drained.push(Drained::Note(format!(
@@ -508,6 +525,29 @@ async fn republish(
     row: &HeldRow,
     trace: Option<&JjStoreOperationTrace>,
 ) -> Result<SlotPublicationOutcome, PublishFailure> {
+    // A row from before held rows named their run cannot have its session
+    // checked by the publication authority, so it is refused once any
+    // resolution has stopped its job's work. Asked first, under the same
+    // store-lock hold as the rest of the drain, before anything is pinned.
+    if let (None, Some(job_id)) = (row.run_id.as_deref(), row.job_id.as_deref()) {
+        match crate::mcp::handlers::branch::unattributed_held_authority(
+            &orch.db,
+            job_id,
+            &row.branch,
+        )
+        .await
+        {
+            crate::mcp::handlers::branch::PublicationAuthority::Authorized => {}
+            crate::mcp::handlers::branch::PublicationAuthority::Retired(retired) => {
+                return Err(PublishFailure::Retired(retired))
+            }
+            crate::mcp::handlers::branch::PublicationAuthority::Unknown(error) => {
+                return Err(PublishFailure::Failed(format!(
+                    "could not confirm this held commit may still publish: {error}"
+                )))
+            }
+        }
+    }
     // The objects were installed when the delta was held; this re-pins them
     // for the transaction the way a fresh install is pinned.
     let _pin = crate::jj::pin_validated_delta(
@@ -529,6 +569,7 @@ async fn republish(
             message: &row.commit_message,
             author: author.as_ref(),
             job_id: row.job_id.as_deref(),
+            run_id: row.run_id.as_deref(),
             trace,
         },
         None,
@@ -873,6 +914,7 @@ mod tests {
             repository_path: PathBuf::from("/repo"),
             branch: "feature".into(),
             job_id: Some("job".into()),
+            run_id: None,
             base_commit: "base".into(),
             delta_commit: delta.into(),
             commit_message: message.into(),
@@ -938,6 +980,90 @@ mod tests {
             row("d", "^").origin(),
             "from an earlier batch that amended the previous commit"
         );
+    }
+
+    /// Held rows from before rows named their run, drained after a merge that
+    /// left the branch in place and a reopen that continued the job in a new
+    /// session. The job and issue read live again. Neither ordering of hold and
+    /// resolution makes the row publishable: one held before the session closed
+    /// (100, closed at 200), and one a stale batch recorded only after it
+    /// closed (300), the delayed completion a hold timestamp cannot tell apart
+    /// from the successor's work. Each stops waiting and keeps its recovery
+    /// ref, and nothing reaches the repository (the paths here do not exist, so
+    /// any pin or publish would fail instead).
+    #[tokio::test]
+    async fn an_unattributed_held_delta_stays_refused_across_resolution_and_reopen() {
+        for (attempt, held_at) in [("attempt-before", 100), ("attempt-after", 300)] {
+            unattributed_held_delta_is_stranded(attempt, held_at).await;
+        }
+    }
+
+    async fn unattributed_held_delta_is_stranded(attempt: &str, held_at: i64) {
+        let db = crate::storage::migrated_test_db("held-unattributed.db").await;
+        db.execute_script(&format!(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('project', 'w', 'Proj', 'proj', '/nonexistent/proj', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('issue-1', 'project', 3, 'Issue', 'active', 'idle', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, node_name, status, branch, current_session_id, created_at, updated_at)
+             VALUES('job', 'project', 'issue-1', 'builder', 'running', 'feature', 's-new', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, terminal_reason, created_at, closed_at, updated_at)
+             VALUES('s-old', 'job', 'claude', 'closed', 'issue_merged', 1, 200, 200);
+            INSERT INTO sessions(id, job_id, backend, status, created_at, updated_at)
+             VALUES('s-new', 'job', 'claude', 'open', 400, 400);
+            INSERT INTO held_publications(attempt_id, project_id, store_path, repository_path, branch,
+                job_id, base_commit, delta_commit, commit_message, reference, status, last_error,
+                created_at, updated_at)
+             VALUES('{attempt}', 'project', '/nonexistent/store', '/nonexistent/repo', 'feature',
+                'job', 'base', 'delta', 'old work', 'refs/cairn/stranded/job/{attempt}', 'held',
+                'contention', {held_at}, {held_at});
+            ",
+        ))
+        .await
+        .unwrap();
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep())
+                .unwrap(),
+        );
+        let orch = crate::orchestrator::OrchestratorBuilder::new(
+            std::sync::Arc::new(crate::db::DbState::new(std::sync::Arc::new(db), search)),
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+
+        let drained = drain_held_publications(&orch, "project", "feature", None).await;
+        let [Drained::Note(note)] = drained.as_slice() else {
+            panic!("{attempt}: expected one refusal note, got {drained:?}");
+        };
+        assert!(
+            note.contains("branch_retired (session_closed)"),
+            "{attempt}: {note}"
+        );
+        assert!(note.contains("proj/3"), "{attempt}: {note}");
+        let (status, reference) = orch
+            .db
+            .local
+            .query_opt(
+                "SELECT status, reference FROM held_publications WHERE attempt_id = ?1",
+                (attempt.to_string(),),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, "stranded", "{attempt}: the row stops waiting");
+        assert_eq!(
+            reference,
+            Some(format!("refs/cairn/stranded/job/{attempt}")),
+            "{attempt}: the recovery ref is kept"
+        );
+        assert!(held_rows(&orch.db.local, "project", "feature")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// A merge is refused while anything is held, and when what is held

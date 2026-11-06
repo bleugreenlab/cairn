@@ -411,18 +411,38 @@ pub(crate) async fn resolve_terminal(
         }
     }
 
-    let crud::ResolveOutcome {
-        closed_sessions,
-        became_terminal,
-    } = crud::resolve(
+    // Recording the resolution revokes publication to the issue's branches, so
+    // it is recorded under the project store's lock: every seal and bookmark
+    // advance asks `mcp::handlers::branch::publication_authority` under that
+    // lock, and a write either finishes before this edge or is refused after
+    // it. Only the row write sits inside the hold; stopping processes above and
+    // teardown afterwards never do.
+    let revocation = match revocation_store_lock(orch, owning_db, issue_id).await {
+        Ok(revocation) => revocation,
+        // Not recorded: an unordered resolution is the state this hold exists
+        // to prevent. The resolution's own retries (the confirmed write sent
+        // again, the next PR refresh observing the merge) record it once the
+        // project can be read.
+        Err(error) => {
+            return Err(ResolutionRefusal::Rejected(format!(
+                "The resolution was not recorded because its project could not be read to order it \
+                 against in-flight commits ({error}). Send the same write again."
+            )))
+        }
+    };
+    let resolved = crud::resolve(
         owning_db,
         &*orch.services.clock,
         issue_id,
         resolution,
         &orch.anon_device_manager.device_id(),
     )
-    .await
-    .map_err(|e| ResolutionRefusal::Rejected(e.to_string()))?;
+    .await;
+    drop(revocation);
+    let crud::ResolveOutcome {
+        closed_sessions,
+        became_terminal,
+    } = resolved.map_err(|e| ResolutionRefusal::Rejected(e.to_string()))?;
 
     crate::orchestrator::lifecycle::stop_processes_for_sessions(orch, &closed_sessions);
 
@@ -446,6 +466,75 @@ pub(crate) async fn resolve_terminal(
     orch.notify_tenet_evidence();
 
     Ok(())
+}
+
+/// How many times the project lookup behind the revocation hold is tried
+/// before the resolution is refused unrecorded.
+const REVOCATION_LOOKUP_ATTEMPTS: u32 = 3;
+
+/// The store-lock hold that orders a resolution against publication.
+///
+/// `Ok(None)` only when a successful lookup proves the issue's project has no
+/// local repository, so no store this runner publishes to. A lookup that
+/// fails proves nothing: it is retried, then returned as an error, and the
+/// caller records nothing. Otherwise this waits for the lock however long a
+/// publication holds it, or finds this task already holding it.
+async fn revocation_store_lock(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+) -> Result<Option<crate::orchestrator::EdgeHold>, String> {
+    revocation_store_lock_with(orch, issue_id, move || async move {
+        db.query_opt_text(
+            "SELECT p.repo_path FROM issues i JOIN projects p ON p.id = i.project_id
+              WHERE i.id = ?1",
+            params![issue_id],
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn revocation_store_lock_with<F, Fut>(
+    orch: &Orchestrator,
+    issue_id: &str,
+    lookup: F,
+) -> Result<Option<crate::orchestrator::EdgeHold>, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, String>>,
+{
+    let mut attempt = 1;
+    let repo_path = loop {
+        match lookup().await {
+            Ok(path) => break path,
+            Err(error) if attempt >= REVOCATION_LOOKUP_ATTEMPTS => {
+                return Err(format!(
+                    "looking up the project of issue {issue_id}: {error}"
+                ))
+            }
+            Err(error) => {
+                log::warn!(
+                    "Terminal resolution of issue {issue_id}: project lookup failed (attempt \
+                     {attempt}), retrying: {error}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt))).await;
+                attempt += 1;
+            }
+        }
+    };
+    let Some(repo_path) = repo_path.filter(|path| !path.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path));
+    Ok(Some(
+        orch.acquire_jj_store_lock_for_edge(
+            &store,
+            format!("terminal resolution of issue {issue_id}"),
+        )
+        .await,
+    ))
 }
 
 /// Announce the resolution [`resolve_terminal`] just recorded to the issue's
@@ -916,6 +1005,183 @@ mod tests {
             tempfile::tempdir().unwrap().keep(),
         )
         .build()
+    }
+
+    /// The ordering the publication authority depends on. A publisher holds the
+    /// project store lock and has passed its authority check; a resolution that
+    /// arrives now must queue behind it rather than record itself, and the
+    /// publisher's next check after the release is refused. No timeout lets the
+    /// resolution through while the hold lasts.
+    #[tokio::test]
+    async fn a_resolution_waits_for_a_publication_holding_the_store_lock() {
+        use crate::mcp::handlers::branch::{publication_authority_in, PublicationAuthority};
+        let orch = orch_with_queued_job().await;
+        let store =
+            crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new("/tmp/proj"));
+        let publisher = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "publisher past its authority check",
+            )
+            .await;
+        assert_eq!(
+            publication_authority_in(&orch.db.local, "job-queued", None, None).await,
+            PublicationAuthority::Authorized
+        );
+
+        let resolver = orch.clone();
+        let resolving = tokio::spawn(async move {
+            let db = resolver.db.local.clone();
+            resolve_terminal(
+                &resolver,
+                &db,
+                "issue-1",
+                Resolution::Merged,
+                StopFailure::Escalates,
+            )
+            .await
+        });
+        let mut queued = false;
+        for _ in 0..10_000 {
+            tokio::task::yield_now().await;
+            queued = orch.store_lock_status(&store).is_some_and(|status| {
+                status
+                    .waiters
+                    .iter()
+                    .any(|waiter| waiter.operation.starts_with("terminal resolution"))
+            });
+            if queued {
+                break;
+            }
+        }
+        assert!(queued, "the resolution queues on the store lock");
+        let status = orch
+            .db
+            .local
+            .query_opt_text("SELECT status FROM issues WHERE id = 'issue-1'", ())
+            .await
+            .unwrap();
+        assert_ne!(
+            status.as_deref(),
+            Some("merged"),
+            "nothing is recorded while the publication holds the lock"
+        );
+        assert!(!resolving.is_finished());
+
+        drop(publisher);
+        resolving.await.unwrap().unwrap();
+        assert!(matches!(
+            publication_authority_in(&orch.db.local, "job-queued", None, None).await,
+            PublicationAuthority::Retired(_)
+        ));
+    }
+
+    /// A failed project lookup is not evidence that there is no store: it is
+    /// retried, and only a lookup that keeps failing refuses, before anything is
+    /// recorded. A lookup that fails once and then succeeds takes the hold.
+    #[tokio::test]
+    async fn a_failed_project_lookup_never_lets_a_resolution_through_unordered() {
+        let orch = orch_with_queued_job().await;
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let calls = &counter;
+        let flaky = move || async move {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err("database is busy".to_string())
+            } else {
+                Ok(Some("/tmp/proj".to_string()))
+            }
+        };
+        let hold = revocation_store_lock_with(&orch, "issue-1", flaky)
+            .await
+            .expect("the retry reads the project");
+        assert!(matches!(
+            hold,
+            Some(crate::orchestrator::EdgeHold::Acquired(_))
+        ));
+        drop(hold);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let failing = || async { Err::<Option<String>, _>("database is busy".to_string()) };
+        let error = revocation_store_lock_with(&orch, "issue-1", failing)
+            .await
+            .err()
+            .expect("a lookup that keeps failing is an error, not 'no store'");
+        assert!(error.contains("database is busy"), "{error}");
+
+        let absent = || async { Ok::<_, String>(None) };
+        assert!(revocation_store_lock_with(&orch, "issue-1", absent)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A reopen lifts the work a resolution stopped and continues it in a new
+    /// session on the same job, so the job and issue read live again. A delta
+    /// the old session prepared before the resolution must still be refused;
+    /// the successor session's own work is not.
+    #[tokio::test]
+    async fn a_reopen_does_not_reauthorize_the_session_the_resolution_closed() {
+        use crate::mcp::handlers::branch::{
+            publication_authority_in, PublicationAuthority, RetirementCause,
+        };
+        let orch = orch_with_queued_job().await;
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, issue_id, node_name, status, branch, current_session_id, created_at, updated_at)
+             VALUES('job-live', 'p-1', 'issue-1', 'builder', 'complete', 'agent/proj-1-builder-0', 's-old', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, created_at, updated_at)
+             VALUES('s-old', 'job-live', 'claude', 'open', 1, 1);
+            INSERT INTO runs(id, issue_id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES('r-old', 'issue-1', 'p-1', 'job-live', 'live', 's-old', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        crud::resolve(
+            &db,
+            &*orch.services.clock,
+            "issue-1",
+            Resolution::Merged,
+            "device",
+        )
+        .await
+        .unwrap();
+        crud::unresolve(&db, &*orch.services.clock, "issue-1")
+            .await
+            .unwrap();
+
+        let PublicationAuthority::Retired(retired) =
+            publication_authority_in(&db, "job-live", Some("r-old"), None).await
+        else {
+            panic!("the session the resolution closed is still refused after the reopen");
+        };
+        assert_eq!(retired.cause, RetirementCause::SessionClosed);
+        assert_eq!(retired.branch, "agent/proj-1-builder-0");
+
+        let successor = db
+            .query_opt_text(
+                "SELECT current_session_id FROM jobs WHERE id = 'job-live'",
+                (),
+            )
+            .await
+            .unwrap()
+            .expect("the reopen continues the job in a session");
+        assert_ne!(successor, "s-old");
+        db.execute(
+            "INSERT INTO runs(id, issue_id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES('r-new', 'issue-1', 'p-1', 'job-live', 'live', ?1, 2, 2)",
+            (successor.as_str(),),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            publication_authority_in(&db, "job-live", Some("r-new"), None).await,
+            PublicationAuthority::Authorized,
+            "the reopened issue's own work publishes"
+        );
     }
 
     fn queued(id: &str, name: &str) -> LiveJob {

@@ -69,7 +69,8 @@ pub(crate) use store_lock::{
     branch_preparation_operation, describe_preparation_wait, StoreLockStatus,
 };
 pub use store_lock::{
-    JjStoreGuard, JjStoreLockMetrics, JjStoreOperationTrace, JjStorePhaseTimer, StoreLockClass,
+    EdgeHold, JjStoreGuard, JjStoreLockMetrics, JjStoreOperationTrace, JjStorePhaseTimer,
+    StoreLockClass,
 };
 mod team_attention_push;
 pub mod usage_refresh;
