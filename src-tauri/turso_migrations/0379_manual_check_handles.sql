@@ -45,7 +45,10 @@ UPDATE check_result_observations
            'unverified',json_extract(c.target_results_json,'$.unverified'),
            'failures',json('[]')) END END FROM check_result_cache c
        WHERE c.source_observation_id=check_result_observations.id
-         AND c.project_id=check_result_observations.project_id
+         -- Unary + keeps the planner off the (project_id, ...) primary key:
+         -- probed by project, each observation walks its project's whole cache
+         -- and its overflowed JSON (~10^10 row visits on a 137k-row install).
+         AND +c.project_id=check_result_observations.project_id
          AND json_valid(c.target_results_json) LIMIT 1
    )
  WHERE id IN (SELECT source_observation_id FROM check_result_cache
