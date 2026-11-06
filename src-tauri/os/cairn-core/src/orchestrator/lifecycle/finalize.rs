@@ -965,7 +965,7 @@ fn finalize_run_inner(
             run_status(orch, run_id).as_deref(),
             Some("exited" | "crashed")
         ) {
-            transition_run(orch, run_id, status)?;
+            transition_owned_run(orch, run_id, status)?;
         }
         crate::execution::jobs::on_call_run_finalized(orch, run_id);
         return Ok(());
@@ -1016,7 +1016,7 @@ fn finalize_run_inner(
         }
     }
 
-    // Transition run via transition_run (validates state machine, emits db-change).
+    // Transition run via transitions::transition_run (validates state machine, emits db-change).
     // Also get the job_id for subsequent job lifecycle.
     let current_status = run_status(orch, run_id);
     if matches!(current_status.as_deref(), Some("exited") | Some("crashed")) {
@@ -1051,7 +1051,7 @@ fn finalize_run_inner(
         return first_error.map_or(Ok(()), Err);
     }
 
-    if let Err(e) = transition_run(orch, run_id, status.clone()) {
+    if let Err(e) = transition_owned_run(orch, run_id, status.clone()) {
         log::error!("Failed to transition run {}: {}", run_id, e);
         first_error.get_or_insert(e);
     }

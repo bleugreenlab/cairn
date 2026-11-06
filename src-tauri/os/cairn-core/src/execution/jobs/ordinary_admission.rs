@@ -2969,6 +2969,56 @@ mod tests {
         assert!(delivery_returned(&orch, "j", "t").await);
     }
 
+    /// Settling a queued launch is a side effect of the one
+    /// `transitions::transition_run`, so the stop path and the start-failed path
+    /// both withdraw the row and wake the promoter through it. A second copy of
+    /// the transition once carried these effects for only one of the two paths.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_and_start_failure_settle_queued_launches_through_one_transition() {
+        let (orch, _, snapshot) = lifecycle_fixture("ordinary-one-transition.db").await;
+        orch.db.local.execute(
+            "UPDATE runtime_admission_requests SET state='queued', lease_owner=NULL, lease_expires_at=NULL WHERE request_id='req'",
+            (),
+        ).await.unwrap();
+        queue_launch(&orch, &snapshot, 2, "starting").await;
+        let mut admission = orch.db.local.subscribe_provider_admission_changes();
+        admission.mark_unchanged();
+
+        crate::orchestrator::lifecycle::stop_job(&orch, "j").unwrap();
+
+        assert_eq!(
+            request_state(&orch, "req").await,
+            (
+                "cancelled".to_string(),
+                Some("run exited before admission".to_string())
+            )
+        );
+        assert!(
+            admission.has_changed().unwrap(),
+            "the stop path woke the promoter"
+        );
+        admission.mark_unchanged();
+
+        crate::execution::jobs::mark_job_start_failed(&orch, &orch.db.local, "j2", "boom", false)
+            .await;
+
+        assert_eq!(
+            text(&orch, "SELECT status FROM runs WHERE id='r2'").await,
+            "crashed"
+        );
+        assert_eq!(
+            request_state(&orch, "req2").await,
+            (
+                "cancelled".to_string(),
+                Some("run crashed before admission".to_string())
+            )
+        );
+        assert!(
+            admission.has_changed().unwrap(),
+            "the start-failed path woke the promoter"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_head_evicts_one_unprotected_warm_process_under_a_unit_ceiling() {
         let gc = Arc::new(crate::agent_process::gc::WarmProcessGC::with_probe(

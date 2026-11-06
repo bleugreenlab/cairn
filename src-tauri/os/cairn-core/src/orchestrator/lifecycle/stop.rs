@@ -918,7 +918,7 @@ fn stop_session_with_pause_intent(
             Some("starting" | "live" | "running" | "idle")
         ) {
             let _ = set_exit_reason(orch, run_id, "user_stop");
-            if let Err(error) = transition_run(orch, run_id, RunStatus::Exited) {
+            if let Err(error) = transition_owned_run(orch, run_id, RunStatus::Exited) {
                 log::warn!("Failed to finalize stopped stale run {}: {}", run_id, error);
             }
             // This reconcile early-return transitions to Exited WITHOUT reaching

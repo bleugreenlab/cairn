@@ -242,150 +242,24 @@ pub(super) fn interrupt_turn(
     Ok(())
 }
 
-pub(super) fn transition_run(
+/// Route a run-status transition to the run's owning database and apply it
+/// through `transitions::transition_run`, from the synchronous lifecycle paths.
+pub(super) fn transition_owned_run(
     orch: &Orchestrator,
     run_id: &str,
     to: RunStatus,
 ) -> Result<RunStatus, String> {
     let run_id = run_id.to_string();
-    let emit_run_id = run_id.clone();
-    let to_str = to.to_string();
-    let (from, admission_changed) = run_db_blocking({
-        let dbs = orch.db.clone();
-        move || async move {
-            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            db.write(|conn| {
-                let run_id = run_id.clone();
-                let to_str = to_str.clone();
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT status
-                         FROM runs
-                         WHERE id = ?1",
-                            (run_id.as_str(),),
-                        )
-                        .await?;
-                    let current_str = crate::storage::next_opt_text(&mut rows, 0)
-                        .await?
-                        .ok_or_else(|| {
-                            db_internal(transition_error(
-                                "run",
-                                &run_id,
-                                "unknown",
-                                to_str.clone(),
-                                "run not found",
-                            ))
-                        })?;
-
-                    let from: RunStatus = current_str.parse().map_err(|_| {
-                        db_internal(transition_error(
-                            "run",
-                            &run_id,
-                            current_str.clone(),
-                            to_str.clone(),
-                            format!("unparseable current status: {}", current_str),
-                        ))
-                    })?;
-                    let to: RunStatus = to_str.parse().map_err(db_internal)?;
-                    let valid = matches!(
-                        (&from, &to),
-                        (RunStatus::Starting, RunStatus::Live)
-                            | (RunStatus::Starting, RunStatus::Exited)
-                            | (RunStatus::Starting, RunStatus::Crashed)
-                            | (RunStatus::Live, RunStatus::Exited)
-                            | (RunStatus::Live, RunStatus::Crashed)
-                    );
-                    if !valid {
-                        return Err(db_internal(transition_error(
-                            "run",
-                            &run_id,
-                            from.to_string(),
-                            to.to_string(),
-                            "transition not allowed",
-                        )));
-                    }
-
-                    let now = chrono::Utc::now().timestamp();
-                    let mut admission_changed = false;
-                    match to {
-                        RunStatus::Live => {
-                            conn.execute(
-                                "UPDATE runs
-                             SET status = ?1,
-                                 started_at = ?2,
-                                 updated_at = ?2
-                             WHERE id = ?3",
-                                (to.to_string().as_str(), now, run_id.as_str()),
-                            )
-                            .await?;
-                        }
-                        RunStatus::Exited | RunStatus::Crashed => {
-                            conn.execute(
-                                "UPDATE runs
-                             SET status = ?1,
-                                 exited_at = ?2,
-                                 updated_at = ?2
-                             WHERE id = ?3",
-                                (to.to_string().as_str(), now, run_id.as_str()),
-                            )
-                            .await?;
-                            // A run that ends while its launch is still queued
-                            // (stopped, killed, or failed to start) withdraws that
-                            // queue entry in the same write, so the promoter never
-                            // leases a dead launch, and returns the attention the
-                            // launch's turn was to carry.
-                            if let Some(withdrawn) =
-                                crate::storage::withdraw_queued_ordinary_admission(
-                                    conn,
-                                    &run_id,
-                                    &format!("run {to} before admission"),
-                                    now,
-                                )
-                                .await?
-                            {
-                                admission_changed = true;
-                                crate::orchestrator::attention_push::return_withdrawn_delivery_conn(
-                                    conn, &withdrawn,
-                                )
-                                .await;
-                            }
-                        }
-                        RunStatus::Starting => {
-                            conn.execute(
-                                "UPDATE runs
-                             SET status = ?1,
-                                 updated_at = ?2
-                             WHERE id = ?3",
-                                (to.to_string().as_str(), now, run_id.as_str()),
-                            )
-                            .await?;
-                        }
-                    }
-                    Ok((from, admission_changed))
-                })
-            })
+    let dbs = orch.db.clone();
+    let emitter = orch.services.emitter.clone();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::transitions::transition_run(&db, &run_id, to, &*emitter)
             .await
             .map_err(|e| e.to_string())
-        }
-    })?;
-    let change = run_db_blocking({
-        let dbs = orch.db.clone();
-        let run_id = emit_run_id.clone();
-        move || async move {
-            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(crate::notify::run_db_change_for_id(&db, &run_id, "update").await)
-        }
-    })?;
-    if admission_changed {
-        orch.db.local.provider_admission_changed();
-    }
-    let _ = orch.services.emitter.emit("db-change", change);
-    Ok(from)
+    })
 }
 
 pub(crate) fn set_exit_reason(
