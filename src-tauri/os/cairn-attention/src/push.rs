@@ -928,6 +928,41 @@ pub async fn retire_resolved(
     .await
 }
 
+/// Retire every pending `review:` push naming `issue_uri`, inside the write that
+/// resolves the issue, returning how many rows it retired.
+///
+/// A review push names an issue as awaiting review, and once the issue is merged
+/// or closed nothing is. The drain resolver cannot always prove that from the
+/// issue's artifacts: a merged issue whose `create-pr` artifact was written
+/// again after its PR opened reads as a rerun still waiting for its PR, which is
+/// `Suspended` rather than `Terminal`, so the push would stay pending forever.
+/// The resolution is the one write that knows the fact, so it records it.
+///
+/// Delivered rows are untouched. A reopen does not undo this: a retired row has
+/// left the supersede index, so the reopened issue's next review is a new row.
+/// Only `review:` keys retire here. A `question:` or `permission:` push on a
+/// resolved issue is deliberately `Suspended`, because reopening restores it.
+///
+/// The reason is `review_resolved`. Naming the resolution itself would widen
+/// 0196's CHECK, which needs a rebuild of a table both lineages carry; the issue
+/// row already records which resolution it was.
+pub async fn retire_reviews_of_resolved_issue_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    issue_uri: &str,
+    now: i64,
+) -> DbResult<usize> {
+    let key = cairn_common::uri::canonicalize_uri_identity(&format!("review:{issue_uri}"));
+    let retired = conn
+        .execute(
+            "UPDATE attention_pushes
+                SET retired_at=?1, retirement_reason=?2
+              WHERE \"key\"=?3 AND delivered_event_id IS NULL AND retired_at IS NULL",
+            params![now, RetirementReason::ReviewResolved.as_str(), key.as_str()],
+        )
+        .await?;
+    Ok(retired as usize)
+}
+
 /// Undelivered pushes for a recipient at a given boundary that are still
 /// **live** — **every** wake level, including `passive`. The busy-agent boundary
 /// drain: a thin [`lazy_resolve_live`] filter over [`pending_at_boundary`]. Wake

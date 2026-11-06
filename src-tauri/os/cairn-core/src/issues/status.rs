@@ -1958,4 +1958,214 @@ mod projection_tests {
             "an issue with no resolution time closes stamped with the migration's time"
         );
     }
+
+    struct FixedClock(i64);
+
+    impl crate::services::Clock for FixedClock {
+        fn now(&self) -> i64 {
+            self.0
+        }
+        fn now_u64(&self) -> u64 {
+            self.0 as u64
+        }
+    }
+
+    /// `delivered_event_id:retired_at:retirement_reason` of one push.
+    async fn push_state(db: &LocalDb, id: &str) -> String {
+        db.query_opt_text(
+            "SELECT COALESCE(delivered_event_id, '') || ':' || COALESCE(retired_at, '') || ':'
+                    || COALESCE(retirement_reason, '')
+               FROM attention_pushes WHERE id = ?1",
+            params![id.to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("push {id} is missing"))
+    }
+
+    async fn ids(db: &LocalDb, sql: &str) -> Vec<String> {
+        let sql = sql.to_string();
+        db.read(move |conn| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, ()).await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row.text(0)?);
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A resolution retires the pending review pushes naming its issue in the
+    /// same write, and nothing else: a delivered review, another issue's review,
+    /// and a question on the same issue are untouched. A reopen leaves the
+    /// retired row retired, and the reopened issue's next review is a new row.
+    #[tokio::test]
+    async fn a_resolution_retires_its_issues_pending_review_pushes() {
+        use cairn_attention::push::{push, Boundary, Wake};
+        let db = crate::storage::migrated_test_db("resolution-retires-reviews.db").await;
+        // The project key is stored capitalized; push keys are canonical.
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'P', 'Proj', '/tmp/p', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('one', 'p', 1, 'One', 'active', 'active', 'none', 1, 1),
+                   ('two', 'p', 2, 'Two', 'active', 'active', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+             VALUES('watcher', 'p', 'running', 1, 1),
+                   ('other', 'p', 'running', 1, 1);
+            INSERT INTO attention_pushes(id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id)
+             VALUES('pending', 'watcher', 'cairn://p/proj/1/1/builder/create-pr', 'wake', 'event', 'review:cairn://p/proj/1', 1, NULL),
+                   ('delivered', 'other', 'cairn://p/proj/1/1/builder/create-pr', 'wake', 'event', 'review:cairn://p/proj/1', 1, 'ev-1'),
+                   ('sibling', 'watcher', 'cairn://p/proj/2/1/builder/create-pr', 'wake', 'event', 'review:cairn://p/proj/2', 1, NULL),
+                   ('question', 'watcher', 'cairn://p/proj/1/1/builder/questions/q', 'wake', 'event', 'question:cairn://p/proj/1/1/builder/questions/q', 1, NULL);
+            ",
+        )
+        .await
+        .unwrap();
+
+        crud::resolve(&db, &FixedClock(500), "one", Resolution::Merged, "device")
+            .await
+            .unwrap();
+
+        for (id, expected, why) in [
+            (
+                "pending",
+                ":500:review_resolved",
+                "the resolved issue's pending review",
+            ),
+            (
+                "delivered",
+                "ev-1::",
+                "a delivered review is history, not queue",
+            ),
+            ("sibling", "::", "another issue's review"),
+            (
+                "question",
+                "::",
+                "an ask on a resolved issue is suspended, not retired",
+            ),
+        ] {
+            assert_eq!(push_state(&db, id).await, expected, "{id}: {why}");
+        }
+
+        crud::unresolve(&db, &FixedClock(600), "one").await.unwrap();
+        assert_eq!(
+            push_state(&db, "pending").await,
+            ":500:review_resolved",
+            "a reopen does not resurrect the retired push"
+        );
+
+        let (fresh, _) = push(
+            &db,
+            "watcher",
+            "cairn://p/Proj/1/1/builder/create-pr",
+            Wake::Wake,
+            Boundary::Event,
+            "review:cairn://p/Proj/1",
+        )
+        .await
+        .unwrap();
+        assert_ne!(fresh, "pending", "the next review is a new row");
+        assert_eq!(push_state(&db, &fresh).await, "::");
+        assert_eq!(push_state(&db, "pending").await, ":500:review_resolved");
+    }
+
+    /// The migration retires exactly the rows the live-database audit selects —
+    /// pending `review:` pushes on merged or closed issues — and leaves every
+    /// other row as it was.
+    #[tokio::test]
+    async fn the_migration_retires_review_pushes_of_resolved_issues() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("resolved-review-pushes.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "retire_review_pushes_of_resolved_issues")
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            before.len() < TURSO_MIGRATIONS.len(),
+            "the migration must be in the lineage"
+        );
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'P', 'p', '/tmp/p', 1, 1),
+                   ('q', 'w', 'Q', 'q', '/tmp/q', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('merged', 'p', 1, 'M', 'merged', 'merged', 'none', 1, 1),
+                   ('closed', 'p', 2, 'C', 'closed', 'closed', 'none', 1, 1),
+                   ('active', 'p', 3, 'A', 'active', 'active', 'none', 1, 1),
+                   ('failed', 'p', 4, 'F', 'failed', 'failed', 'none', 1, 1),
+                   ('other-project', 'q', 1, 'Q', 'active', 'active', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+             VALUES('watcher', 'p', 'running', 1, 1),
+                   ('other', 'p', 'running', 1, 1);
+            INSERT INTO attention_pushes(id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id, retired_at, retirement_reason)
+             VALUES('r-merged', 'watcher', 'cairn://p/p/1', 'wake', 'event', 'review:cairn://p/p/1', 1, NULL, NULL, NULL),
+                   ('r-closed', 'watcher', 'cairn://p/p/2', 'wake', 'event', 'review:cairn://p/p/2', 1, NULL, NULL, NULL),
+                   ('r-active', 'watcher', 'cairn://p/p/3', 'wake', 'event', 'review:cairn://p/p/3', 1, NULL, NULL, NULL),
+                   ('r-failed', 'watcher', 'cairn://p/p/4', 'wake', 'event', 'review:cairn://p/p/4', 1, NULL, NULL, NULL),
+                   ('r-other-project', 'watcher', 'cairn://p/q/1', 'wake', 'event', 'review:cairn://p/q/1', 1, NULL, NULL, NULL),
+                   ('r-delivered', 'other', 'cairn://p/p/1', 'wake', 'event', 'review:cairn://p/p/1', 1, 'ev-1', NULL, NULL),
+                   ('r-retired', 'other', 'cairn://p/p/2', 'wake', 'event', 'review:cairn://p/p/2', 1, NULL, 5, 'review_resolved'),
+                   ('q-merged', 'watcher', 'cairn://p/p/1/1/builder/questions/q', 'wake', 'event', 'question:cairn://p/p/1/1/builder/questions/q', 1, NULL, NULL, NULL),
+                   ('resolved-merged', 'watcher', 'cairn://p/p/1', 'wake', 'event', 'resolved:cairn://p/p/1', 1, NULL, NULL, NULL);
+            ",
+        )
+        .await
+        .unwrap();
+
+        const AUDIT: &str = "SELECT p.id FROM attention_pushes p
+            JOIN issues i ON p.key = 'review:cairn://p/' || (SELECT key FROM projects WHERE id = i.project_id) || '/' || i.number
+           WHERE p.delivered_event_id IS NULL AND p.retired_at IS NULL AND i.status IN ('merged', 'closed')
+           ORDER BY p.id";
+        let selected = ids(&db, AUDIT).await;
+        assert_eq!(selected, vec!["r-closed", "r-merged"]);
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ids(
+                &db,
+                "SELECT id FROM attention_pushes
+                  WHERE retirement_reason = 'review_resolved' AND retired_at IS NOT NULL
+                    AND id <> 'r-retired' ORDER BY id"
+            )
+            .await,
+            selected,
+            "exactly the audited rows retire"
+        );
+        assert!(ids(&db, AUDIT).await.is_empty());
+        for (id, expected) in [
+            ("r-active", "::"),
+            ("r-failed", "::"),
+            ("r-other-project", "::"),
+            ("r-delivered", "ev-1::"),
+            ("r-retired", ":5:review_resolved"),
+            ("q-merged", "::"),
+            ("resolved-merged", "::"),
+        ] {
+            assert_eq!(push_state(&db, id).await, expected, "{id}");
+        }
+        assert_eq!(
+            ids(&db, "SELECT id FROM attention_pushes").await.len(),
+            9,
+            "nothing is deleted"
+        );
+    }
 }

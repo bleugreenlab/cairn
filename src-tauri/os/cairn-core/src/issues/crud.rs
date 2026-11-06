@@ -819,6 +819,27 @@ pub async fn resolve(
             .await?;
 
             let closed_sessions = close_sessions_for_issue_conn(conn, &id, reason, now).await?;
+
+            let mut subject = conn
+                .query(
+                    "SELECT p.key, i.number FROM issues i JOIN projects p ON p.id = i.project_id
+                      WHERE i.id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+            let issue_uri = match subject.next().await? {
+                Some(row) => Some(cairn_common::uri::build_issue_uri(
+                    &row.text(0)?,
+                    row.i64(1)? as i32,
+                )),
+                None => None,
+            };
+            drop(subject);
+            if let Some(issue_uri) = issue_uri {
+                cairn_attention::push::retire_reviews_of_resolved_issue_conn(conn, &issue_uri, now)
+                    .await?;
+            }
+
             Ok(ResolveOutcome {
                 closed_sessions,
                 became_terminal,
