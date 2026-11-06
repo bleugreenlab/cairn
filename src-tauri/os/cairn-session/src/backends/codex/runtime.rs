@@ -220,6 +220,9 @@ pub(crate) fn watchdog_lifecycle(
 
 pub(crate) struct OwnedCodexWatchdog {
     state: Arc<Mutex<CodexTurnProgressWatchdog>>,
+    /// `state`, as the run's witness of calls the gateway serves for it.
+    host_call_witness: std::sync::Weak<dyn crate::agent_process::host_calls::HostCallWitness>,
+    process_state: Arc<crate::agent_process::process::AgentProcessState>,
     identity: Arc<Mutex<Option<crate::runs::watchdog_ledger::WatchdogIdentity>>>,
     cancel: mpsc::Sender<()>,
     join: Option<thread::JoinHandle<()>>,
@@ -275,6 +278,14 @@ impl OwnedCodexWatchdog {
             CODEX_TURN_NO_PROGRESS_TIMEOUT,
             CODEX_POST_TOOL_SILENCE_TIMEOUT,
         )));
+        // A call a functions.exec cell makes reaches the gateway with no item
+        // event, so the gateway itself tells this watchdog it is serving one.
+        let host_call_witness: std::sync::Weak<
+            dyn crate::agent_process::host_calls::HostCallWitness,
+        > = Arc::downgrade(&state) as _;
+        host.process_state
+            .host_calls
+            .register(run_id, host_call_witness.clone());
         let identity = Arc::new(Mutex::new(
             None::<crate::runs::watchdog_ledger::WatchdogIdentity>,
         ));
@@ -378,6 +389,8 @@ impl OwnedCodexWatchdog {
         }).expect("spawn owned Codex turn watchdog");
         Self {
             state,
+            host_call_witness,
+            process_state: host.process_state.clone(),
             identity,
             cancel,
             join: Some(join),
@@ -476,6 +489,9 @@ impl OwnedCodexWatchdog {
 
 impl Drop for OwnedCodexWatchdog {
     fn drop(&mut self) {
+        self.process_state
+            .host_calls
+            .unregister(&self.run_id, &self.host_call_witness);
         self.disarm("reader_shutdown");
         let _ = self.cancel.send(());
         if let Some(join) = self.join.take() {
@@ -697,6 +713,28 @@ impl CodexTurnProgressWatchdog {
         matched
     }
 
+    /// The gateway began serving a call for this run that no provider item
+    /// announced. It holds the turn in `ToolOutstanding` like any tool, and
+    /// returns the turn it was taken under; with no active turn it is ignored,
+    /// so a call never arms a cleared turn.
+    pub fn start_host_call(&mut self, call_id: &str, now: Instant) -> Option<String> {
+        let turn_id = self.active_turn_id.clone()?;
+        self.start_tool(call_id.to_string(), now);
+        Some(turn_id)
+    }
+
+    /// The gateway answered a call it began under `turn_id`. Completes the
+    /// tool only while that turn is still the active one and still holds the
+    /// call, so a late answer cannot move a successor turn's phase.
+    pub fn complete_host_call(&mut self, call_id: &str, turn_id: &str, now: Instant) -> bool {
+        if self.active_turn_id.as_deref() != Some(turn_id)
+            || !self.outstanding_tool_ids.contains(call_id)
+        {
+            return false;
+        }
+        self.complete_tool(Some(call_id), now)
+    }
+
     pub fn deadline_at(&self, now: Instant, wall_now: i64) -> Option<i64> {
         self.active_turn_id.as_ref()?;
         let timeout = match self.phase {
@@ -728,6 +766,18 @@ impl CodexTurnProgressWatchdog {
             phase: self.phase,
             elapsed,
         })
+    }
+}
+
+impl crate::agent_process::host_calls::HostCallWitness for Mutex<CodexTurnProgressWatchdog> {
+    fn call_started(&self, call_id: &str) -> Option<String> {
+        self.lock().ok()?.start_host_call(call_id, Instant::now())
+    }
+
+    fn call_answered(&self, call_id: &str, scope: &str) {
+        if let Ok(mut watchdog) = self.lock() {
+            watchdog.complete_host_call(call_id, scope, Instant::now());
+        }
     }
 }
 
@@ -1701,6 +1751,103 @@ mod tests {
         assert_eq!(watchdog.progress_sequence, 3);
         watchdog.complete_tool(Some("tool-1"), start + Duration::from_secs(3));
         assert_eq!(watchdog.progress_sequence, 4);
+    }
+    #[test]
+    fn a_host_served_call_holds_the_turn_past_the_general_timeout() {
+        let start = Instant::now();
+        let general = Duration::from_secs(10);
+        let mut watchdog = CodexTurnProgressWatchdog::new(general, Duration::from_secs(3));
+        watchdog.start_turn("turn-1", start);
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ProviderProgress);
+
+        let started_at = start + Duration::from_secs(5);
+        let turn = watchdog
+            .start_host_call("exec-1#host-0", started_at)
+            .expect("an active turn takes the call");
+        assert_eq!(turn, "turn-1");
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ToolOutstanding);
+        assert_eq!(watchdog.expired(started_at + general * 8), None);
+
+        let answered_at = started_at + general * 8;
+        assert!(watchdog.complete_host_call("exec-1#host-0", &turn, answered_at));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::PostToolContinuation);
+        assert_eq!(
+            watchdog.expired(answered_at + Duration::from_secs(2)),
+            None,
+            "post-tool timing starts from the answer"
+        );
+        assert_eq!(
+            watchdog
+                .expired(answered_at + Duration::from_secs(3))
+                .unwrap()
+                .phase,
+            CodexTurnWatchdogPhase::PostToolContinuation
+        );
+    }
+    #[test]
+    fn a_host_call_outlives_the_exec_item_that_made_it() {
+        let start = Instant::now();
+        let mut watchdog =
+            CodexTurnProgressWatchdog::new(Duration::from_secs(10), Duration::from_secs(3));
+        watchdog.start_turn("turn-1", start);
+        watchdog.start_tool("exec-item".into(), start);
+        let turn = watchdog.start_host_call("exec-1#host-0", start).unwrap();
+
+        watchdog.complete_tool(Some("exec-item"), start + Duration::from_secs(1));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ToolOutstanding);
+        assert_eq!(watchdog.expired(start + Duration::from_secs(60)), None);
+        assert!(watchdog.complete_host_call(
+            "exec-1#host-0",
+            &turn,
+            start + Duration::from_secs(60)
+        ));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::PostToolContinuation);
+    }
+    #[test]
+    fn a_host_call_never_arms_or_moves_a_turn_it_did_not_start_under() {
+        let start = Instant::now();
+        let mut watchdog =
+            CodexTurnProgressWatchdog::new(Duration::from_secs(10), Duration::from_secs(3));
+        assert_eq!(watchdog.start_host_call("idle#host-0", start), None);
+        assert!(watchdog.active_turn_id.is_none());
+        assert!(watchdog.outstanding_tool_ids.is_empty());
+
+        watchdog.start_turn("turn-1", start);
+        let turn = watchdog.start_host_call("exec-1#host-1", start).unwrap();
+        watchdog.clear_turn();
+        assert!(!watchdog.complete_host_call("exec-1#host-1", &turn, start));
+        assert!(watchdog.active_turn_id.is_none());
+
+        watchdog.start_turn("turn-2", start);
+        assert!(!watchdog.complete_host_call("exec-1#host-1", &turn, start));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ProviderProgress);
+        assert_eq!(watchdog.active_turn_id.as_deref(), Some("turn-2"));
+    }
+    #[test]
+    fn the_gateway_registry_reaches_the_codex_watchdog() {
+        use crate::agent_process::host_calls::{HostCallWitness, HostCallWitnesses};
+        let registry = HostCallWitnesses::default();
+        let watchdog = Arc::new(Mutex::new(CodexTurnProgressWatchdog::new(
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        )));
+        let witness: std::sync::Weak<dyn HostCallWitness> = Arc::downgrade(&watchdog) as _;
+        registry.register("run-1", witness);
+        watchdog
+            .lock()
+            .unwrap()
+            .start_turn("turn-1", Instant::now());
+
+        let serving = registry.serve("run-1", Some("exec-1")).unwrap();
+        assert_eq!(
+            watchdog.lock().unwrap().phase,
+            CodexTurnWatchdogPhase::ToolOutstanding
+        );
+        drop(serving);
+        assert_eq!(
+            watchdog.lock().unwrap().phase,
+            CodexTurnWatchdogPhase::PostToolContinuation
+        );
     }
     #[test]
     fn late_completion_does_not_clear_newer_provider_turn() {

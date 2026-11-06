@@ -82,7 +82,7 @@ impl WorkflowHost for Host {
         self.calls.lock().unwrap().push("continue".into());
         Ok(())
     }
-    fn resume_parent(&self, _: &str) -> Result<(), String> {
+    fn resume_parent(&self, _: &str, _: crate::runtime::ParentResume) -> Result<(), String> {
         panic!("no delegated parent in this fixture")
     }
     fn run_error(&self, _: &str, _: &str) {

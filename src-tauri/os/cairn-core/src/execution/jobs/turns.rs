@@ -117,6 +117,38 @@ mod codex_goal_admission_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_provider_turn_on_a_closed_run_is_refused_and_binds_nothing() {
+        let db = seeded_db().await;
+        let orch = test_orchestrator(db.clone());
+        db.execute("UPDATE turns SET state='complete' WHERE id='t0'", ())
+            .await
+            .unwrap();
+        db.execute("UPDATE runs SET status='exited' WHERE id='r'", ())
+            .await
+            .unwrap();
+
+        let error = admit_codex_goal_turn(
+            &orch,
+            db.clone(),
+            "r",
+            "s",
+            "j",
+            "provider-late",
+            Some("t0"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains(CODEX_GOAL_TURN_ON_CLOSED_RUN), "{error}");
+        assert_eq!(event_count(&db, "system:codex_goal_turn_started").await, 0);
+        let turns = db
+            .query_opt("SELECT COUNT(*) FROM turns", (), |row| row.i64(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turns, 1, "no successor turn is minted on the closed run");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn provider_turn_started_admits_the_active_launch_turn() {
         let db = seeded_db().await;
         let orch = test_orchestrator(db.clone());
@@ -1407,6 +1439,11 @@ pub(crate) enum CodexGoalTurnAdmission {
     Deferred { predecessor_turn_id: String },
 }
 
+/// The refusal [`admit_codex_goal_turn`] returns for a provider turn on a run
+/// whose row is already closed.
+pub(crate) const CODEX_GOAL_TURN_ON_CLOSED_RUN: &str =
+    "Codex provider turn arrived on a closed run";
+
 pub(crate) fn admit_codex_goal_turn(
     orch: &Orchestrator,
     db: Arc<LocalDb>,
@@ -1464,6 +1501,22 @@ pub(crate) fn admit_codex_goal_turn(
                         }
                         return Ok(CodexGoalTurnAdmission::Admitted(turn_id));
                     }
+
+                    // A provider turn arriving on a closed run would run where
+                    // nothing can stop or settle it. Refusing it ends the
+                    // reader, and with it the process the rows no longer own.
+                    let mut run_rows = conn
+                        .query("SELECT status FROM runs WHERE id = ?1", (run_id.as_str(),))
+                        .await?;
+                    if let Some(row) = run_rows.next().await? {
+                        let status = row.text(0)?;
+                        if matches!(status.as_str(), "exited" | "crashed") {
+                            return Err(db_internal(format!(
+                                "{CODEX_GOAL_TURN_ON_CLOSED_RUN}: run {run_id} is {status}"
+                            )));
+                        }
+                    }
+                    drop(run_rows);
 
                     let turn_id = if let Some(current_turn_id) = current_turn_id {
                         let mut rows = conn

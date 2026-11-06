@@ -160,6 +160,54 @@ pub fn census(out: &mut Census) -> bool {
     })
 }
 
+/// Identity-only census of one process group, with the same live-state reader
+/// and completeness contract as the machine census. Unrelated protected system
+/// processes cannot make this group's membership unreadable.
+pub fn census_process_group(process_group_id: u32, out: &mut Census) -> bool {
+    // PROC_PGRP_ONLY from the macOS SDK's sys/proc_info.h.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let pid_size = std::mem::size_of::<i32>();
+    let needed =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, process_group_id, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return false;
+    }
+    let mut pids = vec![0_i32; needed as usize / pid_size + 64];
+    let filled = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            process_group_id,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * pid_size) as i32,
+        )
+    };
+    // Zero can mean either empty or failure. The caller can establish absence
+    // independently with ESRCH, but this census must not invent completeness.
+    if filled <= 0 {
+        return false;
+    }
+    out.enumeration_incomplete |=
+        filled as usize >= pids.len() * pid_size || !(filled as usize).is_multiple_of(pid_size);
+    for pid in pids
+        .into_iter()
+        .take(filled as usize / pid_size)
+        .filter(|pid| *pid > 0)
+    {
+        match read_kernel_state(pid as u32) {
+            KernelRead::Live(process) => out.rows.push(CensusRow {
+                process,
+                resident_bytes: None,
+                cpu_ms: None,
+                uninterruptible: false,
+                storage_io_bytes: None,
+            }),
+            KernelRead::Gone => {}
+            KernelRead::Unreadable => out.unreadable.push(pid as u32),
+        }
+    }
+    true
+}
+
 #[cfg(target_os = "macos")]
 pub fn macos_task_info(pid: i32) -> Option<libc::proc_taskinfo> {
     let mut task: libc::proc_taskinfo = unsafe { std::mem::zeroed() };

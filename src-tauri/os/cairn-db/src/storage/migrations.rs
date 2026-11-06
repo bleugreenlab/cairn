@@ -2538,6 +2538,19 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "command_resource_profiles",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
+    // The largest single process and the out-of-memory kills learned per
+    // suite and machine context, for memory fit. Machine-local and rebuildable
+    // for the same reason as the profiles beside it.
+    (
+        "suite_memory_evidence",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // Which resident out-of-memory kills the suite evidence above already
+    // counts; machine-local and rebuildable with it.
+    (
+        "resident_kills_learned",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
     // Learned execution durations, keyed by machine context and cache warmth.
     // Machine-local observations of how long work takes HERE; nothing a
     // teammate's replica could use, and rebuildable by running the work again.
@@ -8924,24 +8937,10 @@ mod tests {
 
     /// Foreign keys whose index a named issue owes, as
     /// `(lineage, child table, child column, issue)`. Only an index held back on
-    /// measured boot cost belongs here: `codex_watchdog_lifecycle` holds about
-    /// 1.0M rows until cairn/6037's eviction drains it, and its two builds took
-    /// 45 s on the 11-03 clone. An entry whose key is covered fails the census as
-    /// stale, so the list only shrinks.
-    const PENDING_FOREIGN_KEY_INDEXES: &[(&str, &str, &str, &str)] = &[
-        (
-            "private",
-            "codex_watchdog_lifecycle",
-            "session_id",
-            "cairn://p/cairn/6039",
-        ),
-        (
-            "private",
-            "codex_watchdog_lifecycle",
-            "successor_run_id",
-            "cairn://p/cairn/6039",
-        ),
-    ];
+    /// measured boot cost belongs here, until the table it would be built over
+    /// is small enough to build at boot. An entry whose key is covered fails the
+    /// census as stale, so the list only shrinks.
+    const PENDING_FOREIGN_KEY_INDEXES: &[(&str, &str, &str, &str)] = &[];
 
     /// `docs/database.md` ("Deleting Rows With Dependents"): every foreign-key
     /// child column needs a full index, in both lineages. See

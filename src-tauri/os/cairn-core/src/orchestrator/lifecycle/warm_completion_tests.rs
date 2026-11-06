@@ -1430,6 +1430,15 @@ mod backend_turn {
                 "complete",
                 "the actual resume gate must claim the pending parent successor"
             );
+            if !failed {
+                assert_eq!(
+                    scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "run-child")
+                        .await
+                        .as_deref(),
+                    Some("live"),
+                    "a completed task turn leaves its persistent run live"
+                );
+            }
             assert_usage_attached(
                 &orch,
                 "child-turn",
@@ -1444,7 +1453,7 @@ mod backend_turn {
     }
 
     #[tokio::test]
-    async fn interrupt_finalizes_a_delegated_child_only_after_artifact_handoff() {
+    async fn interrupted_delegated_turn_stays_live_and_hands_off_only_after_a_terminal_tool() {
         for terminal_tool in [false, true] {
             let db = test_db().await;
             seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
@@ -1471,7 +1480,8 @@ mod backend_turn {
                 scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "run-child")
                     .await
                     .as_deref(),
-                Some(if terminal_tool { "exited" } else { "live" })
+                Some("live"),
+                "the run outlives the turn while its process is held"
             );
             assert_eq!(
                 scalar_text(
@@ -1629,7 +1639,6 @@ mod claude_and_owned_completion {
     ) {
         apply_claude_turn_completion(
             orch,
-            &orch.db.local,
             &orch.services.emitter,
             run_id,
             Some("session-test"),

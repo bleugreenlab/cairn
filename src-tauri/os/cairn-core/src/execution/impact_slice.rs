@@ -510,6 +510,7 @@ fn runner_account(started_at: u64, duration_ms: u64) -> CellExecutionMeta {
         duration_ms: Some(duration_ms),
         peak_rss_bytes: None,
         peak_physical_footprint_bytes: None,
+        peak_process: None,
         cpu: None,
         allocation: None,
         disk_delta_bytes: None,

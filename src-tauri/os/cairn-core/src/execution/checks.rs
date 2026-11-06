@@ -18756,6 +18756,7 @@ cairn-common = { path = "../cairn-common" }
                 duration_ms: None,
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,
@@ -19371,6 +19372,40 @@ cairn-common = { path = "../cairn-common" }
             capacity_retry_decision(&outcome),
             CapacityRetry::Again { .. }
         ));
+    }
+
+    /// No observation carried `command_oom_killed` while bgsrv-ub's kernel
+    /// killed three rustc processes, because the stop never arrived. When it
+    /// does, the observation stores the shape, never prose, and the result
+    /// names the victim, its size and the machine.
+    #[test]
+    fn an_out_of_memory_stop_is_stored_as_its_shape_and_names_the_victim() {
+        let stopped = stopped_command_failure(
+            &cairn_common::executor_protocol::CommandStop::OomKilled {
+                pid: 2_597_426,
+                rss_bytes: Some(10_583_000_000),
+                machine_total_bytes: Some(13_000_000_000),
+                process_name: Some("rustc".into()),
+            },
+            "error: could not compile `cairn-core`",
+            serde_json::from_value(serde_json::json!({
+                "executorId": "bgsrv-ub", "slotId": "slot", "cellEpoch": 1,
+                "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+            }))
+            .unwrap(),
+            &crate::fleet::CellAccount::default(),
+        );
+        let CheckExecutionFailure::Substrate(failure) = stopped else {
+            panic!("an out-of-memory kill is a substrate failure");
+        };
+        assert_eq!(failure.shape(), SubstrateFailureShape::CommandOomKilled);
+        assert_eq!(failure.shape().stored(), "command_oom_killed");
+        let message = failure.agent_message();
+        assert!(
+            message.contains("Killed by the kernel out-of-memory killer: rustc (pid 2597426) at 9.9 GiB on a machine with 12.1 GiB"),
+            "{message}"
+        );
+        assert!(!substrate_failure_kind(&failure).is_verdict_about_the_code());
     }
 
     #[test]
@@ -20389,6 +20424,7 @@ cairn-common = { path = "../cairn-common" }
             duration_ms: None,
             peak_rss_bytes: None,
             peak_physical_footprint_bytes: None,
+            peak_process: None,
             cpu: None,
             allocation: None,
             disk_delta_bytes: None,
@@ -21165,6 +21201,7 @@ cairn-common = { path = "../cairn-common" }
                 duration_ms: Some(1),
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,
@@ -21303,7 +21340,7 @@ cairn-common = { path = "../cairn-common" }
         let executor_environment = cairn_checkenv::fingerprint(
             std::env::consts::OS,
             std::env::consts::ARCH,
-            [cairn_checkenv::toolchain_identity().to_string()],
+            [cairn_checkenv::keyed_toolchain_identity().to_string()],
             Some(cairn_checkenv::implementation_identity()),
             Vec::<String>::new(),
             |_| None,
@@ -26799,6 +26836,7 @@ mod write_check_stack_headroom {
             finished_at_unix_ms: 2,
             duration_ms: 1,
             peak_rss_bytes: None,
+            peak_process: None,
             cpu: None,
             granted_units: None,
             disk_delta_bytes: None,
@@ -26831,6 +26869,7 @@ mod write_check_stack_headroom {
                 duration_ms: Some(1),
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,

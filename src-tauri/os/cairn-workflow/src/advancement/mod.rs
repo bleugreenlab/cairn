@@ -46,10 +46,11 @@ pub use readiness::{
     find_ready_action_nodes, find_ready_condition_nodes, is_action_node_ready, issue_settled,
 };
 pub use recompute::{
-    heal_stuck_delegated_children, issue_is_terminal_conn, recompute_execution_jobs,
-    recompute_execution_jobs_conn, recompute_job, recompute_job_status_conn,
-    rederive_after_reopen_conn, reduce_delegated_child_job, settle_stranded_jobs,
-    sweep_execution_jobs_conn, ChangeCause, JobStatusChange, RecomputeOutcome,
+    heal_parked_parents, heal_stuck_delegated_children, issue_is_terminal_conn,
+    recompute_execution_jobs, recompute_execution_jobs_conn, recompute_job,
+    recompute_job_status_conn, rederive_after_reopen_conn, reduce_delegated_child_job,
+    settle_stranded_jobs, sweep_execution_jobs_conn, ChangeCause, JobStatusChange,
+    RecomputeOutcome,
 };
 pub use restart::{restart_node, RestartNodeOutcome};
 pub use snapshot_edit::{

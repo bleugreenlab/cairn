@@ -461,34 +461,52 @@ async fn get_running_runs_for_jobs(
     Ok(run_ids)
 }
 
-/// Resolve the live (`starting`/`live`) run id for a job, if one exists.
+/// Resolve the run whose turn a stop should interrupt, if one exists.
 ///
-/// Used by the resource-layer node `stop` action to find the run whose turn to
-/// interrupt. Returns `None` when the node has no active run (already complete,
-/// failed, or never started), letting the caller report a clear no-op rather
-/// than guessing a run id.
+/// The run the job's head turn runs on comes first whenever this host holds its
+/// process: that process is what serves the turn, whatever its row says. Then
+/// a live (`starting`/`live`) run, preferring one with a process here. Returns
+/// `None` when the node has neither (already complete, failed, or never
+/// started), letting the caller report a clear no-op rather than guessing.
 pub fn live_run_id_for_job(orch: &Orchestrator, job_id: &str) -> Option<String> {
     let dbs = orch.db.clone();
     let job_id = job_id.to_string();
-    run_db_blocking(move || async move {
+    let (head_run, live_runs) = run_db_blocking(move || async move {
         let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
             .await
             .map_err(|e| e.to_string())?;
         db.read(|conn| {
-            Box::pin(
-                async move { get_running_runs_for_jobs(conn, std::slice::from_ref(&job_id)).await },
-            )
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT t.run_id FROM jobs j JOIN turns t ON t.id = j.current_turn_id
+                         WHERE j.id = ?1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                let head_run = match rows.next().await? {
+                    Some(row) => row.opt_text(0)?,
+                    None => None,
+                };
+                drop(rows);
+                let live = get_running_runs_for_jobs(conn, std::slice::from_ref(&job_id)).await?;
+                Ok((head_run, live))
+            })
         })
         .await
         .map_err(|e| e.to_string())
     })
-    .ok()
-    .and_then(|ids| {
-        ids.iter()
-            .find(|run_id| orch.process_state.has_process(run_id) == Some(true))
-            .cloned()
-            .or_else(|| ids.into_iter().next())
-    })
+    .ok()?;
+    if let Some(head_run) = head_run {
+        if orch.process_state.has_process(&head_run) == Some(true) {
+            return Some(head_run);
+        }
+    }
+    live_runs
+        .iter()
+        .find(|run_id| orch.process_state.has_process(run_id) == Some(true))
+        .cloned()
+        .or_else(|| live_runs.into_iter().next())
 }
 
 /// Deliberately stop a running workflow node (CAIRN-2516).

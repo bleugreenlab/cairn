@@ -3288,7 +3288,32 @@ fn continue_job_launch_locked(
     })?
     .account_id;
     let mut restarted_for_model_change = false;
-    let existing_run_id = match orch.process_state.find_process_by_session(&session_id) {
+    let found_process = match orch.process_state.find_process_by_session(&session_id) {
+        // A process outliving its run row means the registry and the rows have
+        // drifted: reusing it would start this turn on a closed run, which
+        // nothing can stop or settle. Ending it and launching a fresh run keeps
+        // them in step. Exited -> Live is not a legal run transition, so the
+        // row is never reopened.
+        Some(found_run_id) if run_row_is_closed(&owning_db, &found_run_id)? => {
+            log::error!(
+                "Process for session {} is still registered under closed run {}; stopping it and launching a new run for job {}",
+                &session_id[..session_id.len().min(8)],
+                &found_run_id[..found_run_id.len().min(8)],
+                &job_id[..job_id.len().min(8)]
+            );
+            // A failed release leaves the process, and its admission claim,
+            // alive and possibly still serving: a replacement beside it would
+            // be two processes on one session. Refuse until teardown succeeds.
+            if !crate::orchestrator::lifecycle::release_and_stop_process(orch, &found_run_id) {
+                return Err(format!(
+                    "{CLOSED_RUN_PROCESS_NOT_STOPPED}: run {found_run_id} for job {job_id}; the lifetime sweep will retry"
+                ));
+            }
+            None
+        }
+        found => found,
+    };
+    let existing_run_id = match found_process {
         Some(found_run_id) => {
             let account_decision = ensure_reused_process_account(
                 &orch.process_state,
@@ -5443,6 +5468,26 @@ pub(super) enum ReuseDecision {
 
 /// Reconcile a reusable process against the session's durable account pin.
 ///
+/// The refusal a continuation returns when the process left under a closed run
+/// could not be stopped.
+pub(crate) const CLOSED_RUN_PROCESS_NOT_STOPPED: &str =
+    "a process is still registered under a closed run and could not be stopped";
+
+/// Whether the run row a registered process is held under has already closed
+/// (`exited` or `crashed`). A missing row is not evidence of closure.
+fn run_row_is_closed(db: &Arc<LocalDb>, run_id: &str) -> Result<bool, String> {
+    let status = run_db({
+        let db = db.clone();
+        let run_id = run_id.to_string();
+        async move {
+            db.query_opt_text("SELECT status FROM runs WHERE id = ?1", (run_id,))
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })?;
+    Ok(matches!(status.as_deref(), Some("exited" | "crashed")))
+}
+
 /// A process's provider credentials are immutable after spawn, so a moved pin
 /// can only be honoured by a cold restart, and only an idle child may be
 /// evicted for one.

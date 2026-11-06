@@ -312,6 +312,7 @@ mod tests {
                 quarantines: None,
                 build_skew: None,
                 stopped_commands: Vec::new(),
+                memory_record: Default::default(),
             },
             executor_build_id: None,
             last_update: None,

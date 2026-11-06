@@ -438,6 +438,7 @@ mod tests {
             finished_at_unix_ms: 2,
             duration_ms: 1,
             peak_rss_bytes: None,
+            peak_process: None,
             cpu: None,
             granted_units: None,
             disk_delta_bytes: None,

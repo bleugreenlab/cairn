@@ -101,26 +101,6 @@ kind = "debt"
 issue = "cairn://p/cairn/6131"
 reason = "The embedding pass reads every artifact to keep those newer than a bound it applies in Rust."
 
-# DELETE FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE issue_id = ?1)
-[[allow]]
-file = "os/cairn-core/src/jobs/cleanup.rs"
-rule = "trigger-scan"
-table = "codex_watchdog_lifecycle"
-statement = "0a2b272216017cd4"
-kind = "debt"
-issue = "cairn://p/cairn/6039"
-reason = "A session delete cascades through session_id, which leads no index until the table has been evicted down."
-
-# DELETE FROM sessions WHERE job_id IN (SELECT id FROM jobs WHERE thread_id = ?1)
-[[allow]]
-file = "os/cairn-core/src/jobs/cleanup.rs"
-rule = "trigger-scan"
-table = "codex_watchdog_lifecycle"
-statement = "3a9321f0984daf59"
-kind = "debt"
-issue = "cairn://p/cairn/6039"
-reason = "A session delete cascades through session_id, which leads no index until the table has been evicted down."
-
 # SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_jso
 [[allow]]
 file = "os/cairn-core/src/mcp/handlers/durable_suspend.rs"
@@ -200,16 +180,6 @@ statement = "28847cc652d16539"
 kind = "deliberate"
 issue = "cairn://p/cairn/5989"
 reason = "The security inventory reads every row of the table by design."
-
-# DELETE FROM sessions WHERE id = ?1
-[[allow]]
-file = "os/cairn-core/src/sessions/queries.rs"
-rule = "trigger-scan"
-table = "codex_watchdog_lifecycle"
-statement = "26f4d1b707e574e9"
-kind = "debt"
-issue = "cairn://p/cairn/6039"
-reason = "A session delete cascades through session_id, which leads no index until the table has been evicted down."
 
 # SELECT rowid, "id", "job_id", "artifact_type", "schema_version", "data", "versio
 [[allow]]

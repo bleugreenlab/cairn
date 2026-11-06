@@ -532,6 +532,7 @@ mod tests {
                 duration_ms: None,
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,

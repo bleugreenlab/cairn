@@ -34,7 +34,7 @@ const MEMORY_RESERVATION_CAP_NUMERATOR: u64 = 3;
 const MEMORY_RESERVATION_CAP_DENOMINATOR: u64 = 4;
 
 /// The most one request may reserve on a machine with this memory budget.
-fn memory_reservation_cap(memory_budget_bytes: u64) -> u64 {
+pub(super) fn memory_reservation_cap(memory_budget_bytes: u64) -> u64 {
     memory_budget_bytes.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
         / MEMORY_RESERVATION_CAP_DENOMINATOR
 }
@@ -349,6 +349,438 @@ pub(super) struct ResolvedResourceProfile {
     /// is unchanged by it; placement reads it to prefer a machine that can
     /// hold the work, and to say so when none can.
     pub memory_fit: MemoryFit,
+    /// The largest single process this work is known to hold, which placement
+    /// judges against what each machine can give one process. `None` when
+    /// nothing has measured it.
+    pub process_demand: Option<ProcessDemand>,
+}
+
+/// The largest single process a request's work is known to hold, and where
+/// that was learned.
+///
+/// Unlike a process tree's total this does not grow with build width, so a
+/// measurement from any machine of the same platform is as true on this one,
+/// and the largest is taken rather than a median: nothing beside one process
+/// can inflate its own working set, so it needs no saturation quarantine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProcessDemand {
+    /// The largest single process measured, or an out-of-memory victim's size,
+    /// before headroom.
+    pub peak_bytes: u64,
+    pub name: Option<String>,
+    /// The suite whose evidence set the number, when its did rather than the
+    /// identity's own, as a reader names it (`rust-tests`, `class:cargoTest`).
+    pub suite: Option<String>,
+    /// The machine context (`device:executor`) the deciding number came from.
+    pub measured_on: Option<String>,
+    /// Kills of this suite in this machine context, and the machine total
+    /// they happened at.
+    pub kills_here: Option<(u32, u64)>,
+}
+
+impl ProcessDemand {
+    /// What one process of the work is charged: the measurement with the
+    /// measured-reservation headroom.
+    pub(super) fn demand_bytes(&self) -> u64 {
+        with_headroom(self.peak_bytes)
+    }
+
+    /// The larger of two demands, keeping the kill count of whichever has
+    /// one: a batch must fit its heaviest item, and a suite killed here is
+    /// killed here whichever item it was.
+    pub(super) fn max(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            (None, other) | (other, None) => other,
+            (Some(left), Some(right)) => {
+                let kills = match (left.kills_here, right.kills_here) {
+                    (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
+                    (a, b) => a.or(b),
+                };
+                let mut larger = if right.peak_bytes > left.peak_bytes {
+                    right
+                } else {
+                    left
+                };
+                larger.kills_here = kills;
+                Some(larger)
+            }
+        }
+    }
+}
+
+/// The key a suite's evidence is learned under: a configured check's name,
+/// else the command class, within the project. `None` for an unclassified
+/// command, which is exactly the case nothing is known about: learning one
+/// interactive shell's rustc under `other` would refuse every unclassified
+/// command on a small machine.
+pub(super) fn suite_key(
+    project_id: &str,
+    identity: Option<&CommandResourceIdentity>,
+    class: CellCommandClass,
+) -> Option<String> {
+    match identity.and_then(|identity| identity.suite.as_deref()) {
+        Some(suite) => Some(format!("{project_id}/{suite}")),
+        None if class == CellCommandClass::Other => None,
+        None => Some(format!(
+            "{project_id}/{CLASS_SUITE_PREFIX}{}",
+            class.as_str()
+        )),
+    }
+}
+
+/// What marks a suite keyed by command class rather than by a check's name.
+const CLASS_SUITE_PREFIX: &str = "class:";
+
+/// A suite key as a reader names it: without its project.
+fn suite_display(suite_key: &str) -> String {
+    suite_key
+        .split_once('/')
+        .map_or(suite_key, |(_, suite)| suite)
+        .to_string()
+}
+
+/// The largest single process `identity` and its suite are known to hold on
+/// this platform.
+///
+/// The identity's own number is the largest any context of the same os and
+/// architecture measured, raised by any out-of-memory victim's size there. A
+/// configured check's suite always joins it: a tiered lane is one suite whose
+/// identity moves with its configuration, and any of its runs may compile the
+/// whole closure. A command-class suite only stands in for an identity that
+/// has measured nothing, since a class spans unrelated commands, and an
+/// identity measured once on any machine then speaks for itself.
+pub(super) async fn resolve_process_demand(
+    db: Arc<LocalDb>,
+    identity: Option<&CommandResourceIdentity>,
+    suite_key: Option<&str>,
+    context: &ProfileContext,
+) -> Option<ProcessDemand> {
+    let own = match identity {
+        Some(identity) => load_identity_process_peak(db.clone(), identity, context)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let suite = match suite_key {
+        Some(key) => load_suite_evidence(db, key, context).await.ok().flatten(),
+        None => None,
+    };
+    let class_suite =
+        suite_key.is_some_and(|key| suite_display(key).starts_with(CLASS_SUITE_PREFIX));
+    let suite_applies = !class_suite || own.is_none();
+    let kills_here = suite.as_ref().and_then(|suite| suite.kills_here);
+    let suite_peak = suite
+        .filter(|_| suite_applies)
+        .and_then(|suite| suite.peak)
+        .map(|(bytes, name, measured_on)| ProcessDemand {
+            peak_bytes: bytes,
+            name,
+            suite: suite_key.map(suite_display),
+            measured_on: Some(measured_on),
+            kills_here: None,
+        });
+    let mut demand = ProcessDemand::max(own, suite_peak);
+    match (&mut demand, kills_here) {
+        (Some(demand), kills) => demand.kills_here = kills,
+        (None, Some(kills)) => {
+            demand = Some(ProcessDemand {
+                peak_bytes: 0,
+                name: None,
+                suite: suite_key.map(suite_display),
+                measured_on: Some(context.executor_class.clone()),
+                kills_here: Some(kills),
+            })
+        }
+        (None, None) => {}
+    }
+    demand
+}
+
+/// What one suite has measured on this platform: its largest process, with
+/// its name and the context that measured it, and its kills in this context.
+struct SuiteEvidence {
+    peak: Option<(u64, Option<String>, String)>,
+    kills_here: Option<(u32, u64)>,
+}
+
+async fn load_identity_process_peak(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+) -> Result<Option<ProcessDemand>, String> {
+    let identity = identity.clone();
+    let context = context.clone();
+    db.read(|conn| {
+        let identity = identity.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT executor_class, upper_process_peak_bytes, process_peak_name, oom_victim_rss_bytes
+                     FROM command_resource_profiles
+                     WHERE identity_version=?1 AND command_identity=?2 AND os=?3 AND arch=?4",
+                    params![identity.version as i64, identity.key, context.os, context.arch],
+                )
+                .await?;
+            let mut largest: Option<ProcessDemand> = None;
+            while let Some(row) = rows.next().await? {
+                let measured = row.get::<Option<i64>>(1)?.map(|value| value as u64);
+                let victim = row.get::<Option<i64>>(3)?.map(|value| value as u64);
+                let Some(peak) = measured.max(victim) else {
+                    continue;
+                };
+                if largest.as_ref().is_some_and(|held| held.peak_bytes >= peak) {
+                    continue;
+                }
+                largest = Some(ProcessDemand {
+                    peak_bytes: peak,
+                    name: row.get::<Option<String>>(2)?,
+                    suite: None,
+                    measured_on: Some(row.get::<String>(0)?),
+                    kills_here: None,
+                });
+            }
+            Ok(largest)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn load_suite_evidence(
+    db: Arc<LocalDb>,
+    suite_key: &str,
+    context: &ProfileContext,
+) -> Result<Option<SuiteEvidence>, String> {
+    let suite_key = suite_key.to_string();
+    let context = context.clone();
+    db.read(|conn| {
+        let suite_key = suite_key.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT executor_class, upper_process_peak_bytes, process_peak_name,
+                            oom_kill_count, oom_machine_total_bytes
+                     FROM suite_memory_evidence
+                     WHERE suite_key=?1 AND os=?2 AND arch=?3",
+                    params![suite_key, context.os, context.arch],
+                )
+                .await?;
+            let mut evidence = SuiteEvidence {
+                peak: None,
+                kills_here: None,
+            };
+            let mut any = false;
+            while let Some(row) = rows.next().await? {
+                any = true;
+                let executor_class = row.get::<String>(0)?;
+                if let Some(peak) = row.get::<Option<i64>>(1)?.map(|value| value as u64) {
+                    if evidence
+                        .peak
+                        .as_ref()
+                        .is_none_or(|(held, _, _)| peak > *held)
+                    {
+                        evidence.peak =
+                            Some((peak, row.get::<Option<String>>(2)?, executor_class.clone()));
+                    }
+                }
+                if executor_class == context.executor_class {
+                    let count = row.get::<i64>(3)?.max(0) as u32;
+                    if let (true, Some(total)) = (count > 0, row.get::<Option<i64>>(4)?) {
+                        evidence.kills_here = Some((count, total as u64));
+                    }
+                }
+            }
+            Ok(any.then_some(evidence))
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// How far a machine's total memory must move from the total its kills
+/// happened at before they stop counting against it: a sixteenth, as for the
+/// solo-kill exclusion, so a kernel update that moves the total by a few
+/// megabytes does not read as a new machine.
+pub(super) const KILL_TOTAL_MARGIN_DIVISOR: u64 = 16;
+
+/// Whether `total_bytes` is still the machine its kills happened on.
+pub(super) fn same_machine_total(killed_at_total: u64, total_bytes: u64) -> bool {
+    total_bytes.abs_diff(killed_at_total) <= killed_at_total / KILL_TOTAL_MARGIN_DIVISOR
+}
+
+/// Fold one completion into its suite's evidence in this machine context:
+/// the largest single process it held, and, for an out-of-memory kill, the
+/// victim's size and one more kill at the machine's total.
+///
+/// Every completion with a suite teaches this, measured identity or not: an
+/// agent's batch carries no command identity, and its suite is the only
+/// place its evidence can live. Rise-only, with no decay: warm runs say
+/// nothing about the cold compile, and one process's working set depends on
+/// the code, not on how busy the machine was.
+pub(super) async fn observe_suite(
+    db: Arc<LocalDb>,
+    suite_key: Option<&str>,
+    context: &ProfileContext,
+    metadata: &CellExecutionMeta,
+    kind: CompletionKind,
+) {
+    let Some(suite_key) = suite_key else { return };
+    if kind == CompletionKind::SelectedNothing {
+        return;
+    }
+    let mut peak = metadata
+        .peak_process
+        .as_ref()
+        .map(|peak| (peak.bytes, peak.name.clone()));
+    let mut kill_total = None;
+    if let Some(CommandStop::OomKilled {
+        rss_bytes,
+        machine_total_bytes,
+        process_name,
+        ..
+    }) = &metadata.stop
+    {
+        if let Some(victim) = rss_bytes {
+            if peak.as_ref().is_none_or(|(held, _)| victim > held) {
+                peak = Some((*victim, process_name.clone()));
+            }
+        }
+        kill_total = *machine_total_bytes;
+    }
+    if peak.is_none() && kill_total.is_none() {
+        return;
+    }
+    let _ = record_suite_evidence(
+        db,
+        suite_key,
+        context,
+        metadata.finished_at_unix_ms,
+        peak,
+        kill_total,
+        None,
+    )
+    .await;
+}
+
+/// One out-of-memory kill of a suite's process outside any completion: a
+/// resident's, which the executor reports on its health rather than on a
+/// result. `victim` is its size and name, when the executor read them.
+///
+/// Idempotent by `(machine context, killed_at_unix_ms, pid)`: the machine
+/// re-reports a kill on every snapshot for a day, and a runner that restarts
+/// reads it again.
+pub(super) async fn observe_suite_kill(
+    db: Arc<LocalDb>,
+    suite_key: &str,
+    context: &ProfileContext,
+    killed_at_unix_ms: u64,
+    pid: u32,
+    victim: Option<(u64, Option<String>)>,
+    machine_total_bytes: Option<u64>,
+) {
+    if victim.is_none() && machine_total_bytes.is_none() {
+        return;
+    }
+    let _ = record_suite_evidence(
+        db,
+        suite_key,
+        context,
+        killed_at_unix_ms,
+        victim,
+        machine_total_bytes,
+        Some(pid),
+    )
+    .await;
+}
+
+/// How old a resident kill may be and still be learned. An executor keeps its
+/// last kills by count, not age, so it may report one for days; the runner
+/// learns only kills younger than this, measured against now.
+pub(super) const RESIDENT_KILL_LEARNING_HORIZON_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// How long a learned resident kill's identity is kept: twice the learning
+/// horizon, so every kill still young enough to be learned keeps its identity
+/// and is never counted again, and pruning removes only identities older than
+/// anything the runner would replay.
+const RESIDENT_KILL_IDENTITY_KEPT_MS: u64 = 2 * RESIDENT_KILL_LEARNING_HORIZON_MS;
+
+async fn record_suite_evidence(
+    db: Arc<LocalDb>,
+    suite_key: &str,
+    context: &ProfileContext,
+    finished_at_unix_ms: u64,
+    peak: Option<(u64, Option<String>)>,
+    kill_total: Option<u64>,
+    resident_kill: Option<u32>,
+) -> Result<(), String> {
+    let suite_key = suite_key.to_string();
+    let context = context.clone();
+    db.write(move |conn| {
+        let suite_key = suite_key.clone();
+        let context = context.clone();
+        let peak = peak.clone();
+        Box::pin(async move {
+            // A resident kill is re-reported on every health snapshot until it
+            // ages out of the machine's record; its stored identity is what
+            // keeps it counted once, across runner restarts too.
+            if let Some(pid) = resident_kill {
+                let inserted = conn
+                    .execute(
+                        "INSERT INTO resident_kills_learned (executor_class, killed_at_unix_ms, pid)
+                         VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+                        params![
+                            context.executor_class.clone(),
+                            finished_at_unix_ms as i64,
+                            pid as i64
+                        ],
+                    )
+                    .await?;
+                if inserted == 0 {
+                    return Ok(());
+                }
+                conn.execute(
+                    "DELETE FROM resident_kills_learned WHERE executor_class=?1 AND killed_at_unix_ms < ?2",
+                    params![
+                        context.executor_class.clone(),
+                        finished_at_unix_ms.saturating_sub(RESIDENT_KILL_IDENTITY_KEPT_MS) as i64
+                    ],
+                )
+                .await?;
+            }
+            let (peak_bytes, peak_name) = match &peak {
+                Some((bytes, name)) => (Some(*bytes as i64), name.clone()),
+                None => (None, None),
+            };
+            conn.execute(
+                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, CASE WHEN ?7 IS NULL THEN 0 ELSE 1 END, ?7, ?8)
+                   ON CONFLICT(suite_key, executor_class, os, arch) DO UPDATE SET
+                     upper_process_peak_bytes=CASE WHEN ?5 IS NULL THEN suite_memory_evidence.upper_process_peak_bytes WHEN suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes THEN ?5 ELSE suite_memory_evidence.upper_process_peak_bytes END,
+                     process_peak_name=CASE WHEN ?5 IS NOT NULL AND (suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes) THEN COALESCE(?6, suite_memory_evidence.process_peak_name) ELSE suite_memory_evidence.process_peak_name END,
+                     oom_kill_count=CASE WHEN ?7 IS NULL THEN suite_memory_evidence.oom_kill_count WHEN suite_memory_evidence.oom_machine_total_bytes IS NOT NULL AND ABS(suite_memory_evidence.oom_machine_total_bytes - ?7) <= suite_memory_evidence.oom_machine_total_bytes / ?9 THEN suite_memory_evidence.oom_kill_count + 1 ELSE 1 END,
+                     oom_machine_total_bytes=COALESCE(?7, suite_memory_evidence.oom_machine_total_bytes),
+                     updated_at_unix_ms=MAX(suite_memory_evidence.updated_at_unix_ms, ?8)"#,
+                params![
+                    suite_key.clone(),
+                    context.executor_class.clone(),
+                    context.os.clone(),
+                    context.arch.clone(),
+                    peak_bytes,
+                    peak_name,
+                    kill_total.map(|bytes| bytes as i64),
+                    finished_at_unix_ms as i64,
+                    KILL_TOTAL_MARGIN_DIVISOR as i64
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// The conservative safety prior for a work class that has never been measured
@@ -469,13 +901,6 @@ fn fleet_prior(
         // reader from mistaking another machine's history for this one's.
         source: ResourceReservationSource::Unmeasured,
     })
-}
-
-/// What the rest of the fleet measured this command needing, with headroom,
-/// judged against nothing: the demand as the machines that ran it saw it. For
-/// fit only; a reservation borrows through [`fleet_memory_demand`].
-fn fleet_portable_demand(evidence: &FleetEvidence) -> Option<u64> {
-    (!evidence.peaks.is_empty()).then(|| with_headroom(upper_median(&evidence.peaks)))
 }
 
 /// What the rest of the fleet measured this command needing, with headroom and
@@ -756,6 +1181,7 @@ pub(super) async fn resolve_reservation(
             duration,
             item_durations: Vec::new(),
             memory_fit: MemoryFit::Unknown,
+            process_demand: None,
         };
     };
     // A store that could not be read and a work class that has never run are
@@ -786,14 +1212,14 @@ pub(super) async fn resolve_reservation(
     let borrowed = fleet_evidence
         .as_ref()
         .and_then(|evidence| fleet_prior(evidence, &prior, memory_budget_bytes));
-    // Read beside the prior rather than from it, because the prior is already
-    // clamped, may have been discarded as no larger than the class prior, and is
-    // quarantined against this machine's budget: none of those says what the
-    // fleet measured. The quarantine is right for a reservation and wrong for a
-    // fit. A borrowed peak was measured on machines it did not saturate, so one
-    // that would nearly consume this machine is evidence this machine is too
-    // small, not that this machine was saturated.
-    let borrowed_demand = fleet_evidence.as_ref().and_then(fleet_portable_demand);
+    // A borrowed process-tree peak prices the work here and never decides its
+    // fit. A tree's total grows with the build width the machine that measured
+    // it granted, so a peak taken on a 32-core machine lands at about 70% of
+    // any large machine's size and refused both Sparks a lane that peaked at
+    // 15 GiB (cairn/6089). Whether this machine can hold the work at all is
+    // the largest single process's question, which placement asks of
+    // `process_demand`; the tree's fit here speaks only for a peak this
+    // machine measured itself, at the width it grants.
     let fit_for = |demand: Option<u64>| MemoryFit::of(demand, memory_budget_bytes);
     // The prior is settled before anything explains itself, so every rationale
     // below reports the number this resolution actually stood on.
@@ -820,7 +1246,8 @@ pub(super) async fn resolve_reservation(
                 ),
                 duration,
                 item_durations: Vec::new(),
-                memory_fit: fit_for(borrowed_demand),
+                memory_fit: MemoryFit::Unknown,
+                process_demand: None,
             }
         }
         Err(_) => {
@@ -830,7 +1257,8 @@ pub(super) async fn resolve_reservation(
                 rationale: rationale(Some(ReservationFallback::ProfileLookupFailed), None),
                 duration,
                 item_durations: Vec::new(),
-                memory_fit: fit_for(borrowed_demand),
+                memory_fit: MemoryFit::Unknown,
+                process_demand: None,
             }
         }
     };
@@ -869,13 +1297,11 @@ pub(super) async fn resolve_reservation(
         ),
         duration,
         item_durations: Vec::new(),
-        // Whichever measurement the reservation stood on: this machine's own,
-        // or, while that is still thin, the fleet's.
-        // A quarantined own peak measured this machine's saturation, so it says
-        // nothing about fit and leaves it unknown unless the fleet says more.
-        memory_fit: fit_for(
-            measured_memory_demand(&profile, memory_quarantined).max(borrowed_demand),
-        ),
+        // This machine's own measurement only. A quarantined own peak measured
+        // this machine's saturation, so it says nothing about fit and leaves
+        // it unknown.
+        memory_fit: fit_for(measured_memory_demand(&profile, memory_quarantined)),
+        process_demand: None,
     };
     floored_by_kill(resolved, profile.memory_kill, memory_budget_bytes)
 }
@@ -1065,6 +1491,10 @@ pub(super) async fn observe_completed(
             true => MEMORY_BOUND_PEAK_DECAY_DIVISOR,
             false => PEAK_DECAY_DIVISOR,
         },
+        // The largest single process rises and never decays: a warm run
+        // says nothing about the cold compile, and nothing beside a process
+        // inflates its working set.
+        metadata.peak_process.as_ref(),
     )
     .await;
 }
@@ -1315,6 +1745,7 @@ pub(super) fn oom_killed_for_test(
         duration_ms: Some(1_263_640),
         peak_rss_bytes: Some(victim_resident_bytes),
         peak_physical_footprint_bytes: None,
+        peak_process: None,
         cpu: None,
         allocation: None,
         disk_delta_bytes: None,
@@ -1337,6 +1768,7 @@ pub(super) fn oom_killed_for_test(
             pid: 1_940_747,
             rss_bytes: Some(victim_resident_bytes),
             machine_total_bytes,
+            process_name: None,
         }),
         cell_origin: None,
     }
@@ -1586,6 +2018,7 @@ async fn update_profile(
         duration,
         false,
         PEAK_DECAY_DIVISOR,
+        None,
     )
     .await
 }
@@ -1604,16 +2037,20 @@ async fn update_profile_with(
     duration: Option<u64>,
     held: bool,
     peak_decay_divisor: u64,
+    peak_process: Option<&cairn_common::executor_protocol::PeakProcess>,
 ) -> Result<(), String> {
     let identity = identity.clone();
     let context = context.clone();
+    let process_bytes = peak_process.map(|peak| peak.bytes as i64);
+    let process_name = peak_process.and_then(|peak| peak.name.clone());
     db.write(|conn| {
         let identity = identity.clone();
         let context = context.clone();
+        let process_name = process_name.clone();
         Box::pin(async move {
             conn.execute(
-                r#"INSERT INTO command_resource_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, sample_count, updated_at_unix_ms, upper_peak_rss_bytes, upper_disk_delta_bytes, upper_duration_ms, confidence_millis)
-                   VALUES (?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10,200)
+                r#"INSERT INTO command_resource_profiles (identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint, sample_count, updated_at_unix_ms, upper_peak_rss_bytes, upper_disk_delta_bytes, upper_duration_ms, confidence_millis, upper_process_peak_bytes, process_peak_name)
+                   VALUES (?1,?2,?3,?4,?5,?6,1,?7,?8,?9,?10,200,?13,?14)
                    ON CONFLICT(identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint) DO UPDATE SET
                      sample_count=MIN(command_resource_profiles.sample_count + 1, 10000),
                      updated_at_unix_ms=MAX(command_resource_profiles.updated_at_unix_ms, excluded.updated_at_unix_ms),
@@ -1621,12 +2058,217 @@ async fn update_profile_with(
                      upper_disk_delta_bytes=CASE WHEN excluded.upper_disk_delta_bytes IS NULL THEN command_resource_profiles.upper_disk_delta_bytes WHEN command_resource_profiles.upper_disk_delta_bytes IS NULL OR excluded.upper_disk_delta_bytes >= command_resource_profiles.upper_disk_delta_bytes THEN excluded.upper_disk_delta_bytes ELSE command_resource_profiles.upper_disk_delta_bytes - ((command_resource_profiles.upper_disk_delta_bytes - excluded.upper_disk_delta_bytes) / 32) END,
                      upper_duration_ms=CASE WHEN excluded.upper_duration_ms IS NULL THEN command_resource_profiles.upper_duration_ms WHEN command_resource_profiles.upper_duration_ms IS NULL OR excluded.upper_duration_ms >= command_resource_profiles.upper_duration_ms THEN excluded.upper_duration_ms ELSE command_resource_profiles.upper_duration_ms - ((command_resource_profiles.upper_duration_ms - excluded.upper_duration_ms) / 32) END,
                      confidence_millis=MIN(1000, (MIN(command_resource_profiles.sample_count + 1, 10000) * 1000) / 5),
-                     oom_alone_machine_bytes=CASE WHEN ?11 = 1 THEN NULL ELSE command_resource_profiles.oom_alone_machine_bytes END"#,
-                params![identity.version as i64, identity.key, context.executor_class, context.os, context.arch, context.toolchain_fingerprint, finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64), held as i64, peak_decay_divisor.max(1) as i64],
+                     oom_alone_machine_bytes=CASE WHEN ?11 = 1 THEN NULL ELSE command_resource_profiles.oom_alone_machine_bytes END,
+                     upper_process_peak_bytes=CASE WHEN ?13 IS NULL THEN command_resource_profiles.upper_process_peak_bytes WHEN command_resource_profiles.upper_process_peak_bytes IS NULL OR ?13 >= command_resource_profiles.upper_process_peak_bytes THEN ?13 ELSE command_resource_profiles.upper_process_peak_bytes END,
+                     process_peak_name=CASE WHEN ?13 IS NOT NULL AND (command_resource_profiles.upper_process_peak_bytes IS NULL OR ?13 >= command_resource_profiles.upper_process_peak_bytes) THEN COALESCE(?14, command_resource_profiles.process_peak_name) ELSE command_resource_profiles.process_peak_name END"#,
+                params![identity.version as i64, identity.key, context.executor_class, context.os, context.arch, context.toolchain_fingerprint, finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64), held as i64, peak_decay_divisor.max(1) as i64, process_bytes, process_name],
             ).await?;
             Ok(())
         })
     }).await.map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod process_peak_tests {
+    use super::*;
+    use cairn_common::executor_protocol::PeakProcess;
+
+    const GIB: u64 = 1 << 30;
+
+    fn context(executor_class: &str) -> ProfileContext {
+        ProfileContext {
+            executor_class: executor_class.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            toolchain_fingerprint: "rust".into(),
+        }
+    }
+
+    fn identity(key: &str) -> CommandResourceIdentity {
+        CommandResourceIdentity {
+            version: 1,
+            key: key.into(),
+            suite: Some("rust-tests".into()),
+        }
+    }
+
+    fn completed(peak: u64, finished_at_unix_ms: u64) -> CellExecutionMeta {
+        CellExecutionMeta {
+            stop: None,
+            peak_process: Some(PeakProcess {
+                bytes: peak,
+                name: Some("rustc".into()),
+            }),
+            ..oom_killed_for_test(GIB, None, 0, finished_at_unix_ms)
+        }
+    }
+
+    /// A completion teaches its identity and its suite the largest single
+    /// process, which only rises: a warm run after the cold compile does not
+    /// lower it.
+    #[tokio::test]
+    async fn the_largest_process_is_learned_and_only_rises() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-rises.db").await);
+        let fedora = context("fedora:fedora");
+        let id = identity("rust-tests-a");
+        let suite = suite_key("cairn", Some(&id), CellCommandClass::CargoTest);
+        assert_eq!(suite.as_deref(), Some("cairn/rust-tests"));
+        for (peak, at) in [(10 * GIB, 1), (4 * GIB, 2)] {
+            let meta = completed(peak, at);
+            observe_suite(
+                db.clone(),
+                suite.as_deref(),
+                &fedora,
+                &meta,
+                CompletionKind::Succeeded,
+            )
+            .await;
+            observe_completed(
+                db.clone(),
+                Some(&id),
+                &fedora,
+                &meta,
+                CompletionKind::Succeeded,
+            )
+            .await;
+        }
+        let demand = resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &fedora)
+            .await
+            .unwrap();
+        assert_eq!(demand.peak_bytes, 10 * GIB);
+        assert_eq!(demand.name.as_deref(), Some("rustc"));
+        assert_eq!(demand.measured_on.as_deref(), Some("fedora:fedora"));
+    }
+
+    /// A tiered lane's never-seen identity is judged on its suite, measured
+    /// on another machine of the same platform: the free kill every new
+    /// identity used to get on each small machine.
+    #[tokio::test]
+    async fn a_never_seen_identity_inherits_its_suites_process() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-suite.db").await);
+        let fedora = context("fedora:fedora");
+        let seen = identity("rust-tests-a");
+        let suite = suite_key("cairn", Some(&seen), CellCommandClass::CargoTest);
+        observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            &fedora,
+            &completed(10 * GIB, 1),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        let unseen = identity("rust-tests-b");
+        let demand = resolve_process_demand(
+            db.clone(),
+            Some(&unseen),
+            suite.as_deref(),
+            &context("bgsrv-ub-device:bgsrv-ub"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(demand.peak_bytes, 10 * GIB);
+        assert_eq!(demand.suite.as_deref(), Some("rust-tests"));
+        let mac = ProfileContext {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            ..fedora
+        };
+        assert_eq!(
+            resolve_process_demand(db, Some(&unseen), suite.as_deref(), &mac).await,
+            None,
+            "another platform's compiler says nothing here"
+        );
+    }
+
+    /// A command class spans unrelated commands, so its suite only stands
+    /// in for an identity that has measured nothing.
+    #[tokio::test]
+    async fn a_class_suite_stands_in_only_for_an_unmeasured_identity() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-class.db").await);
+        let fedora = context("fedora:fedora");
+        let class = suite_key("cairn", None, CellCommandClass::CargoTest);
+        assert_eq!(class.as_deref(), Some("cairn/class:cargoTest"));
+        assert_eq!(suite_key("cairn", None, CellCommandClass::Other), None);
+        observe_suite(
+            db.clone(),
+            class.as_deref(),
+            &fedora,
+            &completed(10 * GIB, 1),
+            CompletionKind::Failed,
+        )
+        .await;
+        assert_eq!(
+            resolve_process_demand(db.clone(), None, class.as_deref(), &fedora)
+                .await
+                .map(|demand| demand.peak_bytes),
+            Some(10 * GIB),
+            "an agent's batch has no identity, and its class speaks for it"
+        );
+        let small = CommandResourceIdentity {
+            suite: None,
+            ..identity("cargo-test-p-small")
+        };
+        observe_completed(
+            db.clone(),
+            Some(&small),
+            &fedora,
+            &completed(GIB, 2),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        assert_eq!(
+            resolve_process_demand(db, Some(&small), class.as_deref(), &fedora)
+                .await
+                .map(|demand| demand.peak_bytes),
+            Some(GIB)
+        );
+    }
+
+    /// A kill teaches the suite its victim's size and counts against this
+    /// machine at its total; a kill at another total starts the count again.
+    #[tokio::test]
+    async fn kills_are_counted_per_machine_total() {
+        let db = Arc::new(crate::storage::migrated_test_db("process-peak-kills.db").await);
+        let ub = context("bgsrv-ub-device:bgsrv-ub");
+        let id = identity("rust-tests-a");
+        let suite = suite_key("cairn", Some(&id), CellCommandClass::CargoTest);
+        let total = 13_000_000_000;
+        let kill = |victim, total, at| {
+            let mut meta = oom_killed_for_test(victim, Some(total), 1, at);
+            if let Some(CommandStop::OomKilled { process_name, .. }) = &mut meta.stop {
+                *process_name = Some("rustc".into());
+            }
+            meta
+        };
+        for at in [1, 2] {
+            observe_suite(
+                db.clone(),
+                suite.as_deref(),
+                &ub,
+                &kill(3 * GIB, total, at),
+                CompletionKind::Failed,
+            )
+            .await;
+        }
+        let demand = resolve_process_demand(db.clone(), Some(&id), suite.as_deref(), &ub)
+            .await
+            .unwrap();
+        assert_eq!(demand.kills_here, Some((2, total)));
+        assert_eq!(demand.peak_bytes, 3 * GIB);
+        observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            &ub,
+            &kill(GIB, 2 * total, 3),
+            CompletionKind::Failed,
+        )
+        .await;
+        let demand = resolve_process_demand(db, Some(&id), suite.as_deref(), &ub)
+            .await
+            .unwrap();
+        assert_eq!(demand.kills_here, Some((1, 2 * total)));
+        assert_eq!(demand.peak_bytes, 3 * GIB, "the largest victim stands");
+    }
 }
 
 #[cfg(test)]
@@ -1728,6 +2370,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "check:rust".into(),
+            suite: None,
         };
         let unseen = resolve_reservation(
             db.clone(),
@@ -1794,6 +2437,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "check:rust".into(),
+            suite: None,
         };
         let linux = ProfileContext {
             executor_class: "device:executor".into(),
@@ -2028,6 +2672,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let context = |executor_class: &str, os: &str, arch: &str| ProfileContext {
             executor_class: executor_class.into(),
@@ -2262,6 +2907,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "identity".into(),
+            suite: None,
         };
         let context = ProfileContext {
             executor_class: "device:executor".into(),
@@ -2282,6 +2928,7 @@ mod tests {
             duration_ms: Some(10),
             peak_rss_bytes: Some(100),
             peak_physical_footprint_bytes: None,
+            peak_process: None,
             cpu: None,
             allocation: None,
             disk_delta_bytes: Some(20),
@@ -2334,6 +2981,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "check-resource".into(),
+            suite: None,
         };
         let context = ProfileContext {
             executor_class: "device:executor".into(),
@@ -2354,6 +3002,7 @@ mod tests {
             duration_ms: Some(10),
             peak_rss_bytes: Some(100),
             peak_physical_footprint_bytes: None,
+            peak_process: None,
             cpu: None,
             allocation: None,
             disk_delta_bytes: None,
@@ -2432,6 +3081,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "check:rust".into(),
+            suite: None,
         };
         let context = ProfileContext {
             executor_class: "device:executor".into(),
@@ -2491,6 +3141,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let context = ProfileContext {
             executor_class: "bgsrv-ub:bgsrv-ub".into(),
@@ -2587,16 +3238,20 @@ mod tests {
         );
     }
 
-    /// A machine with no history of its own is judged on what the fleet
-    /// measured, before this machine's cap discards the difference.
+    /// A machine with no history of its own is charged what the fleet
+    /// measured, clamped to its cap, and the borrowed process-tree total does
+    /// not decide its fit: that total grew with the width the measuring
+    /// machine granted, which is how both Sparks were passed over for a lane
+    /// that peaked at 15 GiB. The largest single process decides fit.
     #[tokio::test]
-    async fn a_borrowed_demand_above_this_machines_cap_is_a_ceiling_here() {
+    async fn a_borrowed_tree_peak_prices_the_work_and_never_decides_its_fit() {
         let db = Arc::new(
             crate::storage::migrated_test_db("resource-profile-ceiling-borrowed.db").await,
         );
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let context = |executor_class: &str| ProfileContext {
             executor_class: executor_class.into(),
@@ -2629,14 +3284,7 @@ mod tests {
         )
         .await;
         assert_eq!(resolved.reservation.memory_bytes, SPECIMEN_CAP);
-        assert_eq!(
-            resolved.memory_fit,
-            MemoryFit::Exceeds(MemoryCeiling {
-                estimate_bytes: with_headroom(8 * GIB),
-                ceiling_bytes: SPECIMEN_CAP,
-                killed_here: None,
-            })
-        );
+        assert_eq!(resolved.memory_fit, MemoryFit::Unknown);
     }
 
     /// cairn/5472's first specimen: bgsrv-ub had run the whole suite past the
@@ -2644,15 +3292,18 @@ mod tests {
     /// was confident and quarantined at once, and the 20+ GiB the rest of the
     /// fleet measured for the same command was never read: the work was charged
     /// its class prior and its fit was unknown. A quarantined peak does not
-    /// speak for this machine's memory, so the fleet's measurement decides fit.
+    /// speak for this machine's memory, and neither does the fleet's tree
+    /// total; the protection this machine needs comes from the largest single
+    /// process, which placement judges (`process_fit_tests`).
     #[tokio::test]
-    async fn a_machine_whose_own_peaks_were_quarantined_is_judged_by_the_fleets_measurement() {
+    async fn a_quarantined_machine_is_not_judged_by_the_fleets_tree_total() {
         let db = Arc::new(
             crate::storage::migrated_test_db("resource-profile-quarantined-borrows.db").await,
         );
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let context = |executor_class: &str| ProfileContext {
             executor_class: executor_class.into(),
@@ -2693,14 +3344,7 @@ mod tests {
             Some(ReservationFallback::MemoryObservationQuarantined),
             "its own peak is still not a demand"
         );
-        assert_eq!(
-            resolved.memory_fit,
-            MemoryFit::Exceeds(MemoryCeiling {
-                estimate_bytes: with_headroom(22 * GIB),
-                ceiling_bytes: SPECIMEN_CAP,
-                killed_here: None,
-            })
-        );
+        assert_eq!(resolved.memory_fit, MemoryFit::Unknown);
     }
 
     /// bgsrv-ub, the 12.1 GiB host of cairn/5416's specimens.
@@ -2713,6 +3357,7 @@ mod tests {
             CommandResourceIdentity {
                 version: 1,
                 key: "test:rust".into(),
+                suite: None,
             },
             ProfileContext {
                 executor_class: "bgsrv-ub:bgsrv-ub".into(),
@@ -2974,6 +3619,7 @@ mod tests {
         CommandResourceIdentity {
             version: 1,
             key: "check:rust".into(),
+            suite: None,
         }
     }
 
@@ -2997,6 +3643,7 @@ mod tests {
             duration_ms: Some(duration_ms),
             peak_rss_bytes: Some(100),
             peak_physical_footprint_bytes: None,
+            peak_process: None,
             cpu: None,
             allocation: None,
             disk_delta_bytes: Some(20),

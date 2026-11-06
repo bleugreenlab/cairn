@@ -3606,7 +3606,6 @@ impl ClaudeHost for ClaudeReaderHost {
     fn complete(&self, outcome: ClaudeTurnOutcome, context: ClaudeTurnContext) {
         apply_claude_turn_completion(
             &self.orch,
-            &self.run_db,
             &self.emitter,
             &self.run_id,
             self.session_id.as_deref(),

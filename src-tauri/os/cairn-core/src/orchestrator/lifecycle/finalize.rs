@@ -349,16 +349,6 @@ fn reconcile_warm_codex_goal_from_job(orch: &Orchestrator, run_id: &str, job_id:
     }
 }
 
-/// Wake a delegated parent whose turn was suspended waiting on this job's run.
-///
-/// Called on every run finalization (normal exit, crash, or re-finalization of
-/// an already-settled run). The resume logic self-gates: it only proceeds when
-/// the finalized job maps to a delegated packet whose siblings are all terminal,
-/// so calling it for non-delegated jobs or partially-complete batches is a
-/// cheap no-op. This must run even on the already-finalized fast path, because
-/// a child that submits via the `return` tool settles its run before the
-/// process exit re-enters here — skipping it leaves suspended batch parents
-/// stopped forever.
 pub(crate) fn finish_memory_review_if_due(orch: &Orchestrator, job_id: &str, run_id: &str) {
     let state = match crate::memories::commands::memory_review_idle_state_for_job(orch, job_id) {
         Ok(state) => state,
@@ -595,11 +585,15 @@ fn maybe_journal_call_result(orch: &Orchestrator, run_id: &str, job_id: Option<&
 ///
 /// A call child is created for an ephemeral agent call (a `write` to a node's
 /// calls collection); it produces a single result artifact and is never
-/// resumed, so keeping its process warm only holds memory (CAIRN-2543). Runs
-/// after the warm-transition completion tail, guarded so a call still awaiting
-/// its first-artifact memory review stays warm — the GC's own protection covers
-/// that, and this check re-fires and reaps it at the review turn's own warm
-/// transition. The kill is detached so it never blocks the turn from ending.
+/// resumed, so its turn end is its end (CAIRN-2543). Reaping finalizes the
+/// run, and that finalize is the call's settlement: it terminalizes the job
+/// from its run and artifact (a call that ended without its `return` fails
+/// there, since no re-prompt is owed), releases the call-admission slot,
+/// journals a workflow call's result and resumes the caller. So the reap
+/// follows any ended turn, not only one that left the job terminal, and holds
+/// off only while the call is still waiting (its head turn yielded on a wait)
+/// or awaiting its first-artifact memory review, whose own warm transition
+/// re-fires this check. The kill is detached so it never blocks the turn end.
 fn maybe_kill_completed_call_child(orch: &Orchestrator, run_id: &str) {
     let Some(job_id) = job_id_for_run(orch, run_id) else {
         return;
@@ -607,15 +601,15 @@ fn maybe_kill_completed_call_child(orch: &Orchestrator, run_id: &str) {
     if !crate::execution::delegation::is_call_child(orch, &job_id) {
         return;
     }
-    let status = blocking_text_lookup(
+    let head_state = blocking_text_lookup(
         orch,
         &job_id,
-        "SELECT status FROM jobs WHERE id = ?1",
+        "SELECT t.state FROM jobs j JOIN turns t ON t.id = j.current_turn_id WHERE j.id = ?1",
         TextColumn::Optional,
     );
-    if !matches!(
-        status.as_deref(),
-        Some("complete") | Some("failed") | Some("cancelled")
+    if matches!(
+        head_state.as_deref(),
+        Some("yielded") | Some("running") | Some("pending")
     ) {
         return;
     }
@@ -702,6 +696,14 @@ fn settle_missing_return(orch: &Orchestrator, job_id: &str, run_id: &str) {
     }
 }
 
+/// Wake a delegated parent whose turn was suspended waiting on this job's run.
+///
+/// Called on every warm turn end and every run finalization (exit, crash, or a
+/// re-finalization of an already-settled run). The resume self-gates: it only
+/// proceeds when the job maps to a delegated packet whose siblings are all
+/// terminal, and its claim delivers at most once, so calling it for a
+/// non-delegated job, a partially-complete batch, or a second time is a cheap
+/// no-op.
 fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
     let Some(job_id) = job_id_for_run(orch, run_id) else {
         return;
@@ -1038,13 +1040,12 @@ fn finalize_run_inner(
             .emitter
             .emit("run-completed", serde_json::json!(run_id));
         let _ = orch.run_completions.send(run_id.to_string());
-        // A delegated child whose run was already settled (typically via the
-        // return tool, which finalizes before the process exits) must still wake
-        // a suspended parent batch. Without this, the parent never resumes.
+        // A run settled by something that never saw its process (the stale-run
+        // sweep, the boot reconcile) may belong to a delegated child whose
+        // parent is still parked; this exit can be the last chance to wake it.
         try_resume_delegated_parent(orch, run_id);
-        // The run settled via the `return` tool before this process-exit
-        // re-entry; still flush any direct queued against it so a parent that
-        // finalized that way isn't left unaware of a stuck child (CAIRN-1297).
+        // Likewise flush any direct still queued against the run, so a parent
+        // isn't left unaware of a stuck child (CAIRN-1297).
         if let Err(error) = crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id) {
             log::warn!("already-finalized queued delivery flush failed: {error}");
         }

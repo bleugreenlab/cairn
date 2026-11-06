@@ -10125,6 +10125,114 @@ impl Fleet {
     }
 
     /// Reattachments and the ten non-acquiring operations consume no capacity.
+    /// A resident started with a declared command is fit-tested on that
+    /// command as a batch of it would be, keyed by the command's class: a
+    /// terminal running `bun run test:rust` compiles the same rustc. `None`
+    /// when it fits, has no command, or nothing is known. An interactive
+    /// shell declares nothing and is not tested; each batch run in it is.
+    ///
+    /// Kills this machine posted against earlier residents are learned first,
+    /// so a terminal killed for memory protects the next one.
+    async fn resident_command_misfit(
+        &self,
+        db: Arc<cairn_db::storage::LocalDb>,
+        selected: &SelectedExecutor,
+        project_id: &str,
+        launch_command: Option<&str>,
+    ) -> Option<String> {
+        let context = ReservationPlan::profile_context(selected);
+        self.learn_resident_kills(db.clone(), &selected.executor_id, &context)
+            .await;
+        let command = launch_command?;
+        let suite = resource_profiles::suite_key(
+            project_id,
+            None,
+            cairn_common::executor_protocol::CellCommandClass::classify(command),
+        )?;
+        let demand =
+            resource_profiles::resolve_process_demand(db, None, Some(&suite), &context).await?;
+        let connections = self.lock_connections();
+        let entry = connections.get(&selected.executor_id)?;
+        let reason = process_misfit(&demand, entry)?;
+        Some(format!(
+            "{} cannot run this terminal's command: {}. Nothing was started; run the command as a batch, which placement sends to a machine that can hold it, or start the terminal on such a machine.",
+            executor_public_name(entry),
+            reason.describe()
+        ))
+    }
+
+    /// Fold the out-of-memory kills `executor_id` posted against residents
+    /// started with a declared command into those commands' suites, each kill
+    /// once. A resident produces no completion, so this is the only way its
+    /// kill teaches anything.
+    ///
+    /// Nothing here is the runner's own memory, nor the machine's occupancy:
+    /// the kill itself carries its resident's project and declared command
+    /// class, captured when the resident started, because a terminal whose
+    /// command was its life exits and is released before this runs. Each
+    /// kill is counted once by its stored identity (machine, time, pid), so a
+    /// rebuilt runner learns later kills like any other and none twice.
+    async fn learn_resident_kills(
+        &self,
+        db: Arc<cairn_db::storage::LocalDb>,
+        executor_id: &str,
+        context: &resource_profiles::ProfileContext,
+    ) {
+        let kills: Vec<(
+            String,
+            cairn_common::executor_protocol::OomKillReport,
+            Option<u64>,
+        )> = {
+            let connections = self.lock_connections();
+            let Some(entry) = connections.get(executor_id) else {
+                return;
+            };
+            let total = entry
+                .health
+                .machine
+                .memory
+                .value()
+                .map(|memory| memory.total_bytes);
+            entry
+                .health
+                .memory_record
+                .oom_kills
+                .iter()
+                .filter(|kill| {
+                    unix_time_ms().saturating_sub(kill.killed_at_unix_ms)
+                        <= resource_profiles::RESIDENT_KILL_LEARNING_HORIZON_MS
+                })
+                .filter_map(|kill| {
+                    if !matches!(
+                        kill.owner,
+                        Some(cairn_common::executor_protocol::LiveUsageSubject::Resident { .. })
+                    ) {
+                        return None;
+                    }
+                    let suite = resource_profiles::suite_key(
+                        kill.project_id.as_deref()?,
+                        None,
+                        kill.command_class?,
+                    )?;
+                    Some((suite, kill.clone(), total))
+                })
+                .collect()
+        };
+        for (suite, kill, total) in kills {
+            resource_profiles::observe_suite_kill(
+                db.clone(),
+                &suite,
+                context,
+                kill.killed_at_unix_ms,
+                kill.pid,
+                kill.footprint_bytes
+                    .map(|bytes| (bytes, kill.process_name.clone())),
+                total,
+            )
+            .await;
+        }
+    }
+
     async fn operate_residency_rpc(
         &self,
         orch: &Orchestrator,
@@ -10179,6 +10287,24 @@ impl Fleet {
                     Ok(routed) => routed,
                     Err(refusal) => return refusal,
                 };
+                // Judged before anything is prepared: a refusal costs nothing.
+                if let ResidencyOperation::StartProcess { process, .. } = &operation {
+                    if let Some(refusal) = self
+                        .resident_command_misfit(
+                            orch.db.local.clone(),
+                            &selected,
+                            &residency.repository.identity().project_id,
+                            process.launch_command.as_deref(),
+                        )
+                        .await
+                    {
+                        return residency_core_failure(
+                            ResidencyFailureKind::Admission,
+                            refusal,
+                            None,
+                        );
+                    }
+                }
                 let executor_config = if matches!(
                     operation,
                     ResidencyOperation::StartProcess { .. }
@@ -13087,6 +13213,12 @@ impl Fleet {
             .into();
         }
         let batch_profile_identities = plan.batch_identities.clone();
+        let request_suite = plan.suite.clone();
+        let batch_suites: Vec<Option<String>> = plan
+            .batch_suites
+            .iter()
+            .map(|(_, suite)| suite.clone())
+            .collect();
         let batch_items_share_the_machine = plan.parallel_width > 1;
         let profile_identity = request.command_resource_identity.clone();
         let standing = self.purposes.lock().unwrap().live_key_of(&key).is_some();
@@ -13512,6 +13644,10 @@ impl Fleet {
             };
         }
         let mut pace = None;
+        if let CellOutcome::Completed { .. } = &outcome {
+            self.learn_resident_kills(db.clone(), &selected.executor_id, &profile_context)
+                .await;
+        }
         if let CellOutcome::Completed {
             output,
             metadata,
@@ -13520,7 +13656,10 @@ impl Fleet {
             ..
         } = &outcome
         {
-            if batch_profile_identities.is_empty() {
+            // The batch's shape decides, not whether its items carry
+            // identities: an agent's batch has none, and its items' outcomes
+            // (their own stops included) live only in the serialized output.
+            if batch_suites.is_empty() {
                 if let Some(identity) = profile_identity.as_ref() {
                     record_command_outcome(
                         db.clone(),
@@ -13547,15 +13686,24 @@ impl Fleet {
                     selected.capabilities.memory_budget_bytes,
                 )
                 .await;
+                let kind = resource_profiles::CompletionKind::classify(
+                    *exit_code == Some(0) && !*timed_out,
+                    output,
+                );
+                resource_profiles::observe_suite(
+                    db.clone(),
+                    request_suite.as_deref(),
+                    &profile_context,
+                    metadata,
+                    kind,
+                )
+                .await;
                 resource_profiles::observe_completed(
                     db,
                     profile_identity.as_ref(),
                     &profile_context,
                     metadata,
-                    resource_profiles::CompletionKind::classify(
-                        *exit_code == Some(0) && !*timed_out,
-                        output,
-                    ),
+                    kind,
                 )
                 .await;
             } else if let Ok(items) = serde_json::from_str::<
@@ -13576,10 +13724,31 @@ impl Fleet {
                         .await,
                     );
                 }
-                pace = Some(BatchPace {
-                    lowered: selected.colocated,
-                    expected_ms,
-                });
+                if !batch_profile_identities.is_empty() {
+                    pace = Some(BatchPace {
+                        lowered: selected.colocated,
+                        expected_ms,
+                    });
+                }
+                // Every item teaches its suite, with or without a command
+                // identity: an agent's batch carries none, and its suite is
+                // the only place its largest process can be learned.
+                for (index, item) in items.iter().enumerate() {
+                    if item.suspended {
+                        continue;
+                    }
+                    resource_profiles::observe_suite(
+                        db.clone(),
+                        batch_suites.get(index).and_then(|suite| suite.as_deref()),
+                        &profile_context,
+                        &metadata.for_batch_item(item),
+                        resource_profiles::CompletionKind::classify(
+                            item.succeeded && !item.timed_out,
+                            &item.body,
+                        ),
+                    )
+                    .await;
+                }
                 for (identity, item) in batch_profile_identities.iter().zip(items) {
                     let item_meta = metadata.for_batch_item(&item);
                     // An item the batch never ran to an end (handed off as
@@ -15849,7 +16018,82 @@ fn model_room_rejection(
 /// never offered the work; the request waits for the rest of the fleet instead
 /// of being refused for want of a machine it was never going to get.
 fn excluded_by_memory_kill(reason: &PlacementRejectionReason) -> bool {
-    matches!(reason, PlacementRejectionReason::MemoryKillExcluded { .. })
+    matches!(
+        reason,
+        PlacementRejectionReason::MemoryKillExcluded { .. }
+            | PlacementRejectionReason::ProcessTooLarge(_)
+    )
+}
+
+/// Two kills of a suite on one machine at one total end its fit there,
+/// whatever their size: one kill below the fit line can be crowding, a second
+/// is the machine's answer. A constant, not a setting.
+const KILLS_THAT_END_FIT: u32 = 2;
+
+/// Whether one process of this work is larger than this machine can give a
+/// single process: its total memory less its standing use, or, from an
+/// executor that posts no standing use, its reservation cap. Never `available`
+/// at this instant, which says what is free now rather than what the machine
+/// can hold. `None` when it fits, or when the machine's total is unread.
+fn process_misfit(
+    demand: &resource_profiles::ProcessDemand,
+    entry: &ExecutorConnectionState,
+) -> Option<PlacementRejectionReason> {
+    judge_process_fit(
+        demand,
+        entry.health.machine.memory.value()?.total_bytes,
+        entry.health.memory_record.standing_bytes,
+        entry.advertisement.capabilities.memory_budget_bytes,
+        &format!(
+            "{}:{}",
+            entry.identity.device_id, entry.identity.executor_id
+        ),
+    )
+}
+
+/// [`process_misfit`] over the machine's numbers: its total, its standing
+/// use, its memory budget, and its profile context (`device:executor`).
+fn judge_process_fit(
+    demand: &resource_profiles::ProcessDemand,
+    total_bytes: u64,
+    standing_bytes: Option<u64>,
+    memory_budget_bytes: Option<u64>,
+    here: &str,
+) -> Option<PlacementRejectionReason> {
+    let capacity_bytes = match (standing_bytes, memory_budget_bytes) {
+        (Some(standing), _) => total_bytes.saturating_sub(standing),
+        (None, Some(budget)) => resource_profiles::memory_reservation_cap(budget),
+        (None, None) => total_bytes,
+    };
+    let too_large = demand.peak_bytes > 0 && demand.demand_bytes() > capacity_bytes;
+    let killed_out = demand.kills_here.filter(|(count, killed_at_total)| {
+        *count >= KILLS_THAT_END_FIT
+            && resource_profiles::same_machine_total(*killed_at_total, total_bytes)
+    });
+    if !too_large && killed_out.is_none() {
+        return None;
+    }
+    Some(PlacementRejectionReason::ProcessTooLarge(
+        cairn_common::executor_protocol::ProcessMisfit {
+            process_bytes: demand.demand_bytes(),
+            process_name: demand.name.clone(),
+            suite: demand.suite.clone(),
+            measured_on: demand.measured_on.as_deref().map(|context| {
+                context
+                    .rsplit_once(':')
+                    .map_or(context, |(_, executor)| executor)
+                    .to_string()
+            }),
+            measured_here: demand.measured_on.as_deref() == Some(here),
+            capacity_bytes,
+            total_bytes,
+            standing_bytes,
+            kills_here: (!too_large)
+                .then_some(killed_out)
+                .flatten()
+                .map(|(count, _)| count),
+        },
+    ))
 }
 
 /// The machines a pass passed over because the work cannot run there, each
@@ -15861,6 +16105,7 @@ fn describe_memory_rejections(rejected: &[PlacementRejection]) -> Option<String>
             matches!(
                 rejection.reason,
                 PlacementRejectionReason::MemoryKillExcluded { .. }
+                    | PlacementRejectionReason::ProcessTooLarge(_)
                     | PlacementRejectionReason::ExceedsMemoryCeiling { .. }
             )
         })
@@ -15924,6 +16169,124 @@ fn memory_kill_exclusion(
     })
 }
 
+#[cfg(test)]
+mod process_fit_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    fn rustc(peak_bytes: u64, kills_here: Option<(u32, u64)>) -> resource_profiles::ProcessDemand {
+        resource_profiles::ProcessDemand {
+            peak_bytes,
+            name: Some("rustc".into()),
+            suite: Some("rust-tests".into()),
+            measured_on: Some("bgsrv-ub2-device:bgsrv-ub2".into()),
+            kills_here,
+        }
+    }
+
+    /// The issue's test: a learned 10 GiB process is not offered to a 12 GiB
+    /// machine with 2.7 GiB standing, is offered to a 125 GiB one, and the
+    /// record names the process, the suite, where it was measured, and that
+    /// the number is an estimate here.
+    #[test]
+    fn a_ten_gib_process_fits_a_large_machine_and_not_a_small_one() {
+        let demand = rustc(10 * GIB, None);
+        let reason = judge_process_fit(
+            &demand,
+            13 * GIB,
+            Some(2 * GIB + 7 * GIB / 10),
+            Some(11 * GIB),
+            "bgsrv-ub-device:bgsrv-ub",
+        )
+        .expect("refused on the small machine");
+        let text = reason.describe();
+        assert!(
+            text.starts_with("needs one process of ~12.5 GiB (rustc, suite rust-tests, measured on bgsrv-ub2; estimated here); this machine can give one process 10.3 GiB (13.0 GiB total, 2.7 GiB standing)"),
+            "{text}"
+        );
+        assert!(excluded_by_memory_kill(&reason), "a filter, never a clamp");
+        assert_eq!(
+            judge_process_fit(
+                &demand,
+                125 * GIB,
+                Some(6 * GIB),
+                Some(110 * GIB),
+                "fedora:fedora"
+            ),
+            None
+        );
+    }
+
+    /// An executor that posts no standing use is judged against its
+    /// reservation cap, which is no more permissive than before.
+    #[test]
+    fn without_standing_use_the_cap_is_the_capacity() {
+        let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) = judge_process_fit(
+            &rustc(7 * GIB, None),
+            13 * GIB,
+            None,
+            Some(11 * GIB),
+            "bgsrv-ub-device:bgsrv-ub",
+        ) else {
+            panic!("8.75 GiB does not fit an 8.25 GiB cap");
+        };
+        assert_eq!(
+            misfit.capacity_bytes,
+            resource_profiles::memory_reservation_cap(11 * GIB)
+        );
+        assert!(misfit.describe().contains("its standing use is unmeasured"));
+    }
+
+    /// Two kills at one machine total end fit whatever their size, and a
+    /// machine whose memory changed is offered the work again.
+    #[test]
+    fn two_kills_at_one_total_end_fit_until_the_memory_changes() {
+        let total = 13 * GIB;
+        let small = |kills| rustc(2 * GIB, Some((kills, total)));
+        let here = "bgsrv-ub-device:bgsrv-ub";
+        assert_eq!(
+            judge_process_fit(&small(1), total, Some(GIB), None, here),
+            None
+        );
+        let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) =
+            judge_process_fit(&small(2), total, Some(GIB), None, here)
+        else {
+            panic!("two kills end fit");
+        };
+        assert_eq!(misfit.kills_here, Some(2));
+        assert!(misfit
+            .describe()
+            .contains("killed it here for memory 2 times"));
+        assert_eq!(
+            judge_process_fit(&small(2), 32 * GIB, Some(GIB), None, here),
+            None,
+            "a machine with more memory is a new machine"
+        );
+    }
+
+    #[test]
+    fn a_number_measured_here_is_not_called_an_estimate() {
+        let demand = resource_profiles::ProcessDemand {
+            measured_on: Some("bgsrv-ub-device:bgsrv-ub".into()),
+            ..rustc(10 * GIB, None)
+        };
+        let reason = judge_process_fit(
+            &demand,
+            13 * GIB,
+            Some(GIB),
+            None,
+            "bgsrv-ub-device:bgsrv-ub",
+        )
+        .unwrap();
+        let text = reason.describe();
+        assert!(
+            text.contains("measured here") && !text.contains("estimated"),
+            "{text}"
+        );
+    }
+}
+
 /// Logged placement rejections, keyed by request and machine.
 type PlacementRejectionLog = crate::repeat_report::KeyedRepeatReporter<(String, String)>;
 
@@ -15960,6 +16323,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::InsufficientVolume { .. } => "insufficientVolume",
         PlacementRejectionReason::ExceedsMemoryCeiling { .. } => "exceedsMemoryCeiling",
         PlacementRejectionReason::MemoryKillExcluded { .. } => "memoryKillExcluded",
+        PlacementRejectionReason::ProcessTooLarge(_) => "processTooLarge",
         PlacementRejectionReason::OutrankedBy { .. } => "outrankedBy",
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
@@ -16264,7 +16628,28 @@ fn rank_survey(
             exploration,
         );
     let Some(winner) = winner else {
+        // Every machine placement could score is too small for one process of
+        // this work: a fact about their size that no wait changes.
+        let all_too_small = !ranked.is_empty()
+            && ranked.iter().all(|candidate| {
+                matches!(
+                    candidate.excluded,
+                    Some(PlacementRejectionReason::ProcessTooLarge(_))
+                )
+            });
         rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
+        // Refused at once, unless some machine is only away for now (held,
+        // declining, updating, or drained) and may yet be the one that fits.
+        let something_to_wait_for = rejected.iter().any(|rejection| {
+            waits_on_machine(&rejection.reason)
+                || matches!(rejection.reason, PlacementRejectionReason::Drained)
+        });
+        if all_too_small && !something_to_wait_for {
+            return Err(format!(
+                "no machine can run this work: {}. Nothing was run; this needs a machine with more memory for one process.",
+                describe_memory_rejections(&rejected).unwrap_or_default()
+            ));
+        }
         // A machine the command was killed on while alone is never chosen, so
         // when it is all there is the work waits for another machine, which is
         // the whole of the remedy: placing it there repeats the death. Work the
@@ -16626,7 +17011,12 @@ impl<'a> ScoredCandidate<'a> {
             });
         let ceiling = reservation.and_then(|resolved| resolved.memory_fit.ceiling());
         let excluded = ceiling
-            .and_then(|ceiling| memory_kill_exclusion(ceiling.killed_here.as_ref()?, machine));
+            .and_then(|ceiling| memory_kill_exclusion(ceiling.killed_here.as_ref()?, machine))
+            .or_else(|| {
+                reservation
+                    .and_then(|resolved| resolved.process_demand.as_ref())
+                    .and_then(|demand| process_misfit(demand, entry))
+            });
         let over_ceiling = ceiling.map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
             estimate_bytes: ceiling.estimate_bytes,
             ceiling_bytes: ceiling.ceiling_bytes,
@@ -17995,6 +18385,11 @@ struct ReservationPlan {
     stated: ResourceReservation,
     /// How many items run at once: a parallel batch's item count, otherwise 1.
     parallel_width: u32,
+    /// The suite a single-command request's evidence is learned under.
+    suite: Option<String>,
+    /// Every batch item's identity and suite, in item order, including the
+    /// items no identity was minted for.
+    batch_suites: Vec<(Option<CommandResourceIdentity>, Option<String>)>,
 }
 
 impl ReservationPlan {
@@ -18034,7 +18429,65 @@ impl ReservationPlan {
             parallel_width: batch.filter(|batch| !batch.sequential).map_or(1, |batch| {
                 u32::try_from(batch.items.len()).unwrap_or(u32::MAX).max(1)
             }),
+            suite: resource_profiles::suite_key(
+                &request.project_id,
+                request.command_resource_identity.as_ref(),
+                request.command_class,
+            ),
+            batch_suites: batch
+                .map(|batch| {
+                    batch
+                        .items
+                        .iter()
+                        .map(|item| {
+                            let command = std::iter::once(item.program.as_str())
+                                .chain(item.args.iter().map(String::as_str))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            (
+                                item.command_resource_identity.clone(),
+                                resource_profiles::suite_key(
+                                    &request.project_id,
+                                    item.command_resource_identity.as_ref(),
+                                    cairn_common::executor_protocol::CellCommandClass::classify(
+                                        &command,
+                                    ),
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
+    }
+
+    /// The largest single process this work is known to hold on `context`'s
+    /// platform: a batch's heaviest item.
+    async fn process_demand(
+        &self,
+        context: &resource_profiles::ProfileContext,
+    ) -> Option<resource_profiles::ProcessDemand> {
+        if self.batch_suites.is_empty() {
+            return resource_profiles::resolve_process_demand(
+                self.db.clone(),
+                self.request_identity.as_ref(),
+                self.suite.as_deref(),
+                context,
+            )
+            .await;
+        }
+        let mut demand = None;
+        for (identity, suite) in &self.batch_suites {
+            let item = resource_profiles::resolve_process_demand(
+                self.db.clone(),
+                identity.as_ref(),
+                suite.as_deref(),
+                context,
+            )
+            .await;
+            demand = resource_profiles::ProcessDemand::max(demand, item);
+        }
+        demand
     }
 
     fn profile_context(selected: &SelectedExecutor) -> resource_profiles::ProfileContext {
@@ -18090,6 +18543,9 @@ impl ReservationPlan {
                 // A stated reservation is the caller's own number, not a
                 // measurement this machine's cap could be hiding.
                 memory_fit: resource_profiles::MemoryFit::Unknown,
+                // Whether one process fits is the machine's size, which no
+                // caller's statement changes.
+                process_demand: self.process_demand(&context).await,
             };
         }
         // Whether the caller declared concurrency is decided here, before the
@@ -18145,6 +18601,7 @@ impl ReservationPlan {
             resolved.reservation.source = ResourceReservationSource::Declared;
             resolved.rationale.declared_concurrency_units = Some(clamped);
         }
+        resolved.process_demand = self.process_demand(&context).await;
         resolved
     }
 
@@ -18278,6 +18735,7 @@ impl ReservationPlan {
             duration: self.predict_batch_duration(context, duration_context).await,
             item_durations,
             memory_fit: resource_profiles::MemoryFit::of_batch(memory_fits),
+            process_demand: None,
         }
     }
 }
@@ -18635,6 +19093,7 @@ fn executor_health_snapshot(
         evicted_cells: entry.health.evicted_cells.clone(),
         busy_declined_cells: entry.health.busy_declined_cells.clone(),
         stopped_commands: entry.health.stopped_commands.clone(),
+        memory_record: entry.health.memory_record.clone(),
         repository_faults: entry.health.repository_faults.clone(),
         quarantines: entry.health.quarantines.clone(),
         build_volume: entry.health.build_volume.clone(),
@@ -21587,6 +22046,7 @@ mod tests {
                 duration_ms: None,
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,
@@ -23169,6 +23629,7 @@ mod tests {
             command_resource_identity: Some(CommandResourceIdentity {
                 version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
                 key: "check:rust".into(),
+                suite: None,
             }),
             resource_reservation: Default::default(),
             learned_estimate: None,
@@ -26011,6 +26472,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let pool = Fleet::default();
         let now = unix_time_ms();
@@ -26050,6 +26512,383 @@ mod tests {
         request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
         request.command_resource_identity = Some(identity);
         (pool, db, request)
+    }
+
+    /// Two Linux machines and a suite whose largest process is 10 GiB:
+    /// bgsrv-ub (13 GiB total, 2 GiB standing) and `other` with `other_total`.
+    async fn process_fit_fleet(
+        db_name: &str,
+        other_total: u64,
+        other_drained: bool,
+    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "rust-tests:never-seen".into(),
+            suite: Some("rust-tests".into()),
+        };
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let mut connections = HashMap::new();
+        let mut measured_on = None;
+        for (id, total) in [("bgsrv-ub", 13_000_000_000_u64), ("other", other_total)] {
+            let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
+            entry.advertisement.capabilities.memory_budget_bytes = Some(total / 100 * 85);
+            measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
+            Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
+                now,
+                MachineMemory {
+                    total_bytes: total,
+                    available_bytes: total - 3 * GIB,
+                },
+            );
+            Arc::make_mut(&mut entry.health)
+                .memory_record
+                .standing_bytes = Some(2 * GIB);
+            entry.drained = id == "other" && other_drained;
+            measured_on.get_or_insert_with(|| {
+                ReservationPlan::context_for(
+                    &entry.identity.device_id,
+                    &entry.identity.executor_id,
+                    &entry.advertisement.capabilities,
+                )
+            });
+            connections.insert(id, entry);
+        }
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
+        let suite = resource_profiles::suite_key(
+            &request.project_id,
+            Some(&identity),
+            request.command_class,
+        );
+        resource_profiles::observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            &measured_on.unwrap(),
+            &CellExecutionMeta {
+                stop: None,
+                peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                    bytes: 10 * GIB,
+                    name: Some("rustc".into()),
+                }),
+                ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
+            },
+            resource_profiles::CompletionKind::Succeeded,
+        )
+        .await;
+        request.command_resource_identity = Some(identity);
+        (pool, db, request)
+    }
+
+    /// cairn/5944's specimen across a runner restart and the terminal's own
+    /// end. A terminal was started on bgsrv-ub with a `cargo test` compile by
+    /// a runner that has since been rebuilt; its rustc was killed twice in one
+    /// census (one millisecond, two pids), the command exited, and the terminal
+    /// was released, so the machine posts no occupancy for it, only the kills,
+    /// each carrying the project and command class the terminal started with.
+    /// Starting another terminal of that class there, through the real
+    /// `StartProcess` dispatch, is refused with both kills counted; a second
+    /// start, as a further restarted runner would make, counts neither again;
+    /// and an interactive shell is not judged.
+    #[tokio::test]
+    async fn a_terminal_running_across_a_runner_restart_teaches_its_kills_and_refuses_the_next() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let command = "bun run test:rust -p cairn-core";
+        let spec = |launch: Option<&str>| -> cairn_common::executor_protocol::ResidentProcessSpec {
+            serde_json::from_value(serde_json::json!({
+                "program": "/bin/sh",
+                "launchCommand": launch,
+            }))
+            .unwrap()
+        };
+        let (id, mut entry) = answering_fleet_entry("bgsrv-ub", "linux", 0, &[]);
+        entry.advertisement.capabilities.memory_budget_bytes = Some(11_042_782_208);
+        {
+            let health = Arc::make_mut(&mut entry.health);
+            health.machine.memory = Measurement::measured(
+                unix_time_ms(),
+                MachineMemory {
+                    total_bytes: 13_000_000_000,
+                    available_bytes: 9 * GIB,
+                },
+            );
+            health.memory_record.standing_bytes = Some(GIB);
+            let killed_at = unix_time_ms();
+            health.memory_record.oom_kills = [11, 12]
+                .into_iter()
+                .map(|pid| cairn_common::executor_protocol::OomKillReport {
+                    killed_at_unix_ms: killed_at,
+                    pid,
+                    process_name: Some("rustc".into()),
+                    footprint_bytes: Some(3 * GIB),
+                    owner: Some(
+                        cairn_common::executor_protocol::LiveUsageSubject::Resident {
+                            cell_id: "released-home".into(),
+                            process_key: "terminal:tests".into(),
+                            generation: 1,
+                        },
+                    ),
+                    project_id: Some("p".into()),
+                    command_class: Some(
+                        cairn_common::executor_protocol::CellCommandClass::classify(command),
+                    ),
+                })
+                .collect();
+        }
+        // A fresh environment: nothing of the killed terminal is posted.
+        let cell = materialization_read_cell("ub-home", "builder");
+        let residency = cell.residency.clone().unwrap();
+        Arc::make_mut(&mut entry.snapshot).cells = vec![cell.clone()];
+        orch.fleet.lock_connections().insert(id, entry);
+        orch.fleet.residency_routes.lock().unwrap().insert(
+            ("bgsrv-ub".into(), residency.holder.storage_key()),
+            ResidencyRoute {
+                holder: residency.holder.clone(),
+                repository: residency.repository.clone(),
+                executor_id: "bgsrv-ub".into(),
+                pending: false,
+            },
+        );
+        let start = |key: &str, launch: Option<&str>| ResidencyOperation::StartProcess {
+            fence: ResidencyFence {
+                holder: residency.holder.clone(),
+                incarnation_id: residency.incarnation_id.clone(),
+                cell_epoch: cell.cell_epoch,
+            },
+            process_key: key.into(),
+            kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
+                slug: key.into(),
+            },
+            reservation: None,
+            process: spec(launch),
+        };
+        let refused = format!(
+            "{:?}",
+            orch.fleet
+                .operate_residency(&orch, start("terminal:again", Some(command)))
+                .await
+        );
+        assert!(
+            refused.contains("cannot run this terminal's command"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("killed it here for memory 2 times"),
+            "{refused}"
+        );
+        let again = format!(
+            "{:?}",
+            orch.fleet
+                .operate_residency(&orch, start("terminal:third", Some(command)))
+                .await
+        );
+        assert!(again.contains("2 times"), "each kill counted once: {again}");
+        let counted = orch
+            .db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query("SELECT SUM(oom_kill_count) FROM suite_memory_evidence", ())
+                        .await?;
+                    Ok(rows
+                        .next()
+                        .await?
+                        .map(|row| row.get::<i64>(0))
+                        .transpose()?)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            counted,
+            Some(2),
+            "two kills in one millisecond are two kills, once"
+        );
+        let shell = format!(
+            "{:?}",
+            orch.fleet
+                .operate_residency(&orch, start("terminal:shell", None))
+                .await
+        );
+        assert!(
+            !shell.contains("cannot run this terminal's command"),
+            "an interactive shell is not judged: {shell}"
+        );
+    }
+
+    /// The executor keeps its last kills by count, so a kill learned days ago
+    /// is still posted when a new one arrives. Suite A was killed once three
+    /// days ago and learned then; suite B is killed now. Learning B prunes old
+    /// identities, and replaying the ring again and again never counts A's
+    /// kill a second time: it is past the learning horizon, so A stays at one
+    /// kill and still fits.
+    #[tokio::test]
+    async fn an_old_kill_still_posted_is_never_counted_again() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const DAY: u64 = 24 * 60 * 60 * 1_000;
+        let db = Arc::new(crate::storage::migrated_test_db("resident-kill-horizon.db").await);
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let (id, mut entry) = answering_fleet_entry("bgsrv-ub", "linux", 0, &[]);
+        entry.advertisement.capabilities.memory_budget_bytes = Some(11_042_782_208);
+        let kill =
+            |pid: u32, at: u64, command: &str| cairn_common::executor_protocol::OomKillReport {
+                killed_at_unix_ms: at,
+                pid,
+                process_name: Some("rustc".into()),
+                footprint_bytes: Some(2 * GIB),
+                owner: Some(
+                    cairn_common::executor_protocol::LiveUsageSubject::Resident {
+                        cell_id: "cell".into(),
+                        process_key: format!("terminal:{pid}"),
+                        generation: 1,
+                    },
+                ),
+                project_id: Some("p".into()),
+                command_class: Some(cairn_common::executor_protocol::CellCommandClass::classify(
+                    command,
+                )),
+            };
+        let old = kill(11, now - 3 * DAY, "cargo test -p cairn-core");
+        let new = kill(12, now, "bun run test:frontend");
+        {
+            let health = Arc::make_mut(&mut entry.health);
+            health.machine.memory = Measurement::measured(
+                now,
+                MachineMemory {
+                    total_bytes: 13_000_000_000,
+                    available_bytes: 9 * GIB,
+                },
+            );
+            health.memory_record.standing_bytes = Some(GIB);
+            health.memory_record.oom_kills = vec![old.clone(), new];
+        }
+        let selected = selected_executor(&entry);
+        let context = ReservationPlan::profile_context(&selected);
+        pool.lock_connections().insert(id, entry);
+        // Day one: A's kill was learned when it happened.
+        let suite_a = resource_profiles::suite_key(
+            "p",
+            None,
+            cairn_common::executor_protocol::CellCommandClass::CargoTest,
+        )
+        .unwrap();
+        resource_profiles::observe_suite_kill(
+            db.clone(),
+            &suite_a,
+            &context,
+            old.killed_at_unix_ms,
+            old.pid,
+            Some((2 * GIB, Some("rustc".into()))),
+            Some(13_000_000_000),
+        )
+        .await;
+        for _ in 0..3 {
+            pool.learn_resident_kills(db.clone(), &selected.executor_id, &context)
+                .await;
+        }
+        let counts = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT suite_key, oom_kill_count FROM suite_memory_evidence ORDER BY suite_key",
+                            (),
+                        )
+                        .await?;
+                    let mut found = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        found.push((row.get::<String>(0)?, row.get::<i64>(1)?));
+                    }
+                    Ok(found)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            counts,
+            vec![
+                ("p/class:cargoTest".to_string(), 1),
+                ("p/class:vitest".to_string(), 1)
+            ]
+        );
+        assert_eq!(
+            pool.resident_command_misfit(db, &selected, "p", Some("cargo test -p cairn-core"))
+                .await,
+            None,
+            "one kill below the fit line still fits"
+        );
+    }
+
+    /// The issue's test end to end: a never-seen identity of a suite whose
+    /// rustc is 10 GiB is not offered to a 13 GiB machine and is offered to a
+    /// 125 GiB one; when every machine is too small it is refused on the first
+    /// pass rather than waiting out its horizon; and when the machine that
+    /// would fit is only drained, it waits.
+    #[tokio::test]
+    async fn a_process_larger_than_a_machine_is_placed_elsewhere_refused_or_waits() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let select = |pool: Fleet, db, request: CellRequest| async move {
+            let plan = ReservationPlan::new(db, &request, None);
+            pool.select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+        };
+
+        let (pool, db, request) =
+            process_fit_fleet("process-fit-elsewhere.db", 125 * GIB, false).await;
+        let placement = select(pool, db, request)
+            .await
+            .unwrap()
+            .placed()
+            .expect("the large machine takes it");
+        assert_eq!(placement.selected.executor_id, "other");
+        let small = placement
+            .decision
+            .rejected
+            .iter()
+            .find(|rejection| rejection.executor_id == "bgsrv-ub")
+            .expect("bgsrv-ub is on the record");
+        let text = small.reason.describe();
+        assert!(
+            matches!(small.reason, PlacementRejectionReason::ProcessTooLarge(_)),
+            "{text}"
+        );
+        assert!(
+            text.contains("needs one process of ~12.5 GiB (rustc, suite rust-tests"),
+            "{text}"
+        );
+
+        let (pool, db, request) =
+            process_fit_fleet("process-fit-nowhere.db", 14 * GIB, false).await;
+        let refusal = select(pool, db, request)
+            .await
+            .expect_err("no machine can give one process 12.5 GiB")
+            .diagnostic;
+        assert!(
+            refusal.contains("no machine can run this work"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("bgsrv-ub: needs one process"), "{refusal}");
+
+        let (pool, db, request) =
+            process_fit_fleet("process-fit-drained.db", 125 * GIB, true).await;
+        assert!(
+            select(pool, db, request).await.unwrap().placed().is_none(),
+            "a drained machine that fits is worth waiting for"
+        );
     }
 
     fn pinned_to(mut request: CellRequest, home: &str) -> CellRequest {
@@ -26177,11 +27016,11 @@ mod tests {
     }
 
     /// cairn/4931 review: a cold machine with a smaller budget than the home
-    /// borrows the fleet's measurement, and that measurement says it is too
-    /// small too. The borrowed peak is quarantined against its budget for a
-    /// reservation, but for fit it is evidence, so the smaller machine is never
-    /// named as the place that can hold the work, and the pin holds at the
-    /// clamp with every machine's ceiling on the record.
+    /// is never named as the place that can hold the work, and the pin holds
+    /// at the clamp. Since cairn/6089 a borrowed process-tree total no longer
+    /// decides any machine's fit (it grew with the width the measuring machine
+    /// granted), so the cold machine's fit is unknown rather than a ceiling,
+    /// and unknown is still not "can hold it".
     #[tokio::test]
     async fn a_smaller_cold_machine_is_never_named_as_able_to_hold_what_its_home_cannot() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -26210,7 +27049,7 @@ mod tests {
             .placed()
             .expect("the pin holds");
         assert_eq!(placement.selected.executor_id, "bgsrv-ub");
-        assert!(placement.decision.rejected.iter().any(|rejection| {
+        assert!(!placement.decision.rejected.iter().any(|rejection| {
             rejection.executor_id == "bglab-mac"
                 && matches!(
                     rejection.reason,
@@ -26218,8 +27057,10 @@ mod tests {
                 )
         }));
         let above = placement.above_ceiling.unwrap();
-        assert!(!above.holdable_elsewhere && !above.unknown_elsewhere);
-        assert!(above.note().contains("no executor can hold"));
+        assert!(!above.holdable_elsewhere && above.unknown_elsewhere);
+        assert!(above
+            .note()
+            .contains("no usable machine is known to hold it"));
     }
 
     /// A machine with no stated budget has no measured fit either way. It is not
@@ -26284,6 +27125,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let pool = Fleet::default();
         let now = unix_time_ms();
@@ -26589,6 +27431,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let now = unix_time_ms();
         let mut connections = HashMap::new();
@@ -26676,6 +27519,7 @@ mod tests {
         let identity = CommandResourceIdentity {
             version: 1,
             key: "test:rust".into(),
+            suite: None,
         };
         let now = unix_time_ms();
         let mut connections = HashMap::new();
@@ -29116,6 +29960,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
+            process_demand: None,
         };
         let reservations = HashMap::from([
             ("a-fast".to_string(), demand.clone()),
@@ -29952,6 +30797,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
+            process_demand: None,
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -30007,6 +30853,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
+            process_demand: None,
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -30138,6 +30985,7 @@ mod tests {
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
             memory_fit: resource_profiles::MemoryFit::Unknown,
+            process_demand: None,
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -37271,6 +38119,7 @@ mod tests {
                 duration_ms: None,
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,
@@ -38495,6 +39344,7 @@ mod tests {
                 duration_ms: None,
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,
@@ -38773,6 +39623,7 @@ mod tests {
                 finished_at_unix_ms: 2,
                 duration_ms: 1,
                 peak_rss_bytes: None,
+                peak_process: None,
                 cpu: None,
                 granted_units: None,
                 disk_delta_bytes: None,
@@ -38970,6 +39821,7 @@ mod tests {
             finished_at_unix_ms: 2,
             duration_ms: 1,
             peak_rss_bytes: None,
+            peak_process: None,
             cpu: None,
             granted_units: None,
             disk_delta_bytes: None,
@@ -39057,6 +39909,7 @@ mod tests {
                 command_resource_identity: Some(CommandResourceIdentity {
                     version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
                     key: key.to_string(),
+                    suite: None,
                 }),
                 ..cache_batch_item(Vec::new())
             })
@@ -39096,6 +39949,7 @@ mod tests {
                     finished_at_unix_ms: 1 + duration_ms,
                     duration_ms,
                     peak_rss_bytes: Some(1_000),
+                    peak_process: None,
                     cpu: None,
                     granted_units: None,
                     disk_delta_bytes: Some(10),
@@ -39215,6 +40069,175 @@ mod tests {
             vec!["failed".to_string(), "worked".to_string()],
             "a failure's memory is real demand; an empty selection's is not"
         );
+    }
+
+    /// An agent's batch carries no command identities, and its items' kills
+    /// live only in their own outcomes. Through the real completion path each
+    /// item teaches its own command class: the two cargo items killed below
+    /// the fit line count two kills at the machine's total, and the vitest
+    /// item's process is learned under vitest, not cargo.
+    #[tokio::test]
+    async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() {
+        use cairn_common::executor_protocol::ProcessBatchItemOutcome;
+        const GIB: u64 = 1 << 30;
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(sender);
+        let commands = [
+            "cargo test -p cairn-core",
+            "cargo test -p cairn-db",
+            "bun run test:frontend",
+        ];
+        let items = commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| ProcessBatchItem {
+                header: command.to_string(),
+                stream_id: format!("stream:{index}"),
+                args: vec![command.to_string()],
+                ..cache_batch_item(Vec::new())
+            })
+            .collect::<Vec<_>>();
+        let fleet = orch.fleet.clone();
+        let machine = tokio::spawn(async move {
+            let Some(ExecutorMessage::Offer { entry_id, .. }) =
+                next_work_frame(&mut executor).await
+            else {
+                panic!("the batch is offered");
+            };
+            fleet.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::Claim { entry_id },
+            );
+            let Some(ExecutorMessage::Granted { request, .. }) =
+                next_work_frame(&mut executor).await
+            else {
+                panic!("granted");
+            };
+            let item =
+                |header: &str,
+                 peak: u64,
+                 stop: Option<cairn_common::executor_protocol::CommandStop>| {
+                    ProcessBatchItemOutcome {
+                        header: header.into(),
+                        body: "output".into(),
+                        succeeded: stop.is_none(),
+                        suspended: false,
+                        images: Vec::new(),
+                        exit_code: Some(if stop.is_none() { 0 } else { 101 }),
+                        timed_out: false,
+                        started_at_unix_ms: 1,
+                        finished_at_unix_ms: 2,
+                        duration_ms: 1,
+                        peak_rss_bytes: Some(peak),
+                        peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                            bytes: peak,
+                            name: None,
+                        }),
+                        cpu: None,
+                        granted_units: None,
+                        disk_delta_bytes: None,
+                        sandbox_denials: Vec::new(),
+                        tracked_modifications: None,
+                        environment_fingerprint: String::new(),
+                        verdict_platform: None,
+                        verdict_arch: None,
+                        toolchain_fingerprint: None,
+                        verdict_environment_hash: None,
+                        stop,
+                        build_jobs: None,
+                    }
+                };
+            let killed = || {
+                Some(cairn_common::executor_protocol::CommandStop::OomKilled {
+                    pid: 7,
+                    rss_bytes: Some(3 * GIB),
+                    machine_total_bytes: Some(13_000_000_000),
+                    process_name: Some("rustc".into()),
+                })
+            };
+            let outcomes = vec![
+                item("cargo-core", 2 * GIB, killed()),
+                item("cargo-db", 2 * GIB, killed()),
+                item("vitest", GIB, None),
+            ];
+            let mut outcome = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
+            if let CellOutcome::Completed { output, .. } = &mut outcome {
+                *output = serde_json::to_string(&outcomes).unwrap();
+            }
+            fleet.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::Result {
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    outcome,
+                },
+            );
+        });
+        let mut request = provenance_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        request.command_resource_identity = None;
+        let batch = ProcessBatch {
+            files: Vec::new(),
+            runtime_packages: Vec::new(),
+            sequential: true,
+            stop_on_error: false,
+            sandbox_mode: ProcessSandboxMode::Unconfined,
+            timeout_bases: Vec::new(),
+            items,
+            runner_context_id: None,
+            execution_residency: None,
+            containment: None,
+            node_scratch: None,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            orch.fleet.submit_execution(&orch, request, Some(batch)),
+        )
+        .await
+        .expect("the batch settles");
+        machine.await.unwrap();
+        assert!(
+            matches!(outcome, CellOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        let db = orch.db.local.clone();
+        let rows = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT suite_key, upper_process_peak_bytes, oom_kill_count FROM suite_memory_evidence ORDER BY suite_key",
+                            (),
+                        )
+                        .await?;
+                    let mut found = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        found.push((
+                            row.get::<String>(0)?,
+                            row.get::<i64>(1)? as u64,
+                            row.get::<i64>(2)?,
+                        ));
+                    }
+                    Ok(found)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].0.ends_with("/class:cargoTest"), "{rows:?}");
+        assert_eq!(
+            (rows[0].1, rows[0].2),
+            (3 * GIB, 2),
+            "two kills at one total"
+        );
+        assert!(rows[1].0.ends_with("/class:vitest"), "{rows:?}");
+        assert_eq!((rows[1].1, rows[1].2), (GIB, 0));
     }
 
     /// A machine that provisions one cell at a time: it claims the first offer

@@ -1,20 +1,17 @@
 //! Claude Result policy after the reader has persisted the provider event.
 
 use crate::agent_process::completion::ClaudeTurnOutcome;
-use crate::backends::is_task_spawned_run;
 use crate::models::{RunStatus, TurnEndReason};
 use crate::orchestrator::lifecycle::{finalize_run, transition_to_warm_state};
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::services::EventEmitter;
-use crate::storage::LocalDb;
 use std::sync::Arc;
 
 pub(crate) use cairn_session::agent_process::completion::ClaudeTurnContext;
 
 pub(crate) fn apply_claude_turn_completion(
     orch: &Orchestrator,
-    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
@@ -48,12 +45,11 @@ pub(crate) fn apply_claude_turn_completion(
         }
     }
 
-    if is_task_spawned_run("Claude", run_db, run_id) {
-        finalize_run(orch, run_id, RunStatus::Exited);
-        orch.process_state.transition_to_warm(run_id);
-    } else {
-        warm_and_emit(orch, emitter, run_id, None);
-    }
+    // A delegated task's turn end is a turn end like any other: the run stays
+    // live while its process is held, so a re-prompt or follow-up turn the
+    // warm transition delivers runs on a live run. `finalize_run` is for the
+    // process actually ending (EOF, kill, reap).
+    warm_and_emit(orch, emitter, run_id, None);
 }
 
 /// The work boundary precedes the delayed CLI interrupt acknowledgement.

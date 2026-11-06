@@ -95,25 +95,7 @@ async fn open_child_turn(orch: &Orchestrator, child: &str, run_id: &str, turn_id
 /// The turn the idle flush resumed the child into, once the provider has
 /// started it: `(run_id, turn_id)`.
 async fn continued_turn(orch: &Orchestrator, child: &str, after: &str) -> (String, String) {
-    let started = std::time::Instant::now();
-    let (run_id, turn_id) = loop {
-        let head = text(
-            orch,
-            &format!(
-                "SELECT t.run_id || '|' || t.id FROM jobs j JOIN turns t ON t.id = j.current_turn_id
-                 WHERE j.id = '{child}' AND t.id != '{after}'"
-            ),
-        )
-        .await;
-        if let Some((run_id, turn_id)) = head.as_deref().and_then(|head| head.split_once('|')) {
-            break (run_id.to_string(), turn_id.to_string());
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the child was never resumed past {after}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let (run_id, turn_id) = resumed_head(orch, child, after).await;
     orch.db
         .local
         .execute(
@@ -126,6 +108,144 @@ async fn continued_turn(orch: &Orchestrator, child: &str, after: &str) -> (Strin
     orch.process_state
         .set_current_turn_id(&run_id, Some(&turn_id));
     (run_id, turn_id)
+}
+
+/// The child's head turn once the idle flush has moved it past `after`, as the
+/// resume left it and before any provider event: `(run_id, turn_id)`.
+async fn resumed_head(orch: &Orchestrator, child: &str, after: &str) -> (String, String) {
+    let started = std::time::Instant::now();
+    loop {
+        let head = text(
+            orch,
+            &format!(
+                "SELECT t.run_id || '|' || t.id FROM jobs j JOIN turns t ON t.id = j.current_turn_id
+                 WHERE j.id = '{child}' AND t.id != '{after}'"
+            ),
+        )
+        .await;
+        if let Some((run_id, turn_id)) = head.as_deref().and_then(|head| head.split_once('|')) {
+            return (run_id.to_string(), turn_id.to_string());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the child was never resumed past {after}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn run_status(orch: &Orchestrator, run_id: &str) -> String {
+    text(
+        orch,
+        &format!("SELECT status FROM runs WHERE id = '{run_id}'"),
+    )
+    .await
+    .expect("the run exists")
+}
+
+/// A Claude task's first turn ends on a clean Result with no `return`. The
+/// re-prompt reaches the task on the same run, which is still live, and the
+/// process serving that turn is not marked idle underneath it: an idle mark is
+/// what made the reader drop the `return` tool's result.
+async fn first_claude_miss(orch: &Orchestrator, child: &str) -> (String, String) {
+    open_child_turn(orch, child, "run-child", "child-turn-1").await;
+    say(orch, "run-child", "child-turn-1", LAST_WORDS).await;
+    end_claude_task_turn(orch, "run-child").await;
+    assert_eq!(reprompts(orch, child).await, 1);
+    assert_eq!(successor_count(orch).await, 0);
+    let (run_id, turn_id) = resumed_head(orch, child, "child-turn-1").await;
+    assert_eq!(
+        run_id, "run-child",
+        "the re-prompt reuses the task's process"
+    );
+    assert_eq!(
+        run_status(orch, "run-child").await,
+        "live",
+        "a turn runs on a live run"
+    );
+    assert!(
+        !orch.process_state.is_warm("run-child"),
+        "the process serving the re-prompt turn is not idle"
+    );
+    let next = continued_turn(orch, child, "child-turn-1").await;
+    assert_eq!(next.1, turn_id);
+    next
+}
+
+/// cairn/6071: a Claude task that ended its first turn without `return`, and
+/// returned on the re-prompt, settled only by a later nudge or never, because
+/// its first turn end closed the run the re-prompt then ran on.
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_task_that_returns_on_its_reprompt_settles_and_resumes_its_parent() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-claude-returns.db").await;
+    let (run_id, _turn) = first_claude_miss(&orch, &child).await;
+
+    write_return(&orch, &child, RETURNED).await;
+    end_claude_task_turn(&orch, &run_id).await;
+
+    assert_eq!(job_status(&orch, &child).await, "complete");
+    await_successor(&orch).await;
+    assert_eq!(successor_count(&orch).await, 1);
+    let delivered = delivered_tool_result(&orch)
+        .await
+        .expect("the parent receives the task's result");
+    assert!(delivered.contains(RETURNED), "{delivered}");
+    assert_eq!(
+        text(
+            &orch,
+            &format!(
+                "SELECT status FROM delegated_packets WHERE result_artifact_job_id = '{child}'"
+            )
+        )
+        .await
+        .as_deref(),
+        Some("completed")
+    );
+    assert_eq!(run_status(&orch, &run_id).await, "live");
+    assert!(orch.process_state.is_warm(&run_id), "warm after the turn");
+    assert_eq!(reprompts(&orch, &child).await, 1);
+    assert_eq!(
+        fleet_slots_held(&orch, &child).await,
+        0,
+        "a returned task on a live, warm run is not working"
+    );
+}
+
+/// Whether the job counts against the fleet's working-job cap.
+async fn fleet_slots_held(orch: &Orchestrator, job_id: &str) -> i64 {
+    count(
+        orch,
+        &format!(
+            concat!(
+                "SELECT COUNT(*) FROM jobs j WHERE j.id = '{}' AND ",
+                cairn_db::fleet_working_job_sql!()
+            ),
+            job_id
+        ),
+    )
+    .await
+}
+
+/// The Claude twin of the ignored re-prompt: the parent is released with the
+/// ended-without-return account instead of waiting on a closed run.
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_task_that_ignores_its_reprompt_resumes_its_parent_with_ended_without_return() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-claude-ignored.db").await;
+    let (run_id, turn_id) = first_claude_miss(&orch, &child).await;
+    say(&orch, &run_id, &turn_id, "Still reading the scorer").await;
+    end_claude_task_turn(&orch, &run_id).await;
+
+    assert_eq!(job_status(&orch, &child).await, "failed");
+    await_successor(&orch).await;
+    assert_eq!(successor_count(&orch).await, 1);
+    let delivered = delivered_tool_result(&orch)
+        .await
+        .expect("the parent is told what happened");
+    assert!(
+        delivered.contains("ended without returning a result (asked once)"),
+        "{delivered}"
+    );
+    assert_eq!(reprompts(&orch, &child).await, 1);
 }
 
 /// The child says something mid-thought on its turn, which is exactly what the
@@ -169,14 +289,13 @@ async fn end_turn_without_return(orch: &Orchestrator, run_id: &str) {
 }
 
 /// End the child's turn the way Claude reports a clean Result for a
-/// task-spawned run: the run is finalized as exited.
+/// task-spawned run.
 async fn end_claude_task_turn(orch: &Orchestrator, run_id: &str) {
     let orch = orch.clone();
     let run_id = run_id.to_string();
     tokio::task::spawn_blocking(move || {
         apply_claude_turn_completion(
             &orch,
-            &orch.db.local,
             &orch.services.emitter,
             &run_id,
             Some("session-child"),
@@ -627,6 +746,36 @@ async fn no_reprompt_for_a_call() {
     assert_eq!(reprompts(&orch, &child).await, 0);
 }
 
+/// A call is never resumed, so its turn end settles it even without its
+/// `return`: the reap finalizes the run, which is what releases the call's
+/// slot and journals its result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_that_ends_without_return_is_reaped_and_its_run_finalized() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-call-reaped.db").await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE delegated_packets SET spec = json_set(spec, '$.origin', 'call_tool')
+             WHERE result_artifact_job_id = ?1",
+            params![child.clone()],
+        )
+        .await
+        .unwrap();
+    open_child_turn(&orch, &child, "run-child", "child-turn-1").await;
+    end_claude_task_turn(&orch, "run-child").await;
+
+    let started = std::time::Instant::now();
+    while run_status(&orch, "run-child").await != "exited" {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the call's run was never finalized"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(orch.process_state.has_process("run-child"), Some(false));
+    assert_eq!(reprompts(&orch, &child).await, 0);
+}
+
 /// A top-level node owes its own output, not a `return`, and is never
 /// re-prompted here, even resting Blocked on it.
 #[tokio::test(flavor = "multi_thread")]
@@ -670,8 +819,7 @@ async fn inline_wait_releases_a_task_that_returns_and_exits_cleanly() {
     open_child_turn(&orch, &child, "run-child", "child-turn-1").await;
     say(&orch, "run-child", "child-turn-1", LAST_WORDS).await;
     write_return(&orch, &child, RETURNED).await;
-    // Claude reports the clean Result after the return; the task-spawned path
-    // finalizes the run as exited.
+    // Claude reports the clean Result after the return.
     end_claude_task_turn(&orch, "run-child").await;
 
     let response = spawning
@@ -741,4 +889,503 @@ async fn created_child(orch: &Orchestrator) -> String {
     // Let the spawn reach its wait before the child's turn ends.
     tokio::time::sleep(Duration::from_millis(300)).await;
     child
+}
+
+/// The shape a host that died mid-settlement leaves: the child's turn ended
+/// and its `return` landed, but its run closed and its job still reads running.
+async fn strand_finished_child(orch: &Orchestrator, child: &str) {
+    orch.db
+        .local
+        .write({
+            let child = child.to_string();
+            move |conn| {
+                let child = child.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+                         VALUES('session-child',?1,'claude','backend-child','open',1,2,2)",
+                        params![child.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO runs(id,job_id,issue_id,project_id,session_id,status,start_mode,created_at,updated_at)
+                         VALUES('run-child',?1,'i','p','session-child','exited','fresh',10,10)",
+                        params![child.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,started_at,ended_at,updated_at)
+                         VALUES('child-turn-1','session-child','run-child',?1,1,'complete','initial',10,10,12,12)",
+                        params![child.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "UPDATE jobs SET status='running', started_at=10, current_turn_id='child-turn-1',
+                             current_session_id='session-child' WHERE id=?1",
+                        params![child.as_str()],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            }
+        })
+        .await
+        .unwrap();
+    write_return(orch, child, RETURNED).await;
+}
+
+async fn settle_stranded(orch: &Orchestrator, child: &str) {
+    let execution_id = text(
+        orch,
+        &format!("SELECT execution_id FROM jobs WHERE id = '{child}'"),
+    )
+    .await
+    .expect("the child belongs to an execution");
+    let child = child.to_string();
+    on_blocking_thread(orch, move |orch| {
+        let changes = crate::execution::advancement::settle_stranded_jobs(
+            orch,
+            &execution_id,
+            &std::iter::once(child.clone()).collect(),
+        )
+        .unwrap();
+        assert!(
+            changes.iter().any(|change| change.job_id == child),
+            "the repair settles the stranded child: {changes:?}"
+        );
+    })
+    .await;
+}
+
+fn turn_starts(requests: &Arc<Mutex<Vec<serde_json::Value>>>) -> usize {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["method"] == "turn/start")
+        .count()
+}
+
+/// The parent's provider is started after the delivery is stored, so wait for
+/// the expected count, then a moment more for a duplicate to show.
+async fn await_turn_starts(requests: &Arc<Mutex<Vec<serde_json::Value>>>, expected: usize) {
+    let started = std::time::Instant::now();
+    while turn_starts(requests) < expected {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the parent's provider turn was never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(turn_starts(requests), expected);
+}
+
+async fn tool_results_on_the_spawning_call(orch: &Orchestrator) -> i64 {
+    count(
+        orch,
+        "SELECT COUNT(*) FROM events WHERE run_id='run-parent' AND event_type='tool_result' \
+         AND json_extract(data,'$.toolUseId')='tool-write'",
+    )
+    .await
+}
+
+/// A boot repair that settles a stranded child is a settlement like any other:
+/// the parent parked on it is resumed, told the result arrived late.
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_parent_resumes_once_when_boot_repair_settles_its_child() {
+    let (orch, child, requests) = spawn_and_park("return-followup-boot-repair.db").await;
+    strand_finished_child(&orch, &child).await;
+    let starts_before = turn_starts(&requests);
+
+    settle_stranded(&orch, &child).await;
+
+    assert_eq!(job_status(&orch, &child).await, "complete");
+    await_successor(&orch).await;
+    assert_eq!(successor_count(&orch).await, 1);
+    let delivered = delivered_tool_result(&orch)
+        .await
+        .expect("the parent receives the repaired task's result");
+    assert!(delivered.contains("Delayed delivery"), "{delivered}");
+    assert!(delivered.contains(RETURNED), "{delivered}");
+    await_turn_starts(&requests, starts_before + 1).await;
+}
+
+/// Every resume edge firing for one settled child still delivers once.
+#[tokio::test(flavor = "multi_thread")]
+async fn healed_resume_does_not_double_deliver() {
+    let (orch, child, requests) = spawn_and_park("return-followup-no-double.db").await;
+    strand_finished_child(&orch, &child).await;
+    let starts_before = turn_starts(&requests);
+    settle_stranded(&orch, &child).await;
+    await_successor(&orch).await;
+
+    assert_eq!(
+        crate::execution::advancement::heal_parked_parents(&orch).await,
+        0,
+        "a resumed parent is no longer parked"
+    );
+    let again = child.clone();
+    on_blocking_thread(&orch, move |orch| {
+        let _ = crate::execution::delegation::resume_suspended_parent_after_task_completion(
+            orch, &again,
+        );
+        let _ = finalize_run(orch, "run-child", RunStatus::Exited);
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(successor_count(&orch).await, 1);
+    assert_eq!(tool_results_on_the_spawning_call(&orch).await, 1);
+    await_turn_starts(&requests, starts_before + 1).await;
+}
+
+/// The backstop: a child already settled, its packet still `running`, its
+/// parent still parked because no resume ever fired. The heal releases it once;
+/// a parent whose child is still unfinished is left parked.
+#[tokio::test(flavor = "multi_thread")]
+async fn heal_parked_parents_releases_a_parent_whose_children_finished_without_a_resume() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-heal-parked.db").await;
+    assert_eq!(
+        crate::execution::advancement::heal_parked_parents(&orch).await,
+        0,
+        "a parent whose child has not finished stays parked"
+    );
+    assert_eq!(successor_count(&orch).await, 0);
+
+    write_return(&orch, &child, RETURNED).await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE jobs SET status = 'complete' WHERE id = ?1",
+            params![child.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        text(
+            &orch,
+            &format!(
+                "SELECT status FROM delegated_packets WHERE result_artifact_job_id = '{child}'"
+            )
+        )
+        .await
+        .as_deref(),
+        Some("running"),
+        "the stale packet is the shape the heal must see past"
+    );
+
+    assert_eq!(
+        crate::execution::advancement::heal_parked_parents(&orch).await,
+        1
+    );
+    await_successor(&orch).await;
+    let delivered = delivered_tool_result(&orch)
+        .await
+        .expect("the healed parent receives the result");
+    assert!(delivered.contains(RETURNED), "{delivered}");
+    assert_eq!(
+        crate::execution::advancement::heal_parked_parents(&orch).await,
+        0
+    );
+    assert_eq!(successor_count(&orch).await, 1);
+}
+
+/// A process still registered under a run whose row has closed is never
+/// reused: the next turn would run on a run nothing can stop or settle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_under_a_closed_run_is_stopped_rather_than_reused() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-closed-reuse.db").await;
+    open_child_turn(&orch, &child, "run-child", "child-turn-1").await;
+    orch.db
+        .local
+        .execute_script(
+            "UPDATE turns SET state = 'complete', ended_at = 11 WHERE id = 'child-turn-1';
+             UPDATE runs SET status = 'exited' WHERE id = 'run-child';",
+        )
+        .await
+        .unwrap();
+    orch.process_state.transition_to_warm("run-child");
+
+    let resumed = child.clone();
+    on_blocking_thread(&orch, move |orch| {
+        // The fresh launch may fail here (the fixture has no provider
+        // account); what matters is that it is not a reuse.
+        let _ =
+            crate::execution::jobs::continue_job_impl(orch, &resumed, Some("carry on"), None, None);
+    })
+    .await;
+
+    assert_eq!(
+        orch.process_state.has_process("run-child"),
+        Some(false),
+        "the drifted process is stopped"
+    );
+    assert_eq!(
+        count(
+            &orch,
+            &format!(
+                "SELECT COUNT(*) FROM turns WHERE job_id = '{child}' AND run_id = 'run-child' \
+                 AND id != 'child-turn-1'"
+            ),
+        )
+        .await,
+        0,
+        "no turn starts on the closed run"
+    );
+}
+
+fn codex_goal(status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "result": { "goal": {
+            "threadId": "thread-child",
+            "objective": "map the fleet",
+            "status": status,
+            "tokenBudget": null,
+            "tokensUsed": 0,
+            "timeUsedSeconds": 0,
+            "createdAt": 1,
+            "updatedAt": 2
+        }}
+    })
+}
+
+/// Place the parked task on a live Codex run serving its first turn.
+async fn open_codex_child_turn(orch: &Orchestrator, child: &str) {
+    let child_owned = child.to_string();
+    orch.db
+        .local
+        .write(move |conn| {
+            let child = child_owned.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+                     VALUES('session-child',?1,'codex','thread-child','open',1,2,2)",
+                    params![child.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs(id,job_id,issue_id,project_id,session_id,status,start_mode,created_at,updated_at)
+                     VALUES('run-child',?1,'i','p','session-child','live','fresh',10,10)",
+                    params![child.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,started_at,updated_at)
+                     VALUES('child-turn-1','session-child','run-child',?1,1,'running','initial',10,10,10)",
+                    params![child.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "UPDATE jobs SET status='running', started_at=10, current_turn_id='child-turn-1',
+                         current_session_id='session-child', model='gpt-5.6-sol' WHERE id=?1",
+                    params![child.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    // Goal reconciliation at each turn end talks to the provider; any status
+    // reply satisfies it, and the provider's own turns are admitted below.
+    let (stdin, _requests, _provider_turn) = crate::backends::codex::scripted_owned_goal_stdin_for_test(
+        "thread-child",
+        "provider-child-1",
+        (0..32).map(|_| Ok(codex_goal("active"))).collect(),
+    );
+    let mut handle = RunHandle::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Some(stdin))),
+        Some("session-child".into()),
+        Some(child.to_string()),
+    );
+    handle.backend = Some("codex".into());
+    handle.model = Some("gpt-5.6-sol".into());
+    handle.begin_turn("child-turn-1");
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run-child".into(), handle);
+    orch.process_state
+        .set_current_turn_id("run-child", Some("child-turn-1"));
+}
+
+async fn complete_codex_child_turn(orch: &Orchestrator) {
+    on_blocking_thread(orch, |orch| {
+        crate::orchestrator::lifecycle::apply_codex_turn_completion(
+            orch,
+            &orch.db.local,
+            &orch.services.emitter,
+            "run-child",
+            Some("session-child"),
+            crate::agent_process::completion::SessionTurnCompletion {
+                outcome: crate::agent_process::completion::SessionTurnOutcome::Completed,
+                usage: crate::agent_process::stream::TokenCounts::default(),
+                session_lifetime: crate::agent_process::completion::SessionLifetime::Persistent,
+            },
+            cairn_session::agent_process::completion::CodexTurnContext {
+                failure_disposition:
+                    cairn_session::agent_process::completion::TurnFailureDisposition::Unhandled,
+            },
+        );
+    })
+    .await;
+}
+
+/// The provider starts its next turn on the task's process, as a native goal
+/// continuation does, through the same admission the session reader calls.
+async fn admit_codex_child_turn(orch: &Orchestrator, child: &str, provider_turn: &str) -> String {
+    let (child, provider_turn) = (child.to_string(), provider_turn.to_string());
+    let orch = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        let admission = crate::execution::jobs::admit_codex_goal_turn(
+            &orch,
+            orch.db.local.clone(),
+            "run-child",
+            "session-child",
+            &child,
+            &provider_turn,
+            orch.process_state.get_current_turn_id("run-child").as_deref(),
+        )
+        .expect("a provider turn on the task's live run is admitted");
+        let crate::execution::jobs::CodexGoalTurnAdmission::Admitted(turn_id) = admission else {
+            panic!("the provider turn was deferred: {admission:?}");
+        };
+        assert!(orch.process_state.begin_turn("run-child", &turn_id));
+        orch.process_state
+            .set_current_turn_id("run-child", Some(&turn_id));
+        turn_id
+    })
+    .await
+    .unwrap()
+}
+
+/// cairn/6071 comments #2 and #3: a Codex task takes several turns on one
+/// process. Every one of them runs on a live run, a stop resolves to that run
+/// while a turn is active, and the turn that returns settles the task and
+/// resumes its parent, while the run outlives it, warm and holding no slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_task_turns_all_run_on_a_live_run_and_the_returning_one_settles_it() {
+    let (orch, child, _requests) = spawn_and_park("return-followup-codex-turns.db").await;
+    // The task waits on a grandchild of its own, so its early turn ends owe no
+    // `return` yet and its later turns are the provider's own continuations.
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO jobs(id,parent_job_id,project_id,issue_id,status,created_at,updated_at)
+             VALUES('j-grandchild',?1,'p','i','running',5,5)",
+            params![child.clone()],
+        )
+        .await
+        .unwrap();
+    open_codex_child_turn(&orch, &child).await;
+    let stoppable = |orch: &Orchestrator, child: &str| {
+        crate::orchestrator::lifecycle::live_run_id_for_job(orch, child)
+    };
+
+    let mut turns = vec!["child-turn-1".to_string()];
+    for provider_turn in ["provider-follow-up", "provider-after-grandchild"] {
+        assert_eq!(stoppable(&orch, &child).as_deref(), Some("run-child"));
+        complete_codex_child_turn(&orch).await;
+        assert_eq!(run_status(&orch, "run-child").await, "live");
+        assert!(orch.process_state.is_warm("run-child"));
+        if provider_turn == "provider-after-grandchild" {
+            orch.db
+                .local
+                .execute("UPDATE jobs SET status = 'complete' WHERE id = 'j-grandchild'", ())
+                .await
+                .unwrap();
+        }
+        turns.push(admit_codex_child_turn(&orch, &child, provider_turn).await);
+        assert_eq!(
+            text(
+                &orch,
+                &format!(
+                    "SELECT run_id FROM turns WHERE id = '{}'",
+                    turns.last().unwrap()
+                )
+            )
+            .await
+            .as_deref(),
+            Some("run-child")
+        );
+        assert_eq!(run_status(&orch, "run-child").await, "live");
+    }
+    assert_eq!(reprompts(&orch, &child).await, 0);
+    assert_eq!(successor_count(&orch).await, 0);
+
+    assert_eq!(stoppable(&orch, &child).as_deref(), Some("run-child"));
+    write_return(&orch, &child, RETURNED).await;
+    complete_codex_child_turn(&orch).await;
+
+    assert_eq!(job_status(&orch, &child).await, "complete");
+    await_successor(&orch).await;
+    assert_eq!(successor_count(&orch).await, 1);
+    let delivered = delivered_tool_result(&orch)
+        .await
+        .expect("the parent receives the Codex task's result");
+    assert!(delivered.contains(RETURNED), "{delivered}");
+    for turn in &turns {
+        assert_eq!(
+            text(&orch, &format!("SELECT state FROM turns WHERE id = '{turn}'"))
+                .await
+                .as_deref(),
+            Some("complete"),
+            "turn {turn} settled"
+        );
+    }
+    assert_eq!(run_status(&orch, "run-child").await, "live");
+    assert!(orch.process_state.is_warm("run-child"));
+    assert_eq!(fleet_slots_held(&orch, &child).await, 0);
+}
+
+/// The resume gate groups siblings by blocking-ness: a finished background
+/// packet at the same anchor is neither the child the heal resumes through
+/// (a Repair resume through it returns at once) nor, while still running,
+/// a reason to leave the blocking wait parked.
+#[tokio::test(flavor = "multi_thread")]
+async fn heal_parked_parents_looks_past_background_siblings_at_the_anchor() {
+    for background_finished in [true, false] {
+        let (orch, child, _requests) = spawn_and_park(&format!(
+            "return-followup-heal-background-{background_finished}.db"
+        ))
+        .await;
+        // A background sibling at the same anchor whose id sorts first.
+        orch.db
+            .local
+            .execute_script(&format!(
+                "INSERT INTO jobs(id,parent_job_id,project_id,issue_id,execution_id,status,created_at,updated_at)
+                   SELECT '0-background', parent_job_id, project_id, issue_id, execution_id, '{}', 5, 5
+                   FROM jobs WHERE id = '{child}';
+                 INSERT INTO delegated_packets(execution_id,id,seq,parent_job_id,parent_turn_id,result_artifact_job_id,status,spec,created_at)
+                   SELECT execution_id, 'packet-background', seq + 1, parent_job_id, parent_turn_id, '0-background',
+                          'running', json_set(spec, '$.background', json('true')), created_at
+                   FROM delegated_packets WHERE result_artifact_job_id = '{child}';",
+                if background_finished { "complete" } else { "running" }
+            ))
+            .await
+            .unwrap();
+        write_return(&orch, &child, RETURNED).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET status = 'complete' WHERE id = ?1",
+                params![child.clone()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::execution::advancement::heal_parked_parents(&orch).await,
+            1,
+            "background finished: {background_finished}"
+        );
+        await_successor(&orch).await;
+        let delivered = delivered_tool_result(&orch)
+            .await
+            .expect("the blocking wait is released");
+        assert!(delivered.contains(RETURNED), "{delivered}");
+    }
 }

@@ -535,6 +535,14 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "bounded by command-key cardinality; samples capped in the row",
     ),
     keep(
+        "suite_memory_evidence",
+        "bounded by suite and machine-context cardinality; one high-water row each",
+    ),
+    keep(
+        "resident_kills_learned",
+        "pruned to two days of out-of-memory kills as rows are added",
+    ),
+    keep(
         "command_duration_profiles",
         "bounded by command-key cardinality; samples capped in the row",
     ),

@@ -110,6 +110,23 @@ impl JobStatusChange {
         self.cause == ChangeCause::Derived
     }
 
+    /// How a parent parked on this job should hear of it, when this change
+    /// settles a child terminally. A settlement onto a resolved issue wakes
+    /// nobody: the parent's issue is settling in the same sweep.
+    pub fn parent_resume(&self) -> Option<crate::runtime::ParentResume> {
+        self.parent_job_id.as_ref()?;
+        if !self.to.is_terminal() {
+            return None;
+        }
+        match self.cause {
+            ChangeCause::Derived | ChangeCause::InheritedFailure => {
+                Some(crate::runtime::ParentResume::Live)
+            }
+            ChangeCause::Repaired => Some(crate::runtime::ParentResume::Repair),
+            ChangeCause::IssueResolved => None,
+        }
+    }
+
     /// JobEnded fires for a top-level job reaching a terminal status.
     /// Delegated children stay silent because they have a parent job.
     pub fn fires_job_ended(&self) -> bool {
@@ -2073,7 +2090,10 @@ pub async fn heal_stuck_delegated_children(runtime: &WorkflowRuntime) {
         match reduce_delegated_child_job(runtime, &job_id) {
             Ok(Some(status)) => {
                 healed += 1;
-                if let Err(e) = runtime.host.resume_parent(&job_id) {
+                if let Err(e) = runtime
+                    .host
+                    .resume_parent(&job_id, crate::runtime::ParentResume::Live)
+                {
                     log::warn!(
                         "heal: resume after terminalizing stuck child {job_id} as {status} failed: {e}"
                     );
@@ -2086,6 +2106,71 @@ pub async fn heal_stuck_delegated_children(runtime: &WorkflowRuntime) {
     if healed > 0 {
         log::info!("Healed {healed} stuck node-less delegated child job(s) on startup");
     }
+}
+
+/// Release parents left parked on delegated children that have all finished.
+///
+/// The backstop for every resume edge: a parent whose head turn is yielded on
+/// `dependency_wait`, whose blocking packets of one origin anchored to that turn
+/// all name a child job that is terminal, has nothing left to wait for, yet a parked parent declines
+/// steering, so nothing else can wake it. Each is resumed in Repair mode
+/// through one of its children; the resume's sibling gate and exact-anchor
+/// claim make a repeat, or a race with a live resume, deliver once. Fans out
+/// over every open database. Returns how many parents it asked to resume.
+pub async fn heal_parked_parents(runtime: &WorkflowRuntime) -> usize {
+    let mut parked: Vec<(String, String)> = Vec::new();
+    for db in runtime.host.databases().await {
+        let scan = db
+            .read(|conn| {
+                Box::pin(async move {
+                    // Grouped as the resume gate groups siblings: the parent,
+                    // its anchor, and the packet's origin, over blocking
+                    // packets only. A background packet shares the anchor but
+                    // nobody is parked on it, and a Repair resume through one
+                    // returns at once, so it must be neither chosen nor waited on.
+                    let mut rows = conn
+                        .query(
+                            "SELECT pj.id, MIN(p.result_artifact_job_id)
+                             FROM jobs pj
+                             JOIN turns pt ON pt.id = pj.current_turn_id
+                             JOIN delegated_packets p
+                               ON p.execution_id = pj.execution_id
+                              AND p.parent_job_id = pj.id AND p.parent_turn_id = pt.id
+                             LEFT JOIN jobs cj ON cj.id = p.result_artifact_job_id
+                             WHERE pj.status IN ('pending', 'running', 'blocked', 'idle')
+                               AND pt.state = 'yielded' AND pt.yield_reason = 'dependency_wait'
+                               AND COALESCE(json_extract(p.spec, '$.background'), 0) = 0
+                             GROUP BY pj.id, json_extract(p.spec, '$.origin')
+                             HAVING SUM(CASE WHEN cj.status IN ('complete', 'failed', 'cancelled')
+                                             THEN 0 ELSE 1 END) = 0",
+                            (),
+                        )
+                        .await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push((row.text(0)?, row.text(1)?));
+                    }
+                    Ok(out)
+                })
+            })
+            .await;
+        match scan {
+            Ok(mut found) => parked.append(&mut found),
+            Err(error) => log::warn!("heal_parked_parents: candidate scan failed: {error}"),
+        }
+    }
+    for (parent_job_id, child_job_id) in &parked {
+        log::info!(
+            "Parent {parent_job_id} is parked on delegated children that have all finished; resuming it through {child_job_id}"
+        );
+        if let Err(error) = runtime
+            .host
+            .resume_parent(child_job_id, crate::runtime::ParentResume::Repair)
+        {
+            log::warn!("heal: resume of parked parent {parent_job_id} failed: {error}");
+        }
+    }
+    parked.len()
 }
 
 /// Settle only canonical, started work with positively impossible pending
@@ -2283,6 +2368,11 @@ pub(super) fn publish_recompute_outcome(
     }
 
     runtime.host.projection_changed(execution_id, &outcome);
+    for change in &outcome.changes {
+        if let Some(mode) = change.parent_resume() {
+            dispatch_parent_resume(runtime, &change.job_id, mode);
+        }
+    }
     let advance = outcome
         .changes
         .iter()
@@ -2303,6 +2393,32 @@ pub(super) fn publish_recompute_outcome(
     }
 
     Ok(outcome.changes)
+}
+
+/// Wake the parent of a delegated child this sweep settled, on its own thread.
+///
+/// Every settlement passes through here, not only the turn ends that also
+/// resume explicitly: a boot reproject, a stranded-job repair, a sweep. Off the
+/// caller's thread because the resume may launch the parent's next turn, and a
+/// recompute can run under locks that launch would also take. The resume's
+/// anchor claim makes a race with an explicit resume deliver once.
+fn dispatch_parent_resume(
+    runtime: &WorkflowRuntime,
+    job_id: &str,
+    mode: crate::runtime::ParentResume,
+) {
+    let runtime = runtime.clone();
+    let thread_job_id = job_id.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("settled-child-resume".to_string())
+        .spawn(move || {
+            if let Err(error) = runtime.host.resume_parent(&thread_job_id, mode) {
+                log::warn!("Failed to resume the parent of settled job {thread_job_id}: {error}");
+            }
+        });
+    if let Err(error) = spawned {
+        log::error!("Could not resume the parent of settled job {job_id}: {error}");
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]

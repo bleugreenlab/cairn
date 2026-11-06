@@ -917,6 +917,8 @@ pub struct AgentProcessState {
     /// moves into RunHandle at registration, so warm reuse cannot acquire or
     /// attach a second claim.
     pending_admission_claims: Mutex<HashMap<String, ProcessAdmissionClaim>>,
+    /// Who to tell, per run, that the gateway is serving one of its tool calls.
+    pub host_calls: super::host_calls::HostCallWitnesses,
 }
 
 impl AgentProcessState {
@@ -1796,6 +1798,7 @@ impl Default for AgentProcessState {
             workflow_stop_requested: Mutex::new(std::collections::HashSet::new()),
             workflow_leases: Mutex::new(std::collections::HashMap::new()),
             pending_admission_claims: Mutex::new(HashMap::new()),
+            host_calls: Default::default(),
         }
     }
 }

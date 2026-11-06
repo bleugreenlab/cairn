@@ -173,11 +173,45 @@ pub fn signal_verified(
     })
 }
 
-/// Whether any process is still a member of `process_group_id`.
+/// Whether the group may still contain a live process. Uncertainty counts as alive.
+/// Linux retains its signal-probe contract, including zombie thread-group leaders.
 #[cfg(unix)]
 pub fn process_group_is_alive(process_group_id: u32) -> bool {
-    let probed = unsafe { libc::kill(-(process_group_id as libc::pid_t), 0) };
-    probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin returns EPERM, not ESRCH, for a zombie-only group. EPERM can
+        // also mean a live member we may not signal, so inspect members instead.
+        if unsafe { libc::kill(-(process_group_id as libc::pid_t), 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return false;
+        }
+        let mut census = cairn_procmem::Census::default();
+        let complete = cairn_procmem::platform::census_process_group(process_group_id, &mut census);
+        group_may_be_live_in_census(process_group_id, complete, &census)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let probed = unsafe { libc::kill(-(process_group_id as libc::pid_t), 0) };
+        probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn group_may_be_live_in_census(
+    process_group_id: u32,
+    complete: bool,
+    census: &cairn_procmem::Census,
+) -> bool {
+    // An unreadable PID could belong to this group; absence from rows proves
+    // nothing unless every enumerated identity could be read.
+    !complete
+        || census.enumeration_incomplete
+        || !census.unreadable.is_empty()
+        || census
+            .rows
+            .iter()
+            .any(|row| row.process.process_group_id == process_group_id)
 }
 
 /// What the kernel says a process's threads are doing: what a pid's presence
@@ -579,6 +613,34 @@ mod windows_presence_tests {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_census_gaps_never_prove_absence() {
+        let mut census = cairn_procmem::Census::default();
+        assert!(!group_may_be_live_in_census(42, true, &census));
+        assert!(group_may_be_live_in_census(42, false, &census));
+        census.enumeration_incomplete = true;
+        assert!(group_may_be_live_in_census(42, true, &census));
+        census.enumeration_incomplete = false;
+        census.unreadable.push(123);
+        assert!(group_may_be_live_in_census(42, true, &census));
+        census.unreadable.clear();
+        census.rows.push(cairn_procmem::CensusRow {
+            process: cairn_procmem::KernelProcess {
+                pid: 123,
+                parent_pid: 1,
+                process_group_id: 42,
+                session_id: None,
+                start: cairn_procmem::StartKey(1, 0),
+            },
+            resident_bytes: None,
+            cpu_ms: None,
+            uninterruptible: false,
+            storage_io_bytes: None,
+        });
+        assert!(group_may_be_live_in_census(42, true, &census));
+        assert!(!group_may_be_live_in_census(43, true, &census));
+    }
 
     #[test]
     fn the_running_process_is_present_under_its_own_token() {

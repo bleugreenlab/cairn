@@ -228,6 +228,7 @@ mod tests {
             finished_at_unix_ms: started + duration_ms,
             duration_ms,
             peak_rss_bytes: None,
+            peak_process: None,
             cpu: cpu_ms.map(CpuTime::sampled),
             granted_units: None,
             build_jobs: None,

@@ -25,6 +25,6 @@ pub use cairn_workflow::advancement::{
     RemovedNodesReconcile, RestartNodeOutcome,
 };
 pub use recompute::{
-    heal_stuck_delegated_children, recompute_execution_jobs, recompute_job,
+    heal_parked_parents, heal_stuck_delegated_children, recompute_execution_jobs, recompute_job,
     reduce_delegated_child_job, settle_stranded_jobs,
 };

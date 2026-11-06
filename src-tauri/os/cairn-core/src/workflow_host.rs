@@ -10,7 +10,9 @@ use cairn_workflow::{
     advancement::RecomputeOutcome,
     conditions::ExecutedCheckpoint,
     effects::types::{EffectResult, JobEvent, WorkflowEffect},
-    runtime::{DecisionRequest, WorkflowHost, WorkflowOwner, WorkflowRuntime, Workload},
+    runtime::{
+        DecisionRequest, ParentResume, WorkflowHost, WorkflowOwner, WorkflowRuntime, Workload,
+    },
 };
 use std::{collections::HashSet, path::Path, sync::Arc};
 
@@ -173,9 +175,17 @@ impl WorkflowHost for CoreWorkflowHost {
         crate::execution::jobs::continue_job_impl(&self.0, job_id, Some(message), None, None)
             .map(|_| ())
     }
-    fn resume_parent(&self, job_id: &str) -> Result<(), String> {
-        crate::execution::delegation::resume_suspended_parent_after_task_completion(&self.0, job_id)
-            .map(|_| ())
+    fn resume_parent(&self, job_id: &str, mode: ParentResume) -> Result<(), String> {
+        match mode {
+            ParentResume::Live => {
+                crate::execution::delegation::resume_suspended_parent_after_task_completion(
+                    &self.0, job_id,
+                )
+            }
+            ParentResume::Repair => {
+                crate::execution::delegation::resume_parked_parent_after_repair(&self.0, job_id)
+            }
+        }
     }
     fn run_error(&self, run_id: &str, error: &str) {
         crate::orchestrator::session::insert_error_event(&self.0, run_id, None, error);

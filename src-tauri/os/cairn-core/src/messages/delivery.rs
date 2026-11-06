@@ -1295,10 +1295,8 @@ fn nudge(
     }
 
     if urgency == DeliveryUrgency::Interrupt && head_active {
-        let run_id = live_run_id.ok_or_else(|| {
-            "the active turn has not attached to a stoppable run yet; retry interrupt shortly"
-                .to_string()
-        })?;
+        let run_id =
+            live_run_id.ok_or_else(|| "no live process holds the active turn".to_string())?;
         crate::orchestrator::lifecycle::stop_session(orch, &run_id)?;
 
         // The backend abort acknowledgement remains the fast path, but it is not
@@ -1873,7 +1871,10 @@ mod tests {
         let error =
             nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &escalation())
                 .expect_err("a running turn with no stoppable run cannot be interrupted");
-        assert!(error.contains("stoppable run"), "{error}");
+        assert!(
+            error.contains("no live process holds the active turn"),
+            "{error}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

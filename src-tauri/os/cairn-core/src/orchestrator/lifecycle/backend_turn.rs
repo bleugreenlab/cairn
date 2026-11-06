@@ -7,7 +7,6 @@ use crate::agent_process::completion::{
 use crate::backends::codex::{
     emit_codex_run_turn_completed, store_usage_result_event, terminal_tool_called_for_run,
 };
-use crate::backends::is_task_spawned_run;
 use crate::models::RunStatus;
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
@@ -55,14 +54,11 @@ pub(crate) fn apply_codex_turn_completion(
                 return;
             }
 
-            let is_task = is_task_spawned_run("Codex", run_db, run_id);
-            if is_task {
-                super::finalize_run(orch, run_id, RunStatus::Exited);
-                orch.process_state.transition_to_warm(run_id);
-            } else {
-                super::transition_to_warm_state(orch, run_id, None);
-                emit_codex_run_turn_completed(emitter, run_id);
-            }
+            // A delegated task's persistent session keeps its run live across
+            // turns, exactly like a top-level run: the re-prompt, follow-up and
+            // wait-resolved turns it takes next all start on this run.
+            super::transition_to_warm_state(orch, run_id, None);
+            emit_codex_run_turn_completed(emitter, run_id);
         }
         SessionTurnOutcome::Interrupted => {
             store_usage_result_event(
@@ -76,7 +72,7 @@ pub(crate) fn apply_codex_turn_completion(
                 completion.usage,
                 false,
             );
-            handle_codex_interrupted_turn(orch, run_db, emitter, run_id);
+            handle_codex_interrupted_turn(orch, emitter, run_id);
         }
         SessionTurnOutcome::Failed { status } => {
             store_usage_result_event(
@@ -124,43 +120,21 @@ pub(crate) fn apply_codex_turn_completion(
     }
 }
 
-fn should_finalize_task_run_on_interrupted_turn(
-    terminal_tool_called: bool,
-    is_task_spawned: bool,
-) -> bool {
-    terminal_tool_called && is_task_spawned
-}
-
+/// An interrupted Codex turn ends warm. One interrupted after a terminal tool
+/// (a task's `return`) handed its work off, so it completes as such; the run
+/// stays live either way.
 fn handle_codex_interrupted_turn(
     orch: &Orchestrator,
-    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
 ) {
     let terminal_tool_called = terminal_tool_called_for_run(orch, run_id);
-    if should_finalize_task_run_on_interrupted_turn(
-        terminal_tool_called,
-        is_task_spawned_run("Codex", run_db, run_id),
-    ) {
-        log::info!(
-            "codex interrupted after terminal tool for task-spawned run {}; finalizing as completed",
-            &run_id[..run_id.len().min(8)]
-        );
-        super::transition_to_warm_state(
-            orch,
-            run_id,
-            Some(crate::models::TurnEndReason::ArtifactHandoff),
-        );
-        super::finalize_run(orch, run_id, RunStatus::Exited);
-        orch.process_state.transition_to_warm(run_id);
-    } else {
-        super::transition_to_warm_state(
-            orch,
-            run_id,
-            terminal_tool_called.then_some(crate::models::TurnEndReason::ArtifactHandoff),
-        );
-        emit_codex_run_turn_completed(emitter, run_id);
-    }
+    super::transition_to_warm_state(
+        orch,
+        run_id,
+        terminal_tool_called.then_some(crate::models::TurnEndReason::ArtifactHandoff),
+    );
+    emit_codex_run_turn_completed(emitter, run_id);
 }
 
 mod claude;

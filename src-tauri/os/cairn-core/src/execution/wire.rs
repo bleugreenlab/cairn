@@ -21,21 +21,24 @@ pub(crate) enum CheckResourceIdentityInput {
 }
 
 fn resource_identity(input: &CheckResourceIdentityInput) -> CommandResourceIdentity {
-    let key = match input {
+    let (key, name) = match input {
         CheckResourceIdentityInput::Configured { name, check } => {
-            configured_check_resource_key(name, check)
+            (configured_check_resource_key(name, check), name)
         }
         CheckResourceIdentityInput::Checkpoint { name, command } => {
             let mut hasher = Sha256::new();
             hasher.update(name.as_bytes());
             hasher.update([0]);
             hasher.update(command.as_bytes());
-            format!("{:x}", hasher.finalize())
+            (format!("{:x}", hasher.finalize()), name)
         }
     };
     CommandResourceIdentity {
         version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
         key,
+        // The check's name outlives any one configuration of it, so the
+        // runner learns the suite's largest process under it.
+        suite: Some(name.clone()).filter(|name| !name.is_empty()),
     }
 }
 

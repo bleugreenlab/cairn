@@ -332,6 +332,7 @@ mod tests {
         CommandResourceIdentity {
             version: 1,
             key: "rust-tests".into(),
+            suite: None,
         }
     }
 
@@ -532,6 +533,7 @@ mod tests {
         let other = CommandResourceIdentity {
             version: 1,
             key: "frontend-tests".into(),
+            suite: None,
         };
         for identity in [identity(), other.clone()] {
             for offset in 0..2 {

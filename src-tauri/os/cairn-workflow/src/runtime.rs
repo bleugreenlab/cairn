@@ -51,6 +51,16 @@ pub struct DecisionRequest {
     pub input: String,
 }
 
+/// How a parent parked on a delegated child that just settled is told so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentResume {
+    /// The child's own facts settled it: deliver its result as it stands.
+    Live,
+    /// A boot repair settled a child that finished earlier: lead with a
+    /// delayed-delivery notice, and push nothing to a spawner that never parked.
+    Repair,
+}
+
 /// Application operations supplied to the workflow engine.
 ///
 /// Implementations route entity IDs, run external workloads and publish workflow
@@ -90,7 +100,9 @@ pub trait WorkflowHost: Send + Sync {
         outcome: ConditionOutcome,
     );
     fn continue_job(&self, job_id: &str, message: &str) -> Result<(), String>;
-    fn resume_parent(&self, job_id: &str) -> Result<(), String>;
+    /// Wake the parent parked on `job_id`, if it is a delegated child whose
+    /// batch is now terminal. Self-gating and delivered at most once.
+    fn resume_parent(&self, job_id: &str, mode: ParentResume) -> Result<(), String>;
     fn run_error(&self, run_id: &str, error: &str);
     async fn checkpoint(
         &self,

@@ -1,6 +1,7 @@
 //! Session process mechanics and provider protocols.
 pub mod completion;
 pub mod gc;
+pub mod host_calls;
 pub mod memory;
 pub mod orphan;
 pub mod process;

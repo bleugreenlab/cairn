@@ -44,10 +44,17 @@ pub fn reduce_delegated_child_job(
 /// candidate discovery has to fan out across databases. Errors are logged, never
 /// fatal.
 pub async fn heal_stuck_delegated_children(orch: &Orchestrator) {
-    cairn_workflow::advancement::recompute::heal_stuck_delegated_children(
-        &crate::workflow_host::runtime(orch),
-    )
-    .await
+    let runtime = crate::workflow_host::runtime(orch);
+    cairn_workflow::advancement::recompute::heal_stuck_delegated_children(&runtime).await;
+    // Then any parent still parked on children that all finished, whichever
+    // edge failed to wake it.
+    heal_parked_parents(orch).await;
+}
+
+/// [`cairn_workflow::advancement::heal_parked_parents`] for this host. Runs at
+/// startup and on every process sweep.
+pub async fn heal_parked_parents(orch: &Orchestrator) -> usize {
+    cairn_workflow::advancement::heal_parked_parents(&crate::workflow_host::runtime(orch)).await
 }
 
 /// The single entry point every former decider calls: run the execution sweep in

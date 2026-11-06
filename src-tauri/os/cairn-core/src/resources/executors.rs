@@ -1352,10 +1352,26 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             render_io_pressure
         )
     ));
+    if let Some(standing) = health.memory_record.standing_bytes {
+        out.push_str(&format!(
+            "- Standing memory use: {} (the most over the last {} that was neither Cairn's work nor the executor); one process can have {} here\n",
+            bytes(standing),
+            duration_words(health.memory_record.standing_window_ms),
+            machine
+                .memory
+                .value()
+                .map(|memory| bytes(memory.total_bytes.saturating_sub(standing)))
+                .unwrap_or_else(|| "an unknown amount".into())
+        ));
+    }
     out.push_str(
         "- Kernel I/O timeouts: not measured; the kernel log is their only source, and whether it is readable varies by host\n",
     );
     out.push('\n');
+    out.push_str(&render_oom_kills(
+        &health.memory_record,
+        executor.captured_at_unix_ms,
+    ));
 
     out.push_str(&render_gpus(
         &health.host.gpus,
@@ -4060,6 +4076,73 @@ fn slot_project_name(cell: &cairn_common::executor_protocol::PersistentCellState
         .find(|parts| parts[0] == "build-slots" && parts[1] != ".authority")
         .map(|parts| parts[1].to_string())
         .unwrap_or_else(|| "name unavailable".into())
+}
+
+/// How far back the page lists out-of-memory kills.
+const OOM_KILLS_SHOWN_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// A span in the coarsest unit that keeps it readable.
+fn duration_words(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    match minutes {
+        0 => format!("{}s", ms / 1_000),
+        1..60 => format!("{minutes}m"),
+        _ => format!("{}h {}m", minutes / 60, minutes % 60),
+    }
+}
+
+/// The out-of-memory kills this machine saw: one line per kill the executor
+/// attributed in the last day, under a line that says how many the kernel made
+/// and how many Cairn could not attribute, so an unnamed kill still shows.
+/// Said only when the kernel has killed something.
+fn render_oom_kills(
+    record: &cairn_common::executor_protocol::MemoryRecord,
+    captured_at_unix_ms: u64,
+) -> String {
+    let recent: Vec<&cairn_common::executor_protocol::OomKillReport> = record
+        .oom_kills
+        .iter()
+        .filter(|kill| {
+            captured_at_unix_ms.saturating_sub(kill.killed_at_unix_ms) <= OOM_KILLS_SHOWN_MS
+        })
+        .collect();
+    let any = !recent.is_empty()
+        || record.unattributed_kills > 0
+        || record.cgroup_oom_kills.is_some_and(|count| count > 0)
+        || record.machine_oom_kills.is_some_and(|count| count > 0);
+    if !any {
+        return String::new();
+    }
+    let mut summary: Vec<String> = Vec::new();
+    if let Some(machine) = record.machine_oom_kills {
+        summary.push(format!("the kernel killed {machine} processes since boot"));
+    }
+    if let Some(cgroup) = record.cgroup_oom_kills {
+        summary.push(format!(
+            "{cgroup} in Cairn's cgroup since the executor service started"
+        ));
+    }
+    summary.push(format!("{} attributed in the last 24 h", recent.len()));
+    if record.unattributed_kills > 0 {
+        summary.push(format!(
+            "{} counted but not attributed since the executor started",
+            record.unattributed_kills
+        ));
+    }
+    if let Some(method) = &record.attribution {
+        summary.push(format!("victims chosen by {method}"));
+    }
+    let mut out = String::from("## Out-of-memory kills (24 h)\n");
+    out.push_str(&format!("- {}\n", summary.join("; ")));
+    for kill in recent.iter().rev() {
+        out.push_str(&format!(
+            "- {}: {}\n",
+            age(captured_at_unix_ms.saturating_sub(kill.killed_at_unix_ms)),
+            kill.describe()
+        ));
+    }
+    out.push('\n');
+    out
 }
 
 /// The commands this machine ended, and what each teardown left alive.
@@ -7380,6 +7463,7 @@ mod tests {
                 quarantines: None,
                 build_skew: None,
                 stopped_commands: Vec::new(),
+                memory_record: Default::default(),
             },
             executor_build_id: Some("build-abc".into()),
             last_update: None,
@@ -10299,6 +10383,65 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("STILL RUNNING: pids 4133"), "{rendered}");
+    }
+
+    /// bgsrv-ub on 11-04: the kernel killed rustc three times and the page
+    /// said nothing. Each attributed kill is a line with its process, size
+    /// and owner, and the counts say how many went unnamed.
+    #[test]
+    fn an_out_of_memory_kill_is_a_line_on_the_page() {
+        use cairn_common::executor_protocol::{LiveUsageSubject, MemoryRecord, OomKillReport};
+        assert!(
+            render_oom_kills(&MemoryRecord::default(), CAPTURED_AT).is_empty(),
+            "a machine that killed nothing says nothing"
+        );
+        let record = MemoryRecord {
+            standing_bytes: Some(2_900_000_000),
+            standing_window_ms: 3_600_000,
+            oom_kills: vec![OomKillReport {
+                killed_at_unix_ms: CAPTURED_AT - 120_000,
+                pid: 2_597_426,
+                process_name: Some("rustc".into()),
+                footprint_bytes: Some(10_583_000_000),
+                owner: Some(LiveUsageSubject::Resident {
+                    cell_id: "slot-126".into(),
+                    process_key: "diagnostic-tests".into(),
+                    generation: 1,
+                }),
+                project_id: None,
+                command_class: None,
+            }],
+            unattributed_kills: 2,
+            cgroup_oom_kills: Some(3),
+            machine_oom_kills: Some(46),
+            attribution: Some("oom_score".into()),
+        };
+        let rendered = render_oom_kills(&record, CAPTURED_AT);
+        assert!(
+            rendered.starts_with("## Out-of-memory kills (24 h)\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- the kernel killed 46 processes since boot; 3 in Cairn's cgroup since the executor service started; 1 attributed in the last 24 h; 2 counted but not attributed since the executor started; victims chosen by oom_score"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- 2m ago: rustc (pid 2597426) at 9.9 GiB, resident diagnostic-tests in slot-126"
+            ),
+            "{rendered}"
+        );
+        let old = MemoryRecord {
+            oom_kills: vec![OomKillReport {
+                killed_at_unix_ms: 0,
+                ..record.oom_kills[0].clone()
+            }],
+            ..record
+        };
+        assert!(
+            !render_oom_kills(&old, CAPTURED_AT + OOM_KILLS_SHOWN_MS).contains("rustc"),
+            "a kill older than a day is counted, not listed"
+        );
     }
 
     #[test]

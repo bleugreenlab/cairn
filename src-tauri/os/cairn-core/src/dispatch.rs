@@ -89,6 +89,16 @@ pub async fn dispatch_tool(
     let resolved = resolve_pooled_thread_request(orch, request);
     let request = resolved.as_ref().unwrap_or(request);
 
+    // The provider is waiting on this call whether or not its own event stream
+    // announced one (a Codex functions.exec cell does not), so the run's
+    // supervisor hears from the host itself, on the pool-resolved run, until
+    // this function returns or its future is dropped.
+    let _serving = request.run_id.as_deref().and_then(|run_id| {
+        orch.process_state
+            .host_calls
+            .serve(run_id, request.tool_use_id.as_deref())
+    });
+
     // Ownership fence (CAIRN-3287). Fenced AFTER pooled resolution so a pooled
     // Codex call is judged on the run it actually belongs to, and BEFORE any
     // handler runs so a refusal costs no side effects.
@@ -1486,6 +1496,51 @@ mod tests {
         let mut reminders = Vec::new();
         augment_with_poll_nudge(orch, request, &mut reminders).await;
         reminders
+    }
+
+    #[derive(Default)]
+    struct RecordingWitness {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl cairn_session::agent_process::host_calls::HostCallWitness for RecordingWitness {
+        fn call_started(&self, call_id: &str) -> Option<String> {
+            self.events.lock().unwrap().push(format!("start {call_id}"));
+            Some("turn-1".into())
+        }
+        fn call_answered(&self, call_id: &str, scope: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("answer {call_id} in {scope}"));
+        }
+    }
+
+    /// A call the gateway serves is reported to the run's witness when it
+    /// starts and again when it answers, though no provider item announced it.
+    #[tokio::test]
+    async fn a_served_call_is_witnessed_from_start_to_answer() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        let witness = std::sync::Arc::new(RecordingWitness::default());
+        let other = std::sync::Arc::new(RecordingWitness::default());
+        orch.process_state
+            .host_calls
+            .register("run-1", std::sync::Arc::downgrade(&witness) as _);
+        orch.process_state
+            .host_calls
+            .register("run-2", std::sync::Arc::downgrade(&other) as _);
+        let mut request = terminal_read_request("run-1", serde_json::json!(["cairn:~/todos"]));
+        request.tool_use_id = Some("exec-9".into());
+
+        let cursors = std::sync::Mutex::new(std::collections::HashMap::new());
+        let _ = dispatch_tool(&orch, &request, &cursors).await;
+
+        let events = witness.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let call_id = events[0].strip_prefix("start ").expect("started first");
+        assert!(call_id.starts_with("exec-9#"), "{call_id}");
+        assert_eq!(events[1], format!("answer {call_id} in turn-1"));
+        assert!(other.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

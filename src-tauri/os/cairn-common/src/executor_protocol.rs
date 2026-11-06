@@ -6982,6 +6982,23 @@ pub struct LearnedResourceEstimate {
 /// changes; no frame, field or variant does. A runner talking to an older
 /// executor gets nothing wrong it did not already get: that executor keeps
 /// refusing resident starts after a cancelled bound batch until it is updated.
+///
+/// cairn/6159 does not move the number. Darwin group-exit verification uses a
+/// group-scoped live-process census rather than treating a zombie-only group's
+/// EPERM signal probe as proof of a survivor. No frame, field, or serialized
+/// meaning changes: a runner talking to an older executor still receives its
+/// existing cleanup failures, not a new or misinterpreted result.
+///
+/// cairn/6089 does not move the number. Every shape it adds is an omitted-when-
+/// absent field an older peer neither sends nor reads: [`PeakProcess`] on
+/// [`CellExecutionMeta`] and [`ProcessBatchItemOutcome`], `processName` on
+/// [`CommandStop::OomKilled`], [`MemoryRecord`] on the health snapshot, and
+/// `suite` on [`CommandResourceIdentity`], which only the runner mints and
+/// reads. [`PlacementRejectionReason::ProcessTooLarge`] is runner placement
+/// vocabulary under cairn/4931's argument: nothing the runner sends an
+/// executor carries it. What a runner gets wrong talking to an older executor:
+/// nothing; that executor contributes no process peak and no standing use, so
+/// its fit falls back to the reservation cap, which is no worse than before.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 165;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -8870,6 +8887,14 @@ pub const COMMAND_RESOURCE_IDENTITY_VERSION: u32 = 1;
 pub struct CommandResourceIdentity {
     pub version: u32,
     pub key: String,
+    /// The suite this identity belongs to: a configured check's name, which
+    /// stays the same while the identity changes with the check's
+    /// configuration. The runner learns a suite's largest single process
+    /// beside the identity's, so a never-seen identity of a known suite is not
+    /// judged as if nothing were known about it. `None` for an identity minted
+    /// without one; the runner then keys the suite by command class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -9733,6 +9758,10 @@ pub struct CellExecutionMeta {
     pub peak_rss_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_physical_footprint_bytes: Option<u64>,
+    /// The largest single process the command's tree held. See
+    /// [`PeakProcess`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_process: Option<PeakProcess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_delta_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9781,6 +9810,24 @@ pub struct CellExecutionMeta {
     /// one derivation, [`CellExecutionMeta::for_batch_item`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<CommandStop>,
+}
+
+/// The largest single process a command's tree held at any census, and what
+/// it was.
+///
+/// The number memory fit is judged on. A tree's total grows with the build
+/// width a machine grants, so it is elastic; one compiler's working set is
+/// not, and it is the thing a machine too small for the work cannot shrink.
+/// `bytes` is resident plus swapped where the platform reports swap per
+/// process (Linux), else resident alone, so a process the machine pushed into
+/// swap is still measured at its size.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PeakProcess {
+    pub bytes: u64,
+    /// The process's short name (`rustc`), when the executor read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// The width a command was granted and how that grant was applied on the
@@ -10097,6 +10144,7 @@ impl CellExecutionMeta {
         meta.finished_at_unix_ms = item.finished_at_unix_ms;
         meta.duration_ms = Some(item.duration_ms);
         meta.peak_rss_bytes = item.peak_rss_bytes;
+        meta.peak_process = item.peak_process.clone();
         meta.disk_delta_bytes = item.disk_delta_bytes;
         meta.environment_fingerprint = item.environment_fingerprint.clone();
         meta.cpu = item.cpu;
@@ -14847,6 +14895,9 @@ pub struct ExecutorSubstrateReport {
     /// by nothing but a restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stopped_commands: Vec<StoppedCommandReport>,
+    /// Standing memory use and the out-of-memory kills this executor saw.
+    #[serde(default, skip_serializing_if = "MemoryRecord::is_empty")]
+    pub memory_record: MemoryRecord,
     /// Shared repositories this executor currently holds to be faulty, one
     /// entry per repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -15255,6 +15306,8 @@ pub struct ExecutorHealthSnapshot {
     pub busy_declined_cells: Vec<BusyDeclinedCellReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stopped_commands: Vec<StoppedCommandReport>,
+    #[serde(default, skip_serializing_if = "MemoryRecord::is_empty")]
+    pub memory_record: MemoryRecord,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repository_faults: Vec<RepositoryFaultReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -17033,6 +17086,182 @@ impl MemoryKill {
     }
 }
 
+/// One process of a request's work does not fit what a machine can give a
+/// single process.
+///
+/// The demand is the largest single process the work's command identity or
+/// suite was measured holding, on any machine of the same platform, raised by
+/// any out-of-memory kill's victim, with the measured-reservation headroom.
+/// Unlike a process tree's total it does not grow with build width, so a
+/// borrowed measurement is as true on this machine as where it was taken; it
+/// is still called estimated unless it was taken here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessMisfit {
+    /// The demand, with headroom.
+    pub process_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// The suite whose evidence set the demand, when the suite's did rather
+    /// than the identity's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    /// The machine the deciding measurement was taken on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_on: Option<String>,
+    pub measured_here: bool,
+    /// What this machine can give one process.
+    pub capacity_bytes: u64,
+    pub total_bytes: u64,
+    /// The machine's standing use, when it posts one. `None` means the
+    /// capacity is the reservation cap instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_bytes: Option<u64>,
+    /// Kills of this suite on this machine at this total, when the count
+    /// rather than the size decided the misfit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kills_here: Option<u32>,
+}
+
+impl ProcessMisfit {
+    pub fn describe(&self) -> String {
+        let mut evidence: Vec<String> = Vec::new();
+        if let Some(name) = &self.process_name {
+            evidence.push(name.clone());
+        }
+        if let Some(suite) = &self.suite {
+            evidence.push(format!("suite {suite}"));
+        }
+        match (&self.measured_on, self.measured_here) {
+            (_, true) => evidence.push("measured here".into()),
+            (Some(machine), false) => {
+                evidence.push(format!("measured on {machine}; estimated here"))
+            }
+            (None, false) => evidence.push("estimated here".into()),
+        }
+        let capacity = match self.standing_bytes {
+            Some(standing) => format!(
+                "this machine can give one process {} ({} total, {} standing)",
+                describe_gib(self.capacity_bytes),
+                describe_gib(self.total_bytes),
+                describe_gib(standing)
+            ),
+            None => format!(
+                "this machine can give one process {} ({} total; its standing use is unmeasured, so this is its reservation cap)",
+                describe_gib(self.capacity_bytes),
+                describe_gib(self.total_bytes)
+            ),
+        };
+        let demand = format!(
+            "needs one process of ~{} ({})",
+            describe_gib(self.process_bytes),
+            evidence.join(", ")
+        );
+        match self.kills_here {
+            Some(kills) => format!(
+                "{demand}; the kernel killed it here for memory {kills} times on this {} machine, which is its answer until its memory changes",
+                describe_gib(self.total_bytes)
+            ),
+            None => format!("{demand}; {capacity}"),
+        }
+    }
+}
+
+/// What an executor posts about memory beyond the machine's instantaneous
+/// reading: what the machine holds for things other than Cairn's work, and the
+/// out-of-memory kills it has seen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecord {
+    /// The largest reading over the last hour of total memory less available
+    /// memory less what Cairn's process trees and the daemon held: the desktop,
+    /// services, a CI runner. `None` where the platform's `available` cannot be
+    /// stood behind (macOS, whose compressor it never sees) or until the first
+    /// reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_bytes: Option<u64>,
+    /// How long the readings behind `standing_bytes` span, up to an hour.
+    #[serde(default)]
+    pub standing_window_ms: u64,
+    /// Kills the executor attributed to a process of a tree it watched, most
+    /// recent last. Bounded, and cleared by nothing but a restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oom_kills: Vec<OomKillReport>,
+    /// Kills its cgroup counted that it could not attribute to a watched
+    /// process, since it started.
+    #[serde(default)]
+    pub unattributed_kills: u64,
+    /// Its cgroup's own `oom_kill` count, which restarts with the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_oom_kills: Option<u64>,
+    /// The machine-wide `oom_kill` count since boot (`/proc/vmstat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_oom_kills: Option<u64>,
+    /// How a victim was chosen among the watched processes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<String>,
+}
+
+impl MemoryRecord {
+    /// Nothing measured and nothing seen, as from an executor that predates
+    /// the record: omitted from the wire rather than sent as zeros.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// One out-of-memory kill the executor attributed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OomKillReport {
+    pub killed_at_unix_ms: u64,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// Resident plus swapped, at the largest the executor saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_bytes: Option<u64>,
+    /// Whose tree it was, when the tree was attributed to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<LiveUsageSubject>,
+    /// For a resident started with a declared command: the project its cell
+    /// served and the command's class, captured when it started. Carried on
+    /// the kill itself because a terminal whose command was its life exits
+    /// and is released before anyone reads this record, and with it the
+    /// occupancy that said what it was running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_class: Option<CellCommandClass>,
+}
+
+impl OomKillReport {
+    /// `rustc (pid 2597426) at 9.9 GiB, command req-1/att-1`.
+    pub fn describe(&self) -> String {
+        let victim = match &self.process_name {
+            Some(name) => format!("{name} (pid {})", self.pid),
+            None => format!("pid {}", self.pid),
+        };
+        let size = self
+            .footprint_bytes
+            .map(|bytes| format!(" at {}", human_bytes(bytes)))
+            .unwrap_or_default();
+        let owner = match &self.owner {
+            Some(LiveUsageSubject::Command {
+                request_id,
+                attempt_id,
+            }) => format!(", command {request_id}/{attempt_id}"),
+            Some(LiveUsageSubject::Resident {
+                cell_id,
+                process_key,
+                ..
+            }) => format!(", resident {process_key} in {cell_id}"),
+            None => String::new(),
+        };
+        format!("{victim}{size}{owner}")
+    }
+}
+
 /// Bytes as gibibytes with one decimal, for prose about memory demand.
 pub fn describe_gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -17121,6 +17350,12 @@ pub enum PlacementRejectionReason {
         machine_total_bytes: u64,
         killed_at_unix_ms: u64,
     },
+    /// One process of this work is larger than this machine can give a single
+    /// process: its total memory less what it holds for things other than
+    /// Cairn's work. A fact about the machine's size, so it is a filter like
+    /// [`Self::MemoryKillExcluded`]: never placed here at any clamp, and the
+    /// work waits for a machine that can hold it. See [`ProcessMisfit`].
+    ProcessTooLarge(ProcessMisfit),
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
     /// Capable of running the work, but not a platform whose answer the
@@ -17352,6 +17587,7 @@ impl PlacementRejectionReason {
                 describe_gib(*machine_total_bytes),
                 describe_age(*killed_at_unix_ms)
             ),
+            Self::ProcessTooLarge(misfit) => misfit.describe(),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
             Self::UntrustedVerdictPlatform { os, trusted } => format!(
                 "runs {os}, and this verdict counts only from {}",
@@ -18669,12 +18905,16 @@ pub enum CommandStop {
     /// that left when it advanced, never from the exit code alone.
     OomKilled {
         pid: u32,
-        /// The victim's largest resident size the executor saw.
+        /// The victim's largest size the executor saw: resident plus swapped
+        /// where the platform reports swap per process.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rss_bytes: Option<u64>,
         /// The machine's physical memory.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         machine_total_bytes: Option<u64>,
+        /// The victim's short name (`rustc`), when the executor read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_name: Option<String>,
     },
 }
 
@@ -18825,16 +19065,19 @@ impl CommandStop {
                 pid,
                 rss_bytes,
                 machine_total_bytes,
+                process_name,
             } => {
-                let resident = rss_bytes
-                    .map(|bytes| format!(" ({} resident)", human_bytes(bytes)))
+                let victim = match process_name {
+                    Some(name) => format!("{name} (pid {pid})"),
+                    None => format!("pid {pid}"),
+                };
+                let size = rss_bytes
+                    .map(|bytes| format!(" at {}", human_bytes(bytes)))
                     .unwrap_or_default();
                 let machine = machine_total_bytes
                     .map(|bytes| format!(" on a machine with {}", human_bytes(bytes)))
                     .unwrap_or_default();
-                format!(
-                    "the kernel's out-of-memory killer killed pid {pid}{resident} of its process tree{machine} while it ran"
-                )
+                format!("killed by the kernel out-of-memory killer: {victim}{size}{machine}")
             }
         }
     }
@@ -18891,6 +19134,8 @@ pub struct ProcessBatchItemOutcome {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_process: Option<PeakProcess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<CpuTime>,
     /// The width this item was told to use. Items running concurrently in one
@@ -21270,6 +21515,7 @@ mod tests {
             command_resource_identity: Some(CommandResourceIdentity {
                 version: COMMAND_RESOURCE_IDENTITY_VERSION,
                 key: "check-result-key".into(),
+                suite: None,
             }),
             resource_reservation: ResourceReservation {
                 memory_bytes: 10,
@@ -22585,6 +22831,7 @@ mod tests {
                     executor_build_id: "executor".into(),
                 }),
                 stopped_commands: Vec::new(),
+                memory_record: MemoryRecord::default(),
             }],
             occupancy: CellLifecycleCensus {
                 total: 1,
@@ -22664,6 +22911,7 @@ mod tests {
                         duration_ms: Some(1),
                         peak_rss_bytes: Some(34),
                         peak_physical_footprint_bytes: Some(35),
+                        peak_process: None,
                         cpu: Some(CpuTime::sampled(37)),
                         allocation: Some(ExecutionAllocation::uncapped(
                             2,
@@ -24217,6 +24465,7 @@ mod tests {
                 duration_ms: None,
                 peak_rss_bytes: None,
                 peak_physical_footprint_bytes: None,
+                peak_process: None,
                 cpu: None,
                 allocation: None,
                 disk_delta_bytes: None,
