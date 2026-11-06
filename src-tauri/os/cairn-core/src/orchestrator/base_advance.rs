@@ -2637,6 +2637,89 @@ async fn execute_durable_reconcile_work(
     result
 }
 
+/// Return a completed intent to the sweep once a branch it deferred at the
+/// mutation boundary is free to move.
+///
+/// A pass whose only unfinished branches are held by in-flight run batches
+/// completes instead of staying open to re-defer them. Re-deferring a held branch
+/// every sweep interval cannot succeed until its batch ends, and it keeps the
+/// intent `running` for the batch's whole life, which turns away every explicit
+/// replay at that destination. The rebase the branch owes is not dropped: its
+/// item stays `pending`/`deferred`, and this reopens the intent when the batch
+/// has ended, with no further base advance. The hold is judged by the reader the
+/// pass itself uses, over the same live-sibling set, so the sweep reopens an
+/// intent exactly when its pass would replay the branch rather than defer it
+/// again.
+///
+/// Only the newest intent that visited a branch on a base owns its debt; an
+/// older one is superseded by it and is not revisited.
+async fn reopen_released_deferrals(db: &LocalDb) -> Result<(), String> {
+    let sql = format!(
+        "SELECT intent.id, intent.project_id, intent.target_branch, item.bookmark
+           FROM jj_reconcile_intents intent
+           JOIN jj_reconcile_items item ON item.intent_id = intent.id
+          WHERE intent.status = 'completed'
+            AND item.status = 'pending' AND item.outcome_kind = 'deferred'
+            AND item.failure_kind IS NULL
+            AND EXISTS (
+              SELECT 1 FROM jobs j
+               WHERE j.project_id = intent.project_id AND j.branch = item.bookmark
+                 AND j.base_branch = intent.target_branch AND {LIVE_JOB_PREDICATE})
+            AND NOT EXISTS (
+              SELECT 1 FROM jj_reconcile_intents newer
+                JOIN jj_reconcile_items newer_item ON newer_item.intent_id = newer.id
+               WHERE newer.store_path = intent.store_path
+                 AND newer.target_branch = intent.target_branch
+                 AND newer.created_at > intent.created_at
+                 AND newer_item.bookmark = item.bookmark)"
+    );
+    let candidates = db
+        .read(|conn| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, ()).await?;
+                let mut candidates = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    candidates.push((row.text(0)?, row.text(1)?, row.text(2)?, row.text(3)?));
+                }
+                Ok(candidates)
+            })
+        })
+        .await
+        .map_err(|error| format!("list deferred reconcile items: {error}"))?;
+    let mut siblings_by_base: HashMap<(String, String), Vec<SiblingJob>> = HashMap::new();
+    let mut reopened: HashSet<String> = HashSet::new();
+    for (intent_id, project_id, target_branch, bookmark) in candidates {
+        if reopened.contains(&intent_id) {
+            continue;
+        }
+        let key = (project_id, target_branch);
+        if !siblings_by_base.contains_key(&key) {
+            let siblings = load_sibling_jobs(db, &key.0, &key.1, EXCLUDE_NONE).await?;
+            siblings_by_base.insert(key.clone(), siblings);
+        }
+        let branch_siblings = siblings_for_branch(&siblings_by_base[&key], &bookmark);
+        if branch_siblings.is_empty() || inflight_run_batch(db, &branch_siblings).await?.is_some() {
+            continue;
+        }
+        let changed = db
+            .execute(
+                "UPDATE jj_reconcile_intents SET status = 'pending', updated_at = ?2
+                  WHERE id = ?1 AND status = 'completed'",
+                params![intent_id.as_str(), chrono::Utc::now().timestamp()],
+            )
+            .await
+            .map_err(|error| format!("reopen released deferral: {error}"))?;
+        if changed > 0 {
+            log::info!(
+                "jj reconcile worker reopened intent {intent_id}: {bookmark} is no longer held at the mutation boundary"
+            );
+            reopened.insert(intent_id);
+        }
+    }
+    Ok(())
+}
+
 fn first_claim_this_sweep(claimed: &mut HashSet<String>, intent_id: &str) -> bool {
     claimed.insert(intent_id.to_owned())
 }
@@ -2660,6 +2743,9 @@ where
 
 pub(crate) async fn sweep_reconcile_intents(orch: &Orchestrator) {
     for db in orch.db.all_dbs().await {
+        if let Err(error) = reopen_released_deferrals(&db).await {
+            log::warn!("jj reconcile worker could not reopen released deferrals: {error}");
+        }
         let mut claimed_this_pass = HashSet::new();
         loop {
             let work = match claim_next_reconcile_intent(&db).await {
@@ -3699,6 +3785,39 @@ fn failed_reconcile_report(branch: &str, error: String) -> crate::jj::ReconcileR
     report
 }
 
+async fn defer_run_batch_reconcile(
+    db: &LocalDb,
+    intent_id: &str,
+    branch: &str,
+    observed_tip: Option<&str>,
+    batch: InflightRunBatch,
+    label: &str,
+) -> Result<(), String> {
+    let held_by = batch.resolve_holder(db).await.describe();
+    log::info!(
+        "jj base advance ({label}): deferred {branch} at the mutation boundary for an in-flight {held_by}"
+    );
+    let diagnostic = format!(
+        "deferred at the mutation boundary: {held_by} was in flight on this branch, \
+         so its rebase was not attempted. It stays queued for the durable sweep, \
+         which performs it once that batch finishes or is stopped."
+    );
+    persist_reconcile_item(
+        db,
+        ReconcileItemUpdate {
+            intent_id,
+            bookmark: branch,
+            observed_tip,
+            status: "pending",
+            failure_kind: None,
+            outcome_kind: Some("deferred"),
+            fingerprint: None,
+            diagnostic: Some(&diagnostic),
+        },
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_reconcile_claim(
     orch: &Orchestrator,
@@ -3753,6 +3872,24 @@ async fn execute_reconcile_claim(
         }) {
             log::debug!("jj reconcile ({label}): resumed past completed {branch}");
             continue;
+        }
+        // This read needs no store lock. In particular, do not inspect a held
+        // bookmark or prepare its resolution basis just to decide not to replay
+        // it. Admission is rechecked under each mutation guard below.
+        let branch_siblings = siblings_for_branch(&siblings, branch);
+        if progress.as_ref().is_none_or(|p| p.status != "graph_moved") {
+            if let Some(batch) = inflight_run_batch(db, &branch_siblings).await? {
+                defer_run_batch_reconcile(
+                    db,
+                    intent_id,
+                    branch,
+                    progress.as_ref().and_then(|p| p.observed_tip.as_deref()),
+                    batch,
+                    label,
+                )
+                .await?;
+                continue;
+            }
         }
         let current_tip = {
             let guard = orch
@@ -3948,39 +4085,15 @@ async fn execute_reconcile_claim(
             drop(admission_check);
             if let Some(batch) = inflight {
                 drop(guard);
-                let held_by = batch.resolve_holder(db).await.describe();
-                log::info!(
-                    "jj base advance ({label}): deferred {branch} at the mutation boundary for an in-flight {held_by}"
-                );
-                // Record the deferral rather than only counting it. A deferred
-                // branch owes a rebase that has not been attempted, which is a
-                // different state from both "rebased" and "never advanced" and
-                // is the one an agent is least able to infer: no bookmark moved,
-                // no note was sent, and cairn:~/rebase would otherwise report a
-                // branch that had never met a base advance at all. The row is
-                // what lets the resource say an advance is owed, and it survives
-                // a restart that loses this pass. It names the batch, because
-                // the batch ending is the only thing that releases the branch.
-                let diagnostic = format!(
-                    "deferred at the mutation boundary: {held_by} was in flight on this branch, \
-                     so its rebase was not attempted. It stays queued for the durable sweep, \
-                     which performs it once that batch finishes or is stopped."
-                );
-                persist_reconcile_item(
+                defer_run_batch_reconcile(
                     db,
-                    ReconcileItemUpdate {
-                        intent_id,
-                        bookmark: branch,
-                        observed_tip: current_tip.as_deref(),
-                        status: "pending",
-                        failure_kind: None,
-                        outcome_kind: Some("deferred"),
-                        fingerprint: None,
-                        diagnostic: Some(&diagnostic),
-                    },
+                    intent_id,
+                    branch,
+                    current_tip.as_deref(),
+                    batch,
+                    label,
                 )
                 .await?;
-                any_branch_deferred = true;
                 continue;
             }
 
@@ -4317,7 +4430,6 @@ async fn execute_reconcile_claim(
                     let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
                     let deadline =
                         tokio::time::Instant::now() + crate::jj::BACKGROUND_RECONCILE_BUDGET;
-                    let tip = crate::jj::bookmark_commit_checked(&jj, &store, branch)?;
                     // A run may have been admitted while the pure candidate was
                     // prepared. Revalidate at this second mutation boundary.
                     let branch_siblings = siblings_for_branch(&siblings, branch);
@@ -4329,27 +4441,18 @@ async fn execute_reconcile_claim(
                             })??;
                     if let Some(batch) = inflight {
                         drop(guard);
-                        let diagnostic = format!(
-                            "structural replay deferred at the mutation boundary: {}",
-                            batch.resolve_holder(db).await.describe(),
-                        );
-                        persist_reconcile_item(
+                        defer_run_batch_reconcile(
                             db,
-                            ReconcileItemUpdate {
-                                intent_id,
-                                bookmark: branch,
-                                observed_tip: tip.as_deref(),
-                                status: "pending",
-                                failure_kind: None,
-                                outcome_kind: Some("deferred"),
-                                fingerprint: None,
-                                diagnostic: Some(&diagnostic),
-                            },
+                            intent_id,
+                            branch,
+                            current_tip.as_deref(),
+                            batch,
+                            label,
                         )
                         .await?;
-                        any_branch_deferred = true;
                         continue;
                     }
+                    let tip = crate::jj::bookmark_commit_checked(&jj, &store, branch)?;
                     let quarantine = tokio::time::timeout_at(
                         deadline,
                         load_reconcile_quarantine(db, &claim.project_id, &store, branch),
@@ -4772,6 +4875,10 @@ async fn execute_reconcile_claim(
     // this write resumes graph_moved items without replaying their jj mutation.
     mark_reconcile_delivered(db, intent_id).await?;
 
+    // A branch held by an in-flight run batch does not keep the intent open:
+    // its item stays pending/deferred, and `reopen_released_deferrals` returns
+    // the intent to the sweep once the batch ends. The other deferrals (an
+    // unreadable tip, a timeout cooldown, the ref-store lock) still retry.
     let retry_transient = any_branch_deferred || reconcile_has_transient_failures(&report.failed);
     // Fan a lifetime-cell refresh out to every sibling this reconcile actually
     // rewrote. A running cell on a rebased job branch must follow the logical
@@ -11907,6 +12014,243 @@ mod real_store_collision_tests {
         assert!(
             crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &destination),
             "durable retry must finish once the admitted batch ends"
+        );
+    }
+
+    // ── A pass whose only unfinished branches are held at the boundary ──────
+    //
+    // cairn/6175. `BRANCH` (job `JOB`) is held by a run batch that stays in
+    // flight; `HEALTHY` is an ordinary sibling on the same base.
+
+    const HEALTHY_JOB: &str = "job-healthy";
+    const HEALTHY: &str = "agent/healthy";
+
+    /// The harness plus a second live job on `HEALTHY`, both cut from `main`,
+    /// each carrying one commit of its own, and `main` advanced past both.
+    /// Returns the advanced main.
+    async fn held_and_healthy(r: &Replay) -> String {
+        let healthy_ws = r.fx.workspaces.path().join("healthy");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &healthy_ws, HEALTHY, "main", None)
+            .unwrap();
+        r.db.execute_script(format!(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-2', 'proj-1', 2, 'Healthy', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('exec-2', 'recipe-default', 'issue-2', 'proj-1', 'running', 1, 1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+               VALUES ('{HEALTHY_JOB}', 'exec-2', 'node', 'issue-2', 'proj-1', 'running', '{HEALTHY}', 'main', 1, 1);"
+        ))
+        .await
+        .unwrap();
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("held.txt", "held\n")],
+            "held work",
+        );
+        commit(
+            &r.fx,
+            &healthy_ws,
+            HEALTHY,
+            &[("healthy.txt", "healthy\n")],
+            "healthy work",
+        );
+        let destination = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("main.txt", "main\n")],
+            "main advances",
+        );
+        set_main(&r.fx, &destination);
+        destination
+    }
+
+    /// Park a run batch on `JOB`, which holds `BRANCH` at the mutation boundary.
+    async fn hold_branch(r: &Replay) {
+        for sql in [
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-held','job-replay','open','backend',1,1)",
+            "UPDATE runs SET session_id='session-held' WHERE id='run-replay'",
+            "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-held','session-held','run-replay','job-replay',1,'yielded','initial',1,1)",
+            "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-held','job-replay','run-replay','session-held','turn-held','tool-held','{\"kind\":\"run_batch\",\"request_id\":\"held-batch\",\"commits\":true,\"label\":\"long verification\"}','pending',1)",
+        ] {
+            r.db.execute(sql, ()).await.unwrap();
+        }
+    }
+
+    async fn intent_status(r: &Replay, destination: &str) -> String {
+        r.db.query_text(
+            "SELECT status FROM jj_reconcile_intents WHERE destination_commit = ?1",
+            (destination.to_string(),),
+        )
+        .await
+        .unwrap()
+        .expect("the advance recorded an intent")
+    }
+
+    /// `(status, outcome_kind, attempt_count)` of one branch's item.
+    async fn held_item(r: &Replay, destination: &str) -> (String, String, i64) {
+        r.db.query_one(
+            "SELECT item.status, COALESCE(item.outcome_kind, ''), item.attempt_count
+               FROM jj_reconcile_items item
+               JOIN jj_reconcile_intents intent ON intent.id = item.intent_id
+              WHERE intent.destination_commit = ?1 AND item.bookmark = ?2",
+            (destination.to_string(), BRANCH.to_string()),
+            |row| Ok((row.text(0)?, row.text(1)?, row.get::<i64>(2)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A held sibling used to keep its intent alive for as long as its batch
+    /// ran: every pass re-deferred it, returned the intent to `pending`, and the
+    /// sweep claimed it again, so the intent read `running` for tens of minutes
+    /// and refused every explicit replay at its destination. The pass now ends
+    /// when the healthy siblings are done, the held branch keeps its debt, and
+    /// the sweep replays it once the batch ends, with no further base advance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn a_pass_left_with_only_held_branches_completes_and_replays_them_once_released() {
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for a held-branch pass");
+        let r = replay_harness(&bin, "held-pass-completes.db", &[]).await;
+        let destination = held_and_healthy(&r).await;
+        hold_branch(&r).await;
+
+        let outcome = reconcile_base_advance(
+            &r.orch,
+            &r.db,
+            "proj-1",
+            "merged job (test)",
+            &r.fx.repo.to_string_lossy(),
+            "main",
+            "main",
+            load_sibling_jobs(&r.db, "proj-1", "main", EXCLUDE_NONE)
+                .await
+                .unwrap(),
+            BaseAdvanceNotes {
+                conflict: build_jj_conflict_note("main", None, None),
+                clean: build_jj_clean_note("main", None, None),
+                incoming: IncomingIdentity {
+                    base_branch: "main".to_string(),
+                    ..IncomingIdentity::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.eligible, 2, "the advance claimed both siblings");
+        wait_for_worker(&r).await;
+
+        assert!(crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            HEALTHY,
+            &destination
+        ));
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &destination
+        ));
+        assert_eq!(
+            intent_status(&r, &destination).await,
+            "completed",
+            "a pass with only held branches left is finished, not waiting on them"
+        );
+        let (status, outcome_kind, attempts) = held_item(&r, &destination).await;
+        assert_eq!(
+            (status.as_str(), outcome_kind.as_str()),
+            ("pending", "deferred")
+        );
+
+        // While the batch runs, the sweep neither reopens the intent nor
+        // re-defers the branch across revisits.
+        for _ in 0..2 {
+            sweep_reconcile_intents(&r.orch).await;
+            wait_for_worker(&r).await;
+        }
+        assert_eq!(intent_status(&r, &destination).await, "completed");
+        assert_eq!(
+            held_item(&r, &destination).await,
+            ("pending".to_string(), "deferred".to_string(), attempts),
+            "a held branch is not revisited while its batch is in flight"
+        );
+
+        r.db.execute("DELETE FROM agent_waits WHERE id = 'wait-held'", ())
+            .await
+            .unwrap();
+        sweep_reconcile_intents(&r.orch).await;
+        wait_for_worker(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &destination),
+            "the deferred branch is replayed once its batch ends, without a new advance"
+        );
+        assert_eq!(intent_status(&r, &destination).await, "completed");
+        assert_ne!(held_item(&r, &destination).await.0, "pending");
+    }
+
+    /// An explicit replay requested while a pass runs waits for that pass and is
+    /// served by the follow-on on the same intent as soon as it completes. The
+    /// requester is told it was accepted, not handed the lease refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn an_explicit_replay_waiting_on_a_pass_is_accepted_when_it_completes() {
+        use std::time::Duration;
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for a follow-on pass");
+        let r = replay_harness(&bin, "explicit-follow-on.db", &[]).await;
+        let destination = held_and_healthy(&r).await;
+        hold_branch(&r).await;
+
+        // The pass in flight at this destination, its remaining work held.
+        let pass = claim_reconcile_intent(
+            &r.db,
+            &r.fx.repo.to_string_lossy(),
+            &r.fx.store,
+            "main",
+            &destination,
+            "merged job (test)",
+        )
+        .await
+        .unwrap()
+        .expect("the pass owns the destination");
+
+        let orch = r.orch.clone();
+        let db = Arc::clone(&r.db);
+        let mut request = tokio::spawn(async move {
+            request_branch_replay(&orch, &db, HEALTHY_JOB, HEALTHY, None, false, None).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut request)
+                .await
+                .is_err(),
+            "the request waits for the running pass"
+        );
+        sweep_reconcile_intents(&r.orch).await;
+        assert!(
+            !request.is_finished(),
+            "the sweep does not take a live pass"
+        );
+
+        finish_reconcile_intent(&r.db, &pass.id, &pass.owner, false)
+            .await
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(120), request)
+            .await
+            .expect("the request is served once the pass completes")
+            .unwrap()
+            .unwrap_or_else(|refusal| panic!("the request was refused: {refusal}"));
+        assert!(!answer.contains("did not yield"), "{answer}");
+        wait_for_worker(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, HEALTHY, &destination),
+            "the follow-on pass replayed the requested branch"
+        );
+        assert_eq!(intent_status(&r, &destination).await, "completed");
+        assert!(
+            !crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &destination),
+            "serving the request did not move the held branch"
         );
     }
 }
