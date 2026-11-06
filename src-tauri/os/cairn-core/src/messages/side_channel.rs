@@ -56,10 +56,12 @@ impl SideChannelNotice {
                 )
             }
             SideChannelOrigin::IssueMessage { source } => {
-                let who = if source == "user" {
-                    "the user"
-                } else {
-                    "an agent"
+                let who = match source.as_str() {
+                    "user" => "the user",
+                    crate::messages::render::UNVERIFIED_LOCAL_SENDER => {
+                        "an unverified local process (not the operator or an agent)"
+                    }
+                    _ => "an agent",
                 };
                 format!(
                     "[Side-channel] {who} posted a message on this issue {}:\n{}",

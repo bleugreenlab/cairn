@@ -428,16 +428,30 @@ impl ResidentRelays {
         match run_id {
             Some(run_id) => crate::mcp::run_bearer::bind_request_to_run(request, &run_id),
             None => {
-                if request.thread_id.is_some() {
-                    return Err("a relayed call cannot name a pooled thread".into());
-                }
                 if request.run_id.as_deref().is_some_and(|run| !run.is_empty()) {
                     return Err("this process was started for no run and cannot claim one".into());
                 }
-                request.run_id = None;
+                crate::mcp::run_bearer::hold_to_run_less_process(request)?;
+                request.origin = Some(
+                    cairn_common::protocol::DispatchOrigin::RelayedRunLessProcess(
+                        cairn_common::protocol::RelayedProcess {
+                            relay_id: call.relay_id.clone(),
+                            process_key: context.process_key.clone(),
+                        },
+                    ),
+                );
                 Ok(())
             }
         }
+    }
+
+    /// Whether the process behind this relay is, as far as this runner can tell,
+    /// still running. A context waiting for its executor's next link, or holding
+    /// an exit it has not matched to a generation yet, counts as ended.
+    pub(crate) fn is_live(&self, relay_id: &ResidentRelayId) -> bool {
+        self.contexts
+            .get(relay_id)
+            .is_some_and(|context| context.binding.is_some() && context.exited_generation.is_none())
     }
 
     #[cfg(test)]
@@ -467,13 +481,17 @@ pub fn authorize_resident_relay(
             .run_bearers
             .verify(token, audience)
             .map_err(|refusal| refusal.to_string())?;
+        let run_id = verified
+            .run_id()
+            .ok_or_else(|| format!("{} is no project service's run", verified.scope.label()))?
+            .to_string();
         let run = orch
             .project_services
             .runs
-            .get(&verified.run_id)
-            .ok_or_else(|| format!("run {} belongs to no live project service", verified.run_id))?;
+            .get(&run_id)
+            .ok_or_else(|| format!("run {run_id} belongs to no live project service"))?;
         Ok(VerifiedServiceRun {
-            run_id: verified.run_id,
+            run_id,
             standing: matches!(
                 run.role,
                 crate::project_services::authority::ServiceRunRole::Standing
@@ -509,7 +527,7 @@ mod tests {
         McpCallbackRequest {
             cwd: "/".into(),
             run_id: run_id.map(str::to_string),
-            tool: "read".into(),
+            tool: "read_batch".into(),
             payload: serde_json::json!({"paths": ["cairn:~"]}),
             ..McpCallbackRequest::default()
         }
@@ -663,15 +681,17 @@ mod tests {
         }
         let mut threaded = request(None);
         threaded.thread_id = Some("thread".into());
-        assert!(relays
+        relays
             .authorize(
                 "machine-b",
                 7,
                 &call(&relay_id, &holder, "shell", 4, &auth),
                 &mut threaded,
-                &no_services
+                &no_services,
             )
-            .is_err());
+            .unwrap();
+        assert_eq!(threaded.run_id.as_deref(), Some("run-1"));
+        assert_eq!(threaded.thread_id, None, "a thread cannot re-attribute it");
         let mut fine = request(None);
         assert!(
             relays
@@ -848,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn a_runless_process_may_name_neither_a_run_nor_a_thread() {
+    fn a_runless_process_may_not_name_a_run() {
         let holder = holder();
         let mut relays = ResidentRelays::default();
         let minted = relays.register(
@@ -871,6 +891,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fine.run_id, None);
+        assert!(
+            fine.is_unverified_local(),
+            "it is limited and labelled as any run-less caller is"
+        );
+        let named = fine.relayed_run_less_process().unwrap();
+        assert_eq!(named.relay_id, relay_id);
+        assert_eq!(named.process_key, "shell");
         assert!(relays
             .authorize(
                 "machine-b",
@@ -880,6 +907,39 @@ mod tests {
                 &no_services
             )
             .is_err());
+    }
+
+    #[test]
+    fn a_relay_stops_being_live_when_its_process_ends_or_its_link_is_lost() {
+        let holder = holder();
+        for end in ["exit", "stop", "release", "replace", "link", "early exit"] {
+            let mut relays = ResidentRelays::default();
+            let (relay_id, _) = started_terminal(&mut relays);
+            assert!(relays.is_live(&relay_id), "{end}");
+            match end {
+                "exit" => relays.process_exited("machine-b", &holder, "shell", 4),
+                "stop" => relays.revoke_process(&holder, "shell"),
+                "release" => relays.revoke_holder(&holder),
+                "replace" => {
+                    relays.register(
+                        "machine-b",
+                        &holder,
+                        "shell",
+                        RegisteredAuthority::Run { run_id: None },
+                    );
+                }
+                "link" => relays.detach("machine-b", 7),
+                _ => {
+                    relays
+                        .contexts
+                        .get_mut(&relay_id)
+                        .unwrap()
+                        .process_generation = None;
+                    relays.process_exited("machine-b", &holder, "shell", 4);
+                }
+            }
+            assert!(!relays.is_live(&relay_id), "{end}");
+        }
     }
 
     fn incarnation(generation: u64) -> ServiceIncarnation {

@@ -111,6 +111,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["dev"] => Some(CairnResource::Dev),
         ["dev", "db"] => Some(CairnResource::DevDb),
         ["dev", "pid"] => Some(CairnResource::DevPid),
+        ["dev", "launch-ticket"] => Some(CairnResource::DevLaunchTicket),
         ["logs"] => Some(CairnResource::Logs),
         ["channels", "conversations"] => Some(CairnResource::ChannelsConversations),
         ["executors"] => Some(CairnResource::Executors),
@@ -189,6 +190,10 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             })
         }
         ["bug"] => Some(CairnResource::Bug),
+        ["self-rebuild"] => Some(CairnResource::SelfRebuild),
+        ["self-rebuild", id] => Some(CairnResource::SelfRebuildOutcome {
+            id: (*id).to_string(),
+        }),
         ["help"] => Some(CairnResource::Help),
         ["websearch"] => Some(CairnResource::WebSearch),
         ["packs"] => Some(CairnResource::Packs),

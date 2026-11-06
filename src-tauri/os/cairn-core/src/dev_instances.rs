@@ -2733,3 +2733,152 @@ mod tests {
         assert_eq!(fences.len(), 1);
     }
 }
+
+/// One-time tickets for the dev-instance launch route.
+///
+/// The launch is a WebSocket held open on the runner, and an agent shell reaches
+/// the runner only through its executor's request/response relay, so no
+/// credential a shell holds can be presented there, and it may not read the
+/// machine credential. A run, or a terminal started for no run, asks for a ticket
+/// through that relay instead (`cairn://dev/launch-ticket`) and presents it on the
+/// connection it then opens directly. The ticket carries no authority past that
+/// one connection, so it is not a registered secret: the write's answer has to be
+/// able to carry it.
+pub mod launch_ticket {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use cairn_common::executor_protocol::ResidentRelayId;
+    use sha2::{Digest, Sha256};
+
+    const LIFETIME: Duration = Duration::from_secs(60);
+
+    struct Ticket {
+        issuer: Issuer,
+        issued_at: Instant,
+    }
+
+    /// Who a ticket was issued to, which is who its launch is journaled against
+    /// and whose end refuses it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Issuer {
+        Run(String),
+        Terminal(TerminalIssuer),
+    }
+
+    /// A terminal started for no run. There is no run to be answerable for its
+    /// launch, so the terminal is, with whichever run created it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TerminalIssuer {
+        pub relay_id: ResidentRelayId,
+        pub uri: String,
+        pub created_by_run_id: Option<String>,
+    }
+
+    fn book() -> &'static Mutex<HashMap<[u8; 32], Ticket>> {
+        static BOOK: OnceLock<Mutex<HashMap<[u8; 32], Ticket>>> = OnceLock::new();
+        BOOK.get_or_init(Default::default)
+    }
+
+    fn digest(token: &str) -> [u8; 32] {
+        Sha256::digest(token.as_bytes()).into()
+    }
+
+    /// A fresh ticket for `issuer`. Only its digest is kept.
+    pub fn issue(issuer: Issuer) -> String {
+        let token = format!("dev-launch-{}", uuid::Uuid::new_v4().simple());
+        let mut book = book().lock().unwrap_or_else(|e| e.into_inner());
+        book.retain(|_, ticket| ticket.issued_at.elapsed() < LIFETIME);
+        book.insert(
+            digest(&token),
+            Ticket {
+                issuer,
+                issued_at: Instant::now(),
+            },
+        );
+        token
+    }
+
+    /// Spend `token`. Taking it out of the book under the lock is the spend, so
+    /// of any number of concurrent presentations one wins. A second
+    /// presentation, an expired ticket, and anything else get `None`.
+    pub fn redeem(token: &str) -> Option<Issuer> {
+        let ticket = book()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&digest(token))?;
+        (ticket.issued_at.elapsed() < LIFETIME).then_some(ticket.issuer)
+    }
+
+    /// Spend `token` for a launch. A ticket whose issuer has ended launches
+    /// nothing, whatever it asked for in its last minute: a run that has
+    /// finalized, or a terminal whose process has exited, been stopped or been
+    /// replaced.
+    pub fn admit(orch: &crate::orchestrator::Orchestrator, token: &str) -> Result<Issuer, String> {
+        let issuer = redeem(token)
+            .ok_or_else(|| "This is not a live dev-instance launch ticket".to_string())?;
+        let ended = match &issuer {
+            Issuer::Run(run_id) => orch
+                .run_bearers
+                .run_is_revoked(run_id)
+                .then(|| format!("run {run_id}, which has finalized")),
+            Issuer::Terminal(terminal) => {
+                (!orch.fleet.resident_relays().is_live(&terminal.relay_id))
+                    .then(|| format!("terminal {}, which has ended", terminal.uri))
+            }
+        };
+        match ended {
+            Some(ended) => Err(format!("this launch ticket was issued to {ended}")),
+            None => Ok(issuer),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_ticket_admits_once_and_names_its_issuer() {
+            let run = || Issuer::Run("run-a".to_string());
+            let ticket = issue(run());
+            assert_eq!(redeem(&ticket), Some(run()));
+            assert_eq!(redeem(&ticket), None);
+            assert_eq!(redeem("dev-launch-never-issued"), None);
+        }
+
+        #[test]
+        fn of_concurrent_presentations_one_wins() {
+            let ticket = issue(Issuer::Run("run-a".to_string()));
+            let barrier = std::sync::Barrier::new(8);
+            let wins = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            redeem(&ticket).is_some()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .filter(|won| *won)
+                    .count()
+            });
+            assert_eq!(wins, 1);
+        }
+
+        #[test]
+        fn an_expired_ticket_is_refused() {
+            let ticket = issue(Issuer::Run("run-a".to_string()));
+            book()
+                .lock()
+                .unwrap()
+                .get_mut(&digest(&ticket))
+                .unwrap()
+                .issued_at = Instant::now() - LIFETIME;
+            assert_eq!(redeem(&ticket), None);
+        }
+    }
+}

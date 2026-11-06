@@ -481,6 +481,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("inference_machines", CONFIG),
     keep("model_pool_preferences", CONFIG),
     keep("model_pins", "one row per pinned model resident"),
+    keep(
+        "self_rebuild_outcomes",
+        "one row per self-rebuild a run starts, a handful a month on the one Mac that rebuilds itself",
+    ),
     keep("inference_models", CONFIG),
     owned_by(
         "inference_verifications",

@@ -225,6 +225,25 @@ pub(crate) async fn compose_read(
     })
 }
 
+/// What a request that speaks for no run is told when it names a host file, a
+/// web target, or a resource whose read leaves Cairn. Such a read would be served
+/// by the runner's own process, past every fence, for whoever holds a credential
+/// that proves nothing about them.
+const RUN_LESS_HOST_READ_REFUSAL: &str = "Refused: this request speaks for no run, so it reads \
+     cairn:// resources only, and none that reach outside Cairn (a web search, an MCP server). \
+     Read host files directly from your own process.";
+
+/// Whether a request that speaks for no run may read `target`: a `cairn://`
+/// resource that the runner answers from its own state. A web search spends the
+/// provider's budget, and reading an MCP server connects to it, starting its
+/// process when it is a stdio one.
+fn is_run_less_readable(target: &str) -> bool {
+    let base = target.split('?').next().unwrap_or(target);
+    is_cairn_resource_target(target)
+        && base != "cairn://websearch"
+        && !base.starts_with("cairn://mcp/")
+}
+
 /// Classify one resolved target and run its producer.
 async fn produce_segment(
     orch: &Orchestrator,
@@ -233,6 +252,12 @@ async fn produce_segment(
     target: &str,
     fence_ask: FenceAsk,
 ) -> Produced {
+    if request.is_unverified_local() && !is_run_less_readable(target) {
+        return Produced::Segment(error_segment(
+            target,
+            RUN_LESS_HOST_READ_REFUSAL.to_string(),
+        ));
+    }
     if is_web_target(target) {
         return Produced::Segment(produce_web_segment(orch, request, target).await);
     }
@@ -758,6 +783,35 @@ fn split_line_scope(target: &str, include_limit: bool) -> (String, Option<i64>, 
         format!("{}?{}", split.identity, encode_query_params(&remaining))
     };
     (clean, offset, limit)
+}
+
+#[cfg(test)]
+mod run_less_read_tests {
+    use super::is_run_less_readable;
+
+    #[test]
+    fn a_run_less_read_stays_inside_cairn() {
+        for target in [
+            "cairn://help",
+            "cairn://p/cairn/5949",
+            "cairn://mcp",
+            "cairn:@/issues",
+        ] {
+            assert!(is_run_less_readable(target), "{target}");
+        }
+        for target in [
+            "file:src/lib.rs",
+            "file:/etc/passwd",
+            "https://example.com",
+            "/tmp/paper.pdf",
+            "cairn://websearch?q=anything",
+            "cairn://websearch",
+            "cairn://mcp/turso",
+            "cairn://mcp/turso/query",
+        ] {
+            assert!(!is_run_less_readable(target), "{target}");
+        }
+    }
 }
 
 #[cfg(test)]

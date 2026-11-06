@@ -174,8 +174,10 @@ pub struct SessionConfig {
     /// disk; each backend gives it as the session's one server
     /// ([`cairn_servers`]).
     pub(crate) mcp: McpServer,
-    /// The run bearer an HTTP attachment's agent presents. `None` for stdio,
-    /// which authenticates with the machine secret instead.
+    /// The run bearer the agent's MCP attachment presents, stdio or HTTP.
+    /// Session start always mints one; a backend that attaches Cairn's MCP
+    /// server refuses to start without it. `None` only in fixtures for
+    /// backends that never present it.
     pub(crate) mcp_bearer: Option<crate::mcp::run_bearer::RunBearer>,
     /// Stable home URI for this run (full node URI). The stdio attachment
     /// forwards it to `cairn-cmd` as `CAIRN_HOME_URI`.

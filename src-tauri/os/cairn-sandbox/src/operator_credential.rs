@@ -3,9 +3,11 @@
 //! A Cairn home holds two shared secrets of the same shape and opposite
 //! audiences (see `cairn_common::auth`). `operator_auth_secret` authenticates the
 //! person at the desktop answering an authority prompt, so a process that can
-//! read it can approve its own escalation. An agent and the desktop run as the
-//! same OS user, so file modes cannot tell them apart, and a refusal in the
-//! `read` and `write` verb handlers does nothing about a shell that opens the
+//! read it can approve its own escalation. `mcp_auth_secret` is the runner's
+//! machine credential, which speaks for no run: a run holding it could act
+//! outside the run its own credential binds it to. An agent and the desktop run
+//! as the same OS user, so file modes cannot tell them apart, and a refusal in
+//! the `read` and `write` verb handlers does nothing about a shell that opens the
 //! file itself.
 //!
 //! This module draws the boundary where shells actually run. On macOS, every
@@ -29,19 +31,25 @@
 //! the spawning process knows about outside that family, such as its own
 //! `CAIRN_HOME` override. Within those homes:
 //!
-//! - the credential file refuses data reads and every write, which also refuses
+//! - each credential file refuses data reads and every write, which also refuses
 //!   hard-linking it, cloning it, and renaming it away;
 //! - the home directory itself refuses unlink, so it cannot be renamed out of the
 //!   pattern that names it. Creating a new home, and everything else inside an
 //!   existing one, stays allowed.
 //!
+//! One exception, for `mcp_auth_secret` alone: a dev-instance home's
+//! (`~/.cairn-dev-<key>`) stays readable to every install but that instance's
+//! own. The agent that launched an instance drives it from outside (its frontend
+//! runtime, its desktop window, a profile of it), and that secret reaches only
+//! run-less reads of a database the same agent can already read as a file.
+//!
 //! Seatbelt evaluates a rule against the resolved real path, so a relative path,
 //! `..`, a symlinked file or directory, a case variant, the
 //! `/System/Volumes/Data` firmlink, and a `/.vol/<device>/<inode>` path all reach
-//! the same rule. A file named `operator_auth_secret` anywhere else is untouched,
-//! which is why the rules name homes rather than the file name alone: the tests
-//! that exercise the credential store create it in temp directories, and they
-//! must keep working inside an agent's own `cargo test`.
+//! the same rule. A file of either name anywhere else is untouched, which is why
+//! the rules name homes rather than the file name alone: the tests that exercise
+//! the credential store create them in temp directories, and they must keep
+//! working inside an agent's own `cargo test`.
 //!
 //! Linux landlock can only allowlist, so it cannot refuse one file inside a
 //! readable tree, and Windows has no sandbox primitive here. Neither platform
@@ -53,12 +61,30 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use cairn_common::auth::OPERATOR_SECRET_FILE;
+use cairn_common::auth::{MCP_SECRET_FILE, OPERATOR_SECRET_FILE};
 
 use crate::SandboxPolicy;
 
+/// The files in a Cairn home this boundary keeps from every agent process.
+const CREDENTIAL_FILES: [&str; 2] = [OPERATOR_SECRET_FILE, MCP_SECRET_FILE];
+
 /// The name every Cairn home directly inside the OS user's home begins with.
 const HOME_FAMILY_PREFIX: &str = ".cairn";
+
+/// The name a branch-keyed dev-instance home begins with.
+const DEV_INSTANCE_HOME_PREFIX: &str = ".cairn-dev-";
+
+/// Seatbelt regex for a home-family member that is not a dev-instance home:
+/// every name [`HOME_FAMILY_PREFIX`] starts except those
+/// [`DEV_INSTANCE_HOME_PREFIX`] starts, spelled out because the regex has no
+/// lookahead. `base` is already regex-escaped.
+#[cfg(any(test, target_os = "macos"))]
+fn machine_secret_family_regex(base: &str) -> String {
+    let file = regex_literal(MCP_SECRET_FILE);
+    format!(
+        r"^{base}/\.cairn([^-/][^/]*|-|-d|-de|-dev|-[^d/][^/]*|-d[^e/][^/]*|-de[^v/][^/]*|-dev[^-/][^/]*)?/{file}$"
+    )
+}
 
 /// What an agent is told when the operator credential boundary refuses it.
 ///
@@ -67,11 +93,12 @@ const HOME_FAMILY_PREFIX: &str = ".cairn";
 pub const OPERATOR_CREDENTIAL_REFUSAL: &str = concat!(
     "Denied by the operator credential boundary. A Cairn home's `operator_auth_secret` ",
     "(in ~/.cairn, a dev-instance home such as ~/.cairn-dev-<branch>, or any other Cairn home) ",
-    "is the credential the person at the desktop uses to answer authority prompts, so a process ",
-    "holding it could approve its own escalation. No agent process may read, copy, link, rename, ",
-    "or write it, and the kernel refuses the access below the tool layer. This is not a file ",
-    "permission or a containment crossing: no fence answer, `allowAll`, or permission response ",
-    "changes it. Authority requests are answered by the operator in the desktop app."
+    "and a runner's own `mcp_auth_secret` are the credentials of the person at the desktop and of ",
+    "the runner itself, so a process holding one could approve its own escalation or act outside ",
+    "its run. No agent process may read, copy, link, rename, or write them, and the kernel refuses ",
+    "the access below the tool layer. This is not a file permission or a containment crossing: no fence answer, ",
+    "`allowAll`, or permission response changes it. A run calls back with the credential Cairn ",
+    "gave it, and authority requests are answered by the operator in the desktop app."
 );
 
 /// Where operator credentials live on this machine, as the boundary sees them.
@@ -193,7 +220,8 @@ impl OperatorCredentialFloor {
     }
 
     pub fn holds_a_credential(&self) -> bool {
-        let has_credential = |home: &PathBuf| home.join(OPERATOR_SECRET_FILE).exists();
+        let has_credential =
+            |home: &PathBuf| CREDENTIAL_FILES.iter().any(|file| home.join(file).exists());
         if self.named.iter().any(has_credential) {
             return true;
         }
@@ -247,7 +275,7 @@ impl OperatorCredentialFloor {
         self
     }
 
-    /// Whether `path` names an operator credential this boundary covers.
+    /// Whether `path` names a credential this boundary covers.
     ///
     /// The path is resolved first, best effort, so a symlink, `..`, or `/var`
     /// alias is judged by what it reaches; on a case-insensitive platform the
@@ -264,8 +292,20 @@ impl OperatorCredentialFloor {
         let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
             return false;
         };
+        if !(self.in_home_family(dir) || self.homes.iter().any(|home| same_path(home, dir))) {
+            return false;
+        }
         same_name(name, OPERATOR_SECRET_FILE)
-            && (self.in_home_family(dir) || self.homes.iter().any(|home| same_path(home, dir)))
+            || (same_name(name, MCP_SECRET_FILE) && !self.is_another_installs_dev_home(dir))
+    }
+
+    /// Whether `dir` is a dev-instance home this process does not itself run in.
+    fn is_another_installs_dev_home(&self, dir: &Path) -> bool {
+        self.in_home_family(dir)
+            && dir
+                .file_name()
+                .is_some_and(|name| name_has_prefix(name, DEV_INSTANCE_HOME_PREFIX))
+            && !self.named.iter().any(|home| same_path(home, dir))
     }
 
     fn in_home_family(&self, dir: &Path) -> bool {
@@ -285,14 +325,30 @@ impl OperatorCredentialFloor {
     /// grant, or a session-approved crossing from reopening a credential.
     #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn sbpl_rules(&self) -> String {
-        let file = regex_literal(OPERATOR_SECRET_FILE);
         let mut credentials = Vec::new();
         let mut home_nodes = Vec::new();
         let mut planted_links = String::new();
         if let Some(os_home) = &self.os_home {
             let base = regex_literal(&os_home.to_string_lossy());
             let family = regex_literal(HOME_FAMILY_PREFIX);
-            credentials.push(format!("(regex #\"^{base}/{family}[^/]*/{file}$\")"));
+            let operator = regex_literal(OPERATOR_SECRET_FILE);
+            credentials.push(format!("(regex #\"^{base}/{family}[^/]*/{operator}$\")"));
+            credentials.push(format!(
+                "(regex #\"{}\")",
+                machine_secret_family_regex(&base)
+            ));
+            // A dev instance's own agents are refused its machine secret too.
+            credentials.extend(
+                self.named
+                    .iter()
+                    .filter(|home| {
+                        self.in_home_family(home)
+                            && home
+                                .file_name()
+                                .is_some_and(|name| name_has_prefix(name, DEV_INSTANCE_HOME_PREFIX))
+                    })
+                    .map(|home| literal_rule(&home.join(MCP_SECRET_FILE))),
+            );
             home_nodes.push(format!("(regex #\"^{base}/{family}[^/]*$\")"));
             // A symlink planted at a family name would relocate a future home
             // outside every rule above before its install ever wrote a credential.
@@ -301,7 +357,11 @@ impl OperatorCredentialFloor {
             );
         }
         for home in &self.homes {
-            credentials.push(literal_rule(&home.join(OPERATOR_SECRET_FILE)));
+            credentials.extend(
+                CREDENTIAL_FILES
+                    .iter()
+                    .map(|file| literal_rule(&home.join(file))),
+            );
             // An explicit home can sit under directories this process may
             // rename, so the home and each ancestor refuse unlink as well.
             home_nodes.extend(
@@ -700,15 +760,18 @@ mod tests {
     }
 
     #[test]
-    fn the_mcp_secret_and_other_files_are_not_the_credential() {
+    fn both_secrets_are_credentials_and_other_files_are_not() {
         let os_home = tempfile::tempdir().unwrap();
         let floor = floor_at(os_home.path());
         let home = os_home.path().join(".cairn");
-        for name in [
-            cairn_common::auth::MCP_SECRET_FILE,
-            "settings.yaml",
-            "operator_auth_secret.bak",
-        ] {
+        for name in CREDENTIAL_FILES {
+            assert!(floor.names_credential(&home.join(name)), "{name}");
+            assert!(
+                !floor.names_credential(&os_home.path().join("project").join(name)),
+                "{name} outside any Cairn home is a fixture"
+            );
+        }
+        for name in ["settings.yaml", "operator_auth_secret.bak"] {
             assert!(!floor.names_credential(&home.join(name)), "{name}");
         }
         // A file of the same name outside any Cairn home is a fixture, not a
@@ -771,6 +834,56 @@ mod tests {
         }
     }
 
+    /// The agent that launched a dev instance drives it from outside, so that
+    /// instance's machine secret stays readable to it. The instance's own agents
+    /// are still refused it, and nobody reads its operator credential.
+    #[test]
+    fn only_a_dev_instance_s_own_agents_are_refused_its_machine_secret() {
+        let os_home = tempfile::tempdir().unwrap();
+        let dev = os_home.path().join(".cairn-dev-feature");
+        let host = floor_at(os_home.path());
+        assert!(!host.names_credential(&dev.join(MCP_SECRET_FILE)));
+        assert!(host.names_credential(&dev.join(OPERATOR_SECRET_FILE)));
+        assert!(host.names_credential(&os_home.path().join(".cairn-dev").join(MCP_SECRET_FILE)));
+
+        let own = floor_at(os_home.path()).with_home(&dev);
+        assert!(own.names_credential(&dev.join(MCP_SECRET_FILE)));
+        assert!(own.sbpl_rules().contains(&format!("{}\"", MCP_SECRET_FILE)));
+    }
+
+    /// The Seatbelt regex has no lookahead, so the family it refuses is spelled
+    /// out. This pins that it is the family minus dev-instance homes, using the
+    /// same syntax in a regex engine that can run here.
+    #[test]
+    fn the_machine_secret_regex_is_the_family_minus_dev_instance_homes() {
+        let pattern = regex::Regex::new(&machine_secret_family_regex("/Users/x")).unwrap();
+        for refused in [
+            ".cairn",
+            ".cairnish",
+            ".cairn-",
+            ".cairn-d",
+            ".cairn-de",
+            ".cairn-dev",
+            ".cairn-devices",
+            ".cairn-executor",
+            ".cairn-containment-probe-1",
+            ".cairn-doc",
+            ".cairn-dex",
+        ] {
+            let path = format!("/Users/x/{refused}/mcp_auth_secret");
+            assert!(pattern.is_match(&path), "{path} must be refused");
+        }
+        for allowed in [
+            "/Users/x/.cairn-dev-feature/mcp_auth_secret",
+            "/Users/x/.cairn-dev-/mcp_auth_secret",
+            "/Users/x/.cairn/sub/mcp_auth_secret",
+            "/Users/x/.cairn/operator_auth_secret",
+            "/Users/y/.cairn/mcp_auth_secret",
+        ] {
+            assert!(!pattern.is_match(allowed), "{allowed} must not match");
+        }
+    }
+
     #[test]
     fn the_rules_name_every_home_and_refuse_renaming_one_away() {
         let floor = OperatorCredentialFloor::new(
@@ -779,7 +892,10 @@ mod tests {
         );
         let rules = floor.sbpl_rules();
         assert!(rules.contains(
-            r#"(deny file-read-data file-write* (regex #"^/Users/x/\.cairn[^/]*/operator_auth_secret$") (literal "/opt/cairn/home/operator_auth_secret"))"#
+            r#"(deny file-read-data file-write* (regex #"^/Users/x/\.cairn[^/]*/operator_auth_secret$") (regex #"^/Users/x/\.cairn("#
+        ));
+        assert!(rules.contains(
+            r#"(literal "/opt/cairn/home/operator_auth_secret") (literal "/opt/cairn/home/mcp_auth_secret"))"#
         ));
         assert!(rules.contains(r#"(deny file-write-unlink (regex #"^/Users/x/\.cairn[^/]*$")"#));
         for node in ["/opt/cairn/home", "/opt/cairn", "/opt"] {
@@ -842,7 +958,7 @@ mod tests {
         let os_home = tempfile::tempdir().unwrap();
         let home = os_home.path().join(".cairn");
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join(cairn_common::auth::MCP_SECRET_FILE), [0u8; 32]).unwrap();
+        std::fs::write(home.join("settings.yaml"), "").unwrap();
         let floor = floor_at(os_home.path());
         assert!(!floor.holds_a_credential());
         assert!(matches!(
@@ -850,12 +966,15 @@ mod tests {
             Confinement::Unconfined
         ));
 
-        std::fs::write(home.join(OPERATOR_SECRET_FILE), [0u8; 32]).unwrap();
-        assert!(floor.holds_a_credential());
-        assert!(matches!(
-            Confinement::for_branch_code_on(&floor),
-            Confinement::CredentialFloor
-        ));
+        for file in CREDENTIAL_FILES {
+            std::fs::write(home.join(file), [0u8; 32]).unwrap();
+            assert!(floor.holds_a_credential(), "{file}");
+            assert!(matches!(
+                Confinement::for_branch_code_on(&floor),
+                Confinement::CredentialFloor
+            ));
+            std::fs::remove_file(home.join(file)).unwrap();
+        }
     }
 
     #[test]

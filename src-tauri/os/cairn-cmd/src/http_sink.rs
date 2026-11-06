@@ -166,10 +166,11 @@ impl CallbackSink for HttpCallbackSink {
                 let status = resp.status();
                 let http_ok = status.is_success();
                 match resp.text().await {
-                    // A non-2xx callback (e.g. HTTP 413 when the body exceeds the
-                    // callback limit) is not a `CallbackResponse`; surface the
-                    // status and request size explicitly instead of failing to
-                    // parse the error body into an opaque message.
+                    // A non-2xx callback is reported by its status and request
+                    // size, since a proxy's or the body limit's answer (HTTP 413)
+                    // is no `CallbackResponse`. A refusal the runner itself
+                    // writes (a 401 naming what a credential may do) is one, and
+                    // its sentence is the only account of why, so it is kept.
                     Ok(text) if !http_ok => {
                         tracing::error!(
                             "MCP callback returned HTTP {} for tool {}: {}",
@@ -177,12 +178,21 @@ impl CallbackSink for HttpCallbackSink {
                             request.tool,
                             truncate_chars(&text, 500)
                         );
+                        let mut message = http_status_error_message(
+                            status.as_u16(),
+                            status.canonical_reason().unwrap_or("error"),
+                            request_bytes,
+                        );
+                        if let Some(refusal) = serde_json::from_str::<CallbackResponse>(&text)
+                            .ok()
+                            .map(|response| response.result)
+                            .filter(|result| !result.trim().is_empty())
+                        {
+                            message.push_str(" The runner said: ");
+                            message.push_str(&refusal);
+                        }
                         failed(
-                            http_status_error_message(
-                                status.as_u16(),
-                                status.canonical_reason().unwrap_or("error"),
-                                request_bytes,
-                            ),
+                            message,
                             CallbackFailureKind::HttpStatus(status.as_u16()),
                             started.elapsed(),
                         )
@@ -418,6 +428,48 @@ mod tests {
         .await;
         let gateway = outcome(url, None).await;
         assert_eq!(kind(&gateway), CallbackFailureKind::HttpStatus(504));
+        assert!(
+            !gateway.result.contains("The runner said"),
+            "{}",
+            gateway.result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_the_runner_writes_reaches_the_caller() {
+        let url = serving(|mut stream| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                // Closing with request bytes still unread resets the
+                // connection, which the client may see before the answer.
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !seen.ends_with(b"}") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = r#"{"result":"the machine credential speaks for no run"}"#;
+                let head = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            })
+        })
+        .await;
+        let refused = outcome(url, None).await;
+        assert_eq!(kind(&refused), CallbackFailureKind::HttpStatus(401));
+        assert!(refused.result.contains("HTTP 401"), "{}", refused.result);
+        assert!(
+            refused
+                .result
+                .ends_with("The runner said: the machine credential speaks for no run"),
+            "{}",
+            refused.result
+        );
     }
 
     #[tokio::test]

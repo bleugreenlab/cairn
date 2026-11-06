@@ -764,6 +764,14 @@ pub fn build_bug_uri() -> String {
     "cairn://bug".to_string()
 }
 
+pub fn build_self_rebuild_uri() -> String {
+    "cairn://self-rebuild".to_string()
+}
+
+pub fn build_self_rebuild_outcome_uri(id: &str) -> String {
+    format!("cairn://self-rebuild/{id}")
+}
+
 pub fn build_packs_uri() -> String {
     "cairn://packs".to_string()
 }
@@ -1537,6 +1545,7 @@ impl CairnResource {
             Self::Dev => "cairn://dev".to_string(),
             Self::DevDb => "cairn://dev/db".to_string(),
             Self::DevPid => "cairn://dev/pid".to_string(),
+            Self::DevLaunchTicket => "cairn://dev/launch-ticket".to_string(),
             Self::Logs => "cairn://logs".to_string(),
             Self::ChannelsConversations => "cairn://channels/conversations".to_string(),
             Self::Executors => "cairn://executors".to_string(),
@@ -1585,6 +1594,8 @@ impl CairnResource {
                 format!("cairn://executors/{name}/{action}")
             }
             Self::Bug => "cairn://bug".to_string(),
+            Self::SelfRebuild => build_self_rebuild_uri(),
+            Self::SelfRebuildOutcome { id } => build_self_rebuild_outcome_uri(id),
             Self::Help => "cairn://help".to_string(),
             Self::WebSearch => "cairn://websearch".to_string(),
             Self::Mcp { server, resource } => {

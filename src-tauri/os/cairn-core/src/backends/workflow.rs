@@ -69,12 +69,6 @@ pub(crate) async fn spawn_workflow_process(
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let run_db = resolve_run_db(WORKFLOW_BACKEND_NAME, orch, &params.run_id)?;
-    // Resolve every runner-owned input before admission so validation/auth errors
-    // cannot strand an acquired cell until heartbeat reclamation.
-    let secret = orch
-        .mcp_auth
-        .get_secret_for_mcp()
-        .map_err(|e| format!("Failed to get MCP auth secret: {e}"))?;
     let tip = crate::fleet::residency::resolve_logical_commit(
         orch,
         &params.repository_path,
@@ -242,7 +236,6 @@ pub(crate) async fn spawn_workflow_process(
         orch,
         &fence.holder,
         placed.as_deref(),
-        secret,
         &params.run_id,
         params.args_json,
         params.output_name,
@@ -287,13 +280,14 @@ pub(crate) async fn spawn_workflow_process(
                     } else {
                         ResidentProcessCwdRoot::ResidencyScratch
                     },
+                    // `CAIRN_HOME` is the executor's own, layered beneath this.
                     env: routed.env,
                     sandbox_mode,
                     sandbox_policy: None,
                     runtime_assets: assets,
                     io: ResidentProcessIoMode::Pipe,
                     node_scratch: None,
-                    relay: routed.relay,
+                    relay: Some(routed.relay),
                 },
             },
         )
@@ -354,54 +348,37 @@ pub(crate) async fn spawn_workflow_process(
     Ok(())
 }
 
-/// The workflow runtime's environment, routed for the machine `placed` names.
+/// The workflow runtime's environment, routed through the resident relay of the
+/// machine `placed` names.
 ///
 /// The runtime talks to Cairn only through its callback, so where that callback
-/// goes is the whole question. On this runner's machine it calls the loopback
-/// with the runner's secret. On any other it calls its executor's relay with a
-/// capability minted for this one process, speaking for `run_id`, the way a
-/// terminal or REPL there does; neither the secret nor the loopback leaves this
-/// machine. `CAIRN_HOME` is dropped from a relayed start: it names this
-/// runner's directory, which is no path on the machine the runtime runs on, and
-/// the SDK reads it only to find an on-disk secret that machine does not hold.
+/// goes is the whole question. Wherever it runs, this runner's own colocated
+/// executor included, it calls its executor's relay with a capability minted
+/// for this one process, speaking for `run_id`, the way a terminal or REPL
+/// does. Neither the machine secret, which speaks for no run, nor the loopback
+/// goes in its environment. `CAIRN_HOME` is the executor's own, layered beneath
+/// this.
 pub(crate) fn workflow_runtime_env(
     orch: &Orchestrator,
     holder: &cairn_common::executor_protocol::ResidencyHolder,
     placed: Option<&str>,
-    secret: String,
     run_id: &str,
     args_json: String,
     output_name: String,
 ) -> Result<crate::fleet::residency::RoutedResidentEnv, String> {
-    let env = vec![
-        ("CAIRN_RUN_ID".into(), run_id.to_string()),
-        ("CAIRN_MCP_SECRET".into(), secret),
-        (
-            "CAIRN_CALLBACK_URL".into(),
-            crate::fleet::residency::runner_callback_url(orch),
-        ),
-        ("CAIRN_ENV".into(), cairn_common::paths::env_str().into()),
-        (
-            "CAIRN_HOME".into(),
-            cairn_common::paths::cairn_home()
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        ("CAIRN_WORKFLOW_ARGS".into(), args_json),
-        ("CAIRN_WORKFLOW_OUTPUT".into(), output_name),
-    ];
-    let mut routed = crate::fleet::residency::route_resident_callbacks_on(
+    crate::fleet::residency::route_resident_callbacks_on(
         orch,
         placed,
         holder,
         run_id,
         Some(run_id),
-        env,
-    )?;
-    if routed.relay.is_some() {
-        routed.env.retain(|(name, _)| name != "CAIRN_HOME");
-    }
-    Ok(routed)
+        vec![
+            ("CAIRN_RUN_ID".into(), run_id.to_string()),
+            ("CAIRN_ENV".into(), cairn_common::paths::env_str().into()),
+            ("CAIRN_WORKFLOW_ARGS".into(), args_json),
+            ("CAIRN_WORKFLOW_OUTPUT".into(), output_name),
+        ],
+    )
 }
 
 fn workflow_runtime_assets(package: &Path) -> Result<Vec<ResidentRuntimeAsset>, String> {

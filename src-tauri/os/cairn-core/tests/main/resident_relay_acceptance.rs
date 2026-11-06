@@ -48,7 +48,7 @@ async fn a_remote_terminal_reads_its_home_through_its_executors_relay() {
     let body = probe.join("body.json");
     std::fs::write(
         &body,
-        r#"{"cwd":"","tool":"read","payload":{"paths":["cairn:~"]}}"#,
+        r#"{"cwd":"","tool":"read_batch","payload":{"paths":["cairn:~"]}}"#,
     )
     .unwrap();
     let (env, read, code) = (probe.join("env"), probe.join("read"), probe.join("code"));

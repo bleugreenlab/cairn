@@ -1194,10 +1194,10 @@ pub(crate) async fn build_agent_spawn_config(
     if let (Some(policy), Some((scratch, _))) = (confinement.policy_mut(), &job_scratch) {
         policy.grant_tmpdir(scratch);
     }
-    // Inject the MCP callback env so an in-run `cairn read|change ...` shell
-    // invocation can authenticate and forward to this same app (the basis for
-    // composability like `cairn read <uri> | rg ...`). The CLI is a thin client;
-    // it never opens the DB, it forwards over this callback.
+    // No MCP credential is injected. Every agent process batch is placed on an
+    // executor, which gives its items a capability bound to the batch's run;
+    // this host spawn is reached by no agent shell or script item, and the
+    // machine secret speaks for no run, so it would authenticate nothing here.
     // Point uv at the shared, per-home Cairn package cache (`<cairn_home>/uv-cache`)
     // so every agent shares warm caches and uv never writes to `~/.cache/uv`,
     // which is outside the fence's writable set. The dir is in the sandbox
@@ -1256,9 +1256,6 @@ pub(crate) async fn build_agent_spawn_config(
     // (live-checkout) cwd, so that path is untouched.
     for (k, v) in crate::mcp::vcs::worktree_shell_vcs_env(orch, std::path::Path::new(cwd)) {
         spawn_config = spawn_config.env(&k, &v);
-    }
-    if let Ok(secret) = orch.mcp_auth.get_secret_for_mcp() {
-        spawn_config = spawn_config.env("CAIRN_MCP_SECRET", &secret);
     }
     // Managed Build Services: inject each enabled service's client env so the
     // agent's tooling connects to the Cairn-owned daemon (e.g. the shared sccache
@@ -2120,6 +2117,10 @@ mod tests {
         assert_eq!(
             config.env.get("CAIRN_HOME_URI").map(String::as_str),
             Some("cairn://p/team-home/design")
+        );
+        assert!(
+            !config.env.contains_key("CAIRN_MCP_SECRET"),
+            "a host spawn carries no MCP credential"
         );
     }
 

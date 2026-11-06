@@ -515,7 +515,7 @@ async fn restart_terminal_process(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT job_id, project_id, slug, command, title, residency_holder, id, executor_selector
+                        "SELECT job_id, project_id, slug, command, title, residency_holder, id, executor_selector, created_by_run_id
                  FROM job_terminals
                  WHERE slug = ?2 AND ((residency_holder = ?1 AND residency_incarnation_id = ?3 AND cell_epoch = ?4)
                     OR (status = 'exited'
@@ -538,6 +538,7 @@ async fn restart_terminal_process(
                     row.opt_text(5)?,
                     row.text(6)?,
                     row.opt_text(7)?,
+                    row.opt_text(8)?,
                 ))
             })
         })
@@ -576,6 +577,7 @@ async fn restart_terminal_process(
         .await
         .map_err(|error| error.to_string())?;
     target.selector = selector;
+    target.created_by_run_id = row.8.clone();
     // This is the fenced recovery of the row that already owns the slug, not a
     // competing create. New terminal creation performs the live-slug admission
     // check before it reaches this path.
@@ -1447,6 +1449,10 @@ struct TerminalResourceTarget {
     /// The `executor` the terminal was created with. Written on its row and
     /// read back by recovery, so it holds for the terminal's whole life.
     selector: Option<ExecutorSelector>,
+    /// The run that created the terminal, written on its row and read back by
+    /// recovery. A project terminal speaks for no run, so this is what says who
+    /// is answerable for it.
+    created_by_run_id: Option<String>,
 }
 
 async fn resolve_terminal_resource_target(
@@ -1518,6 +1524,7 @@ async fn resolve_terminal_resource_target(
                         }),
                         lease: None,
                         selector: None,
+                        created_by_run_id: None,
                     })
                 }
                 CairnResource::TaskTerminal {
@@ -1584,6 +1591,7 @@ async fn resolve_terminal_resource_target(
                         }),
                         lease: None,
                         selector: None,
+                        created_by_run_id: None,
                     })
                 }
                 CairnResource::ProjectTerminal { project, slug } => {
@@ -1608,6 +1616,7 @@ async fn resolve_terminal_resource_target(
                         owner_ref: None,
                         lease: None,
                         selector: None,
+                        created_by_run_id: None,
                     })
                 }
                 _ => Err(crate::storage::DbError::Row(
@@ -1667,8 +1676,10 @@ async fn insert_terminal_resource(
     let description = description.map(ToOwned::to_owned);
     let lease = target.lease.clone();
     let selector = crate::fleet::residency::persisted_resident_selector(target.selector.as_ref());
+    let created_by_run_id = target.created_by_run_id.clone();
 
     db.write(|conn| {
+        let created_by_run_id = created_by_run_id.clone();
         let job_id = job_id.clone();
         let project_id = project_id.clone();
         let run_id = run_id.clone();
@@ -1707,9 +1718,10 @@ async fn insert_terminal_resource(
                 INSERT INTO job_terminals (
                     id, job_id, project_id, run_id, session_id, command, title,
                     description, status, exit_code, created_at, exited_at, slug,
-                    residency_holder, residency_incarnation_id, cell_epoch, executor_selector
+                    residency_holder, residency_incarnation_id, cell_epoch, executor_selector,
+                    created_by_run_id
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', NULL, ?9, NULL, ?10, ?11, ?12, ?13, ?14)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', NULL, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15)
                 ",
                 params![
                     id.as_str(),
@@ -1730,6 +1742,7 @@ async fn insert_terminal_resource(
                     lease.as_ref().map(|fence| fence.incarnation_id.as_str()),
                     lease.as_ref().map(|fence| fence.cell_epoch as i64),
                     selector.as_deref(),
+                    created_by_run_id.as_deref(),
                 ],
             )
             .await?;
@@ -1737,6 +1750,61 @@ async fn insert_terminal_resource(
         })
     })
     .await
+}
+
+/// A running terminal that speaks for no run: its URI, and the run that created it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunLessTerminal {
+    pub uri: String,
+    pub created_by_run_id: Option<String>,
+}
+
+/// The running, run-less terminal whose process is `session_id`, if there is one.
+pub(crate) async fn run_less_terminal_for_session(
+    db: &LocalDb,
+    session_id: &str,
+) -> Result<Option<RunLessTerminal>, String> {
+    let session_id = session_id.to_string();
+    let row = db
+        .read(|conn| {
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT job_id, project_id, slug, created_by_run_id
+                         FROM job_terminals
+                         WHERE session_id = ?1 AND status = 'running' AND run_id IS NULL
+                         LIMIT 1",
+                        (session_id.as_str(),),
+                    )
+                    .await?;
+                rows.next()
+                    .await?
+                    .map(|row| {
+                        Ok((
+                            row.opt_text(0)?,
+                            row.opt_text(1)?,
+                            row.text(2)?,
+                            row.opt_text(3)?,
+                        ))
+                    })
+                    .transpose()
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((job_id, project_id, slug, created_by_run_id)) = row else {
+        return Ok(None);
+    };
+    let resource = match (job_id, project_id) {
+        (Some(job_id), _) => terminal_resource_for_job(db, &job_id, slug).await?,
+        (None, Some(project_id)) => terminal_resource_for_project(db, &project_id, slug).await?,
+        (None, None) => return Err("terminal row names no job and no project".to_string()),
+    };
+    Ok(Some(RunLessTerminal {
+        uri: resource.to_uri(),
+        created_by_run_id,
+    }))
 }
 
 /// Whether a live terminal with this slug exists in the job scope. Only a
@@ -2541,6 +2609,7 @@ pub(crate) async fn create_terminal_from_resource(
         .await
         .map_err(|e| e.to_string())?;
     target.selector = selector.cloned();
+    target.created_by_run_id = caller_run_id.map(ToOwned::to_owned);
     let subscriber_job_id =
         match (&wake, target.job_id.as_deref()) {
             (Some(_), Some(job_id)) => Some(job_id.to_string()),
@@ -3023,11 +3092,9 @@ async fn spawn_terminal_session(
         home_uri.as_deref(),
         target.branch.as_deref(),
         &session_id,
-        crate::fleet::residency::runner_callback_url(orch),
-        orch.mcp_auth.get_secret_for_mcp().ok(),
     );
-    // A PTY on another machine reaches this runner through its executor's
-    // relay, with a capability for this one process in place of the secret.
+    // A PTY reaches this runner through its executor's resident relay, with a
+    // capability for this one process.
     let (env, relay) = match crate::fleet::residency::route_resident_callbacks(
         orch,
         &fence.holder,
@@ -3035,7 +3102,7 @@ async fn spawn_terminal_session(
         target.run_id.as_deref(),
         env,
     ) {
-        Ok(routed) => (routed.env, routed.relay),
+        Ok(routed) => (routed.env, Some(routed.relay)),
         Err(error) => {
             rollback_terminal_creation(orch, &session_id, &fence).await;
             return Err(error);
@@ -3218,19 +3285,15 @@ async fn spawn_terminal_session(
 /// `UV_CACHE_DIR` is `<cairn_home>/uv-cache` on this machine, a directory an
 /// executor elsewhere does not have.
 ///
-/// Transport is where a terminal differs from a batch. A batch reaches the
-/// runner through a per-batch relay capability its executor injects. A
-/// terminal on this runner's machine carries this runner's callback address
-/// and secret, and the fleet scrubs that secret from relayed terminal output;
-/// one on another machine has both replaced by its executor's resident relay
-/// ([`crate::fleet::residency::route_resident_callbacks`]).
+/// Transport is added afterwards. A batch reaches the runner through a
+/// per-batch relay capability its executor injects; a terminal, on any
+/// machine, through its executor's resident relay with a capability for this
+/// one process ([`crate::fleet::residency::route_resident_callbacks`]).
 fn terminal_process_env(
     run_id: Option<&str>,
     home_uri: Option<&str>,
     managed_branch: Option<&str>,
     session_id: &str,
-    callback_url: String,
-    mcp_secret: Option<String>,
 ) -> Vec<(String, String)> {
     // A terminal carries no batch pin: it was placed for its job, not asked to
     // run anywhere in particular.
@@ -3238,10 +3301,6 @@ fn terminal_process_env(
     // Child tooling can carry the exact tracked-terminal relationship across a
     // launcher handoff. This is provenance only; it grants no terminal control.
     env.push(("CAIRN_TERMINAL_SESSION_ID".into(), session_id.to_string()));
-    env.push(("CAIRN_CALLBACK_URL".into(), callback_url));
-    if let Some(secret) = mcp_secret {
-        env.push(("CAIRN_MCP_SECRET".into(), secret));
-    }
     // A PTY needs a terminal type, and the only true one is the type the
     // frontend emulates. Whatever TERM the executor process happens to carry
     // describes no terminal this PTY is attached to; without one at all, every
@@ -3662,6 +3721,7 @@ mod terminal_finalize_tests {
             owner_ref: Some(owner_ref),
             lease: None,
             selector: None,
+            created_by_run_id: None,
         }
     }
 
@@ -4297,6 +4357,7 @@ mod terminal_finalize_tests {
                 owner_ref: None,
                 lease: Some(fence.clone()),
                 selector: None,
+                created_by_run_id: None,
             },
             fence,
         )
@@ -5805,6 +5866,65 @@ mod terminal_finalize_tests {
             "a restarted operator terminal must come back as a bare shell, not a replay of their command: {:?}",
             spec.args
         );
+        executor.abort();
+    }
+
+    /// A restart replaces the row and its session, and the terminal still answers
+    /// to the run that created it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_restarted_terminal_still_names_the_run_that_created_it() {
+        let db = crate::storage::migrated_test_db("term_restart_creator.db").await;
+        let orch = test_orchestrator(db);
+        let checkout = tempdir().unwrap();
+        seed_managed_job_terminal_checkout(&orch, checkout.path()).await;
+        let resource = node_terminal_resource("direct");
+        let target = resolve_terminal_resource_target(&orch.db.local, &resource)
+            .await
+            .unwrap();
+        let request = terminal_residency_acquisition(&orch, &target)
+            .await
+            .unwrap();
+        let cell = terminal_slot_for_request(&request, checkout.path());
+        let fence = fence_from_cell(&cell);
+        let (executor, _releases, _ops, _start_process) =
+            attach_fake_terminal_executor_with_cell(&orch, cell, FakeTerminalStart::StaysRunning);
+
+        create_terminal_from_resource(
+            &orch,
+            &resource,
+            "sleep 100",
+            None,
+            None,
+            Some("run-creator"),
+            None,
+        )
+        .await
+        .expect("creating an agent terminal should succeed");
+
+        let creator = |orch: Orchestrator| async move {
+            orch.db
+                .local
+                .query_opt(
+                    "SELECT created_by_run_id FROM job_terminals WHERE slug = 'direct'",
+                    (),
+                    |row| row.opt_text(0),
+                )
+                .await
+                .unwrap()
+                .flatten()
+        };
+        assert_eq!(creator(orch.clone()).await.as_deref(), Some("run-creator"));
+
+        orch.pty_state.sessions.lock().unwrap().clear();
+        crate::terminal_host::prepare_terminal_recovery(&orch)
+            .await
+            .unwrap();
+        restart_terminal_process(&orch, fence, "direct")
+            .await
+            .expect("recovery restarts the terminal");
+
+        assert_eq!(creator(orch.clone()).await.as_deref(), Some("run-creator"));
         executor.abort();
     }
 

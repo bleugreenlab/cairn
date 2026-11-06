@@ -253,6 +253,83 @@ pub async fn journal_served_api_decision(
     }
 }
 
+/// Journal one dev-instance launch connection against what admitted it: the
+/// issuer of a launch ticket, or `None` for the operator's own credential. A
+/// ticket issued to a run-less terminal is attributed to the run that created the
+/// terminal, if one did, and the row names the terminal. A launch starts a process
+/// under the user's account with no run transcript to record it, so this is where
+/// it is attributed. A failure is logged and never fails the launch.
+pub async fn journal_dev_instance_launch(
+    orch: &Orchestrator,
+    ticket_issuer: Option<&crate::dev_instances::launch_ticket::Issuer>,
+) {
+    use crate::dev_instances::launch_ticket::Issuer;
+    let (run_id, terminal_uri, admitted_by) = match ticket_issuer {
+        None => (None, None, "the operator credential".to_string()),
+        Some(Issuer::Run(run_id)) => (
+            Some(run_id.as_str()),
+            None,
+            format!("a one-time launch ticket issued to run {run_id}"),
+        ),
+        Some(Issuer::Terminal(terminal)) => (
+            terminal.created_by_run_id.as_deref(),
+            Some(terminal.uri.clone()),
+            match &terminal.created_by_run_id {
+                Some(creator) => format!(
+                    "a one-time launch ticket issued to terminal {}, created by run {creator}",
+                    terminal.uri
+                ),
+                None => format!(
+                    "a one-time launch ticket issued to terminal {}, with no run recorded as its \
+                     creator: the app or /api/invoke started it, or it is older than that record",
+                    terminal.uri
+                ),
+            },
+        ),
+    };
+    let request = McpCallbackRequest {
+        run_id: run_id.map(str::to_string),
+        ..Default::default()
+    };
+    let actor = match run_id {
+        Some(_) => resolve_actor(orch, &request).await,
+        None => None,
+    };
+    let (principal, audience, db) = match actor {
+        Some(actor) => (actor.principal, actor.audience, actor.db),
+        None => (
+            AuthorityPrincipal::default(),
+            AuthorityAudience::workspace(WORKSPACE_ID),
+            orch.db.local.clone(),
+        ),
+    };
+    let event = NewAuthorizationEvent {
+        scope: AuthorityScope::new(
+            AuthorityPlace::Resource {
+                canonical_uri: "cairn://dev/launch-ticket".to_string(),
+            },
+            AuthorityAction::Write,
+        ),
+        mutation: AuthorityMutation::Create.as_str().to_string(),
+        summary: format!("dev-instance launch admitted by {admitted_by}"),
+        outcome: AuthorityDecision::Direct.as_str().to_string(),
+        reason: AuthorityReason::WithinExistingAuthority
+            .as_str()
+            .to_string(),
+        principal,
+        audience,
+        run_id: run_id.map(str::to_string),
+        request_uri: terminal_uri,
+        grant_id: None,
+        decision_actor: None,
+        appearance_snapshot: None,
+        decided_at: now(),
+    };
+    if let Err(error) = store::append_event(&db, event).await {
+        log::warn!("failed to journal a dev-instance launch: {error}");
+    }
+}
+
 /// One row an instrument-carried act wrote: what happened, to which table, and
 /// the row it names.
 #[derive(Debug, Clone)]

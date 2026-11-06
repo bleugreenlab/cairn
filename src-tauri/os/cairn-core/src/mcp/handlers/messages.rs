@@ -117,7 +117,12 @@ async fn sender_context(
     // run. It has no node URI, so it is recorded under the shared external-sender
     // name that `messages::render` renders a no-address reply hint for.
     let Some(_) = request.run_id.as_ref() else {
-        return Ok((None, crate::messages::render::EXTERNAL_SENDER.to_string()));
+        let sender = if request.is_unverified_local() {
+            crate::messages::render::UNVERIFIED_LOCAL_SENDER
+        } else {
+            crate::messages::render::EXTERNAL_SENDER
+        };
+        return Ok((None, sender.to_string()));
     };
 
     let run_ctx = super::run_context::lookup_run(db, request).await?;
@@ -398,6 +403,8 @@ pub async fn append_project_or_issue_message(
     if let Some(number) = issue_number {
         let source = if sender_run_id.is_some() {
             "agent"
+        } else if sender_name == crate::messages::render::UNVERIFIED_LOCAL_SENDER {
+            crate::messages::render::UNVERIFIED_LOCAL_SENDER
         } else {
             "user"
         };
@@ -621,8 +628,8 @@ pub async fn append_direct_message_with_urgency(
     // the push key, so the shared `mute_downgrade` rule is applied here rather
     // than in the central issue-mute path inside `push`. A user sender is the
     // `user` source; an agent sender is a `peer` keyed by sender name — matching
-    // the legacy `WakeSource::User`/`Peer` axis.
-    let (source_kind, source_ref) = if request.run_id.is_none() {
+    // the legacy `WakeSource::User`/`Peer` axis. An unverified sender is no user.
+    let (source_kind, source_ref) = if request.run_id.is_none() && !request.is_unverified_local() {
         ("user", None)
     } else {
         ("peer", Some(sender_name.as_str()))

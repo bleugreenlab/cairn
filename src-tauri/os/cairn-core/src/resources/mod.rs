@@ -44,6 +44,7 @@ mod rebase;
 mod recipes;
 mod responses;
 mod routes;
+pub mod self_rebuild;
 mod services;
 mod settings;
 mod spend;

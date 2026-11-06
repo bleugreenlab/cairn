@@ -920,6 +920,9 @@ fn finalize_run_inner(
     // idempotent.
     orch.run_bearers
         .revoke_run(run_id, &format!("finalized ({status})"));
+    // A pooled Codex server's bearer outlives this run, so it is the run's
+    // thread bindings that must stop answering for it.
+    orch.codex_pool.release_run(run_id);
     // Finalization ends this physical process lifetime, so its generation-fenced
     // provider-runtime claim is released before any teardown below can drop the
     // handle that carries it.

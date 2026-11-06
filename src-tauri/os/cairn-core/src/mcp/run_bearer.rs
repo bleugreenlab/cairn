@@ -1,15 +1,26 @@
-//! Per-run bearer tokens for the orchestrator's streamable-HTTP MCP endpoint.
+//! Per-run bearer tokens: the credential every agent process this runner
+//! spawns presents to its MCP callback.
 //!
 //! # Why a bearer per run
 //!
-//! The stdio path authenticates with the machine's MCP secret: one value, stable
-//! across restarts, held by every agent this machine spawns. That is tolerable
-//! only because the agent runs on the same machine as the runner and its run id
-//! arrives in the environment the runner gave it. An agent on another host
-//! presents nothing but what its MCP client sends, so the credential itself has
-//! to say which run is calling. A run bearer does: it identifies exactly one
-//! run, the endpoint attributes every call to that run from the token alone,
-//! and it stops working when the run finalizes.
+//! The credential itself has to say which run is calling, because whatever a
+//! request body claims is chosen by whoever holds the credential. A run bearer
+//! does: it identifies exactly one run, the endpoint attributes every call to
+//! that run from the token alone ([`bind_request_to_run`]), and it stops
+//! working when the run finalizes. Both attachments carry one: the stdio shim
+//! (`cairn-cmd mcp`, which posts to the runner's loopback `/api/mcp`) and the
+//! streamable-HTTP endpoint. The machine's MCP secret speaks for no run at all.
+//!
+//! # The one bearer that spans runs
+//!
+//! A pooled Codex app-server hosts many runs' ephemeral calls behind one
+//! `cairn-cmd`, so no single run's bearer can be its credential. Its bearer is
+//! scoped to that one server instead ([`BearerScope::CodexPool`]): a request
+//! must name a thread that is a live call on that server, and is attributed to
+//! that call's run ([`bind_request_to_pool_thread`]). It is revoked when the
+//! server closes. This is the only credential whose authority covers more than
+//! one run, and it is bounded by the server's own calls: a call stops counting
+//! the moment its run finalizes, though the bearer lives on for its neighbours.
 //!
 //! # Why the book is process-local
 //!
@@ -57,49 +68,79 @@ pub fn public_mcp_url(orch: &Orchestrator) -> String {
 
 /// The streamable-HTTP attachment for one run, with a bearer freshly minted
 /// for it and bound to the attachment's host.
-///
-/// The one way a run gets an HTTP attachment: session start uses it today, and
-/// a hub's session-create request will carry what it returns.
 pub fn attachment_for_run(
     orch: &Orchestrator,
     run_id: &str,
     node_uri: &str,
 ) -> Result<(McpServer, RunBearer), String> {
-    let url = public_mcp_url(orch);
-    let audience = audience_for_url(&url)?;
-    let bearer = orch
+    let attachment = McpServer::cairn_http(public_mcp_url(orch));
+    let bearer = bearer_for_attachment(orch, &attachment, run_id, node_uri)?;
+    Ok((attachment, bearer))
+}
+
+/// A bearer for `run_id`, bound to the destination `attachment` reaches: the
+/// public endpoint's host for HTTP, this machine's loopback for the stdio
+/// shim.
+pub fn bearer_for_attachment(
+    orch: &Orchestrator,
+    attachment: &McpServer,
+    run_id: &str,
+    node_uri: &str,
+) -> Result<RunBearer, String> {
+    orch.run_bearers
+        .mint(run_id, node_uri, attachment_audience(attachment)?)
+        .map_err(|refusal| refusal.to_string())
+}
+
+/// A bearer for the pooled Codex server `server_id`, bound to the destination
+/// `attachment` reaches. See the module docs on why it alone spans runs.
+pub fn bearer_for_pool(
+    orch: &Orchestrator,
+    attachment: &McpServer,
+    server_id: &str,
+) -> Result<RunBearer, String> {
+    Ok(orch
         .run_bearers
-        .mint(run_id, node_uri, audience)
-        .map_err(|refusal| refusal.to_string())?;
-    Ok((McpServer::cairn_http(url), bearer))
+        .mint_pool(server_id, attachment_audience(attachment)?))
+}
+
+/// The variable `cairn-cmd` reads its callback credential from. The name
+/// predates per-run bearers; what it carries is now always a bearer.
+pub const STDIO_CREDENTIAL_ENV: &str = "CAIRN_MCP_SECRET";
+
+/// Where `attachment`'s agent sends the bearer it presents: the HTTP
+/// endpoint, or the loopback callback the stdio shim posts to.
+fn attachment_destination(attachment: &McpServer) -> Result<&str, String> {
+    match &attachment.transport {
+        McpTransport::Http { url, .. } => Ok(url),
+        McpTransport::Stdio { env, .. } => env
+            .get("CAIRN_CALLBACK_URL")
+            .map(String::as_str)
+            .ok_or_else(|| "a stdio MCP attachment names no CAIRN_CALLBACK_URL".to_string()),
+    }
+}
+
+fn attachment_audience(attachment: &McpServer) -> Result<LeaseAudience, String> {
+    audience_for_url(attachment_destination(attachment)?)
 }
 
 /// The environment variable, and its value, that an agent process's MCP entry
-/// authenticates with: the machine secret for the stdio shim, or the run's
-/// bearer for the HTTP endpoint.
+/// authenticates with: its bearer, under the name the stdio shim or the HTTP
+/// client reads it from.
 pub fn mcp_credential_env(
-    orch: &Orchestrator,
     attachment: &McpServer,
-    bearer: Option<&RunBearer>,
+    bearer: &RunBearer,
 ) -> Result<(&'static str, String), String> {
-    match &attachment.transport {
-        McpTransport::Stdio { .. } => orch
-            .mcp_auth
-            .get_secret_for_mcp()
-            .map(|secret| ("CAIRN_MCP_SECRET", secret))
-            .map_err(|e| format!("Failed to get MCP auth secret: {e}")),
-        McpTransport::Http { url, .. } => {
-            let bearer = bearer.ok_or_else(|| {
-                "an HTTP MCP attachment needs its run's bearer, and none was minted".to_string()
-            })?;
-            // Presented to the agent that will carry it to `url`, so the
-            // audience is derived from where it is going.
-            let presented = bearer
-                .present(&audience_for_url(url)?)
-                .map_err(|denied| format!("run bearer not presentable: {denied}"))?;
-            Ok((MCP_TOKEN_ENV, presented.expose().to_string()))
-        }
-    }
+    let var = match &attachment.transport {
+        McpTransport::Stdio { .. } => STDIO_CREDENTIAL_ENV,
+        McpTransport::Http { .. } => MCP_TOKEN_ENV,
+    };
+    // Presented to the agent that will carry it to the attachment's
+    // destination, so the audience is derived from where it is going.
+    let presented = bearer
+        .present(&attachment_audience(attachment)?)
+        .map_err(|denied| format!("run bearer not presentable: {denied}"))?;
+    Ok((var, presented.expose().to_string()))
 }
 
 /// The value a project service process presents to `audience`, where it
@@ -129,22 +170,20 @@ pub fn relay_audience(executor_id: &str) -> LeaseAudience {
     LeaseAudience::process(format!("executor-relay:{executor_id}"))
 }
 
-/// Hold a callback request to the one run its credential speaks for: a
-/// request may not name a pooled thread, which would re-attribute it to
-/// whichever run holds that thread, and a run it names must be this one. An
-/// absent run is filled with it.
+/// Hold a callback request to the one run its credential speaks for: a run it
+/// names must be this one, and an absent run is filled with it. A thread it names
+/// is dropped, not refused. Codex stamps `_meta.threadId` on every tool call,
+/// pooled or not, so a per-run session always sends one, and left in place it
+/// would re-attribute the request to whichever run holds that thread.
 ///
 /// The rule every per-run credential gets, whether it arrived as a bearer at
-/// `/api/mcp` or through an executor's resident relay.
+/// `/api/mcp` or through an executor's resident relay. [`bind_request`]
+/// applies it, or the pool rule, by the bearer's scope.
 pub fn bind_request_to_run(
     request: &mut crate::mcp::types::McpCallbackRequest,
     run_id: &str,
 ) -> Result<(), String> {
-    if request.thread_id.is_some() {
-        return Err(format!(
-            "this credential speaks for run {run_id} alone and cannot name a pooled thread"
-        ));
-    }
+    request.thread_id = None;
     match request
         .run_id
         .as_deref()
@@ -158,6 +197,215 @@ pub fn bind_request_to_run(
             Ok(())
         }
     }
+}
+
+/// The `CAIRN_RUN_ID` a pooled Codex server's `cairn-cmd` carries. It names no
+/// run: every pooled call is attributed by its thread.
+pub const POOLED_CODEX_RUN_SENTINEL: &str = "codex-pooled-app-server";
+
+/// Hold a pooled Codex server's callback to one of that server's own calls.
+///
+/// The request must name a thread that is a live call on server `server_id`;
+/// it is attributed to that call's run. A run it names besides the sentinel
+/// must be that run. A thread on another server, a closed server, or no
+/// thread at all is refused.
+///
+/// So is a thread whose run has been revoked. Finalization also removes the
+/// binding, but a call that registers while its run finalizes can land after
+/// that removal, and the book is what says the run is over.
+pub fn bind_request_to_pool_thread(
+    pools: &crate::backends::codex::pool::CodexAppServerPool,
+    bearers: &RunBearerBook,
+    request: &mut crate::mcp::types::McpCallbackRequest,
+    server_id: &str,
+) -> Result<(), String> {
+    let Some(thread_id) = request
+        .thread_id
+        .as_deref()
+        .filter(|thread| !thread.is_empty())
+    else {
+        return Err(format!(
+            "this credential speaks for the calls on pooled Codex server {server_id}, and the \
+             request names none of its threads"
+        ));
+    };
+    let Some(binding) = pools.binding_for_server_thread(server_id, thread_id) else {
+        return Err(format!(
+            "thread {thread_id} is not a live call on pooled Codex server {server_id}"
+        ));
+    };
+    if bearers.run_is_revoked(&binding.run_id) {
+        return Err(format!(
+            "thread {thread_id} belongs to run {}, which has finalized",
+            binding.run_id
+        ));
+    }
+    match request
+        .run_id
+        .as_deref()
+        .filter(|claimed| !claimed.is_empty() && *claimed != POOLED_CODEX_RUN_SENTINEL)
+    {
+        Some(claimed) if claimed != binding.run_id => Err(format!(
+            "thread {thread_id} belongs to run {}, and the request claims run {claimed}",
+            binding.run_id
+        )),
+        _ => {
+            request.run_id = Some(binding.run_id);
+            Ok(())
+        }
+    }
+}
+
+/// Hold a request to what its verified bearer speaks for.
+pub fn bind_request(
+    orch: &Orchestrator,
+    request: &mut crate::mcp::types::McpCallbackRequest,
+    scope: &BearerScope,
+) -> Result<(), String> {
+    match scope {
+        BearerScope::Run(run_id) => bind_request_to_run(request, run_id),
+        BearerScope::CodexPool(server_id) => {
+            bind_request_to_pool_thread(&orch.codex_pool, &orch.run_bearers, request, server_id)
+        }
+    }
+}
+
+/// The callback tools a request that speaks for no run may call. Every other
+/// tool needs a credential that names a run, and these read `cairn://` resources
+/// alone (`handlers::read::batch` refuses such a request any host file or web
+/// target). Adding a tool widens what a local process can do with no run to
+/// answer for it, so `the_run_less_allowlist_is_pinned` makes that a reviewed
+/// change.
+const RUN_LESS_TOOLS: &[&str] = &[
+    "read_batch",
+    "read_resource",
+    "read_issue_resource",
+    "watch",
+    "process_info",
+];
+
+/// `request`, when it is one `write` of one append and nothing else: no commit
+/// message, branch or other batch option. A typed client serializes its unset
+/// options as null (or `false`), so those count as absent.
+fn lone_append(
+    request: &crate::mcp::types::McpCallbackRequest,
+) -> Option<(cairn_common::uri::CairnResource, &serde_json::Value)> {
+    if request.tool != "write" {
+        return None;
+    }
+    let batch = request.payload.as_object()?;
+    let unset = |key: &str, value: &serde_json::Value| {
+        key == "changes"
+            // The CLI's stamp of what kind of caller it is. It grants nothing.
+            || key == cairn_common::protocol::CALLBACK_ORIGIN_KEY
+            || value.is_null()
+            || (key != "commit_msg" && *value == serde_json::Value::Bool(false))
+    };
+    if !batch.iter().all(|(key, value)| unset(key, value)) {
+        return None;
+    }
+    let [change] = batch.get("changes")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let change = change.as_object()?;
+    if change
+        .keys()
+        .any(|key| !matches!(key.as_str(), "target" | "mode" | "payload"))
+        || change.get("mode")?.as_str()? != "append"
+    {
+        return None;
+    }
+    let target = cairn_common::uri::parse_uri(change.get("target")?.as_str()?)?;
+    Some((target, change.get("payload")?))
+}
+
+/// `request`'s target, when it is one append of `{content}` and nothing else.
+pub(crate) fn lone_content_append(
+    request: &crate::mcp::types::McpCallbackRequest,
+) -> Option<cairn_common::uri::CairnResource> {
+    let (target, payload) = lone_append(request)?;
+    let payload = payload.as_object()?;
+    (payload.len() == 1 && payload.get("content").is_some_and(|c| c.is_string())).then_some(target)
+}
+
+/// A thread's, an issue's, a node's or a task's `/messages` collection. Exact, so
+/// a table a thread's database happens to name `messages` is not one.
+fn is_message_collection(target: &cairn_common::uri::CairnResource) -> bool {
+    use cairn_common::uri::CairnResource as R;
+    match target {
+        R::IssueMessages { .. } | R::NodeMessages { .. } | R::TaskMessages { .. } => true,
+        R::Thread { path, .. } => matches!(
+            path.iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            ["messages"] | ["task", _, "messages"]
+        ),
+        _ => false,
+    }
+}
+
+/// Hold a request that speaks for no run to the run-less allowlist, and mark it
+/// as such. It may claim no run. It reaches [`RUN_LESS_TOOLS`]; the delivery of a
+/// pending self-rebuild outcome, the one write with no run left to make it; and
+/// a message to a `/messages` collection, because a local agent outside Cairn has
+/// no other way in. That message is labelled as unverified wherever it is stored
+/// or shown, since nothing proves who sent it.
+fn hold_run_less(
+    request: &mut crate::mcp::types::McpCallbackRequest,
+    holder: &str,
+    also_admits: impl Fn(&crate::mcp::types::McpCallbackRequest) -> bool,
+) -> Result<(), String> {
+    // Codex stamps a thread on every call, and only a pool credential resolves one.
+    request.thread_id = None;
+    if let Some(claimed) = request
+        .run_id
+        .as_deref()
+        .filter(|claimed| !claimed.is_empty())
+    {
+        return Err(format!(
+            "{holder} speaks for no run, and the request claims run {claimed}"
+        ));
+    }
+    let admitted = RUN_LESS_TOOLS.contains(&request.tool.as_str())
+        || crate::resources::self_rebuild::is_self_rebuild_delivery(request)
+        || lone_content_append(request).is_some_and(|target| is_message_collection(&target))
+        || also_admits(request);
+    if !admitted {
+        return Err(format!(
+            "{holder} speaks for no run: it can read cairn:// resources, watch, and post a \
+             message to a /messages collection, not make this `{}` call. Make it from a Cairn \
+             run, or as the operator in the desktop app",
+            request.tool
+        ));
+    }
+    request.run_id = None;
+    request.origin = Some(cairn_common::protocol::DispatchOrigin::UnverifiedLocal);
+    Ok(())
+}
+
+/// Hold a callback request to what the machine credential may do.
+pub fn hold_to_machine_credential(
+    request: &mut crate::mcp::types::McpCallbackRequest,
+) -> Result<(), String> {
+    hold_run_less(request, "the machine credential", |_| false)
+}
+
+/// Hold a call from a resident process started for no run, such as a project
+/// terminal, to the same allowlist. A process Cairn started may also ask for a
+/// dev-instance launch ticket, which is how `bun dev:instance` launches from a
+/// project terminal; the machine credential has no use for one.
+pub fn hold_to_run_less_process(
+    request: &mut crate::mcp::types::McpCallbackRequest,
+) -> Result<(), String> {
+    hold_run_less(request, "this process", |request| {
+        lone_append(request).is_some_and(|(target, payload)| {
+            matches!(target, cairn_common::uri::CairnResource::DevLaunchTicket)
+                && payload
+                    .as_object()
+                    .is_some_and(|payload| payload.is_empty())
+        })
+    })
 }
 
 /// The consumer role a bearer is bound to when the endpoint is reached over
@@ -276,7 +524,7 @@ pub async fn dev_export_attachment(
         crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, &request).await?;
 
     let (attachment, bearer) = attachment_for_run(orch, run_id, &node_uri)?;
-    let (_, token) = mcp_credential_env(orch, &attachment, Some(&bearer))?;
+    let (_, token) = mcp_credential_env(&attachment, &bearer)?;
     let McpTransport::Http { url, .. } = &attachment.transport else {
         unreachable!("attachment_for_run always builds an HTTP attachment");
     };
@@ -390,29 +638,56 @@ fn format_time(at: i64) -> String {
         .unwrap_or_else(|| at.to_string())
 }
 
-/// A minted bearer: the run it speaks for and the lease holding its value.
+/// What a bearer speaks for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BearerScope {
+    /// Exactly one run.
+    Run(String),
+    /// The calls on one pooled Codex server, by server id.
+    CodexPool(String),
+}
+
+impl BearerScope {
+    /// The run, for a per-run bearer.
+    pub fn run_id(&self) -> Option<&str> {
+        match self {
+            Self::Run(run_id) => Some(run_id),
+            Self::CodexPool(_) => None,
+        }
+    }
+
+    /// What the scope is called in logs and refusals. Never a value.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Run(run_id) => format!("run {run_id}"),
+            Self::CodexPool(server_id) => format!("pooled Codex server {server_id}"),
+        }
+    }
+}
+
+/// A minted bearer: what it speaks for and the lease holding its value.
 ///
 /// Deliberately without `Debug`: the only way to its value is
 /// [`Self::present`], which names where the value is going.
 #[derive(Clone)]
 pub struct RunBearer {
-    run_id: String,
+    scope: BearerScope,
     lease: CredentialLease,
 }
 
-/// Names the run and the lease, never the value.
+/// Names the scope and the lease, never the value.
 impl std::fmt::Debug for RunBearer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunBearer")
-            .field("run_id", &self.run_id)
+            .field("scope", &self.scope)
             .field("lease", self.lease.id())
             .finish()
     }
 }
 
 impl RunBearer {
-    pub fn run_id(&self) -> &str {
-        &self.run_id
+    pub fn scope(&self) -> &BearerScope {
+        &self.scope
     }
 
     pub fn lease_id(&self) -> &LeaseId {
@@ -432,11 +707,18 @@ impl RunBearer {
     }
 }
 
-/// A request's bearer, verified: the run the request speaks for.
+/// A request's bearer, verified: what the request speaks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBearer {
-    pub run_id: String,
+    pub scope: BearerScope,
     pub lease_id: LeaseId,
+}
+
+impl VerifiedBearer {
+    /// The run, for a per-run bearer.
+    pub fn run_id(&self) -> Option<&str> {
+        self.scope.run_id()
+    }
 }
 
 /// Why the endpoint refused a request's bearer.
@@ -458,20 +740,23 @@ pub enum BearerRefusal {
          by the process that spawned the run"
     )]
     Unknown,
-    #[error("run {run_id} {reason}{}; its bearer is revoked", at.map(|at| format!(" at {}", format_time(at))).unwrap_or_default())]
+    #[error("{holder} {reason}{}; its bearer is revoked", at.map(|at| format!(" at {}", format_time(at))).unwrap_or_default())]
     Revoked {
-        run_id: String,
+        /// What the bearer spoke for ([`BearerScope::label`]).
+        holder: String,
         at: Option<i64>,
         reason: String,
     },
     #[error("this bearer is bound to {bound} and was presented to {presented}")]
     Audience { bound: String, presented: String },
-    #[error("the bearer for run {run_id} expired at {}", format_time(*at))]
-    Expired { run_id: String, at: i64 },
+    #[error("the bearer for {holder} expired at {}", format_time(*at))]
+    Expired { holder: String, at: i64 },
+    #[error("this bearer speaks for {holder}, not one run, and this endpoint serves runs alone")]
+    NotARun { holder: String },
 }
 
 struct Entry {
-    run_id: String,
+    scope: BearerScope,
     lease: CredentialLease,
     revoked: Option<Revocation>,
 }
@@ -540,6 +825,44 @@ impl RunBearerBook {
         self.mint_token(run_id, node_uri, audience, now() + lifetime, token)
     }
 
+    /// Mint the bearer for pooled Codex server `server_id`, presentable only to
+    /// `audience`. Ended by [`Self::revoke_pool`] when the server closes.
+    pub fn mint_pool(&self, server_id: &str, audience: LeaseAudience) -> RunBearer {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = URL_SAFE_NO_PAD.encode(bytes);
+        let source = CredentialSource::CodexPoolMcpBearer {
+            server_id: server_id.to_string(),
+            serial: BEARER_SERIAL.fetch_add(1, Ordering::Relaxed),
+        };
+        let lease = leases().issue(
+            LeaseTerms {
+                source: &source,
+                audience,
+                expires_at: now() + BEARER_LIFETIME_SECS,
+                purpose: "pooled Codex MCP bearer",
+            },
+            token.clone(),
+        );
+        let scope = BearerScope::CodexPool(server_id.to_string());
+        log::info!(
+            "MCP bearer {} minted for {} ({})",
+            lease.id(),
+            scope.label(),
+            lease.audience().label()
+        );
+        let mut state = self.state.lock().expect("run bearer book poisoned");
+        state.entries.insert(
+            digest(&token),
+            Entry {
+                scope: scope.clone(),
+                lease: lease.clone(),
+                revoked: None,
+            },
+        );
+        RunBearer { scope, lease }
+    }
+
     fn mint_token(
         &self,
         run_id: &str,
@@ -554,7 +877,7 @@ impl RunBearerBook {
         let mut state = self.state.lock().expect("run bearer book poisoned");
         if let Some(revocation) = state.revoked_runs.get(run_id) {
             return Err(BearerRefusal::Revoked {
-                run_id: run_id.to_string(),
+                holder: format!("run {run_id}"),
                 at: Some(revocation.at),
                 reason: revocation.reason.clone(),
             });
@@ -592,13 +915,13 @@ impl RunBearerBook {
         state.entries.insert(
             token_digest,
             Entry {
-                run_id: run_id.to_string(),
+                scope: BearerScope::Run(run_id.to_string()),
                 lease: lease.clone(),
                 revoked: None,
             },
         );
         Ok(RunBearer {
-            run_id: run_id.to_string(),
+            scope: BearerScope::Run(run_id.to_string()),
             lease,
         })
     }
@@ -625,7 +948,7 @@ impl RunBearerBook {
             .ok_or(BearerRefusal::Unknown)?;
         if let Some(revocation) = &entry.revoked {
             return Err(BearerRefusal::Revoked {
-                run_id: entry.run_id.clone(),
+                holder: entry.scope.label(),
                 at: Some(revocation.at),
                 reason: revocation.reason.clone(),
             });
@@ -633,7 +956,7 @@ impl RunBearerBook {
         let verdict = match entry.lease.present(presented_to) {
             Ok(presented) if constant_time_eq(presented.expose().as_bytes(), token.as_bytes()) => {
                 Ok(VerifiedBearer {
-                    run_id: entry.run_id.clone(),
+                    scope: entry.scope.clone(),
                     lease_id: entry.lease.id().clone(),
                 })
             }
@@ -642,13 +965,13 @@ impl RunBearerBook {
                 bound, presented, ..
             }) => Err(BearerRefusal::Audience { bound, presented }),
             Err(LeaseDenied::Expired { expired_at, .. }) => Err(BearerRefusal::Expired {
-                run_id: entry.run_id.clone(),
+                holder: entry.scope.label(),
                 at: expired_at,
             }),
             // Revoked through the lease book rather than by finalization, as a
             // disclosure response does.
             Err(LeaseDenied::Revoked { .. }) => Err(BearerRefusal::Revoked {
-                run_id: entry.run_id.clone(),
+                holder: entry.scope.label(),
                 at: None,
                 reason: "had its credential revoked".to_string(),
             }),
@@ -669,9 +992,30 @@ impl RunBearerBook {
                 at,
                 reason: reason.to_string(),
             });
+        Self::revoke_scope(
+            &mut state,
+            &BearerScope::Run(run_id.to_string()),
+            at,
+            reason,
+        )
+    }
+
+    /// Revoke pooled Codex server `server_id`'s bearers, leaving tombstones
+    /// that name `reason`. Idempotent. Returns how many this call revoked.
+    pub fn revoke_pool(&self, server_id: &str, reason: &str) -> usize {
+        let mut state = self.state.lock().expect("run bearer book poisoned");
+        Self::revoke_scope(
+            &mut state,
+            &BearerScope::CodexPool(server_id.to_string()),
+            now(),
+            reason,
+        )
+    }
+
+    fn revoke_scope(state: &mut BookState, scope: &BearerScope, at: i64, reason: &str) -> usize {
         let mut revoked = 0;
         for entry in state.entries.values_mut() {
-            if entry.run_id != run_id || entry.revoked.is_some() {
+            if &entry.scope != scope || entry.revoked.is_some() {
                 continue;
             }
             entry.lease.revoke();
@@ -680,9 +1024,9 @@ impl RunBearerBook {
                 reason: reason.to_string(),
             });
             log::info!(
-                "MCP bearer {} for run {} revoked: {}",
+                "MCP bearer {} for {} revoked: {}",
                 entry.lease.id(),
-                run_id,
+                scope.label(),
                 reason
             );
             revoked += 1;
@@ -717,7 +1061,10 @@ mod tests {
             .mint("run-s", NODE, audience_for_url(callback).unwrap())
             .unwrap();
         let token = service_credential(&bearer, &local()).unwrap();
-        assert_eq!(book.verify(&token, &local()).unwrap().run_id, "run-s");
+        assert_eq!(
+            book.verify(&token, &local()).unwrap().run_id(),
+            Some("run-s")
+        );
         assert!(service_credential(&bearer, &audience_for_host("elsewhere.example")).is_err());
 
         book.revoke_run("run-s", "call ended");
@@ -740,8 +1087,8 @@ mod tests {
         assert_eq!(
             book.verify(&token, &relay_audience("machine-b"))
                 .unwrap()
-                .run_id,
-            "run-r"
+                .run_id(),
+            Some("run-r")
         );
         assert!(matches!(
             book.verify(&token, &local()),
@@ -771,11 +1118,15 @@ mod tests {
             ..Default::default()
         };
         assert!(bind_request_to_run(&mut claimed, "run-a").is_err());
+        // Codex stamps a thread on every call: the run stays the credential's own,
+        // with nothing left for dispatch to re-attribute.
         let mut threaded = crate::mcp::types::McpCallbackRequest {
             thread_id: Some("t".into()),
             ..Default::default()
         };
-        assert!(bind_request_to_run(&mut threaded, "run-a").is_err());
+        bind_request_to_run(&mut threaded, "run-a").unwrap();
+        assert_eq!(threaded.run_id.as_deref(), Some("run-a"));
+        assert_eq!(threaded.thread_id, None);
     }
 
     #[test]
@@ -783,7 +1134,7 @@ mod tests {
         let book = RunBearerBook::default();
         let bearer = book.mint("run-a", NODE, local()).unwrap();
         let verified = book.verify(&token_of(&bearer), &local()).unwrap();
-        assert_eq!(verified.run_id, "run-a");
+        assert_eq!(verified.run_id(), Some("run-a"));
         assert_eq!(&verified.lease_id, bearer.lease_id());
     }
 
@@ -793,12 +1144,12 @@ mod tests {
         let a = book.mint("run-a", NODE, local()).unwrap();
         let b = book.mint("run-b", NODE, local()).unwrap();
         assert_eq!(
-            book.verify(&token_of(&a), &local()).unwrap().run_id,
-            "run-a"
+            book.verify(&token_of(&a), &local()).unwrap().run_id(),
+            Some("run-a")
         );
         assert_eq!(
-            book.verify(&token_of(&b), &local()).unwrap().run_id,
-            "run-b"
+            book.verify(&token_of(&b), &local()).unwrap().run_id(),
+            Some("run-b")
         );
     }
 
@@ -814,10 +1165,10 @@ mod tests {
         assert_eq!(book.revoke_run("run-a", "finalized (exited)"), 0);
 
         let refusal = book.verify(&token, &local()).unwrap_err();
-        let BearerRefusal::Revoked { run_id, at, reason } = &refusal else {
+        let BearerRefusal::Revoked { holder, at, reason } = &refusal else {
             panic!("expected a revoked refusal, got {refusal:?}");
         };
-        assert_eq!(run_id, "run-a");
+        assert_eq!(holder, "run run-a");
         assert!(at.is_some());
         assert_eq!(reason, "finalized (exited)");
         let message = refusal.to_string();
@@ -841,8 +1192,8 @@ mod tests {
         assert!(book.run_is_revoked("run-empty"));
         let refusal = book.mint("run-empty", NODE, local()).unwrap_err();
         assert!(
-            matches!(&refusal, BearerRefusal::Revoked { run_id, reason, .. }
-                if run_id == "run-empty" && reason == "finalized (exited)"),
+            matches!(&refusal, BearerRefusal::Revoked { holder, reason, .. }
+                if holder == "run run-empty" && reason == "finalized (exited)"),
             "{refusal:?}"
         );
 
@@ -903,9 +1254,298 @@ mod tests {
             .unwrap();
         let refusal = book.verify(&token, &local()).unwrap_err();
         assert!(
-            matches!(&refusal, BearerRefusal::Expired { run_id, .. } if run_id == "run-a"),
+            matches!(&refusal, BearerRefusal::Expired { holder, .. } if holder == "run run-a"),
             "{refusal:?}"
         );
+    }
+
+    /// A pool bearer verifies as its pooled server, never as a run; revoking
+    /// the pool ends it and leaves run bearers alone, and finalizing a run
+    /// does not end the pool's.
+    #[test]
+    fn a_pool_bearer_speaks_for_its_server_and_dies_with_it() {
+        let book = RunBearerBook::default();
+        let pool = book.mint_pool("codex-pool-7", local());
+        let run = book.mint("run-a", NODE, local()).unwrap();
+        let token = token_of(&pool);
+
+        let verified = book.verify(&token, &local()).unwrap();
+        assert_eq!(
+            verified.scope,
+            BearerScope::CodexPool("codex-pool-7".into())
+        );
+        assert_eq!(verified.run_id(), None);
+
+        book.revoke_run("codex-pool-7", "finalized (exited)");
+        assert!(book.verify(&token, &local()).is_ok());
+
+        assert_eq!(book.revoke_pool("codex-pool-7", "server closed"), 1);
+        let refusal = book.verify(&token, &local()).unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("pooled Codex server codex-pool-7 server closed"),
+            "{refusal}"
+        );
+        assert!(book.verify(&token_of(&run), &local()).is_ok());
+    }
+
+    #[test]
+    fn both_attachments_carry_a_bearer_under_their_own_variable() {
+        let book = RunBearerBook::default();
+        let stdio = crate::config::mcp_setup::stdio_attachment(
+            "/usr/bin/cairn-cmd",
+            3849,
+            None,
+            "dev",
+            None,
+            "info",
+        );
+        let bearer = book
+            .mint("run-a", NODE, attachment_audience(&stdio).unwrap())
+            .unwrap();
+        let (var, value) = mcp_credential_env(&stdio, &bearer).unwrap();
+        assert_eq!(var, STDIO_CREDENTIAL_ENV);
+        assert_eq!(
+            book.verify(&value, &local()).unwrap().run_id(),
+            Some("run-a")
+        );
+
+        let http = McpServer::cairn_http("https://orch.tail1234.ts.net/mcp");
+        assert!(
+            mcp_credential_env(&http, &bearer).is_err(),
+            "a loopback bearer is not presentable to a public endpoint"
+        );
+    }
+
+    #[test]
+    fn the_run_less_allowlist_is_pinned() {
+        assert_eq!(
+            RUN_LESS_TOOLS,
+            [
+                "read_batch",
+                "read_resource",
+                "read_issue_resource",
+                "watch",
+                "process_info",
+            ]
+        );
+    }
+
+    fn machine_request(tool: &str) -> crate::mcp::types::McpCallbackRequest {
+        crate::mcp::types::McpCallbackRequest {
+            tool: tool.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_machine_credential_claims_no_run_and_reaches_only_its_tools() {
+        for tool in RUN_LESS_TOOLS {
+            let mut request = machine_request(tool);
+            hold_to_machine_credential(&mut request).unwrap();
+            assert!(
+                request.is_unverified_local(),
+                "an admitted request carries the mark that labels and limits it"
+            );
+        }
+        for tool in ["write", "run", "check_run", "read", "read_web", "anything"] {
+            let refusal = hold_to_machine_credential(&mut machine_request(tool)).unwrap_err();
+            assert!(refusal.contains(tool), "{refusal}");
+        }
+
+        let mut claiming = machine_request("read_batch");
+        claiming.run_id = Some("run-a".into());
+        let refusal = hold_to_machine_credential(&mut claiming).unwrap_err();
+        assert!(refusal.contains("claims run run-a"), "{refusal}");
+
+        let mut threaded = machine_request("read_batch");
+        threaded.thread_id = Some("thread-a".into());
+        hold_to_machine_credential(&mut threaded).unwrap();
+        assert_eq!(
+            threaded.thread_id, None,
+            "a run-less caller borrows no thread"
+        );
+
+        // An empty claim is how a run-less client serializes "no run".
+        let mut empty = machine_request("read_batch");
+        empty.run_id = Some(String::new());
+        hold_to_machine_credential(&mut empty).unwrap();
+        assert_eq!(empty.run_id, None);
+    }
+
+    fn write_request(
+        target: &str,
+        payload: serde_json::Value,
+    ) -> crate::mcp::types::McpCallbackRequest {
+        let mut request = machine_request("write");
+        request.payload = serde_json::json!({
+            "changes": [{"target": target, "mode": "append", "payload": payload}]
+        });
+        request
+    }
+
+    /// The machine credential's writes: a self-rebuild delivery and a message to
+    /// a `/messages` collection, with `content` only. Nothing else, including
+    /// everything that shares a shape with those two.
+    #[test]
+    fn the_machine_credential_writes_only_a_delivery_or_a_message() {
+        let content = || serde_json::json!({"content": "hello"});
+        for target in [
+            "cairn://self-rebuild/outcome-1",
+            "cairn://p/cairn/5949/messages",
+            "cairn://p/cairn/5949/1/builder/messages",
+            "cairn://p/cairn/5949/1/builder/task/review/messages",
+            "cairn://p/cairn/security/messages",
+            "cairn://p/cairn/security/task/review/messages",
+        ] {
+            hold_to_machine_credential(&mut write_request(target, content()))
+                .unwrap_or_else(|refusal| panic!("{target}: {refusal}"));
+        }
+        for target in [
+            "cairn://self-rebuild",
+            "cairn://p/cairn/5949",
+            "cairn://p/cairn/5949/comments",
+            "cairn://p/cairn/messages",
+            "cairn://p/cairn/security",
+            "cairn://p/cairn/security/db/messages",
+            "cairn://p/cairn/5949/1/builder",
+            "cairn://p/cairn/5949/1/builder/tasks",
+            "cairn://p/cairn/5949/1/builder/questions",
+            "cairn://grants",
+            "cairn://settings",
+            "cairn://dev/launch-ticket",
+            "file:src/lib.rs",
+        ] {
+            assert!(
+                hold_to_machine_credential(&mut write_request(target, content())).is_err(),
+                "{target}"
+            );
+        }
+        let messages = "cairn://p/cairn/5949/1/builder/messages";
+        for payload in [
+            serde_json::json!({"content": "hello", "escalate": true}),
+            serde_json::json!({"content": 1}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                hold_to_machine_credential(&mut write_request(messages, payload.clone())).is_err(),
+                "{payload}"
+            );
+        }
+        let mut committing = write_request(messages, content());
+        committing.payload["commit_msg"] = "nope".into();
+        assert!(hold_to_machine_credential(&mut committing).is_err());
+    }
+
+    /// A resident process started for no run is held to the same list, plus the
+    /// launch ticket `bun dev:instance` asks for from a project terminal.
+    #[test]
+    fn a_run_less_process_may_also_ask_for_a_launch_ticket() {
+        let ticket = || write_request("cairn://dev/launch-ticket", serde_json::json!({}));
+        hold_to_run_less_process(&mut ticket()).unwrap();
+        assert!(hold_to_machine_credential(&mut ticket()).is_err());
+        assert!(hold_to_run_less_process(&mut write_request(
+            "cairn://p/cairn/5949",
+            serde_json::json!({"content": "x"})
+        ))
+        .is_err());
+        assert!(hold_to_run_less_process(&mut machine_request("run")).is_err());
+    }
+
+    /// A pool bearer naming no thread, or a thread no server of its id holds,
+    /// is refused.
+    #[test]
+    fn a_pool_request_must_name_one_of_its_own_threads() {
+        let pools = crate::backends::codex::pool::CodexAppServerPool::default();
+        let book = RunBearerBook::default();
+        let mut threadless = crate::mcp::types::McpCallbackRequest {
+            run_id: Some(POOLED_CODEX_RUN_SENTINEL.into()),
+            ..Default::default()
+        };
+        let refusal = bind_request_to_pool_thread(&pools, &book, &mut threadless, "codex-pool-x")
+            .unwrap_err();
+        assert!(refusal.contains("names none of its threads"), "{refusal}");
+        let mut foreign = crate::mcp::types::McpCallbackRequest {
+            thread_id: Some("thread-elsewhere".into()),
+            ..Default::default()
+        };
+        let refusal =
+            bind_request_to_pool_thread(&pools, &book, &mut foreign, "codex-pool-x").unwrap_err();
+        assert!(refusal.contains("is not a live call"), "{refusal}");
+    }
+
+    /// A pool with one live server, which lives while the returned sender does.
+    fn live_pooled_server() -> (
+        std::sync::Arc<crate::backends::codex::pool::CodexAppServerPool>,
+        std::sync::Arc<crate::backends::codex::pool::PooledAppServer>,
+        crossbeam_channel::Sender<serde_json::Value>,
+    ) {
+        let pools =
+            std::sync::Arc::new(crate::backends::codex::pool::CodexAppServerPool::default());
+        let (server, stream) = crate::backends::codex::pool::testing::live_server(&pools);
+        (pools, server, stream)
+    }
+
+    fn pool_thread_request(thread: &str) -> crate::mcp::types::McpCallbackRequest {
+        crate::mcp::types::McpCallbackRequest {
+            run_id: Some(POOLED_CODEX_RUN_SENTINEL.into()),
+            thread_id: Some(thread.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A live call on the server is admitted and attributed to its run, and a
+    /// claim to any other run is refused.
+    #[test]
+    fn a_pool_request_is_attributed_to_its_thread_s_run() {
+        let (pools, server, _stream) = live_pooled_server();
+        let book = RunBearerBook::default();
+        let _call = server.register_call("thread-a", "run-a");
+
+        let mut own = pool_thread_request("thread-a");
+        bind_request_to_pool_thread(&pools, &book, &mut own, server.id()).unwrap();
+        assert_eq!(own.run_id.as_deref(), Some("run-a"));
+
+        let mut forged = pool_thread_request("thread-a");
+        forged.run_id = Some("run-b".into());
+        let refusal =
+            bind_request_to_pool_thread(&pools, &book, &mut forged, server.id()).unwrap_err();
+        assert!(refusal.contains("claims run run-b"), "{refusal}");
+
+        let mut elsewhere = pool_thread_request("thread-a");
+        assert!(
+            bind_request_to_pool_thread(&pools, &book, &mut elsewhere, "codex-pool-other").is_err(),
+            "a bearer for another server speaks for none of this one's threads"
+        );
+    }
+
+    /// The pool's bearer outlives every run it serves, so the run's end is what
+    /// has to stop it. A thread whose run is revoked is refused even with its
+    /// binding still in place, which is what a call registering during
+    /// finalization leaves behind; the run's neighbour is unaffected.
+    #[test]
+    fn a_pool_request_for_a_finalized_run_is_refused() {
+        let (pools, server, _stream) = live_pooled_server();
+        let book = RunBearerBook::default();
+        let _ended = server.register_call("thread-ended", "run-ended");
+        let _other = server.register_call("thread-other", "run-other");
+
+        book.revoke_run("run-ended", "finalized (exited)");
+
+        let mut late = pool_thread_request("thread-ended");
+        let refusal =
+            bind_request_to_pool_thread(&pools, &book, &mut late, server.id()).unwrap_err();
+        assert!(refusal.contains("has finalized"), "{refusal}");
+        assert_eq!(
+            late.run_id.as_deref(),
+            Some(POOLED_CODEX_RUN_SENTINEL),
+            "a refused request attributes nothing"
+        );
+
+        let mut neighbour = pool_thread_request("thread-other");
+        bind_request_to_pool_thread(&pools, &book, &mut neighbour, server.id()).unwrap();
+        assert_eq!(neighbour.run_id.as_deref(), Some("run-other"));
     }
 
     #[test]

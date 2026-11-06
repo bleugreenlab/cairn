@@ -144,6 +144,10 @@ pub enum CredentialSource {
         node_uri: String,
         serial: u64,
     },
+    /// The bearer a pooled Codex app-server's `cairn-cmd` presents: scoped to
+    /// that one server's calls, each attributed to its own run by the MCP
+    /// endpoint (`mcp::run_bearer::bind_request_to_pool_thread`).
+    CodexPoolMcpBearer { server_id: String, serial: u64 },
 }
 
 /// The provider name every GitHub credential is scoped under.
@@ -199,6 +203,12 @@ impl CredentialSource {
             Self::RunMcpBearer { node_uri, .. } => AuthorityPlace::Resource {
                 canonical_uri: node_uri.clone(),
             },
+            // A pool bearer may act as any run with a call on its server, so
+            // the place it names is the bound on that: the workspace. The
+            // endpoint narrows each request to one call's run.
+            Self::CodexPoolMcpBearer { .. } => AuthorityPlace::Workspace {
+                workspace_id: workspace_id(),
+            },
         };
         AuthorityScope::new(place, AuthorityAction::Run)
     }
@@ -226,6 +236,9 @@ impl CredentialSource {
             Self::RunMcpBearer { run_id, serial, .. } => {
                 format!("run-mcp-bearer:{run_id}:{serial}")
             }
+            Self::CodexPoolMcpBearer { server_id, serial } => {
+                format!("codex-pool-mcp-bearer:{server_id}:{serial}")
+            }
         })
     }
 
@@ -240,7 +253,9 @@ impl CredentialSource {
             }
             Self::ModelBackend { .. } => SecretCategory::ModelBackendKey,
             Self::AccountDevice => SecretCategory::AccountToken,
-            Self::RunMcpBearer { .. } => SecretCategory::CallbackCredential,
+            Self::RunMcpBearer { .. } | Self::CodexPoolMcpBearer { .. } => {
+                SecretCategory::CallbackCredential
+            }
         }
     }
 }

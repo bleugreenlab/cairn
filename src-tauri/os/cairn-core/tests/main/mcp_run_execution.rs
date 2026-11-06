@@ -3784,7 +3784,8 @@ async fn a_repl_ships_only_cairn_identity_to_its_executor() {
         value("CAIRN_WORKTREE_BRANCH").as_deref(),
         Some("agent/RHG-1-builder-0")
     );
-    assert!(value("CAIRN_CALLBACK_URL").is_some());
+    // Its callback route and capability come from the resident relay as it
+    // starts, so the spec names neither.
     let unexpected: Vec<&str> = spec
         .env
         .iter()
@@ -3792,11 +3793,7 @@ async fn a_repl_ships_only_cairn_identity_to_its_executor() {
         .filter(|name| {
             !matches!(
                 *name,
-                "CAIRN_RUN_ID"
-                    | "CAIRN_HOME_URI"
-                    | "CAIRN_WORKTREE_BRANCH"
-                    | "CAIRN_CALLBACK_URL"
-                    | "CAIRN_MCP_SECRET"
+                "CAIRN_RUN_ID" | "CAIRN_HOME_URI" | "CAIRN_WORKTREE_BRANCH"
             )
         })
         .collect();

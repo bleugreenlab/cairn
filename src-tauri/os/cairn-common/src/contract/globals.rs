@@ -132,6 +132,24 @@ pub(crate) const DEV_PID_CONTRACT: ResourceContract =
         mutations: NO_MUTATIONS,
     };
 
+pub(crate) const DEV_LAUNCH_TICKET_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::DevLaunchTicket,
+        uri_template: "cairn://dev/launch-ticket",
+        name: "Dev instance launch ticket",
+        description: "Issues the calling run a one-time ticket that admits one connection to the runner's dev-instance launch route within a minute. `bun dev:instance` asks for one itself: an agent shell has no credential it could otherwise present to that route, because the route is a WebSocket on the runner and an agent shell reaches the runner only through its executor's request relay.",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[MutationSpec {
+            mode: ChangeMode::Append,
+            required: &[],
+            optional: &[],
+            label: "issue a one-time launch ticket (a run only)",
+            example: "write({changes:[{target:\"cairn://dev/launch-ticket\",mode:\"append\",payload:{}}]})",
+        }],
+    };
+
 pub(crate) const LOGS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Logs,

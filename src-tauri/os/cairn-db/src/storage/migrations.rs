@@ -2768,6 +2768,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "main_cadence_interruptions",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // A self-rebuild's pending outcome: this runner's run recording where the
+    // detached installer, replacing this runner's app, reports back once.
+    (
+        "self_rebuild_outcomes",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "pending_injections",
         TableScope::Private(PrivateReason::RunnerTransient),

@@ -668,6 +668,41 @@ async fn crash_finalize_leaves_one_open_agent_failed_entry() {
     assert!(emitter.events_named("agent-attention").is_empty());
 }
 
+/// A pooled Codex server's bearer outlives every run it serves, so finalizing a
+/// run is what stops that bearer speaking for it: its threads stop resolving,
+/// the moment it finalizes, while its neighbour on the same server keeps going.
+#[tokio::test]
+async fn finalize_ends_the_run_s_pooled_thread_bindings() {
+    let db = test_db().await;
+    seed_top_level_run(&db, "run-pooled", "job-pooled", "turn-pooled", "none").await;
+    let orch = test_orchestrator(db);
+    let (server, _stream) = crate::backends::codex::pool::testing::live_server(&orch.codex_pool);
+    let _ended = server.register_call("thread-ended", "run-pooled");
+    let _other = server.register_call("thread-other", "run-other");
+    let bind = |thread: &str| {
+        let mut request = crate::mcp::types::McpCallbackRequest {
+            thread_id: Some(thread.into()),
+            ..Default::default()
+        };
+        crate::mcp::run_bearer::bind_request(
+            &orch,
+            &mut request,
+            &crate::mcp::run_bearer::BearerScope::CodexPool(server.id().to_string()),
+        )
+        .map(|()| request.run_id)
+    };
+    assert_eq!(bind("thread-ended").unwrap().as_deref(), Some("run-pooled"));
+
+    finalize_run(&orch, "run-pooled", RunStatus::Exited);
+
+    assert!(orch.codex_pool.binding_for_thread("thread-ended").is_none());
+    assert!(
+        bind("thread-ended").is_err(),
+        "the pool's bearer no longer speaks for a finalized run"
+    );
+    assert_eq!(bind("thread-other").unwrap().as_deref(), Some("run-other"));
+}
+
 #[tokio::test]
 async fn warm_transition_broadcasts_run_completion() {
     let db = test_db().await;

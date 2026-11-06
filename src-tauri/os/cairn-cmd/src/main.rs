@@ -519,9 +519,11 @@ async fn async_main() -> Result<()> {
     // Run ID - preferred method for accurate run identification (avoids cwd ambiguity)
     let run_id = env::var("CAIRN_RUN_ID").ok();
     // Shared secret for bearer token authentication (base64-encoded)
-    let mcp_secret = env::var("CAIRN_MCP_SECRET")
-        .ok()
-        .or_else(cairn_common::auth::load_local_mcp_token);
+    let mcp_secret = cairn_common::auth::callback_token(
+        env::var("CAIRN_MCP_SECRET").ok(),
+        run_id.as_deref(),
+        cairn_common::auth::load_local_mcp_token,
+    );
     // Stable home URI for client-side Cairn shorthand resolution.
     let home_uri = env::var("CAIRN_HOME_URI").ok().and_then(|uri| {
         if parse_cairn_uri(&uri).is_some() {

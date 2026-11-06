@@ -25,13 +25,12 @@ pub struct CallbackRequest {
     /// Tool use ID from MCP protocol - tracks parent for batch_tasks children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
-    /// Codex pooled-app-server thread id (CAIRN-2549). Set by `cairn-cmd` from
-    /// the `tools/call` request's `_meta.threadId` when Codex injects it (one
-    /// shared app-server hosts N ephemeral call threads). The host maps this
-    /// thread id back to the owning run, overriding the process-global
-    /// `CAIRN_RUN_ID`/`cwd`, so each pooled call's tool results and `cairn:~/`
-    /// targets attribute to the right run. `None` for every non-pooled caller
-    /// (Claude, CLI, SDK, and Codex node/task sessions), which is unchanged.
+    /// Codex's thread id (CAIRN-2549). Set by `cairn-cmd` from the `tools/call`
+    /// request's `_meta.threadId`, which Codex injects on every tool call. Only a
+    /// pool credential resolves it: one shared app-server hosts N ephemeral call
+    /// threads, and the host maps the thread back to the owning run so each
+    /// pooled call attributes to the right run. Every other credential drops it
+    /// on arrival, so it cannot re-attribute a request to another run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// The longest, in milliseconds, the sender will wait for the host's
@@ -62,6 +61,22 @@ pub enum DispatchOrigin {
     /// instrument. Boxed: the appearance snapshot is large, and every request
     /// carries this field.
     RowWrite(Box<RowWriteOrigin>),
+    /// A process on this machine that speaks for no run: the machine credential
+    /// at the callback, or a resident process Cairn started for no run. Nothing
+    /// proves who it is, so it reaches only what the run-less allowlist admits
+    /// and its messages are labelled as unverified.
+    UnverifiedLocal,
+    /// A resident process Cairn started for no run, named by the relay that
+    /// carried its call. It is limited and labelled as [`Self::UnverifiedLocal`]
+    /// is: the relay proves which process called, not who stands behind it.
+    RelayedRunLessProcess(RelayedProcess),
+}
+
+/// The resident process a relay verified a call came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayedProcess {
+    pub relay_id: crate::executor_protocol::ResidentRelayId,
+    pub process_key: String,
 }
 
 /// What an operator's row write was made through. The runner sets it from the
@@ -148,8 +163,25 @@ impl CallbackRequest {
     pub fn row_write_origin(&self) -> Option<&RowWriteOrigin> {
         match &self.origin {
             Some(DispatchOrigin::RowWrite(origin)) => Some(&**origin),
-            None => None,
+            Some(DispatchOrigin::UnverifiedLocal | DispatchOrigin::RelayedRunLessProcess(_))
+            | None => None,
         }
+    }
+
+    /// The run-less resident process a relay verified this request came from.
+    pub fn relayed_run_less_process(&self) -> Option<&RelayedProcess> {
+        match &self.origin {
+            Some(DispatchOrigin::RelayedRunLessProcess(process)) => Some(process),
+            _ => None,
+        }
+    }
+
+    /// Whether this request came from a local process that speaks for no run.
+    pub fn is_unverified_local(&self) -> bool {
+        matches!(
+            self.origin,
+            Some(DispatchOrigin::UnverifiedLocal | DispatchOrigin::RelayedRunLessProcess(_))
+        )
     }
 
     /// Whether this call's result is composed into a model's context (see

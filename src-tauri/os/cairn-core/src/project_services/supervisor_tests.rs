@@ -590,8 +590,8 @@ async fn a_service_holds_a_bearer_for_its_own_run_never_the_machine_secret() {
             .run_bearers
             .verify(&credential, &local())
             .unwrap()
-            .run_id,
-        standing
+            .run_id(),
+        Some(standing.as_str())
     );
     assert_eq!(var("CAIRN_SERVICE").as_deref(), Some("echo"));
     assert!(

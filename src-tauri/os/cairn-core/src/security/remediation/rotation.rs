@@ -162,6 +162,18 @@ pub fn rotation_hook(secret_id: &SecretId, category: Option<SecretCategory>) -> 
             revocation_suffices: true,
         };
     }
+    if id.starts_with("codex-pool-mcp-bearer:") {
+        return RotationHook {
+            provider: "cairn-runner",
+            configured_at: "none \u{2014} minted per pooled Codex server",
+            guidance:
+                "A pooled Codex server's MCP bearer is validated by this runner alone and speaks \
+                 only for the calls live on that one server. Revoking its lease ends it; it is \
+                 also revoked when the server closes and dropped when the runner restarts. No \
+                 operator action is required.",
+            revocation_suffices: true,
+        };
+    }
     if id.starts_with("callback:") || category == Some(SecretCategory::CallbackCredential) {
         return RotationHook {
             provider: "cairn-runner",
@@ -222,6 +234,10 @@ mod tests {
                 node_uri: "cairn://p/CAIRN/1/1/builder".to_string(),
                 serial: 0,
             },
+            CredentialSource::CodexPoolMcpBearer {
+                server_id: "codex-pool-0".to_string(),
+                serial: 1,
+            },
         ];
         // The exhaustiveness check: adding a variant to `CredentialSource`
         // without adding it above stops compiling here.
@@ -235,7 +251,8 @@ mod tests {
                 | CredentialSource::ModelBackend { .. }
                 | CredentialSource::AccountDevice
                 | CredentialSource::TeamSync { .. }
-                | CredentialSource::RunMcpBearer { .. } => {}
+                | CredentialSource::RunMcpBearer { .. }
+                | CredentialSource::CodexPoolMcpBearer { .. } => {}
             }
         }
         all

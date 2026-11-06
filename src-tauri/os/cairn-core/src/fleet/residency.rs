@@ -842,11 +842,15 @@ pub(crate) fn resident_callback(
 const CALLBACK_URL_ENV: &str = "CAIRN_CALLBACK_URL";
 const MCP_SECRET_ENV: &str = "CAIRN_MCP_SECRET";
 
-/// Route a terminal's, REPL's or workflow runtime's callbacks for the machine
-/// its environment is on. `env` is composed for this machine; for a process on another one, its
-/// callback address and this runner's secret are taken out, a capability for
-/// this one process speaking for `run_id` is put in, and the grant the
-/// executor relays it under is returned.
+/// Route a terminal's, REPL's, or workflow's callbacks through the resident
+/// relay of the executor it runs on: any callback address in `env` is taken
+/// out, a capability for this one process speaking for `run_id` (or for no run)
+/// is put in, and the grant the executor relays it under is returned. The
+/// executor supplies the relay's address when it starts the process.
+///
+/// Every placement is relayed, this runner's own colocated executor included.
+/// A resident process never carries the machine MCP secret, which speaks for no
+/// run: its capability is what binds its calls to its run.
 pub(crate) fn route_resident_callbacks(
     orch: &Orchestrator,
     holder: &ResidencyHolder,
@@ -859,6 +863,9 @@ pub(crate) fn route_resident_callbacks(
 }
 
 /// [`route_resident_callbacks`] for a process placed on `placed`.
+///
+/// A process with no placement yet starts on the colocated executor, so that is
+/// whose relay it is given.
 pub(crate) fn route_resident_callbacks_on(
     orch: &Orchestrator,
     placed: Option<&str>,
@@ -867,8 +874,11 @@ pub(crate) fn route_resident_callbacks_on(
     run_id: Option<&str>,
     mut env: Vec<(String, String)>,
 ) -> Result<RoutedResidentEnv, String> {
-    let ResidentCallback::Relayed { executor_id } = resident_callback(orch, placed) else {
-        return Ok(RoutedResidentEnv { env, relay: None });
+    let executor_id = match placed {
+        Some(executor_id) => executor_id.to_string(),
+        None => orch.fleet.job_home_executor(holder).ok_or_else(|| {
+            "no executor is connected to relay this process's callbacks to the runner".to_string()
+        })?,
     };
     env.retain(|(name, _)| name != CALLBACK_URL_ENV && name != MCP_SECRET_ENV);
     let minted = orch.fleet.resident_relays().register(
@@ -888,15 +898,15 @@ pub(crate) fn route_resident_callbacks_on(
     }
     Ok(RoutedResidentEnv {
         env,
-        relay: Some(minted.grant),
+        relay: minted.grant,
     })
 }
 
-/// A terminal's or REPL's environment once its callbacks are routed, and the
-/// relay grant its start carries when it runs on another machine.
+/// A resident process's environment once its callbacks are routed, and the
+/// relay grant its start carries.
 pub(crate) struct RoutedResidentEnv {
     pub env: Vec<(String, String)>,
-    pub relay: Option<cairn_common::executor_protocol::ResidentRelayGrant>,
+    pub relay: cairn_common::executor_protocol::ResidentRelayGrant,
 }
 
 /// Refuse an environment bound for another machine that still carries this
@@ -924,29 +934,24 @@ pub(crate) fn refuse_runner_credentials(
     Ok(())
 }
 
-/// The last check before a resident start leaves for its machine: one bound for
-/// any machine but this runner's own may not carry the runner's MCP secret,
-/// whichever path composed its environment.
+/// The last check before a resident start leaves for its machine: it may not
+/// carry the runner's MCP secret, whichever path composed its environment and
+/// whichever machine it is bound for.
 ///
-/// `resident_callback` already keeps the secret out of the environments it
-/// routes; this holds the property for every resident kind at the one place
-/// the frame is sent, against the connection actually selected, so a launch
-/// that composed its own environment, or a machine that turned out remote
-/// after the decision, cannot carry it there.
-pub(crate) fn refuse_unrelayed_runner_secret(
-    colocated: bool,
+/// [`route_resident_callbacks`] already keeps the secret out of the
+/// environments it routes, and project services carry bearers; this holds the
+/// property for every resident kind at the one place the frame is sent, so a
+/// launch that composed its own environment cannot carry it anywhere.
+pub(crate) fn refuse_runner_secret_in_start(
     process: &cairn_common::executor_protocol::ResidentProcessSpec,
     secret: Option<&str>,
 ) -> Result<(), String> {
     let Some(secret) = secret else {
         return Ok(());
     };
-    if colocated {
-        return Ok(());
-    }
     match process.env.iter().find(|(_, value)| value == secret) {
         Some((name, _)) => Err(format!(
-            "refusing to start a process on another machine with this runner's MCP secret in `{name}`; start it again so it is given a relay of its own"
+            "refusing to start a process with this runner's MCP secret in `{name}`: the machine credential speaks for no run, so a process is given a relay capability of its own"
         )),
         None => Ok(()),
     }
@@ -1198,25 +1203,55 @@ mod resident_callback_tests {
     }
 
     /// A resident on the runner's own machine, or one with no placement yet,
-    /// starts with exactly what was composed for it and no relay.
+    /// is relayed through the colocated executor exactly as a remote one is:
+    /// a capability of its own, never the machine secret or the runner's URL.
     #[tokio::test]
-    async fn a_colocated_or_unplaced_resident_keeps_its_environment_and_gets_no_relay() {
+    async fn a_colocated_or_unplaced_resident_is_relayed_with_a_capability_of_its_own() {
         let orch = orchestrator().await;
         attach(&orch, "local", true);
-        for placed in [Some("local"), None] {
+        for (index, placed) in [Some("local"), None].into_iter().enumerate() {
             let routed = route_resident_callbacks_on(
                 &orch,
                 placed,
                 &holder(),
-                "shell",
+                &format!("shell-{index}"),
                 Some("r-1"),
                 runner_env(&orch),
             )
             .unwrap();
-            assert_eq!(routed.env, runner_env(&orch), "placed on {placed:?}");
-            assert!(routed.relay.is_none(), "placed on {placed:?}");
+            assert!(
+                routed
+                    .env
+                    .iter()
+                    .all(|(name, value)| name != CALLBACK_URL_ENV
+                        && *value != secret(&orch)
+                        && *value != runner_callback_url(&orch)),
+                "placed on {placed:?}"
+            );
+            assert!(routed
+                .env
+                .iter()
+                .any(|(name, value)| name == MCP_SECRET_ENV && !value.is_empty()));
+            assert_eq!(orch.fleet.resident_relays().len(), index + 1);
         }
-        assert_eq!(orch.fleet.resident_relays().len(), 0);
+    }
+
+    /// With no executor connected at all there is no relay to give, so the
+    /// start is refused rather than handed the machine secret.
+    #[tokio::test]
+    async fn an_unplaced_resident_with_no_executor_is_refused() {
+        let orch = orchestrator().await;
+        let refusal = route_resident_callbacks_on(
+            &orch,
+            None,
+            &holder(),
+            "shell",
+            Some("r-1"),
+            runner_env(&orch),
+        )
+        .err()
+        .expect("no relay, no start");
+        assert!(refusal.contains("no executor"), "{refusal}");
     }
 
     /// A resident on another machine, connected or not at this instant, holds
@@ -1236,7 +1271,6 @@ mod resident_callback_tests {
                 runner_env(&orch),
             )
             .unwrap();
-            assert!(routed.relay.is_some(), "placed on {placed}");
             assert!(
                 routed
                     .env
@@ -1269,33 +1303,39 @@ mod resident_callback_tests {
                 run_id: "wf-1".into(),
             },
             placed,
-            secret(orch),
             "wf-1",
             "{}".into(),
             "return".into(),
         )
     }
 
-    /// A workflow runtime placed on another machine, connected or not, starts
-    /// with a relay and a capability of its own, and carries neither the
-    /// runner's secret, its loopback callback, nor this runner's home path.
-    /// What the runtime itself reads (its run, args and output name) travels.
+    /// A workflow runtime starts with a relay and a capability of its own
+    /// wherever it is placed: another machine, connected or not, this runner's
+    /// own, or nowhere yet. It carries neither the runner's secret, its loopback
+    /// callback, nor this runner's home path; what the runtime itself reads (its
+    /// run, args and output name) travels.
     #[tokio::test]
-    async fn a_workflow_placed_on_another_machine_is_relayed_without_the_runners_credentials() {
+    async fn a_workflow_is_relayed_without_the_runners_credentials_wherever_it_is_placed() {
         let orch = orchestrator().await;
+        attach(&orch, "local", true);
         attach(&orch, "machine-b", false);
-        for placed in ["machine-b", "machine-away"] {
-            let routed = workflow_env(&orch, Some(placed)).unwrap();
-            assert!(routed.relay.is_some(), "placed on {placed}");
+        for placed in [Some("machine-b"), Some("machine-away"), Some("local"), None] {
+            let routed = workflow_env(&orch, placed).unwrap();
             refuse_runner_credentials(&orch, &routed.env).unwrap();
             let process = ResidentProcessSpec {
-                relay: routed.relay.clone(),
+                relay: Some(routed.relay.clone()),
                 ..spec(routed.env.clone())
             };
-            refuse_unrelayed_runner_secret(false, &process, Some(&secret(&orch))).unwrap();
+            refuse_runner_secret_in_start(&process, Some(&secret(&orch))).unwrap();
             let names: Vec<&str> = routed.env.iter().map(|(name, _)| name.as_str()).collect();
-            assert!(!names.contains(&CALLBACK_URL_ENV), "{names:?}");
-            assert!(!names.contains(&"CAIRN_HOME"), "{names:?}");
+            assert!(
+                !names.contains(&CALLBACK_URL_ENV),
+                "placed on {placed:?}: {names:?}"
+            );
+            assert!(
+                !names.contains(&"CAIRN_HOME"),
+                "placed on {placed:?}: {names:?}"
+            );
             for kept in [
                 ("CAIRN_RUN_ID", "wf-1"),
                 ("CAIRN_WORKFLOW_ARGS", "{}"),
@@ -1305,7 +1345,7 @@ mod resident_callback_tests {
                     routed
                         .env
                         .contains(&(kept.0.to_string(), kept.1.to_string())),
-                    "{names:?}"
+                    "placed on {placed:?}: {names:?}"
                 );
             }
             let capability = routed
@@ -1318,24 +1358,6 @@ mod resident_callback_tests {
         }
     }
 
-    /// A workflow runtime on this runner's machine, or not yet placed, keeps
-    /// the loopback callback and the runner's secret and gets no relay.
-    #[tokio::test]
-    async fn a_colocated_workflow_keeps_the_runners_callback_and_gets_no_relay() {
-        let orch = orchestrator().await;
-        attach(&orch, "local", true);
-        for placed in [Some("local"), None] {
-            let routed = workflow_env(&orch, placed).unwrap();
-            assert!(routed.relay.is_none(), "placed on {placed:?}");
-            assert!(routed
-                .env
-                .contains(&(CALLBACK_URL_ENV.into(), runner_callback_url(&orch))));
-            assert!(routed.env.contains(&(MCP_SECRET_ENV.into(), secret(&orch))));
-            assert!(routed.env.iter().any(|(name, _)| name == "CAIRN_HOME"));
-        }
-        assert_eq!(orch.fleet.resident_relays().len(), 0);
-    }
-
     /// A start that failed before it reached a machine leaves no relay
     /// behind: rollback revokes it even when the stop and release it sends
     /// cannot be dispatched.
@@ -1345,8 +1367,7 @@ mod resident_callback_tests {
         let holder = ResidencyHolder::Workflow {
             run_id: "wf-1".into(),
         };
-        let routed = workflow_env(&orch, Some("machine-away")).unwrap();
-        assert!(routed.relay.is_some());
+        workflow_env(&orch, Some("machine-away")).unwrap();
         assert_eq!(orch.fleet.resident_relays().len(), 1);
         let fence = ResidencyFence {
             holder,
@@ -1428,19 +1449,18 @@ mod resident_callback_tests {
     }
 
     /// Where the start frame leaves: a machine other than the runner's own
-    /// never receives the secret, relayed or not, and the runner's own does.
+    /// never receives the secret, relayed or not, and neither does the runner's own.
     #[test]
-    fn a_start_for_another_machine_carrying_the_secret_is_refused_where_it_leaves() {
+    fn a_start_carrying_the_secret_is_refused_where_it_leaves() {
         let carrying = spec(vec![(MCP_SECRET_ENV.into(), "machine-secret".into())]);
         assert!(
-            refuse_unrelayed_runner_secret(false, &carrying, Some("machine-secret"))
+            refuse_runner_secret_in_start(&carrying, Some("machine-secret"))
                 .unwrap_err()
                 .contains("`CAIRN_MCP_SECRET`")
         );
-        assert!(refuse_unrelayed_runner_secret(true, &carrying, Some("machine-secret")).is_ok());
         let capability = spec(vec![(MCP_SECRET_ENV.into(), "per-process".into())]);
-        assert!(refuse_unrelayed_runner_secret(false, &capability, Some("machine-secret")).is_ok());
-        assert!(refuse_unrelayed_runner_secret(false, &carrying, None).is_ok());
+        assert!(refuse_runner_secret_in_start(&capability, Some("machine-secret")).is_ok());
+        assert!(refuse_runner_secret_in_start(&carrying, None).is_ok());
     }
 }
 

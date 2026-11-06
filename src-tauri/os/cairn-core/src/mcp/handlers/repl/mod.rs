@@ -724,8 +724,6 @@ pub async fn process_spec(
         run_context.map(|ctx| ctx.run_id.as_str()),
         home_uri.as_deref(),
         managed_branch,
-        crate::fleet::residency::runner_callback_url(orch),
-        orch.mcp_auth.get_secret_for_mcp().ok(),
     );
     // A REPL makes its node's scratch its `$TMPDIR`, wherever it runs. Another
     // live process of the node on another machine is no reason to refuse it:
@@ -771,25 +769,16 @@ pub async fn process_spec(
 /// its jj and git worktree configuration, and its build-service wrapper to
 /// every cell, where each one named a path on the controller.
 ///
-/// The route is the terminal's, for the terminal's reason: a REPL has no
-/// per-batch relay capability, and `@cairn/sdk` and an in-REPL `cairn` call
-/// reach the runner through the callback address and secret. Composed for this
-/// runner's machine; a REPL placed elsewhere has both replaced by its
-/// executor's resident relay when it starts.
+/// The route is the terminal's, added when it starts: a REPL has no per-batch
+/// relay capability, so `@cairn/sdk` and an in-REPL `cairn` call reach the
+/// runner through its executor's resident relay, with a capability for this
+/// one process ([`crate::fleet::residency::route_resident_callbacks`]).
 fn repl_process_env(
     run_id: Option<&str>,
     home_uri: Option<&str>,
     managed_branch: Option<&str>,
-    callback_url: String,
-    mcp_secret: Option<String>,
 ) -> Vec<(String, String)> {
-    let mut env =
-        crate::mcp::handlers::run::placed_process_env(run_id, home_uri, None, managed_branch, None);
-    env.push(("CAIRN_CALLBACK_URL".into(), callback_url));
-    if let Some(secret) = mcp_secret {
-        env.push(("CAIRN_MCP_SECRET".into(), secret));
-    }
-    env
+    crate::mcp::handlers::run::placed_process_env(run_id, home_uri, None, managed_branch, None)
 }
 
 /// Start an eval server in an executor residency.
@@ -930,8 +919,8 @@ pub async fn spawn_session(
     // Process keys are unique within the home, so a REPL names itself by slug
     // rather than claiming the one generic key.
     let key = format!("repl:{slug}");
-    // An interpreter on another machine reaches this runner through its
-    // executor's relay, with a capability for this one process.
+    // An interpreter reaches this runner through its executor's relay, with a
+    // capability for this one process.
     match crate::fleet::residency::route_resident_callbacks(
         orch,
         &fence.holder,
@@ -941,7 +930,7 @@ pub async fn spawn_session(
     ) {
         Ok(crate::fleet::residency::RoutedResidentEnv { env, relay }) => {
             process.env = env;
-            process.relay = relay;
+            process.relay = Some(relay);
         }
         Err(error) => {
             let _ = crate::fleet::residency::release(orch, &fence).await;
@@ -1509,17 +1498,15 @@ pub(crate) async fn resolve_node_repl_job_id(
 mod process_env_tests {
     use super::repl_process_env;
 
-    /// A REPL states its run, its home, its branch, and its route to the runner,
-    /// and nothing else: every key the executor would supply from its own
-    /// machine is absent, so the runner's value cannot override it.
+    /// A REPL states its run, its home, and its branch, and nothing else: every
+    /// key the executor would supply from its own machine is absent, so the
+    /// runner's value cannot override it, and its route is added at start.
     #[test]
-    fn a_repl_ships_its_identity_and_route_and_nothing_of_the_runner() {
+    fn a_repl_ships_its_identity_and_nothing_of_the_runner() {
         let env = repl_process_env(
             Some("run-7"),
             Some("cairn://p/cairn/7/1/builder"),
             Some("agent/cairn-7-builder-0"),
-            "http://127.0.0.1:4100/api/mcp".into(),
-            Some("secret".into()),
         );
         assert_eq!(
             env,
@@ -1533,11 +1520,6 @@ mod process_env_tests {
                     "CAIRN_WORKTREE_BRANCH".into(),
                     "agent/cairn-7-builder-0".into()
                 ),
-                (
-                    "CAIRN_CALLBACK_URL".into(),
-                    "http://127.0.0.1:4100/api/mcp".into()
-                ),
-                ("CAIRN_MCP_SECRET".into(), "secret".into()),
             ]
         );
     }
@@ -1545,21 +1527,9 @@ mod process_env_tests {
     /// A REPL opened from the UI carries no run, so it claims none, and a
     /// branchless thread REPL names no branch.
     #[test]
-    fn an_unowned_branchless_repl_carries_only_its_route() {
-        let env = repl_process_env(
-            None,
-            Some("cairn://p/cairn/thread"),
-            None,
-            "http://127.0.0.1:4100/api/mcp".into(),
-            None,
-        );
-        assert_eq!(
-            env,
-            [(
-                "CAIRN_CALLBACK_URL".to_string(),
-                "http://127.0.0.1:4100/api/mcp".to_string()
-            )]
-        );
+    fn an_unowned_branchless_repl_carries_nothing() {
+        let env = repl_process_env(None, Some("cairn://p/cairn/thread"), None);
+        assert!(env.is_empty(), "{env:?}");
     }
 }
 

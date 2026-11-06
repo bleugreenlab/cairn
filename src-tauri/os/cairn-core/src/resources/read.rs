@@ -3727,6 +3727,14 @@ async fn render_resource_body(
         CairnResource::Bug => {
             "cairn://bug is write-only; use change with mode=append to submit reports".to_string()
         }
+        CairnResource::DevLaunchTicket => {
+            "cairn://dev/launch-ticket is write-only; `bun dev:instance` appends to it from a run"
+                .to_string()
+        }
+        CairnResource::SelfRebuild => super::self_rebuild::render_collection(),
+        CairnResource::SelfRebuildOutcome { id } => {
+            super::self_rebuild::render_outcome(&orch.db.local, &id).await
+        }
         CairnResource::Help => render_help(&params),
         // Web search: the query rides in `?q=` as literal text (no URL-encoding).
         // Results are normalized to a ranked title · url · snippet list by the

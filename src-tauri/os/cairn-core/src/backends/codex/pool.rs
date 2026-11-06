@@ -40,4 +40,45 @@ impl PoolHost for CorePoolHost {
     fn standing_token_refusal(&self) -> Option<String> {
         standing_refusal_notice(self.oauth_state.as_ref())
     }
+    fn server_closed(&self, server_id: &str) {
+        self.orch
+            .run_bearers
+            .revoke_pool(server_id, "closed (pooled Codex server exited)");
+    }
+}
+
+/// A live pooled server for a test to attribute calls to.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    struct QuietPoolHost;
+    impl PoolHost for QuietPoolHost {
+        fn refresh_tokens(&self, _client: &AppServerClient, _id: &Value) {}
+        fn disconnected(&self, _runs: &[String]) {}
+        fn standing_token_refusal(&self) -> Option<String> {
+            None
+        }
+        fn server_closed(&self, _server_id: &str) {}
+    }
+
+    /// A server on `pools`. Its notification stream stays open, and the server
+    /// with it, while the returned sender lives.
+    pub(crate) fn live_server(
+        pools: &Arc<CodexAppServerPool>,
+    ) -> (Arc<PooledAppServer>, crossbeam_channel::Sender<Value>) {
+        let (client, stream) = AppServerClient::for_test_with_notifications(
+            |_| Ok(serde_json::json!({})),
+            Default::default(),
+        );
+        let server = pools
+            .ensure(&"identity".to_string(), |_| {
+                Ok((
+                    Arc::new(client),
+                    Arc::new(QuietPoolHost) as Arc<dyn PoolHost>,
+                ))
+            })
+            .unwrap();
+        (server, stream)
+    }
 }

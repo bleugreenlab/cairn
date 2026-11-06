@@ -55,8 +55,9 @@ fn run_tool_meta() -> rmcp::model::MetaObject {
 pub enum Caller {
     /// The process speaks for one run for its whole life. The stdio server and
     /// the `cairn` CLI read the run id and residence from their environment. A
-    /// pooled Codex app-server may still name a different thread per call via
-    /// `_meta.threadId`, which the host maps back to that thread's run.
+    /// pooled Codex app-server names a different thread per call via
+    /// `_meta.threadId`, which the host maps back to that thread's run; a per-run
+    /// Codex session sends one too, and the host drops it.
     Fixed { run_id: Option<String>, cwd: String },
     /// Every request names its own run through the [`RunPrincipal`] the HTTP
     /// layer attached after verifying that request's bearer. The server holds
@@ -440,8 +441,9 @@ impl CairnMcpServer {
 
     /// Extract Codex's per-call thread id from a `tools/call` request's `_meta`
     /// (CAIRN-2549). Codex injects it under the `"threadId"` key for every tool
-    /// call from a pooled app-server thread; other callers send no such meta and
-    /// this returns `None`. A per-request server never honors it (see
+    /// call, pooled or not; other callers send no such meta and this returns
+    /// `None`. The host resolves it only for a pool credential and drops it for
+    /// every other. A per-request server never honors it (see
     /// [`Caller::PerRequest`]).
     fn thread_id(&self, meta: &rmcp::model::RequestMetaObject) -> Option<String> {
         if self.per_request {

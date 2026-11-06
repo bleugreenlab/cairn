@@ -10398,8 +10398,7 @@ impl Fleet {
             return residency_core_failure(ResidencyFailureKind::Admission, diagnostic, None);
         }
         if let ResidencyOperation::StartProcess { process, .. } = &operation {
-            if let Err(diagnostic) = crate::fleet::residency::refuse_unrelayed_runner_secret(
-                selected.colocated,
+            if let Err(diagnostic) = crate::fleet::residency::refuse_runner_secret_in_start(
                 process,
                 orch.mcp_auth.get_secret_for_mcp().ok().as_deref(),
             ) {

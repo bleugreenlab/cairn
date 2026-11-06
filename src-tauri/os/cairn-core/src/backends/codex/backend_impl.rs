@@ -295,11 +295,14 @@ impl AgentBackend for CodexBackend {
             start_time.elapsed()
         );
 
-        let (mcp_credential_var, mcp_credential) = crate::mcp::run_bearer::mcp_credential_env(
-            orch,
-            &config.mcp,
-            config.mcp_bearer.as_ref(),
-        )?;
+        let mcp_bearer = config.mcp_bearer.as_ref().ok_or_else(|| {
+            format!(
+                "run {} has no MCP bearer to attach Cairn with",
+                config.run_id
+            )
+        })?;
+        let (mcp_credential_var, mcp_credential) =
+            crate::mcp::run_bearer::mcp_credential_env(&config.mcp, mcp_bearer)?;
 
         let identity = config
             .identity
@@ -771,8 +774,9 @@ fn codex_response_availability(
 /// The `cairn` MCP entry a pooled app-server is started with, built from
 /// the orchestrator alone so it never depends on which caller spawned the
 /// server. It carries no home: every pooled tool call is attributed by its
-/// `_meta.threadId`. A pooled server serves many runs, so no one run's HTTP
-/// bearer could credential it; it always reaches Cairn over the stdio shim.
+/// `_meta.threadId`. A pooled server serves many runs, so no one run's bearer
+/// could credential it: it reaches Cairn over the stdio shim with a bearer
+/// scoped to that server's own calls.
 fn pooled_mcp_attachment(orch: &Orchestrator) -> cairn_models::session::mcp::McpServer {
     let cairn_home = cairn_common::paths::cairn_home();
     let log_level = crate::config::settings::load_log_level(&orch.config_dir);
@@ -845,7 +849,7 @@ fn acquire_pooled_server(
     let codex_auth = codex_auth.clone();
     let server = orch
         .codex_pool
-        .ensure(&pool_key, move || {
+        .ensure(&pool_key, move |server_id| {
             let codex_path = runtime.host.resolve_cli(Cli::Codex).map_err(String::from)?;
             let login = codex_login(orch, &codex_auth, oauth_state.as_ref())?;
             // The home is hardened from a model catalog, which only a refresh
@@ -865,34 +869,48 @@ fn acquire_pooled_server(
                     .map_err(String::from)?
             };
             let mcp = pooled_mcp_attachment(orch);
+            let bearer = crate::mcp::run_bearer::bearer_for_pool(orch, &mcp, server_id)?;
+            let revoke = || {
+                orch.run_bearers
+                    .revoke_pool(server_id, "closed (pooled Codex server failed to start)")
+            };
             let (mcp_credential_var, mcp_credential) =
-                crate::mcp::run_bearer::mcp_credential_env(orch, &mcp, None)?;
+                crate::mcp::run_bearer::mcp_credential_env(&mcp, &bearer).inspect_err(|_| {
+                    revoke();
+                })?;
             // `CAIRN_RUN_ID` is a sentinel, not a run: every pooled tool call is
-            // attributed by its `_meta.threadId`, and one that somehow carries
-            // none fails loudly in run lookup instead of landing on some run.
+            // attributed by its `_meta.threadId`, and the server's bearer is
+            // refused for a call that names no thread of its own.
             let env = BTreeMap::from([
                 ("CODEX_HOME".to_string(), codex_home),
                 (
                     "CAIRN_RUN_ID".to_string(),
-                    "codex-pooled-app-server".to_string(),
+                    crate::mcp::run_bearer::POOLED_CODEX_RUN_SENTINEL.to_string(),
                 ),
             ]);
             let secrets = SecretEnv::new().with(mcp_credential_var, mcp_credential);
             // The process's own residence only; each thread passes its cwd.
             let residence = cairn_common::scratch::scratch_root();
-            std::fs::create_dir_all(&residence)
-                .map_err(|error| format!("Failed to prepare {}: {error}", residence.display()))?;
-            let client = runtime.codex.start_server(
-                runtime.host.as_ref(),
-                ServerLaunch {
-                    cli_path: &codex_path,
-                    cwd: &residence.to_string_lossy(),
-                    env: &env,
-                    secrets: &secrets,
-                    mcp: &crate::backends::cairn_servers(&mcp),
-                    login: login.as_ref(),
-                },
-            )?;
+            std::fs::create_dir_all(&residence).map_err(|error| {
+                revoke();
+                format!("Failed to prepare {}: {error}", residence.display())
+            })?;
+            let client = runtime
+                .codex
+                .start_server(
+                    runtime.host.as_ref(),
+                    ServerLaunch {
+                        cli_path: &codex_path,
+                        cwd: &residence.to_string_lossy(),
+                        env: &env,
+                        secrets: &secrets,
+                        mcp: &crate::backends::cairn_servers(&mcp),
+                        login: login.as_ref(),
+                    },
+                )
+                .inspect_err(|_| {
+                    revoke();
+                })?;
             Ok((client, super::pool::pool_host(orch, oauth_state)))
         })
         .map_err(|error| format!("Failed to start Codex app-server pool: {error}"))?;

@@ -136,6 +136,33 @@ pub fn load_local_mcp_token() -> Option<String> {
     load_mcp_token_from(&crate::paths::cairn_home())
 }
 
+/// The callback credential a local client presents: the one its environment
+/// gave it, or, for a process outside any run, this home's machine credential.
+///
+/// A process in a run never falls back to the file. The machine credential
+/// speaks for no run, so a run reaching for it can only have lost the credential
+/// it was given, and that is said here rather than left to surface as a refused
+/// call.
+pub fn callback_token(
+    explicit: Option<String>,
+    run_id: Option<&str>,
+    load_local: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    match run_id.filter(|run_id| !run_id.is_empty()) {
+        Some(run_id) => {
+            eprintln!(
+                "cairn: this process belongs to run {run_id} but has no CAIRN_MCP_SECRET, and a \
+                 run does not read the machine credential from disk"
+            );
+            None
+        }
+        None => load_local(),
+    }
+}
+
 /// Load the desktop operator token from the `operator_auth_secret` under a
 /// specific home directory.
 ///
@@ -229,6 +256,27 @@ mod tests {
         std::fs::write(home.path().join(OPERATOR_SECRET_FILE), [0u8; 8]).unwrap();
 
         assert!(load_operator_token_from(home.path()).is_none());
+    }
+
+    #[test]
+    fn only_a_process_outside_any_run_falls_back_to_the_machine_credential() {
+        let unreached = || panic!("this call must not read the machine credential");
+        assert_eq!(
+            callback_token(Some("given".into()), Some("run-a"), unreached),
+            Some("given".into())
+        );
+        assert_eq!(
+            callback_token(Some("given".into()), None, unreached),
+            Some("given".into())
+        );
+        assert_eq!(callback_token(None, Some("run-a"), unreached), None);
+
+        let local = || Some("machine".to_string());
+        assert_eq!(callback_token(None, None, local), Some("machine".into()));
+        assert_eq!(
+            callback_token(None, Some(""), local),
+            Some("machine".into())
+        );
     }
 
     #[test]

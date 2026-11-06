@@ -872,7 +872,15 @@ pub(crate) fn config(
             None,
             "standard",
         ),
-        mcp_bearer: None,
+        mcp_bearer: Some(
+            crate::mcp::run_bearer::RunBearerBook::default()
+                .mint(
+                    run_id,
+                    "cairn://p/COVERAGE/1/1/builder",
+                    crate::mcp::run_bearer::audience_for_host("127.0.0.1"),
+                )
+                .unwrap(),
+        ),
         home_uri: "cairn://p/COVERAGE/1/1/builder".to_string(),
         max_thinking_tokens: None,
         reasoning_effort: None,

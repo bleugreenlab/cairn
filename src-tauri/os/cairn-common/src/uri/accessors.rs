@@ -396,6 +396,7 @@ impl CairnResource {
             | Self::Dev
             | Self::DevDb
             | Self::DevPid
+            | Self::DevLaunchTicket
             | Self::Logs
             | Self::ChannelsConversations
             | Self::Executors
@@ -440,6 +441,8 @@ impl CairnResource {
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
             | Self::Bug
+            | Self::SelfRebuild
+            | Self::SelfRebuildOutcome { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Workflows
@@ -628,6 +631,7 @@ impl CairnResource {
             | Self::Dev
             | Self::DevDb
             | Self::DevPid
+            | Self::DevLaunchTicket
             | Self::Logs
             | Self::ChannelsConversations
             | Self::Executors
@@ -672,6 +676,8 @@ impl CairnResource {
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
             | Self::Bug
+            | Self::SelfRebuild
+            | Self::SelfRebuildOutcome { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,
@@ -828,6 +834,7 @@ impl CairnResource {
             | Self::Dev
             | Self::DevDb
             | Self::DevPid
+            | Self::DevLaunchTicket
             | Self::Logs
             | Self::ChannelsConversations
             | Self::Executors
@@ -872,6 +879,8 @@ impl CairnResource {
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
             | Self::Bug
+            | Self::SelfRebuild
+            | Self::SelfRebuildOutcome { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,

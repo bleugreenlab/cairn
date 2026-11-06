@@ -1552,11 +1552,14 @@ impl AgentBackend for ClaudeBackend {
         // closed replica fails fast rather than orphaning a live agent.
         let run_db = resolve_run_db(CLAUDE_BACKEND_NAME, orch, &config.run_id)?;
 
-        let (mcp_credential_var, mcp_credential) = crate::mcp::run_bearer::mcp_credential_env(
-            orch,
-            &config.mcp,
-            config.mcp_bearer.as_ref(),
-        )?;
+        let mcp_bearer = config.mcp_bearer.as_ref().ok_or_else(|| {
+            format!(
+                "run {} has no MCP bearer to attach Cairn with",
+                config.run_id
+            )
+        })?;
+        let (mcp_credential_var, mcp_credential) =
+            crate::mcp::run_bearer::mcp_credential_env(&config.mcp, mcp_bearer)?;
         log::info!("Using {} for run {}", mcp_credential_var, config.run_id);
 
         // Inject user identity into Claude process environment

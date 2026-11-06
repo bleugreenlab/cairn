@@ -1439,7 +1439,16 @@ pub(crate) async fn produce_file_segment_with(
                 fence::RunFenceResolution::Unavailable(error) => {
                     return Produced::Segment(error_segment(uri, error));
                 }
-                fence::RunFenceResolution::Ambient => {}
+                // A crossing is decided for a run or by asking its operator. With
+                // no run there is nobody to ask and nothing to answer for it.
+                fence::RunFenceResolution::Ambient => {
+                    return Produced::Segment(error_segment(
+                        uri,
+                        "Refused: this path is denied to agents, and a request that speaks for \
+                         no run has no fence to approve the crossing"
+                            .to_string(),
+                    ));
+                }
             }
         }
     }

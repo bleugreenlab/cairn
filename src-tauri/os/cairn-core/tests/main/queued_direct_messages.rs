@@ -59,6 +59,49 @@ fn model_request(tool: &str, run_id: Option<&str>) -> McpCallbackRequest {
     request
 }
 
+/// A message through the machine credential, taken the whole way from the
+/// credential's own gate through dispatch: it is stored and shown as coming from
+/// an unverified local process, never the operator or a named agent, and the
+/// recipient is told what that means.
+#[tokio::test(flavor = "current_thread")]
+async fn a_machine_credential_message_reaches_its_recipient_as_unverified() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_dm_recipient(&orch.db.local, "proj", "running").await;
+    let cursors = Mutex::new(HashMap::new());
+
+    let mut send = callback_request("write", None);
+    send.payload = serde_json::json!({
+        "changes": [{
+            "target": "cairn://p/proj/42/1/builder/messages",
+            "mode": "append",
+            "payload": {"content": "merge it"}
+        }]
+    });
+    cairn_core::internal::mcp::run_bearer::hold_to_machine_credential(&mut send).unwrap();
+    dispatch_tool(&orch, &send, &cursors).await;
+
+    let stored = orch
+        .db
+        .local
+        .query_text(
+            "SELECT sender_name FROM messages WHERE content = 'merge it'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("unverified local process"));
+
+    let delivered = dispatch_tool(&orch, &model_request("bogus_tool", Some("run-1")), &cursors)
+        .await
+        .reminders
+        .join("\n");
+    assert!(
+        delivered.contains("[Direct message from unverified local process] merge it"),
+        "{delivered}"
+    );
+    assert!(delivered.contains("not the operator"), "{delivered}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_tool_augments_result_with_queued_direct_messages() {
     // A direct message to a busy recipient becomes an undelivered `direct:` push;

@@ -1,9 +1,13 @@
 //! Shared-secret bearer authentication for the two credentials a Cairn install
 //! holds, and the reason they are two.
 //!
-//! [`McpAuthState`] guards `~/.cairn/mcp_auth_secret`, which authenticates MCP
-//! callbacks. It is passed to every agent process as `CAIRN_MCP_AUTH_TOKEN`
-//! because that is what it is for: an agent has to be able to call back.
+//! [`McpAuthState`] guards `~/.cairn/mcp_auth_secret`, the runner's machine
+//! credential. It speaks for no run, so at the MCP callback it reads and watches
+//! and no more (`mcp::run_bearer::hold_to_machine_credential`). It is what a
+//! local process outside any run presents, what the desktop's invoke transport
+//! presents as attribution, and what the colocated executor authenticates with.
+//! An agent process never holds it: each carries a credential bound to its own
+//! run instead.
 //!
 //! [`OperatorAuthState`] guards `~/.cairn/operator_auth_secret`, which
 //! authenticates a **desktop operator** answering an authority prompt. Holding
@@ -14,11 +18,11 @@
 //! token accessor at all, so the runner can check the credential without ever
 //! being able to disclose it.
 //!
-//! The credential is a file, and a file is only out of reach if something keeps
+//! Each credential is a file, and a file is only out of reach if something keeps
 //! it out of reach. `cairn_core::authorization::protected` refuses agent reads
-//! and writes of this path, and the executor sandbox denies reads of it
-//! unconditionally. See `docs/authorization.md` for what that does and does not
-//! establish.
+//! and writes of these paths, and the executor sandbox denies them to every agent
+//! spawn where the platform can. See `docs/authorization.md` for what that does
+//! and does not establish.
 
 use crate::security::SecretCategory;
 use cairn_common::auth::{SharedSecret, MCP_SECRET_FILE, OPERATOR_SECRET_FILE, SECRET_LEN};
@@ -636,6 +640,9 @@ mod tests {
             // unchanged, and returns only the runner's payload. Its test names
             // the header only to assert it is sent.
             "src-tauri/src/commands/served_api.rs",
+            // The dev-instance launch route: checks the header the operator's own
+            // shell sends. Runs in the runner, and answers with no credential.
+            "src-tauri/cairn-transport/src/routes/dev_instances.rs",
             // Test fixtures, which mint their own throwaway credentials.
             "src-tauri/cairn-orch/tests/transport.rs",
             "src-tauri/cairn-transport/src/routes/invoke/tests.rs",

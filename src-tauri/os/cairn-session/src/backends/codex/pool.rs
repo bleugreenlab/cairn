@@ -22,9 +22,16 @@
 //!   [`CodexAppServerPool::retire_versions_except`] takes older servers out of
 //!   lookup; each is shut down once its last call deregisters, so in-flight
 //!   calls finish on the release they started on.
+//! - Each server has an id of its own, distinct from its key, so a credential
+//!   issued to one server's `cairn-cmd` speaks for that server's threads alone
+//!   ([`CodexAppServerPool::binding_for_server_thread`]) and dies with it
+//!   ([`PoolHost::server_closed`]), even when a successor takes its key.
+//! - That credential outlives every run it serves, so a run's bindings end when
+//!   the run does ([`CodexAppServerPool::release_run`]), whatever its reader is
+//!   still doing.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Receiver;
@@ -40,6 +47,9 @@ pub trait PoolHost: Send + Sync {
     /// What a call whose turn fails is told about a token request this pool
     /// refused on its shared login, while that refusal stands.
     fn standing_token_refusal(&self) -> Option<String>;
+    /// The server with this id has closed: whatever was issued to it for its
+    /// lifetime alone ends here.
+    fn server_closed(&self, server_id: &str);
 }
 
 /// Auth-identity fingerprint keying the pool.
@@ -69,6 +79,17 @@ fn key_version(key: &str) -> Option<&str> {
         .map(|(_, version)| version)
 }
 
+/// Distinguishes every pooled server this process starts, across keys and
+/// across successive servers on one key.
+static SERVER_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+fn next_server_id() -> String {
+    format!(
+        "codex-pool-{}",
+        SERVER_SERIAL.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// The authenticated run bound to a pooled call's thread.
 ///
 /// Process cwd is deliberately absent: repository identity and logical file
@@ -81,6 +102,8 @@ pub struct CallBinding {
 
 /// One long-lived app-server hosting N ephemeral call threads.
 pub struct PooledAppServer {
+    /// This server's own id, never reused within the process.
+    id: String,
     /// Routes each `params.threadId` message to the owning call's reader, and
     /// hands pool-scoped ones (the token refresh) to the pool's [`PoolHost`].
     router: Arc<ThreadRouter>,
@@ -95,16 +118,23 @@ pub struct PooledAppServer {
 
 impl PooledAppServer {
     fn new(
+        id: String,
         router: Arc<ThreadRouter>,
         thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
         host: Arc<dyn PoolHost>,
     ) -> Self {
         Self {
+            id,
             router,
             thread_runs,
             retiring: AtomicBool::new(false),
             host,
         }
+    }
+
+    /// This server's id: what its `cairn-cmd`'s credential is scoped to.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// The server's router: a thread opened on it is `CodexServer::Shared`
@@ -192,6 +222,7 @@ impl PooledAppServer {
         let host: Arc<dyn PoolHost> = Arc::new(TestPoolHost);
         let scoped_host = host.clone();
         Arc::new(Self::new(
+            next_server_id(),
             ThreadRouter::new(client, move |client, message| {
                 Self::scoped(scoped_host.as_ref(), client, message)
             }),
@@ -257,14 +288,57 @@ impl CodexAppServerPool {
     /// Map a pooled call's `threadId` (from `_meta.threadId`) to its owning run. A `threadId` is a globally-unique Codex uuid, so a
     /// linear scan across the (few) live pools is correct and cheap.
     pub fn binding_for_thread(&self, thread_id: &str) -> Option<CallBinding> {
+        self.find_binding(|_| true, thread_id)
+    }
+
+    /// [`Self::binding_for_thread`], answered only from the server with id
+    /// `server_id`: a thread on any other server, or on a server that has
+    /// closed, has no binding here.
+    pub fn binding_for_server_thread(
+        &self,
+        server_id: &str,
+        thread_id: &str,
+    ) -> Option<CallBinding> {
+        self.find_binding(
+            |server| server.id == server_id && !server.is_closed(),
+            thread_id,
+        )
+    }
+
+    fn find_binding(
+        &self,
+        on: impl Fn(&PooledAppServer) -> bool,
+        thread_id: &str,
+    ) -> Option<CallBinding> {
         let pools = self.pools.lock().ok()?;
         let retiring = self.retiring.lock().ok()?;
         for server in pools.values().chain(retiring.iter()) {
+            if !on(server) {
+                continue;
+            }
             if let Some(binding) = server.thread_runs.lock().ok()?.get(thread_id) {
                 return Some(binding.clone());
             }
         }
         None
+    }
+
+    /// End every binding `run_id` holds, on any server, retiring ones included.
+    /// Idempotent.
+    ///
+    /// Called when the run finalizes. Only the bindings go: the threads' routes
+    /// stay for their readers to wind down, and a server death after this has
+    /// nothing left to fail for a run that has already ended.
+    pub fn release_run(&self, run_id: &str) {
+        let pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        let retiring = self.retiring.lock().unwrap_or_else(|e| e.into_inner());
+        for server in pools.values().chain(retiring.iter()) {
+            server
+                .thread_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|_, binding| binding.run_id != run_id);
+        }
     }
 
     /// Take every server not on Codex `current` out of lookup, so the next
@@ -297,11 +371,13 @@ impl CodexAppServerPool {
     /// Get-or-spawn the app-server for `key`. `build` performs the full spawn +
     /// `initialize`/`initialized` + `account/login/start` handshake and returns
     /// the ready client and its identity host; it runs at most once per key
-    /// under the per-key init lock. Starts the server's router on first build.
+    /// under the per-key init lock, and is given the id the server will have,
+    /// so anything it issues the process can be scoped to that one server.
+    /// Starts the server's router on first build.
     pub fn ensure(
         self: &Arc<Self>,
         key: &PoolKey,
-        build: impl FnOnce() -> Result<(Arc<AppServerClient>, Arc<dyn PoolHost>), String>,
+        build: impl FnOnce(&str) -> Result<(Arc<AppServerClient>, Arc<dyn PoolHost>), String>,
     ) -> Result<Arc<PooledAppServer>, String> {
         if let Some(existing) = self.pools.lock().unwrap().get(key).cloned() {
             return Ok(existing);
@@ -319,16 +395,18 @@ impl CodexAppServerPool {
         if let Some(existing) = self.pools.lock().unwrap().get(key).cloned() {
             return Ok(existing);
         }
-        let (client, host) = build()?;
+        let id = next_server_id();
+        let (client, host) = build(&id)?;
         let thread_runs = Arc::new(Mutex::new(HashMap::new()));
-        let closed = self.on_server_closed(key.clone(), thread_runs.clone(), host.clone());
+        let closed =
+            self.on_server_closed(key.clone(), id.clone(), thread_runs.clone(), host.clone());
         let scoped_host = host.clone();
         let router = ThreadRouter::start(
             client,
             move |client, message| PooledAppServer::scoped(scoped_host.as_ref(), client, message),
             closed,
         );
-        let server = Arc::new(PooledAppServer::new(router, thread_runs, host));
+        let server = Arc::new(PooledAppServer::new(id, router, thread_runs, host));
         self.pools
             .lock()
             .unwrap()
@@ -360,11 +438,13 @@ impl CodexAppServerPool {
     fn on_server_closed(
         self: &Arc<Self>,
         key: PoolKey,
+        server_id: String,
         thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
         host: Arc<dyn PoolHost>,
     ) -> impl FnOnce() + Send + 'static {
         let pool = self.clone();
         move || {
+            host.server_closed(&server_id);
             let runs: Vec<String> = thread_runs
                 .lock()
                 .map(|m| m.values().map(|b| b.run_id.clone()).collect())
@@ -391,6 +471,7 @@ impl PoolHost for TestPoolHost {
     fn standing_token_refusal(&self) -> Option<String> {
         None
     }
+    fn server_closed(&self, _server_id: &str) {}
 }
 
 #[cfg(test)]
@@ -555,6 +636,68 @@ mod tests {
             pool.binding_for_thread("thread-live").map(|b| b.run_id),
             Some("run-live".to_string())
         );
+    }
+
+    // A server-scoped lookup answers only for that server's own threads: a
+    // credential issued to one pooled server cannot reach a call on another,
+    // and nothing answers for a server once it has closed.
+    #[test]
+    fn a_server_scoped_lookup_sees_only_that_server_s_threads() {
+        let pool = CodexAppServerPool::default();
+        let a = PooledAppServer::for_test(scripted_client());
+        let b = PooledAppServer::for_test(scripted_client());
+        assert_ne!(a.id(), b.id());
+        pool.insert_test_server("identity-a".to_string(), a.clone());
+        pool.insert_test_server("identity-b".to_string(), b.clone());
+        let _on_a = a.register_call("thread-a", "run-a");
+        let _on_b = b.register_call("thread-b", "run-b");
+
+        assert_eq!(
+            pool.binding_for_server_thread(a.id(), "thread-a")
+                .map(|binding| binding.run_id),
+            Some("run-a".to_string())
+        );
+        assert!(pool.binding_for_server_thread(a.id(), "thread-b").is_none());
+        assert!(pool
+            .binding_for_server_thread("codex-pool-unknown", "thread-a")
+            .is_none());
+
+        a.close_all_calls_for_test();
+        assert!(
+            pool.binding_for_server_thread(a.id(), "thread-a").is_none(),
+            "a closed server's credential speaks for nothing"
+        );
+    }
+
+    // A pooled server's credential outlives every run it serves, so a finalized
+    // run's threads stop resolving on every server, retiring ones included, while
+    // its neighbours and its threads' routes stay.
+    #[test]
+    fn releasing_a_run_ends_its_bindings_and_nothing_else() {
+        let pool = CodexAppServerPool::default();
+        let live = PooledAppServer::for_test(scripted_client());
+        let retiring = PooledAppServer::for_test(scripted_client());
+        pool.insert_test_server("identity-a".to_string(), live.clone());
+        pool.retiring.lock().unwrap().push(retiring.clone());
+        let _a = live.register_call("thread-a", "run-ended");
+        let _b = live.register_call("thread-b", "run-other");
+        let _c = retiring.register_call("thread-c", "run-ended");
+
+        pool.release_run("run-ended");
+
+        for thread in ["thread-a", "thread-c"] {
+            assert!(pool.binding_for_thread(thread).is_none(), "{thread}");
+        }
+        assert!(pool
+            .binding_for_server_thread(live.id(), "thread-a")
+            .is_none());
+        assert_eq!(
+            pool.binding_for_thread("thread-b").map(|b| b.run_id),
+            Some("run-other".to_string())
+        );
+        assert!(live.router.is_routed("thread-a"), "its reader winds down");
+
+        pool.release_run("run-ended");
     }
 
     #[test]

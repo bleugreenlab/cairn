@@ -335,6 +335,33 @@ mod thread_db_tests {
 
     /// A page's call to a service lands in the page's thread database, through
     /// the store's own ownership rule; another thread's database stays shut.
+    /// Launching a dev instance starts a runtime outside the fence, so a run
+    /// whose fence is `Deny`, as a service run's always is, gets no ticket.
+    #[tokio::test]
+    async fn a_run_under_a_deny_fence_gets_no_launch_ticket() {
+        let (orch, _config) = crate::fleet::service_placement::tests::attached_orchestrator().await;
+        let db = orch.db.local.clone();
+        testing::seed_project(&db).await;
+        let job = rows::ensure_service_job(&db, "p", &ServiceOwner::Project, "judge")
+            .await
+            .unwrap();
+        let run_id = rows::mint_run(&db, "p", &job).await.unwrap();
+
+        let refusal = change(
+            &orch,
+            &run_id,
+            "cairn://dev/launch-ticket",
+            ChangeMode::Append,
+            json!({}),
+        )
+        .await
+        .expect_err("a Deny fence refuses the ticket");
+        assert!(
+            format!("{refusal:?}").contains("denies crossings"),
+            "{refusal:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_service_call_writes_the_database_of_the_thread_it_acts_for() {
         let (orch, config) = crate::fleet::service_placement::tests::attached_orchestrator().await;

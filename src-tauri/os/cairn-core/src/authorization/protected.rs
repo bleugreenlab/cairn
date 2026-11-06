@@ -34,7 +34,9 @@
 //! crossing is something an agent may do through its own `permissions`
 //! resource, so a merely deny-read credential would be one self-approved
 //! crossing away from disclosure. Both of its boundaries therefore refuse rather
-//! than prompt.
+//! than prompt. The same holds for the runner's machine credential,
+//! `mcp_auth_secret`, which a run could otherwise use to act outside its own
+//! run-bound credential.
 //!
 //! The refusals here are defense in depth for the structured verbs. The
 //! boundary itself is enforced in the kernel at every agent spawn by
@@ -159,9 +161,9 @@ pub fn is_workspace_settings_path(candidate: &Path, config_dir: &Path) -> bool {
     resolves_to(candidate, &workspace_settings_path(config_dir))
 }
 
-/// Whether `candidate` resolves to a desktop operator credential: this
-/// install's, or any other Cairn home's on the machine, dev-instance homes
-/// included.
+/// Whether `candidate` resolves to a desktop operator credential or a runner's
+/// machine credential: this install's, or any other Cairn home's on the machine,
+/// dev-instance homes included.
 ///
 /// The covered set is the kernel boundary's (`OperatorCredentialFloor`), with
 /// this install's own home added in case it lives outside the `~/.cairn*`
@@ -210,9 +212,8 @@ pub fn denied_path_refusal(config_dir: &Path, path: &Path) -> Option<&'static st
 ///
 /// Narrower than [`denied_path_refusal`] on purpose. Reading the configuration
 /// document is ordinary, useful work — an agent inspecting how the workspace is
-/// set up is not expanding anything. Reading the operator credential has no
-/// legitimate form at all, because its only use is to authenticate as the
-/// operator.
+/// set up is not expanding anything. Reading a credential has no legitimate form
+/// at all, because its only use is to authenticate as something a run is not.
 pub fn read_refusal(config_dir: &Path, path: &Path) -> Option<&'static str> {
     is_operator_credential_path(path, config_dir).then_some(OPERATOR_CREDENTIAL_REFUSAL)
 }
@@ -481,8 +482,8 @@ mod tests {
         }
         assert_eq!(
             read_refusal(config.path(), &os_home.join(".cairn-dev/mcp_auth_secret")),
-            None,
-            "the MCP secret beside it stays readable"
+            Some(OPERATOR_CREDENTIAL_REFUSAL),
+            "the machine credential beside it is refused too"
         );
     }
 
@@ -509,7 +510,6 @@ mod tests {
         std::fs::create_dir_all(&config).unwrap();
 
         for ordinary in [
-            config.join("mcp_auth_secret"),
             config.join("operator_auth_secret.bak"),
             dir.path().join("project/operator_auth_secret"),
         ] {

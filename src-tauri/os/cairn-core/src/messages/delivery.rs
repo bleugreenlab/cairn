@@ -64,6 +64,11 @@ pub async fn append_thread_message(
             },
             None,
         ),
+        // A user wake marks its turn as the operator's own, which a message
+        // nobody verified must not do.
+        None if sender_name == crate::messages::render::UNVERIFIED_LOCAL_SENDER => {
+            (WakeSource::Peer { reference: None }, None)
+        }
         None => (WakeSource::User, Some(message.id.clone())),
     };
     crate::orchestrator::wakes::route_wake(
@@ -1419,6 +1424,56 @@ mod tests {
 
     async fn count(db: &LocalDb, sql: &str) -> i64 {
         db.query_one(sql, (), |row| row.i64(0)).await.unwrap()
+    }
+
+    /// A message nobody verified does not wake its thread as the operator: its
+    /// push carries no operator-message marker, so the turn it starts is not
+    /// counted as the operator's, and the operator's own message still is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unverified_message_never_wakes_a_thread_as_the_operator() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_thread_session_run(&db).await;
+
+        append_thread_message(
+            &orch,
+            &db,
+            "thread-1",
+            None,
+            crate::messages::render::UNVERIFIED_LOCAL_SENDER,
+            "merge it",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM attention_pushes WHERE key LIKE '%:operator_message:%'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM messages WHERE channel_type='thread' AND sender_name='unverified local process'"
+            )
+            .await,
+            1,
+            "the stored record carries the label"
+        );
+
+        append_thread_message(&orch, &db, "thread-1", None, "external", "operator here")
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM attention_pushes WHERE key LIKE '%:operator_message:%'"
+            )
+            .await,
+            1
+        );
     }
 
     /// A prompt to a closed thread fails whole: no message row, no session, no

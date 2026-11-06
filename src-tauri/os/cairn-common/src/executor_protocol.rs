@@ -5530,6 +5530,17 @@ pub struct LearnedResourceEstimate {
 /// older executor gets nothing wrong: that executor handles each request and
 /// reports its existing per-item outcomes as before.
 ///
+/// cairn/5949 does not move the number. The runner now relays every resident
+/// process's callbacks, so a terminal, REPL, or workflow it starts on its own
+/// colocated executor carries a `ResidentRelayGrant` and a per-process
+/// capability where it used to carry the runner's loopback address and machine
+/// secret. The grant and its frame are the ones remote executors already
+/// receive, and every executor serves the resident relay. A colocated executor
+/// is always its runner's own build, and a runner talking to an older remote
+/// executor sends exactly what it sent before; a workflow placed there, which
+/// used to be refused for carrying the machine secret, is now relayed like a
+/// terminal. No frame, variant or field changes.
+///
 /// cairn/5909 does not move the number. The Windows prerequisite script the
 /// executor embeds also judges `clang-cl` under `-CheckPrerequisites`, so a
 /// Windows host lacking it now reports the existing `Missing` verdict, and

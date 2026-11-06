@@ -81,21 +81,15 @@ fn select_callback_url(explicit: Option<String>) -> String {
     explicit.unwrap_or_else(default_callback_url)
 }
 
-fn select_mcp_secret(
-    explicit: Option<String>,
-    load_local: impl FnOnce() -> Option<String>,
-) -> Option<String> {
-    explicit.or_else(load_local)
-}
-
 /// Build a thin server client from the environment for CLI forwarding.
 pub(crate) fn build_cli_client(callback_url: String) -> CairnMcpServer {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let run_id = env::var("CAIRN_RUN_ID").ok();
-    let mcp_secret = select_mcp_secret(
+    let mcp_secret = cairn_common::auth::callback_token(
         env::var("CAIRN_MCP_SECRET").ok(),
+        run_id.as_deref(),
         cairn_common::auth::load_local_mcp_token,
     );
     fixed_server(callback_url, cwd, run_id, mcp_secret)
@@ -1234,24 +1228,13 @@ mod tests {
     #[test]
     fn explicit_relay_callback_and_capability_win_unchanged() {
         let callback = "http://127.0.0.1:49152/api/mcp".to_string();
-        let capability = "batch-callback-capability".to_string();
 
         assert_eq!(select_callback_url(Some(callback.clone())), callback);
-        assert_eq!(
-            select_mcp_secret(Some(capability.clone()), || {
-                panic!("an explicit batch capability must not read the local runner secret")
-            }),
-            Some(capability)
-        );
     }
 
     #[test]
     fn unconfigured_shell_retains_local_runner_fallbacks() {
         assert_eq!(select_callback_url(None), default_callback_url());
-        assert_eq!(
-            select_mcp_secret(None, || Some("local-runner-secret".into())),
-            Some("local-runner-secret".into())
-        );
     }
 
     #[test]

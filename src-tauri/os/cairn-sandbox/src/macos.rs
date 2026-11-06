@@ -1160,6 +1160,7 @@ mod tests {
             "the boundary must follow every allow:\n{profile}"
         );
         assert!(profile.contains(r#"^/Users/tester/\.cairn[^/]*/operator_auth_secret$"#));
+        assert!(profile.contains("/mcp_auth_secret$"));
     }
 
     #[test]
@@ -2318,7 +2319,8 @@ mod tests {
                 let home = os_home.join(home);
                 std::fs::create_dir_all(&home).unwrap();
                 std::fs::write(home.join("operator_auth_secret"), SECRET_MARKER).unwrap();
-                std::fs::write(home.join("mcp_auth_secret"), "mcp-secret").unwrap();
+                std::fs::write(home.join("mcp_auth_secret"), SECRET_MARKER).unwrap();
+                std::fs::write(home.join("ordinary"), "ordinary").unwrap();
             }
             std::fs::create_dir_all(root.join("fixture")).unwrap();
             std::fs::write(root.join("fixture/operator_auth_secret"), "fixture").unwrap();
@@ -2468,7 +2470,11 @@ mod tests {
         let profile = fixture.floor_only_profile();
         let home = fixture.dev_secret().parent().unwrap().to_path_buf();
         for (what, script) in [
-            ("read the MCP secret", format!("cat {}/mcp_auth_secret", home.display())),
+            ("read an ordinary file", format!("cat {}/ordinary", home.display())),
+            (
+                "read a dev instance's machine secret",
+                format!("cat {}/mcp_auth_secret", home.display()),
+            ),
             ("stat the credential", format!("ls -l {}", fixture.dev_secret().display())),
             (
                 "write inside a home",
@@ -2496,6 +2502,29 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    // Live: the machine secret is refused under the floor alone, for reads and
+    // writes both. A dev-instance home's stays readable to the agent that
+    // launched the instance, and is still never writable.
+    #[test]
+    fn the_machine_secret_is_refused_under_the_floor_live() {
+        if skip_without_nested_sandbox_exec("the_machine_secret_is_refused_under_the_floor_live") {
+            return;
+        }
+        let fixture = CredentialFixture::new();
+        let profile = fixture.floor_only_profile();
+        let secret = fixture.os_home.join(".cairn/mcp_auth_secret");
+        let out = fixture.run(&profile, &format!("cat {}", secret.display()));
+        assert!(!leaked(&out), "{} was readable", secret.display());
+        let out = fixture.run(&profile, &format!("echo x > {}", secret.display()));
+        assert!(!out.status.success(), "{} was writable", secret.display());
+
+        let dev = fixture
+            .os_home
+            .join(".cairn-dev-agent-cairn-1-builder-0/mcp_auth_secret");
+        let out = fixture.run(&profile, &format!("cat {}", dev.display()));
+        assert!(leaked(&out), "{} must stay readable", dev.display());
     }
 
     // Live: a family home that is a symlink to a directory elsewhere is read
@@ -2562,7 +2591,10 @@ mod tests {
         let profile = sbpl_profile(&policy, &fixture.floor);
         let out = fixture.run(&profile, &format!("cat {}", fixture.dev_secret().display()));
         assert!(!leaked(&out), "a fence grant reopened the credential");
-        let out = fixture.run(&profile, &format!("cat {}/mcp_auth_secret", home.display()));
+        let machine = fixture.os_home.join(".cairn/mcp_auth_secret");
+        let out = fixture.run(&profile, &format!("cat {}", machine.display()));
+        assert!(!leaked(&out), "a fence grant reopened the machine secret");
+        let out = fixture.run(&profile, &format!("cat {}/ordinary", home.display()));
         assert!(out.status.success(), "the worktree itself stays readable");
     }
 

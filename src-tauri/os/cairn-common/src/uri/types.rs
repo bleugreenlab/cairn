@@ -996,6 +996,8 @@ pub enum CairnResource {
     /// reported by the instance over its MCP callback server so a caller can
     /// target the process (e.g. with Axon) without shelling out.
     DevPid,
+    /// Issues a run a one-time ticket for the dev-instance launch route.
+    DevLaunchTicket,
     /// Read-only projection of the running app's JSONL log entries
     /// (URI parity with the in-app Logs viewer).
     Logs,
@@ -1131,6 +1133,13 @@ pub enum CairnResource {
     },
     /// Global bug report sink.
     Bug,
+    /// Pending self-rebuild outcomes: a run records one before handing the
+    /// install to the detached installer.
+    SelfRebuild,
+    /// One pending self-rebuild outcome, delivered at most once.
+    SelfRebuildOutcome {
+        id: String,
+    },
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
     Help,
     /// Web search via the active typed web-search provider. The query rides in
@@ -1249,6 +1258,7 @@ impl CairnResource {
             Self::Dev => ResourceKind::Dev,
             Self::DevDb => ResourceKind::DevDb,
             Self::DevPid => ResourceKind::DevPid,
+            Self::DevLaunchTicket => ResourceKind::DevLaunchTicket,
             Self::Logs => ResourceKind::Logs,
             Self::ChannelsConversations => ResourceKind::ChannelsConversations,
             Self::Executors => ResourceKind::Executors,
@@ -1293,6 +1303,8 @@ impl CairnResource {
             Self::InferenceGenerations => ResourceKind::InferenceGenerations,
             Self::InferenceGeneration { .. } => ResourceKind::InferenceGeneration,
             Self::Bug => ResourceKind::Bug,
+            Self::SelfRebuild => ResourceKind::SelfRebuild,
+            Self::SelfRebuildOutcome { .. } => ResourceKind::SelfRebuildOutcome,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,
             Self::Mcp { .. } => ResourceKind::Mcp,

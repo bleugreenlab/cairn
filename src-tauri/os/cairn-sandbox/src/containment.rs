@@ -795,6 +795,7 @@ pub fn observe_host_socket(
 pub fn probe_operator_credential_read() -> Result<ProbeWitness, String> {
     const CONTROL: &str = "cairn-containment-control";
     const CREDENTIAL: &str = "cairn-containment-credential";
+    const MACHINE_CREDENTIAL: &str = "cairn-containment-machine-credential";
 
     let home = crate::home_dir()
         .ok_or_else(|| "no home directory to plant a Cairn home in".to_string())?;
@@ -805,14 +806,17 @@ pub fn probe_operator_credential_read() -> Result<ProbeWitness, String> {
     std::fs::create_dir(&probe_home).map_err(|e| format!("create the probe home: {e}"))?;
     let control = probe_home.join("control");
     let credential = probe_home.join(cairn_common::auth::OPERATOR_SECRET_FILE);
+    let machine_credential = probe_home.join(cairn_common::auth::MCP_SECRET_FILE);
     let planted = std::fs::write(&control, CONTROL)
         .and_then(|()| std::fs::write(&credential, CREDENTIAL))
-        .map_err(|e| format!("plant the probe credential: {e}"));
+        .and_then(|()| std::fs::write(&machine_credential, MACHINE_CREDENTIAL))
+        .map_err(|e| format!("plant the probe credentials: {e}"));
     let output = planted.and_then(|()| {
         let script = format!(
-            "cat {} 2>/dev/null; cat {} 2>/dev/null; exit 0",
+            "cat {} 2>/dev/null; echo; cat {} 2>/dev/null; echo; cat {} 2>/dev/null; exit 0",
             shell_quote(&control),
-            shell_quote(&credential)
+            shell_quote(&credential),
+            shell_quote(&machine_credential)
         );
         let confinement = crate::Confinement::CredentialFloor;
         let (program, args) = confinement.wrap_argv("/bin/sh", &["-c".to_string(), script]);
@@ -828,11 +832,11 @@ pub fn probe_operator_credential_read() -> Result<ProbeWitness, String> {
     let stdout = String::from_utf8_lossy(&output?.stdout).into_owned();
 
     let positive_control_passed = stdout.contains(CONTROL);
-    let crossing_permitted = stdout.contains(CREDENTIAL);
+    let crossing_permitted = stdout.contains(CREDENTIAL) || stdout.contains(MACHINE_CREDENTIAL);
     let detail = match (positive_control_passed, crossing_permitted) {
-        (true, false) => "an agent spawn read an ordinary file in a Cairn home and was refused that home's operator_auth_secret".to_string(),
+        (true, false) => "an agent spawn read an ordinary file in a Cairn home and was refused that home's operator_auth_secret and mcp_auth_secret".to_string(),
         (true, true) => format!(
-            "an agent spawn read a Cairn home's operator_auth_secret: {} cannot enforce the operator credential boundary, so any agent process on this machine can approve its own escalation with a credential it finds here",
+            "an agent spawn read a Cairn home's credentials: {} cannot enforce the operator credential boundary, so any agent process on this machine can approve its own escalation with a credential it finds here",
             std::env::consts::OS
         ),
         (false, _) => "the ordinary file beside the planted credential could not be read, so this probe could not exercise the seam".to_string(),
