@@ -7,6 +7,7 @@
 //! appending to a terminal sends it input.
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const SERVICE_ACTION: KeySpec = KeySpec::new("action", KeyType::Str, "start|stop|restart");
 const SERVICE_METHOD: KeySpec =

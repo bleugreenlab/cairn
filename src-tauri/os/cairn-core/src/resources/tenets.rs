@@ -6,7 +6,7 @@
 //! same way today and a reader must be able to tell them apart.
 
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{build_project_tenets_uri, build_thread_uri};
+use cairn_uri::{build_project_tenets_uri, build_thread_uri};
 
 use crate::storage::LocalDb;
 use crate::tenets::{TenetFilter, TenetStatus, TenetView, Verdict};

@@ -42,7 +42,7 @@ use std::sync::RwLock;
 use super::protocol::CallerKind;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServiceRunRole {
@@ -100,7 +100,7 @@ fn acting_thread(home: &str) -> Option<String> {
 
 /// [`acting_thread`], with the project the thread is in.
 fn acting_thread_of(home: &str) -> Option<(String, String)> {
-    match cairn_common::uri::parse_uri(home)? {
+    match cairn_uri::parse_uri(home)? {
         CairnResource::Thread {
             project,
             name,
@@ -135,7 +135,7 @@ pub(crate) fn admit_caller(
         _ => Err(format!(
             "a thread's service serves only its own thread: {}, its tasks, and its pages. \
              This call acts for {}",
-            cairn_common::uri::build_thread_uri(project_key, owner),
+            cairn_uri::build_thread_uri(project_key, owner),
             caller.acting_for
         )),
     }
@@ -661,7 +661,7 @@ fn classify_page_call(
 ) -> Result<(), String> {
     let root = format!(
         "{}/db",
-        cairn_common::uri::build_thread_uri(&run.project_key, thread)
+        cairn_uri::build_thread_uri(&run.project_key, thread)
     );
     let refused = |what: String| {
         format!(
@@ -745,16 +745,13 @@ fn classify_standing(run: &ServiceRun, tool: &str, payload: &Value) -> Result<()
 fn project_resource(run: &ServiceRun, target: &str) -> Option<CairnResource> {
     let target = without_query(target);
     let absolute = if target == "cairn:@" {
-        cairn_common::uri::build_project_uri(&run.project_key)
+        cairn_uri::build_project_uri(&run.project_key)
     } else if let Some(rest) = target.strip_prefix("cairn:@/") {
-        format!(
-            "{}/{rest}",
-            cairn_common::uri::build_project_uri(&run.project_key)
-        )
+        format!("{}/{rest}", cairn_uri::build_project_uri(&run.project_key))
     } else {
         target.to_string()
     };
-    let resource = cairn_common::uri::parse_uri(&absolute)?;
+    let resource = cairn_uri::parse_uri(&absolute)?;
     (resource.project_key() == Some(run.project_key.as_str())).then_some(resource)
 }
 

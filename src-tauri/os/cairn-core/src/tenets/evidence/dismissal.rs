@@ -59,7 +59,7 @@ struct EvidenceRow {
 /// `uri` in canonical form, so a caller may name a source in any spelling the
 /// URI grammar accepts.
 fn canonical(uri: &str) -> String {
-    cairn_common::uri::parse_uri(uri)
+    cairn_uri::parse_uri(uri)
         .map(|resource| resource.to_uri())
         .unwrap_or_else(|| uri.to_string())
 }

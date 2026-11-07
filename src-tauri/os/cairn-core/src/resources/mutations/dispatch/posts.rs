@@ -4,7 +4,7 @@ use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::models::{CreatePost, CreatePostComment};
 use crate::orchestrator::Orchestrator;
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 fn content<'a>(
     index: usize,
@@ -64,7 +64,7 @@ async fn identity(
         .await
         .map_err(|error| build_failure(index, item, error))?;
     let job_id = agent.job_id.clone();
-    let home = cairn_common::uri::parse_uri(&agent.home)
+    let home = cairn_uri::parse_uri(&agent.home)
         .ok_or_else(|| build_failure(index, item, "Authenticated run has an invalid home URI"))?;
     let project = home
         .project_key()

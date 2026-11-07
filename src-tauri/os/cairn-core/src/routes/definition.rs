@@ -757,8 +757,8 @@ fn validate_sink(
                 return Err("label sink issue value must be a canonical issue URI string".into());
             };
             if !matches!(
-                cairn_common::uri::parse_uri(target),
-                Some(cairn_common::uri::CairnResource::Issue { .. })
+                cairn_uri::parse_uri(target),
+                Some(cairn_uri::CairnResource::Issue { .. })
             ) {
                 return Err("label sink issue value must be a canonical issue URI".into());
             }

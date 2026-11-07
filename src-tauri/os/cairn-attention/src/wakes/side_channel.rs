@@ -170,9 +170,9 @@ async fn insert_message_wake_row(
     let subscription_id = subscription_id.map(ToString::to_string);
     let job_id = job_id.to_string();
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
+    let source_ref = source_ref.map(cairn_uri::canonicalize_uri_identity);
     let fact_kind = fact_kind.to_string();
-    let detail_uri = detail_uri.map(cairn_common::uri::canonicalize_uri_identity);
+    let detail_uri = detail_uri.map(cairn_uri::canonicalize_uri_identity);
     let content = content.to_string();
     db.write(|conn| {
         let id = id.clone();

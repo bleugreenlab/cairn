@@ -14,8 +14,8 @@
 use super::definition::Bindable;
 use super::{ArgumentBinding, RouteDefinition, RouteGraph, RouteNodeConfig, RouteSink};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_config::library::LibraryRoots;
+use cairn_uri::{parse_uri, CairnResource};
 use std::path::Path;
 
 pub async fn validate_references(
@@ -119,11 +119,11 @@ async fn validate_sink_references(
             return Err(match number {
                 Some(number) => format!(
                     "Issue not found: {}-{number}",
-                    cairn_common::uri::canonical_project(project)
+                    cairn_uri::canonical_project(project)
                 ),
                 None => format!(
                     "Project not found: {}",
-                    cairn_common::uri::canonical_project(project)
+                    cairn_uri::canonical_project(project)
                 ),
             });
         }

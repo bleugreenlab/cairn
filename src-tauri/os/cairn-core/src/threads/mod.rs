@@ -36,7 +36,7 @@ pub(crate) async fn resolve_parent_thread_uri_conn(
     conn: &cairn_db::storage::TrackedConnection,
     uri: &str,
 ) -> crate::storage::DbResult<Option<(String, String, String)>> {
-    use cairn_common::uri::{parse_uri, CairnResource};
+    use cairn_uri::{parse_uri, CairnResource};
     let (project, name, migrated_number) = match parse_uri(uri) {
         Some(CairnResource::Thread {
             project,
@@ -172,10 +172,7 @@ pub(crate) async fn thread_id_by_name(
         "SELECT t.id FROM threads t
          JOIN projects p ON t.project_id = p.id
          WHERE p.key = ?1 AND t.name = ?2 LIMIT 1",
-        (
-            cairn_common::uri::canonical_project(project_key),
-            name.to_string(),
-        ),
+        (cairn_uri::canonical_project(project_key), name.to_string()),
     )
     .await
 }
@@ -196,10 +193,7 @@ pub(crate) async fn session_job_id_by_name_conn(
                  WHERE p.key = ?1 AND t.name = ?2 AND {SESSION_JOB_SHAPE}
                  ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1"
             ),
-            cairn_db::turso::params![
-                cairn_common::uri::canonical_project(project_key),
-                thread_name
-            ],
+            cairn_db::turso::params![cairn_uri::canonical_project(project_key), thread_name],
         )
         .await?;
     rows.next()
@@ -216,7 +210,7 @@ pub(crate) async fn thread_id_for_coordinate_conn(
     project_key: &str,
     name: &str,
 ) -> crate::storage::DbResult<String> {
-    let canonical_key = cairn_common::uri::canonical_project(project_key);
+    let canonical_key = cairn_uri::canonical_project(project_key);
     let mut projects = conn
         .query(
             "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
@@ -322,7 +316,7 @@ pub(crate) async fn task_job_id_by_name_conn(
                  ORDER BY child.created_at DESC, child.rowid DESC LIMIT 1"
             ),
             cairn_db::turso::params![
-                cairn_common::uri::canonical_project(project_key),
+                cairn_uri::canonical_project(project_key),
                 thread_name,
                 task_segment
             ],

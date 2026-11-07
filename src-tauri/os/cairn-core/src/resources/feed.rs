@@ -7,7 +7,7 @@
 use crate::orchestrator::Orchestrator;
 use crate::storage::{FeedHome, FeedHomeKind, FeedPage, LocalDb, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{build_home_feed_uri, NodeAddress};
+use cairn_uri::{build_home_feed_uri, NodeAddress};
 
 /// Resolve the durable home a feed coordinate addresses.
 ///
@@ -429,9 +429,7 @@ mod tests {
     /// gate accepts.
     #[test]
     fn the_feed_advertises_its_acknowledgement_on_read() {
-        let block = super::super::common::affordance_for_kind(
-            cairn_common::contract::ResourceKind::HomeFeed,
-        );
+        let block = super::super::common::affordance_for_kind(cairn_uri::ResourceKind::HomeFeed);
         assert!(block.contains("Home feed"), "{block}");
         assert!(block.contains("cairn:~/feed"), "{block}");
         assert!(block.contains("ack"), "{block}");

@@ -15,14 +15,14 @@ use crate::mcp::handlers::skills_resources::{current_run_project, project_path_b
 use crate::mcp::handlers::tool_use_correlation::Claim;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// If any run item targets a workflow URI, return its `(project, workflow_id)`.
 /// `project` is `Some` only for an explicit `cairn://p/<project>/workflows/<id>`.
 pub(crate) fn detect_workflow_target(commands: &[RunItem]) -> Option<(Option<String>, String)> {
     for item in commands {
         if let Some(target) = item.target.as_deref() {
-            match cairn_common::uri::parse_uri(target) {
+            match cairn_uri::parse_uri(target) {
                 Some(CairnResource::Workflow { workflow_id }) => return Some((None, workflow_id)),
                 Some(CairnResource::ProjectWorkflow {
                     project,

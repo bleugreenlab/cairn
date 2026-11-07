@@ -7,7 +7,7 @@ use crate::orchestrator::conflict_session::{load_active_session, load_pending_re
 use crate::orchestrator::Orchestrator;
 use crate::services::testing::TestServicesBuilder;
 use crate::storage::SearchIndex;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 use std::sync::Arc;
 
 const CHILD: &str = "agent/child";

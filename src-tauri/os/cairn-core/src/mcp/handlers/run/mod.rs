@@ -3860,9 +3860,9 @@ async fn refuse_retired_surface_targets(
         else {
             continue;
         };
-        if let Some(refusal) = cairn_common::uri::parse_uri(&target)
+        if let Some(refusal) = cairn_uri::parse_uri(&target)
             .as_ref()
-            .and_then(crate::resources::retired_surface)
+            .and_then(cairn_uri::retired_surface)
         {
             return Err(refusal);
         }
@@ -10143,7 +10143,7 @@ mod decide_door_tests {
     async fn every_run_target_resolves_to_its_own_spec() {
         let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         for target in cairn_common::contract::RUN_TARGETS {
-            let sample = cairn_common::uri::samples::every_resource_variant()
+            let sample = cairn_uri::samples::every_resource_variant()
                 .into_iter()
                 .find(|sample| sample.resource.kind() == target.kind)
                 .expect("every run target has a URI");

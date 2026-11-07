@@ -17,7 +17,7 @@ use crate::config::ConfigResult;
 use crate::mcp::handlers::skills_resources::{current_run_project, project_path_by_key};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::{build_project_workflow_uri, build_workflow_uri};
+use cairn_uri::{build_project_workflow_uri, build_workflow_uri};
 
 fn scope_label(workflow: &FileWorkflow) -> &'static str {
     if workflow.is_project_scoped() {
@@ -47,10 +47,7 @@ async fn resolve_scope(
 ) -> Result<(Option<String>, Option<PathBuf>), String> {
     if let Some(project) = explicit_project {
         let path = project_path_by_key(orch, project).await?;
-        Ok((
-            Some(cairn_common::uri::canonical_project(project)),
-            Some(path),
-        ))
+        Ok((Some(cairn_uri::canonical_project(project)), Some(path)))
     } else {
         match current_run_project(orch, request).await {
             Some((key, path)) => Ok((Some(key), path)),
@@ -171,7 +168,7 @@ fn not_found(workflow_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Workflow not found in project {}: {workflow_id}",
-            cairn_common::uri::canonical_project(project)
+            cairn_uri::canonical_project(project)
         ),
         None => format!("Workflow not found: {workflow_id}"),
     }

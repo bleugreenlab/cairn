@@ -38,14 +38,9 @@ fn rebase_item_index(changes: &[crate::mcp::types::ChangeItem]) -> Option<usize>
 }
 
 fn target_is_rebase(target: &str) -> bool {
-    cairn_common::uri::parse_uri(target)
-        .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok())
-        .is_some_and(|resource| {
-            matches!(
-                resource,
-                cairn_common::uri::CairnResource::NodeRebase { .. }
-            )
-        })
+    cairn_uri::parse_uri(target)
+        .and_then(|parsed| cairn_uri::delegate_thread_descendant(parsed).ok())
+        .is_some_and(|resource| matches!(resource, cairn_uri::CairnResource::NodeRebase { .. }))
 }
 
 /// [`target_is_rebase`] for a target as a transcript recorded it, which may still
@@ -81,17 +76,17 @@ fn row_origin_refusal(
         ));
     }
     payload.changes.iter().enumerate().find_map(|(index, item)| {
-        let resource = cairn_common::uri::parse_uri(&item.target)
-            .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok());
+        let resource = cairn_uri::parse_uri(&item.target)
+            .and_then(|parsed| cairn_uri::delegate_thread_descendant(parsed).ok());
         // A collection patch or delete is admitted only scoped by where=,
         // which the dispatch arm enforces as it does for every writer.
         let allowed = matches!(
             (resource, item.mode),
             (
-                Some(cairn_common::uri::CairnResource::ThreadDbTable { .. }),
+                Some(cairn_uri::CairnResource::ThreadDbTable { .. }),
                 ChangeMode::Append | ChangeMode::Patch | ChangeMode::Delete
             ) | (
-                Some(cairn_common::uri::CairnResource::ThreadDbRow { .. }),
+                Some(cairn_uri::CairnResource::ThreadDbRow { .. }),
                 ChangeMode::Patch | ChangeMode::Delete
             )
         );

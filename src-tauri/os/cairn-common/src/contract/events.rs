@@ -5,6 +5,7 @@
 
 use super::specs::{NO_CROSS_ACTIONS, NO_MUTATIONS, NO_PROJECTIONS, NO_RELATED};
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const LIST_KEYS: &[ProjectionSpec] = &[
     ProjectionSpec {

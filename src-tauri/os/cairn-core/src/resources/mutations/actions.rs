@@ -138,7 +138,7 @@ fn not_found(action_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Action not found in project {}: {action_id}",
-            cairn_common::uri::canonical_project(project)
+            cairn_uri::canonical_project(project)
         ),
         None => format!("Action not found: {action_id}"),
     }

@@ -119,7 +119,7 @@ pub(crate) async fn lookup_conn(
     let mut rows = conn
         .query(
             "SELECT id FROM projects WHERE key = ?1 COLLATE NOCASE LIMIT 1",
-            cairn_db::turso::params![cairn_common::uri::canonical_project(project_key)],
+            cairn_db::turso::params![cairn_uri::canonical_project(project_key)],
         )
         .await?;
     let Some(project_id) = rows.next().await?.map(|row| row.text(0)).transpose()? else {
@@ -492,7 +492,7 @@ async fn gates_by_tenet(
                 let issue = row
                     .opt_text(5)?
                     .zip(row.opt_i64(6)?)
-                    .map(|(key, number)| cairn_common::uri::build_issue_uri(&key, number as i32));
+                    .map(|(key, number)| cairn_uri::build_issue_uri(&key, number as i32));
                 Ok((
                     row.text(0)?,
                     TenetGate {
@@ -511,7 +511,7 @@ async fn gates_by_tenet(
         .map_err(|error| format!("Failed to read tenet gates: {error}"))?;
     let mut out: HashMap<String, Vec<TenetGate>> = HashMap::new();
     for (tenet, gate) in rows {
-        let tenet = match cairn_common::uri::parse_uri(&tenet) {
+        let tenet = match cairn_uri::parse_uri(&tenet) {
             Some(resource) => resource.to_uri(),
             None => tenet,
         };

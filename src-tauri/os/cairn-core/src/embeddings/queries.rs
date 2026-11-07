@@ -450,9 +450,9 @@ pub(crate) async fn resolve_session_owner_uri_async(
                         .filter(|s| !s.is_empty())
                 });
                 return Ok(match (key, number, seq, segment) {
-                    (Some(key), Some(number), Some(seq), Some(segment)) => Some(
-                        cairn_common::uri::build_node_uri(&key, number, seq, &segment),
-                    ),
+                    (Some(key), Some(number), Some(seq), Some(segment)) => {
+                        Some(cairn_uri::build_node_uri(&key, number, seq, &segment))
+                    }
                     _ => None,
                 });
             }

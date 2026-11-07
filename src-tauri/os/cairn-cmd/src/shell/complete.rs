@@ -12,7 +12,7 @@
 
 use cairn_common::contract::RESOURCE_CONTRACTS;
 use cairn_common::read::AffordanceSpec;
-use cairn_common::uri::{scan_uris, ROOT_URI};
+use cairn_uri::{scan_uris, ROOT_URI};
 
 use super::actions;
 use super::nav::BUILTINS;

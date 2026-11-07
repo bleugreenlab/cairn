@@ -25,7 +25,7 @@ async fn resolve_project_and_issue(
     project_key: &str,
     number: i32,
 ) -> Result<(String, String, String), String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let resolved = db
         .read(|conn| {
             let key = key.clone();
@@ -190,7 +190,7 @@ pub(crate) async fn start_execution_from_collection(
     let owning_db = orch.db.for_project(project_key).await;
     let (project_id, issue_id, title) =
         resolve_project_and_issue(&owning_db, project_key, number).await?;
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let recipe = Some(filing.resolution.recipe.as_str());
 
     // Read BEFORE the launch: after it, the prior canonical execution is
@@ -255,7 +255,7 @@ pub(crate) async fn start_execution_from_collection(
     // Wake any in-flight `watch` so the driving loop re-derives state promptly.
     orch.wake_for_issue(&issue_id).await;
 
-    let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
+    let issue_uri = cairn_uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
 
     let steps = crate::execution::launch_preview::preview_execution(
@@ -451,10 +451,7 @@ pub(crate) async fn patch_execution_gates(
     let execution_id = resolve_execution_id(&owning_db, project_key, number, exec_seq).await?;
     let label = format!(
         "execution {exec_seq} on {}",
-        cairn_common::uri::build_issue_uri(
-            &cairn_common::uri::canonical_project(project_key),
-            number
-        )
+        cairn_uri::build_issue_uri(&cairn_uri::canonical_project(project_key), number)
     );
     let state = crate::execution::gates::authoring::hold_state(&owning_db, &execution_id).await?;
     crate::execution::gates::authoring::require_held(&state, &label)?;
@@ -786,7 +783,7 @@ pub(crate) async fn resolve_execution_id(
     number: i32,
     exec_seq: i32,
 ) -> Result<String, String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let resolved = db
         .read(|conn| {
             let key = key.clone();

@@ -5,7 +5,7 @@
 //! directory — except that arriving somewhere *is* reading it, so `cd` and `cat`
 //! are the same gesture.
 //!
-//! Nothing here is a new interface. Resolution is [`cairn_common::uri`], reads go
+//! Nothing here is a new interface. Resolution is [`cairn_uri`], reads go
 //! through the same `read_batch` callback `cairn read` uses and print its exact
 //! output, writes go through `cairn write`'s change path, and the commands
 //! available at any location are whatever that resource's affordance block

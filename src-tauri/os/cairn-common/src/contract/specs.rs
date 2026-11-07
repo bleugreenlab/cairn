@@ -2,6 +2,7 @@
 //! `RESOURCE_CONTRACTS` table entries.
 
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 // Reusable key specs. Notes carry value guidance (enumerations/defaults) only
 // where the key name + type + example don't already make the value obvious; an

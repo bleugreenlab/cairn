@@ -32,7 +32,7 @@ pub async fn create(
     projects_dir: Option<&Path>,
     store_init: Option<StoreInit<'_>>,
 ) -> Result<DbProject, CairnError> {
-    input.key = cairn_common::uri::canonical_project(&input.key);
+    input.key = cairn_uri::canonical_project(&input.key);
     if db
         .query_opt_text(
             "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
@@ -542,7 +542,7 @@ pub async fn create_routed(
     projects_dir: Option<&Path>,
     store_init: Option<StoreInit<'_>>,
 ) -> Result<(DbProject, Arc<LocalDb>), CairnError> {
-    let key = cairn_common::uri::canonical_project(&input.key);
+    let key = cairn_uri::canonical_project(&input.key);
     let team_id = input.team_id.clone();
     if dbs
         .local
@@ -648,7 +648,7 @@ async fn local_repo_path(
     private_db: &LocalDb,
     project_key: &str,
 ) -> Result<Option<String>, CairnError> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     private_db
         .query_opt_text(
             "SELECT local_repo_path FROM project_routes WHERE project_key = ?1",
@@ -663,7 +663,7 @@ pub async fn set_local_repo_path(
     project_key: &str,
     path: &Path,
 ) -> Result<(), CairnError> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let path = path.to_string_lossy().to_string();
     private_db
         .execute(
@@ -704,7 +704,7 @@ pub(crate) async fn insert_project_route(
     project_key: &str,
     team_id: Option<&str>,
 ) -> Result<(), CairnError> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let team_id = team_id.map(str::to_string);
     let now = clock.now();
     db.write(|conn| {

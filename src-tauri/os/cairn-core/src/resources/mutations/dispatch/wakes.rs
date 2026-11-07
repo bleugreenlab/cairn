@@ -3,7 +3,7 @@
 use super::super::{build_failure, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
@@ -505,7 +505,7 @@ async fn normalize_checks_filter(
             "a checks wake watches a whole node and does not accept suite",
         ));
     }
-    let home = cairn_common::uri::build_node_uri(project, number, exec_seq, node_id);
+    let home = cairn_uri::build_node_uri(project, number, exec_seq, node_id);
     let reference = filter.reference.as_deref().unwrap_or("cairn:~/checks");
     let target =
         crate::execution::checks_settlement::resolve_checks_target(orch, reference, Some(&home))
@@ -884,7 +884,7 @@ async fn subscribe_terminal_wake(
         )
     })?;
     let db = orch.db.for_project(project).await;
-    let home = cairn_common::uri::build_node_uri(project, number, exec_seq, node_id);
+    let home = cairn_uri::build_node_uri(project, number, exec_seq, node_id);
     let caller = TerminalCaller {
         job_id,
         home: &home,

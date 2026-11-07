@@ -75,9 +75,10 @@ use super::{
 };
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::contract::{contract_for, MutationSpec, ResourceKind};
-use cairn_common::uri::CairnResource;
+use cairn_common::contract::{contract_for, MutationSpec};
 use cairn_platform::stack::off_frame;
+use cairn_uri::CairnResource;
+use cairn_uri::ResourceKind;
 
 fn append_payload(index: usize, item: &ChangeItem) -> ResourceMutationResult<&serde_json::Value> {
     item.payload
@@ -239,7 +240,7 @@ fn gate_resource_change(
             render_unsupported(kind, item.mode),
         ));
     }
-    let schema_resolved = kind.payload_keys_are_schema_resolved();
+    let schema_resolved = cairn_common::contract::payload_keys_are_schema_resolved(kind);
     let payload = item.payload.as_ref();
 
     // Track the closest near-miss so a rejection quotes the shape the caller was
@@ -700,7 +701,8 @@ fn wants_return_content(target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{retired_model_keys_refusal, ALLOTMENT_KINDS};
-    use cairn_common::contract::{contract_for, ResourceKind};
+    use cairn_common::contract::contract_for;
+    use cairn_uri::ResourceKind;
     use serde_json::json;
 
     /// Each retired model key is refused with what replaced it, on every

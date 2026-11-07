@@ -22,7 +22,7 @@ fn resolve_message_content(
     let text = text.into();
     let mut seen = std::collections::HashSet::new();
     let mut images = Vec::new();
-    for found in cairn_common::uri::scan_markdown_stored_images(&text) {
+    for found in cairn_uri::scan_markdown_stored_images(&text) {
         if seen.insert(found.uri.clone()) {
             if let Ok(image) = resolver.resolve(&found.uri) {
                 images.push(image);

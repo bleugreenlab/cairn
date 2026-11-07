@@ -11,7 +11,7 @@ use crate::attachments::{AttachmentKind, AttachmentRow};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{
+use cairn_uri::{
     build_issue_uri, build_project_issues_uri, build_project_reference_uri,
     build_project_references_uri, build_project_terminal_uri, build_project_uri,
     AttachmentScopeRef,
@@ -152,7 +152,7 @@ const PROJECT_ISSUES_RETIRED_PARAMS: &[(&str, &str)] = &[
 /// advertises, so the affordance block and this reader's refusal cannot name
 /// different sets.
 fn project_issues_supported_params() -> impl Iterator<Item = &'static str> {
-    cairn_common::contract::contract_for(cairn_common::contract::ResourceKind::ProjectIssues)
+    cairn_common::contract::contract_for(cairn_uri::ResourceKind::ProjectIssues)
         .map(|contract| contract.read_projections)
         .unwrap_or_default()
         .iter()
@@ -464,7 +464,7 @@ fn render_project_issue_entries(
         };
         output.push_str(&format!(
             "- [{}-{}]({}) [{}] {}{}\n",
-            cairn_common::uri::canonical_project(project_key),
+            cairn_uri::canonical_project(project_key),
             issue.number,
             build_issue_uri(project_key, issue.number),
             status_indicator,
@@ -498,7 +498,7 @@ fn render_recent_project_issue_entries(
         };
         output.push_str(&format!(
             "- [{}-{}]({}) [{}] {}\n",
-            cairn_common::uri::canonical_project(project_key),
+            cairn_uri::canonical_project(project_key),
             number,
             build_issue_uri(project_key, *number),
             status_indicator,
@@ -579,7 +579,7 @@ pub(super) async fn read_project_issues(
 
 /// How an attachment scope reads in prose.
 fn attachment_scope_label(project_key: &str, scope: &AttachmentScopeRef) -> String {
-    let project = cairn_common::uri::canonical_project(project_key);
+    let project = cairn_uri::canonical_project(project_key);
     match scope {
         AttachmentScopeRef::Issue(number) => format!("{project}/{number}"),
         AttachmentScopeRef::Thread(name) => format!("{project}/{name}"),
@@ -626,8 +626,8 @@ pub(super) async fn read_project_images(
         })
         .collect();
 
-    let base = cairn_common::uri::build_project_images_uri(project_key, scope);
-    let attachments = cairn_common::uri::build_project_attachments_uri(project_key, scope);
+    let base = cairn_uri::build_project_images_uri(project_key, scope);
+    let attachments = cairn_uri::build_project_attachments_uri(project_key, scope);
     let mut body = format!(
         "# Images — {}\n\n",
         attachment_scope_label(project_key, scope)
@@ -670,7 +670,7 @@ pub(super) async fn read_project_attachments(
         Err(error) => return error,
     };
 
-    let base = cairn_common::uri::build_project_attachments_uri(project_key, scope);
+    let base = cairn_uri::build_project_attachments_uri(project_key, scope);
     let mut body = format!(
         "# Attachments — {}\n\n",
         attachment_scope_label(project_key, scope)
@@ -747,7 +747,7 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
     let requested_key = project_key.to_owned();
     let read = read_resource(db, move |conn| {
         Box::pin(async move {
-            let lookup_key = cairn_common::uri::canonical_project(&requested_key);
+            let lookup_key = cairn_uri::canonical_project(&requested_key);
             let mut project_rows = conn
                 .query(
                     "
@@ -888,7 +888,7 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
     if let Ok(pending) = crate::tenets::pending_count(db, &project_id).await {
         let inbox = format!(
             "{}?status=pending",
-            cairn_common::uri::build_project_tenets_uri(&canonical_key)
+            cairn_uri::build_project_tenets_uri(&canonical_key)
         );
         output.push_str(&format!(
             "{}: [{inbox}]({inbox})\n\n",
@@ -1001,7 +1001,7 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
 /// collection that carries their jurisdictions. Thread names are chosen, not
 /// numbered, so without this listing a caller can only guess them.
 fn render_project_threads(project_key: &str, threads: &[String]) -> String {
-    let collection = cairn_common::uri::build_project_threads_uri(project_key);
+    let collection = cairn_uri::build_project_threads_uri(project_key);
     let mut out = String::from("## Threads\n\n");
     if threads.is_empty() {
         out.push_str(&format!(
@@ -1017,7 +1017,7 @@ fn render_project_threads(project_key: &str, threads: &[String]) -> String {
     let links: Vec<String> = threads
         .iter()
         .map(|name| {
-            let uri = cairn_common::uri::build_thread_uri(project_key, name);
+            let uri = cairn_uri::build_thread_uri(project_key, name);
             format!("[{name}]({uri})")
         })
         .collect();
@@ -1507,7 +1507,7 @@ fn render_held_executions(
     let entry_line = |entry: &crate::execution::gates::census::ProjectHeldExecution| {
         format!(
             "- [{}-{}]({}) {} — {}\n",
-            cairn_common::uri::canonical_project(project_key),
+            cairn_uri::canonical_project(project_key),
             entry.issue_number,
             build_issue_uri(project_key, entry.issue_number as i32),
             entry.issue_title,
@@ -1734,7 +1734,7 @@ async fn project_repo_path_row(db: &LocalDb, project_key: &str) -> Result<String
     let project_key = project_key.to_owned();
     read_resource(db, move |conn| {
         Box::pin(async move {
-            let lookup = cairn_common::uri::canonical_project(&project_key);
+            let lookup = cairn_uri::canonical_project(&project_key);
             let mut rows = conn
                 .query(
                     "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
@@ -1754,7 +1754,7 @@ async fn project_repo_path_row(db: &LocalDb, project_key: &str) -> Result<String
 }
 
 pub(super) async fn read_project_references(orch: &Orchestrator, project_key: &str) -> String {
-    let lookup = cairn_common::uri::canonical_project(project_key);
+    let lookup = cairn_uri::canonical_project(project_key);
     let repo_path = match project_repo_path_row(&orch.db.local, project_key).await {
         Ok(repo_path) => repo_path,
         Err(error) => return error,
@@ -1789,7 +1789,7 @@ pub(super) async fn read_project_reference(
     project_key: &str,
     name: &str,
 ) -> String {
-    let lookup = cairn_common::uri::canonical_project(project_key);
+    let lookup = cairn_uri::canonical_project(project_key);
     let repo_path = match project_repo_path_row(&orch.db.local, project_key).await {
         Ok(repo_path) => repo_path,
         Err(error) => return error,
@@ -1810,7 +1810,7 @@ pub(super) async fn read_project_reference(
 
 pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str) -> String {
     let routed_db = orch.db.for_project(project_key).await;
-    let lookup = cairn_common::uri::canonical_project(project_key);
+    let lookup = cairn_uri::canonical_project(project_key);
     let requested_key = project_key.to_owned();
     let row_key = lookup.clone();
     let (project_id, repo_path, default_branch): (String, String, Option<String>) =
@@ -2157,14 +2157,13 @@ mod project_issues_query_tests {
             ("label", "bug"),
             ("labels", "bug,ui"),
         ];
-        let advertised = cairn_common::contract::contract_for(
-            cairn_common::contract::ResourceKind::ProjectIssues,
-        )
-        .expect("project issues contract")
-        .read_projections
-        .iter()
-        .map(|projection| projection.key)
-        .collect::<Vec<_>>();
+        let advertised =
+            cairn_common::contract::contract_for(cairn_uri::ResourceKind::ProjectIssues)
+                .expect("project issues contract")
+                .read_projections
+                .iter()
+                .map(|projection| projection.key)
+                .collect::<Vec<_>>();
         assert_eq!(
             advertised,
             samples.iter().map(|(key, _)| *key).collect::<Vec<_>>(),

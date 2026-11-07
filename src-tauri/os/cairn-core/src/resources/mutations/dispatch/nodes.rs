@@ -3,7 +3,7 @@
 use super::super::{build_failure, payload_str, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 async fn resolution_attribution(
     orch: &Orchestrator,

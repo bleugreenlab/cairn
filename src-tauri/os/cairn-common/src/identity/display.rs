@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{Address, AppearanceSnapshot, PrincipalRef};
-use crate::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 
 /// What a surface shows when attribution is genuinely absent — an issue created
 /// before authorship was recorded at all. An id that merely failed to resolve is

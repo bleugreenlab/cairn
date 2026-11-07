@@ -1,7 +1,7 @@
 //! Cairn URI resolution and display-relativization for the MCP verbs: home/base
 //! shorthand expansion and target validation.
 use cairn_common::query::split_target_query;
-use cairn_common::uri::parse_uri as parse_cairn_uri;
+use cairn_uri::parse_uri as parse_cairn_uri;
 
 use crate::schemas::ChangeInput;
 use crate::server::CairnMcpServer;

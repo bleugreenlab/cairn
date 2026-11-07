@@ -3,8 +3,9 @@
 use crate::error::CairnError;
 use crate::models::{CreateThread, Thread, UpdateThread};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use cairn_common::{ids, thread_name::validate_thread_name};
+use cairn_common::ids;
 use cairn_db::turso::params;
+use cairn_uri::thread_name::validate_thread_name;
 
 const COLUMNS: &str = "id, project_id, name, jurisdiction, status, attention,
     definition, migrated_from_number, created_at, updated_at";

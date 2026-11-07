@@ -11,8 +11,8 @@ use crate::models::IssueStatus;
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
-use cairn_common::uri::{build_job_base_uri, build_node_uri};
 use cairn_db::turso::params;
+use cairn_uri::{build_job_base_uri, build_node_uri};
 
 async fn sender_name_for_run(db: &LocalDb, run_ctx: &super::RunContext) -> Result<String, String> {
     // The canonical resolver covers issue nodes, their tasks, thread sessions,
@@ -70,7 +70,7 @@ async fn ensure_issue_accepts_messages(
     project_key: &str,
     issue_number: i32,
 ) -> Result<(), String> {
-    let lookup_key = cairn_common::uri::canonical_project(project_key);
+    let lookup_key = cairn_uri::canonical_project(project_key);
     let requested_key = project_key.to_string();
     db.read(move |conn| {
         Box::pin(async move {
@@ -137,7 +137,7 @@ async fn resolve_channel_id(
     issue_number: Option<i32>,
 ) -> Result<String, String> {
     let requested_key = project_key.to_string();
-    let lookup_key = cairn_common::uri::canonical_project(&requested_key);
+    let lookup_key = cairn_uri::canonical_project(&requested_key);
     db.read(|conn| {
         let lookup_key = lookup_key.clone();
         let requested_key = requested_key.clone();
@@ -203,7 +203,7 @@ async fn find_recipient_job(
     node_name: &str,
     task_name: Option<&str>,
 ) -> Result<Option<RecipientJob>, String> {
-    let lookup_key = cairn_common::uri::canonical_project(project_key);
+    let lookup_key = cairn_uri::canonical_project(project_key);
     let node_name = node_name.to_string();
     let task_name = task_name.map(str::to_string);
     db.read(|conn| {
@@ -372,9 +372,7 @@ pub async fn append_project_or_issue_message(
             ChannelType::Issue,
             format!(
                 "Appended message to issue channel {}-{}",
-                cairn_common::uri::canonical_project(
-                    channel_id.split('/').next().unwrap_or(project_key),
-                ),
+                cairn_uri::canonical_project(channel_id.split('/').next().unwrap_or(project_key),),
                 number
             ),
         ),
@@ -520,7 +518,7 @@ pub async fn append_direct_message_with_urgency(
     let (addressed_uri, scope_hint) = if is_thread {
         match task_name {
             Some(task) => (
-                cairn_common::uri::build_thread_task_uri(project_key, node_name, task),
+                cairn_uri::build_thread_task_uri(project_key, node_name, task),
                 format!("no task '{task}' under thread '{node_name}'"),
             ),
             None => (

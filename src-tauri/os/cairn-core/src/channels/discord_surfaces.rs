@@ -4,8 +4,8 @@
 //! reconciler. This module is the sole owner of remote container mutations.
 
 use super::discord::DiscordApi;
-use cairn_common::uri::parse_uri;
 use cairn_db::turso::{params, Row};
+use cairn_uri::parse_uri;
 use std::sync::Arc;
 
 use crate::storage::{LocalDb, RowExt};
@@ -213,7 +213,7 @@ async fn ensure_ambient_under(
         guild_id,
         SurfaceKind::AmbientHome,
         project_key,
-        Some(&cairn_common::uri::build_project_uri(project_key)),
+        Some(&cairn_uri::build_project_uri(project_key)),
         Some(category_id),
         now,
     )
@@ -1397,7 +1397,7 @@ async fn find_surface(
 }
 
 fn canonical_target(uri: &str) -> Result<String, String> {
-    let uri = cairn_common::uri::canonicalize_uri_identity(uri);
+    let uri = cairn_uri::canonicalize_uri_identity(uri);
     if uri == "cairn:~" || uri.starts_with("cairn:~/") || uri.starts_with("cairn:@") {
         Err("deictic Discord target must be resolved before persistence".into())
     } else {
@@ -1606,7 +1606,7 @@ impl DiscordSurfaceReconciler {
         let parsed = parse_uri(target).ok_or_else(|| "invalid Discord issue target".to_string())?;
         let project = parsed
             .project()
-            .map(cairn_common::uri::canonical_project)
+            .map(cairn_uri::canonical_project)
             .ok_or_else(|| "Discord issue target is missing its project".to_string())?;
         let number = parsed
             .issue_number()
@@ -1847,7 +1847,7 @@ fn binding_key(row: &DiscordSurface) -> Option<(String, String)> {
     };
     Some((
         format!("discord:{}/{}", row.guild_id, remote),
-        cairn_common::uri::canonicalize_uri_identity(target),
+        cairn_uri::canonicalize_uri_identity(target),
     ))
 }
 

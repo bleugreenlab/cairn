@@ -16,8 +16,9 @@ use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::models::UpdateSettings;
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::AuthorityRequest;
-use cairn_common::contract::{mutation_spec, ResourceKind};
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_common::contract::mutation_spec;
+use cairn_uri::ResourceKind;
+use cairn_uri::{parse_uri, CairnResource};
 
 /// Scalar/app-pref + backend keys that route to `orch.update_settings`.
 pub(crate) const PREF_KEYS: &[&str] = &[

@@ -509,9 +509,9 @@ pub(crate) fn ambient_feedback_query(
                     AMBIENT_OUTCOMES.join(", ")
                 ))
             }
-            "thread" => match cairn_common::uri::parse_uri(value) {
-                Some(cairn_common::uri::CairnResource::Thread { path, .. }) if path.is_empty() => {
-                    filter.thread = Some(cairn_common::uri::canonicalize_uri_identity(value))
+            "thread" => match cairn_uri::parse_uri(value) {
+                Some(cairn_uri::CairnResource::Thread { path, .. }) if path.is_empty() => {
+                    filter.thread = Some(cairn_uri::canonicalize_uri_identity(value))
                 }
                 _ => {
                     return Err(format!(

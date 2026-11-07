@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 use crate::browsers::{
     ensure_open_browser, find_browser_by_scope_and_slug, mark_browser_closed, BridgeRequest,

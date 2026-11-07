@@ -148,7 +148,7 @@ fn address_root_predicate(alias: &str) -> String {
 ///
 /// `task_name: None` names the node (or thread session) itself; `Some` names a
 /// sub-agent task beneath it. `(0, 0, name)` is the reserved thread coordinate
-/// that [`cairn_common::uri::NodeAddress`] defines; every other coordinate names
+/// that [`cairn_uri::NodeAddress`] defines; every other coordinate names
 /// an execution node under an issue.
 ///
 /// This is the ONE place the two ownerships are told apart when resolving, so a
@@ -168,8 +168,8 @@ pub(crate) async fn job_id_for_node_coordinate_conn(
     node_id: &str,
     task_name: Option<&str>,
 ) -> Result<Option<String>, DbError> {
-    if let cairn_common::uri::NodeAddress::Thread { name } =
-        cairn_common::uri::NodeAddress::new(number, exec_seq, node_id)
+    if let cairn_uri::NodeAddress::Thread { name } =
+        cairn_uri::NodeAddress::new(number, exec_seq, node_id)
     {
         return match task_name {
             None => crate::threads::session_job_id_by_name_conn(conn, project_key, name).await,
@@ -179,7 +179,7 @@ pub(crate) async fn job_id_for_node_coordinate_conn(
         };
     }
 
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let node_root = address_root_predicate("j");
     let task_root = address_root_predicate("parent");
     let mut rows = match task_name {
@@ -823,7 +823,7 @@ async fn live_agent_census_db(
         serde_json::to_string(&projects).map_err(|e| CairnError::Internal(e.to_string()))?;
     let sql = live_agent_census_sql();
     db.query_all(sql, params![projects.as_str()], move |row| {
-        use cairn_common::uri::{build_job_base_uri, build_thread_task_uri, build_thread_uri};
+        use cairn_uri::{build_job_base_uri, build_thread_task_uri, build_thread_uri};
         let project_key = row.text(2)?;
         let issue_number = row.opt_i64(4)?.map(|n| n as i32);
         let thread_name = row.opt_text(6)?;
@@ -1067,7 +1067,7 @@ async fn thread_pending_request_counts(
             ).await?;
             let mut counts = HashMap::new();
             while let Some(row) = rows.next().await? {
-                let uri = cairn_common::uri::build_thread_uri(&row.text(1)?, &row.text(2)?);
+                let uri = cairn_uri::build_thread_uri(&row.text(1)?, &row.text(2)?);
                 counts.insert(row.text(0)?, pending.get(&uri).copied().unwrap_or_default());
             }
             Ok(counts)

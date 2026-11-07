@@ -23,7 +23,7 @@ use crate::authorization::prepare::Prepared;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::AuthorityDecision;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// A parsed `catch-up-mode` payload.
 struct CatchUpSetting {

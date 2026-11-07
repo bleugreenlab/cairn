@@ -1513,6 +1513,7 @@ mod tests {
                 "cairn-tokenize",
                 "cairn-toks",
                 "cairn-transport",
+                "cairn-uri",
                 "cairn-vcs",
                 "cairn-workflow",
             ]
@@ -1524,7 +1525,8 @@ mod tests {
                 "cairn-cmd",
                 "cairn-common",
                 "cairn-mcp-server",
-                "cairn-procmem"
+                "cairn-procmem",
+                "cairn-uri"
             ]
         );
     }

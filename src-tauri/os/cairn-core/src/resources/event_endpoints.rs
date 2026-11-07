@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{
+use cairn_uri::{
     build_project_event_delivery_uri, build_project_event_endpoint_uri,
     build_project_event_endpoints_uri, build_project_events_uri,
 };

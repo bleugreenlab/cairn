@@ -4,12 +4,11 @@ use cairn_db::turso::params;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
-use cairn_common::contract::{
-    contract_for, ChangeMode, KeyType, MutationSpec, ResourceContract, ResourceKind,
-};
+use cairn_common::contract::{contract_for, ChangeMode, KeyType, MutationSpec, ResourceContract};
 use cairn_common::query::QueryParam;
 use cairn_common::read::{ActionSpec, AffordanceSpec, FilterSpec, KeyInfo, LinkSpec};
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
+use cairn_uri::ResourceKind;
 use futures_util::future::BoxFuture;
 
 #[derive(Debug)]
@@ -173,7 +172,7 @@ fn scope_anchor_of(home_uri: &str) -> Option<&str> {
         return Some(project_uri);
     };
     if segment.parse::<i32>().is_ok_and(|number| number > 0)
-        || cairn_common::thread_name::validate_thread_name(segment).is_ok()
+        || cairn_uri::thread_name::validate_thread_name(segment).is_ok()
     {
         return Some(&home_uri[..project_uri.len() + 1 + segment.len()]);
     }
@@ -277,7 +276,7 @@ pub(super) async fn lookup_project_by_key(
     conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
 ) -> Result<ProjectContext, String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let mut rows = conn
         .query(
             "SELECT id, key FROM projects WHERE key = ?1 LIMIT 1",
@@ -841,12 +840,12 @@ pub(crate) fn node_job_not_found_message(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
-    match cairn_common::uri::NodeAddress::new(number, exec_seq, node_name) {
-        cairn_common::uri::NodeAddress::Thread { name } => format!(
+    match cairn_uri::NodeAddress::new(number, exec_seq, node_name) {
+        cairn_uri::NodeAddress::Thread { name } => format!(
             "Thread '{name}' has no session yet. Read {} for the thread overview.",
-            cairn_common::uri::build_thread_uri(project_key, name)
+            cairn_uri::build_thread_uri(project_key, name)
         ),
-        cairn_common::uri::NodeAddress::Node { .. } => {
+        cairn_uri::NodeAddress::Node { .. } => {
             format!("Node '{node_name}' not found for issue {project_key}/{number}")
         }
     }
@@ -917,8 +916,8 @@ pub(crate) async fn find_node_job(
     // nonexistent issue is reported as itself rather than collapsed into "node
     // not found", which would be false for the first and misleading for the
     // second. A thread coordinate names no issue and goes straight to the job.
-    if let cairn_common::uri::NodeAddress::Node { .. } =
-        cairn_common::uri::NodeAddress::new(number, exec_seq, node_name)
+    if let cairn_uri::NodeAddress::Node { .. } =
+        cairn_uri::NodeAddress::new(number, exec_seq, node_name)
     {
         resolve_issue_id(conn, project_key, number).await?;
     }

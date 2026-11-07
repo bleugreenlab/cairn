@@ -88,7 +88,7 @@ pub async fn page_service(
                 .as_ref()
                 .map(DeclaredService::canonical)
                 .unwrap_or_default(),
-            _ => cairn_common::uri::build_project_service_uri(&project_key, &request.service),
+            _ => cairn_uri::build_project_service_uri(&project_key, &request.service),
         },
         request.method
     );

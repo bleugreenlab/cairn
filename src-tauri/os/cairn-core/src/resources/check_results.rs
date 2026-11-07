@@ -1189,10 +1189,10 @@ mod tests {
         let handle = ack["observationHandle"].as_str().unwrap();
         assert!(uuid::Uuid::try_parse(handle).is_ok(), "{ack}");
         let reference = ack["observationRef"].as_str().unwrap();
-        let Some(cairn_common::uri::CairnResource::ProjectCheckObservation {
+        let Some(cairn_uri::CairnResource::ProjectCheckObservation {
             project,
             handle: parsed,
-        }) = cairn_common::uri::parse_uri(reference)
+        }) = cairn_uri::parse_uri(reference)
         else {
             panic!("{reference} is not a check observation resource");
         };

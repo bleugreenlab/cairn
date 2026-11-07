@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::{Map, Value};
 
 use super::decision::{self as decisions, DecisionRun};
@@ -71,7 +71,7 @@ enum MessageTarget {
 fn resolve_message_target(target: &str) -> Result<(MessageTarget, String), String> {
     match parse_uri(target) {
         Some(CairnResource::Project { project }) => {
-            let canonical = cairn_common::uri::build_project_uri(&project);
+            let canonical = cairn_uri::build_project_uri(&project);
             Ok((
                 MessageTarget::Stream {
                     project,
@@ -81,7 +81,7 @@ fn resolve_message_target(target: &str) -> Result<(MessageTarget, String), Strin
             ))
         }
         Some(CairnResource::Issue { project, number }) => {
-            let canonical = cairn_common::uri::build_issue_uri(&project, number);
+            let canonical = cairn_uri::build_issue_uri(&project, number);
             Ok((
                 MessageTarget::Stream {
                     project,
@@ -95,7 +95,7 @@ fn resolve_message_target(target: &str) -> Result<(MessageTarget, String), Strin
             name,
             path,
         }) if path.is_empty() => {
-            let canonical = cairn_common::uri::build_thread_uri(&project, &name);
+            let canonical = cairn_uri::build_thread_uri(&project, &name);
             Ok((MessageTarget::Thread { project, name }, canonical))
         }
         _ => Err(format!(
@@ -141,7 +141,7 @@ async fn deliver_message(
                 .ok_or_else(|| {
                     format!(
                         "Thread not found: {}",
-                        cairn_common::uri::build_thread_uri(project, name)
+                        cairn_uri::build_thread_uri(project, name)
                     )
                 })?;
             crate::messages::delivery::append_thread_message(
@@ -1113,7 +1113,7 @@ async fn fire_label_sink(
             "label sink target must be a canonical issue URI: {uri}"
         ));
     };
-    let canonical = cairn_common::uri::build_issue_uri(&project, number);
+    let canonical = cairn_uri::build_issue_uri(&project, number);
     let db = orch.db.for_project(&project).await;
     let target = canonical.clone();
     let labels = labels.to_vec();

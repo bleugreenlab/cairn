@@ -7,6 +7,7 @@
 
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const FROM: ProjectionSpec = ProjectionSpec {
     key: "from",

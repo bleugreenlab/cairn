@@ -75,7 +75,7 @@ fn read_task_rows<'s, T: Send + 'static>(
     })
 }
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{
+use cairn_uri::{
     build_job_todos_uri, build_node_artifact_uri_named, build_node_chat_uri, build_node_checks_uri,
     build_node_permission_uri, build_node_question_uri, build_node_uri, build_node_wakes_uri,
     build_task_artifact_uri, build_task_artifact_uri_named, build_task_chat_uri,
@@ -199,11 +199,11 @@ pub(crate) async fn resolve_node_or_task_job_id_for_read(
     .await
     .map_err(|error| error.to_string())?
     .ok_or_else(|| match task_name {
-        Some(task_name) => match cairn_common::uri::NodeAddress::new(number, exec_seq, node_name) {
-            cairn_common::uri::NodeAddress::Thread { name } => {
+        Some(task_name) => match cairn_uri::NodeAddress::new(number, exec_seq, node_name) {
+            cairn_uri::NodeAddress::Thread { name } => {
                 format!("Task '{task_name}' not found under thread '{name}'")
             }
-            cairn_common::uri::NodeAddress::Node { .. } => {
+            cairn_uri::NodeAddress::Node { .. } => {
                 format!("Task '{task_name}' not found under node '{node_name}'")
             }
         },
@@ -225,8 +225,8 @@ pub(crate) async fn resolve_node_or_task_job_id(
     node_name: &str,
     task_name: Option<&str>,
 ) -> Result<String, String> {
-    if let (cairn_common::uri::NodeAddress::Thread { name }, None) = (
-        cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
+    if let (cairn_uri::NodeAddress::Thread { name }, None) = (
+        cairn_uri::NodeAddress::new(number, exec_seq, node_name),
         task_name,
     ) {
         let (project_key, name) = (project_key.to_string(), name.to_string());
@@ -2766,7 +2766,7 @@ pub(super) async fn artifact_affordance_spec(
     node_name: &str,
     task_name: Option<&str>,
     artifact_name: Option<&str>,
-    current: &cairn_common::uri::CairnResource,
+    current: &cairn_uri::CairnResource,
 ) -> Option<cairn_common::read::AffordanceSpec> {
     let db = orch.db.for_project(project_key).await;
     let job_id = resolve_node_or_task_job_id_for_read(
@@ -2791,7 +2791,7 @@ pub(super) async fn job_artifact_affordance_spec(
     job_id: &str,
     task_name: Option<&str>,
     artifact_name: Option<&str>,
-    current: &cairn_common::uri::CairnResource,
+    current: &cairn_uri::CairnResource,
 ) -> Option<cairn_common::read::AffordanceSpec> {
     let contract = crate::mcp::handlers::comments_artifacts::resolve_artifact_contract(
         orch,
@@ -2892,8 +2892,8 @@ pub(super) async fn read_node_artifact(
     // and eras still cite).
     if format != ArtifactFormat::Json
         && matches!(
-            cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
-            cairn_common::uri::NodeAddress::Thread { .. }
+            cairn_uri::NodeAddress::new(number, exec_seq, node_name),
+            cairn_uri::NodeAddress::Thread { .. }
         )
     {
         let refusal = crate::threads::thread_artifact_refusal(artifact_name);

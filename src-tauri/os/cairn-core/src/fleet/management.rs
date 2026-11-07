@@ -42,9 +42,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
-use cairn_common::executor_protocol::{
-    executor_names_match, normalize_executor_name, ExecutorRuntimePolicy,
-};
+use cairn_common::executor_protocol::{executor_names_match, ExecutorRuntimePolicy};
+use cairn_uri::normalize_executor_name;
 use serde::{Deserialize, Serialize};
 
 use super::{unix_time_ms, FleetConfig, RemoteExecutorConfig, RemoteExecutorDeclaration};

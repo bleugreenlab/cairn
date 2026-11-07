@@ -4,8 +4,8 @@ use crate::mcp::handlers::permission::{PermissionDecision, PermissionScope};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::turso::params;
+use cairn_uri::{parse_uri, CairnResource};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -252,7 +252,7 @@ async fn validate_target(
     exec_seq: i32,
 ) -> Result<(), String> {
     let execution_id = execution_id.to_string();
-    let project = cairn_common::uri::canonical_project(project);
+    let project = cairn_uri::canonical_project(project);
     db.read(|conn| Box::pin(async move {
         let mut rows = conn.query(
             "SELECT 1 FROM executions e JOIN issues i ON i.id=e.issue_id JOIN projects p ON p.id=i.project_id
@@ -455,7 +455,7 @@ async fn validate_issue_target(
     number: i32,
 ) -> Result<(), String> {
     let execution_id = execution_id.to_string();
-    let project = cairn_common::uri::canonical_project(project);
+    let project = cairn_uri::canonical_project(project);
     db.read(|conn| Box::pin(async move {
         let mut rows = conn.query(
             "SELECT 1 FROM executions e JOIN issues i ON i.id=e.issue_id JOIN projects p ON p.id=i.project_id WHERE e.id=?1 AND upper(p.key)=?2 AND i.number=?3",

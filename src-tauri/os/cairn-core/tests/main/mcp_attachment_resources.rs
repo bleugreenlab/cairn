@@ -167,7 +167,7 @@ async fn a_retired_reference_refuses_by_name_and_stays_enumerated() {
         &db,
         &project_id,
         "att",
-        &cairn_common::uri::AttachmentScopeRef::Issue(7),
+        &cairn_uri::AttachmentScopeRef::Issue(7),
         1,
     )
     .await
@@ -194,7 +194,7 @@ async fn a_removed_image_reads_as_its_tombstone() {
         &db,
         &project_id,
         "att",
-        &cairn_common::uri::AttachmentScopeRef::Issue(7),
+        &cairn_uri::AttachmentScopeRef::Issue(7),
         1,
         &cairn_core::attachments::RemovalRequest {
             removed_by: "the desktop operator".into(),

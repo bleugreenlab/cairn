@@ -1045,8 +1045,7 @@ pub(crate) fn instances(
 pub(crate) fn instances_on(orch: &Orchestrator, machine: &str) -> Vec<MachineServiceInstance> {
     let row = crate::config::settings::load_fleet(&orch.config_dir).machine_services;
     let views = supervisor(orch).host().machines(orch);
-    let name = cairn_common::executor_protocol::normalize_executor_name(machine)
-        .unwrap_or_else(|| machine.to_string());
+    let name = cairn_uri::normalize_executor_name(machine).unwrap_or_else(|| machine.to_string());
     let mut instances: Vec<MachineServiceInstance> = row
         .selected_on(machine)
         .into_iter()

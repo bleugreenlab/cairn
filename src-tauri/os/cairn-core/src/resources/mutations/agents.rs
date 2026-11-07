@@ -9,7 +9,7 @@
 use cairn_config::library::{LibraryKind, LibraryRoots, Origin};
 use std::path::PathBuf;
 
-use cairn_common::uri::{build_agent_uri, build_project_agent_uri};
+use cairn_uri::{build_agent_uri, build_project_agent_uri};
 
 use crate::agents::{agent_to_markdown, parse_agent_markdown, AgentExportData};
 use crate::config::agents::{self as config_agents, FileAgent};
@@ -265,7 +265,7 @@ fn not_found(agent_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Agent not found in project {}: {agent_id}",
-            cairn_common::uri::canonical_project(project)
+            cairn_uri::canonical_project(project)
         ),
         None => format!("Agent not found: {agent_id}"),
     }

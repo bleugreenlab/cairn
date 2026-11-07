@@ -69,10 +69,11 @@ use cairn_common::executor_protocol::{
     EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS, LOCAL_EXECUTOR_NAME, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
-    executor_names_match, normalize_executor_name, AdmissionHoldEvidence, ClaimedAttemptAccount,
-    MachineModelResident, PriorDecline,
+    executor_names_match, AdmissionHoldEvidence, ClaimedAttemptAccount, MachineModelResident,
+    PriorDecline,
 };
 use cairn_common::executor_protocol::{HomeAffinity, ScratchSyncEstimate};
+use cairn_uri::normalize_executor_name;
 use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]

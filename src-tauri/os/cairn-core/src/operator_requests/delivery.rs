@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use cairn_common::requests::RequestOutbox;
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::storage::requests;
 use cairn_db::turso::params;
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::json;
 
 use crate::agent_process::stream::{TranscriptEvent, TranscriptJson};
@@ -613,7 +613,7 @@ mod tests {
         let uri = db.read(|conn| Box::pin(async move {
             let mut rows = conn.query("SELECT p.key,i.number FROM issues i JOIN projects p ON p.id=i.project_id WHERE i.id='issue-1'",()).await?;
             let row = rows.next().await?.unwrap();
-            Ok(cairn_common::uri::build_issue_uri(&row.text(0)?, row.i64(1)? as i32))
+            Ok(cairn_uri::build_issue_uri(&row.text(0)?, row.i64(1)? as i32))
         })).await.unwrap();
         deliver_issue_attention(&db, &uri, "one", "Request completed", 1)
             .await

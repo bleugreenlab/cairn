@@ -1,11 +1,10 @@
-//! Parsing of cairn:// URIs into `CairnResource` / `CairnResourceUri`.
+//! Parsing of cairn:// URIs into `CairnResource`.
 
 use super::build::{canonical_project, decode_path_segment};
 use super::types::{
-    is_reserved_node_segment, AttachmentRef, AttachmentScopeRef, CairnResource, CairnResourceUri,
+    is_reserved_node_segment, AttachmentRef, AttachmentScopeRef, CairnResource,
     DEFAULT_BROWSER_SLUG, PROJECT_SCOPE,
 };
-use crate::query::parse_query_params;
 use crate::thread_name::validate_thread_name;
 
 fn valid_opaque_id(value: &str) -> bool {
@@ -31,7 +30,7 @@ fn valid_content_hash(value: &str) -> bool {
 /// differently from the selector that names the same machine would make a
 /// resource an agent can read but not target.
 fn cairn_executor_name(segment: &str) -> Option<String> {
-    crate::executor_protocol::normalize_executor_name(segment)
+    crate::normalize_executor_name(segment)
 }
 
 fn parse_positive_i32(value: &str) -> Option<i32> {
@@ -40,27 +39,6 @@ fn parse_positive_i32(value: &str) -> Option<i32> {
 
 fn parse_non_negative_i32(value: &str) -> Option<i32> {
     value.parse::<i32>().ok().filter(|value| *value >= 0)
-}
-
-pub fn parse_resource_uri(uri: &str) -> Result<Option<CairnResourceUri>, String> {
-    let (identity, raw_query) = match uri.split_once('?') {
-        Some((identity, query)) => (identity, Some(query)),
-        None => (uri, None),
-    };
-    if identity.starts_with("cairn://p/") && identity.split('/').nth(4) == Some("t") {
-        return Err("thread /t/ aliases have been retired; use cairn://p/PROJECT/<name>".into());
-    }
-    if let Some(refusal) = removed_executor_verb_refusal(identity) {
-        return Err(refusal);
-    }
-    let Some(resource) = parse_uri(identity) else {
-        return Ok(None);
-    };
-    let params = raw_query
-        .map(parse_query_params)
-        .transpose()?
-        .unwrap_or_default();
-    Ok(Some(CairnResourceUri { resource, params }))
 }
 
 /// The refusal for a `cairn://executors/<name>/<verb>` address, which is gone:
@@ -680,7 +658,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         // This parser deliberately owns NONE of the thread sub-path vocabulary:
         // what `db`, `services/<name>`, `pages/<name>`, `chat/turn/<n>`, or
         // `task/<name>/...` MEAN under a thread is decided
-        // in exactly one place, cairn-core's `delegate_thread_descendant`, which
+        // in exactly one place, `thread::delegate_thread_descendant`, which
         // read dispatch, write dispatch, and run-target expansion all call. A
         // second interpreter here would be free to know a different subset than
         // that one does, and it was: the since-retired `branches` had arms here
@@ -691,7 +669,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         // The obligation this arm carries is to be LOSSLESS: the segments the
         // builder wrote arrive at the resolver untouched, which is what
         // `round_trips_every_resource_family` pins from the build side and
-        // cairn-core's `every_resource_variant_survives_its_own_uri` closes.
+        // `thread::tests::every_resource_variant_survives_its_own_uri` closes.
         [PROJECT_SCOPE, project, name, rest @ ..] if validate_thread_name(name).is_ok() => {
             Some(CairnResource::Thread {
                 project: canonical_project(project),

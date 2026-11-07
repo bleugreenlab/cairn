@@ -16,7 +16,7 @@ use crate::orchestrator::Orchestrator;
 use crate::services::{sandbox, SpawnConfig};
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::executor_protocol::{CrossingAccess, CrossingRerun};
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};

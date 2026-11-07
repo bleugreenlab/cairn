@@ -1,6 +1,5 @@
 use super::*;
-use crate::contract::ResourceKind;
-use crate::query::QueryParam;
+use crate::ResourceKind;
 
 #[test]
 fn uri_identity_canonicalization_preserves_non_project_segments() {
@@ -153,7 +152,7 @@ fn an_executor_verb_address_is_refused_naming_its_replacement() {
         "cairn://executors/Local/look?x=1",
     ] {
         assert_eq!(parse_uri(uri), None, "{uri}");
-        let refusal = parse_resource_uri(uri).unwrap_err();
+        let refusal = removed_executor_verb_refusal(uri).unwrap();
         assert!(refusal.contains("cairn://mcp/axon/look"), "{refusal}");
         assert!(refusal.contains("executor:{name:\"local\"}"), "{refusal}");
         assert!(
@@ -175,9 +174,7 @@ fn an_executor_verb_address_is_refused_naming_its_replacement() {
         None
     );
     assert_eq!(
-        parse_resource_uri("cairn://executors/local")
-            .unwrap()
-            .map(|uri| uri.resource),
+        parse_uri("cairn://executors/local"),
         Some(CairnResource::Executor {
             name: "local".to_string()
         })
@@ -842,54 +839,6 @@ fn parses_and_roundtrips_task_terminal() {
 }
 
 #[test]
-fn parse_resource_uri_preserves_ordered_query_params() {
-    let parsed = parse_resource_uri("cairn://p/cairn/issues?limit=10&status=backlog").unwrap();
-    assert_eq!(
-        parsed,
-        Some(CairnResourceUri {
-            resource: CairnResource::ProjectIssues {
-                project: "cairn".to_string(),
-            },
-            params: vec![
-                QueryParam {
-                    key: "limit".to_string(),
-                    value: "10".to_string(),
-                },
-                QueryParam {
-                    key: "status".to_string(),
-                    value: "backlog".to_string(),
-                },
-            ],
-        })
-    );
-    assert_eq!(
-        parsed.unwrap().to_uri(),
-        "cairn://p/cairn/issues?limit=10&status=backlog"
-    );
-}
-
-#[test]
-fn parse_resource_uri_encodes_canonical_query_params() {
-    // `+` is literal in a value (not form-decoded to a space), so it
-    // canonicalizes to `%2B`; a space encodes as `%20`. `&status=` still
-    // splits because `status` is a recognized key.
-    let parsed =
-        parse_resource_uri("cairn://p/cairn/issues?label=needs+review&status=backlog%2Cactive")
-            .unwrap()
-            .unwrap();
-    assert_eq!(
-        parsed.to_uri(),
-        "cairn://p/cairn/issues?label=needs%2Breview&status=backlog%2Cactive"
-    );
-}
-
-#[test]
-fn parse_resource_uri_rejects_invalid_query_encoding() {
-    let err = parse_resource_uri("cairn://p/cairn/issues?status=%ZZ").unwrap_err();
-    assert!(err.contains("Invalid percent escape"));
-}
-
-#[test]
 fn rejects_legacy_roots_and_invalid_paths() {
     assert!(parse_uri("cairn://CAIRN/42").is_none());
     assert!(parse_uri("cairn://ws/skills").is_none());
@@ -1010,11 +959,8 @@ fn numeric_and_reserved_segments_do_not_parse_as_thread_names() {
 }
 
 #[test]
-fn retired_thread_alias_has_a_helpful_error() {
+fn retired_thread_alias_does_not_parse() {
     assert_eq!(parse_uri("cairn://p/cairn/t/design-review"), None);
-    let error = parse_resource_uri("cairn://p/cairn/t/design-review").unwrap_err();
-    assert!(error.contains("retired"), "{error}");
-    assert!(error.contains("cairn://p/PROJECT/<name>"), "{error}");
 }
 
 #[test]
@@ -1187,18 +1133,18 @@ fn round_trips_every_resource_family() {
                 parsed, sample.resource,
                 "{uri} must parse back into the variant that built it"
             ),
-            // A thread sub-resource. The common parser owns none of the thread
+            // A thread sub-resource. The parser owns none of the thread
             // sub-path vocabulary: it stops at `Thread { path }` and hands the
-            // segments on untouched, and cairn-core's
-            // `delegate_thread_descendant` is the single reader that names the
+            // segments on untouched, and `thread::delegate_thread_descendant`
+            // is the single reader that names the
             // variant. Asserting the re-render here is what makes the handoff
             // LOSSLESS — the resolver receives exactly the address the builder
-            // wrote. cairn-core closes the other half of the trip.
+            // wrote. `thread::tests` closes the other half of the trip.
             samples::RoundTrip::ThreadResolver => {
                 assert!(
                     matches!(parsed, CairnResource::Thread { .. }),
-                    "{uri} is a thread sub-resource, so the common parser must stop at \
-                     Thread {{ path }} and leave the meaning to the core resolver; got {parsed:?}"
+                    "{uri} is a thread sub-resource, so the parser must stop at \
+                     Thread {{ path }} and leave the meaning to the thread resolver; got {parsed:?}"
                 );
                 assert_eq!(
                     parsed.to_uri(),
@@ -1466,7 +1412,6 @@ fn round_trips_workflow_resources() {
     ];
     for resource in resources {
         assert_eq!(parse_uri(&resource.to_uri()), Some(resource.clone()));
-        assert!(crate::contract::contract_for(resource.kind()).is_some());
     }
 }
 
@@ -1538,7 +1483,6 @@ fn round_trips_service_resources() {
         assert_eq!(resource.issue_number(), None);
         assert_eq!(resource.node_id(), None);
         assert_eq!(resource.to_route(), None);
-        assert!(crate::contract::contract_for(kind).is_some());
     }
     assert_eq!(
         build_project_services_uri("cairn"),
@@ -1737,26 +1681,8 @@ fn skill_resources_have_no_project_or_route() {
 }
 
 #[test]
-fn resource_contracts_include_project_issue_collection() {
-    use crate::contract::RESOURCE_CONTRACTS;
-    assert!(RESOURCE_CONTRACTS
-        .iter()
-        .any(|contract| contract.uri_template == "cairn://p/{project}/issues"));
-}
-
-#[test]
 fn every_resource_kind_round_trips_through_kind() {
-    use crate::contract::ResourceKind;
-    // kind() must agree with the table: every kind a resource reports has a contract.
-    for resource in [
-        CairnResource::Project {
-            project: "cairn".to_string(),
-        },
-        CairnResource::Bug,
-        CairnResource::Skills,
-    ] {
-        assert!(crate::contract::contract_for(resource.kind()).is_some());
-    }
+    use crate::ResourceKind;
     assert_eq!(
         CairnResource::Issue {
             project: "cairn".to_string(),
@@ -1940,14 +1866,14 @@ fn an_issue_attachment_collection_is_never_read_as_a_node() {
             .kind(),
         ResourceKind::ProjectAttachments
     );
-    assert!(crate::uri::is_reserved_node_segment("attachments"));
+    assert!(crate::is_reserved_node_segment("attachments"));
     // And no thread may take the name, or the thread arm would shadow the scope.
     assert!(crate::thread_name::validate_thread_name("attachments").is_err());
 }
 
 #[cfg(test)]
 mod node_rebase_uri {
-    use crate::uri::{parse_uri, CairnResource};
+    use crate::{parse_uri, CairnResource};
 
     /// `rebase` has to be a RESERVED node segment, not a type-named artifact.
     /// Without that, `cairn:~/rebase` parses as an artifact lookup and the
@@ -2151,7 +2077,7 @@ fn page_uris_parse_build_and_reserve_their_segment() {
     );
 
     // `pages` is a sub-resource, never an artifact type-name.
-    assert!(crate::uri::is_reserved_node_segment("pages"));
+    assert!(crate::is_reserved_node_segment("pages"));
 }
 
 #[test]

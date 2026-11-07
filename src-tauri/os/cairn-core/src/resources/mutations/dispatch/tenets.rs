@@ -12,7 +12,7 @@ use super::append_payload;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::tenets::{Proposal, Proposer, TenetOrigin, TenetStatus};
-use cairn_common::uri::{build_project_tenets_uri, CairnResource};
+use cairn_uri::{build_project_tenets_uri, CairnResource};
 
 /// Payload keys a tenet patch may carry. Anything else is an attempt to edit
 /// the tenet, which is refused as such rather than as an unknown key.

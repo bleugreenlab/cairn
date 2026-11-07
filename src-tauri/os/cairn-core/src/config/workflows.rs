@@ -556,7 +556,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             write_workflow(&dir, &format!("name: W\nscript: {script}\n"));
             assert!(
-                matches!(load_workflow_dir(&dir, Origin::Workspace), ConfigResult::Err { .. }),
+                matches!(
+                    load_workflow_dir(&dir, Origin::Workspace),
+                    ConfigResult::Err { .. }
+                ),
                 "{script} must be refused"
             );
         }

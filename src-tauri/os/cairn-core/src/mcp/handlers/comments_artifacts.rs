@@ -63,7 +63,7 @@ async fn append_issue_comment_canonical(
     intent_id: Option<&str>,
 ) -> Result<String, String> {
     let services = &orch.services;
-    let project_key_upper = cairn_common::uri::canonical_project(project_key);
+    let project_key_upper = cairn_uri::canonical_project(project_key);
     let (_comment_id, issue_id, _now) = append_issue_comment_db(
         orch,
         &project_key_upper,
@@ -223,10 +223,10 @@ fn refuse_thread_session_artifact(
     artifact_name: Option<&str>,
 ) -> Result<(), String> {
     match (
-        cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
+        cairn_uri::NodeAddress::new(number, exec_seq, node_name),
         task_name,
     ) {
-        (cairn_common::uri::NodeAddress::Thread { .. }, None) => {
+        (cairn_uri::NodeAddress::Thread { .. }, None) => {
             Err(crate::threads::thread_artifact_refusal(artifact_name))
         }
         _ => Ok(()),
@@ -702,7 +702,7 @@ pub(crate) async fn write_artifact_change(
     .await
     {
         Ok(Some(uri)) => uri,
-        _ if task_name.is_some() => cairn_common::uri::build_task_artifact_uri_named(
+        _ if task_name.is_some() => cairn_uri::build_task_artifact_uri_named(
             project_key,
             number,
             exec_seq,
@@ -710,7 +710,7 @@ pub(crate) async fn write_artifact_change(
             task_name.unwrap_or_default(),
             artifact_name,
         ),
-        _ => cairn_common::uri::build_node_artifact_uri_named(
+        _ => cairn_uri::build_node_artifact_uri_named(
             project_key,
             number,
             exec_seq,

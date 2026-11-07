@@ -587,8 +587,8 @@ pub(crate) async fn current_session_refuses_turns(
 }
 
 fn push_job_coordinate(content_ref: &str) -> Option<PushJobCoordinate> {
-    use cairn_common::uri::CairnResource;
-    match cairn_common::uri::parse_uri(content_ref)? {
+    use cairn_uri::CairnResource;
+    match cairn_uri::parse_uri(content_ref)? {
         CairnResource::Node {
             project,
             number,

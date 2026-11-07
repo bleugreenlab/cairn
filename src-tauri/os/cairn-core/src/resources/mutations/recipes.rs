@@ -9,7 +9,7 @@
 use cairn_config::library::{self, LibraryKind, LibraryRoots, Origin};
 use std::path::PathBuf;
 
-use cairn_common::uri::{build_project_recipe_uri, build_recipe_uri};
+use cairn_uri::{build_project_recipe_uri, build_recipe_uri};
 
 use crate::config::recipes::{self as config_recipes, FileRecipe};
 use crate::config::slugify;
@@ -262,7 +262,7 @@ fn not_found(recipe_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Recipe not found in project {}: {recipe_id}",
-            cairn_common::uri::canonical_project(project)
+            cairn_uri::canonical_project(project)
         ),
         None => format!("Recipe not found: {recipe_id}"),
     }

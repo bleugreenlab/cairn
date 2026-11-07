@@ -15,7 +15,7 @@ use crate::models::question::QuestionAnswer;
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use cairn_common::protocol::CallbackResponse;
-use cairn_common::uri::{build_node_uri, parse_uri, CairnResource};
+use cairn_uri::{build_node_uri, parse_uri, CairnResource};
 use serde::{Deserialize, Serialize};
 
 /// A blocking append routed to a node's tasks/questions collection.
@@ -38,7 +38,7 @@ pub(crate) fn blocking_append_kind(item: &ChangeItem) -> Option<BlockingKind> {
     if item.mode != ChangeMode::Append {
         return None;
     }
-    let resource = crate::resources::delegate_thread_descendant(parse_uri(&item.target)?).ok()?;
+    let resource = cairn_uri::delegate_thread_descendant(parse_uri(&item.target)?).ok()?;
     match resource {
         CairnResource::NodeTasks { .. } => Some(BlockingKind::Tasks),
         CairnResource::NodeCalls { .. } => Some(BlockingKind::Calls),

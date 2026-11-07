@@ -149,8 +149,8 @@ fn issue_resolution_watch(
         .and_then(serde_json::Value::as_str)
         .filter(|value| {
             matches!(
-                cairn_common::uri::parse_uri(value),
-                Some(cairn_common::uri::CairnResource::Issue { .. })
+                cairn_uri::parse_uri(value),
+                Some(cairn_uri::CairnResource::Issue { .. })
             )
         })?;
     let statuses = match clause.get("status")? {
@@ -165,7 +165,7 @@ fn issue_resolution_watch(
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
         == std::collections::BTreeSet::from(["closed", "failed", "merged"]))
-    .then(|| cairn_common::uri::canonicalize_uri_identity(issue))
+    .then(|| cairn_uri::canonicalize_uri_identity(issue))
 }
 
 /// The reference a `fact` subscription is stored and delivered under: the
@@ -181,8 +181,7 @@ pub fn fact_clause_ref(
             .get("request")
             .and_then(serde_json::Value::as_str)
             .ok_or("request fact subscription requires a request URI")?;
-        let Some(resource @ cairn_common::uri::CairnResource::Request { .. }) =
-            cairn_common::uri::parse_uri(raw)
+        let Some(resource @ cairn_uri::CairnResource::Request { .. }) = cairn_uri::parse_uri(raw)
         else {
             return Err("request fact subscription requires cairn://requests/<id>".into());
         };
@@ -271,7 +270,7 @@ async fn exact_subscription(
 ) -> Result<Option<WakeSubscription>, String> {
     let job_id = job_id.to_string();
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
+    let source_ref = source_ref.map(cairn_uri::canonicalize_uri_identity);
     let fact_kinds_json = fact_kinds_json(fact_kinds);
     db.read(|conn| {
         let job_id = job_id.clone();
@@ -704,7 +703,7 @@ async fn update_state_matching(
 ) -> Result<usize, String> {
     let job_id = job_id.to_string();
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
+    let source_ref = source_ref.map(cairn_uri::canonicalize_uri_identity);
     let now = chrono::Utc::now().timestamp();
     let state_str = state.as_str().to_string();
     db.write(|conn| {
@@ -766,10 +765,10 @@ async fn upsert_subscription(
     let id = uuid::Uuid::new_v4().to_string();
     let job_id = job_id.to_string();
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
+    let source_ref = source_ref.map(cairn_uri::canonicalize_uri_identity);
     let fact_kinds_json = fact_kinds_json(fact_kinds);
     let until_kind = until_kind.map(ToString::to_string);
-    let until_ref = until_ref.map(cairn_common::uri::canonicalize_uri_identity);
+    let until_ref = until_ref.map(cairn_uri::canonicalize_uri_identity);
     let created_by = created_by.to_string();
     let state_str = state.as_str().to_string();
     let match_phrase = match_phrase.map(ToString::to_string);

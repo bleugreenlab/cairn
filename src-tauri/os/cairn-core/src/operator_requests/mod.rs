@@ -16,8 +16,8 @@ use cairn_common::authorization::ActBinding;
 use cairn_common::identity::{AppearanceSnapshot, AppearanceTransport, PrincipalRef};
 use cairn_common::protocol::CallbackRequest;
 use cairn_common::requests::*;
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::storage::requests as store;
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::{json, Value};
 
 use crate::orchestrator::Orchestrator;

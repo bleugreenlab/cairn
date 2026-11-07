@@ -33,7 +33,7 @@ fn pin_phrase(queued: &crate::execution::gates::capacity::QueuedExecution) -> Op
 }
 
 fn render(project: &str, view: &crate::execution::gates::capacity::QueueView, now: i64) -> String {
-    let project = cairn_common::uri::canonical_project(project);
+    let project = cairn_uri::canonical_project(project);
     let mut out = format!(
         "# Execution queue\n\nEvery execution the caps hold, across every project and thread in \
          the workspace, in the order the fleet releases them. Issue numbers in a write resolve \
@@ -55,7 +55,7 @@ fn render(project: &str, view: &crate::execution::gates::capacity::QueueView, no
         let mut parts = Vec::new();
         parts.push(match (&queued.project_key, queued.issue_number) {
             (Some(key), Some(number)) => {
-                let key = cairn_common::uri::canonical_project(key);
+                let key = cairn_uri::canonical_project(key);
                 format!("[{key}/{number}](cairn://p/{key}/{number})")
             }
             _ => format!("execution {}", queued.execution_id),

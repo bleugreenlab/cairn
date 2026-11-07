@@ -5,14 +5,14 @@
 //! utterance alike. A reference is structural or it is nothing: there is no
 //! prose or keyword reading here.
 
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 use crate::storage::LocalDb;
 
 /// Every structural reference in `text`, canonical and deduplicated, in the
 /// order first written.
 ///
-/// Two shapes count. Any candidate [`cairn_common::uri::scan_uris`] hands to
+/// Two shapes count. Any candidate [`cairn_uri::scan_uris`] hands to
 /// the one URI parser and gets back a resource, so prose about "cairn://" that
 /// does not parse names nothing. And a project-qualified thread name
 /// (`project/thread`), which is how people name a thread in prose, included
@@ -24,7 +24,7 @@ use crate::storage::LocalDb;
 /// decided at delivery, so the row never freezes a session that may rotate.
 pub(crate) async fn structural_mentions(db: &LocalDb, text: &str) -> Vec<String> {
     let mut mentions: Vec<String> = Vec::new();
-    for found in cairn_common::uri::scan_uris(text) {
+    for found in cairn_uri::scan_uris(text) {
         let uri = found.resource.to_uri();
         if !mentions.contains(&uri) {
             mentions.push(uri);
@@ -37,7 +37,7 @@ pub(crate) async fn structural_mentions(db: &LocalDb, text: &str) -> Vec<String>
             continue;
         }
         let Some(resource @ CairnResource::Thread { .. }) =
-            cairn_common::uri::parse_uri(&format!("cairn://p/{candidate}"))
+            cairn_uri::parse_uri(&format!("cairn://p/{candidate}"))
         else {
             continue;
         };

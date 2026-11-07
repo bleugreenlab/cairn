@@ -7,7 +7,7 @@
 //! "no eras yet", which is the honest and correct state today.
 
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{build_node_era_uri, build_node_eras_uri};
+use cairn_uri::{build_node_era_uri, build_node_eras_uri};
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;

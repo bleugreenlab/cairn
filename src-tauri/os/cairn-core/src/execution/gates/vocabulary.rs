@@ -140,8 +140,8 @@ impl<'a> GateContext<'a> {
     /// issue's rows exist only in its replica. Reading the private DB for it
     /// would find nothing and foreclose a live issue as nonexistent.
     pub(crate) async fn db_for_issue(&self, issue_uri: &str) -> Arc<LocalDb> {
-        match cairn_common::uri::parse_uri(issue_uri) {
-            Some(cairn_common::uri::CairnResource::Issue { project, .. }) => {
+        match cairn_uri::parse_uri(issue_uri) {
+            Some(cairn_uri::CairnResource::Issue { project, .. }) => {
                 self.orch.db.for_project(&project).await
             }
             _ => self.orch.db.local.clone(),
@@ -609,15 +609,14 @@ async fn project_present(
     conn: &crate::storage::TrackedConnection,
     issue_uri: &str,
 ) -> DbResult<bool> {
-    let Some(cairn_common::uri::CairnResource::Issue { project, .. }) =
-        cairn_common::uri::parse_uri(issue_uri)
+    let Some(cairn_uri::CairnResource::Issue { project, .. }) = cairn_uri::parse_uri(issue_uri)
     else {
         return Ok(false);
     };
     let mut rows = conn
         .query(
             "SELECT 1 FROM projects WHERE key = ?1 COLLATE NOCASE LIMIT 1",
-            params![cairn_common::uri::canonical_project(&project)],
+            params![cairn_uri::canonical_project(&project)],
         )
         .await?;
     Ok(rows.next().await?.is_some())
@@ -958,8 +957,8 @@ impl GateFact for RequestFact {
 fn request_id(clause: &TriggerClause) -> Result<String, String> {
     let raw = clause_str(clause, "request")
         .ok_or_else(|| "request gate needs a canonical 'request' URI".to_string())?;
-    match cairn_common::uri::parse_uri(raw) {
-        Some(cairn_common::uri::CairnResource::Request { id })
+    match cairn_uri::parse_uri(raw) {
+        Some(cairn_uri::CairnResource::Request { id })
             if raw == format!("cairn://requests/{id}") =>
         {
             Ok(id)
@@ -1176,8 +1175,8 @@ impl GateFact for TenetVerdictFact {
 /// The project key and number a tenet URI names. A gate names a tenet by its
 /// canonical number, never by a migrated ruling's slug alias.
 pub(crate) fn parse_tenet_uri(raw: &str) -> Result<(String, i64), String> {
-    match cairn_common::uri::parse_uri(raw.trim()) {
-        Some(cairn_common::uri::CairnResource::ProjectTenet { project, key }) => key
+    match cairn_uri::parse_uri(raw.trim()) {
+        Some(cairn_uri::CairnResource::ProjectTenet { project, key }) => key
             .parse::<i64>()
             .ok()
             .filter(|number| *number > 0)

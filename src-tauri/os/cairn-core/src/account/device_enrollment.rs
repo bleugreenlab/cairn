@@ -3,10 +3,10 @@
 use crate::storage::{DbResult, LocalDb, RowExt};
 use base64::Engine;
 use cairn_common::executor_protocol::{
-    normalize_executor_name, EnrollmentRejectionReason, ExecutorEnrollmentIdentity,
-    ExecutorIdentity,
+    EnrollmentRejectionReason, ExecutorEnrollmentIdentity, ExecutorIdentity,
 };
 use cairn_db::turso::params;
+use cairn_uri::normalize_executor_name;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 

@@ -45,6 +45,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 # into cross-crate test-utils builds where dev-deps are absent (mirrors cairn-codec).
 tempfile = "3"
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 # The per-thread region registry the runtime stall watchdog reads; a database
 # call tags each poll with the statement it is running (`local_db::named`).
 cairn-platform = { path = "../cairn-platform" }

@@ -2480,7 +2480,7 @@ mod tests {
         let orch = seeded_orchestrator().await;
         for uri in all_reads(&orch) {
             let out = read(&orch, &uri).await;
-            let kind = cairn_common::uri::parse_uri(&uri).expect("parses").kind();
+            let kind = cairn_uri::parse_uri(&uri).expect("parses").kind();
             let name = cairn_common::contract::contract_for(kind)
                 .expect("registered")
                 .name;

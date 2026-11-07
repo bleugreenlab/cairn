@@ -14,7 +14,7 @@
 //! owner ever proceeds), NOT from a conditional UPDATE — an embedded-replica CAS
 //! is local-first and would let two machines both "win" locally.
 
-use cairn_common::uri::canonical_project;
+use cairn_uri::canonical_project;
 
 use crate::storage::{LocalDb, RowExt};
 

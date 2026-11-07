@@ -1,4 +1,4 @@
-use cairn_common::uri::parse_uri;
+use cairn_uri::parse_uri;
 
 use super::RouteFact;
 use crate::models::Label;

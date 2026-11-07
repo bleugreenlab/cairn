@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 cairn-mcp-server = { path = "../cairn-mcp-server" }
 async-trait = "0.1"
 url = "2"

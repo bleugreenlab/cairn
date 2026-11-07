@@ -1395,7 +1395,7 @@ async fn relevance_rank(
         .map_err(|error| format!("failed to read open children: {error}"))?;
     let work_uris: Vec<String> = open_children
         .into_iter()
-        .map(|number| cairn_common::uri::build_issue_uri(input.project_key, number as i32))
+        .map(|number| cairn_uri::build_issue_uri(input.project_key, number as i32))
         .collect();
     let mut work: Vec<(crate::embeddings::VectorKey, Vec<f32>)> = Vec::new();
     for uri in &work_uris {
@@ -1575,7 +1575,7 @@ fn render_tenets(projection: &ThreadRecord, ranked: &[RankedTenet]) -> String {
             }
         }
 
-        let tenets = cairn_common::uri::build_project_tenets_uri(&projection.project_key);
+        let tenets = cairn_uri::build_project_tenets_uri(&projection.project_key);
         out.push_str(&format!(
             "\nFull text: {tenets}/<n> · all of this thread's: {tenets}?thread={}\n",
             projection.thread_name
@@ -2390,7 +2390,7 @@ async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<Chil
         };
         Ok(Some((
             row.text(0)?,
-            cairn_common::uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
+            cairn_uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
             row.text(3)?,
             row.text(4)?,
             approver,
@@ -2801,11 +2801,11 @@ fn render_working_documents(
         match coordinates.thread_name.as_deref() {
             Some(name) => out.push_str(&format!(
                 "- Thread: `{}`\n",
-                cairn_common::uri::build_thread_uri(&coordinates.project_key, name)
+                cairn_uri::build_thread_uri(&coordinates.project_key, name)
             )),
             None if coordinates.number > 0 => out.push_str(&format!(
                 "- Issue: `{}`\n",
-                cairn_common::uri::build_issue_uri(&coordinates.project_key, coordinates.number)
+                cairn_uri::build_issue_uri(&coordinates.project_key, coordinates.number)
             )),
             None => {}
         }

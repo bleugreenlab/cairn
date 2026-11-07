@@ -11,8 +11,8 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::query::split_target_query;
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::turso::params;
+use cairn_uri::{parse_uri, CairnResource};
 
 /// Type alias for read cursor state: session_id -> bytes_read
 /// Uses per-terminal cursor so reads "consume" output regardless of which run is reading.
@@ -78,7 +78,7 @@ pub(crate) fn resource_uri_hint(uri: &str) -> Option<String> {
     thread_db_hint(uri)
         .or_else(|| task_terminal_hint(uri))
         .or_else(|| inference_recipes_hint(uri))
-        .or_else(|| cairn_common::uri::removed_executor_verb_refusal(uri))
+        .or_else(|| cairn_uri::removed_executor_verb_refusal(uri))
 }
 
 /// Name the address inference recipes moved to when they became profiles, so
@@ -227,8 +227,8 @@ async fn thread_without_session_reason(db: &LocalDb, parsed: &ParsedTerminalUri)
         parsed.node_id.as_deref()?,
     );
     if !matches!(
-        cairn_common::uri::NodeAddress::new(number, exec_seq, node_id),
-        cairn_common::uri::NodeAddress::Thread { .. }
+        cairn_uri::NodeAddress::new(number, exec_seq, node_id),
+        cairn_uri::NodeAddress::Thread { .. }
     ) {
         return None;
     }
@@ -380,7 +380,7 @@ async fn lookup_terminal_info(
         let task_name = task_name.clone();
         Box::pin(async move {
             let row = if node_id.is_none() {
-                let lookup_key = cairn_common::uri::canonical_project(project_key);
+                let lookup_key = cairn_uri::canonical_project(project_key);
                 let mut rows = conn
                     .query(
                         "
@@ -468,7 +468,7 @@ async fn list_terminal_slugs_in_scope(
         let task_name = task_name.clone();
         Box::pin(async move {
             let mut rows = if node_id.is_none() {
-                let lookup_key = cairn_common::uri::canonical_project(project_key);
+                let lookup_key = cairn_uri::canonical_project(project_key);
                 conn.query(
                     "
                     SELECT jt.slug
@@ -642,7 +642,7 @@ fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
     // the session-level `terminal/<slug>` shape — so a thread TASK could create
     // a terminal (the write path resolves it) and then not read it back.
     let resource = parse_uri(&split.identity)
-        .map(crate::resources::delegate_thread_descendant)
+        .map(cairn_uri::delegate_thread_descendant)
         .transpose()?
         .ok_or_else(|| terminal_shape_error(&split.identity))?;
     let anchor_uri = resource.to_uri();

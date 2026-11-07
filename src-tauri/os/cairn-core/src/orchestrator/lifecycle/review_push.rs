@@ -1707,7 +1707,7 @@ async fn open_pr_review_arm(
         |(mr_id, additions, deletions, head_sha, seq, uri_segment, parent_segment)| {
             let content_ref = match (seq, uri_segment) {
                 (Some(seq), Some(node)) => match parent_segment {
-                    Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                    Some(parent) => cairn_uri::build_task_artifact_uri_named(
                         project_key,
                         number,
                         seq as i32,
@@ -1715,7 +1715,7 @@ async fn open_pr_review_arm(
                         &node,
                         None,
                     ),
-                    None => cairn_common::uri::build_node_artifact_uri_named(
+                    None => cairn_uri::build_node_artifact_uri_named(
                         project_key,
                         number,
                         seq as i32,
@@ -1784,7 +1784,7 @@ pub(crate) async fn review_artifact_ref(
     Ok(resolved.map(
         |(seq, node, parent_segment, output_name, version, updated_at)| {
             let uri = match parent_segment {
-                Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                Some(parent) => cairn_uri::build_task_artifact_uri_named(
                     project_key,
                     number,
                     seq as i32,
@@ -1792,7 +1792,7 @@ pub(crate) async fn review_artifact_ref(
                     &node,
                     output_name.as_deref(),
                 ),
-                None => cairn_common::uri::build_node_artifact_uri_named(
+                None => cairn_uri::build_node_artifact_uri_named(
                     project_key,
                     number,
                     seq as i32,

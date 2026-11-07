@@ -1730,7 +1730,7 @@ async fn find_peer_agents(
         let Some(uri_segment) = uri_segment else {
             continue;
         };
-        let uri = cairn_common::uri::build_job_base_uri(
+        let uri = cairn_uri::build_job_base_uri(
             project_key,
             issue_number,
             exec_seq,

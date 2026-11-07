@@ -610,9 +610,8 @@ async fn read_collection_lists_comments_with_seq_source_and_content() {
 
 #[test]
 fn comments_collection_affordance_advertises_edit_and_delete() {
-    let block = crate::resources::common::affordance_for_kind(
-        cairn_common::contract::ResourceKind::IssueComments,
-    );
+    let block =
+        crate::resources::common::affordance_for_kind(cairn_uri::ResourceKind::IssueComments);
     assert!(block.contains("edit comment"), "block: {block}");
     assert!(block.contains("delete comment"), "block: {block}");
 }
@@ -2805,8 +2804,8 @@ fn required_payload(spec: &cairn_common::contract::MutationSpec) -> serde_json::
 /// registry; patch/delete name one server). A kind that gains a mutation
 /// without a sample here trips the explicit panic, telling the next builder
 /// to add one.
-fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode) -> CairnResource {
-    use cairn_common::contract::ResourceKind as K;
+fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnResource {
+    use cairn_uri::ResourceKind as K;
     let uri = match kind {
         K::Mcp => {
             if matches!(mode, ChangeMode::Create) {
@@ -2940,8 +2939,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
     // bare parse here could only sample a thread sub-resource by constructing
     // the variant by hand — which meant the parity check exercised a resource
     // no URI in the system actually produced.
-    let resource = crate::resources::delegate_thread_descendant(
-        cairn_common::uri::parse_uri(uri)
+    let resource = cairn_uri::delegate_thread_descendant(
+        cairn_uri::parse_uri(uri)
             .unwrap_or_else(|| panic!("sample_resource URI failed to parse: {uri}")),
     )
     .unwrap_or_else(|error| panic!("sample_resource URI {uri} failed to resolve: {error}"));
@@ -3032,8 +3031,8 @@ async fn thread_subtree_mutations_all_have_dispatch_arms() {
         "task/probe/browser",
     ] {
         let uri = format!("cairn://p/cairn/design-review/{path}");
-        let delegated = crate::resources::threads::delegate_thread_descendant(
-            cairn_common::uri::parse_uri(&uri).expect("a thread path parses"),
+        let delegated = cairn_uri::delegate_thread_descendant(
+            cairn_uri::parse_uri(&uri).expect("a thread path parses"),
         )
         .unwrap_or_else(|error| panic!("{path} must delegate: {error}"));
         let Some(contract) = cairn_common::contract::contract_for(delegated.kind()) else {

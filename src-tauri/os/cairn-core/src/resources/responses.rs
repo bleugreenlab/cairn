@@ -6,8 +6,8 @@ use crate::{
     },
     orchestrator::Orchestrator,
 };
-use cairn_common::uri::*;
 use cairn_config::library::LibraryRoots;
+use cairn_uri::*;
 use std::{collections::BTreeMap, path::PathBuf};
 async fn history_scope(o: &Orchestrator, project: Option<&str>) -> Result<String, String> {
     let Some(project) = project else {
@@ -31,7 +31,7 @@ async fn scope(
 ) -> Result<(Option<String>, Option<PathBuf>), String> {
     if let Some(k) = p {
         Ok((
-            Some(cairn_common::uri::canonical_project(k)),
+            Some(cairn_uri::canonical_project(k)),
             Some(project_path_by_key(o, k).await?),
         ))
     } else {

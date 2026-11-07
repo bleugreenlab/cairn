@@ -123,7 +123,7 @@ impl WriteScope {
     pub fn db_root(&self) -> String {
         format!(
             "{}/db",
-            cairn_common::uri::build_thread_uri(&self.project, &self.thread_name)
+            cairn_uri::build_thread_uri(&self.project, &self.thread_name)
         )
     }
 }
@@ -210,8 +210,7 @@ pub async fn apply_write(
                     (RowKey::Returned, Some(key)) => Some(key.clone()),
                     _ => None,
                 };
-                let uri =
-                    key.map(|key| cairn_common::uri::build_db_row_uri(&root, &target.table, &key));
+                let uri = key.map(|key| cairn_uri::build_db_row_uri(&root, &target.table, &key));
                 // A structured update or delete of one named row that matched
                 // nothing changed nothing; it is refused rather than reported
                 // or announced. A `where=`-scoped one reports its count.
@@ -221,10 +220,7 @@ pub async fn apply_write(
                 {
                     return Err(format!(
                         "No row at {}",
-                        uri.unwrap_or_else(|| cairn_common::uri::build_db_table_uri(
-                            &root,
-                            &target.table
-                        ))
+                        uri.unwrap_or_else(|| cairn_uri::build_db_table_uri(&root, &target.table))
                     ));
                 }
                 rows.push(uri.clone());

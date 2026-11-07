@@ -3,8 +3,8 @@
 use crate::db::DbState;
 use crate::models::SearchFilters;
 use crate::storage::{DbError, LocalDb, RowExt};
-use cairn_common::uri::{build_issue_uri, build_thread_uri};
 use cairn_db::turso::params;
+use cairn_uri::{build_issue_uri, build_thread_uri};
 use serde::Serialize;
 
 const NAVIGATION_METADATA_SQL: &str = "WITH metadata AS (
@@ -211,9 +211,9 @@ pub async fn resolve_navigation_passage(
     uri: &str,
     project_id: Option<&str>,
 ) -> Result<Option<NavigationPassage>, String> {
-    use cairn_common::uri::{parse_uri, CairnResource};
+    use cairn_uri::{parse_uri, CairnResource};
     let parsed = parse_uri(uri).ok_or_else(|| "Invalid canonical passage URI".to_string())?;
-    let parsed = crate::resources::delegate_thread_descendant(parsed)?;
+    let parsed = cairn_uri::delegate_thread_descendant(parsed)?;
     let (project, number, exec_seq, node, task, turn, event) = match parsed {
         CairnResource::NodeChatTurn {
             project,

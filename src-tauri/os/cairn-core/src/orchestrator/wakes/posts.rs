@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 use serde_json::Value;
 
 use crate::models::{Post, PostComment};
@@ -47,7 +47,7 @@ fn principal_home(principal: &PrincipalRef) -> Option<String> {
     let PrincipalRef::Agent { node, .. } = principal else {
         return None;
     };
-    cairn_common::uri::parse_uri(node).map(|home| home.to_uri())
+    cairn_uri::parse_uri(node).map(|home| home.to_uri())
 }
 
 fn first_line(text: &str) -> &str {
@@ -107,8 +107,8 @@ async fn mint_post_fact(
     )
     .await?;
     Ok(id.map(|id| match fact.project_key.as_deref() {
-        Some(key) => cairn_common::uri::build_project_event_uri(key, id),
-        None => cairn_common::uri::build_workspace_event_uri(id),
+        Some(key) => cairn_uri::build_project_event_uri(key, id),
+        None => cairn_uri::build_workspace_event_uri(id),
     }))
 }
 
@@ -185,7 +185,7 @@ pub async fn mint_post_commented(
     actor_job_id: Option<&str>,
 ) -> Result<Option<String>, String> {
     let db = &orch.db.local;
-    let uri = cairn_common::uri::build_post_comment_uri(post.id, comment.id);
+    let uri = cairn_uri::build_post_comment_uri(post.id, comment.id);
     let key = project_key(db, post.project_id.as_deref()).await;
     let mentions = crate::routes::structural_mentions(db, &comment.content).await;
     let mut fields = BTreeMap::from([
@@ -239,7 +239,7 @@ pub async fn mint_post_commented(
 /// `None` when `record_ref` names no post or comment that still exists, so the
 /// caller keeps its reference-only header rather than printing a lie.
 pub(crate) async fn render_post_wake(db: &LocalDb, record_ref: &str) -> Option<String> {
-    let (post_id, comment_id) = match cairn_common::uri::parse_uri(record_ref)? {
+    let (post_id, comment_id) = match cairn_uri::parse_uri(record_ref)? {
         CairnResource::Post { id } => (id, None),
         CairnResource::PostComment {
             post_id,

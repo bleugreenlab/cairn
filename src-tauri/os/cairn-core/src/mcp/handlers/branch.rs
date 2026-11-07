@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::turso::params;
+use cairn_uri::{parse_uri, CairnResource};
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
@@ -992,7 +992,7 @@ async fn job_by_node_uri(
     node_id: &str,
     task_name: Option<&str>,
 ) -> Result<JobBranchContext, String> {
-    let project = cairn_common::uri::canonical_project(project);
+    let project = cairn_uri::canonical_project(project);
     let node_id = node_id.to_string();
     let task_name = task_name.map(ToOwned::to_owned);
     orch.db

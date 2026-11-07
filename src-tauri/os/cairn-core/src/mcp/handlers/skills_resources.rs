@@ -17,7 +17,7 @@ use crate::config::skills::FileSkill;
 use crate::config::{skills as config_skills, ConfigResult};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::{build_project_skill_uri, build_skill_uri, CairnResource};
+use cairn_uri::{build_project_skill_uri, build_skill_uri, CairnResource};
 
 /// Whether a skill subtree is addressed contextually or under an explicit project.
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ pub(crate) async fn project_path_by_key(
     orch: &Orchestrator,
     project_key: &str,
 ) -> Result<PathBuf, String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let lookup_key = key.clone();
     let id = orch
         .db
@@ -204,11 +204,7 @@ pub(crate) async fn read_skills_collection(
                 let id = super::run_context::project_id_by_key(&orch.db.local, project)
                     .await
                     .ok();
-                (
-                    id,
-                    Some(cairn_common::uri::canonical_project(project)),
-                    Some(base),
-                )
+                (id, Some(cairn_uri::canonical_project(project)), Some(base))
             }
             Err(e) => return e,
         }
@@ -278,8 +274,8 @@ pub(crate) async fn read_skills_collection(
     }
 
     let create_uri = match explicit_project {
-        Some(project) => cairn_common::uri::build_project_skills_uri(project),
-        None => cairn_common::uri::build_skills_uri(),
+        Some(project) => cairn_uri::build_project_skills_uri(project),
+        None => cairn_uri::build_skills_uri(),
     };
     out.push_str("## actions\n");
     out.push_str(&format!(
@@ -332,7 +328,7 @@ pub(crate) async fn read_skill(
                 Some(project) => {
                     format!(
                         "Skill not found in project {}: {skill_id}",
-                        cairn_common::uri::canonical_project(project)
+                        cairn_uri::canonical_project(project)
                     )
                 }
                 None => format!("Skill not found: {skill_id}"),
@@ -351,14 +347,14 @@ pub(crate) async fn read_skill(
         return match explicit_project {
             Some(project) => format!(
                 "Skill not found in project {}: {skill_id}",
-                cairn_common::uri::canonical_project(project)
+                cairn_uri::canonical_project(project)
             ),
             None => format!("Skill not found: {skill_id}"),
         };
     }
 
     let scope = match explicit_project {
-        Some(project) => SkillScopeUri::Project(cairn_common::uri::canonical_project(project)),
+        Some(project) => SkillScopeUri::Project(cairn_uri::canonical_project(project)),
         None => SkillScopeUri::Contextual,
     };
 

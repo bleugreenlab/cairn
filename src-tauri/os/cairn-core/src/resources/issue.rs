@@ -11,7 +11,7 @@ use super::common::{
 use crate::issues::relations;
 use crate::models::{ExecutionSnapshot, RecipeNodeType};
 use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_common::uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
+use cairn_uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
 
 struct IssuePrSummary {
     number: Option<i32>,
@@ -41,7 +41,7 @@ async fn thread_uri_for_id(
         .await
         .ok()?;
     let row = rows.next().await.ok()??;
-    Some(cairn_common::uri::build_thread_uri(
+    Some(cairn_uri::build_thread_uri(
         &row.text(0).ok()?,
         &row.text(1).ok()?,
     ))
@@ -776,7 +776,7 @@ async fn resolve_issue_id_for_comments(
         Ok(Some(issue_id)) => Ok(issue_id),
         Ok(None) => Err(format!(
             "Issue {}/{} not found",
-            cairn_common::uri::canonical_project(project_key),
+            cairn_uri::canonical_project(project_key),
             number
         )),
         Err(error) => Err(format!("Failed to resolve issue: {error}")),
@@ -809,7 +809,7 @@ pub(super) async fn read_issue_comments(db: &LocalDb, project_key: &str, number:
         Ok(comments) => comments,
         Err(error) => return format!("Failed to load comments: {error}"),
     };
-    let project_upper = cairn_common::uri::canonical_project(project_key);
+    let project_upper = cairn_uri::canonical_project(project_key);
     let mut out = format!("# Comments — {}/{}\n\n", project_upper, number);
     out.push_str(&format!("{} comment(s)\n\n", comments.len()));
     out.push_str(
@@ -844,7 +844,7 @@ pub(super) async fn read_issue_comment(
         .find(|comment| comment.seq == comment_seq as i64)
     {
         Some(comment) => {
-            let project_upper = cairn_common::uri::canonical_project(project_key);
+            let project_upper = cairn_uri::canonical_project(project_key);
             let uri = build_issue_comment_uri(&project_upper, number, comment.seq as i32);
             let mut out = format!(
                 "# Comment {} on {}/{}\n\n",
@@ -855,7 +855,7 @@ pub(super) async fn read_issue_comment(
         }
         None => format!(
             "Comment {comment_seq} not found on issue {}-{number}",
-            cairn_common::uri::canonical_project(project_key)
+            cairn_uri::canonical_project(project_key)
         ),
     }
 }
@@ -1017,7 +1017,7 @@ fn render_condition_evaluations(
         .enumerate()
         .map(|(index, evaluation)| (evaluation.recipe_node_id.as_str(), index))
         .collect();
-    let execution_uri = cairn_common::uri::build_issue_execution_uri(project_key, number, exec_seq);
+    let execution_uri = cairn_uri::build_issue_execution_uri(project_key, number, exec_seq);
 
     for (index, evaluation) in evaluations.iter().enumerate() {
         let node_id = evaluation.recipe_node_id.as_str();

@@ -504,7 +504,7 @@ pub(crate) struct ChecksCoords {
 /// which suffix this surface wants. `home` is the caller's own node URI, used to
 /// expand a deictic `cairn:~` / `cairn:@` reference; pass it already resolved.
 pub(crate) fn checks_coords(reference: &str, home: Option<&str>) -> Result<ChecksCoords, String> {
-    use cairn_common::uri::{parse_uri, CairnResource};
+    use cairn_uri::{parse_uri, CairnResource};
 
     let reference = reference.trim();
     let expanded = if crate::resources::mutations::is_home_relative_target(reference) {

@@ -46,10 +46,8 @@ pub mod service;
 pub mod skip_ledger;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_seal;
-pub mod thread_name;
 pub mod token_meter;
 pub mod toolchain_path;
 pub mod toolchain_requirements;
-pub mod uri;
 pub mod volume;
 pub mod write_contract;

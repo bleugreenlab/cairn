@@ -3,7 +3,7 @@ use super::super::{build_failure, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::requests::FileOperatorRequest;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 fn file_input(payload: &serde_json::Value) -> Result<FileOperatorRequest, String> {
     serde_json::from_value(payload.clone())

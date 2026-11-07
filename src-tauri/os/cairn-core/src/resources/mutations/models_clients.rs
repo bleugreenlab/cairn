@@ -16,7 +16,7 @@
 use cairn_common::authorization::{
     ActDigest, AuthorityDecision, AuthorityGrant, AuthorityProvenance, AuthorityRequest,
 };
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::Value;
 
 use super::{build_failure, ResourceMutationResult};

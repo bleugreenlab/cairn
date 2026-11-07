@@ -1044,7 +1044,7 @@ async fn emit_permission_attention(
             crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, &ctx.job_id).await;
         let detail_uri = match perm_segment {
             Some(perm) => match parent_segment.as_deref() {
-                Some(parent) => cairn_common::uri::build_task_permission_uri(
+                Some(parent) => cairn_uri::build_task_permission_uri(
                     &ctx.project_key,
                     issue_number,
                     ctx.exec_seq.unwrap_or(1),
@@ -1052,7 +1052,7 @@ async fn emit_permission_attention(
                     &segment,
                     perm,
                 ),
-                None => cairn_common::uri::build_node_permission_uri(
+                None => cairn_uri::build_node_permission_uri(
                     &ctx.project_key,
                     issue_number,
                     ctx.exec_seq.unwrap_or(1),
@@ -1060,7 +1060,7 @@ async fn emit_permission_attention(
                     perm,
                 ),
             },
-            None => cairn_common::uri::build_job_base_uri(
+            None => cairn_uri::build_job_base_uri(
                 &ctx.project_key,
                 issue_number,
                 ctx.exec_seq.unwrap_or(1),
@@ -2827,7 +2827,7 @@ async fn lookup_permission_request_for_node(
     task_name: Option<&str>,
     perm_segment: &str,
 ) -> Result<String, String> {
-    let project_key = cairn_common::uri::canonical_project(project_key);
+    let project_key = cairn_uri::canonical_project(project_key);
     let node_segment = node_segment.to_string();
     let task_name = task_name.map(str::to_string);
     let perm_segment = perm_segment.to_string();

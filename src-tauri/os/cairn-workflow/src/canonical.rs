@@ -246,7 +246,7 @@ async fn canonical_successor(
         .await?;
     let node_uri = match (node_rows.next().await?, seq) {
         (Some(row), Some(seq)) => row.opt_text(0)?.map(|segment| {
-            cairn_common::uri::build_node_uri(&project_key, number as i32, seq as i32, &segment)
+            cairn_uri::build_node_uri(&project_key, number as i32, seq as i32, &segment)
         }),
         _ => None,
     };

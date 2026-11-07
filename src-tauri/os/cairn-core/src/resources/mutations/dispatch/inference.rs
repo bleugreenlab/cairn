@@ -25,9 +25,9 @@ use crate::orchestrator::inference_models::{register, Web};
 use crate::orchestrator::inference_verify;
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::AuthorityRequest;
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_inference::import::ImportSpec;
 use cairn_inference::RecordSource;
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::Value;
 
 /// A `cairn://inference/pools` patch: applied as preferences, then a pin,

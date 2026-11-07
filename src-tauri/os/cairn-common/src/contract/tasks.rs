@@ -5,6 +5,7 @@
 
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 pub(crate) const TASK_TERMINAL_CONTRACT: ResourceContract =
     ResourceContract {

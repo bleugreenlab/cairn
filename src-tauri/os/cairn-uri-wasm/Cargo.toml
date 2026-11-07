@@ -1,0 +1,22 @@
+[package]
+name = "cairn-uri-wasm"
+version.workspace = true
+edition = "2021"
+description = "The cairn:// URI grammar for the frontend, as a WebAssembly module"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+publish = false
+
+# Built by `bun run build:uri-wasm` (scripts/build-uri-wasm.ts) for
+# wasm32-unknown-unknown under the `wasm-release` profile. The rlib is what the
+# fixture example and the native tests link.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cairn-uri = { path = "../cairn-uri", features = ["serde"] }
+serde_json = "1.0"
+# Must equal the `wasm-bindgen` CLI pin in scripts/lib/wasm-tools.ts: the CLI
+# refuses a module built against any other version.
+wasm-bindgen = "=0.2.114"

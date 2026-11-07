@@ -50,7 +50,7 @@ pub async fn issue_watch_stood_down(
     issue_uri: &str,
     fact_kind: &str,
 ) -> Result<bool, String> {
-    let issue_uri = cairn_common::uri::canonicalize_uri_identity(issue_uri);
+    let issue_uri = cairn_uri::canonicalize_uri_identity(issue_uri);
     Ok(
         matching_subscription(db, job_id, SOURCE_KIND_ISSUE, Some(&issue_uri), fact_kind)
             .await?
@@ -128,7 +128,7 @@ pub async fn subscriptions_for_source(
 ) -> Result<Vec<WakeSubscription>, String> {
     let standing_watch = i64::from(unscoped_row_is_a_standing_watch(source_kind));
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
+    let source_ref = source_ref.map(cairn_uri::canonicalize_uri_identity);
     db.read(move |conn| {
         let source_kind = source_kind.clone();
         let source_ref = source_ref.clone();

@@ -319,7 +319,7 @@ async fn ask_questions_owned(
             ctx.issue_number,
             node_segment.as_deref(),
         ) {
-            let detail_uri = cairn_common::uri::build_node_question_uri(
+            let detail_uri = cairn_uri::build_node_question_uri(
                 &ctx.project_key,
                 issue_number,
                 ctx.exec_seq.unwrap_or(1),
@@ -424,7 +424,7 @@ async fn ask_questions_owned(
 
     if background {
         let question_uri = match (issue_number, node_segment.as_deref()) {
-            (Some(number), Some(node)) => Some(cairn_common::uri::build_node_question_uri(
+            (Some(number), Some(node)) => Some(cairn_uri::build_node_question_uri(
                 &project_key,
                 number,
                 exec_seq.unwrap_or(1),

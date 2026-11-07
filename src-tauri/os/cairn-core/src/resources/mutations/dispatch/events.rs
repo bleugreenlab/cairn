@@ -3,7 +3,7 @@ use crate::{
     mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest},
     orchestrator::Orchestrator,
 };
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// Mint (append on the collection), rotate (patch on a member), and revoke
 /// (delete on a member) ingress endpoints.

@@ -3,7 +3,7 @@ use crate::{
     mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest},
     orchestrator::Orchestrator,
 };
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 pub(super) async fn dispatch(
     o: &Orchestrator,
     r: &McpCallbackRequest,

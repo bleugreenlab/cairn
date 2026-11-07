@@ -199,10 +199,10 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
 /// Whether a resource place is one stored object, by either spelling.
 fn names_stored_object(canonical_uri: &str) -> bool {
     matches!(
-        cairn_common::uri::parse_uri(canonical_uri),
+        cairn_uri::parse_uri(canonical_uri),
         Some(
-            cairn_common::uri::CairnResource::ProjectAttachment { .. }
-                | cairn_common::uri::CairnResource::ProjectImage { .. }
+            cairn_uri::CairnResource::ProjectAttachment { .. }
+                | cairn_uri::CairnResource::ProjectImage { .. }
         )
     )
 }

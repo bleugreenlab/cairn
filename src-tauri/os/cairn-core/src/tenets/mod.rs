@@ -389,5 +389,5 @@ pub fn emit_changed(emitter: &dyn EventEmitter, project_id: &str, action: &str) 
 
 /// The canonical address of tenet `number` in `project_key`.
 pub fn tenet_uri(project_key: &str, number: i64) -> String {
-    cairn_common::uri::build_project_tenet_uri(project_key, &number.to_string())
+    cairn_uri::build_project_tenet_uri(project_key, &number.to_string())
 }

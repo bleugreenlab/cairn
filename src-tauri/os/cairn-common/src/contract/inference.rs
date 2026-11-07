@@ -11,6 +11,7 @@
 
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const DEPLOYMENT_ACTION: KeySpec = KeySpec::new("action", KeyType::Str, "start|stop");
 

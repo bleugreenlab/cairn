@@ -146,13 +146,11 @@ pub async fn home_uri_for_job_conn(
     // thread that is gone leaves it with no home rather than a project one.
     if row.opt_text(5)?.as_deref() == Some("service") {
         return Ok(match row.opt_text(8)? {
-            None => {
-                segment.map(|service| cairn_common::uri::build_project_service_uri(&key, &service))
-            }
+            None => segment.map(|service| cairn_uri::build_project_service_uri(&key, &service)),
             Some(_) => match (row.opt_text(9)?, segment) {
-                (Some(thread), Some(service)) => Some(cairn_common::uri::build_thread_service_uri(
-                    &key, &thread, &service,
-                )),
+                (Some(thread), Some(service)) => {
+                    Some(cairn_uri::build_thread_service_uri(&key, &thread, &service))
+                }
                 _ => None,
             },
         });
@@ -170,10 +168,8 @@ pub async fn home_uri_for_job_conn(
     if let Some(name) = row.opt_text(6)? {
         let is_session = row.opt_i64(7)?.unwrap_or_default() != 0;
         return Ok(match (is_session, segment) {
-            (true, _) => Some(cairn_common::uri::build_thread_uri(&key, &name)),
-            (false, Some(segment)) => Some(cairn_common::uri::build_thread_task_uri(
-                &key, &name, &segment,
-            )),
+            (true, _) => Some(cairn_uri::build_thread_uri(&key, &name)),
+            (false, Some(segment)) => Some(cairn_uri::build_thread_task_uri(&key, &name, &segment)),
             (false, None) => None,
         });
     }
@@ -186,6 +182,6 @@ pub async fn home_uri_for_job_conn(
     let is_workflow = row.opt_text(5)?.as_deref() == Some("workflow");
     let parent_segment = (!is_workflow).then_some(parent_segment).flatten();
     Ok(segment.map(|seg| {
-        cairn_common::uri::build_job_base_uri(&key, number, seq, &seg, parent_segment.as_deref())
+        cairn_uri::build_job_base_uri(&key, number, seq, &seg, parent_segment.as_deref())
     }))
 }

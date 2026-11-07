@@ -16,8 +16,11 @@ use cairn_common::query::QueryParam;
 use cairn_common::read::{
     ActionSpec, Affordance, AffordanceSpec, KeyInfo, NaturalUnit, SegmentKind,
 };
-use cairn_common::uri::{build_db_row_uri, build_db_table_uri, CairnResource};
 use cairn_db::turso::Value;
+use cairn_uri::{
+    build_db_row_uri, build_db_table_uri, reserved_table_segment_refusal, CairnResource,
+    RESERVED_TABLE_SEGMENT,
+};
 
 use super::common::{affordance_spec_for_kind, find_query_value, render_affordance};
 use super::read::{
@@ -27,23 +30,8 @@ use super::read::{
 use super::sql_schema::quote_identifier;
 use crate::storage::{DbResult, LocalDb};
 
-/// The path segment under every `/db/` that never names a table. Under a thread
-/// it is the generated schema projection (`.../db/schema`); under `cairn://db`
-/// it is held back so the two roots keep one grammar.
-pub(crate) const RESERVED_TABLE_SEGMENT: &str = "schema";
-
 /// Markdown cells longer than this are cut; `format=json` carries full values.
 const CELL_MAX_CHARS: usize = 120;
-
-/// The refusal for a table or row address whose table segment is the reserved
-/// one. `db_root` is the store's canonical root URI.
-pub(crate) fn reserved_table_segment_refusal(db_root: &str) -> String {
-    format!(
-        "`{RESERVED_TABLE_SEGMENT}` is a reserved segment under {db_root} and never names a table. \
-         Read a table called `{RESERVED_TABLE_SEGMENT}` with {db_root}?sql=SELECT * FROM \"{RESERVED_TABLE_SEGMENT}\" \
-         or {db_root}?table={RESERVED_TABLE_SEGMENT}."
-    )
-}
 
 /// One column, as `PRAGMA table_info` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]

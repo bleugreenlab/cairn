@@ -4,9 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::sql::placeholders;
 use cairn_db::turso::{params, Value};
+use cairn_uri::{parse_uri, CairnResource};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -194,7 +194,7 @@ fn channel_command(text: &str) -> Option<ChannelCommand> {
 fn ambient_help(project: &str) -> String {
     format!(
         "This is {project}'s ambient channel. A message here is logged to {}/events for routes to act on. Start it with @<thread> (or @<issue number>) or a #channel mention to deliver it straight there. Commands: /threads, /issues, /help.",
-        cairn_common::uri::build_project_uri(project)
+        cairn_uri::build_project_uri(project)
     )
 }
 
@@ -312,7 +312,7 @@ fn routed_gate_target(uri: &str) -> Option<String> {
     let resource = parse_uri(uri)?;
     match resource {
         CairnResource::Thread { project, name, .. } => {
-            Some(cairn_common::uri::build_thread_uri(&project, &name))
+            Some(cairn_uri::build_thread_uri(&project, &name))
         }
         resource => Some(format!(
             "cairn://p/{}/{}",
@@ -1068,7 +1068,7 @@ async fn stamp_agent_holders(db: &LocalDb, gates: &mut [Gate]) -> Result<(), Str
             continue;
         };
         gate.held_since = held
-            .get(&cairn_common::uri::canonicalize_uri_identity(key))
+            .get(&cairn_uri::canonicalize_uri_identity(key))
             .copied();
     }
     Ok(())
@@ -2153,7 +2153,7 @@ impl ChannelRouter {
                             title: None,
                             uri: format!(
                                 "cairn://p/{}/{}",
-                                cairn_common::uri::canonical_project(row.text(0)?),
+                                cairn_uri::canonical_project(row.text(0)?),
                                 row.text(1)?
                             ),
                         })
@@ -2186,7 +2186,7 @@ impl ChannelRouter {
                             title: Some(row.text(2)?),
                             uri: format!(
                                 "cairn://p/{}/{}",
-                                cairn_common::uri::canonical_project(row.text(0)?),
+                                cairn_uri::canonical_project(row.text(0)?),
                                 row.i64(1)?
                             ),
                         })
@@ -2238,7 +2238,7 @@ impl ChannelRouter {
             FollowTarget::Thread { project, name } => {
                 db.query_all(
                     follow_thread_jobs_sql(),
-                    params![cairn_common::uri::canonical_project(project), name.clone()],
+                    params![cairn_uri::canonical_project(project), name.clone()],
                     |row| {
                         Ok((
                             row.text(0)?,
@@ -2255,7 +2255,7 @@ impl ChannelRouter {
             FollowTarget::Issue { project, number } => {
                 db.query_all(
                     FOLLOW_ISSUE_JOBS_SQL,
-                    params![cairn_common::uri::canonical_project(project), *number],
+                    params![cairn_uri::canonical_project(project), *number],
                     |row| {
                         Ok((
                             row.text(0)?,
@@ -2356,7 +2356,7 @@ impl ChannelRouter {
                 let thread_id = db
                     .query_opt(
                         "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE LOWER(p.key) = ?1 AND t.name = ?2",
-                        params![cairn_common::uri::canonical_project(project), name.clone()],
+                        params![cairn_uri::canonical_project(project), name.clone()],
                         |row| row.text(0),
                     )
                     .await
@@ -2376,7 +2376,7 @@ impl ChannelRouter {
             FollowTarget::Issue { project, number } => {
                 let job_id = db.query_opt(
                     "SELECT j.id FROM jobs j JOIN runs r ON r.job_id = j.id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2 AND j.parent_job_id IS NULL ORDER BY r.created_at DESC LIMIT 1",
-                    params![cairn_common::uri::canonical_project(project), *number],
+                    params![cairn_uri::canonical_project(project), *number],
                     |row| row.text(0),
                 ).await.map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("{} has no addressable node", target.uri()))?;
@@ -2426,7 +2426,7 @@ impl ChannelRouter {
             text,
             binding_kind,
             target_uri: target.uri(),
-            project_key: cairn_common::uri::canonical_project(target.project()),
+            project_key: cairn_uri::canonical_project(target.project()),
             addressed: true,
             reply_of,
         })
@@ -2614,8 +2614,8 @@ impl ChannelRouter {
                 sender,
                 text,
                 binding_kind: Some(BindingKind::Ambient),
-                target_uri: cairn_common::uri::build_project_uri(project),
-                project_key: cairn_common::uri::canonical_project(project),
+                target_uri: cairn_uri::build_project_uri(project),
+                project_key: cairn_uri::canonical_project(project),
                 addressed: false,
                 reply_of,
             })
@@ -2674,7 +2674,7 @@ impl ChannelRouter {
         project: &str,
         address: &AmbientAddress,
     ) -> Result<Option<FollowTarget>, String> {
-        let project = cairn_common::uri::canonical_project(project);
+        let project = cairn_uri::canonical_project(project);
         match address {
             AmbientAddress::Selector(selector) => {
                 let db = self.orch.db.for_project(&project).await;
@@ -2691,7 +2691,7 @@ impl ChannelRouter {
                         Some(_) => self
                             .resolve_target(&format!(
                                 "{}/{number}",
-                                cairn_common::uri::build_project_uri(&project)
+                                cairn_uri::build_project_uri(&project)
                             ))
                             .await
                             .map(Some),
@@ -2709,7 +2709,7 @@ impl ChannelRouter {
                     .map_err(|error| error.to_string())?;
                 match name {
                     Some(name) => self
-                        .resolve_target(&cairn_common::uri::build_thread_uri(&project, &name))
+                        .resolve_target(&cairn_uri::build_thread_uri(&project, &name))
                         .await
                         .map(Some),
                     None => Ok(None),
@@ -4507,7 +4507,7 @@ async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
                     segment.as_deref(),
                 ) {
                     (Some(project), Some(number), Some(node), Some(segment)) => {
-                        Some(cairn_common::uri::build_node_question_uri(
+                        Some(cairn_uri::build_node_question_uri(
                             &project,
                             number as i32,
                             row.i64(7)? as i32,
@@ -4610,10 +4610,10 @@ async fn load_permissions(db: &LocalDb) -> Result<Vec<Gate>, String> {
                         let number = number as i32;
                         let seq = row.i64(8)? as i32;
                         Some(match row.opt_text(10)? {
-                            Some(parent) => cairn_common::uri::build_task_permission_uri(
+                            Some(parent) => cairn_uri::build_task_permission_uri(
                                 &project, number, seq, &parent, &node, segment,
                             ),
-                            None => cairn_common::uri::build_node_permission_uri(
+                            None => cairn_uri::build_node_permission_uri(
                                 &project, number, seq, &node, segment,
                             ),
                         })
@@ -4713,7 +4713,7 @@ const REVIEW_BACKLOG_SQL: &str = "SELECT ap.id, ap.recipient, ap.content_ref, ap
 /// halves of one sweep cannot disagree about which issue a push names.
 fn review_subject(content_ref: &str) -> Option<(String, i32)> {
     let parsed = parse_uri(content_ref)?;
-    let project = parsed.project().map(cairn_common::uri::canonical_project)?;
+    let project = parsed.project().map(cairn_uri::canonical_project)?;
     Some((project, parsed.issue_number()?))
 }
 
@@ -4773,7 +4773,7 @@ async fn load_review_issue_titles(
             while let Some(row) = rows.next().await? {
                 titles.insert(
                     (
-                        cairn_common::uri::canonical_project(row.text(0)?),
+                        cairn_uri::canonical_project(row.text(0)?),
                         row.i64(1)? as i32,
                     ),
                     row.text(2)?,
@@ -5237,7 +5237,7 @@ mod tests {
             key_of(&questions, "node-prompt"),
             format!(
                 "question:{}",
-                cairn_common::uri::build_node_question_uri("proj", 2, 1, "builder", "q-1")
+                cairn_uri::build_node_question_uri("proj", 2, 1, "builder", "q-1")
             )
         );
         assert_eq!(key_of(&questions, "node-prompt"), NODE_QUESTION_KEY);
@@ -5245,7 +5245,7 @@ mod tests {
             key_of(&questions, "task-prompt"),
             format!(
                 "question:{}",
-                cairn_common::uri::build_node_question_uri("proj", 2, 1, "probe", "q-2")
+                cairn_uri::build_node_question_uri("proj", 2, 1, "probe", "q-2")
             )
         );
 
@@ -5254,16 +5254,14 @@ mod tests {
             key_of(&permissions, "node-perm"),
             format!(
                 "permission:{}",
-                cairn_common::uri::build_node_permission_uri("proj", 2, 1, "builder", "perm-1")
+                cairn_uri::build_node_permission_uri("proj", 2, 1, "builder", "perm-1")
             )
         );
         assert_eq!(
             key_of(&permissions, "task-perm"),
             format!(
                 "permission:{}",
-                cairn_common::uri::build_task_permission_uri(
-                    "proj", 2, 1, "builder", "probe", "perm-2"
-                )
+                cairn_uri::build_task_permission_uri("proj", 2, 1, "builder", "probe", "perm-2")
             )
         );
     }

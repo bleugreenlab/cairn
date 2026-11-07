@@ -1,6 +1,7 @@
 //! Posts resource contracts.
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 pub(crate) const POSTS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Posts,

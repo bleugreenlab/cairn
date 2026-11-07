@@ -1131,7 +1131,7 @@ async fn triage_issue_uri_for_memory(db: &LocalDb, memory_id: &str) -> DbResult<
         |row| {
             let key = row.text(0)?;
             let number = row.i64(1)? as i32;
-            Ok(Some(cairn_common::uri::build_issue_uri(&key, number)))
+            Ok(Some(cairn_uri::build_issue_uri(&key, number)))
         },
     )
     .await

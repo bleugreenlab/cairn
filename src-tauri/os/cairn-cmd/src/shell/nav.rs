@@ -10,7 +10,7 @@
 //! once the read succeeded.
 
 use cairn_common::read::AffordanceSpec;
-use cairn_common::uri::{build_issue_uri, parse_uri, resolve_relative, ROOT_URI};
+use cairn_uri::{build_issue_uri, parse_uri, resolve_relative, ROOT_URI};
 use serde_json::Value;
 
 use super::actions;

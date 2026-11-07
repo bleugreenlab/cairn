@@ -11,7 +11,7 @@ use std::{env, io::IsTerminal};
 
 use rmcp::ServiceExt;
 
-use cairn_common::uri::parse_uri as parse_cairn_uri;
+use cairn_uri::parse_uri as parse_cairn_uri;
 
 mod auth;
 mod cli;

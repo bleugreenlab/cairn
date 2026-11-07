@@ -8,7 +8,7 @@ use crate::mcp::handlers::planning;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::AuthorityLifetimeKind;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// Parse a permission answer payload into the decision plus both lifetime
 /// concepts.
@@ -344,7 +344,8 @@ mod tests {
 
     #[test]
     fn both_permission_resources_declare_the_message_key() {
-        use cairn_common::contract::{contract_for, ResourceKind};
+        use cairn_common::contract::contract_for;
+        use cairn_uri::ResourceKind;
         for kind in [ResourceKind::NodePermission, ResourceKind::TaskPermission] {
             let contract = contract_for(kind).unwrap();
             assert!(

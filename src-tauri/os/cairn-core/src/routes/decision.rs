@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -512,10 +512,7 @@ pub fn chartered_options(
             Some(DecisionOption {
                 value: thread.name.clone(),
                 description: Some(charter.to_string()),
-                address: Some(cairn_common::uri::build_thread_uri(
-                    project_key,
-                    &thread.name,
-                )),
+                address: Some(cairn_uri::build_thread_uri(project_key, &thread.name)),
                 revision: Some(revision(charter)),
             })
         })

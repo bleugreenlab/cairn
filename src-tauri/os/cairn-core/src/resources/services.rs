@@ -6,7 +6,7 @@
 //! supervisor.
 
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{
+use cairn_uri::{
     build_project_service_log_uri, build_project_service_status_uri, build_project_service_uri,
     build_thread_service_log_uri, build_thread_service_status_uri, build_thread_services_uri,
 };
@@ -57,7 +57,7 @@ async fn resolve(
     thread: Option<&str>,
     service: &str,
 ) -> Result<ServiceRef, String> {
-    let project_key = cairn_common::uri::canonical_project(project);
+    let project_key = cairn_uri::canonical_project(project);
     let (project_id, owner) = match thread {
         None => (
             project_id_for_key(orch, project).await?,
@@ -166,7 +166,7 @@ pub(crate) async fn read_index(orch: &Orchestrator, project: &str) -> String {
 
 /// The services a thread has written, newest version of each.
 pub(crate) async fn read_thread_index(orch: &Orchestrator, project: &str, thread: &str) -> String {
-    let project_key = cairn_common::uri::canonical_project(project);
+    let project_key = cairn_uri::canonical_project(project);
     let db = orch.db.for_project(project).await;
     let (project_id, owner) = match thread_store::resolve_owner(&db, &project_key, thread).await {
         Ok(found) => found,
@@ -180,7 +180,7 @@ pub(crate) async fn read_thread_index(orch: &Orchestrator, project: &str, thread
     let mut out = format!(
         "# Services — {}\n\n{} service(s) this thread has written. Write one at `{}/<name>`: a page is \
          the interface, a service is the process behind it, and the thread database is the state.\n\n",
-        cairn_common::uri::build_thread_uri(&project_key, thread),
+        cairn_uri::build_thread_uri(&project_key, thread),
         rows.len(),
         build_thread_services_uri(&project_key, thread)
     );

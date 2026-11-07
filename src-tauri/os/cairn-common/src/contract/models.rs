@@ -13,6 +13,7 @@
 
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const MODELS_SESSION_ACTION: KeySpec = KeySpec::new(
     "action",

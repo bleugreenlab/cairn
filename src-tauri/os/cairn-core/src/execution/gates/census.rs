@@ -367,7 +367,7 @@ pub fn wont_start_reason(
         let resolution = if merged { "merged" } else { "closed" };
         return format!(
             "{}/{number} {resolution}",
-            cairn_common::uri::canonical_project(key)
+            cairn_uri::canonical_project(key)
         );
     }
     match (superseded, successor_seq) {

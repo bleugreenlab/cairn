@@ -1,5 +1,6 @@
 use super::specs::{DELETE_REASON, NO_CROSS_ACTIONS, NO_RELATED};
 use super::types::*;
+use cairn_uri::ResourceKind;
 const DEFINITION: KeySpec = KeySpec::new("definition", KeyType::Any, "complete route definition");
 const ROUTE_PROJECTIONS: &[ProjectionSpec] = &[ProjectionSpec {
     key: "projection",

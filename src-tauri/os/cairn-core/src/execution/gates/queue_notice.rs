@@ -76,10 +76,7 @@ const SUBJECT_SQL: &str = "SELECT i.id, i.number, p.key, i.parent_thread_id, t.n
   WHERE e.id = ?1";
 
 fn issue_label(project_key: &str, number: i64) -> String {
-    format!(
-        "{}/{number}",
-        cairn_common::uri::canonical_project(project_key)
-    )
+    format!("{}/{number}", cairn_uri::canonical_project(project_key))
 }
 
 /// Where `execution_id` stands before a Start now: its place in its thread's

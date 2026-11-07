@@ -327,7 +327,7 @@ pub(crate) async fn commit_posture_refusal(
 
 /// Resolve a project's database ID by canonical lowercase key.
 pub(crate) async fn project_id_by_key(db: &LocalDb, key: &str) -> Result<String, String> {
-    let key = cairn_common::uri::canonical_project(key);
+    let key = cairn_uri::canonical_project(key);
     db.query_text(
         "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
         (key.clone(),),

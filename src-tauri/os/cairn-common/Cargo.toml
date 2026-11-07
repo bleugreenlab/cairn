@@ -9,6 +9,7 @@ homepage = "https://cairn.computer"
 keywords = ["agent", "orchestration", "mcp"]
 
 [dependencies]
+cairn-uri = { path = "../cairn-uri" }
 url = "2"
 regex = "1"
 log = "0.4"

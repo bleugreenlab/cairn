@@ -14,7 +14,7 @@
 
 use cairn_common::authorization::AuthorityMutation;
 use cairn_common::protocol::{DispatchOrigin, RowWriteOrigin};
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::{Map, Value};
 
 use crate::mcp::types::McpCallbackRequest;
@@ -85,10 +85,10 @@ impl RowTarget {
 
     /// The canonical collection URI the change writes into.
     pub(crate) fn collection(&self) -> String {
-        cairn_common::uri::build_db_table_uri(
+        cairn_uri::build_db_table_uri(
             &format!(
                 "{}/db",
-                cairn_common::uri::build_thread_uri(&self.project, &self.thread)
+                cairn_uri::build_thread_uri(&self.project, &self.thread)
             ),
             &self.table,
         )
@@ -116,8 +116,8 @@ pub(crate) fn row_target(resolved: &str, target: &str) -> Result<Option<RowTarge
             true
         }
     };
-    let resource = parse_uri(resolved)
-        .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok());
+    let resource =
+        parse_uri(resolved).and_then(|parsed| cairn_uri::delegate_thread_descendant(parsed).ok());
     Ok(match resource {
         Some(CairnResource::ThreadDbTable {
             project,

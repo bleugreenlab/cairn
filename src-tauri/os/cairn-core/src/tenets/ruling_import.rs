@@ -437,7 +437,7 @@ fn new_tenet(
         })),
         // The thread decided; no run is recorded for a ruling.
         proposer: PrincipalRef::Agent {
-            node: cairn_common::uri::build_thread_uri(project_key, &candidate.thread_name),
+            node: cairn_uri::build_thread_uri(project_key, &candidate.thread_name),
             run_id: None,
         },
         now,

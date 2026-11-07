@@ -891,6 +891,7 @@ dependencies = [
  "cairn-db",
  "cairn-domain",
  "cairn-platform",
+ "cairn-uri",
  "chrono",
  "futures-util",
  "log",
@@ -950,6 +951,7 @@ dependencies = [
  "base64 0.22.1",
  "cairn-common",
  "cairn-mcp-server",
+ "cairn-uri",
  "clap",
  "crossterm",
  "futures",
@@ -985,6 +987,7 @@ dependencies = [
  "base64 0.22.1",
  "cairn-cell",
  "cairn-procmem",
+ "cairn-uri",
  "dirs 6.0.0",
  "flate2",
  "getrandom 0.3.4",
@@ -1025,6 +1028,7 @@ dependencies = [
  "cairn-platform",
  "cairn-sandbox",
  "cairn-symbols",
+ "cairn-uri",
  "dirs 5.0.1",
  "log",
  "serde",
@@ -1062,6 +1066,7 @@ dependencies = [
  "cairn-symbols",
  "cairn-tls",
  "cairn-tokenize",
+ "cairn-uri",
  "cairn-vcs",
  "cairn-workflow",
  "chacha20poly1305",
@@ -1152,6 +1157,7 @@ dependencies = [
  "cairn-common",
  "cairn-domain",
  "cairn-platform",
+ "cairn-uri",
  "chrono",
  "futures-util",
  "log",
@@ -1229,6 +1235,7 @@ dependencies = [
  "async-trait",
  "axum",
  "cairn-common",
+ "cairn-uri",
  "http",
  "regex",
  "rmcp",
@@ -1363,6 +1370,7 @@ dependencies = [
  "cairn-procmem",
  "cairn-tokenize",
  "cairn-toks",
+ "cairn-uri",
  "chrono",
  "crossbeam-channel",
  "libc",
@@ -1442,6 +1450,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-uri"
+version = "0.13.7"
+dependencies = [
+ "regex",
+ "serde",
+]
+
+[[package]]
+name = "cairn-uri-wasm"
+version = "0.13.7"
+dependencies = [
+ "cairn-uri",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "cairn-vcs"
 version = "0.13.7"
 dependencies = [
@@ -1477,6 +1502,7 @@ dependencies = [
  "cairn-domain",
  "cairn-models-types",
  "cairn-platform",
+ "cairn-uri",
  "chrono",
  "evalexpr",
  "log",

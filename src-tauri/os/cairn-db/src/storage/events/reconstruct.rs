@@ -622,7 +622,7 @@ async fn load_run_row(conn: &crate::storage::TrackedConnection, run_id: &str) ->
 }
 
 async fn load_private_local_repo_path(private_db: &LocalDb, project_key: &str) -> Option<String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     private_db
         .query_opt_text(
             "SELECT local_repo_path FROM project_routes WHERE project_key = ?1",

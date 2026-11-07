@@ -150,7 +150,7 @@ async fn project_repo_path(
     conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
 ) -> Result<Option<String>, String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let mut rows = conn
         .query(
             "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",

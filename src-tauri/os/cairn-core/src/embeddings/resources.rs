@@ -125,7 +125,7 @@ pub fn skill_embed_text(description: &str) -> String {
 /// A workspace skill's vector lives at `cairn://skills/{id}`.
 pub fn skill_embed_target(skill_id: &str, description: &str) -> ResourceTarget {
     ResourceTarget {
-        uri: cairn_common::uri::build_skill_uri(skill_id, &[]),
+        uri: cairn_uri::build_skill_uri(skill_id, &[]),
         text: skill_embed_text(description),
     }
 }
@@ -341,7 +341,7 @@ impl Walk {
                     by_id.insert(
                         id,
                         ResourceTarget {
-                            uri: cairn_common::uri::build_issue_uri(&key, number as i32),
+                            uri: cairn_uri::build_issue_uri(&key, number as i32),
                             text: issue_embed_text(description.as_deref()),
                         },
                     );

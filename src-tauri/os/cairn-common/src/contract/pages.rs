@@ -6,6 +6,7 @@
 //! that renders on that node and never reaches the project index.
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const PAGE_TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 const PAGE_FILES: KeySpec = KeySpec::new(

@@ -7,8 +7,9 @@ use crate::{
     orchestrator::Orchestrator,
     routes::{RouteDefinition, RouteNodeConfig, RouteSink},
 };
-use cairn_common::{query::QueryParam, uri::*};
+use cairn_common::query::QueryParam;
 use cairn_config::library::LibraryRoots;
+use cairn_uri::*;
 use std::path::PathBuf;
 async fn scope(
     o: &Orchestrator,
@@ -17,7 +18,7 @@ async fn scope(
 ) -> Result<(Option<String>, Option<PathBuf>), String> {
     if let Some(k) = p {
         Ok((
-            Some(cairn_common::uri::canonical_project(k)),
+            Some(cairn_uri::canonical_project(k)),
             Some(project_path_by_key(o, k).await?),
         ))
     } else {

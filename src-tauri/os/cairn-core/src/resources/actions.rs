@@ -11,7 +11,7 @@ use crate::mcp::handlers::run_context;
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::ActionConfig;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::{build_action_uri, build_project_action_uri};
+use cairn_uri::{build_action_uri, build_project_action_uri};
 
 /// Workspace id used for workspace-scoped action definitions.
 const WORKSPACE_ID: &str = "default";
@@ -43,10 +43,7 @@ pub(crate) async fn read_actions_collection(
             // owning db by key first so the id (and its team prefix) is found.
             let project_db = orch.db.for_project(project).await;
             match run_context::project_id_by_key(&project_db, project).await {
-                Ok(id) => (
-                    Some(id),
-                    Some(cairn_common::uri::canonical_project(project)),
-                ),
+                Ok(id) => (Some(id), Some(cairn_uri::canonical_project(project))),
                 Err(e) => return e,
             }
         }
@@ -178,7 +175,7 @@ fn not_found(action_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Action not found in project {}: {action_id}",
-            cairn_common::uri::canonical_project(project)
+            cairn_uri::canonical_project(project)
         ),
         None => format!("Action not found: {action_id}"),
     }

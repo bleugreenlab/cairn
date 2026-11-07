@@ -2,7 +2,7 @@
 
 pub mod display;
 
-use crate::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use thiserror::Error;

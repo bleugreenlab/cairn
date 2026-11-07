@@ -19,20 +19,21 @@ use super::types::{AttachmentRef, AttachmentScopeRef, CairnResource};
 ///
 /// Both halves are round-trip guarantees; they differ only in how many readers
 /// the trip goes through, and that difference is the deliberate ownership
-/// boundary between the two crates.
+/// boundary between the parser and the thread resolver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundTrip {
     /// The common parser is the whole reader: `parse_uri(x.to_uri()) == x`.
     Parser,
-    /// A thread sub-resource. The common parser deliberately stops every thread
-    /// URI at `CairnResource::Thread { path }` and hands the path on intact;
-    /// `cairn-core`'s `delegate_thread_descendant` is the single reader that
-    /// names the variant. So the guarantee is
-    /// `delegate(parse_uri(x.to_uri())) == x`, and cairn-core's
-    /// `every_resource_variant_survives_its_own_uri` is where it is pinned.
+    /// A thread sub-resource. The parser deliberately stops every thread URI
+    /// at `CairnResource::Thread { path }` and hands the path on intact;
+    /// [`crate::delegate_thread_descendant`] is the single reader that names
+    /// the variant. So the guarantee is
+    /// `delegate(parse_uri(x.to_uri())) == x`, and
+    /// `thread::tests::every_resource_variant_survives_its_own_uri` is where it
+    /// is pinned.
     ///
     /// One resolver for thread sub-paths: a `procedures` or `db` arm added to
-    /// the common parser would be a second implementation of what a thread
+    /// the parser would be a second implementation of what a thread
     /// sub-path means, free to drift from the one read and write dispatch use.
     ThreadResolver,
 }
@@ -144,8 +145,8 @@ resource_samples! {
     Changed { project: project(), number: 42 } => Parser,
 
     // ---- Threads ----
-    // The thread itself is the common parser's; everything beneath it is the
-    // core resolver's, and `Thread { path }` is the handoff both agree on.
+    // The thread itself is the parser's; everything beneath it is the thread
+    // resolver's, and `Thread { path }` is the handoff both agree on.
     Thread { project: project(), name: thread(), path: Vec::new() } => Parser,
     ThreadQueue { project: project(), thread: thread() } => ThreadResolver,
     ThreadDb { project: project(), name: thread() } => ThreadResolver,

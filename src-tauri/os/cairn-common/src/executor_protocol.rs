@@ -5619,6 +5619,12 @@ pub struct LearnedResourceEstimate {
 /// frame, variant or field changes, so a runner talking to an older executor
 /// gets nothing wrong.
 ///
+/// cairn/6326 does not move the number. `normalize_executor_name` moves, byte
+/// for byte, into the `cairn-uri` crate so the URI grammar can build for
+/// WebAssembly; both peers call the same function from its new home. No frame,
+/// variant or field changes, and a runner talking to an older executor gets
+/// nothing wrong: every name either side folds folds to the same string.
+///
 /// cairn/6090 does not move the number. An operator Compact's job-wide cancel
 /// now spares the job's check requests, reading the `priority` field
 /// the runner already holds, so the runner sends `Cancel` for fewer requests
@@ -8070,37 +8076,11 @@ pub const LOCAL_EXECUTOR_NAME: &str = "local";
 /// to reject one.
 pub const EXECUTOR_NAME_RULE: &str = "an executor name is hostname-like: lowercase ASCII letters, digits, and hyphens, beginning and ending with a letter or digit";
 
-/// Fold an operator-supplied label into the public name that addresses it.
-///
-/// Names are the address space agents type, so they are normalized on the way
-/// in rather than validated and refused: `"BG Lab (Ubuntu)"` and `"bg-lab-ubuntu"`
-/// are the same machine, and an agent that reads one in `cairn://executors` and
-/// writes the other in a placement request must reach it. `None` means the label
-/// contains nothing that can be part of an address.
-pub fn normalize_executor_name(raw: &str) -> Option<String> {
-    let mut name = String::with_capacity(raw.len());
-    for character in raw.chars() {
-        let mapped = if character.is_ascii_alphanumeric() {
-            character.to_ascii_lowercase()
-        } else {
-            '-'
-        };
-        if mapped == '-' && (name.is_empty() || name.ends_with('-')) {
-            continue;
-        }
-        name.push(mapped);
-    }
-    while name.ends_with('-') {
-        name.pop();
-    }
-    (!name.is_empty()).then_some(name)
-}
-
 /// Whether two labels address the same machine.
 pub fn executor_names_match(left: &str, right: &str) -> bool {
     match (
-        normalize_executor_name(left),
-        normalize_executor_name(right),
+        cairn_uri::normalize_executor_name(left),
+        cairn_uri::normalize_executor_name(right),
     ) {
         (Some(left), Some(right)) => left == right,
         _ => false,
@@ -8112,7 +8092,7 @@ pub fn executor_names_match(left: &str, right: &str) -> bool {
 /// One vocabulary for every surface that requests placement — the run tool, a
 /// project check, the SDK, the protocol. A machine is addressed by its public
 /// name or by the platform it must provide, never by both and never by an
-/// opaque identity: names are what [`crate::uri::CairnResource::Executors`]
+/// opaque identity: names are what [`cairn_uri::CairnResource::Executors`]
 /// publishes, so everything this accepts is discoverable before it is used.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -8174,7 +8154,7 @@ impl ExecutorSelector {
             containment.validate()?;
         }
         if let Some(name) = &self.name {
-            if normalize_executor_name(name).is_none() {
+            if cairn_uri::normalize_executor_name(name).is_none() {
                 return Err(format!(
                     "executor name {name:?} addresses no machine: {EXECUTOR_NAME_RULE}"
                 ));
@@ -22451,7 +22431,7 @@ mod tests {
             ("\u{fffd}", None),
         ] {
             assert_eq!(
-                normalize_executor_name(label).as_deref(),
+                cairn_uri::normalize_executor_name(label).as_deref(),
                 expected,
                 "label {label:?}"
             );
@@ -22459,8 +22439,11 @@ mod tests {
         // Normalization is idempotent: a name read out of the resource and fed
         // back in as a selector must address the same machine.
         for label in ["BGLab UB", "192.168.1.18"] {
-            let once = normalize_executor_name(label).unwrap();
-            assert_eq!(normalize_executor_name(&once), Some(once.clone()));
+            let once = cairn_uri::normalize_executor_name(label).unwrap();
+            assert_eq!(
+                cairn_uri::normalize_executor_name(&once),
+                Some(once.clone())
+            );
         }
         assert!(executor_names_match("BGLab UB", "bglab-ub"));
         assert!(!executor_names_match("bglab-ub", "bglab-mac"));

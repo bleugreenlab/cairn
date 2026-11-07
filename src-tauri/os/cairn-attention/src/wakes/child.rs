@@ -205,7 +205,7 @@ pub async fn coordinated_child_issue_uris_for_job(
             while let Some(row) = rows.next().await? {
                 children.push((
                     row.text(0)?,
-                    cairn_common::uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
+                    cairn_uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
                 ));
             }
             let mut uris = Vec::new();

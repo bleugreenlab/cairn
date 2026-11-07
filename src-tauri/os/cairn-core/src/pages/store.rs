@@ -1,7 +1,7 @@
 //! Where a page's versions live, and the write that appends one.
 
-use cairn_common::uri::{build_node_page_uri, build_node_uri, CairnResource, NodeAddress};
 use cairn_db::turso::params;
+use cairn_uri::{build_node_page_uri, build_node_uri, CairnResource, NodeAddress};
 use serde_json::Value;
 
 use super::data::{
@@ -54,8 +54,8 @@ impl PageAddress {
     pub(crate) fn parse(uri: &str) -> Result<Self, String> {
         let refusal =
             || format!("`{uri}` is not a canonical page URI (cairn://p/PROJECT/THREAD/pages/NAME)");
-        let resource = cairn_common::uri::parse_uri(uri.trim()).ok_or_else(refusal)?;
-        let resource = crate::resources::delegate_thread_descendant(resource)?;
+        let resource = cairn_uri::parse_uri(uri.trim()).ok_or_else(refusal)?;
+        let resource = cairn_uri::delegate_thread_descendant(resource)?;
         match resource {
             CairnResource::NodePage { .. } => Self::from_resource(&resource).ok_or_else(refusal),
             _ => Err(refusal()),

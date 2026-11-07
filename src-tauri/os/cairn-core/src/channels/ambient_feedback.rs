@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use cairn_common::uri::{build_thread_uri, parse_uri, CairnResource};
+use cairn_uri::{build_thread_uri, parse_uri, CairnResource};
 use serde_json::Value;
 
 use crate::orchestrator::Orchestrator;
@@ -230,7 +230,7 @@ pub(crate) fn delivered_threads(firings: &[RouteFiringRecord]) -> Vec<String> {
             continue;
         }
         if let Some(sink) = firing.sink_ref.as_deref() {
-            let thread = cairn_common::uri::canonicalize_uri_identity(sink);
+            let thread = cairn_uri::canonicalize_uri_identity(sink);
             if !threads.contains(&thread) {
                 threads.push(thread);
             }
@@ -280,7 +280,7 @@ pub(crate) fn outcome_rows(
         recipients = decision
             .addresses
             .iter()
-            .map(|address| cairn_common::uri::canonicalize_uri_identity(address))
+            .map(|address| cairn_uri::canonicalize_uri_identity(address))
             .collect();
     }
     if recipients.is_empty() {
@@ -607,10 +607,10 @@ async fn sent_to_conversation(
         )
         .await
         .map_err(|error| error.to_string())?;
-    let thread_uri = cairn_common::uri::canonicalize_uri_identity(thread_uri);
+    let thread_uri = cairn_uri::canonicalize_uri_identity(thread_uri);
     Ok(refs.iter().any(|binding_ref| {
         crate::channels::agent_message::sender_home(binding_ref)
-            .is_some_and(|home| cairn_common::uri::canonicalize_uri_identity(home) == thread_uri)
+            .is_some_and(|home| cairn_uri::canonicalize_uri_identity(home) == thread_uri)
     }))
 }
 
@@ -718,7 +718,7 @@ pub(crate) async fn labeller(
     match parse_uri(&agent.home) {
         Some(CairnResource::Thread { project, path, .. }) if path.is_empty() => {
             Ok(Labeller::Thread {
-                uri: cairn_common::uri::canonicalize_uri_identity(&agent.home),
+                uri: cairn_uri::canonicalize_uri_identity(&agent.home),
                 project_key: project,
             })
         }

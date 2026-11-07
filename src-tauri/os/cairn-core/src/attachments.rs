@@ -24,10 +24,10 @@
 
 use crate::storage::{content_store::content_hash, LocalDb};
 use base64::Engine;
-use cairn_common::uri::{
+use cairn_db::storage::RowExt;
+use cairn_uri::{
     build_project_attachment_uri, build_project_image_uri, AttachmentRef, AttachmentScopeRef,
 };
-use cairn_db::storage::RowExt;
 
 /// The ceiling on one durable ingest, matching what the web composer already
 /// enforced on an upload. Above it the composer refuses by name with a stated
@@ -1484,7 +1484,7 @@ pub async fn remove_attachment(
 mod tests {
     use super::*;
     use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
-    use cairn_common::uri::{parse_uri, CairnResource};
+    use cairn_uri::{parse_uri, CairnResource};
     use std::sync::Arc;
 
     async fn seeded_db() -> (tempfile::TempDir, LocalDb) {
@@ -1766,10 +1766,7 @@ mod tests {
         // Built by hand from the collection URI, never returned by a lookup.
         let constructed = format!(
             "{}/2",
-            cairn_common::uri::build_project_attachments_uri(
-                "cairn",
-                &AttachmentScopeRef::Issue(444)
-            )
+            cairn_uri::build_project_attachments_uri("cairn", &AttachmentScopeRef::Issue(444))
         );
         assert_eq!(
             fetch_attachment(&db, "p", "cairn", &reference_of(&constructed))

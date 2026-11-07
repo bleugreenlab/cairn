@@ -37,7 +37,7 @@ pub(crate) use settings::workspace_settings_authority;
 
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResourceTargetHash {
@@ -232,7 +232,7 @@ pub(super) async fn target_resource_for_request(
         crate::mcp::handlers::resources::resource_uri_hint(&target)
             .unwrap_or_else(|| format!("Unrecognized URI format: {}", item.target))
     })?;
-    super::delegate_thread_descendant(resource)
+    cairn_uri::delegate_thread_descendant(resource)
 }
 
 #[cfg(test)]
@@ -244,7 +244,7 @@ mod tests {
         let ack = created_resource_ack(
             "skill",
             "rust-dev",
-            &cairn_common::uri::build_project_skill_uri("cairn", "rust-dev", &[]),
+            &cairn_uri::build_project_skill_uri("cairn", "rust-dev", &[]),
         );
         assert_eq!(
             ack,
@@ -258,10 +258,10 @@ mod tests {
     #[test]
     fn created_resource_ack_never_carries_a_filesystem_path() {
         for uri in [
-            cairn_common::uri::build_skill_uri("local", &[]),
-            cairn_common::uri::build_project_recipe_uri("cairn", "coordinator"),
-            cairn_common::uri::build_agent_uri("build"),
-            cairn_common::uri::build_project_agent_uri("cairn", "build"),
+            cairn_uri::build_skill_uri("local", &[]),
+            cairn_uri::build_project_recipe_uri("cairn", "coordinator"),
+            cairn_uri::build_agent_uri("build"),
+            cairn_uri::build_project_agent_uri("cairn", "build"),
         ] {
             let ack = created_resource_ack("resource", "id", &uri);
             let address = ack

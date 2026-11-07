@@ -15,8 +15,8 @@ use cairn_common::executor_protocol::{
     ResidentProcessIoMode, ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus,
     ResidentStreamFraming, ResourceReservation, ResourceReservationSource,
 };
-use cairn_common::uri::CairnResource;
 use cairn_db::turso::params;
+use cairn_uri::CairnResource;
 use tokio::sync::mpsc;
 
 use crate::messages::delivery::{latest_run_for_job, queue_system_direct};
@@ -791,7 +791,7 @@ async fn canonical_selector(
         number,
         exec_seq,
         node_id,
-    }) = cairn_common::uri::parse_uri(selector)
+    }) = cairn_uri::parse_uri(selector)
     else {
         return Err(DevInstanceLaunchFailure::InvalidSelector {
             diagnostic: format!(
@@ -801,7 +801,7 @@ async fn canonical_selector(
     };
     let node = format!("{project}/{number}/{exec_seq}/{node_id}");
     let owned_project = project_id.to_string();
-    let key = cairn_common::uri::canonical_project(project);
+    let key = cairn_uri::canonical_project(project);
     let branch = orch
         .db
         .local

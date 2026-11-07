@@ -15,7 +15,7 @@ use crate::config::agents::{self as config_agents, FileAgent};
 use crate::mcp::handlers::skills_resources::{current_run_project, project_path_by_key};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::{build_agent_uri, build_project_agent_uri};
+use cairn_uri::{build_agent_uri, build_project_agent_uri};
 
 const LINKS: Links = Links {
     bare: build_agent_uri,
@@ -30,10 +30,7 @@ async fn resolve_scope(
 ) -> Result<(Option<String>, Option<PathBuf>), String> {
     if let Some(project) = explicit_project {
         let path = project_path_by_key(orch, project).await?;
-        Ok((
-            Some(cairn_common::uri::canonical_project(project)),
-            Some(path),
-        ))
+        Ok((Some(cairn_uri::canonical_project(project)), Some(path)))
     } else {
         match current_run_project(orch, request).await {
             Some((key, path)) => Ok((Some(key), path)),
@@ -144,7 +141,7 @@ fn not_found(agent_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Agent not found in project {}: {agent_id}",
-            cairn_common::uri::canonical_project(project)
+            cairn_uri::canonical_project(project)
         ),
         None => format!("Agent not found: {agent_id}"),
     }

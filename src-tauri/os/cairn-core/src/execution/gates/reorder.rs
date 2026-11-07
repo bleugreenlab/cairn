@@ -662,7 +662,7 @@ pub(crate) struct PlannedMove {
 fn row_label(entry: &FleetOrdered) -> String {
     match (&entry.queued.project_key, entry.queued.issue_number) {
         (Some(project), Some(number)) => {
-            format!("{}/{number}", cairn_common::uri::canonical_project(project))
+            format!("{}/{number}", cairn_uri::canonical_project(project))
         }
         _ => entry.queued.execution_id.clone(),
     }
@@ -1777,7 +1777,7 @@ pub(crate) mod tests {
         );
 
         let spec = cairn_common::contract::mutation_spec(
-            cairn_common::contract::ResourceKind::ThreadQueue,
+            cairn_uri::ResourceKind::ThreadQueue,
             ChangeMode::Patch,
         )
         .expect("the queue advertises its order patch");

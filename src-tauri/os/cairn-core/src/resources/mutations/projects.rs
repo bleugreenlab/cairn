@@ -23,7 +23,7 @@ use crate::projects::{crud, remote};
 use crate::references::ProjectReference;
 use crate::services::RealClock;
 use crate::storage::{LocalDb, RowExt};
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use std::collections::HashMap;
 
 fn emit_db_change(orch: &Orchestrator, action: &str) {
@@ -169,7 +169,7 @@ async fn resolve_project(
     project_key: &str,
 ) -> Result<(Arc<LocalDb>, String, String, Option<String>), String> {
     let db = orch.db.for_project(project_key).await;
-    let lookup = cairn_common::uri::canonical_project(project_key);
+    let lookup = cairn_uri::canonical_project(project_key);
     let row = db
         .read(move |conn| {
             let lookup = lookup.clone();
@@ -623,11 +623,7 @@ async fn load_project_settings_read_only_for_mutation(
         resolve_project(orch, project_key).await?;
     let repo = PathBuf::from(repo_path);
     let config = load_project_settings_read_only(&repo);
-    Ok((
-        cairn_common::uri::canonical_project(project_key),
-        repo,
-        config,
-    ))
+    Ok((cairn_uri::canonical_project(project_key), repo, config))
 }
 
 fn emit_project_settings_change(orch: &Orchestrator) {

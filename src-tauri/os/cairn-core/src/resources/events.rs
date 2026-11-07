@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use cairn_common::query::QueryParam;
-use cairn_common::uri::{
+use cairn_uri::{
     build_project_event_uri, build_project_route_history_entry_uri, build_route_history_entry_uri,
     build_workspace_event_uri,
 };
@@ -560,7 +560,7 @@ pub(crate) async fn member(
             "explain" if explain.is_some() => {
                 return "Query parameter 'explain' must be specified once".to_string()
             }
-            "explain" => match cairn_common::uri::parse_uri(param.value.trim()) {
+            "explain" => match cairn_uri::parse_uri(param.value.trim()) {
                 Some(resource) => explain = Some(resource.to_uri()),
                 None => {
                     return format!(

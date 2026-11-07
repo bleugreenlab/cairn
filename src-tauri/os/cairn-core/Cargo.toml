@@ -79,6 +79,7 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 async-trait = "0.1"
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 # Every TLS client this crate builds takes its trust config from here: the
 # platform root store is loaded once per process, never inside a task's poll.
 cairn-tls = { path = "../cairn-tls" }

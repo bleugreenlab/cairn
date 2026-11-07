@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use crate::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 
 /// How long a `run` call stays synchronous. A batch that settles inside this
 /// window returns from the original call; past it the call suspends durably and

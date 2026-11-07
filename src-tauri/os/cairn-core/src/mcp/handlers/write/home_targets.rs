@@ -24,7 +24,7 @@ use super::types::AppliedChange;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::resources::mutations::{is_home_relative_target, resolve_change_target_against_home};
-use cairn_common::uri::{canonicalize_uri_identity, parse_uri, CairnResource};
+use cairn_uri::{canonicalize_uri_identity, parse_uri, CairnResource};
 
 /// A rename of the run's own thread, sitting earlier in the same batch.
 #[derive(Clone)]

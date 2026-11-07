@@ -80,10 +80,8 @@ impl ServiceOwner {
     /// owning thread. A scheduled call's `actingFor`.
     pub(crate) fn acting_home(&self, project_key: &str) -> String {
         match self {
-            ServiceOwner::Project => cairn_common::uri::build_project_uri(project_key),
-            ServiceOwner::Thread { name, .. } => {
-                cairn_common::uri::build_thread_uri(project_key, name)
-            }
+            ServiceOwner::Project => cairn_uri::build_project_uri(project_key),
+            ServiceOwner::Thread { name, .. } => cairn_uri::build_thread_uri(project_key, name),
             ServiceOwner::Pack { machine, .. } => executor_uri(machine),
         }
     }
@@ -91,11 +89,9 @@ impl ServiceOwner {
     /// The service's home, which is also its resource.
     pub(crate) fn home(&self, project_key: &str, service: &str) -> String {
         match self {
-            ServiceOwner::Project => {
-                cairn_common::uri::build_project_service_uri(project_key, service)
-            }
+            ServiceOwner::Project => cairn_uri::build_project_service_uri(project_key, service),
             ServiceOwner::Thread { name, .. } => {
-                cairn_common::uri::build_thread_service_uri(project_key, name, service)
+                cairn_uri::build_thread_service_uri(project_key, name, service)
             }
             ServiceOwner::Pack { machine, .. } => executor_uri(machine),
         }
@@ -205,7 +201,7 @@ pub(crate) const CONFINEMENT_NOTE: &str = "Confinement: the process runs under t
 
 /// The project id for a project key.
 pub(crate) async fn project_id_for_key(orch: &Orchestrator, key: &str) -> Result<String, String> {
-    let key = cairn_common::uri::canonical_project(key);
+    let key = cairn_uri::canonical_project(key);
     orch.db
         .local
         .query_text(

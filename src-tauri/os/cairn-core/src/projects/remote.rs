@@ -255,7 +255,7 @@ mod tests {
             &CreateProject {
                 id: Some(id.to_string()),
                 name: id.to_string(),
-                key: cairn_common::uri::canonical_project(id.chars().take(8).collect::<String>()),
+                key: cairn_uri::canonical_project(id.chars().take(8).collect::<String>()),
                 repo_path: repo_path.to_string(),
                 team_id: None,
             },

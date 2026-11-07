@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use cairn_common::protocol::{RowWriteInstrument, RowWriteOrigin};
-use cairn_common::uri::{canonical_project, parse_uri, CairnResource};
+use cairn_uri::{canonical_project, parse_uri, CairnResource};
 use serde_json::{json, Value};
 
 use crate::mcp::types::McpCallbackRequest;
@@ -94,8 +94,8 @@ async fn gate_read(orch: &Orchestrator, project_id: &str, target: &str) -> Resul
         ));
     }
     let identity = target.split(['?', '#']).next().unwrap_or_default();
-    let resource = parse_uri(identity)
-        .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok());
+    let resource =
+        parse_uri(identity).and_then(|parsed| cairn_uri::delegate_thread_descendant(parsed).ok());
     match resource {
         Some(
             CairnResource::ThreadDb { project, .. }
@@ -208,7 +208,7 @@ fn gate_write(changes: &[Value]) -> Result<(Vec<GatedChange>, WriteThread), Vec<
             {
                 refusals.push(format!(
                     "{target}: one browser write touches one thread's rows; this batch began in {}",
-                    cairn_common::uri::build_thread_uri(&first.project, &first.name)
+                    cairn_uri::build_thread_uri(&first.project, &first.name)
                 ));
                 continue;
             }
@@ -275,7 +275,7 @@ pub async fn write_db_rows(
     let origin = RowWriteOrigin {
         instrument: RowWriteInstrument::DbBrowser,
         owner_thread_id,
-        owner: cairn_common::uri::build_thread_uri(&thread.project, &thread.name),
+        owner: cairn_uri::build_thread_uri(&thread.project, &thread.name),
         project_id: project_id.to_string(),
         actor: operator.actor.clone(),
         appearance: operator.appearance.clone(),

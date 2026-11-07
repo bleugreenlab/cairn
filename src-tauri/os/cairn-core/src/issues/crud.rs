@@ -335,8 +335,8 @@ pub(crate) async fn resolve_parent_edge(
     project_id: &str,
     parent_uri: &str,
 ) -> DbResult<ParentEdge> {
-    let resolved_issue = match cairn_common::uri::parse_uri(parent_uri) {
-        Some(cairn_common::uri::CairnResource::Issue { .. }) => {
+    let resolved_issue = match cairn_uri::parse_uri(parent_uri) {
+        Some(cairn_uri::CairnResource::Issue { .. }) => {
             relations::resolve_issue_uri(conn, parent_uri).await?
         }
         _ => None,
@@ -853,7 +853,7 @@ pub async fn resolve(
                 )
                 .await?;
             let issue_uri = match subject.next().await? {
-                Some(row) => Some(cairn_common::uri::build_issue_uri(
+                Some(row) => Some(cairn_uri::build_issue_uri(
                     &row.text(0)?,
                     row.i64(1)? as i32,
                 )),

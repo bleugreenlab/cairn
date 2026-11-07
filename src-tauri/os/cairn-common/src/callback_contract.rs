@@ -64,8 +64,8 @@ use crate::protocol::CallbackRequest;
 use crate::run_contract::{
     declared_need_of_payload, is_control_flow_batch, RUN_BATCH_CEILING_MS, RUN_GRACE_WINDOW_MS,
 };
-use crate::uri::{parse_uri, CairnResource};
 use crate::write_contract::{WRITE_CHECK_INLINE_WAIT_MS, WRITE_STORE_LOCK_WAIT_MS};
+use cairn_uri::{parse_uri, CairnResource};
 
 /// How long the host waits inline for a permission answer, a question answer,
 /// or a spawned task before durably suspending the run (no auto-deny): long

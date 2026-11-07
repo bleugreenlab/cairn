@@ -21,9 +21,9 @@ use super::super::{
 use crate::mcp::types::{ChangeItem, McpCallbackRequest};
 use crate::orchestrator::usage_refresh::{UsageMeasurement, UsageRefresh, UsageRefreshTarget};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
 use cairn_models::accounts::RoutedProvider;
 use cairn_models::subscription::{SignInStart, SignInTarget, SubmitCodeResult};
+use cairn_uri::CairnResource;
 
 fn provider_name(provider: RoutedProvider) -> &'static str {
     match provider {

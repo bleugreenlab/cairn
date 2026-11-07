@@ -684,7 +684,7 @@ struct ProjectRow {
 }
 
 async fn load_project(db: &LocalDb, project_key: &str) -> Result<ProjectRow, String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let (project, _) = short_read(db, move |conn| {
         Box::pin(async move {
             let mut rows = conn
@@ -764,7 +764,7 @@ async fn export_project_paged(
             .map_err(|error| format!("materializing owner ids: {error}"))?,
         None => OwnerIds::SameDatabase,
     };
-    let canonical_key = cairn_common::uri::canonical_project(&project.key);
+    let canonical_key = cairn_uri::canonical_project(&project.key);
 
     let mut databases = vec![describe(&private_db, "private").await?];
     if team.is_some() {

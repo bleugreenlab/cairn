@@ -193,7 +193,8 @@ async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
 /// enforcing constant, so moving the cap moves all of them or fails here.
 #[test]
 fn the_statement_cap_reads_as_one_number_wherever_it_is_stated() {
-    use cairn_common::contract::{mutation_spec, ChangeMode, ResourceKind};
+    use cairn_common::contract::{mutation_spec, ChangeMode};
+    use cairn_uri::ResourceKind;
 
     let cap = format!("at most {MAX_STATEMENT_CHARS} characters");
     let note = mutation_spec(ResourceKind::ProjectTenets, ChangeMode::Append)

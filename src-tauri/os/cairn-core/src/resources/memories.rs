@@ -2,7 +2,7 @@
 
 use crate::models::Memory;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::build_node_memory_uri;
+use cairn_uri::build_node_memory_uri;
 
 fn memory_label<'a>(memory: &'a Memory, uri: &'a str) -> &'a str {
     memory

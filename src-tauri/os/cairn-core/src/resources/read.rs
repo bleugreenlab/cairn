@@ -51,8 +51,8 @@ use crate::orchestrator::Orchestrator;
 use base64::Engine;
 use cairn_common::query::{split_target_query, QueryParam};
 use cairn_common::read::{Affordance, ImageBlock, NaturalUnit, SegmentKind};
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::turso::Value;
+use cairn_uri::{parse_uri, CairnResource};
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -668,7 +668,7 @@ async fn produce_db_rows_resource(
     match resource {
         CairnResource::ThreadDbTable { project, name, .. }
         | CairnResource::ThreadDbRow { project, name, .. } => {
-            let root = format!("{}/db", cairn_common::uri::build_thread_uri(project, name));
+            let root = format!("{}/db", cairn_uri::build_thread_uri(project, name));
             let db = match open_thread_store(orch, project, name).await {
                 Ok(Some(db)) => db,
                 Ok(None) => {
@@ -1296,7 +1296,7 @@ pub(crate) async fn produce_cairn_resource(
     // drifting from the write path's copy. This is the same call the write
     // dispatcher makes, so the two can no longer disagree about what a thread
     // sub-path means.
-    let resource = match super::delegate_thread_descendant(resource) {
+    let resource = match cairn_uri::delegate_thread_descendant(resource) {
         Ok(resource) => resource,
         Err(refusal) => return RenderedResource::line(refusal, None, None, None),
     };
@@ -1943,7 +1943,7 @@ fn image_resource(
 async fn render_attachment_body(
     db: &LocalDb,
     project: &str,
-    reference: &cairn_common::uri::AttachmentRef,
+    reference: &cairn_uri::AttachmentRef,
 ) -> String {
     let project_id = match crate::mcp::handlers::run_context::project_id_by_key(db, project).await {
         Ok(id) => id,
@@ -1954,7 +1954,7 @@ async fn render_attachment_body(
             Ok(fetched) => fetched,
             Err(error) => return error.to_string(),
         };
-    let uri = cairn_common::uri::build_project_attachment_uri(project, reference);
+    let uri = cairn_uri::build_project_attachment_uri(project, reference);
     let size = fetched.bytes.len();
 
     if fetched.media_type == "application/pdf" {
@@ -3879,7 +3879,7 @@ async fn web_search_body(orch: &Orchestrator, params: &[QueryParam]) -> Result<S
 /// (`cairn://help?kind=<slug>`) re-renders a collapsed block on demand.
 fn render_help(params: &[QueryParam]) -> String {
     match find_query_value(params, "kind") {
-        Some(slug) => match cairn_common::contract::ResourceKind::from_slug(slug) {
+        Some(slug) => match cairn_uri::ResourceKind::from_slug(slug) {
             Some(kind) => affordance_for_kind(kind),
             None => format!(
                 "Unknown resource-kind slug '{slug}' for cairn://help?kind=. Expected a kebab-case resource-kind slug such as `issue`, `node`, or `node-artifact`."

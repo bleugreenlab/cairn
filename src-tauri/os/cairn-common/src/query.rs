@@ -14,6 +14,7 @@
 //! a literal `&` immediately before a key token is `%26`.
 
 use crate::contract::RESOURCE_CONTRACTS;
+use cairn_uri::percent::{decode_component, encode_component};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryParam {
@@ -145,13 +146,13 @@ pub fn parse_query_params(query: &str) -> Result<Vec<QueryParam>, String> {
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
             let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = decode_query_component(raw_key)?;
+            let key = decode_component(raw_key)?;
             // Free-text payloads (sql/q) are taken verbatim so a literal `%`
             // survives; every other value is percent-decoded as usual.
             let value = if RAW_VALUE_KEYS.contains(&key.as_str()) {
                 raw_value.to_string()
             } else {
-                decode_query_component(raw_value)?
+                decode_component(raw_value)?
             };
             Ok(QueryParam { key, value })
         })
@@ -165,64 +166,12 @@ pub fn encode_query_params(params: &[QueryParam]) -> String {
             let value = if RAW_VALUE_KEYS.contains(&param.key.as_str()) {
                 param.value.clone()
             } else {
-                encode_query_component(&param.value)
+                encode_component(&param.value)
             };
-            format!("{}={value}", encode_query_component(&param.key))
+            format!("{}={value}", encode_component(&param.key))
         })
         .collect::<Vec<_>>()
         .join("&")
-}
-
-pub(crate) fn encode_query_component(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-pub(crate) fn decode_query_component(value: &str) -> Result<String, String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' => {
-                if index + 2 >= bytes.len() {
-                    return Err(format!(
-                        "Invalid percent escape in query component: {value}"
-                    ));
-                }
-                let hi = decode_hex(bytes[index + 1])
-                    .ok_or_else(|| format!("Invalid percent escape in query component: {value}"))?;
-                let lo = decode_hex(bytes[index + 2])
-                    .ok_or_else(|| format!("Invalid percent escape in query component: {value}"))?;
-                decoded.push((hi << 4) | lo);
-                index += 3;
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-
-    String::from_utf8(decoded).map_err(|_| format!("Query component is not valid UTF-8: {value}"))
-}
-
-fn decode_hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

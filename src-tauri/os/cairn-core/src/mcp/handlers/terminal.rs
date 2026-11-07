@@ -15,8 +15,8 @@ use cairn_common::executor_protocol::{
     RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
 };
 use cairn_common::ids;
-use cairn_common::uri::CairnResource;
 use cairn_db::turso::params;
+use cairn_uri::CairnResource;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::{atomic::Ordering, Arc, Mutex};
@@ -73,7 +73,7 @@ pub(crate) async fn reconcile_exited_terminal_wakes(orch: &Orchestrator) -> Resu
 
     let mut routed = 0;
     for uri in uris {
-        let Some(resource) = cairn_common::uri::parse_uri(&uri) else {
+        let Some(resource) = cairn_uri::parse_uri(&uri) else {
             continue;
         };
         let slug = match &resource {
@@ -1025,13 +1025,13 @@ pub(crate) async fn terminal_resource_for_job(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("Job not found: {job_id}"))?;
     let uri = format!("{home}/terminal/{slug}");
-    let resource = cairn_common::uri::parse_uri(&uri)
+    let resource = cairn_uri::parse_uri(&uri)
         .ok_or_else(|| format!("Job {job_id} has no addressable terminal at {uri}"))?;
     // A thread's home URI parses as a `Thread` with a `terminal/<slug>` path;
     // delegation turns it into the node-family resource the rest of the terminal
     // stack answers for. Every other owner is already node-family and passes
     // through untouched.
-    crate::resources::delegate_thread_descendant(resource)
+    cairn_uri::delegate_thread_descendant(resource)
 }
 
 pub(crate) async fn terminal_resource_for_project(
@@ -1430,9 +1430,9 @@ pub struct AgentTerminalCreatedPayload {
 /// the honest answer is to omit them rather than let a `0` placeholder travel
 /// out to the executor and the UI as if it named issue zero.
 fn owner_issue_coordinate(number: i32, exec_seq: i32, node_id: &str) -> (Option<i32>, Option<i32>) {
-    match cairn_common::uri::NodeAddress::new(number, exec_seq, node_id) {
-        cairn_common::uri::NodeAddress::Thread { .. } => (None, None),
-        cairn_common::uri::NodeAddress::Node { .. } => (Some(number), Some(exec_seq)),
+    match cairn_uri::NodeAddress::new(number, exec_seq, node_id) {
+        cairn_uri::NodeAddress::Thread { .. } => (None, None),
+        cairn_uri::NodeAddress::Node { .. } => (Some(number), Some(exec_seq)),
     }
 }
 
@@ -1475,7 +1475,7 @@ async fn resolve_terminal_resource_target(
                     node_id,
                     slug,
                 } => {
-                    let address = cairn_common::uri::build_node_terminal_uri(
+                    let address = cairn_uri::build_node_terminal_uri(
                         &project, number, exec_seq, &node_id, &slug,
                     );
                     let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
@@ -1541,7 +1541,7 @@ async fn resolve_terminal_resource_target(
                     task_name,
                     slug,
                 } => {
-                    let address = cairn_common::uri::build_task_terminal_uri(
+                    let address = cairn_uri::build_task_terminal_uri(
                         &project, number, exec_seq, &node_id, &task_name, &slug,
                     );
                     let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
@@ -1602,7 +1602,7 @@ async fn resolve_terminal_resource_target(
                     })
                 }
                 CairnResource::ProjectTerminal { project, slug } => {
-                    let lookup_key = cairn_common::uri::canonical_project(&project);
+                    let lookup_key = cairn_uri::canonical_project(&project);
                     let mut rows = conn
                         .query(
                             "SELECT id, repo_path FROM projects WHERE key = ?1 LIMIT 1",
@@ -3776,8 +3776,8 @@ mod terminal_finalize_tests {
             .await
             .unwrap();
 
-        let resource = cairn_common::uri::parse_uri("cairn://p/thr/thread-ux/terminal/smoke")
-            .and_then(|resource| crate::resources::delegate_thread_descendant(resource).ok())
+        let resource = cairn_uri::parse_uri("cairn://p/thr/thread-ux/terminal/smoke")
+            .and_then(|resource| cairn_uri::delegate_thread_descendant(resource).ok())
             .expect("a thread terminal path normalizes");
         assert!(matches!(resource, CairnResource::NodeTerminal { .. }));
 
@@ -3817,8 +3817,8 @@ mod terminal_finalize_tests {
         )
         .await
         .unwrap();
-        let resource = cairn_common::uri::parse_uri("cairn://p/thr/thread-ux/terminal/smoke")
-            .and_then(|resource| crate::resources::delegate_thread_descendant(resource).ok())
+        let resource = cairn_uri::parse_uri("cairn://p/thr/thread-ux/terminal/smoke")
+            .and_then(|resource| cairn_uri::delegate_thread_descendant(resource).ok())
             .unwrap();
         let error = resolve_terminal_resource_target(&db, &resource)
             .await
@@ -4348,7 +4348,7 @@ mod terminal_finalize_tests {
     }
 
     fn node_uri() -> String {
-        cairn_common::uri::build_node_terminal_uri("p", 7, 2, "builder", "run-1")
+        cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "run-1")
     }
 
     #[derive(Clone, Copy)]
@@ -6523,7 +6523,7 @@ mod terminal_finalize_tests {
         block_on(seed_live_turn(&orch.db.local));
 
         let uri = node_uri();
-        let resource = cairn_common::uri::parse_uri(&uri).unwrap();
+        let resource = cairn_uri::parse_uri(&uri).unwrap();
         let target = block_on(resolve_terminal_resource_target(&orch.db.local, &resource)).unwrap();
         block_on(orch.db.local.execute(
             "UPDATE job_terminals SET status='recovering' WHERE session_id='s1'",
@@ -7068,7 +7068,7 @@ mod terminal_finalize_tests {
                 turn_id: "turn-1".into(),
                 tool_use_id: "tool-1".into(),
                 condition: crate::mcp::handlers::durable_suspend::Condition::Terminal {
-                    uri: cairn_common::uri::build_node_terminal_uri("p", 7, 2, "builder", "tests"),
+                    uri: cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "tests"),
                     slug: "tests".into(),
                     owner: None,
                     on: crate::mcp::handlers::run::TerminalWaitEvent::Exit,

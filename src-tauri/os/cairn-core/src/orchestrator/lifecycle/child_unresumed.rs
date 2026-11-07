@@ -206,9 +206,7 @@ impl UnresumedChild {
 /// The push key of one child node. Canonical, because the store canonicalizes
 /// the keys it writes and the withdrawal below compares against what it stored.
 fn unresumed_push_key(node_uri: &str) -> String {
-    cairn_common::uri::canonicalize_uri_identity(&format!(
-        "{CHILD_UNRESUMED_PUSH_PREFIX}:{node_uri}"
-    ))
+    cairn_uri::canonicalize_uri_identity(&format!("{CHILD_UNRESUMED_PUSH_PREFIX}:{node_uri}"))
 }
 
 /// Every node of a child issue that is not over and could hold a stranded turn.
@@ -409,13 +407,8 @@ pub(crate) async fn unresumed_children(
                 job_id: row.text(0)?,
                 job_status: row.text(1)?,
                 issue_id: row.text(2)?,
-                issue_uri: cairn_common::uri::build_issue_uri(&project_key, number),
-                node_uri: cairn_common::uri::build_node_uri(
-                    &project_key,
-                    number,
-                    exec_seq,
-                    &segment,
-                ),
+                issue_uri: cairn_uri::build_issue_uri(&project_key, number),
+                node_uri: cairn_uri::build_node_uri(&project_key, number, exec_seq, &segment),
             })
         })
         .await
@@ -599,10 +592,10 @@ pub(crate) async fn render_unresumed_push_body(
     let standing = unresumed_children(&db, &orch.claimed_launch_job_ids())
         .await
         .ok()?;
-    let node_uri = cairn_common::uri::canonicalize_uri_identity(node_uri);
+    let node_uri = cairn_uri::canonicalize_uri_identity(node_uri);
     match standing
         .into_iter()
-        .find(|child| cairn_common::uri::canonicalize_uri_identity(&child.node_uri) == node_uri)
+        .find(|child| cairn_uri::canonicalize_uri_identity(&child.node_uri) == node_uri)
     {
         Some(child) => Some(child.render(now)),
         None => Some(format!(

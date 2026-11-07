@@ -1,7 +1,7 @@
 //! Label resource reads.
 
-use cairn_common::uri::build_label_uri;
 use cairn_db::turso::params;
+use cairn_uri::build_label_uri;
 
 use super::common::{read_resource, storage_error};
 use crate::labels::crud::{get_label_conn, list_labels_conn, DEFAULT_WORKSPACE_ID};

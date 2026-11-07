@@ -289,7 +289,7 @@ const RUN_LESS_TOOLS: &[&str] = &[
 /// options as null (or `false`), so those count as absent.
 fn lone_append(
     request: &crate::mcp::types::McpCallbackRequest,
-) -> Option<(cairn_common::uri::CairnResource, &serde_json::Value)> {
+) -> Option<(cairn_uri::CairnResource, &serde_json::Value)> {
     if request.tool != "write" {
         return None;
     }
@@ -315,14 +315,14 @@ fn lone_append(
     {
         return None;
     }
-    let target = cairn_common::uri::parse_uri(change.get("target")?.as_str()?)?;
+    let target = cairn_uri::parse_uri(change.get("target")?.as_str()?)?;
     Some((target, change.get("payload")?))
 }
 
 /// `request`'s target, when it is one append of `{content}` and nothing else.
 pub(crate) fn lone_content_append(
     request: &crate::mcp::types::McpCallbackRequest,
-) -> Option<cairn_common::uri::CairnResource> {
+) -> Option<cairn_uri::CairnResource> {
     let (target, payload) = lone_append(request)?;
     let payload = payload.as_object()?;
     (payload.len() == 1 && payload.get("content").is_some_and(|c| c.is_string())).then_some(target)
@@ -330,8 +330,8 @@ pub(crate) fn lone_content_append(
 
 /// A thread's, an issue's, a node's or a task's `/messages` collection. Exact, so
 /// a table a thread's database happens to name `messages` is not one.
-fn is_message_collection(target: &cairn_common::uri::CairnResource) -> bool {
-    use cairn_common::uri::CairnResource as R;
+fn is_message_collection(target: &cairn_uri::CairnResource) -> bool {
+    use cairn_uri::CairnResource as R;
     match target {
         R::IssueMessages { .. } | R::NodeMessages { .. } | R::TaskMessages { .. } => true,
         R::Thread { path, .. } => matches!(
@@ -400,7 +400,7 @@ pub fn hold_to_run_less_process(
 ) -> Result<(), String> {
     hold_run_less(request, "this process", |request| {
         lone_append(request).is_some_and(|(target, payload)| {
-            matches!(target, cairn_common::uri::CairnResource::DevLaunchTicket)
+            matches!(target, cairn_uri::CairnResource::DevLaunchTicket)
                 && payload
                     .as_object()
                     .is_some_and(|payload| payload.is_empty())

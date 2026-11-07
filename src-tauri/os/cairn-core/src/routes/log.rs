@@ -154,7 +154,7 @@ pub async fn mint(orch: &Orchestrator, mint: Mint<'_>) -> Result<Option<i64>, St
         .map_err(|error| error.to_string())?;
     let new = NewFact {
         project_id: mint.project_id.map(str::to_owned),
-        identity: cairn_common::uri::canonicalize_uri_identity(&mint.fact.identity),
+        identity: cairn_uri::canonicalize_uri_identity(&mint.fact.identity),
         source: mint.fact.source,
         record_ref: mint.record_ref,
         record_id: mint.record_id,

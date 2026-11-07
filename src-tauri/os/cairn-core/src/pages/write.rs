@@ -33,7 +33,7 @@
 
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
 use cairn_common::protocol::{RowWriteInstrument, RowWriteOrigin};
-use cairn_common::uri::canonical_project;
+use cairn_uri::canonical_project;
 use serde_json::{json, Value};
 
 use super::data::{write_scope_table, write_scopes};

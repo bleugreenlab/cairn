@@ -1,8 +1,7 @@
 //! Persisted fleet policy and executor declarations; no running fleet.
-use cairn_common::executor_protocol::{
-    normalize_executor_name, EXECUTOR_NAME_RULE, LOCAL_EXECUTOR_NAME,
-};
 pub use cairn_common::executor_protocol::{MachineRole, PlacementWorkClass};
+use cairn_common::executor_protocol::{EXECUTOR_NAME_RULE, LOCAL_EXECUTOR_NAME};
+use cairn_uri::normalize_executor_name;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub const COLOCATED_EXECUTOR_ID: &str = "colocated";

@@ -284,8 +284,8 @@ pub(crate) async fn route_pass(
 /// The canonical URI of one fact log row.
 pub(crate) fn fact_row_uri(project_key: Option<&str>, id: i64) -> String {
     match project_key {
-        Some(project) => cairn_common::uri::build_project_event_uri(project, id),
-        None => cairn_common::uri::build_workspace_event_uri(id),
+        Some(project) => cairn_uri::build_project_event_uri(project, id),
+        None => cairn_uri::build_workspace_event_uri(id),
     }
 }
 
@@ -706,12 +706,9 @@ async fn wake_header(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
         None => None,
     };
     let (events, scope) = match project.as_deref() {
-        Some(key) => (
-            cairn_common::uri::build_project_events_uri(key),
-            key.to_string(),
-        ),
+        Some(key) => (cairn_uri::build_project_events_uri(key), key.to_string()),
         None => (
-            cairn_common::uri::build_workspace_events_uri(),
+            cairn_uri::build_workspace_events_uri(),
             "the workspace".to_string(),
         ),
     };

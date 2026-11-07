@@ -8,7 +8,7 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::models::{MemoryScope, MemoryStatus, MemoryTriageDecision};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
-use cairn_common::uri::build_node_memory_uri;
+use cairn_uri::build_node_memory_uri;
 
 use super::PromotedMemoryRef;
 

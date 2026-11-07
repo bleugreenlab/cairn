@@ -299,7 +299,7 @@ async fn pending_node_detail_uri(
             detail.agent_config_id.as_deref() == Some("workflow"),
             detail.parent_segment,
         ) {
-            (false, Some(parent)) => cairn_common::uri::build_job_base_uri(
+            (false, Some(parent)) => cairn_uri::build_job_base_uri(
                 &project_key,
                 number,
                 detail.exec_seq as i32,
@@ -341,7 +341,7 @@ async fn pending_question_uri(
                          LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                          WHERE r.issue_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL
                          ORDER BY p.created_at DESC LIMIT 1",
-        cairn_common::uri::build_node_question_uri,
+        cairn_uri::build_node_question_uri,
     )
     .await
 }
@@ -399,7 +399,7 @@ async fn pending_permission_uri(
 
     resolved.map(
         |(seq, node, parent_segment, segment)| match parent_segment {
-            Some(parent) => cairn_common::uri::build_task_permission_uri(
+            Some(parent) => cairn_uri::build_task_permission_uri(
                 &project_key,
                 number,
                 seq as i32,
@@ -407,7 +407,7 @@ async fn pending_permission_uri(
                 &node,
                 &segment,
             ),
-            None => cairn_common::uri::build_node_permission_uri(
+            None => cairn_uri::build_node_permission_uri(
                 &project_key,
                 number,
                 seq as i32,
@@ -560,10 +560,10 @@ async fn blocked_node_artifact_uri(
     resolved.map(|owner| match owner {
         // Bare node URI — the pr action node has no artifact name.
         BlockedOwner::Action { seq, segment } => {
-            cairn_common::uri::build_node_uri(&project_key, number, seq as i32, &segment)
+            cairn_uri::build_node_uri(&project_key, number, seq as i32, &segment)
         }
         BlockedOwner::Condition { seq } => {
-            cairn_common::uri::build_issue_execution_uri(&project_key, number, seq as i32)
+            cairn_uri::build_issue_execution_uri(&project_key, number, seq as i32)
         }
         BlockedOwner::Job {
             seq,
@@ -574,7 +574,7 @@ async fn blocked_node_artifact_uri(
             // A blocked sub-agent task nests under its parent node so the URI
             // resolves (issue #143); a top-level node uses the flat node URI.
             match parent_segment {
-                Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                Some(parent) => cairn_uri::build_task_artifact_uri_named(
                     &project_key,
                     number,
                     seq as i32,
@@ -582,7 +582,7 @@ async fn blocked_node_artifact_uri(
                     &segment,
                     output_name.as_deref(),
                 ),
-                None => cairn_common::uri::build_node_artifact_uri_named(
+                None => cairn_uri::build_node_artifact_uri_named(
                     &project_key,
                     number,
                     seq as i32,
@@ -669,7 +669,7 @@ async fn open_pr_work_for_issue(
     resolved.map(
         |(seq, node, parent_segment, output_name, updated_at)| OpenPrWork {
             detail_uri: match parent_segment {
-                Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                Some(parent) => cairn_uri::build_task_artifact_uri_named(
                     project_key,
                     number,
                     seq as i32,
@@ -677,7 +677,7 @@ async fn open_pr_work_for_issue(
                     &node,
                     output_name.as_deref(),
                 ),
-                None => cairn_common::uri::build_node_artifact_uri_named(
+                None => cairn_uri::build_node_artifact_uri_named(
                     project_key,
                     number,
                     seq as i32,
@@ -843,7 +843,7 @@ pub struct IssueAttentionContext {
 
 impl IssueAttentionContext {
     pub fn issue_uri(&self) -> String {
-        cairn_common::uri::build_issue_uri(&self.project_key, self.number)
+        cairn_uri::build_issue_uri(&self.project_key, self.number)
     }
 }
 
@@ -854,7 +854,7 @@ pub async fn lookup_issue_for_attention_by_key(
     project_key: &str,
     number: i32,
 ) -> Result<(String, IssueAttentionContext), String> {
-    let project_key = cairn_common::uri::canonical_project(project_key);
+    let project_key = cairn_uri::canonical_project(project_key);
     db.read(|conn| {
         let project_key = project_key.clone();
         Box::pin(async move {

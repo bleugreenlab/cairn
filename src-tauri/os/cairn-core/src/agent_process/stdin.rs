@@ -8,13 +8,12 @@ pub(crate) async fn resolve_stable_images(
     let text = text.into();
     let mut seen = std::collections::HashSet::new();
     let mut images = Vec::new();
-    for found in cairn_common::uri::scan_markdown_stored_images(&text) {
+    for found in cairn_uri::scan_markdown_stored_images(&text) {
         let uri = found.uri;
         if !seen.insert(uri.clone()) {
             continue;
         }
-        let cairn_common::uri::CairnResource::ProjectImage { project, reference } = found.resource
-        else {
+        let cairn_uri::CairnResource::ProjectImage { project, reference } = found.resource else {
             continue;
         };
         if !project.eq_ignore_ascii_case(authorized_project_key) {

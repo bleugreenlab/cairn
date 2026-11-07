@@ -8,6 +8,7 @@ description = "Durable agent attention, wake subscriptions and delivery policy"
 [dependencies]
 async-trait = "0.1"
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 cairn-db = { path = "../cairn-db" }
 cairn-domain = { path = "../cairn-domain" }
 cairn-platform = { path = "../cairn-platform" }

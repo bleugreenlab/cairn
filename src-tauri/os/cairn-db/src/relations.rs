@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::turso::params;
-use cairn_common::uri::{build_issue_uri, parse_uri, CairnResource};
+use cairn_uri::{build_issue_uri, parse_uri, CairnResource};
 
 use crate::models::IssueStatus;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -57,7 +57,7 @@ pub async fn resolve_issue_uri(
     let Some(CairnResource::Issue { project, number }) = parse_uri(&canonical) else {
         return Ok(None);
     };
-    let project_key = cairn_common::uri::canonical_project(project);
+    let project_key = cairn_uri::canonical_project(project);
     let mut rows = conn
         .query(
             "
@@ -116,7 +116,7 @@ pub async fn issue_id_for_project_number(
     project_key: &str,
     number: i32,
 ) -> DbResult<Option<String>> {
-    let project_key = cairn_common::uri::canonical_project(project_key);
+    let project_key = cairn_uri::canonical_project(project_key);
     db.read(|conn| {
         let project_key = project_key.clone();
         Box::pin(async move {

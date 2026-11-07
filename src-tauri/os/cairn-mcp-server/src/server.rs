@@ -27,7 +27,7 @@ use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
 use cairn_common::protocol::{stamp_callback_origin, CallbackRequest, MODEL_FACING_ORIGIN};
 use cairn_common::read::{ReadBatchEnvelope, RunBatchEnvelope};
-use cairn_common::uri::{parse_uri as parse_cairn_uri, CairnResource};
+use cairn_uri::{parse_uri as parse_cairn_uri, CairnResource};
 
 use crate::heartbeat::{with_heartbeat, HEARTBEAT_INTERVAL};
 use crate::output::{

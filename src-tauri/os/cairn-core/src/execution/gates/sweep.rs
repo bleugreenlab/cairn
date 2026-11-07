@@ -1435,7 +1435,7 @@ async fn foreclosure_message(
             .and_then(serde_json::Value::as_str)
             .map(super::vocabulary::parse_tenet_uri)
         {
-            Some(Ok((project, _))) => cairn_common::uri::build_project_tenets_uri(&project),
+            Some(Ok((project, _))) => cairn_uri::build_project_tenets_uri(&project),
             _ => "cairn://p/PROJECT/tenets".to_string(),
         };
         let mut regated = clause.clone();

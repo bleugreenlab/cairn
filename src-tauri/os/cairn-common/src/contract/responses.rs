@@ -1,5 +1,6 @@
 use super::specs::{DELETE_REASON, DESCRIPTION, NO_CROSS_ACTIONS, NO_PROJECTIONS, NO_RELATED};
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const NAME: KeySpec = KeySpec::new(
     "name",

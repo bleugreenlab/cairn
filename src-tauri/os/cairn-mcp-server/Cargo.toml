@@ -26,6 +26,7 @@ tracing = "0.1"
 # Progress heartbeats on held-open tool calls (src/heartbeat.rs).
 tokio = { version = "1", features = ["time", "macros"] }
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 
 [dev-dependencies]
 rmcp = { version = "3", features = [

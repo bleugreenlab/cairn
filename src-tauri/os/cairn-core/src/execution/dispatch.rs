@@ -117,7 +117,7 @@ fn process_job_ended(
 
     // Build transcript URI
     let transcript_uri = match (&context.issue_number, &context.exec_seq, &context.node_name) {
-        (Some(num), Some(seq), Some(name)) => Some(cairn_common::uri::build_node_chat_uri(
+        (Some(num), Some(seq), Some(name)) => Some(cairn_uri::build_node_chat_uri(
             &context.project_key,
             *num,
             *seq,
@@ -249,12 +249,9 @@ fn process_skill_called(
 
     // Build transcript URI
     let transcript_uri = match (issue_number, exec_seq, &node_name) {
-        (Some(num), Some(seq), Some(name)) => Some(cairn_common::uri::build_node_chat_uri(
-            project_key,
-            num,
-            seq,
-            name,
-        )),
+        (Some(num), Some(seq), Some(name)) => {
+            Some(cairn_uri::build_node_chat_uri(project_key, num, seq, name))
+        }
         _ => None,
     };
 

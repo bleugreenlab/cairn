@@ -2082,8 +2082,8 @@ mod tests {
         );
         let dbs = Arc::new(crate::db::DbState::new(local, index));
         let services = Arc::new(crate::services::testing::TestServicesBuilder::new().build());
-        let orch =
-            crate::orchestrator::OrchestratorBuilder::new(dbs, services, config_dir.clone()).build();
+        let orch = crate::orchestrator::OrchestratorBuilder::new(dbs, services, config_dir.clone())
+            .build();
 
         let snapshot_of = |reference: &str| {
             let recipe = get_selected_recipe(&config_dir, &project_dir, "p", reference)?;
@@ -2101,7 +2101,10 @@ mod tests {
         // The workspace's recipe stands in front of the pack's.
         assert_eq!(snapshot_of("build").unwrap().recipe.name, "My Build");
         assert_eq!(
-            snapshot_of("cairn://packs/core/recipes/build").unwrap().recipe.name,
+            snapshot_of("cairn://packs/core/recipes/build")
+                .unwrap()
+                .recipe
+                .name,
             "Core Build"
         );
 
@@ -2116,11 +2119,17 @@ mod tests {
         );
         assert!(snapshot_of("build").is_err());
         assert_eq!(
-            snapshot_of("cairn://packs/core/recipes/build").unwrap().recipe.name,
+            snapshot_of("cairn://packs/core/recipes/build")
+                .unwrap()
+                .recipe
+                .name,
             "Core Build"
         );
         assert_eq!(
-            snapshot_of("cairn://packs/extra/recipes/build").unwrap().recipe.name,
+            snapshot_of("cairn://packs/extra/recipes/build")
+                .unwrap()
+                .recipe
+                .name,
             "Extra Build"
         );
     }

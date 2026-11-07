@@ -90,7 +90,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use cairn_common::uri::{build_node_checks_uri, build_task_checks_uri};
+use cairn_uri::{build_node_checks_uri, build_task_checks_uri};
 use sha2::{Digest, Sha256};
 
 use crate::execution::checks::{

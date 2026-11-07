@@ -33,13 +33,13 @@ pub fn canonicalize_uri_identity(value: &str) -> String {
 /// is escaped, so `/`, `?`, `%` and spaces can never change the address's shape.
 /// [`decode_path_segment`] is its exact inverse.
 pub fn encode_path_segment(segment: &str) -> String {
-    crate::query::encode_query_component(segment)
+    crate::percent::encode_component(segment)
 }
 
 /// Decode a segment written by [`encode_path_segment`]. A malformed escape or
 /// non-UTF-8 result is an error naming the segment.
 pub fn decode_path_segment(segment: &str) -> Result<String, String> {
-    crate::query::decode_query_component(segment)
+    crate::percent::decode_component(segment)
 }
 
 /// `{db_root}/{table}`: one table's row collection under a database root,

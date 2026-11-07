@@ -1,6 +1,7 @@
 //! Install-local operator intent; acceptance is deliberately not a resource mutation.
 use super::specs::{NO_CROSS_ACTIONS, NO_PROJECTIONS, NO_RELATED};
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 pub(crate) const REQUESTS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Requests,

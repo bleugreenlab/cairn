@@ -118,7 +118,7 @@ async fn resolve_issue_ref(
     project_key: &str,
     number: i32,
 ) -> Result<IssueRef, String> {
-    let key = cairn_common::uri::canonical_project(project_key);
+    let key = cairn_uri::canonical_project(project_key);
     let resolved = db
         .read(|conn| {
             let key = key.clone();
@@ -329,7 +329,7 @@ pub async fn handle_watch(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     };
     let since = request.payload.get("since").and_then(|v| v.as_i64());
 
-    let parsed = cairn_common::uri::parse_uri(issue_uri).and_then(|resource| {
+    let parsed = cairn_uri::parse_uri(issue_uri).and_then(|resource| {
         match (
             resource.project().map(str::to_string),
             resource.issue_number(),

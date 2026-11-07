@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use cairn_common::uri::build_pack_uri;
+use cairn_uri::build_pack_uri;
 
 use crate::config::machine_services::MachineServiceSnapshot;
 use crate::config::mcp_servers::{

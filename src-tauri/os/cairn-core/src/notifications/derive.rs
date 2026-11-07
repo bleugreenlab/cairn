@@ -13,8 +13,8 @@ use super::{
     PermissionActionRequest, ProjectRef,
 };
 use crate::storage::{DbError, LocalDb, RowExt};
-use cairn_common::uri;
 use cairn_db::turso::{params, Row};
+use cairn_uri as uri;
 
 /// The longest summary line, in characters.
 const SUMMARY_CHARS: usize = 160;

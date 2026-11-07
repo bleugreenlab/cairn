@@ -19,9 +19,9 @@
 //! on is cheap and reversible, so none of those is gated.
 
 use cairn_common::authorization::{AuthorityDecision, AuthorityRequest};
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_models::accounts::{AccountInfo, ApiProvider, RoutedProvider};
 use cairn_models::interface::{ModelScope, Models};
+use cairn_uri::{parse_uri, CairnResource};
 use serde_json::Value;
 
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};

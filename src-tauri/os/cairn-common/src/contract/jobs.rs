@@ -5,6 +5,7 @@
 
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 pub(crate) const JOB_TODOS_CONTRACT: ResourceContract =
     ResourceContract {

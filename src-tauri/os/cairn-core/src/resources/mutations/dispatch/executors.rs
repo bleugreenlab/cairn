@@ -10,7 +10,7 @@ use super::super::{build_failure, ResourceMutationResult};
 use crate::fleet::management;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// The controls a patch may carry. Deliberately narrow: a machine's host,
 /// identity, paths, tunnel, and project membership have no safe reconnect

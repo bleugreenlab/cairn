@@ -18,7 +18,7 @@ use crate::storage::{LocalDb, PostScope, RowExt};
 use cairn_common::identity::display::PrincipalAliases;
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
 use cairn_common::query::QueryParam;
-use cairn_common::uri::build_project_posts_uri;
+use cairn_uri::build_project_posts_uri;
 
 fn value<'a>(params: &'a [QueryParam], key: &str) -> Option<&'a str> {
     params

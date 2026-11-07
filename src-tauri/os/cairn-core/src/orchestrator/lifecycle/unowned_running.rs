@@ -223,7 +223,7 @@ impl UnownedJob {
 }
 
 fn unowned_push_key(node_uri: &str) -> String {
-    cairn_common::uri::canonicalize_uri_identity(&format!("{CHILD_UNOWNED_PUSH_PREFIX}:{node_uri}"))
+    cairn_uri::canonicalize_uri_identity(&format!("{CHILD_UNOWNED_PUSH_PREFIX}:{node_uri}"))
 }
 
 /// Every job that reads running on an open session of a canonical execution on
@@ -368,9 +368,9 @@ pub(crate) async fn unowned_jobs(
                 row.text(0)?,
                 row.text(1)?,
                 row.text(2)?,
-                cairn_common::uri::build_issue_uri(&project_key, number),
+                cairn_uri::build_issue_uri(&project_key, number),
                 segment.filter(|_| child).map(|segment| {
-                    cairn_common::uri::build_node_uri(&project_key, number, exec_seq, &segment)
+                    cairn_uri::build_node_uri(&project_key, number, exec_seq, &segment)
                 }),
             ))
         })
@@ -624,14 +624,13 @@ pub(crate) async fn render_unowned_push_body(
     )
     .await
     .ok()?;
-    let node_uri = cairn_common::uri::canonicalize_uri_identity(node_uri);
+    let node_uri = cairn_uri::canonicalize_uri_identity(node_uri);
     let found = standing.into_iter().find_map(|job| {
         let Decision::Report(cause) = &job.decision else {
             return None;
         };
         let uri = job.child_node_uri.as_deref()?;
-        (cairn_common::uri::canonicalize_uri_identity(uri) == node_uri)
-            .then(|| job.render(uri, cause, now))
+        (cairn_uri::canonicalize_uri_identity(uri) == node_uri).then(|| job.render(uri, cause, now))
     });
     Some(found.unwrap_or_else(|| {
         format!(

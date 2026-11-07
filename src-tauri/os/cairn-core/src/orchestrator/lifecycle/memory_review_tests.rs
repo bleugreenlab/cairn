@@ -206,7 +206,7 @@ async fn review_state(orch: &crate::orchestrator::Orchestrator) -> Option<String
 /// which does not resolve to the sub-task job (issue #143).
 #[tokio::test]
 async fn review_artifact_ref_nests_subtask_artifact_under_parent_task() {
-    use cairn_common::uri::{parse_uri, CairnResource};
+    use cairn_uri::{parse_uri, CairnResource};
 
     // Top-level node job: the flat node artifact URI (unchanged behavior).
     let db = test_db().await;
@@ -259,7 +259,7 @@ async fn review_artifact_ref_nests_subtask_artifact_under_parent_task() {
     // The old flat form named the task's own segment as a top-level node;
     // that URI cannot resolve to the sub-task job.
     let broken =
-        cairn_common::uri::build_node_artifact_uri_named("prj", 2, 1, "builder", Some("create-pr"));
+        cairn_uri::build_node_artifact_uri_named("prj", 2, 1, "builder", Some("create-pr"));
     assert_eq!(broken, "cairn://p/prj/2/1/builder/create-pr");
     assert_ne!(broken, task_uri);
 }

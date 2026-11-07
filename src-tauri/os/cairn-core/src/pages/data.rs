@@ -175,9 +175,9 @@ impl DeclaredService {
                  or '-') nor a thread service's URI (cairn://p/PROJECT/THREAD/services/NAME)"
             )
         };
-        let resource = cairn_common::uri::parse_uri(entry).ok_or_else(refusal)?;
-        match crate::resources::delegate_thread_descendant(resource).map_err(|_| refusal())? {
-            cairn_common::uri::CairnResource::ThreadService {
+        let resource = cairn_uri::parse_uri(entry).ok_or_else(refusal)?;
+        match cairn_uri::delegate_thread_descendant(resource).map_err(|_| refusal())? {
+            cairn_uri::CairnResource::ThreadService {
                 project,
                 name,
                 service,
@@ -201,7 +201,7 @@ impl DeclaredService {
                 project,
                 thread,
                 service,
-            } => cairn_common::uri::build_thread_service_uri(project, thread, service),
+            } => cairn_uri::build_thread_service_uri(project, thread, service),
         }
     }
 }
@@ -286,7 +286,7 @@ pub(crate) fn write_scopes(page: &Value) -> Vec<String> {
 pub(crate) fn write_scope_table(scope: &str) -> Option<&str> {
     let table = scope.strip_prefix("cairn:~/db/")?;
     let valid = !table.is_empty()
-        && table != crate::resources::db_rows::RESERVED_TABLE_SEGMENT
+        && table != cairn_uri::RESERVED_TABLE_SEGMENT
         && !table.contains(['/', '?', '#', '*', '%'])
         && !table.chars().any(char::is_whitespace);
     valid.then_some(table)
@@ -329,7 +329,7 @@ fn validate_writes(page: &Value) -> Result<(), String> {
         if rest.contains('*') {
             return refuse("a write scope names one table, never a wildcard");
         }
-        if rest == crate::resources::db_rows::RESERVED_TABLE_SEGMENT {
+        if rest == cairn_uri::RESERVED_TABLE_SEGMENT {
             return refuse("`schema` is the database's schema listing, not a table");
         }
         if write_scope_table(scope).is_none() {

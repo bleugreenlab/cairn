@@ -9,6 +9,7 @@ description = "Agent session runtime and provider process protocols"
 cairn-analytics = { path = "../cairn-analytics" }
 cairn-attention = { path = "../cairn-attention" }
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 cairn-db = { path = "../cairn-db" }
 cairn-models = { path = "../cairn-models" }
 cairn-domain = { path = "../cairn-domain" }

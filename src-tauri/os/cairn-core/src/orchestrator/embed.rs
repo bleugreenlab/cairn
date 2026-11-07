@@ -313,7 +313,7 @@ impl Orchestrator {
             .await;
         match key {
             Ok(Some(key)) => self.enqueue_resource_embed(
-                &cairn_common::uri::build_issue_uri(&key, issue.number),
+                &cairn_uri::build_issue_uri(&key, issue.number),
                 crate::embeddings::resources::issue_embed_text(Some(&issue.description)),
             ),
             Ok(None) => {}

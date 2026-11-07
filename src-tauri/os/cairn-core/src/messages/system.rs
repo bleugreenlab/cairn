@@ -144,7 +144,7 @@ async fn lookup_job_context_async(
             let thread_id = row.opt_text(7)?;
             let (channel_type, channel_id, uri) = if let Some(issue_number) = issue_number {
                 let uri = uri_segment.as_deref().map(|segment| {
-                    cairn_common::uri::build_job_base_uri(
+                    cairn_uri::build_job_base_uri(
                         &project_key,
                         issue_number,
                         exec_seq,
@@ -158,7 +158,7 @@ async fn lookup_job_context_async(
                     uri,
                 )
             } else if let (Some(thread_name), Some(thread_id)) = (thread_name, thread_id) {
-                let root = cairn_common::uri::build_thread_uri(&project_key, &thread_name);
+                let root = cairn_uri::build_thread_uri(&project_key, &thread_name);
                 let uri = match (parent_uri_segment.as_deref(), uri_segment.as_deref()) {
                     (Some(_), Some(segment)) => Some(format!("{root}/task/{segment}")),
                     _ => Some(root),
@@ -347,8 +347,8 @@ mod tests {
             .expect("top-level URI");
         assert!(
             matches!(
-                cairn_common::uri::parse_uri(&top_uri),
-                Some(cairn_common::uri::CairnResource::Node { .. })
+                cairn_uri::parse_uri(&top_uri),
+                Some(cairn_uri::CairnResource::Node { .. })
             ),
             "top-level URI should parse as Node: {top_uri}"
         );
@@ -360,8 +360,8 @@ mod tests {
             .expect("sub-task URI");
         assert!(
             matches!(
-                cairn_common::uri::parse_uri(&sub_uri),
-                Some(cairn_common::uri::CairnResource::Task { .. })
+                cairn_uri::parse_uri(&sub_uri),
+                Some(cairn_uri::CairnResource::Task { .. })
             ),
             "sub-task URI should parse as Task: {sub_uri}"
         );

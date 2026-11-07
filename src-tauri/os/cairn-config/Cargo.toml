@@ -9,6 +9,7 @@ license = "BUSL-1.1"
 cairn-models-types = { path = "../cairn-models-types" }
 cairn-domain = { path = "../cairn-domain" }
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 cairn-platform = { path = "../cairn-platform" }
 cairn-packs = { path = "../cairn-packs" }
 cairn-symbols = { path = "../cairn-symbols" }

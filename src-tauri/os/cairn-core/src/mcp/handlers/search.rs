@@ -195,8 +195,8 @@ fn result_uri(result: &crate::models::SearchResult, project_key: Option<&str>) -
     }
     let key = project_key.unwrap_or("PROJECT");
     match result.id.parse::<i32>() {
-        Ok(number) if number > 0 => cairn_common::uri::build_issue_uri(key, number),
-        _ => cairn_common::uri::build_project_uri(key),
+        Ok(number) if number > 0 => cairn_uri::build_issue_uri(key, number),
+        _ => cairn_uri::build_project_uri(key),
     }
 }
 

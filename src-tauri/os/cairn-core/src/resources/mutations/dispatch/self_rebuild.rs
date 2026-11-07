@@ -7,7 +7,7 @@ use super::append_payload;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::resources::self_rebuild::{self as outcomes, Claim, Outcome, ReportTo};
-use cairn_common::uri::{build_self_rebuild_outcome_uri, CairnResource};
+use cairn_uri::{build_self_rebuild_outcome_uri, CairnResource};
 
 const RUNLESS_RECORD_REFUSAL: &str = "Only a run may record a pending self-rebuild outcome: this request speaks for no run. Start the self-rebuild from an agent run, or use human mode (no --thread-uri), which reports locally.";
 

@@ -38,7 +38,7 @@ pub(crate) async fn sweep_project_channel_surfaces(
     private_db: &LocalDb,
     project_key: &str,
 ) -> Result<(), DbError> {
-    let project_key = cairn_common::uri::canonical_project(project_key);
+    let project_key = cairn_uri::canonical_project(project_key);
     private_db
         .write(|conn| {
             let project_key = project_key.clone();
@@ -1272,7 +1272,7 @@ pub(crate) async fn sweep_project_with_route(
     project_key: Option<&str>,
 ) -> Result<(), DbError> {
     let project_id = project_id.to_string();
-    let project_key = project_key.map(cairn_common::uri::canonical_project);
+    let project_key = project_key.map(cairn_uri::canonical_project);
     db.write(|conn| {
         let project_id = project_id.clone();
         let project_key = project_key.clone();
@@ -1331,7 +1331,7 @@ pub(crate) async fn sweep_team_project(
 ) -> Result<(), DbError> {
     let owner_ids = materialize_owner_ids(team_db, project_id).await?;
     let id = project_id.to_string();
-    let project_key = cairn_common::uri::canonical_project(project_key);
+    let project_key = cairn_uri::canonical_project(project_key);
     private_db
         .write(|conn| {
             let id = id.clone();

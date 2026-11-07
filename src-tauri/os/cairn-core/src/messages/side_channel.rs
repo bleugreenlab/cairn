@@ -431,8 +431,7 @@ async fn issue_uri_for_issue_id(db: &LocalDb, issue_id: &str) -> Result<Option<S
         })
         .await
         .map_err(|error| error.to_string())?;
-    Ok(resolved
-        .map(|(project_key, number)| cairn_common::uri::build_issue_uri(&project_key, number)))
+    Ok(resolved.map(|(project_key, number)| cairn_uri::build_issue_uri(&project_key, number)))
 }
 
 async fn issue_id_for_key_number(
@@ -440,7 +439,7 @@ async fn issue_id_for_key_number(
     project_key: &str,
     issue_number: i32,
 ) -> Result<Option<String>, String> {
-    let project_key = cairn_common::uri::canonical_project(project_key);
+    let project_key = cairn_uri::canonical_project(project_key);
     db.read(|conn| {
         let project_key = project_key.clone();
         Box::pin(async move {

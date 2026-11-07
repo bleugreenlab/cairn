@@ -81,7 +81,6 @@ pub(crate) use thread_seed::{
 /// the write dispatcher, and anything that resolves a thread-addressed resource.
 #[cfg(test)]
 pub(crate) use threads::read_thread_queue;
-pub(crate) use threads::{delegate_thread_descendant, retired_surface};
 pub(crate) use transcript::{era_source_digest, navigation_passage_event_id};
 
 /// One job's transcript exactly as `.../chat/raw?format=json` serves it: every

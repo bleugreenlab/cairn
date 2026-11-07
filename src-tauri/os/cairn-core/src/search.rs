@@ -23,12 +23,12 @@
 use crate::embeddings::turns::{turn_excerpts, SemanticSearch};
 use crate::models::{SearchContentType, SearchFilters, SearchResult};
 use crate::storage::{DbError, LocalDb, RowExt, SearchIndex, SearchIndexHit};
-use cairn_common::uri::{
+use cairn_db::turso::{Row, Value};
+use cairn_uri::{
     build_issue_messages_uri, build_issue_uri, build_node_artifact_uri, build_node_chat_turn_uri,
     build_node_chat_uri, build_project_messages_uri, build_project_uri, build_task_artifact_uri,
     build_task_chat_turn_uri, build_task_chat_uri,
 };
-use cairn_db::turso::{Row, Value};
 use std::collections::HashMap;
 
 /// Ceiling the search index enforces on a single query.

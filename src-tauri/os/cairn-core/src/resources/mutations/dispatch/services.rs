@@ -29,7 +29,7 @@ use crate::project_services::supervisor::{
     self, CallRequest, ServiceRef, ServiceState, ServiceStatus,
 };
 use crate::project_services::thread_store;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// The longest call value a change report carries.
 const MAX_REPORTED_VALUE_BYTES: usize = 64 * 1024;
@@ -137,7 +137,7 @@ async fn resolve(
         } => (project, Some(name), service),
         _ => return None,
     };
-    let project_key = cairn_common::uri::canonical_project(project);
+    let project_key = cairn_uri::canonical_project(project);
     Some(match thread {
         None => crate::project_services::project_id_for_key(orch, project)
             .await

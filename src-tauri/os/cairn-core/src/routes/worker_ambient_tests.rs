@@ -16,7 +16,7 @@ use crate::channels::RouteSubmissionCapture;
 use crate::routes::decision::revision;
 use crate::routes::{ChannelSubmission, Mint, Presence, RouteFact};
 use crate::storage::RowExt;
-use cairn_common::uri::{build_project_uri, build_thread_uri, CairnResource};
+use cairn_uri::{build_project_uri, build_thread_uri, CairnResource};
 use serde_json::json;
 use std::collections::BTreeMap;
 

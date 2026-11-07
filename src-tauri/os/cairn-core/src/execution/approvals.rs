@@ -195,14 +195,14 @@ pub async fn pending_approvals_conn(
             let created_at = row.i64(10)?;
             let (artifact_uri, node_uri) = match (exec_seq, segment.as_deref()) {
                 (Some(seq), Some(segment)) => (
-                    cairn_common::uri::build_node_artifact_uri_named(
+                    cairn_uri::build_node_artifact_uri_named(
                         &project_key,
                         number as i32,
                         seq as i32,
                         segment,
                         output_name.as_deref(),
                     ),
-                    cairn_common::uri::build_job_base_uri(
+                    cairn_uri::build_job_base_uri(
                         &project_key,
                         number as i32,
                         seq as i32,
@@ -211,7 +211,7 @@ pub async fn pending_approvals_conn(
                     ),
                 ),
                 _ => {
-                    let issue = cairn_common::uri::build_issue_uri(&project_key, number as i32);
+                    let issue = cairn_uri::build_issue_uri(&project_key, number as i32);
                     (issue.clone(), issue)
                 }
             };

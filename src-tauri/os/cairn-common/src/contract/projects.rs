@@ -5,6 +5,7 @@
 
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 pub(crate) const PROJECT_IMAGE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectImage,

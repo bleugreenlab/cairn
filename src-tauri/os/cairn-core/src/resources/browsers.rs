@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use cairn_common::query::QueryParam;
 use cairn_common::read::ImageBlock;
-use cairn_common::uri::{
+use cairn_uri::{
     build_node_browser_network_request_uri, build_project_browser_network_request_uri,
     build_task_browser_network_request_uri, CairnResource, DEFAULT_BROWSER_SLUG,
 };
@@ -100,7 +100,7 @@ async fn resolve_browser_scope(
                         .ok_or_else(|| {
                             DbError::Row(format!(
                                 "No job owns the browser target {}. {}",
-                                cairn_common::uri::build_node_browser_uri(
+                                cairn_uri::build_node_browser_uri(
                                     &project, number, exec_seq, &node_id, &slug
                                 ),
                                 crate::resources::node_job_not_found_message(
@@ -133,7 +133,7 @@ async fn resolve_browser_scope(
                             .ok_or_else(|| {
                                 DbError::Row(format!(
                                     "No job owns the browser target {}",
-                                    cairn_common::uri::build_task_browser_uri(
+                                    cairn_uri::build_task_browser_uri(
                                         &project, number, exec_seq, &node_id, &task_name, &slug
                                     )
                                 ))
@@ -142,7 +142,7 @@ async fn resolve_browser_scope(
                 }
                 CairnResource::ProjectBrowser { project, slug }
                 | CairnResource::ProjectBrowserNetworkRequest { project, slug, .. } => {
-                    let lookup_key = cairn_common::uri::canonical_project(&project);
+                    let lookup_key = cairn_uri::canonical_project(&project);
                     let mut rows = conn
                         .query(
                             "SELECT id FROM projects WHERE key = ?1 LIMIT 1",

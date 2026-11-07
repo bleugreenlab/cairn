@@ -4,9 +4,9 @@ use super::super::{build_failure, payload_non_empty_str, ResourceMutationResult}
 use super::append_payload;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::thread_name::validate_thread_name;
-use cairn_common::uri::CairnResource;
 use cairn_db::models::CreateThread;
+use cairn_uri::thread_name::validate_thread_name;
+use cairn_uri::CairnResource;
 
 use crate::resources::db_rows::{self, PayloadUse, TableShape};
 use crate::threads::crud::by_name as thread_by_name;
@@ -104,7 +104,7 @@ async fn owned_thread_scope(
     Ok(WriteScope {
         thread_id: thread.id,
         project_id,
-        project: cairn_common::uri::canonical_project(project),
+        project: cairn_uri::canonical_project(project),
         thread_name: thread.name,
     })
 }
@@ -131,7 +131,7 @@ async fn acting_thread_id(
         let ServiceRunRole::Delegated { scope, .. } = &service.role else {
             return None;
         };
-        if service.project_key != cairn_common::uri::canonical_project(project) {
+        if service.project_key != cairn_uri::canonical_project(project) {
             return None;
         }
         let name = scope.writable_thread()?;
@@ -248,7 +248,7 @@ pub(super) async fn issue_parent_thread(
            JOIN projects p ON p.id = i.project_id
            JOIN threads t ON t.id = i.parent_thread_id
           WHERE p.key = ?1 AND i.number = ?2",
-        (cairn_common::uri::canonical_project(project), number),
+        (cairn_uri::canonical_project(project), number),
     )
     .await
     .map_err(|error| error.to_string())
@@ -285,7 +285,7 @@ pub(super) async fn issue_title(orch: &Orchestrator, project: &str, number: i32)
     db.query_opt_text(
         "SELECT i.title FROM issues i JOIN projects p ON p.id = i.project_id
           WHERE p.key = ?1 AND i.number = ?2",
-        (cairn_common::uri::canonical_project(project), number),
+        (cairn_uri::canonical_project(project), number),
     )
     .await
     .ok()
@@ -345,8 +345,8 @@ fn refuse_target_query(item: &ChangeItem, form: &str) -> Result<(), String> {
 /// thread's store.
 async fn write_target_shape(scope: &WriteScope, table: &str) -> Result<TableShape, String> {
     let root = scope.db_root();
-    if table == db_rows::RESERVED_TABLE_SEGMENT {
-        return Err(db_rows::reserved_table_segment_refusal(&root));
+    if table == cairn_uri::RESERVED_TABLE_SEGMENT {
+        return Err(cairn_uri::reserved_table_segment_refusal(&root));
     }
     let db = crate::threads::db_store::open(&scope.thread_id).await?;
     db_rows::load_shape(&db, table)
@@ -495,7 +495,7 @@ pub(super) async fn dispatch(
                 })
                 .collect();
             police(&statements).map_err(|error| build_failure(index, item, error))?;
-            let collection = cairn_common::uri::build_db_table_uri(&scope.db_root(), table);
+            let collection = cairn_uri::build_db_table_uri(&scope.db_root(), table);
             let (verb, would) = if append.upsert {
                 ("Upserted", "upsert")
             } else {
@@ -554,7 +554,7 @@ pub(super) async fn dispatch(
             let scope = owned_thread_scope(orch, request, project, name)
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-            let collection = cairn_common::uri::build_db_table_uri(&scope.db_root(), table);
+            let collection = cairn_uri::build_db_table_uri(&scope.db_root(), table);
             if !params.iter().any(|param| param.key == "where") {
                 return Err(build_failure(
                     index,
@@ -643,7 +643,7 @@ pub(super) async fn dispatch(
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
             let root = scope.db_root();
-            let row_uri = cairn_common::uri::build_db_row_uri(&root, table, pk);
+            let row_uri = cairn_uri::build_db_row_uri(&root, table, pk);
             let shape = write_target_shape(&scope, table)
                 .await
                 .map_err(|error| build_failure(index, item, error))?;

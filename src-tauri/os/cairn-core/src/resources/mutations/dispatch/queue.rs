@@ -19,7 +19,7 @@ use cairn_common::authorization::{
     AuthorityAction, AuthorityDecision, AuthorityLifetime, AuthorityMutation, AuthorityPlace,
     AuthorityRequest, AuthorityScope,
 };
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 use super::super::{build_failure, target_resource_for_request, ResourceMutationResult};
 use crate::authorization::normalize;
@@ -277,7 +277,7 @@ async fn resolve_moves(
     let line = crate::execution::gates::capacity::fleet_order(orch)
         .await
         .map_err(MoveRefusal::Invalid)?;
-    let key = cairn_common::uri::canonical_project(project);
+    let key = cairn_uri::canonical_project(project);
     let mut moves = Vec::new();
     let mut refusals = Vec::new();
     for (entry, position) in entries {
@@ -293,7 +293,7 @@ async fn resolve_moves(
                             .queued
                             .project_key
                             .as_deref()
-                            .map(cairn_common::uri::canonical_project)
+                            .map(cairn_uri::canonical_project)
                             .as_deref()
                             == Some(key.as_str())
                 });
@@ -385,8 +385,7 @@ async fn start_now_request(
     let execution_id =
         crate::mcp::handlers::executions::resolve_execution_id(&db, project, number, exec_seq)
             .await?;
-    let issue =
-        cairn_common::uri::build_issue_uri(&cairn_common::uri::canonical_project(project), number);
+    let issue = cairn_uri::build_issue_uri(&cairn_uri::canonical_project(project), number);
     let label = format!("execution {exec_seq} on {issue}");
     let state = crate::execution::gates::authoring::hold_state(&db, &execution_id).await?;
     crate::execution::gates::authoring::require_held(&state, &label)?;
@@ -397,7 +396,7 @@ async fn start_now_request(
         .query_opt_text(
             "SELECT i.parent_thread_id FROM issues i JOIN projects p ON p.id = i.project_id
               WHERE p.key = ?1 AND i.number = ?2",
-            (cairn_common::uri::canonical_project(project), number),
+            (cairn_uri::canonical_project(project), number),
         )
         .await
         .map_err(|error| error.to_string())?;

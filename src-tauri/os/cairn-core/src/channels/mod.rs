@@ -179,7 +179,7 @@ pub async fn ensure_discord_thread_surface(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("Project not found after thread creation: {project_id}"))?;
-    let target = cairn_common::uri::build_thread_uri(&project.key, thread_name);
+    let target = cairn_uri::build_thread_uri(&project.key, thread_name);
     let now = chrono::Utc::now().timestamp();
     discord_surfaces::ensure_thread_surface(db, guild_id, &project.key, &target, now).await?;
     discord_surfaces::ensure_ambient_surface(db, guild_id, &project.key, now).await?;
@@ -925,7 +925,7 @@ pub(crate) async fn ambient_consuming_routes(
         .await
         .query_opt_text(
             "SELECT repo_path FROM projects WHERE lower(key) = ?1",
-            (cairn_common::uri::canonical_project(project),),
+            (cairn_uri::canonical_project(project),),
         )
         .await
         .map_err(|error| error.to_string())?
@@ -938,7 +938,7 @@ pub(crate) async fn ambient_consuming_routes(
     let fields = std::collections::BTreeMap::from([
         (
             "project".to_string(),
-            serde_json::json!(cairn_common::uri::canonical_project(project)),
+            serde_json::json!(cairn_uri::canonical_project(project)),
         ),
         ("provider".to_string(), serde_json::json!(provider_id)),
         ("conversation".to_string(), serde_json::json!(conversation)),
@@ -949,7 +949,7 @@ pub(crate) async fn ambient_consuming_routes(
         ("addressed".to_string(), serde_json::json!(false)),
         (
             "target".to_string(),
-            serde_json::json!(cairn_common::uri::build_project_uri(project)),
+            serde_json::json!(cairn_uri::build_project_uri(project)),
         ),
     ]);
     let mut consuming = Vec::new();
@@ -1005,7 +1005,7 @@ async fn ambient_status(
                     routes,
                     Some(format!(
                         "No route consumes this channel; messages are logged to {}/events but not routed.",
-                        cairn_common::uri::build_project_uri(&project)
+                        cairn_uri::build_project_uri(&project)
                     )),
                 ),
                 Ok(routes) => (routes, None),

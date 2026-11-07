@@ -4,8 +4,8 @@ use super::super::{build_failure, mode_name, payload_str, ResourceMutationResult
 use crate::mcp::handlers::comments_artifacts;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
 use cairn_db::turso::params;
+use cairn_uri::CairnResource;
 
 async fn resolution_attribution(
     orch: &Orchestrator,

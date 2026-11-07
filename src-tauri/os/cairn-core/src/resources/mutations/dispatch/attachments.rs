@@ -25,7 +25,7 @@ use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use cairn_common::authorization::AuthorityDecision;
-use cairn_common::uri::{AttachmentRef, AttachmentScopeRef, CairnResource};
+use cairn_uri::{AttachmentRef, AttachmentScopeRef, CairnResource};
 
 /// One stored object, by either spelling of its address.
 fn stored_object(resource: &CairnResource) -> Option<(&str, &AttachmentRef)> {
@@ -146,7 +146,7 @@ async fn materialize(
         "Materialized {} ({size} bytes) at {path}. That path is cell-scoped and is \
          reclaimed with the cell; the durable address is {}.",
         fetched.file_name,
-        cairn_common::uri::build_project_attachment_uri(project, reference)
+        cairn_uri::build_project_attachment_uri(project, reference)
     ))
 }
 
@@ -189,7 +189,7 @@ fn removal_ask(
     Ok(RemovalAsk {
         scope: scope.clone(),
         ordinal: *ordinal,
-        attachment_uri: cairn_common::uri::build_project_attachment_uri(project, reference),
+        attachment_uri: cairn_uri::build_project_attachment_uri(project, reference),
         reason,
         include_shared,
     })

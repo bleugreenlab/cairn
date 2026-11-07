@@ -9,8 +9,8 @@ use crate::mcp::types::{ChangeMode, ChangePayload, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::resources::mutations::{dispatch_resource_change, hash_resource_target};
 use crate::storage::RowExt;
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::turso::params;
+use cairn_uri::{parse_uri, CairnResource};
 
 #[derive(Debug, Clone)]
 pub(super) struct ChangePreviewEvent {

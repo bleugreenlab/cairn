@@ -203,7 +203,7 @@ pub async fn rearm_failed_resolutions(
                 while let Some(row) = rows.next().await? {
                     candidates.push((
                         row.text(0)?,
-                        cairn_common::uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
+                        cairn_uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
                         row.i64(3)?,
                     ));
                 }
@@ -438,16 +438,16 @@ pub async fn create_catchup_pushes_for_watchers(
     db: &LocalDb,
     child_uri: &str,
 ) -> Result<usize, String> {
-    let Some(parsed) = cairn_common::uri::parse_uri(child_uri) else {
+    let Some(parsed) = cairn_uri::parse_uri(child_uri) else {
         return Ok(0);
     };
     let (Some(project_key), Some(number)) = (
-        parsed.project().map(cairn_common::uri::canonical_project),
+        parsed.project().map(cairn_uri::canonical_project),
         parsed.issue_number(),
     ) else {
         return Ok(0);
     };
-    let issue_uri = cairn_common::uri::build_issue_uri(&project_key, number);
+    let issue_uri = cairn_uri::build_issue_uri(&project_key, number);
     let watchers = crate::wakes::watcher_jobs_for_issue(host.clone(), db, &issue_uri).await?;
     if watchers.is_empty() {
         return Ok(0);
@@ -504,23 +504,22 @@ async fn issue_id_for_issue_uri(db: &LocalDb, issue_uri: &str) -> Result<Option<
 /// job), so a user message directed at a sub-task still scopes catch-up to the
 /// task's own chat. `None` for any other URI or an unresolved node/task.
 async fn job_id_for_child_uri(db: &LocalDb, child_uri: &str) -> Option<String> {
-    let (project, number, exec_seq, node_id, task_name) =
-        match cairn_common::uri::parse_uri(child_uri)? {
-            cairn_common::uri::CairnResource::Node {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => (project, number, exec_seq, node_id, None),
-            cairn_common::uri::CairnResource::Task {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-            } => (project, number, exec_seq, node_id, Some(task_name)),
-            _ => return None,
-        };
+    let (project, number, exec_seq, node_id, task_name) = match cairn_uri::parse_uri(child_uri)? {
+        cairn_uri::CairnResource::Node {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => (project, number, exec_seq, node_id, None),
+        cairn_uri::CairnResource::Task {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => (project, number, exec_seq, node_id, Some(task_name)),
+        _ => return None,
+    };
     db.read(|conn| {
         let project = project.clone();
         let node_id = node_id.clone();
@@ -554,7 +553,7 @@ async fn job_id_for_node_coordinates(
     node_id: &str,
     task_name: Option<&str>,
 ) -> crate::storage::DbResult<Option<String>> {
-    let project = cairn_common::uri::canonical_project(project);
+    let project = cairn_uri::canonical_project(project);
     let mut rows = conn
         .query(
             "SELECT j.id FROM jobs j
@@ -892,14 +891,14 @@ pub(crate) fn prose_candidates_sql(index: &str) -> String {
 /// launch prompt back as news (CAIRN-3408). `None` when the window is empty or
 /// anything fails to read, so the caller keeps the pointer.
 async fn catchup_chat_line(db: &LocalDb, content_ref: &str, child_job_id: &str) -> Option<String> {
-    use cairn_common::uri::CairnResource;
+    use cairn_uri::CairnResource;
     let (address, query) = content_ref.split_once('?')?;
     let offset: i64 = query
         .split('&')
         .find_map(|pair| pair.strip_prefix("offset="))?
         .parse()
         .ok()?;
-    let node = match cairn_common::uri::parse_uri(address)? {
+    let node = match cairn_uri::parse_uri(address)? {
         CairnResource::NodeChat { node_id, .. } => node_id,
         CairnResource::TaskChat {
             node_id, task_name, ..
@@ -1049,9 +1048,9 @@ fn assistant_text(data: &str) -> Option<String> {
 /// whose artifact does not resolve, parse, or carry a title.
 async fn review_artifact_line(runtime: &AttentionRuntime, content_ref: &str) -> Option<String> {
     use cairn_common::references::ReferenceEntry;
-    use cairn_common::uri::CairnResource;
+    use cairn_uri::CairnResource;
     if !matches!(
-        cairn_common::uri::parse_uri(content_ref)?,
+        cairn_uri::parse_uri(content_ref)?,
         CairnResource::NodeArtifact { .. } | CairnResource::TaskArtifact { .. }
     ) {
         return None;
@@ -1182,7 +1181,7 @@ pub async fn issue_failure_conn(
         let Some(segment) = row.opt_text(4)? else {
             continue;
         };
-        let node_uri = cairn_common::uri::build_node_uri(
+        let node_uri = cairn_uri::build_node_uri(
             &row.text(1)?,
             row.i64(2)? as i32,
             row.i64(3)? as i32,
@@ -1214,7 +1213,7 @@ pub async fn issue_failure_conn(
     if let Some(row) = actions.next().await? {
         return Ok(Some(FailureEvidence {
             job_id: None,
-            node_uri: cairn_common::uri::build_node_uri(
+            node_uri: cairn_uri::build_node_uri(
                 &row.text(0)?,
                 row.i64(1)? as i32,
                 row.i64(2)? as i32,
@@ -1233,9 +1232,7 @@ async fn resolved_issue_confirmation(
     runtime: &AttentionRuntime,
     issue_uri: &str,
 ) -> Option<String> {
-    let project_key = cairn_common::uri::parse_uri(issue_uri)?
-        .project_key()?
-        .to_string();
+    let project_key = cairn_uri::parse_uri(issue_uri)?.project_key()?.to_string();
     let db = runtime.host.database_for_project(&project_key).await;
     let issue_uri = issue_uri.to_string();
     db.read(|conn| {

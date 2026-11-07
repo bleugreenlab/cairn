@@ -399,7 +399,7 @@ pub async fn set_message_class(
             params![
                 provider.to_string(),
                 conversation.clone(),
-                cairn_common::uri::canonicalize_uri_identity(uri)
+                cairn_uri::canonicalize_uri_identity(uri)
             ],
         )
         .await
@@ -443,7 +443,7 @@ fn canonical_binding_target(
     uri: &str,
     kind: super::bindings::BindingKind,
 ) -> Result<String, String> {
-    let uri = cairn_common::uri::canonicalize_uri_identity(uri);
+    let uri = cairn_uri::canonicalize_uri_identity(uri);
     if uri == "cairn:~" || uri.starts_with("cairn:~/") || uri.starts_with("cairn:@") {
         return Err(format!(
             "deictic channel target must be resolved before persistence: {uri}"
@@ -465,8 +465,8 @@ fn canonical_binding_target(
 /// The project key an ambient binding's target names, when it is a project
 /// root.
 fn ambient_target_project(uri: &str) -> Option<String> {
-    match cairn_common::uri::parse_uri(uri)? {
-        cairn_common::uri::CairnResource::Project { project } => Some(project),
+    match cairn_uri::parse_uri(uri)? {
+        cairn_uri::CairnResource::Project { project } => Some(project),
         _ => None,
     }
 }
@@ -765,8 +765,8 @@ pub async fn canonicalize_binding(
 ) -> Result<(), String> {
     let conversation = super::bindings::canonical_conversation(provider, conversation)?;
     let provider = provider.to_string();
-    let from_uri = cairn_common::uri::canonicalize_uri_identity(from_uri);
-    let to_uri = cairn_common::uri::canonicalize_uri_identity(to_uri);
+    let from_uri = cairn_uri::canonicalize_uri_identity(from_uri);
+    let to_uri = cairn_uri::canonicalize_uri_identity(to_uri);
     db.write(move |conn| {
         let provider = provider.clone();
         let conversation = conversation.clone();
@@ -1223,7 +1223,7 @@ pub async fn insert_intent_with_status(
             "outbound intent insert status must be pending or expired, got {status:?}"
         ));
     }
-    let binding_ref = cairn_common::uri::canonicalize_uri_identity(intent.binding_ref);
+    let binding_ref = cairn_uri::canonicalize_uri_identity(intent.binding_ref);
     let intent = NewOutbound {
         id: intent.id,
         channel: intent.channel,
@@ -1251,7 +1251,7 @@ pub async fn get_by_conversation_binding(
     kind: &str,
     action_ref: &str,
 ) -> Result<Option<OutboundRecord>, String> {
-    let action_ref = cairn_common::uri::canonicalize_uri_identity(action_ref);
+    let action_ref = cairn_uri::canonicalize_uri_identity(action_ref);
     db.query_opt(
         format!("SELECT {OUTBOUND_COLUMNS} FROM channel_outbound WHERE channel = ?1 AND conversation = ?2 AND kind = ?3 AND binding_ref = ?4"),
         params![channel.to_string(), conversation.to_string(), kind.to_string(), action_ref],
@@ -1265,7 +1265,7 @@ pub async fn get_by_binding(
     kind: &str,
     binding_ref: &str,
 ) -> Result<Option<OutboundRecord>, String> {
-    let binding_ref = cairn_common::uri::canonicalize_uri_identity(binding_ref);
+    let binding_ref = cairn_uri::canonicalize_uri_identity(binding_ref);
     db.query_opt(
         format!("SELECT {OUTBOUND_COLUMNS} FROM channel_outbound WHERE channel = ?1 AND kind = ?2 AND binding_ref = ?3"),
         params![channel.to_string(), kind.to_string(), binding_ref],
@@ -1432,8 +1432,8 @@ pub async fn claim_ask_resolution(
             "{surface} resolution requires an authenticated actor"
         ));
     }
-    let binding_ref = cairn_common::uri::canonicalize_uri_identity(binding_ref);
-    let action_ref = cairn_common::uri::canonicalize_uri_identity(action_ref);
+    let binding_ref = cairn_uri::canonicalize_uri_identity(binding_ref);
+    let action_ref = cairn_uri::canonicalize_uri_identity(action_ref);
     let binding_for_insert = binding_ref.clone();
     let inserted = db.write(move |conn| {
         let binding_ref = binding_for_insert.clone();
@@ -1496,7 +1496,7 @@ pub async fn finalize_ask_resolution(
     receipt: &str,
     resolved_at: i64,
 ) -> Result<u64, String> {
-    let action_ref = cairn_common::uri::canonicalize_uri_identity(action_ref);
+    let action_ref = cairn_uri::canonicalize_uri_identity(action_ref);
     let options = serde_json::json!({ "receipt": receipt }).to_string();
     db.write(move |conn| {
         let action_ref = action_ref.clone();

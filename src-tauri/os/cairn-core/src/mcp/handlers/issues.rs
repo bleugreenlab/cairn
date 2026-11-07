@@ -109,7 +109,7 @@ async fn insert_issue_with_context(
     // filed the child (`issues.parent_job_id`); who that child's facts reach is
     // resolved live on every wake, from that record plus the current parent edge
     // (`wakes::coordinating_job_for_child`).
-    let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
+    let issue_uri = cairn_uri::build_issue_uri(&ctx.project_key, issue.number);
     orch.enqueue_resource_embed(&issue_uri, embed_text);
 
     if let Err(e) = services.emitter.emit(
@@ -211,11 +211,10 @@ pub async fn create_issue_in_project(
     .await?;
     let summary = created_issue_summary(&ctx, &issue);
     let issue_id = issue.id.clone();
-    let uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
+    let uri = cairn_uri::build_issue_uri(&ctx.project_key, issue.number);
     let project_key = ctx.project_key.clone();
     let number = issue.number;
-    let executions_uri =
-        cairn_common::uri::build_issue_executions_uri(&ctx.project_key, issue.number);
+    let executions_uri = cairn_uri::build_issue_executions_uri(&ctx.project_key, issue.number);
 
     let summary = match execution.zip(resolution) {
         // Filing without work is legitimate, but the result has to say so: a
@@ -321,7 +320,7 @@ pub(crate) async fn preview_create_recipe(
 }
 
 async fn lookup_project_by_key(db: &LocalDb, key: &str) -> Result<ProjectContext, String> {
-    let key = cairn_common::uri::canonical_project(key);
+    let key = cairn_uri::canonical_project(key);
     let lookup_key = key.clone();
     db.read(|conn| {
         Box::pin(async move {
@@ -530,14 +529,14 @@ pub(crate) fn canonicalize_parent_uri(value: &str) -> Result<String, String> {
             "payload.parent must be the parent's canonical URI; cairn:~/ resolves to the node making this write, not the parent: {trimmed}"
         ));
     }
-    match cairn_common::uri::parse_uri(trimmed) {
-        Some(cairn_common::uri::CairnResource::Issue { project, number }) => {
-            Ok(cairn_common::uri::build_issue_uri(&project, number))
+    match cairn_uri::parse_uri(trimmed) {
+        Some(cairn_uri::CairnResource::Issue { project, number }) => {
+            Ok(cairn_uri::build_issue_uri(&project, number))
         }
-        Some(cairn_common::uri::CairnResource::Thread { project, name, path })
+        Some(cairn_uri::CairnResource::Thread { project, name, path })
             if path.is_empty() =>
         {
-            Ok(cairn_common::uri::build_thread_uri(&project, &name))
+            Ok(cairn_uri::build_thread_uri(&project, &name))
         }
         _ => Err(format!(
             "payload.parent must be a canonical issue URI like cairn://p/CAIRN/123 or a canonical thread URI like cairn://p/CAIRN/thread-name: {trimmed}"
@@ -761,7 +760,7 @@ pub(crate) async fn update_issue_by_project_number(
 
     // Re-embed only when the description was part of this update; a title-only
     // or dependency-only patch leaves the stored description untouched.
-    let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
+    let issue_uri = cairn_uri::build_issue_uri(&ctx.project_key, issue.number);
     if let Some(description) = embed_description {
         orch.enqueue_resource_embed(
             &issue_uri,

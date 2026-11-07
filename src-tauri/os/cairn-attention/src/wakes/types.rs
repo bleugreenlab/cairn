@@ -191,7 +191,7 @@ impl WakeSource {
             SOURCE_KIND_PEER => Ok(Self::Peer {
                 reference: reference
                     .filter(|value| !value.is_empty())
-                    .map(cairn_common::uri::canonicalize_uri_identity),
+                    .map(cairn_uri::canonicalize_uri_identity),
             }),
             SOURCE_KIND_USER => {
                 if reference.is_some() {
@@ -230,7 +230,7 @@ pub fn unscoped_row_is_a_standing_watch(kind: &str) -> bool {
 fn required_ref(kind: &str, reference: Option<&str>) -> Result<String, String> {
     reference
         .filter(|value| !value.is_empty())
-        .map(cairn_common::uri::canonicalize_uri_identity)
+        .map(cairn_uri::canonicalize_uri_identity)
         .ok_or_else(|| format!("wake source kind '{kind}' requires ref"))
 }
 

@@ -110,7 +110,7 @@ pub async fn issue_event_conn(
     };
     drop(pr_rows);
 
-    let source_uri = cairn_common::uri::build_issue_uri(&key, number as i32);
+    let source_uri = cairn_uri::build_issue_uri(&key, number as i32);
     let resolution = resolution_name(resolution);
     let header = format!("Issue {source_uri} \u{2014} {title}\nResolution: {resolution}");
     let pull_request = pr

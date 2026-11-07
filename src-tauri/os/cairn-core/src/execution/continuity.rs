@@ -561,7 +561,7 @@ pub async fn prior_branch_bearing_jobs(
                     continue;
                 }
                 let node_uri = match (segment, order.seq) {
-                    (Some(segment), Some(seq)) => Some(cairn_common::uri::build_node_uri(
+                    (Some(segment), Some(seq)) => Some(cairn_uri::build_node_uri(
                         &project_key,
                         number,
                         seq as i32,

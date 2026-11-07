@@ -1,0 +1,21 @@
+[package]
+name = "cairn-uri"
+version.workspace = true
+edition = "2021"
+description = "The cairn:// URI grammar: parse, build, and resolve Cairn resource addresses"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+
+# Everything here must build for wasm32-unknown-unknown (`cairn-uri-wasm`):
+# no tokio, sockets, filesystem, or libc.
+[dependencies]
+# `scan` only. Pure Rust, so it builds for wasm32, and the wasm surface never
+# calls `scan`, so the linker drops it there.
+regex = "1"
+# The JSON form `cairn-uri-wasm` hands across the WebAssembly boundary.
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+# `CairnResource` as `{"kind": <ResourceKind slug>, ...fields}`.
+serde = ["dep:serde"]

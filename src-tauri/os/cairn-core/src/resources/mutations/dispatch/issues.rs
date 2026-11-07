@@ -8,7 +8,7 @@ use super::append_payload;
 use crate::mcp::handlers::{comments_artifacts, issues};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
@@ -69,16 +69,17 @@ pub(super) async fn dispatch(
                 .as_mut()
                 .filter(|spec| spec.place != crate::execution::recipe::QueuePlace::Tail)
             {
-                let parent_thread =
-                    match parent.as_deref() {
-                        Some(uri) => match cairn_common::uri::parse_uri(uri) {
-                            Some(cairn_common::uri::CairnResource::Thread {
-                                name, path, ..
-                            }) if path.is_empty() => Some(name),
-                            _ => None,
-                        },
-                        None => super::threads::acting_thread_name(orch, request, project).await,
-                    };
+                let parent_thread = match parent.as_deref() {
+                    Some(uri) => match cairn_uri::parse_uri(uri) {
+                        Some(cairn_uri::CairnResource::Thread { name, path, .. })
+                            if path.is_empty() =>
+                        {
+                            Some(name)
+                        }
+                        _ => None,
+                    },
+                    None => super::threads::acting_thread_name(orch, request, project).await,
+                };
                 let placed_by = super::threads::head_placed_by(
                     orch,
                     request,

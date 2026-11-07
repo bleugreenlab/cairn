@@ -170,8 +170,8 @@ fn stored_image_uri(body: &str) -> Option<String> {
         .map(|caps| caps[1].to_string())
         .find(|uri| {
             matches!(
-                cairn_common::uri::parse_uri(uri),
-                Some(cairn_common::uri::CairnResource::ProjectImage { .. })
+                cairn_uri::parse_uri(uri),
+                Some(cairn_uri::CairnResource::ProjectImage { .. })
             )
         })
 }

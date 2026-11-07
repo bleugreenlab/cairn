@@ -508,7 +508,7 @@ impl DbState {
     /// Normalizes a project key the same way `lookup_project_by_key` does (upper
     /// case), so `cairn` and `CAIRN` route identically.
     fn normalize_key(key: &str) -> String {
-        cairn_common::uri::canonical_project(key)
+        cairn_uri::canonical_project(key)
     }
 
     /// Resolve the owning open team for a project id. Object-plane grants fail
@@ -1278,7 +1278,7 @@ async fn reconcile_team_routes(
         .collect::<Vec<_>>();
     let project_keys = projects
         .iter()
-        .map(|(_, project_key, _)| cairn_common::uri::canonical_project(project_key))
+        .map(|(_, project_key, _)| cairn_uri::canonical_project(project_key))
         .collect::<std::collections::HashSet<_>>();
     let stale_keys = local
         .read(|conn| {
@@ -1319,7 +1319,7 @@ async fn reconcile_team_routes(
 
     let now = chrono::Utc::now().timestamp();
     for (_, project_key, repo_path) in projects {
-        let key = cairn_common::uri::canonical_project(project_key);
+        let key = cairn_uri::canonical_project(project_key);
         local
             .execute(
                 "INSERT INTO project_routes(project_key, team_id, created_at)

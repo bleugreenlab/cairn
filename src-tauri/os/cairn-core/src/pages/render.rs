@@ -105,7 +105,7 @@ pub(crate) async fn read_page(
                 Some(version) => format!("{uri} has no version {version}"),
                 None => format!(
                     "No page at {uri}. Write one with mode `create`; read {} for the pages here.",
-                    cairn_common::uri::build_node_pages_uri(
+                    cairn_uri::build_node_pages_uri(
                         &address.project,
                         address.number,
                         address.exec_seq,
@@ -428,5 +428,5 @@ pub(crate) async fn read_project_pages(
 }
 
 fn canonical(project: &str) -> String {
-    cairn_common::uri::canonical_project(project)
+    cairn_uri::canonical_project(project)
 }

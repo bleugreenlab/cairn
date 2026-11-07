@@ -14,7 +14,7 @@ fn item(target: &str, mode: ChangeMode, payload: Option<serde_json::Value>) -> C
 }
 
 fn gate(item: &ChangeItem) -> ResourceMutationResult<&'static MutationSpec> {
-    let resource = cairn_common::uri::parse_uri(&item.target).unwrap();
+    let resource = cairn_uri::parse_uri(&item.target).unwrap();
     gate_resource_change(0, item, &resource)
 }
 

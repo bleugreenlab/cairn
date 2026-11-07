@@ -350,9 +350,7 @@ pub async fn refuse_cycles_conn(
         if !seen.insert(uri.clone()) {
             continue;
         }
-        if let Some(cairn_common::uri::CairnResource::Issue { project, .. }) =
-            cairn_common::uri::parse_uri(&uri)
-        {
+        if let Some(cairn_uri::CairnResource::Issue { project, .. }) = cairn_uri::parse_uri(&uri) {
             let db = dbs.for_project(&project).await;
             if !loaded
                 .iter()

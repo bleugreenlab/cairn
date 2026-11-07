@@ -23,7 +23,7 @@ use crate::mcp::handlers::skills_resources;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::{AuthorityMutation, AuthorityRequest};
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 
 /// Where a `cairn://mcp` mutation lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

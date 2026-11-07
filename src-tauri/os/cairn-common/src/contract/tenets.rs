@@ -1,6 +1,7 @@
 //! Tenets resource contracts.
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 const TENET_STATEMENT: KeySpec = KeySpec::new(
     "statement",

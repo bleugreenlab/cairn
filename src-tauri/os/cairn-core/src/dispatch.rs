@@ -812,10 +812,10 @@ fn collect_checks_targets(payload: &serde_json::Value) -> Vec<String> {
         let identity = target.split('?').next().unwrap_or(&target).trim();
         let names_checks = identity == "cairn:~/checks"
             || matches!(
-                cairn_common::uri::parse_uri(identity),
+                cairn_uri::parse_uri(identity),
                 Some(
-                    cairn_common::uri::CairnResource::NodeChecks { .. }
-                        | cairn_common::uri::CairnResource::TaskChecks { .. }
+                    cairn_uri::CairnResource::NodeChecks { .. }
+                        | cairn_uri::CairnResource::TaskChecks { .. }
                 )
             );
         if names_checks && !out.iter().any(|existing| existing == identity) {
@@ -859,11 +859,11 @@ fn terminal_identity_and_slug(target: &str) -> Option<(String, String)> {
         return Some((identity.to_string(), rest.to_string()));
     }
     // Canonical node/task/project terminal URIs.
-    match cairn_common::uri::parse_uri(identity) {
+    match cairn_uri::parse_uri(identity) {
         Some(
-            cairn_common::uri::CairnResource::NodeTerminal { slug, .. }
-            | cairn_common::uri::CairnResource::TaskTerminal { slug, .. }
-            | cairn_common::uri::CairnResource::ProjectTerminal { slug, .. },
+            cairn_uri::CairnResource::NodeTerminal { slug, .. }
+            | cairn_uri::CairnResource::TaskTerminal { slug, .. }
+            | cairn_uri::CairnResource::ProjectTerminal { slug, .. },
         ) => Some((identity.to_string(), slug)),
         _ => None,
     }

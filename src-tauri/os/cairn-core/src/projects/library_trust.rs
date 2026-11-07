@@ -217,7 +217,7 @@ fn current_path(
     match ids::parse_route_scope(project_id) {
         Ok(ids::RouteScope::Local) => local.get(project_id).map(|(_, path)| path.clone()),
         Ok(ids::RouteScope::Team(_)) => team
-            .get(&cairn_common::uri::canonical_project(project_key))
+            .get(&cairn_uri::canonical_project(project_key))
             .cloned(),
         Err(_) => None,
     }

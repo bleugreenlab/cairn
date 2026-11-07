@@ -13,8 +13,8 @@
 //! reports success on a different process's output.
 
 use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_common::uri::{self, CairnResource};
 use cairn_db::turso::params;
+use cairn_uri::{self as uri, CairnResource};
 
 /// The owner a terminal row is keyed by in `job_terminals`: a job, or a project
 /// (`job_id` NULL).

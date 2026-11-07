@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use cairn_common::query::{encode_query_params, split_target_query, QueryParam};
 use cairn_common::read::{NaturalUnit, ReadBatchEnvelope, ReadSegment, SegmentKind, SegmentMeta};
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use serde::Deserialize;
 
 use crate::mcp::types::McpCallbackRequest;
@@ -368,8 +368,7 @@ fn is_flail_dedup_exempt(target: &str) -> bool {
 /// resources they stand for.
 fn classify_resource(target: &str) -> Option<(CairnResource, Vec<QueryParam>)> {
     let split = split_target_query(target).ok()?;
-    let resource =
-        crate::resources::delegate_thread_descendant(parse_uri(&split.identity)?).ok()?;
+    let resource = cairn_uri::delegate_thread_descendant(parse_uri(&split.identity)?).ok()?;
     Some((resource, split.params))
 }
 
@@ -537,7 +536,7 @@ async fn produce_resource_segment(
     // router carried its own copy of the thread-path vocabulary, and it knew
     // only the session-level shape.
     let terminal_resource = matches!(
-        parse_uri(&identity).map(crate::resources::delegate_thread_descendant),
+        parse_uri(&identity).map(cairn_uri::delegate_thread_descendant),
         Some(Ok(CairnResource::NodeTerminal { .. }
             | CairnResource::TaskTerminal { .. }
             | CairnResource::ProjectTerminal { .. }))
@@ -1435,7 +1434,7 @@ mod tests {
             "a rendered image read must carry no content hash: {}",
             envelope.text
         );
-        let reference = cairn_common::uri::parse_uri(&target).unwrap();
+        let reference = cairn_uri::parse_uri(&target).unwrap();
         let CairnResource::ProjectImage { reference, .. } = reference else {
             panic!("a minted image URI parses as a stored image: {target}");
         };

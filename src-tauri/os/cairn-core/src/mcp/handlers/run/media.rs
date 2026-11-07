@@ -21,7 +21,6 @@ use std::time::Instant;
 
 use base64::Engine;
 use cairn_common::read::ImageBlock;
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_models::interface::image::{
     Edit, ImageInput, ImageRequest, ImageShape, Provenance, Reference, WireExtras,
 };
@@ -29,6 +28,7 @@ use cairn_models::interface::speak::{AudioFormat, SpeechRequest};
 use cairn_models::types::catalog::Wire;
 use cairn_models::types::image::{Orientation, Pixels, Ratio};
 use cairn_models::types::usage::MeteredUsage;
+use cairn_uri::{parse_uri, CairnResource};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -509,8 +509,8 @@ async fn speak(
 pub(super) mod tests {
     use std::time::Duration;
 
-    use cairn_common::uri::{parse_uri, CairnResource};
     use cairn_models::interface::speak::AudioEncoding;
+    use cairn_uri::{parse_uri, CairnResource};
     use serde_json::{json, Value};
 
     use super::super::types::ItemOutcome;

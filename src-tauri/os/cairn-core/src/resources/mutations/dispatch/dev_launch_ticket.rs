@@ -18,7 +18,7 @@ use crate::mcp::handlers::terminal::run_less_terminal_for_session;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 const DENY_REFUSAL: &str = "fence denies crossings, and a dev instance's runtime runs outside it";
 

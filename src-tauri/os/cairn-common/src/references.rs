@@ -23,7 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{contract_for, ResourceKind};
+use crate::contract::contract_for;
+use cairn_uri::ResourceKind;
 
 /// The heading that opens the block. It is also how a reader recognizes a
 /// block already appended to a text, so it is never scanned or appended twice.
@@ -104,7 +105,7 @@ pub fn without_references_block(text: &str) -> &str {
 /// references block already appended to it.
 pub fn reference_uris(text: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    crate::uri::scan_reference_uris(without_references_block(text))
+    cairn_uri::scan_reference_uris(without_references_block(text))
         .into_iter()
         .filter(|uri| seen.insert(uri.clone()))
         .collect()

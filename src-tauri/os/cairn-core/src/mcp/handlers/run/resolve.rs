@@ -7,7 +7,7 @@ use super::types::{McpCallSpec, McpRoute, RunItem, RunSpec};
 use crate::mcp::handlers::{skills_resources, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// Resolve a single run item into a header + executable spec, or a per-item
 /// error message that will be reported inline (and counts as a failure).
@@ -80,7 +80,7 @@ pub(super) async fn resolve_run_item(
                 Err(error) => return (item_header(item, raw_target), Err(error)),
             };
             let header = item_header(item, &target);
-            let parsed = cairn_common::uri::parse_uri(&target);
+            let parsed = cairn_uri::parse_uri(&target);
             if let Some(door) = parsed
                 .as_ref()
                 .and_then(cairn_common::run_contract::ModelDoor::for_resource)
@@ -525,8 +525,8 @@ async fn resolve_script_spec(
     target: &str,
     item: &RunItem,
 ) -> Result<RunSpec, String> {
-    let resource = cairn_common::uri::parse_uri(target).ok_or_else(|| {
-        cairn_common::uri::removed_executor_verb_refusal(target)
+    let resource = cairn_uri::parse_uri(target).ok_or_else(|| {
+        cairn_uri::removed_executor_verb_refusal(target)
             .unwrap_or_else(|| format!("Invalid run target URI: {target}"))
     })?;
     let script_path = skills_resources::resolve_skill_script_path(orch, request, &resource).await?;

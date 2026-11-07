@@ -4,7 +4,7 @@
 //! which jobs each one reaches right now, so a thread that rotated to a new
 //! session receives on the new one and a retired home receives nothing.
 
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 use crate::storage::LocalDb;
 
@@ -19,12 +19,12 @@ use super::child::watcher_jobs_for_issue;
 /// not who to tell, and routing it would wake a node for being mentioned in
 /// passing.
 pub(crate) async fn addressed_jobs(db: &LocalDb, uri: &str) -> Result<Vec<String>, String> {
-    let Some(resource) = cairn_common::uri::parse_uri(uri) else {
+    let Some(resource) = cairn_uri::parse_uri(uri) else {
         return Ok(Vec::new());
     };
     match &resource {
         CairnResource::Issue { project, number } => {
-            watcher_jobs_for_issue(db, &cairn_common::uri::build_issue_uri(project, *number)).await
+            watcher_jobs_for_issue(db, &cairn_uri::build_issue_uri(project, *number)).await
         }
         CairnResource::Node { .. } | CairnResource::Task { .. } | CairnResource::Thread { .. } => {
             Ok(home_job_for_resource(db, &resource)

@@ -15,7 +15,7 @@
 //! contract advertises, so a resource cannot start declaring `offset` or
 //! `limit` without deciding which of the two meanings it takes.
 
-use cairn_common::contract::ResourceKind;
+use cairn_uri::ResourceKind;
 
 /// How a resource kind's `offset`/`limit` query keys are interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

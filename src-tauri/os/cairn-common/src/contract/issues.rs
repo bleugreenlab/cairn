@@ -5,6 +5,7 @@
 
 use super::specs::*;
 use super::types::*;
+use cairn_uri::ResourceKind;
 
 pub(crate) const ISSUE_CONTRACT: ResourceContract =
     ResourceContract {

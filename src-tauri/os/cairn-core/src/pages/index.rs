@@ -133,13 +133,7 @@ pub async fn list_project_pages(
         pages.push((
             updated_at,
             PageSummary {
-                uri: cairn_common::uri::build_node_page_uri(
-                    &project_key,
-                    0,
-                    0,
-                    &thread_name,
-                    &name,
-                ),
+                uri: cairn_uri::build_node_page_uri(&project_key, 0, 0, &thread_name, &name),
                 name,
                 title,
                 description,

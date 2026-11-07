@@ -67,7 +67,7 @@ use std::sync::Mutex;
 
 use cairn_common::query::{encode_query_params, split_target_query, QueryParam};
 use cairn_common::read::{ReadBatchEnvelope, SegmentKind};
-use cairn_common::uri::{canonical_project, parse_uri, CairnResource};
+use cairn_uri::{canonical_project, parse_uri, CairnResource};
 use serde_json::{json, Value};
 
 use super::log::{record, PageCall, PageCallOutcome, PageCallVerb};
@@ -381,7 +381,7 @@ fn gate_target(
     };
     let split = split_target_query(&resolved)?;
     let resource = match parse_uri(&split.identity) {
-        Some(resource) => crate::resources::delegate_thread_descendant(resource)?,
+        Some(resource) => cairn_uri::delegate_thread_descendant(resource)?,
         None => return Err(ROWS_ONLY.to_string()),
     };
     let sql = split

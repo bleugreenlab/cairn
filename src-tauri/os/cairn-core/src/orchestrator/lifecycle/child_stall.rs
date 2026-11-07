@@ -331,9 +331,9 @@ pub(crate) async fn stalled_children(db: &LocalDb, now: i64) -> Result<Vec<Stall
                     row.text(1)?,
                     row.opt_text(2)?,
                     row.text(3)?,
-                    cairn_common::uri::build_issue_uri(&project_key, number),
+                    cairn_uri::build_issue_uri(&project_key, number),
                     segment.map(|segment| {
-                        cairn_common::uri::build_node_uri(&project_key, number, exec_seq, &segment)
+                        cairn_uri::build_node_uri(&project_key, number, exec_seq, &segment)
                     }),
                 ))
             },

@@ -32,6 +32,8 @@ members = [
   "os/cairn-tls",
   "os/cairn-tokenize",
   "os/cairn-toks",
+  "os/cairn-uri",
+  "os/cairn-uri-wasm",
   "os/cairn-vcs",
   "os/cairn-workflow",
 ]

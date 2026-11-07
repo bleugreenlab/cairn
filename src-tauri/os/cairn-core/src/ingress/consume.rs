@@ -376,7 +376,7 @@ pub async fn consume(
                 summary: None,
                 route_provenance: None,
             },
-            record_ref: cairn_common::uri::build_project_event_delivery_uri(
+            record_ref: cairn_uri::build_project_event_delivery_uri(
                 &project_key,
                 &endpoint.name,
                 ingress_event_id,

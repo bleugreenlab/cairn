@@ -20,10 +20,7 @@ pub fn tenet_embed_text(view: &TenetView) -> String {
 
 /// The URI prefix every tenet of a project shares.
 pub fn project_tenet_prefix(project_key: &str) -> String {
-    format!(
-        "{}/",
-        cairn_common::uri::build_project_tenets_uri(project_key)
-    )
+    format!("{}/", cairn_uri::build_project_tenets_uri(project_key))
 }
 
 /// Every stored tenet vector of a project in `key`'s space, by tenet URI.

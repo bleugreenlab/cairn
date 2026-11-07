@@ -600,11 +600,9 @@ async fn an_empty_model_is_refused_rather_than_silently_clearing_one() {
 async fn the_patch_contract_advertises_every_key_the_arm_accepts() {
     // The affordance block is how an agent discovers this at all, so an accepted
     // key that the contract omits is unreachable in practice.
-    let patch_spec = cairn_common::contract::mutation_spec(
-        cairn_common::contract::ResourceKind::Thread,
-        ChangeMode::Patch,
-    )
-    .expect("a thread patch spec");
+    let patch_spec =
+        cairn_common::contract::mutation_spec(cairn_uri::ResourceKind::Thread, ChangeMode::Patch)
+            .expect("a thread patch spec");
     for key in [
         "action",
         "jurisdiction",

@@ -2,10 +2,10 @@ use crate::common;
 use std::sync::Arc;
 
 use crate::common::{change_resource_as_run as change_as_run, read_resource};
-use cairn_common::uri::{build_issue_uri, build_project_issues_uri, build_project_uri};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
+use cairn_uri::{build_issue_uri, build_project_issues_uri, build_project_uri};
 use serde_json::json;
 
 struct IssueProjectFixture {

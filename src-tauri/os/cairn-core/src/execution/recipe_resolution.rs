@@ -396,7 +396,7 @@ pub(crate) async fn issue_facts(db: &LocalDb, issue_id: &str) -> Result<IssueFac
             let description = row.opt_text(1)?.filter(|text| !text.is_empty());
             let parent_issue = row.opt_text(2)?;
             let thread = match (row.opt_text(3)?, row.opt_text(4)?) {
-                (Some(key), Some(name)) => Some(cairn_common::uri::build_thread_uri(&key, &name)),
+                (Some(key), Some(name)) => Some(cairn_uri::build_thread_uri(&key, &name)),
                 _ => None,
             };
             drop(rows);
@@ -489,8 +489,8 @@ impl ResolutionCreator {
         }
         match crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request).await {
             Ok(home) => Self {
-                kind: match cairn_common::uri::parse_uri(&home) {
-                    Some(cairn_common::uri::CairnResource::Thread { .. }) => CreatorKind::Thread,
+                kind: match cairn_uri::parse_uri(&home) {
+                    Some(cairn_uri::CairnResource::Thread { .. }) => CreatorKind::Thread,
                     _ => CreatorKind::Agent,
                 },
                 uri: Some(home),

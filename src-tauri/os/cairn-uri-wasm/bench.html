@@ -1,0 +1,18 @@
+<!doctype html>
+<!-- Serve src-tauri/ and open os/cairn-uri-wasm/bench.html after `bun run build:uri-wasm`. -->
+<meta charset="utf-8" />
+<title>cairn-uri-wasm bench</title>
+<pre id="report">measuring…</pre>
+<script type="module">
+  import { measure } from "./bench.mjs";
+  const dir = "../../target/uri-wasm";
+  const report = document.getElementById("report");
+  try {
+    const bytes = new Uint8Array(await (await fetch(`${dir}/cairn_uri_bg.wasm`)).arrayBuffer());
+    const { samples } = await (await fetch(`${dir}/samples.json`)).json();
+    const result = await measure(() => import(`${dir}/cairn_uri.js`), bytes, samples);
+    report.textContent = JSON.stringify(result, null, 2);
+  } catch (error) {
+    report.textContent = `failed: ${error?.stack ?? error}`;
+  }
+</script>

@@ -35,9 +35,9 @@ pub const CHILD_UNOWNED_PUSH_PREFIX: &str = "child-unowned";
 
 use std::collections::{HashMap, HashSet};
 
-use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::sql::placeholders;
 use cairn_db::turso::{params, Value};
+use cairn_uri::{parse_uri, CairnResource};
 use uuid::Uuid;
 
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -439,7 +439,7 @@ pub fn render_pushes(pushes: &[Push]) -> Option<String> {
 /// their nudge decision off the effective wake via [`Wake::wakes_idle`].
 pub async fn has_push_identity(db: &LocalDb, recipient: &str, key: &str) -> DbResult<bool> {
     let recipient = recipient.to_string();
-    let key = cairn_common::uri::canonicalize_uri_identity(key);
+    let key = cairn_uri::canonicalize_uri_identity(key);
     db.read(|conn| {
         let recipient = recipient.clone();
         let key = key.clone();
@@ -563,11 +563,8 @@ const SOURCE_KIND_ISSUE: &str = "issue";
 fn issue_uri_of_push_key(key: &str) -> Option<String> {
     let (_, suffix) = key.split_once(':')?;
     let parsed = parse_uri(suffix)?;
-    let project = parsed.project().map(cairn_common::uri::canonical_project)?;
-    Some(cairn_common::uri::build_issue_uri(
-        &project,
-        parsed.issue_number()?,
-    ))
+    let project = parsed.project().map(cairn_uri::canonical_project)?;
+    Some(cairn_uri::build_issue_uri(&project, parsed.issue_number()?))
 }
 
 /// Like [`push`], but stamps a `fingerprint` — a lightweight content key of the
@@ -589,8 +586,8 @@ pub async fn push_with_fingerprint(
     // skips nudging a downgraded recipient.
     let wake = source_mute_downgrade(db, recipient, key, wake).await?;
     let recipient = recipient.to_string();
-    let content_ref = cairn_common::uri::canonicalize_uri_identity(content_ref);
-    let key = cairn_common::uri::canonicalize_uri_identity(key);
+    let content_ref = cairn_uri::canonicalize_uri_identity(content_ref);
+    let key = cairn_uri::canonicalize_uri_identity(key);
     let fingerprint = fingerprint.map(|s| s.to_string());
     db.write(|conn| {
         let recipient = recipient.clone();
@@ -688,9 +685,9 @@ pub(crate) async fn push_fingerprinted_conn(
     fingerprint: Option<&str>,
     deduplicate: bool,
 ) -> DbResult<Option<(String, Wake)>> {
-    let canonical_content_ref = cairn_common::uri::canonicalize_uri_identity(content_ref);
+    let canonical_content_ref = cairn_uri::canonicalize_uri_identity(content_ref);
     let content_ref = canonical_content_ref.as_str();
-    let canonical_key = cairn_common::uri::canonicalize_uri_identity(key);
+    let canonical_key = cairn_uri::canonicalize_uri_identity(key);
     let key = canonical_key.as_str();
     let now = now_ts();
     let id = Uuid::new_v4().to_string();
@@ -1009,7 +1006,7 @@ pub async fn retire_reviews_of_resolved_issue_conn(
     issue_uri: &str,
     now: i64,
 ) -> DbResult<usize> {
-    let key = cairn_common::uri::canonicalize_uri_identity(&format!("review:{issue_uri}"));
+    let key = cairn_uri::canonicalize_uri_identity(&format!("review:{issue_uri}"));
     let retired = conn
         .execute(
             "UPDATE attention_pushes
@@ -1523,7 +1520,7 @@ fn subject_of(key: &str, content_ref: &str) -> Option<Subject> {
         _ => return None,
     };
     let parsed = parse_uri(content_ref)?;
-    let project_key = parsed.project().map(cairn_common::uri::canonical_project)?;
+    let project_key = parsed.project().map(cairn_uri::canonical_project)?;
     let number = parsed.issue_number()?;
     Some(Subject {
         referent,
@@ -1801,7 +1798,7 @@ pub async fn asks_held_by_agent(db: &LocalDb, keys: &[&str]) -> DbResult<HashMap
     // router-built string would miss every row.
     let canonical: Vec<String> = keys
         .iter()
-        .map(|key| cairn_common::uri::canonicalize_uri_identity(key))
+        .map(|key| cairn_uri::canonicalize_uri_identity(key))
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -1996,7 +1993,7 @@ async fn resolve_subjects(
             let mut terminal: HashSet<String> = HashSet::new();
             let mut rows = conn.query(&sql, binds).await?;
             while let Some(row) = rows.next().await? {
-                let project_key = cairn_common::uri::canonical_project(row.text(0)?);
+                let project_key = cairn_uri::canonical_project(row.text(0)?);
                 // Another project happening to use one of these numbers. The
                 // statement cannot exclude it without costing the index, so the
                 // project qualification is applied here instead.

@@ -8,7 +8,7 @@ use super::super::{build_failure, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::storage::FeedAck;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 /// The whole of what an acknowledgement may carry.
 ///

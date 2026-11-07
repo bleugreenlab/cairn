@@ -14,7 +14,7 @@
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use cairn_common::uri::{build_self_rebuild_outcome_uri, parse_uri, CairnResource};
+use cairn_uri::{build_self_rebuild_outcome_uri, parse_uri, CairnResource};
 
 /// Where an outcome reports: an issue's channel or a durable thread.
 #[derive(Debug, Clone, PartialEq, Eq)]

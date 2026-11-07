@@ -20,8 +20,8 @@ use cairn_common::references::{
     file_reference, quotation_excerpt, reference_uris, render_references_block,
     without_references_block, ReferenceEntry, References, MAX_REFERENCE_ENTRIES,
 };
-use cairn_common::uri::{canonical_project, parse_uri, CairnResource};
 use cairn_db::turso::params;
+use cairn_uri::{canonical_project, parse_uri, CairnResource};
 use futures_util::{stream, StreamExt};
 
 use super::common::{
@@ -91,7 +91,7 @@ pub async fn resolve_reference(orch: &Orchestrator, uri: &str) -> Option<Referen
     if uri.starts_with("file:") {
         return file_reference(uri);
     }
-    let resource = super::delegate_thread_descendant(parse_uri(uri)?).ok()?;
+    let resource = cairn_uri::delegate_thread_descendant(parse_uri(uri)?).ok()?;
     let cite = Cite {
         uri: uri.to_string(),
         resource: resource.kind().slug(),
@@ -231,12 +231,7 @@ impl NodeRef {
         let base = if self.number == 0 {
             format!("cairn://p/{}/{}", self.project, self.node_id)
         } else {
-            cairn_common::uri::build_node_uri(
-                &self.project,
-                self.number,
-                self.exec_seq,
-                &self.node_id,
-            )
+            cairn_uri::build_node_uri(&self.project, self.number, self.exec_seq, &self.node_id)
         };
         match &self.task {
             Some(task) => format!("{base}/task/{task}"),

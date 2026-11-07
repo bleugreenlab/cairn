@@ -1,8 +1,7 @@
-//! The URI data model: scheme constants, the `CairnResource` enum and its
-//! `CairnResourceUri` wrapper, and the data-free `kind()` discriminant.
+//! The URI data model: scheme constants, the `CairnResource` enum, and the
+//! data-free `kind()` discriminant.
 
-use crate::contract::ResourceKind;
-use crate::query::{encode_query_params, QueryParam};
+use crate::ResourceKind;
 
 pub(crate) const PROJECT_SCOPE: &str = "p";
 
@@ -62,23 +61,6 @@ pub fn is_reserved_node_segment(segment: &str) -> bool {
     RESERVED_NODE_SEGMENTS.contains(&segment)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CairnResourceUri {
-    pub(crate) resource: CairnResource,
-    pub(crate) params: Vec<QueryParam>,
-}
-
-impl CairnResourceUri {
-    pub fn to_uri(&self) -> String {
-        let mut uri = self.resource.to_uri();
-        if !self.params.is_empty() {
-            uri.push('?');
-            uri.push_str(&encode_query_params(&self.params));
-        }
-        uri
-    }
-}
-
 /// How a stored image is addressed.
 ///
 /// The sha256 that keys the blob in the content store is the image's *storage
@@ -97,6 +79,11 @@ impl CairnResourceUri {
 /// `attachments/{n}` are two spellings of one row: the first resolves only a row
 /// whose stored kind is an image, the second resolves any of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
 pub enum AttachmentRef {
     /// `cairn://p/{PROJECT}/‹scope›/{images|attachments}/{ordinal}` — the
     /// friendly form, an ordinal inside the scope the object entered through.
@@ -117,6 +104,11 @@ pub enum AttachmentRef {
 /// sequence. `Project` is the residual case — a chat that belongs to neither, or a paste into an issue that
 /// does not exist yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
 pub enum AttachmentScopeRef {
     Issue(i32),
     /// The thread's stable name, which is what its URI carries; the record
@@ -125,7 +117,15 @@ pub enum AttachmentScopeRef {
     Project,
 }
 
+/// With the `serde` feature, a resource is the object
+/// `{"kind": <ResourceKind slug>, ...fields}`: serde's kebab-case of a variant
+/// name is exactly [`crate::ResourceKind::slug`], which `cairn-uri-wasm` pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(tag = "kind", rename_all = "kebab-case")
+)]
 pub enum CairnResource {
     Project {
         project: String,

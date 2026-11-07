@@ -2,8 +2,8 @@ use crate::config::skills::{self as config_skills, FileSkill, SkillMetaUpdate};
 use crate::mcp::handlers::{run_context, skills_resources};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::{build_project_skill_uri, build_skill_uri};
 use cairn_config::library::{LibraryKind, LibraryRoots, Origin};
+use cairn_uri::{build_project_skill_uri, build_skill_uri};
 
 fn payload_string_array(
     payload: &serde_json::Value,
@@ -39,7 +39,7 @@ fn skill_not_found_message(skill_id: &str, explicit_project: Option<&str>) -> St
         Some(project) => {
             format!(
                 "Skill not found in project {}: {skill_id}",
-                cairn_common::uri::canonical_project(project)
+                cairn_uri::canonical_project(project)
             )
         }
         None => format!("Skill not found: {skill_id}"),

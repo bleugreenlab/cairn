@@ -137,7 +137,7 @@ pub(super) async fn read_project_messages(
 /// project-channel message to a session, so a caller choosing between this
 /// page and a live thread needs to know that before posting.
 fn project_board_purpose(project_key: &str) -> String {
-    let threads = cairn_common::uri::build_project_threads_uri(project_key);
+    let threads = cairn_uri::build_project_threads_uri(project_key);
     format!(
         "A project-wide board: a message appended here is stored for whoever reads this page, \
          and it wakes no agent. To reach a live session, append to a thread (listed at \
@@ -209,7 +209,7 @@ pub(super) async fn read_node_messages(
 
     match crate::messages::db::query_directs_for_job(db, &job_id, since, limit) {
         Ok(messages) => {
-            let home = cairn_common::uri::build_node_uri(project_key, number, exec_seq, node_name);
+            let home = cairn_uri::build_node_uri(project_key, number, exec_seq, node_name);
             let label = match task_name {
                 Some(task) => format!("{home}/task/{task}"),
                 None => home,

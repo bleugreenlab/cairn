@@ -11,6 +11,7 @@ async-trait = "0.1"
 tracing = "0.1"
 cairn-attention = { path = "../cairn-attention" }
 cairn-common = { path = "../cairn-common" }
+cairn-uri = { path = "../cairn-uri" }
 cairn-config = { path = "../cairn-config" }
 cairn-db = { path = "../cairn-db" }
 cairn-models-types = { path = "../cairn-models-types" }

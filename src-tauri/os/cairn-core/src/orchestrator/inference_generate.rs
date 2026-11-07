@@ -847,7 +847,7 @@ pub async fn launch(
         project_id: project_id.to_string(),
         issue_id: Some(launched.issue_id.clone()),
         job_id: launched.job_id.clone(),
-        node_uri: cairn_common::uri::build_node_uri(
+        node_uri: cairn_uri::build_node_uri(
             &launched.project_key,
             launched.issue_number,
             launched.exec_seq,
@@ -1119,7 +1119,7 @@ async fn asked_question_in(
     let answered_on = match response {
         Some(_) => crate::channels::ledger::resolution_for_action(
             db,
-            &cairn_common::uri::canonicalize_uri_identity(&prompt_id),
+            &cairn_uri::canonicalize_uri_identity(&prompt_id),
         )
         .await?
         .map(|winner| winner.resolution_provenance().map(|answer| answer.surface))

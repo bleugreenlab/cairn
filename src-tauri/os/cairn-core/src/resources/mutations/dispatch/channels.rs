@@ -4,7 +4,7 @@ use crate::channels::{agent_message, provider_notify_fit};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::resources::channels::{admit_send, check_send_length};
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 fn required_text<'a>(
     index: usize,

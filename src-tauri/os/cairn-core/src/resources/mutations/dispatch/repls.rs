@@ -11,7 +11,7 @@ use super::super::{build_failure, payload_trimmed_non_empty_str, ResourceMutatio
 use crate::mcp::handlers::repl::{self, ReplLang};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::uri::CairnResource;
+use cairn_uri::CairnResource;
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,

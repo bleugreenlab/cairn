@@ -14,7 +14,7 @@
 //!
 //! [`OutboundInitiator::Agent`]: super::OutboundInitiator::Agent
 
-use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_uri::{parse_uri, CairnResource};
 use uuid::Uuid;
 
 use super::{ledger, render_text_floor, ConversationAddress, OutboundAsk};

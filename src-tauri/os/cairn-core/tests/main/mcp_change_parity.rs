@@ -16,11 +16,13 @@
 use crate::common;
 
 use cairn_common::contract::{
-    mutation_spec, ChangeMode, KeyType, MutationSpec, ResourceKind, RESOURCE_CONTRACTS,
+    mutation_spec, ChangeMode, KeyType, MutationSpec, RESOURCE_CONTRACTS,
 };
-use cairn_common::uri::samples::every_resource_variant;
+
 use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
+use cairn_uri::samples::every_resource_variant;
+use cairn_uri::ResourceKind;
 use serde_json::json;
 
 /// Kinds whose dispatcher deliberately refuses every unsupported mode ahead of

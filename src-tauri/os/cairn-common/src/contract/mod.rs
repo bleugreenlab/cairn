@@ -39,6 +39,8 @@ pub use nodes::PR_ARTIFACT_ACTION_LABEL;
 pub use specs::BROWSER_ACTIONS;
 pub use types::*;
 
+use cairn_uri::ResourceKind;
+
 /// Look up the contract for a kind.
 pub fn contract_for(kind: ResourceKind) -> Option<&'static ResourceContract> {
     RESOURCE_CONTRACTS
@@ -615,7 +617,7 @@ mod tests {
     #[test]
     fn every_example_key_is_a_declared_key() {
         for contract in RESOURCE_CONTRACTS {
-            if contract.kind.payload_keys_are_schema_resolved() {
+            if payload_keys_are_schema_resolved(contract.kind) {
                 continue;
             }
             for spec in contract.mutations {
