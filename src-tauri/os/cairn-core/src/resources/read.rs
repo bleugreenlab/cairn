@@ -3071,7 +3071,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node batches", &params) {
                 error
             } else {
-                read_node_batches(db, &project, number, exec_seq, &node_id, None).await
+                read_node_batches(db, &project, number, exec_seq, &node_id, None, None).await
             }
         }
         CairnResource::NodeBatch {
@@ -3084,7 +3084,61 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node batch", &params) {
                 error
             } else {
-                read_node_batches(db, &project, number, exec_seq, &node_id, Some(&request_id)).await
+                read_node_batches(
+                    db,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    None,
+                    Some(&request_id),
+                )
+                .await
+            }
+        }
+        CairnResource::TaskBatches {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => {
+            if let Some(error) = reject_query_params("task batches", &params) {
+                error
+            } else {
+                read_node_batches(
+                    db,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    Some(&task_name),
+                    None,
+                )
+                .await
+            }
+        }
+        CairnResource::TaskBatch {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            request_id,
+        } => {
+            if let Some(error) = reject_query_params("task batch", &params) {
+                error
+            } else {
+                read_node_batches(
+                    db,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    Some(&task_name),
+                    Some(&request_id),
+                )
+                .await
             }
         }
         CairnResource::TaskChecks {

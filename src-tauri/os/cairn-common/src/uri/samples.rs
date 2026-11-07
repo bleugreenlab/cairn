@@ -205,6 +205,8 @@ resource_samples! {
         node_id: node(),
         request_id: "req-1".to_string(),
     } => Parser,
+    TaskBatches { project: project(), number: 42, exec_seq: 2, node_id: node(), task_name: "task-1".to_string() } => Parser,
+    TaskBatch { project: project(), number: 42, exec_seq: 2, node_id: node(), task_name: "task-1".to_string(), request_id: "req-1".to_string() } => Parser,
     NodeQuestions { project: project(), number: 42, exec_seq: 2, node_id: node() } => Parser,
     NodeQuestion {
         project: project(),

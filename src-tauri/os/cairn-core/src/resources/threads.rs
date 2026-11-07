@@ -331,6 +331,8 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
         ["tasks"] => at_thread!(NodeTasks),
         ["calls"] => at_thread!(NodeCalls),
         ["wakes"] => at_thread!(NodeWakes),
+        ["batches"] => at_thread!(NodeBatches),
+        ["batches", request_id] => at_thread!(NodeBatch, request_id: (*request_id).to_string()),
         ["questions"] => at_thread!(NodeQuestions),
         ["questions", segment] => at_thread!(NodeQuestion, segment: (*segment).to_string()),
         ["permissions"] => at_thread!(NodePermissions),
@@ -385,6 +387,12 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
         // mutation the contract does not offer and sent a live task looping
         // through addresses (CAIRN-3874).
         ["task", task, "checks"] => at_thread!(TaskChecks, task_name: (*task).to_string()),
+        ["task", task, "batches"] => at_thread!(TaskBatches, task_name: (*task).to_string()),
+        ["task", task, "batches", request_id] => at_thread!(
+            TaskBatch,
+            task_name: (*task).to_string(),
+            request_id: (*request_id).to_string(),
+        ),
         ["task", task, "artifact"] => at_thread!(
             TaskArtifact,
             task_name: (*task).to_string(),

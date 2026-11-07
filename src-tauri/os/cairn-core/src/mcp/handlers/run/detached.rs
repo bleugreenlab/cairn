@@ -192,7 +192,7 @@ pub(crate) fn has_live_resolver(request_id: &str) -> bool {
         .contains(request_id)
 }
 
-/// The node-relative handle a detached batch is read at.
+/// The caller-home-relative handle, resolved beneath the owning node or task.
 pub(crate) fn handle_uri(request_id: &str) -> String {
     format!("cairn:~/batches/{request_id}")
 }
@@ -295,7 +295,7 @@ pub(crate) fn render(batch: &DetachedBatch) -> String {
 }
 
 /// One line for the node's batch list.
-pub(crate) fn summary_line(batch: &DetachedBatch) -> String {
+pub(crate) fn summary_line(batch: &DetachedBatch, home: &str) -> String {
     let state = match batch.state {
         DetachedState::Running => "running".to_string(),
         DetachedState::Settled => format!(
@@ -306,8 +306,8 @@ pub(crate) fn summary_line(batch: &DetachedBatch) -> String {
         DetachedState::Lost => "lost".to_string(),
     };
     format!(
-        "`{}` '{}': {state}",
-        handle_uri(&batch.request_id),
+        "`{home}/batches/{}` '{}': {state}",
+        batch.request_id,
         label_of(batch)
     )
 }

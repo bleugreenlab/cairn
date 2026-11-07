@@ -613,6 +613,31 @@ pub fn build_node_batch_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "batches", request_id)
 }
 
+pub fn build_task_batches_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+) -> String {
+    build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "batches")
+}
+
+pub fn build_task_batch_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        build_task_batches_uri(project, number, exec_seq, node_id, task_name),
+        request_id
+    )
+}
+
 pub fn build_task_checks_uri(
     project: &str,
     number: i32,
@@ -1424,6 +1449,21 @@ impl CairnResource {
                 node_id,
                 request_id,
             } => build_node_batch_uri(project, *number, *exec_seq, node_id, request_id),
+            Self::TaskBatches {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_task_batches_uri(project, *number, *exec_seq, node_id, task_name),
+            Self::TaskBatch {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                request_id,
+            } => build_task_batch_uri(project, *number, *exec_seq, node_id, task_name, request_id),
             Self::TaskChecks {
                 project,
                 number,

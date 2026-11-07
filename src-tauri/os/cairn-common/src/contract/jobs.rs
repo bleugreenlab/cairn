@@ -56,7 +56,7 @@ pub(crate) const NODE_BATCHES_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::NodeBatches,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/batches",
     name: "Node batches",
-    description: "Run batches that kept running after their call answered with a handle, newest first: state, verdict, and what each committed (read-only)",
+    description: "Run batches owned by this node only (not its tasks) that kept running after their call answered with a handle, newest first: state, verdict, and what each committed (read-only)",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -325,3 +325,25 @@ pub(crate) const TASK_PERMISSION_CONTRACT: ResourceContract =
             example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/task/review/permissions/perm-1\",mode:\"patch\",payload:{decision:\"allow\",scope:\"once\"}}]})",
         }],
     };
+
+pub(crate) const TASK_BATCHES_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::TaskBatches,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/batches",
+    name: "Task batches",
+    description: "Detached run batches owned by this task only, newest first (read-only)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const TASK_BATCH_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::TaskBatch,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/batches/{request_id}",
+    name: "Task batch",
+    description: "Detached run batch state, verdict, output and commit (read-only)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};

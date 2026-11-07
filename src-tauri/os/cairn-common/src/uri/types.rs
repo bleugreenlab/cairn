@@ -534,6 +534,23 @@ pub enum CairnResource {
         node_id: String,
         request_id: String,
     },
+    /// Detached run batches owned by a sub-agent task job.
+    TaskBatches {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+    },
+    /// One detached run batch owned by a sub-agent task job.
+    TaskBatch {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+        request_id: String,
+    },
     /// Turn-end project check results owned by a sub-agent task job (collection).
     TaskChecks {
         project: String,
@@ -1249,6 +1266,8 @@ impl CairnResource {
             Self::NodeChecks { .. } => ResourceKind::NodeChecks,
             Self::NodeBatches { .. } => ResourceKind::NodeBatches,
             Self::NodeBatch { .. } => ResourceKind::NodeBatch,
+            Self::TaskBatches { .. } => ResourceKind::TaskBatches,
+            Self::TaskBatch { .. } => ResourceKind::TaskBatch,
             Self::TaskChecks { .. } => ResourceKind::TaskChecks,
             Self::NodeQuestions { .. } => ResourceKind::NodeQuestions,
             Self::NodeQuestion { .. } => ResourceKind::NodeQuestion,

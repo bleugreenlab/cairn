@@ -11488,6 +11488,102 @@ pub(crate) mod host_batch_tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_detached_handle_reads_running_and_settled_through_its_home() {
+        use crate::resources::read_cairn_resource;
+        for thread_home in [false, true] {
+            let orch = env().await;
+            for sql in [
+                "UPDATE jobs SET node_name='Atomic incident',uri_segment='atomic-incident' WHERE id='job-1'",
+                "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('parent','e','i','p','Builder','running',1,1,'builder')",
+                "UPDATE jobs SET parent_job_id='parent' WHERE id='job-1'",
+                "INSERT INTO jobs (id,parent_job_id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('sibling','parent','e','i','p','Sibling','running',1,1,'sibling')",
+            ] {
+                orch.db.local.execute(sql, ()).await.unwrap();
+            }
+            let parent_home = if thread_home {
+                for sql in [
+                    "INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('thread','p','execution','active','none',1,1)",
+                    "UPDATE jobs SET thread_id='thread',issue_id=NULL,execution_id=NULL",
+                    "UPDATE jobs SET uri_segment='thread' WHERE id='parent'",
+                ] {
+                    orch.db.local.execute(sql, ()).await.unwrap();
+                }
+                "cairn://p/prj/execution"
+            } else {
+                "cairn://p/prj/1/1/builder"
+            };
+            let task_home = format!("{parent_home}/task/atomic-incident");
+            let mut request = call_request(declared_payload());
+            request.tool_use_id = None;
+            let actual_home = super::super::run_context::lookup_home_uri_routed(&orch.db, &request)
+                .await
+                .unwrap();
+            assert_eq!(actual_home, task_home);
+
+            let control = BatchControl::new(false);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let deadlines = CallDeadlines::new(
+                tokio::time::Instant::now(),
+                ms(50),
+                ms(100),
+                ms(1_500),
+                Some(ms(600_000)),
+            );
+            let answer =
+                envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
+            let handle = answer
+                .split('`')
+                .find(|s| s.starts_with("cairn:~/batches/"))
+                .expect("detach response names a readable handle");
+            let canonical = format!("{task_home}/batches/{}", control.request_id);
+            assert_eq!(
+                crate::resources::resolve_home_relative_against(&task_home, handle).as_deref(),
+                Some(canonical.as_str()),
+            );
+            for uri in [handle, canonical.as_str()] {
+                let running = read_cairn_resource(&orch, &request, uri).await;
+                assert!(running.contains("State: running"), "{uri}: {running}");
+                assert!(running.contains("## Task batch"), "{running}");
+            }
+            let task_list = read_cairn_resource(&orch, &request, "cairn:~/batches").await;
+            assert!(task_list.contains(&canonical), "{task_list}");
+            let parent_list =
+                read_cairn_resource(&orch, &request, &format!("{parent_home}/batches")).await;
+            assert!(!parent_list.contains(&control.request_id), "{parent_list}");
+            assert!(parent_list.contains("Tasks' batches"), "{parent_list}");
+            let parent_handle = format!("{parent_home}/batches/{}", control.request_id);
+            let misplaced = read_cairn_resource(&orch, &request, &parent_handle).await;
+            assert!(
+                misplaced.contains("belongs to a different job"),
+                "{misplaced}"
+            );
+            assert!(misplaced.contains(&canonical), "{misplaced}");
+
+            control.set_verdict("failed".to_string());
+            deliver_and_expect_one_notice(
+                &orch,
+                &control.request_id,
+                tx,
+                "compiler error: specimen",
+            )
+            .await;
+            for uri in [handle, canonical.as_str()] {
+                let settled = read_cairn_resource(&orch, &request, uri).await;
+                assert!(settled.contains("State: settled"), "{settled}");
+                assert!(settled.contains("Verdict: failed"), "{settled}");
+                assert!(settled.contains("compiler error: specimen"), "{settled}");
+            }
+            let sibling_handle =
+                format!("{parent_home}/task/sibling/batches/{}", control.request_id);
+            let sibling = read_cairn_resource(&orch, &request, &sibling_handle).await;
+            assert!(sibling.contains(&canonical), "{sibling}");
+            assert!(!sibling.contains("compiler error: specimen"), "{sibling}");
+            let missing = read_cairn_resource(&orch, &request, "cairn:~/batches/missing").await;
+            assert!(missing.contains("No detached run batch"), "{missing}");
+        }
+    }
+
     /// A call whose transcript holds no `run` call of its own to claim (the
     /// Claude parallel-block race) detaches too.
     #[tokio::test(flavor = "multi_thread")]

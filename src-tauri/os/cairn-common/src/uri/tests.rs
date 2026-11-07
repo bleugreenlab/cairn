@@ -2168,6 +2168,31 @@ fn project_map_uri_parses_builds_and_reports_its_kind() {
 }
 
 #[test]
+fn task_batch_uris_roundtrip_with_owner_coordinates() {
+    let list = build_task_batches_uri("CAIRN", 42, 2, "builder", "atomic-incident");
+    let item = build_task_batch_uri("CAIRN", 42, 2, "builder", "atomic-incident", "req-1");
+    for (uri, kind) in [
+        (&list, ResourceKind::TaskBatches),
+        (&item, ResourceKind::TaskBatch),
+    ] {
+        let parsed = parse_uri(uri).unwrap();
+        assert_eq!(parsed.kind(), kind);
+        assert_eq!(parsed.to_uri(), *uri);
+        assert_eq!(parsed.project(), Some("cairn"));
+        assert_eq!(parsed.issue_number(), Some(42));
+        assert_eq!(parsed.to_route(), None);
+    }
+    assert!(
+        matches!(parse_uri(&item), Some(CairnResource::TaskBatch { task_name, request_id, .. })
+        if task_name == "atomic-incident" && request_id == "req-1")
+    );
+    assert_eq!(
+        item,
+        "cairn://p/cairn/42/2/builder/task/atomic-incident/batches/req-1"
+    );
+}
+
+#[test]
 fn request_uris_roundtrip_and_reject_unsafe_ids() {
     for (uri, kind) in [
         ("cairn://requests", ResourceKind::Requests),

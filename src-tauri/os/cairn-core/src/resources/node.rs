@@ -605,7 +605,7 @@ pub(super) async fn read_node_wakes(
     .await
 }
 
-/// A node's run batches that outlived their calls, or one of them by request
+/// A node or task job's batches that outlived their calls, or one by request
 /// id: the handle a detached call answered with.
 pub(super) async fn read_node_batches(
     db: &LocalDb,
@@ -613,6 +613,7 @@ pub(super) async fn read_node_batches(
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    task_name: Option<&str>,
     request_id: Option<&str>,
 ) -> String {
     use crate::mcp::handlers::run::detached;
@@ -622,33 +623,47 @@ pub(super) async fn read_node_batches(
         number,
         exec_seq,
         node_name,
-        None,
+        task_name,
     )
     .await
     {
         Ok(job_id) => job_id,
         Err(error) => return error,
     };
+    let label = task_name.unwrap_or(node_name);
+    let home = match crate::jobs::queries::home_uri_for_job(db, &job_id).await {
+        Ok(Some(home)) => home,
+        Ok(None) => return "Could not resolve this job's batch home.".to_string(),
+        Err(error) => return format!("Could not resolve this job's batch home: {error}"),
+    };
     match request_id {
         Some(request_id) => match detached::load(db, request_id).await {
             Ok(Some(batch)) if batch.job_id == job_id => detached::render(&batch),
-            Ok(_) => format!(
-                "No run batch `{request_id}` kept running for {node_name} after its call answered. A batch whose call answered with its own result has no handle here."
+            Ok(Some(batch)) => {
+                match crate::jobs::queries::home_uri_for_job(db, &batch.job_id).await {
+                    Ok(Some(owner)) => format!(
+                        "Run batch `{request_id}` belongs to a different job. Read `{owner}/batches/{request_id}`. This collection lists only batches owned by `{home}`, not its tasks."
+                    ),
+                    _ => format!("Run batch `{request_id}` exists but belongs to a different job, not `{home}`."),
+                }
+            }
+            Ok(None) => format!(
+                "No detached run batch `{request_id}` was found. This collection lists only batches owned by `{home}`, not its tasks. A batch whose call answered with its own result has no handle here."
             ),
             Err(error) => format!("Could not read run batch `{request_id}`: {error}"),
         },
         None => match detached::for_job(db, &job_id).await {
             Ok(batches) if batches.is_empty() => format!(
-                "# Batches ({node_name})\n\nNo run batch of this node has kept running past its call.\n"
+                "# Batches ({label})\n\nNo run batch owned by this job has kept running past its call. Tasks' batches live under each task's own `batches` collection.\n"
             ),
             Ok(batches) => {
-                let mut out = format!("# Batches ({node_name})\n\n");
+                let mut out = format!("# Batches ({label})\n\nOnly this job's batches; tasks have their own `batches` collections.\n\n");
                 for batch in batches {
-                    out.push_str(&format!("- {}\n", detached::summary_line(&batch)));
+                    out.push_str(&format!("- {}\n", detached::summary_line(&batch, &home)));
                 }
                 out
             }
-            Err(error) => format!("Could not read this node's batches: {error}"),
+            Err(error) => format!("Could not read this job's batches: {error}"),
         },
     }
 }
