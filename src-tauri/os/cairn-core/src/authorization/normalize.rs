@@ -117,6 +117,46 @@ pub fn change_item_act(kind: &str, item: &ChangeItem) -> ActDigest {
     })
 }
 
+/// Removing a stored object → `Resource(its attachments/{n} address) + Write`,
+/// a `Delete`.
+///
+/// `images/{n}` and `attachments/{n}` spell one record, so the place is always
+/// the general spelling and a grant for either covers both. The act binds the
+/// reason and whether shared references go too, so a once approval covers
+/// exactly the removal the operator read and no other.
+pub fn stored_content_removal(
+    attachment_uri: &str,
+    reason: &str,
+    include_shared: bool,
+) -> AuthorityRequest {
+    let summary = if include_shared {
+        format!(
+            "remove {attachment_uri} and every other reference to the same bytes, deleting \
+             the stored bytes (reason: {reason})"
+        )
+    } else {
+        format!("remove {attachment_uri}, deleting its stored bytes (reason: {reason})")
+    };
+    AuthorityRequest::new(
+        AuthorityScope::new(
+            AuthorityPlace::Resource {
+                canonical_uri: attachment_uri.to_string(),
+            },
+            AuthorityAction::Write,
+        ),
+        AuthorityMutation::Delete,
+        summary,
+    )
+    .with_act(ActDigest::of("attachments.remove", |encoder| {
+        encoder.field("uri", attachment_uri);
+        encoder.field("reason", reason);
+        encoder.field(
+            "include_shared",
+            if include_shared { "true" } else { "false" },
+        );
+    }))
+}
+
 /// Writing Cairn's inference records (`cairn://inference` replace, or a patch
 /// that upserts or removes) → the same `WorkspaceSettings(inference) + Write`
 /// place a `cairn://settings` `inference` patch reaches.

@@ -13,6 +13,7 @@ mod actions;
 mod agents;
 mod artifacts;
 mod attachments;
+pub(crate) use attachments::attachment_removal_authority;
 mod browsers;
 mod bug;
 mod channels;

@@ -114,6 +114,13 @@ pub async fn prepare_batch(
         {
             prepared.push((index, outcome));
         }
+        // Removing a stored object deletes its bytes for every reader; only
+        // the operator allows it, whoever owns the issue it was attached in.
+        if let Some(outcome) =
+            crate::resources::mutations::attachment_removal_authority(orch, request, item).await
+        {
+            prepared.push((index, outcome));
+        }
         for request in crate::resources::mutations::workspace_settings_authority(item) {
             prepared.push((
                 index,

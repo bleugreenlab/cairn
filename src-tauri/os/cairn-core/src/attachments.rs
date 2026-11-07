@@ -227,6 +227,33 @@ pub enum AttachmentError {
     },
     #[error("attachment {uri} was retired and no longer resolves")]
     Retired { uri: String },
+    /// The object behind this address was deliberately removed. Carries the
+    /// tombstone, which is everything any address that once named it shows.
+    #[error(
+        "{uri} was removed by {removed_by} on {when}: {reason}. Its stored bytes were \
+         deleted, so this record is all that remains"
+    )]
+    Removed {
+        uri: String,
+        removed_by: String,
+        when: String,
+        reason: String,
+    },
+    #[error(
+        "removing stored content needs a reason; it is recorded on the tombstone every \
+         address shows afterwards"
+    )]
+    ReasonRequired,
+    /// Deleting the bytes would take other live references with them. Nothing
+    /// was changed; the list is what the caller must confirm.
+    #[error(
+        "{uri} shares its bytes with {} other live reference(s): {}. Deleting the bytes \
+         removes every one of them, so nothing was changed. To remove them all, repeat \
+         with includeShared: true",
+        .others.len(),
+        .others.join(", ")
+    )]
+    SharedContent { uri: String, others: Vec<String> },
     #[error("attachment {hash} failed its content hash integrity check")]
     Corrupt { hash: String },
     #[error("content store {operation} failed: {message}")]
@@ -390,6 +417,33 @@ pub struct AttachmentRow {
     pub author_principal_json: Option<String>,
     pub created_at: i64,
     pub retired_at: Option<i64>,
+    pub removal: Option<AttachmentRemoval>,
+}
+
+/// The tombstone a removal leaves: who deleted an object's bytes, when, why,
+/// and on what authority. It outlives the bytes, so every address that named
+/// them answers with this record rather than an unexplained absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentRemoval {
+    pub removed_at: i64,
+    pub removed_by: String,
+    pub reason: String,
+    /// The authorization journal row that allowed the removal, when one was
+    /// recorded.
+    pub decision_id: Option<String>,
+}
+
+impl AttachmentRemoval {
+    fn refusal(&self, uri: String) -> AttachmentError {
+        AttachmentError::Removed {
+            uri,
+            removed_by: self.removed_by.clone(),
+            when: chrono::DateTime::from_timestamp(self.removed_at, 0)
+                .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| self.removed_at.to_string()),
+            reason: self.reason.clone(),
+        }
+    }
 }
 
 impl AttachmentRow {
@@ -416,7 +470,8 @@ impl AttachmentRow {
 }
 
 const ATTACHMENT_COLUMNS: &str = "ordinal, content_hash, kind, media_type, declared_media_type,
-     file_name, byte_size, origin_node_uri, author_principal_json, created_at, retired_at";
+     file_name, byte_size, origin_node_uri, author_principal_json, created_at, retired_at,
+     removed_at, removed_by, removal_reason, removal_decision_id";
 
 fn map_attachment_row(
     scope: &AttachmentScopeRef,
@@ -435,6 +490,15 @@ fn map_attachment_row(
         author_principal_json: row.opt_text(8)?,
         created_at: row.i64(9)?,
         retired_at: row.opt_i64(10)?,
+        removal: match row.opt_i64(11)? {
+            Some(removed_at) => Some(AttachmentRemoval {
+                removed_at,
+                removed_by: row.opt_text(12)?.unwrap_or_default(),
+                reason: row.opt_text(13)?.unwrap_or_default(),
+                decision_id: row.opt_text(14)?,
+            }),
+            None => None,
+        },
     })
 }
 
@@ -788,9 +852,21 @@ pub async fn fetch_attachment(
     reference: &AttachmentRef,
 ) -> Result<FetchedAttachment, AttachmentError> {
     let row = match reference {
-        AttachmentRef::Hash(_) => None,
+        AttachmentRef::Hash(hash) => {
+            // A permalink names bytes, not a record, so it is refused whenever
+            // every record of those bytes is a tombstone. On a team replica the
+            // broker may still hold them (cairn/6330); this is what keeps the
+            // permalink from fetching them back.
+            if let Some(removal) = removal_of_hash(db, hash).await? {
+                return Err(removal.refusal(build_project_attachment_uri(project_key, reference)));
+            }
+            None
+        }
         AttachmentRef::Scoped { scope, ordinal } => {
             let row = resolve_attachment(db, project_id, project_key, scope, *ordinal).await?;
+            if let Some(removal) = &row.removal {
+                return Err(removal.refusal(row.canonical_uri(project_key)));
+            }
             if row.retired_at.is_some() {
                 return Err(AttachmentError::Retired {
                     uri: row.attachment_uri(project_key),
@@ -876,6 +952,9 @@ pub async fn peek_media_type(
         AttachmentRef::Hash(_) => Ok(None),
         AttachmentRef::Scoped { scope, ordinal } => {
             let row = resolve_attachment(db, project_id, project_key, scope, *ordinal).await?;
+            if let Some(removal) = &row.removal {
+                return Err(removal.refusal(row.canonical_uri(project_key)));
+            }
             if row.retired_at.is_some() {
                 return Err(AttachmentError::Retired {
                     uri: row.attachment_uri(project_key),
@@ -945,14 +1024,14 @@ pub async fn list_attachments(
 /// Retire a reference: its address stops resolving and the reference is marked
 /// spent.
 ///
-/// This does NOT delete the object. Nothing in this module deletes from the
-/// content store, and that restraint is the correct engineering call rather than
-/// caution for its own sake: the private database's `cas_cache` holds a mixture
-/// of objects whose authoritative home is that database and read-through cached
-/// copies of objects whose home is a per-team broker shared with every other
-/// member, so a reference inventory computed inside one database is not
-/// authoritative over either. Physical reclamation is blocked on cairn/4648's
-/// global inventory.
+/// This does NOT delete the object, and retiring the last reference to it does
+/// not reclaim it: the private database's `cas_cache` holds a mixture of objects
+/// whose authoritative home is that database and read-through cached copies of
+/// objects whose home is a per-team broker shared with every other member, so a
+/// reference inventory computed inside one database is not authoritative over
+/// either. Reclamation is blocked on cairn/4648's global inventory. Deleting
+/// bytes on purpose is [`remove_attachment`], an authorized act against
+/// references the caller has seen.
 pub async fn retire_attachment(
     db: &LocalDb,
     project_id: &str,
@@ -985,6 +1064,410 @@ pub async fn retire_attachment(
         message: error.to_string(),
     })?;
     resolve_attachment(db, project_id, project_key, scope, ordinal).await
+}
+
+/// The tombstone behind a content hash, when every record of those bytes in
+/// this database is one. A live record means the bytes were attached again
+/// after the removal, which is a new act the tombstone does not speak for.
+async fn removal_of_hash(
+    db: &LocalDb,
+    hash: &str,
+) -> Result<Option<AttachmentRemoval>, AttachmentError> {
+    db.query_opt(
+        "SELECT removed_at, removed_by, removal_reason, removal_decision_id FROM attachments
+         WHERE content_hash = ?1 AND removed_at IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM attachments WHERE content_hash = ?1 AND removed_at IS NULL)
+         ORDER BY removed_at DESC
+         LIMIT 1",
+        (hash.to_string(),),
+        |row| {
+            Ok(AttachmentRemoval {
+                removed_at: row.i64(0)?,
+                removed_by: row.opt_text(1)?.unwrap_or_default(),
+                reason: row.opt_text(2)?.unwrap_or_default(),
+                decision_id: row.opt_text(3)?,
+            })
+        },
+    )
+    .await
+    .map_err(|error| AttachmentError::Reference {
+        operation: "resolve removal",
+        message: error.to_string(),
+    })
+}
+
+/// One record of a content hash, wherever in a database it was attached.
+#[derive(Debug, Clone)]
+struct HashReference {
+    project_id: String,
+    scope: AttachmentScopeRef,
+    ordinal: i32,
+    uri: String,
+    retired: bool,
+}
+
+/// Every unremoved record of `hash` in one database, across all its projects.
+async fn references_to(db: &LocalDb, hash: &str) -> Result<Vec<HashReference>, AttachmentError> {
+    db.query_all(
+        "SELECT a.project_id, a.scope, a.scope_key, a.ordinal, a.kind, a.issue_number,
+                t.name, p.key, a.retired_at
+         FROM attachments a
+         JOIN projects p ON p.id = a.project_id
+         LEFT JOIN threads t ON t.id = a.thread_id
+         WHERE a.content_hash = ?1 AND a.removed_at IS NULL",
+        (hash.to_string(),),
+        |row| {
+            let scope = match row.text(1)?.as_str() {
+                "issue" => AttachmentScopeRef::Issue(row.opt_i64(5)?.unwrap_or_default() as i32),
+                "thread" => AttachmentScopeRef::Thread(match row.opt_text(6)? {
+                    Some(name) => name,
+                    None => row.text(2)?,
+                }),
+                _ => AttachmentScopeRef::Project,
+            };
+            let ordinal = row.i64(3)? as i32;
+            let project_key = row.text(7)?;
+            let reference = AttachmentRef::Scoped {
+                scope: scope.clone(),
+                ordinal,
+            };
+            let uri = match AttachmentKind::from_str(&row.text(4)?) {
+                AttachmentKind::Image => build_project_image_uri(&project_key, &reference),
+                AttachmentKind::File => build_project_attachment_uri(&project_key, &reference),
+            };
+            Ok(HashReference {
+                project_id: row.text(0)?,
+                scope,
+                ordinal,
+                uri,
+                retired: row.opt_i64(8)?.is_some(),
+            })
+        },
+    )
+    .await
+    .map_err(|error| AttachmentError::Reference {
+        operation: "list references",
+        message: error.to_string(),
+    })
+}
+
+/// Who is removing a stored object, why, and on what authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalRequest {
+    /// The remover as a reader should see it: the operator, or a run's node.
+    pub removed_by: String,
+    pub reason: String,
+    /// The authorization decision that allowed it, cited on the tombstone.
+    pub decision_id: Option<String>,
+    /// Remove every other live reference to the same bytes as well. Without
+    /// it, shared bytes are refused and the other references listed.
+    pub include_shared: bool,
+}
+
+/// What one removal did and, as plainly, what it could not do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalOutcome {
+    /// The address the removal was asked for.
+    pub uri: String,
+    /// Every address that now shows the tombstone, the asked one first.
+    pub tombstoned: Vec<String>,
+    /// The address had already been removed; nothing changed.
+    pub already_removed: bool,
+    /// Whether a stored copy of the bytes was found and deleted.
+    pub bytes_deleted: bool,
+    /// Copies this removal could not reach, each named.
+    pub unreached: Vec<String>,
+}
+
+impl RemovalOutcome {
+    /// The outcome as the remover reads it, unreached copies included.
+    pub fn summary(&self) -> String {
+        if self.already_removed {
+            return format!("{} was already removed; nothing changed.", self.uri);
+        }
+        let mut out = format!("Removed {}.", self.uri);
+        if self.tombstoned.len() > 1 {
+            out.push_str(&format!(
+                " Every other reference to the same bytes was removed with it: {}.",
+                self.tombstoned[1..].join(", ")
+            ));
+        }
+        out.push_str(if self.bytes_deleted {
+            " Its stored bytes were deleted from this machine."
+        } else {
+            " This machine held no stored copy of its bytes."
+        });
+        out.push_str(" Every address now answers with the tombstone.");
+        if !self.unreached.is_empty() {
+            out.push_str("\n\nThis removal could not reach:\n");
+            for unreached in &self.unreached {
+                out.push_str(&format!("- {unreached}\n"));
+            }
+        }
+        out
+    }
+}
+
+/// The operator's own removal, through a credential-proven door: journaled as
+/// the operator's act in the private database's authorization journal, then
+/// performed with the tombstone citing that journal row. An agent never comes
+/// here; it removes through the write path's operator approval.
+#[allow(clippy::too_many_arguments)]
+pub async fn remove_as_operator(
+    db: &LocalDb,
+    private: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    scope: &AttachmentScopeRef,
+    ordinal: i32,
+    reason: &str,
+    include_shared: bool,
+    operator: cairn_common::identity::PrincipalRef,
+    operator_label: &str,
+) -> Result<RemovalOutcome, AttachmentError> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(AttachmentError::ReasonRequired);
+    }
+    let preflight = removal_preflight(
+        db,
+        private,
+        project_id,
+        project_key,
+        scope,
+        ordinal,
+        include_shared,
+    )
+    .await?;
+    let decision_id = if preflight.row.removal.is_some() {
+        None
+    } else {
+        let attachment_uri = build_project_attachment_uri(
+            project_key,
+            &AttachmentRef::Scoped {
+                scope: scope.clone(),
+                ordinal,
+            },
+        );
+        let authority = crate::authorization::normalize::stored_content_removal(
+            &attachment_uri,
+            reason,
+            include_shared,
+        );
+        crate::authorization::journal_operator_act(private, &authority, operator).await
+    };
+    remove_attachment(
+        db,
+        private,
+        project_id,
+        project_key,
+        scope,
+        ordinal,
+        &RemovalRequest {
+            removed_by: operator_label.to_string(),
+            reason: reason.to_string(),
+            decision_id,
+            include_shared,
+        },
+    )
+    .await
+}
+
+/// Copies of a removed object that no removal can reach from here, whatever
+/// store held it. Stated on every outcome because a removal that implied it
+/// had taken back what was already disclosed would be the more dangerous lie.
+pub const REMOVAL_LIMITS: &[&str] = &[
+    "copies already sent to a model provider by any run that read the object; the provider's retention is outside Cairn",
+    "provider session files on the machines that ran those sessions",
+    "Codex transcript events that carried the bytes inline, and archived transcript packs (cairn/6331)",
+    "project exports already written out",
+    "freed database pages, until the database is compacted",
+];
+
+/// What a removal would reach, settled before anything changes so a caller can
+/// refuse without asking anyone to approve it.
+#[derive(Debug, Clone)]
+pub struct RemovalPreflight {
+    pub row: AttachmentRow,
+    /// The record's canonical address.
+    pub uri: String,
+    /// Other live references to the same bytes.
+    pub others: Vec<String>,
+    /// Retired references to the same bytes, tombstoned without being asked
+    /// about because they no longer resolve.
+    pub retired: Vec<String>,
+}
+
+fn removal_stores<'a>(db: &'a LocalDb, cache: &'a LocalDb) -> Vec<&'a LocalDb> {
+    if std::ptr::eq(db, cache) {
+        vec![db]
+    } else {
+        vec![db, cache]
+    }
+}
+
+/// Resolve the record and every other reference to its bytes, refusing shared
+/// bytes the caller has not included. A record already removed resolves with
+/// its tombstone and no references, since there is nothing left to remove.
+pub async fn removal_preflight(
+    db: &LocalDb,
+    cache: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    scope: &AttachmentScopeRef,
+    ordinal: i32,
+    include_shared: bool,
+) -> Result<RemovalPreflight, AttachmentError> {
+    let row = resolve_attachment(db, project_id, project_key, scope, ordinal).await?;
+    let uri = row.canonical_uri(project_key);
+    let mut others = Vec::new();
+    let mut retired = Vec::new();
+    if row.removal.is_none() {
+        for (index, store) in removal_stores(db, cache).iter().enumerate() {
+            for reference in references_to(store, &row.content_hash).await? {
+                let is_target = index == 0
+                    && reference.project_id == project_id
+                    && reference.scope == row.scope
+                    && reference.ordinal == row.ordinal;
+                if is_target {
+                    continue;
+                }
+                if reference.retired {
+                    retired.push(reference.uri);
+                } else {
+                    others.push(reference.uri);
+                }
+            }
+        }
+    }
+    if !others.is_empty() && !include_shared {
+        return Err(AttachmentError::SharedContent { uri, others });
+    }
+    Ok(RemovalPreflight {
+        row,
+        uri,
+        others,
+        retired,
+    })
+}
+
+/// Remove a stored object: delete the bytes this machine holds and leave a
+/// tombstone on every record of them, so each address answers with who
+/// removed it, when and why.
+///
+/// `db` owns the record. `cache` is the private database: on a team replica it
+/// holds this machine's read-through copy of the broker's bytes, and on a
+/// private project it is `db` itself. The private `cas_cache` mixes those
+/// cached copies with the authoritative bytes of private projects, so live
+/// references in BOTH databases are counted before anything is deleted: an
+/// identical private image must not lose its only copy to a team removal.
+///
+/// Shared bytes are refused, listing the other live references, unless the
+/// request includes them. Retired references are dead already and are
+/// tombstoned with the rest without being asked about. This is an explicit,
+/// authorized deletion, not reclamation: it deletes on purpose against
+/// references the caller has seen, and so does not wait for cairn/4648's
+/// global inventory. What it cannot reach is named in the outcome.
+#[allow(clippy::too_many_arguments)]
+pub async fn remove_attachment(
+    db: &LocalDb,
+    cache: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    scope: &AttachmentScopeRef,
+    ordinal: i32,
+    request: &RemovalRequest,
+) -> Result<RemovalOutcome, AttachmentError> {
+    if request.reason.trim().is_empty() {
+        return Err(AttachmentError::ReasonRequired);
+    }
+    let RemovalPreflight {
+        row,
+        uri,
+        others,
+        retired,
+    } = removal_preflight(
+        db,
+        cache,
+        project_id,
+        project_key,
+        scope,
+        ordinal,
+        request.include_shared,
+    )
+    .await?;
+    if row.removal.is_some() {
+        return Ok(RemovalOutcome {
+            uri: uri.clone(),
+            tombstoned: vec![uri],
+            already_removed: true,
+            bytes_deleted: false,
+            unreached: Vec::new(),
+        });
+    }
+    let hash = row.content_hash.clone();
+    let stores = removal_stores(db, cache);
+
+    // Tombstone by hash rather than by the rows just listed: a record of the
+    // same bytes minted while this runs is removed with them and shows the
+    // same tombstone, instead of keeping a live address to deleted bytes.
+    let now = chrono::Utc::now().timestamp();
+    for store in &stores {
+        store
+            .execute(
+                "UPDATE attachments
+                 SET removed_at = ?2, removed_by = ?3, removal_reason = ?4,
+                     removal_decision_id = ?5, retired_at = COALESCE(retired_at, ?2)
+                 WHERE content_hash = ?1 AND removed_at IS NULL",
+                cairn_db::turso::params![
+                    hash.clone(),
+                    now,
+                    request.removed_by.clone(),
+                    request.reason.trim().to_string(),
+                    request.decision_id.clone(),
+                ],
+            )
+            .await
+            .map_err(|error| AttachmentError::Reference {
+                operation: "remove",
+                message: error.to_string(),
+            })?;
+    }
+
+    let mut bytes_deleted = false;
+    for store in &stores {
+        bytes_deleted |=
+            store
+                .delete_local_content(&hash)
+                .await
+                .map_err(|message| AttachmentError::Store {
+                    operation: "delete",
+                    message,
+                })?;
+    }
+
+    let mut unreached = Vec::new();
+    if db.team_content_store().is_some() {
+        unreached.push(
+            "the team's shared content store, which has no delete route yet (cairn/6330): every \
+             address on this machine refuses the bytes, but the team's copy and other members' \
+             cached copies remain"
+                .to_string(),
+        );
+    }
+    unreached.extend(REMOVAL_LIMITS.iter().map(|limit| limit.to_string()));
+
+    let mut tombstoned = vec![uri.clone()];
+    tombstoned.extend(others);
+    tombstoned.extend(retired);
+    Ok(RemovalOutcome {
+        uri,
+        tombstoned,
+        already_removed: false,
+        bytes_deleted,
+        unreached,
+    })
 }
 
 #[cfg(test)]
@@ -1659,6 +2142,290 @@ mod tests {
                 .bytes,
             png()
         );
+    }
+
+    fn removal(reason: &str, include_shared: bool) -> RemovalRequest {
+        RemovalRequest {
+            removed_by: "the desktop operator".into(),
+            reason: reason.into(),
+            decision_id: Some("decision-1".into()),
+            include_shared,
+        }
+    }
+
+    /// The bytes are gone and every spelling of the address, the content-hash
+    /// permalink old transcripts carry included, answers with the tombstone.
+    #[tokio::test]
+    async fn removing_an_object_deletes_its_bytes_and_every_address_shows_the_tombstone() {
+        let (_dir, db) = seeded_db().await;
+        let stored = store(&db, AttachmentAnchor::Issue(6110), png(), "screen.png").await;
+        let hash = content_hash(&png());
+
+        let outcome = remove_attachment(
+            &db,
+            &db,
+            "p",
+            "cairn",
+            &AttachmentScopeRef::Issue(6110),
+            1,
+            &removal("captured private data by mistake", false),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.bytes_deleted);
+        assert!(!outcome.already_removed);
+        assert_eq!(outcome.tombstoned, vec![stored.uri.clone()]);
+        assert!(
+            outcome
+                .unreached
+                .iter()
+                .any(|limit| limit.contains("model provider")),
+            "{:?}",
+            outcome.unreached
+        );
+        assert_eq!(db.get_content(&hash).await.unwrap(), None);
+
+        for uri in [
+            stored.uri.clone(),
+            "cairn://p/cairn/6110/attachments/1".to_string(),
+            format!("cairn://p/cairn/images/{hash}"),
+        ] {
+            let error = fetch_attachment(&db, "p", "cairn", &reference_of(&uri))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AttachmentError::Removed { .. }),
+                "{uri}: {error}"
+            );
+            let shown = error.to_string();
+            assert!(shown.contains("removed by the desktop operator"), "{shown}");
+            assert!(
+                shown.contains("captured private data by mistake"),
+                "{shown}"
+            );
+        }
+
+        let rows = list_attachments(&db, "p", &AttachmentScopeRef::Issue(6110))
+            .await
+            .unwrap();
+        let tombstone = rows[0]
+            .removal
+            .as_ref()
+            .expect("the row keeps its tombstone");
+        assert_eq!(tombstone.decision_id.as_deref(), Some("decision-1"));
+        assert!(rows[0].retired_at.is_some());
+
+        let again = remove_attachment(
+            &db,
+            &db,
+            "p",
+            "cairn",
+            &AttachmentScopeRef::Issue(6110),
+            1,
+            &removal("again", false),
+        )
+        .await
+        .unwrap();
+        assert!(again.already_removed, "a second removal changes nothing");
+        assert_eq!(
+            list_attachments(&db, "p", &AttachmentScopeRef::Issue(6110))
+                .await
+                .unwrap()[0]
+                .removal
+                .as_ref()
+                .unwrap()
+                .reason,
+            "captured private data by mistake",
+            "the first tombstone stands"
+        );
+    }
+
+    /// Content addressing shares bytes. Another live reference is refused by
+    /// name and nothing changes; included, every reference is removed. A
+    /// retired reference already resolves nothing and is never asked about.
+    #[tokio::test]
+    async fn shared_bytes_are_refused_with_their_references_unless_included() {
+        let (_dir, db) = seeded_db().await;
+        store(&db, AttachmentAnchor::Issue(1), png(), "a.png").await;
+        store(&db, AttachmentAnchor::Issue(2), png(), "b.png").await;
+        store(&db, AttachmentAnchor::Issue(3), png(), "c.png").await;
+        retire_attachment(&db, "p", "cairn", &AttachmentScopeRef::Issue(3), 1)
+            .await
+            .unwrap();
+        let hash = content_hash(&png());
+
+        let refused = remove_attachment(
+            &db,
+            &db,
+            "p",
+            "cairn",
+            &AttachmentScopeRef::Issue(1),
+            1,
+            &removal("private", false),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            AttachmentError::SharedContent {
+                uri: "cairn://p/cairn/1/images/1".into(),
+                others: vec!["cairn://p/cairn/2/images/1".into()],
+            }
+        );
+        assert!(refused.to_string().contains("includeShared"));
+        assert_eq!(db.get_content(&hash).await.unwrap(), Some(png()));
+        assert!(fetch_attachment(
+            &db,
+            "p",
+            "cairn",
+            &reference_of("cairn://p/cairn/1/images/1")
+        )
+        .await
+        .is_ok());
+
+        let outcome = remove_attachment(
+            &db,
+            &db,
+            "p",
+            "cairn",
+            &AttachmentScopeRef::Issue(1),
+            1,
+            &removal("private", true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.tombstoned,
+            vec![
+                "cairn://p/cairn/1/images/1".to_string(),
+                "cairn://p/cairn/2/images/1".to_string(),
+                "cairn://p/cairn/3/images/1".to_string(),
+            ]
+        );
+        assert_eq!(db.get_content(&hash).await.unwrap(), None);
+        for issue in [1, 2, 3] {
+            let rows = list_attachments(&db, "p", &AttachmentScopeRef::Issue(issue))
+                .await
+                .unwrap();
+            assert!(rows[0].removal.is_some(), "issue {issue} keeps a tombstone");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removal_needs_a_reason_and_changes_nothing_without_one() {
+        let (_dir, db) = seeded_db().await;
+        store(&db, AttachmentAnchor::Issue(1), png(), "a.png").await;
+        assert_eq!(
+            remove_attachment(
+                &db,
+                &db,
+                "p",
+                "cairn",
+                &AttachmentScopeRef::Issue(1),
+                1,
+                &removal("   ", false),
+            )
+            .await,
+            Err(AttachmentError::ReasonRequired)
+        );
+        assert_eq!(
+            db.get_content(&content_hash(&png())).await.unwrap(),
+            Some(png())
+        );
+    }
+
+    /// A team replica's bytes live in the broker, and this machine's copy sits
+    /// in the private `cas_cache` beside the authoritative bytes of private
+    /// projects. Removing a team image must count the private database's live
+    /// references before evicting, or an identical private image loses its only
+    /// copy. The broker's own copy is out of reach and the outcome says so.
+    #[tokio::test]
+    async fn a_team_removal_never_takes_a_private_projects_only_copy() {
+        use cairn_db::storage::{InMemoryContentStore, TeamReplicaContext};
+
+        let (_private_dir, private) = seeded_db().await;
+        store(&private, AttachmentAnchor::Issue(1), png(), "mine.png").await;
+
+        let broker = Arc::new(InMemoryContentStore::new());
+        let team_dir = tempfile::tempdir().unwrap();
+        let mut team = LocalDb::open_migrated_for_test(team_dir.path().join("team.db"))
+            .await
+            .unwrap();
+        team.set_team_context(
+            TeamReplicaContext {
+                team_id: cairn_db::storage::TeamId::from("team"),
+                private_db: None,
+            },
+            broker.clone(),
+        );
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('tp','w','T','team','/tmp/t',1,1)",
+        ] {
+            team.execute(sql, ()).await.unwrap();
+        }
+        let team_scope = AttachmentScope {
+            project_id: "tp".into(),
+            project_key: "team".into(),
+            anchor: AttachmentAnchor::Issue(9),
+        };
+        store_attachment_bytes(
+            &team,
+            &team_scope,
+            png(),
+            "theirs.png",
+            None,
+            &AttachmentProvenance::default(),
+        )
+        .await
+        .unwrap();
+        let hash = content_hash(&png());
+
+        let refused = remove_attachment(
+            &team,
+            &private,
+            "tp",
+            "team",
+            &AttachmentScopeRef::Issue(9),
+            1,
+            &removal("private", false),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            AttachmentError::SharedContent {
+                uri: "cairn://p/team/9/images/1".into(),
+                others: vec!["cairn://p/cairn/1/images/1".into()],
+            }
+        );
+        assert_eq!(private.get_content(&hash).await.unwrap(), Some(png()));
+
+        let outcome = remove_attachment(
+            &team,
+            &private,
+            "tp",
+            "team",
+            &AttachmentScopeRef::Issue(9),
+            1,
+            &removal("private", true),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.bytes_deleted);
+        assert_eq!(private.get_content(&hash).await.unwrap(), None);
+        assert!(
+            outcome.unreached[0].contains("cairn/6330"),
+            "the broker's copy is named as unreached: {:?}",
+            outcome.unreached
+        );
+        assert!(broker.contains(&hash).await, "no broker delete exists yet");
+        // The broker still holds the bytes, and the replica still refuses them.
+        assert!(matches!(
+            fetch_attachment(&team, "tp", "team", &AttachmentRef::Hash(hash.clone())).await,
+            Err(AttachmentError::Removed { .. })
+        ));
     }
 
     /// Retirement spends the reference. It does not, and must not, touch the

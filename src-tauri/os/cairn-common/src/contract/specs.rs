@@ -320,6 +320,17 @@ pub(crate) const ATTACHMENT_ACTION: KeySpec = KeySpec::new(
     "materialize — copy this object into the calling run's own execution cell and return the cell-local path",
 );
 
+pub(crate) const REMOVAL_REASON: KeySpec = KeySpec::new(
+    "reason",
+    KeyType::Str,
+    "why it is being removed; recorded on the tombstone every address shows afterwards, and read by the operator before approving",
+);
+pub(crate) const REMOVAL_INCLUDE_SHARED: KeySpec = KeySpec::new(
+    "includeShared",
+    KeyType::Bool,
+    "also remove every other live reference to the same bytes; without it, shared bytes are refused and the other references listed",
+);
+
 pub(crate) const REBASE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,

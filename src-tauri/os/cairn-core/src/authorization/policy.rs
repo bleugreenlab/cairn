@@ -164,6 +164,17 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
             AuthorityPolicy::RequiresApproval(AuthorityReason::QueueStartNow)
         }
 
+        // ── Stored content ───────────────────────────────────────────
+        // Removing a stored object deletes its bytes for every reader, which
+        // no one can undo, and decides over whatever private matter it shows.
+        // Owning the issue it was attached in confers nothing here: an agent
+        // removes only through a grant the operator issued.
+        (AuthorityPlace::Resource { canonical_uri }, AuthorityAction::Write)
+            if names_stored_object(canonical_uri) =>
+        {
+            AuthorityPolicy::RequiresApproval(AuthorityReason::StoredContentRemoval)
+        }
+
         // ── Everything else ─────────────────────────────────────────────
         // Ordinary work stays direct: project reads, writes, and runs; project
         // settings and project MCP configuration under the project's own
@@ -176,10 +187,60 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
     }
 }
 
+/// Whether a resource place is one stored object, by either spelling.
+fn names_stored_object(canonical_uri: &str) -> bool {
+    matches!(
+        cairn_common::uri::parse_uri(canonical_uri),
+        Some(
+            cairn_common::uri::CairnResource::ProjectAttachment { .. }
+                | cairn_common::uri::CairnResource::ProjectImage { .. }
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cairn_common::authorization::ToolKind;
+
+    #[test]
+    fn removing_a_stored_object_requires_approval_whoever_owns_it() {
+        for uri in [
+            "cairn://p/cairn/6110/attachments/1",
+            "cairn://p/cairn/6110/images/1",
+            "cairn://p/cairn/ui/attachments/2",
+        ] {
+            let scope = AuthorityScope::new(
+                AuthorityPlace::Resource {
+                    canonical_uri: uri.to_string(),
+                },
+                AuthorityAction::Write,
+            );
+            for owned in [false, true] {
+                assert_eq!(
+                    classify(&scope, owned),
+                    AuthorityPolicy::RequiresApproval(AuthorityReason::StoredContentRemoval),
+                    "{uri}, owned: {owned}"
+                );
+            }
+        }
+        // Reading one, and writing a resource that is not a stored object,
+        // stay ordinary work.
+        let read = AuthorityScope::new(
+            AuthorityPlace::Resource {
+                canonical_uri: "cairn://p/cairn/6110/images/1".to_string(),
+            },
+            AuthorityAction::Read,
+        );
+        assert_eq!(classify(&read, false), AuthorityPolicy::Direct);
+        let other = AuthorityScope::new(
+            AuthorityPlace::Resource {
+                canonical_uri: "cairn://p/cairn/db/issues".to_string(),
+            },
+            AuthorityAction::Write,
+        );
+        assert_eq!(classify(&other, false), AuthorityPolicy::Direct);
+    }
 
     fn settings(section: &str) -> AuthorityScope {
         AuthorityScope::new(

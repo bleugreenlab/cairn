@@ -619,7 +619,11 @@ pub(super) async fn read_project_images(
     };
     let images: Vec<_> = rows
         .into_iter()
-        .filter(|row| row.kind == AttachmentKind::Image && row.retired_at.is_none())
+        // A removed image stays listed as its tombstone: its address still
+        // answers, with the record of its removal.
+        .filter(|row| {
+            row.kind == AttachmentKind::Image && (row.retired_at.is_none() || row.removal.is_some())
+        })
         .collect();
 
     let base = cairn_common::uri::build_project_images_uri(project_key, scope);
@@ -637,7 +641,12 @@ pub(super) async fn read_project_images(
     }
     body.push_str(&format!("{} image(s)\n\n", images.len()));
     for row in &images {
-        body.push_str(&format!("- `{base}/{}` — {}\n", row.ordinal, row.file_name));
+        body.push_str(&format!(
+            "- `{base}/{}` — {}{}\n",
+            row.ordinal,
+            row.file_name,
+            removal_note(row)
+        ));
     }
     body.push_str(&format!(
         "\nRead any of these URIs to see the image itself. Ordinals are stable and never\nreused, and images share one sequence with files, so a gap here is a file rather\nthan a missing image — `{attachments}` lists them all.\n"
@@ -677,10 +686,12 @@ pub(super) async fn read_project_attachments(
             .byte_size
             .map(|bytes| format!(", {}", human_bytes(bytes)))
             .unwrap_or_default();
-        let retired = if row.retired_at.is_some() {
-            " — RETIRED, this address no longer resolves"
+        let retired = if row.removal.is_some() {
+            removal_note(row)
+        } else if row.retired_at.is_some() {
+            " — RETIRED, this address no longer resolves".to_string()
         } else {
-            ""
+            String::new()
         };
         body.push_str(&format!(
             "- `{base}/{}` — {} ({media}{size}){retired}\n",
@@ -694,6 +705,17 @@ pub(super) async fn read_project_attachments(
         "\nRead any of these URIs for the object itself: an image returns an image block, a\nPDF returns extracted text, text-shaped content returns text. If a tool needs a\nfilesystem path, materialize the attachment into your current cell:\nwrite({changes:[{target:\"‹uri›\",mode:\"patch\",payload:{action:\"materialize\"}}]}).\n",
     );
     body
+}
+
+/// A listed row's tombstone, when its bytes were removed.
+fn removal_note(row: &AttachmentRow) -> String {
+    match &row.removal {
+        Some(removal) => format!(
+            " — REMOVED by {}: {}. Its bytes were deleted",
+            removal.removed_by, removal.reason
+        ),
+        None => String::new(),
+    }
 }
 
 fn human_bytes(bytes: i64) -> String {

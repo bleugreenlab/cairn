@@ -113,6 +113,33 @@ impl LocalDb {
         .map_err(|error| error.to_string())
     }
 
+    /// Delete this database's own `cas_cache` copy of `hash`, answering whether
+    /// one was there.
+    ///
+    /// This never reaches a team store: on a team replica the authoritative
+    /// copy is the broker's, and this deletes only the read-through copy. The
+    /// one caller is a deliberate, authorized removal that has already checked
+    /// this database holds no live reference to the bytes; nothing sweeps with
+    /// it, because no single database can prove an object unreferenced
+    /// (cairn/4648).
+    pub async fn delete_local_content(&self, hash: &str) -> Result<bool, String> {
+        let present = self
+            .query_opt(
+                "SELECT 1 FROM cas_cache WHERE hash = ?1 LIMIT 1",
+                (hash.to_string(),),
+                |row| row.i64(0),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some();
+        if present {
+            self.execute("DELETE FROM cas_cache WHERE hash = ?1", (hash.to_string(),))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(present)
+    }
+
     /// Fetch the bytes stored under `hash`. `Ok(None)` means not found.
     pub async fn get_content(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         if let Some(store) = self.team_content_store() {

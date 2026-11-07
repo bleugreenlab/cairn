@@ -10,11 +10,20 @@ pub(crate) const PROJECT_IMAGE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectImage,
     uri_template: "cairn://p/{project}/{issue}/images/{n}",
     name: "Project image",
-    description: "Immutable stored image returned as one native image block; also addressable project-wide (cairn://p/{project}/images/{n}) and, for images stored before scoped addresses existed, by content hash",
+    description: "Immutable stored image returned as one native image block; also addressable project-wide (cairn://p/{project}/images/{n}) and, for images stored before scoped addresses existed, by content hash. A removed image answers with its tombstone (who removed it, when, why) instead of bytes",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: NO_MUTATIONS,
+    mutations: &[STORED_OBJECT_REMOVAL],
+};
+
+/// Removing a stored object, by either spelling of its address.
+const STORED_OBJECT_REMOVAL: MutationSpec = MutationSpec {
+    mode: ChangeMode::Delete,
+    required: &[REMOVAL_REASON],
+    optional: &[REMOVAL_INCLUDE_SHARED],
+    label: "remove it, deleting its stored bytes and leaving a tombstone (the operator approves)",
+    example: "write({changes:[{target:\"cairn://p/PROJECT/N/images/1\",mode:\"delete\",payload:{reason:\"captured private data by mistake\"}}]})",
 };
 
 pub(crate) const PROJECT_ATTACHMENTS_CONTRACT: ResourceContract = ResourceContract {
@@ -53,13 +62,7 @@ pub(crate) const PROJECT_ATTACHMENT_CONTRACT: ResourceContract = ResourceContrac
             label: "materialize into this cell",
             example: "write({changes:[{target:\"cairn:~/attachments/1\",mode:\"patch\",payload:{action:\"materialize\"}}]})",
         },
-        MutationSpec {
-            mode: ChangeMode::Delete,
-            required: &[],
-            optional: &[],
-            label: "retire this reference",
-            example: "write({changes:[{target:\"cairn:~/attachments/1\",mode:\"delete\"}]})",
-        },
+        STORED_OBJECT_REMOVAL,
     ],
 };
 

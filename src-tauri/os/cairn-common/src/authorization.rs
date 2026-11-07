@@ -1369,6 +1369,11 @@ pub enum AuthorityReason {
     /// A thread starting held work past every cap. The caps constrain what a
     /// thread starts itself (tenet 1319), so only the operator may skip them.
     QueueStartNow,
+    /// Removing a stored object: its bytes are deleted for every reader and
+    /// every address shows a tombstone instead. Destructive, and it decides
+    /// over whatever private matter the object shows, so only the operator may
+    /// allow it (cairn/6318).
+    StoredContentRemoval,
     /// Within the actor's established authority; no blast radius expansion.
     WithinExistingAuthority,
     /// Structurally invalid or an invariant violation. Approval cannot legalize
@@ -1388,6 +1393,7 @@ impl AuthorityReason {
             AuthorityReason::ServedApiRemoteUse => "served_api_remote_use",
             AuthorityReason::QueueReorderAcrossThreads => "queue_reorder_across_threads",
             AuthorityReason::QueueStartNow => "queue_start_now",
+            AuthorityReason::StoredContentRemoval => "stored_content_removal",
             AuthorityReason::WithinExistingAuthority => "within_existing_authority",
             AuthorityReason::StructurallyInvalid => "structurally_invalid",
         }
@@ -2565,5 +2571,9 @@ mod thread_constraint_tests {
             "queue_reorder_across_threads"
         );
         assert_eq!(AuthorityReason::QueueStartNow.as_str(), "queue_start_now");
+        assert_eq!(
+            AuthorityReason::StoredContentRemoval.as_str(),
+            "stored_content_removal"
+        );
     }
 }

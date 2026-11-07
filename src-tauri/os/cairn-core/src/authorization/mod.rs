@@ -330,6 +330,51 @@ pub async fn journal_dev_instance_launch(
     }
 }
 
+/// Journal an act the operator performed directly, through a credential-proven
+/// door rather than a run's grant.
+///
+/// Such an act has no run transcript recording it, so this row is what
+/// attributes it: the operator as principal and decision actor, the scope, and
+/// the summary. Answers with the row id so the act's own record can cite it. A
+/// failure is logged, never propagated, as for every other journal entry.
+pub async fn journal_operator_act(
+    db: &LocalDb,
+    request: &AuthorityRequest,
+    operator: cairn_common::identity::PrincipalRef,
+) -> Option<String> {
+    let reason = policy::classify(&request.scope, false)
+        .reason()
+        .unwrap_or(AuthorityReason::WithinExistingAuthority);
+    let event = NewAuthorizationEvent {
+        scope: request.scope.clone(),
+        mutation: request.mutation.as_str().to_string(),
+        summary: request.summary.clone(),
+        outcome: AuthorityDecision::Direct.as_str().to_string(),
+        reason: reason.as_str().to_string(),
+        principal: AuthorityPrincipal {
+            actor: Some(operator.clone()),
+            ..Default::default()
+        },
+        audience: AuthorityAudience::workspace(WORKSPACE_ID),
+        run_id: None,
+        request_uri: None,
+        grant_id: None,
+        decision_actor: Some(operator),
+        appearance_snapshot: None,
+        decided_at: now(),
+    };
+    match store::append_event(db, event).await {
+        Ok(id) => Some(id),
+        Err(error) => {
+            log::warn!(
+                "failed to journal an operator act ({}): {error}",
+                request.summary
+            );
+            None
+        }
+    }
+}
+
 /// One row an instrument-carried act wrote: what happened, to which table, and
 /// the row it names.
 #[derive(Debug, Clone)]

@@ -181,6 +181,49 @@ async fn a_retired_reference_refuses_by_name_and_stays_enumerated() {
     assert!(collection.contains("RETIRED"), "{collection}");
 }
 
+/// A removed image reads as its tombstone through the agent's read path, and
+/// the collection keeps it listed as removed rather than dropping its ordinal.
+#[tokio::test]
+async fn a_removed_image_reads_as_its_tombstone() {
+    let (_temp, db, orch) = common::resource_orchestrator_fixture().await;
+    let project_id = common::create_project(&db, "att").await;
+    let uri = attach(&db, &project_id, PNG, "screen.png").await;
+
+    cairn_core::attachments::remove_attachment(
+        &db,
+        &db,
+        &project_id,
+        "att",
+        &cairn_common::uri::AttachmentScopeRef::Issue(7),
+        1,
+        &cairn_core::attachments::RemovalRequest {
+            removed_by: "the desktop operator".into(),
+            reason: "captured private data by mistake".into(),
+            decision_id: None,
+            include_shared: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let rendered = read_resource(&orch, &uri).await;
+    assert!(
+        rendered.contains("was removed by the desktop operator"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("captured private data by mistake"),
+        "{rendered}"
+    );
+
+    let images = read_resource(&orch, "cairn://p/att/7/images").await;
+    assert!(images.contains("cairn://p/att/7/images/1"), "{images}");
+    assert!(
+        images.contains("REMOVED by the desktop operator"),
+        "{images}"
+    );
+}
+
 /// The collection is what makes an ordinal a navigable index rather than
 /// decoration, and the image view is a filter over it: a gap in `images` is a
 /// file, not a missing image, and the listing says where to find it.
