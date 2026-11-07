@@ -1223,7 +1223,7 @@ pub async fn remove_as_operator(
     ordinal: i32,
     reason: &str,
     include_shared: bool,
-    operator: cairn_common::identity::PrincipalRef,
+    operator: cairn_common::identity::AppearanceSnapshot,
     operator_label: &str,
 ) -> Result<RemovalOutcome, AttachmentError> {
     let reason = reason.trim();
@@ -1250,12 +1250,22 @@ pub async fn remove_as_operator(
                 ordinal,
             },
         );
-        let authority = crate::authorization::normalize::stored_content_removal(
+        let mut authority = crate::authorization::normalize::stored_content_removal(
             &attachment_uri,
             reason,
             include_shared,
         );
-        crate::authorization::journal_operator_act(private, &authority, operator).await
+        authority
+            .summary
+            .push_str(&format!(" (content hash: {})", preflight.row.content_hash));
+        Some(
+            crate::authorization::journal_operator_act(private, &authority, operator)
+                .await
+                .map_err(|error| AttachmentError::Reference {
+                    operation: "journal removal",
+                    message: error.to_string(),
+                })?,
+        )
     };
     remove_attachment(
         db,

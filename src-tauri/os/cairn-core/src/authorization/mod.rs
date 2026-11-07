@@ -337,13 +337,14 @@ pub async fn journal_dev_instance_launch(
 ///
 /// Such an act has no run transcript recording it, so this row is what
 /// attributes it: the operator as principal and decision actor, the scope, and
-/// the summary. Answers with the row id so the act's own record can cite it. A
-/// failure is logged, never propagated, as for every other journal entry.
+/// the summary. Answers with the row id so the act's own record can cite it.
+/// Failure propagates so an irreversible act cannot proceed without its record.
 pub async fn journal_operator_act(
     db: &LocalDb,
     request: &AuthorityRequest,
-    operator: cairn_common::identity::PrincipalRef,
-) -> Option<String> {
+    appearance: AppearanceSnapshot,
+) -> cairn_db::storage::DbResult<String> {
+    let operator = appearance.principal().clone();
     let reason = policy::classify(&request.scope, false)
         .reason()
         .unwrap_or(AuthorityReason::WithinExistingAuthority);
@@ -362,20 +363,11 @@ pub async fn journal_operator_act(
         request_uri: None,
         grant_id: None,
         decision_actor: Some(operator),
-        appearance_snapshot: None,
+        appearance_snapshot: Some(appearance),
         request_acceptance: None,
         decided_at: now(),
     };
-    match store::append_event(db, event).await {
-        Ok(id) => Some(id),
-        Err(error) => {
-            log::warn!(
-                "failed to journal an operator act ({}): {error}",
-                request.summary
-            );
-            None
-        }
-    }
+    store::append_event(db, event).await
 }
 
 /// Journal a change to a project's library trust: the operator trusting the
