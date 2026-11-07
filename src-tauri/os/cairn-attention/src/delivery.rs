@@ -881,12 +881,6 @@ pub(crate) fn prose_candidates_sql(index: &str) -> String {
     )
 }
 
-/// The newest version of artifact `?1` written by job `?2`: the same lookup the
-/// named artifact read makes, served by `idx_artifacts_output_job_version`.
-pub(crate) const REVIEW_ARTIFACT_SQL: &str = "SELECT data FROM artifacts
-     WHERE output_name = ?1 AND job_id = ?2
-     ORDER BY version DESC LIMIT 1";
-
 /// One line naming what a child's own chat has accrued since the reader's
 /// catch-up cursor: the node, the number of new turns, and the opening of the
 /// newest assistant text among them, then the window's address.
@@ -1046,88 +1040,42 @@ fn assistant_text(data: &str) -> Option<String> {
     (!content.trim().is_empty()).then(|| content.to_string())
 }
 
-/// The artifact a review push's generic `.../artifact` alias stands for. The
-/// open-PR review arm addresses a node's PR that way, and "the newest artifact of
-/// any name" could be a later working document such as a `plan` (CAIRN-1953).
-const REVIEW_ALIAS_ARTIFACT: &str = "create-pr";
-
-/// What a review push asks the reader to look at, from the artifact's own
-/// `title` and optional `summary`, each one bounded line, then the address. The
-/// body is never inlined. `None` for an address that is not a node or task
-/// artifact, an artifact that does not resolve or parse, or one with no title.
+/// What a review push asks the reader to look at: the artifact's preview from
+/// the references resolver, which reads its own `title` and optional `summary`
+/// as bounded lines and never the body, then the address. The resolver reads a
+/// node's generic `.../artifact` alias as its PR, not as "the newest artifact of
+/// any name", which could be a later working document such as a `plan`
+/// (CAIRN-1953). `None` for an address that is not a node or task artifact, or
+/// whose artifact does not resolve, parse, or carry a title.
 async fn review_artifact_line(runtime: &AttentionRuntime, content_ref: &str) -> Option<String> {
+    use cairn_common::references::ReferenceEntry;
     use cairn_common::uri::CairnResource;
-    let (project, number, exec_seq, node_id, task_name, name) =
-        match cairn_common::uri::parse_uri(content_ref)? {
-            CairnResource::NodeArtifact {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                name,
-            } => (project, number, exec_seq, node_id, None, name),
-            CairnResource::TaskArtifact {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-                name,
-            } => (project, number, exec_seq, node_id, Some(task_name), name),
-            _ => return None,
-        };
-    let name = name.unwrap_or_else(|| REVIEW_ALIAS_ARTIFACT.to_string());
-    let db = runtime
-        .host
-        .database_for_project(&cairn_common::uri::canonical_project(&project))
-        .await;
-    let data = db
-        .read(|conn| {
-            let project = project.clone();
-            let node_id = node_id.clone();
-            let task_name = task_name.clone();
-            let name = name.clone();
-            Box::pin(async move {
-                let Some(job_id) = job_id_for_node_coordinates(
-                    conn,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    task_name.as_deref(),
-                )
-                .await?
-                else {
-                    return Ok(None);
-                };
-                let mut rows = conn
-                    .query(REVIEW_ARTIFACT_SQL, params![name.as_str(), job_id.as_str()])
-                    .await?;
-                match rows.next().await? {
-                    Some(row) => Ok(Some(row.text(0)?)),
-                    None => Ok(None),
-                }
-            })
-        })
-        .await
-        .map_err(|error| log::debug!("review line for {content_ref}: {error}"))
-        .ok()
-        .flatten()?;
-    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
-    let field = |key: &str| {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .map(one_line_excerpt)
+    if !matches!(
+        cairn_common::uri::parse_uri(content_ref)?,
+        CairnResource::NodeArtifact { .. } | CairnResource::TaskArtifact { .. }
+    ) {
+        return None;
+    }
+    let ReferenceEntry::Preview { title, line, .. } = runtime.host.reference(content_ref).await?
+    else {
+        return None;
     };
-    let title = field("title")?;
-    let summary = field("summary")
-        .map(|summary| format!("{summary}\n"))
-        .unwrap_or_default();
+    let summary = line.map(|line| format!("{line}\n")).unwrap_or_default();
     Some(format!(
         "Work product ready for review: {title}\n{summary}Read {content_ref} for the current content."
     ))
+}
+
+/// A direct message as its recipient reads it: the header, the content and the
+/// reply hint, then the references block for the URIs the content cites, so
+/// the sender never has to paste what a cited URI holds.
+async fn direct_message_body(runtime: &AttentionRuntime, msg: &cairn_domain::Message) -> String {
+    let body = crate::message_render::render_direct_message(msg);
+    let cited = cairn_common::references::without_references_block(&msg.content);
+    match runtime.host.references_block(cited).await {
+        Some(block) => format!("{body}\n\n{block}"),
+        None => body,
+    }
 }
 
 /// A persisted own failure, rather than a descendant's inherited failed projection.
@@ -1459,7 +1407,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
                     push.wake.as_str(),
                     label
                 );
-                let body = crate::message_render::render_direct_message(&msg);
+                let body = direct_message_body(runtime, &msg).await;
                 return format!("{schedule_header}\n\n{body}");
             }
         }
@@ -1555,7 +1503,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     if push.key.starts_with("direct:") {
         return match pushed_direct_message(runtime, push).await {
             Some(msg) => {
-                let body = crate::message_render::render_direct_message(&msg);
+                let body = direct_message_body(runtime, &msg).await;
                 format!("{header}\n\n{body}")
             }
             _ => header,
@@ -1597,7 +1545,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     // carries, not by a list of prefixes: a list missed every producer added
     // after it, and each of those reached its recipient as a pointer home.
     if let Some(msg) = pushed_direct_message(runtime, push).await {
-        let body = crate::message_render::render_direct_message(&msg);
+        let body = direct_message_body(runtime, &msg).await;
         return format!("{header}\n\n{body}");
     }
     pointer_update(&header, push)

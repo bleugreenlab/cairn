@@ -40,6 +40,12 @@ pub trait AttentionHost: RecipientHost {
     async fn message(&self, db: &LocalDb, message_id: &str) -> Option<cairn_domain::Message>;
     /// Resolve application-specific card content; `None` selects the engine's fallback.
     async fn render_content(&self, request: ContentRequest<'_>) -> Option<String>;
+    /// The entry one cited URI resolves to, from the application's one
+    /// references resolver; `None` when it names nothing a reader could be shown.
+    async fn reference(&self, uri: &str) -> Option<cairn_common::references::ReferenceEntry>;
+    /// The `## References` block for a message's text, rendered for an agent by
+    /// that same resolver; `None` when the text names nothing that resolves.
+    async fn references_block(&self, text: &str) -> Option<String>;
     async fn mark_thread_chapter(
         &self,
         db: &LocalDb,

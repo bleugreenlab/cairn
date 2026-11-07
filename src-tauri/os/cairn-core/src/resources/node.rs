@@ -2526,7 +2526,7 @@ pub(super) async fn grep_node_chat_turn(
 
 /// The reconstructed events of turn `turn_seq` in a node's primary session, or
 /// the message for a turn that does not resolve or holds no events.
-async fn load_node_chat_turn(
+pub(super) async fn load_node_chat_turn(
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -3228,7 +3228,7 @@ pub(super) async fn grep_task_chat_turn(
 
 /// The reconstructed events of a task's turn `turn_seq`, or the message for a
 /// turn that does not resolve or holds no events.
-async fn load_task_chat_turn(
+pub(super) async fn load_task_chat_turn(
     db: &LocalDb,
     project_key: &str,
     number: i32,

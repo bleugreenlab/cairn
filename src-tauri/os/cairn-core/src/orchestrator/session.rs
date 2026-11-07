@@ -1502,6 +1502,7 @@ fn build_messaging_context(
     let project_key = project_key.to_string();
     let issue_id = issue_id.map(str::to_string);
     let current_run_id = current_run_id.to_string();
+    let resolver = orch.clone();
     let data = run_db_blocking(move || async move {
         let db = crate::execution::routing::owning_db_for_run(&dbs, &current_run_id)
             .await
@@ -1558,11 +1559,20 @@ fn build_messaging_context(
             }
         }
 
-        Ok::<_, String>((peers, recent))
+        // What the injected messages cite, resolved once for all of them. It
+        // rides this per-run section, so the block lands in the user message and
+        // never in the cached system prompt.
+        let cited = recent
+            .iter()
+            .map(|msg| cairn_common::references::without_references_block(&msg.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let references = crate::resources::references::references_block(&resolver, &cited).await;
+        Ok::<_, String>((peers, recent, references))
     })
     .unwrap_or_default();
 
-    let (peers, recent) = data;
+    let (peers, recent, references) = data;
     if peers.is_empty() && recent.is_empty() {
         return String::new();
     }
@@ -1603,6 +1613,11 @@ fn build_messaging_context(
                 "[{}] {}: {}\n",
                 stamp, msg.sender_name, msg.content
             ));
+        }
+        if let Some(block) = references {
+            out.push('\n');
+            out.push_str(&block);
+            out.push('\n');
         }
     }
 

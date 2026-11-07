@@ -4,6 +4,7 @@ use super::common::{
     find_query_value, lookup_project_by_key, parse_optional_i64_param, read_resource,
 };
 
+use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use cairn_common::query::QueryParam;
 
@@ -69,7 +70,23 @@ fn format_messages(messages: &[crate::models::Message]) -> String {
     out
 }
 
+/// The references block for what a page of messages cites, after the page.
+/// One block for the page, so a URI several messages cite is explained once;
+/// each message's own content is scanned, never its sender's address.
+async fn references_after(orch: &Orchestrator, messages: &[crate::models::Message]) -> String {
+    let cited = messages
+        .iter()
+        .map(|msg| cairn_common::references::without_references_block(&msg.content))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    match super::references::references_block(orch, &cited).await {
+        Some(block) => format!("\n{block}\n"),
+        None => String::new(),
+    }
+}
+
 pub(super) async fn read_project_messages(
+    orch: &Orchestrator,
     db: &LocalDb,
     project_key: &str,
     params: &[QueryParam],
@@ -109,6 +126,7 @@ pub(super) async fn read_project_messages(
             out.push_str(&project_board_purpose(&project_ctx.project_key));
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
             out.push_str(&format_messages(&messages));
+            out.push_str(&references_after(orch, &messages).await);
             out
         }
         Err(e) => format!("Failed to query messages: {}", e),
@@ -161,6 +179,7 @@ fn format_direct_messages(messages: &[crate::models::Message]) -> String {
 /// describes.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn read_node_messages(
+    orch: &Orchestrator,
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -198,6 +217,7 @@ pub(super) async fn read_node_messages(
             let mut out = format!("# Messages \u{2014} {}\n\n", label);
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
             out.push_str(&format_direct_messages(&messages));
+            out.push_str(&references_after(orch, &messages).await);
             out
         }
         Err(e) => format!("Failed to query messages: {}", e),
@@ -205,6 +225,7 @@ pub(super) async fn read_node_messages(
 }
 
 pub(super) async fn read_issue_messages(
+    orch: &Orchestrator,
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -231,6 +252,7 @@ pub(super) async fn read_issue_messages(
             let mut out = format!("# Messages — {}/{}\n\n", project_key, number);
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
             out.push_str(&format_messages(&messages));
+            out.push_str(&references_after(orch, &messages).await);
             out
         }
         Err(e) => format!("Failed to query messages: {}", e),
@@ -253,7 +275,8 @@ mod tests {
         .await
         .unwrap();
 
-        let read = read_project_messages(&db, "p", &[]).await;
+        let orch = crate::resources::references::test_orchestrator(db);
+        let read = read_project_messages(&orch, &orch.db.local, "p", &[]).await;
         assert!(
             read.starts_with("# Messages — p\n\nA project-wide board"),
             "{read}"
@@ -302,7 +325,9 @@ mod tests {
         .await
         .unwrap();
 
-        let read = read_node_messages(&db, "p", 0, 0, "ux", None, &[]).await;
+        let orch = crate::resources::references::test_orchestrator(db);
+        let db = &orch.db.local;
+        let read = read_node_messages(&orch, db, "p", 0, 0, "ux", None, &[]).await;
 
         assert!(
             read.starts_with("# Messages \u{2014} cairn://p/p/ux\n"),
@@ -325,7 +350,8 @@ mod tests {
         );
 
         let forward = read_node_messages(
-            &db,
+            &orch,
+            db,
             "p",
             0,
             0,

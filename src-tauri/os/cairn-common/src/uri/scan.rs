@@ -131,10 +131,108 @@ pub fn scan_uris(text: &str) -> Vec<UriMatch> {
     found
 }
 
+/// Every reference a reader could follow out of `text`: each parseable
+/// `cairn://` URI and each `file:` target, exactly as written and in textual
+/// order, duplicates preserved.
+///
+/// A `file:` candidate has no parser to consult, so it counts when a path
+/// follows the scheme and the scheme starts a word (`profile:` is prose, not a
+/// reference). Trailing sentence punctuation is shed from it as from a
+/// `cairn://` candidate.
+pub fn scan_reference_uris(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        let cairn = rest.find("cairn://");
+        let file = file_scheme_start(text, index);
+        let start = match (cairn, file) {
+            (Some(cairn), Some(file)) => cairn.min(file),
+            (Some(cairn), None) => cairn,
+            (None, Some(file)) => file,
+            (None, None) => break,
+        };
+        let tail = &rest[start..];
+        let end = tail
+            .char_indices()
+            .find(|(_, c)| !continues_uri(*c))
+            .map(|(at, _)| at)
+            .unwrap_or(tail.len());
+        let mut candidate = &tail[..end];
+        let is_file = Some(start) == file && Some(start) != cairn;
+        // Prose punctuation is shed before the parser is asked, because some
+        // segments (a node name) would accept `builder,` as written.
+        let shed = candidate.trim_end_matches(TRAILING_PUNCTUATION);
+        if !is_file && shed.len() < candidate.len() && parse_uri(shed).is_some() {
+            candidate = shed;
+        }
+        loop {
+            let accepted = if is_file {
+                candidate.len() > "file:".len() && !candidate.ends_with(TRAILING_PUNCTUATION)
+            } else {
+                parse_uri(candidate).is_some()
+            };
+            if accepted {
+                found.push(candidate.to_string());
+                break;
+            }
+            match candidate.strip_suffix(TRAILING_PUNCTUATION) {
+                Some(shorter) if !shorter.is_empty() => candidate = shorter,
+                _ => break,
+            }
+        }
+        index += start + end.max(1);
+        while !text.is_char_boundary(index) {
+            index += 1;
+        }
+    }
+    found
+}
+
+/// The offset, relative to `from`, of the next `file:` that starts a word.
+fn file_scheme_start(text: &str, from: usize) -> Option<usize> {
+    let mut offset = from;
+    while let Some(found) = text[offset..].find("file:") {
+        let at = offset + found;
+        let starts_word = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '/'));
+        if starts_word {
+            return Some(at - from);
+        }
+        offset = at + "file:".len();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::{AttachmentRef, AttachmentScopeRef};
     use super::*;
+
+    #[test]
+    fn reference_scan_finds_cairn_and_file_targets_in_order() {
+        let found = scan_reference_uris(
+            "See file:src/lib.rs?offset=10&limit=5, then cairn://p/cairn/42/1/builder, cairn://p/cairn/42. \
+             A profile: is prose, (file:docs/a.md) is not, and cairn://nonsense/x is skipped.",
+        );
+        assert_eq!(
+            found,
+            vec![
+                "file:src/lib.rs?offset=10&limit=5".to_string(),
+                "cairn://p/cairn/42/1/builder".to_string(),
+                "cairn://p/cairn/42".to_string(),
+                "file:docs/a.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_scan_keeps_duplicates_and_survives_multibyte_text() {
+        let found = scan_reference_uris("é cairn://p/cairn/1 — and cairn://p/cairn/1 again file:");
+        assert_eq!(found, vec!["cairn://p/cairn/1".to_string(); 2]);
+    }
 
     fn uris(text: &str) -> Vec<String> {
         scan_stored_images(text)

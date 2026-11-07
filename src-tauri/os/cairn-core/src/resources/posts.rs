@@ -108,7 +108,11 @@ impl PostContext {
     /// — for an agent, the node home URI a reader can go read. The run that
     /// wrote the row is provenance rather than identity and stays in
     /// `format=json`.
-    fn author(&self, principal: &PrincipalRef, appearance: &AppearanceSnapshot) -> String {
+    pub(crate) fn author(
+        &self,
+        principal: &PrincipalRef,
+        appearance: &AppearanceSnapshot,
+    ) -> String {
         self.aliases
             .display(Some(principal), Some(appearance))
             .inline()
@@ -418,7 +422,7 @@ mod tests {
 
     async fn fixture() -> LocalDb {
         let db = crate::storage::migrated_test_db("posts-rendering.db").await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
              VALUES ('{PROJECT}', 'default', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);"
         ))

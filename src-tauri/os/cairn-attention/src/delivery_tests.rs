@@ -3,7 +3,7 @@
 //! miss is today's pointer rather than an error.
 use crate::delivery::{
     one_line_excerpt, prose_candidates_sql, render_push_resolved, CATCHUP_DIGEST_CHARS,
-    REVIEW_ARTIFACT_SQL, WINDOW_TURNS_SQL,
+    WINDOW_TURNS_SQL,
 };
 use crate::push::{Boundary, Push, Wake, JOB_CHAT_TURNS_SQL};
 use crate::runtime::*;
@@ -54,6 +54,12 @@ impl AttentionHost for Host {
         None
     }
     async fn render_content(&self, _: ContentRequest<'_>) -> Option<String> {
+        None
+    }
+    async fn reference(&self, _: &str) -> Option<cairn_common::references::ReferenceEntry> {
+        None
+    }
+    async fn references_block(&self, _: &str) -> Option<String> {
         None
     }
     async fn mark_thread_chapter(&self, _: &LocalDb, _: &str, _: &str, _: &str, _: &str) {}
@@ -414,60 +420,6 @@ async fn catchup_with_no_new_turns_keeps_the_pointer() {
 }
 
 #[tokio::test]
-async fn review_renders_artifact_title_and_summary() {
-    let (runtime, db) = fixture("delivery-review.db").await;
-    artifact(
-        &db,
-        "create-pr",
-        1,
-        r#"{"title":"Rebase onto main (draft)","body":"BODY sentinel"}"#,
-        10,
-    )
-    .await;
-    artifact(
-        &db,
-        "create-pr",
-        2,
-        r#"{"title":"Rebase onto main","body":"BODY sentinel"}"#,
-        20,
-    )
-    .await;
-    // Written after the PR, so "newest of any name" would wrongly pick it.
-    artifact(
-        &db,
-        "plan",
-        1,
-        r#"{"title":"Plan the rebase","summary":"Reorders the tests,\nthen rebases.","content":"BODY sentinel"}"#,
-        30,
-    )
-    .await;
-
-    let plan = format!("{NODE}/plan");
-    assert_eq!(
-        review(&runtime, &plan).await,
-        format!(
-            "{}\n\nWork product ready for review: Plan the rebase\n\
-             Reorders the tests, then rebases.\n\
-             Read {plan} for the current content.",
-            header(&plan)
-        )
-    );
-
-    for uri in [format!("{NODE}/create-pr"), format!("{NODE}/artifact")] {
-        let rendered = review(&runtime, &uri).await;
-        assert_eq!(
-            rendered,
-            format!(
-                "{}\n\nWork product ready for review: Rebase onto main\n\
-                 Read {uri} for the current content.",
-                header(&uri)
-            )
-        );
-        assert!(!rendered.contains("BODY"), "{rendered}");
-    }
-}
-
-#[tokio::test]
 async fn failed_lookup_keeps_the_pointer() {
     let (runtime, db) = fixture("delivery-failed-lookup.db").await;
     said(&db, "t1", 1, 100, "already read").await;
@@ -510,9 +462,10 @@ async fn failed_lookup_keeps_the_pointer() {
 }
 
 /// Each statement is bounded by what it shows: no scan, no sort over a job's
-/// history, and each on the index that bounds it.
+/// history, and each on the index that bounds it. A review push's artifact line
+/// is the references resolver's artifact preview, tested in cairn-core.
 #[tokio::test]
-async fn catchup_and_review_statements_stay_on_their_indexes() {
+async fn catchup_statements_stay_on_their_indexes() {
     let (_, db) = fixture("delivery-plans.db").await;
     let statements = [
         (
@@ -534,11 +487,6 @@ async fn catchup_and_review_statements_stay_on_their_indexes() {
             "turn fallback",
             prose_candidates_sql("idx_events_turn_id"),
             "idx_events_turn_id",
-        ),
-        (
-            "review artifact",
-            REVIEW_ARTIFACT_SQL.to_string(),
-            "idx_artifacts_output_job_version",
         ),
     ];
     for (label, sql, index) in statements {

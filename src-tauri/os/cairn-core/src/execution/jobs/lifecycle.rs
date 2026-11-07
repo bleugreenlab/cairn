@@ -3675,6 +3675,32 @@ fn continue_job_launch_locked(
     .flatten()
     .collect();
     let resume_note = (!resume_notes.is_empty()).then(|| resume_notes.join("\n\n"));
+    // What the operator's own words cite (queued notes and the immediate
+    // message), resolved once and placed right after them. Cairn's synthesized
+    // continuation is not the operator's and cites nothing.
+    let operator_text = queued_messages
+        .iter()
+        .filter(|_| has_queued)
+        .map(|queued| queued.content.as_str())
+        .chain((!trigger.synthetic).then_some(trigger.message.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let operator_references =
+        if operator_text.contains("cairn://") || operator_text.contains("file:") {
+            crate::storage::run_db_blocking(|| async {
+                Ok::<_, String>(
+                    crate::resources::references::references_block(orch, &operator_text).await,
+                )
+            })
+            .unwrap_or_default()
+        } else {
+            None
+        };
+    let base_prompt = match operator_references {
+        Some(block) if base_prompt.is_empty() => block,
+        Some(block) => format!("{base_prompt}\n\n{block}"),
+        None => base_prompt,
+    };
     let prompt = assemble_resume_prompt(
         resume_note.as_deref(),
         queued_block,

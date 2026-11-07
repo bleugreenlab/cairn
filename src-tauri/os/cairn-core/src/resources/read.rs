@@ -3197,10 +3197,10 @@ async fn render_resource_body(
             node_id,
         } => read_node_rebase(orch, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::ProjectMessages { project } => {
-            read_project_messages(db, &project, &params).await
+            read_project_messages(orch, db, &project, &params).await
         }
         CairnResource::IssueMessages { project, number } => {
-            read_issue_messages(db, &project, number, &params).await
+            read_issue_messages(orch, db, &project, number, &params).await
         }
         CairnResource::IssueComments { project, number } => {
             if let Some(error) = reject_query_params("issue comments", &params) {
@@ -3226,7 +3226,12 @@ async fn render_resource_body(
             number,
             exec_seq,
             node_id,
-        } => read_node_messages(db, &project, number, exec_seq, &node_id, None, &params).await,
+        } => {
+            read_node_messages(
+                orch, db, &project, number, exec_seq, &node_id, None, &params,
+            )
+            .await
+        }
         CairnResource::NodeProgress {
             project,
             number,
@@ -3241,6 +3246,7 @@ async fn render_resource_body(
             task_name,
         } => {
             read_node_messages(
+                orch,
                 db,
                 &project,
                 number,

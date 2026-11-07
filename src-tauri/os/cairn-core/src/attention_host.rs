@@ -156,6 +156,12 @@ impl AttentionHost for CoreAttentionHost {
             }
         }
     }
+    async fn reference(&self, uri: &str) -> Option<cairn_common::references::ReferenceEntry> {
+        crate::resources::references::resolve_reference(&self.0, uri).await
+    }
+    async fn references_block(&self, text: &str) -> Option<String> {
+        crate::resources::references::references_block(&self.0, text).await
+    }
     /// Record that a terminal child makes a watching thread's turns compactable.
     ///
     /// Best-effort by construction: compaction bookkeeping must never be able to

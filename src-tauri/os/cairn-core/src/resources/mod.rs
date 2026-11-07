@@ -42,6 +42,7 @@ mod read;
 mod read_contract_tests;
 mod rebase;
 mod recipes;
+pub mod references;
 mod responses;
 mod routes;
 pub mod self_rebuild;

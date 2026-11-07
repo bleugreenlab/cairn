@@ -34,6 +34,7 @@ pub mod process_identity;
 pub mod protocol;
 pub mod query;
 pub mod read;
+pub mod references;
 pub mod retired_home;
 pub mod run_contract;
 pub mod run_grammar;

@@ -65,6 +65,12 @@ impl AttentionHost for Host {
     async fn render_content(&self, _: ContentRequest<'_>) -> Option<String> {
         panic!("no content rendering expected")
     }
+    async fn reference(&self, _: &str) -> Option<cairn_common::references::ReferenceEntry> {
+        panic!("no reference resolution expected")
+    }
+    async fn references_block(&self, _: &str) -> Option<String> {
+        panic!("no reference resolution expected")
+    }
     async fn mark_thread_chapter(&self, _: &LocalDb, _: &str, _: &str, _: &str, _: &str) {
         panic!("no chapter compaction expected")
     }
