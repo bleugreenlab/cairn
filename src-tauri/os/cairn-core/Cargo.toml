@@ -133,6 +133,10 @@ matfile = "0.5"
 # Finder-launched app (minimal process env) still resolves token-bearing
 # servers. Declared per-target to avoid pulling secret-service/dbus deps into
 # the macOS/Windows builds.
+# sha2 0.10 gates ARM SHA instructions behind asm; sha2-asm rejects Windows.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 

@@ -1244,6 +1244,125 @@ mod tests {
         (format!("http://{address}"), requested)
     }
 
+    /// Run alone in a release test binary; cold means an empty verification memo,
+    /// not an empty OS page cache. No speech model or engine download is needed.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[tokio::test]
+    #[ignore = "manual release benchmark: writes and hashes a 384 MiB fixture"]
+    async fn benchmark_status_verification() {
+        use std::io::Write;
+        assert!(!cfg!(debug_assertions), "run with --release");
+        fn rss() -> u64 {
+            cairn_procmem::platform::process_rss_bytes(std::process::id()).unwrap()
+        }
+        let harness = Harness::managed(COOPERATIVE);
+        let manifest_path = harness.directory.path().join("voice-components.json");
+        let mut manifest: super::super::ManagedManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let component = manifest
+            .components
+            .iter_mut()
+            .find(|c| c.kind == "model:fast")
+            .unwrap();
+        let mut output = std::fs::File::create(&component.path).unwrap();
+        let buffer = [0x5a_u8; 64 * 1024];
+        let mut hasher = Sha256::new();
+        for _ in 0..6144 {
+            output.write_all(&buffer).unwrap();
+            hasher.update(buffer);
+        }
+        output.sync_all().unwrap();
+        drop(output);
+        component.size_bytes = 384 * 1024 * 1024;
+        component.sha256 = format!("{:x}", hasher.finalize());
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let voice = harness.voice();
+        let sampling = Arc::new(AtomicBool::new(true));
+        let (ready, started) = std::sync::mpsc::channel();
+        let sampler = std::thread::spawn({
+            let sampling = sampling.clone();
+            move || {
+                let mut peak = rss();
+                ready.send(()).unwrap();
+                while sampling.load(Ordering::Relaxed) {
+                    peak = peak.max(rss());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                peak.max(rss())
+            }
+        });
+        started.recv().unwrap();
+        let before = rss();
+        let start = std::time::Instant::now();
+        let status = voice.status().await.unwrap();
+        let cold = start.elapsed();
+        assert_eq!(status.engine, ComponentState::Installed);
+        assert_eq!(status.fast_model, ComponentState::Installed);
+        sampling.store(false, Ordering::Relaxed);
+        let after = sampler.join().unwrap();
+        let mut warm = Vec::new();
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let status = voice.status().await.unwrap();
+            warm.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(status.engine, ComponentState::Installed);
+            assert_eq!(status.fast_model, ComponentState::Installed);
+        }
+        warm.sort_by(f64::total_cmp);
+        eprintln!("status 384MiB cold_ms={:.3} warm_median_ms={:.3} warm_max_ms={:.3} rss_before_bytes={} sampled_peak_rss_bytes={} peak_growth_bytes={} sample_interval_ms=1",
+            cold.as_secs_f64() * 1000.0, warm[10], warm[19], before, after, after.saturating_sub(before));
+    }
+
+    #[tokio::test]
+    async fn status_detects_changed_models_and_removal_after_memoized_success() {
+        for same_size in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let components = write_stale_install(directory.path());
+            let service = VoiceService::with_engine(
+                directory.path().to_owned(),
+                APP_VERSION,
+                BUILD_IDENTITY,
+                Arc::new(CapturingEmitter::new()),
+                OFFLINE_RELEASES,
+                Some(TEST_TARGET),
+                None,
+            );
+            let voice = service.handle();
+            assert_eq!(
+                voice.status().await.unwrap().fast_model,
+                ComponentState::Installed
+            );
+            assert_eq!(
+                voice.status().await.unwrap().fast_model,
+                ComponentState::Installed
+            );
+            let model = components.iter().find(|c| c.kind == "model:fast").unwrap();
+            let modified = std::fs::metadata(&model.path).unwrap().modified().unwrap();
+            let size = if same_size {
+                model.size_bytes as usize
+            } else {
+                1
+            };
+            std::fs::write(&model.path, vec![b'x'; size]).unwrap();
+            let modified = if same_size {
+                modified + Duration::from_secs(2)
+            } else {
+                modified
+            };
+            filetime::set_file_mtime(&model.path, filetime::FileTime::from_system_time(modified))
+                .unwrap();
+            assert_eq!(
+                voice.status().await.unwrap().fast_model,
+                ComponentState::Corrupt
+            );
+            voice.0.installer.remove_managed().await.unwrap();
+            let status = voice.status().await.unwrap();
+            assert_eq!(status.fast_model, ComponentState::Missing);
+            assert_eq!(status.realtime_model, ComponentState::Missing);
+            assert_eq!(status.engine, ComponentState::Missing);
+        }
+    }
+
     #[tokio::test]
     async fn missing_engine_override_reports_probe_failure() {
         let directory = tempfile::tempdir().unwrap();

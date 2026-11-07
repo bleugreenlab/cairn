@@ -161,8 +161,22 @@ pub struct ComponentInstaller {
     /// What each engine build can run, by its sha256. See
     /// [`ComponentInstaller::engine_capabilities`].
     capabilities: std::sync::Mutex<HashMap<String, EngineCapabilities>>,
+    // Serialize verification with publication/removal, including detached engine
+    // commits, so an in-flight hash cannot restore an invalidated success.
+    verified: Arc<Mutex<HashMap<PathBuf, VerifiedFile>>>,
+    #[cfg(test)]
+    verification_hashes: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    verification_gate: Option<Arc<CommitGate>>,
     #[cfg(test)]
     commit_gate: Option<Arc<CommitGate>>,
+}
+
+#[derive(PartialEq, Eq)]
+struct VerifiedFile {
+    size: u64,
+    modified: std::time::SystemTime,
+    sha256: String,
 }
 
 /// Holds an engine commit at its most delicate point, new bytes in place and the
@@ -205,6 +219,11 @@ impl ComponentInstaller {
             events: Arc::new(events),
             install_lock: Arc::new(Mutex::new(())),
             capabilities: std::sync::Mutex::new(HashMap::new()),
+            verified: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            verification_hashes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            verification_gate: None,
             #[cfg(test)]
             commit_gate: None,
         }
@@ -213,12 +232,19 @@ impl ComponentInstaller {
     pub async fn install_engine(&self, target: &str) -> VoiceResult<ManagedComponent> {
         let guard = self.install_lock.clone().lock_owned().await;
         let asset = engine_asset_name(&self.app_version, target);
-        recover_engine_backup(
-            &self.root,
-            &self.engine_dir().join(&asset),
-            &self.engine_backup_path(&asset),
-        )
-        .await?;
+        if tokio::fs::try_exists(self.engine_backup_path(&asset))
+            .await
+            .unwrap_or(false)
+        {
+            let mut verified = self.verified.lock().await;
+            verified.remove(&self.engine_dir().join(&asset));
+            recover_engine_backup(
+                &self.root,
+                &self.engine_dir().join(&asset),
+                &self.engine_backup_path(&asset),
+            )
+            .await?;
+        }
         // Ahead of the already-current check: a handed-off engine carries the
         // same asset name as the engine it replaces, so that check would call
         // the stale engine current and never look further.
@@ -395,6 +421,7 @@ impl ComponentInstaller {
         component.target = Some(target.to_owned());
         component.path = destination.clone();
         let commit = EngineCommit {
+            verified: self.verified.clone(),
             root: self.root.clone(),
             staged: staged.to_owned(),
             destination,
@@ -489,29 +516,66 @@ impl ComponentInstaller {
 
     pub async fn verify(&self, component: &ManagedComponent) -> VoiceResult<()> {
         ensure_managed_path(&self.root, &component.path)?;
-        let metadata = tokio::fs::metadata(&component.path)
-            .await
-            .map_err(|error| VoiceError::Corrupt(error.to_string()))?;
-        if metadata.len() != component.size_bytes {
-            return Err(VoiceError::Corrupt(format!(
-                "{} size mismatch",
-                component.id
-            )));
-        }
-        let actual = hash_file(&component.path).await?;
-        if actual != component.sha256 {
-            return Err(VoiceError::Corrupt(format!(
-                "{} checksum mismatch",
-                component.id
-            )));
-        }
-        Ok(())
+        let mut verified = self.verified.clone().lock_owned().await;
+        let component = component.clone();
+        #[cfg(test)]
+        let hashes = self.verification_hashes.clone();
+        #[cfg(test)]
+        let gate = self.verification_gate.clone();
+        // A cancelled caller must not release admission while its blocking hash
+        // still runs. This task owns the guard through hashing and memoization.
+        tokio::spawn(async move {
+            let previous = verified.remove(&component.path);
+            let metadata = tokio::fs::metadata(&component.path)
+                .await
+                .map_err(|error| VoiceError::Corrupt(error.to_string()))?;
+            if metadata.len() != component.size_bytes {
+                return Err(VoiceError::Corrupt(format!(
+                    "{} size mismatch",
+                    component.id
+                )));
+            }
+            let identity = VerifiedFile {
+                size: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .map_err(|error| VoiceError::Corrupt(error.to_string()))?,
+                sha256: component.sha256.clone(),
+            };
+            // Deliberately process-local: changes preserving both size and mtime
+            // are not detected until the next process hashes the file again.
+            if previous.as_ref() == Some(&identity) {
+                verified.insert(component.path.clone(), identity);
+                return Ok(());
+            }
+            #[cfg(test)]
+            {
+                hashes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(gate) = gate {
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                }
+            }
+            let actual = hash_file(&component.path).await?;
+            if actual != component.sha256 {
+                return Err(VoiceError::Corrupt(format!(
+                    "{} checksum mismatch",
+                    component.id
+                )));
+            }
+            verified.insert(component.path.clone(), identity);
+            Ok(())
+        })
+        .await
+        .map_err(|error| VoiceError::Corrupt(format!("verification task failed: {error}")))?
     }
 
     pub async fn remove_managed(&self) -> VoiceResult<()> {
         let _guard = self.install_lock.lock().await;
         let manifest = self.manifest().await?;
+        let mut verified = self.verified.lock().await;
         for component in manifest.components {
+            verified.remove(&component.path);
             ensure_managed_path(&self.root, &component.path)?;
             match tokio::fs::remove_file(&component.path).await {
                 Ok(()) => {}
@@ -644,6 +708,8 @@ impl ComponentInstaller {
             let _ = tokio::fs::remove_file(&partial).await;
             return Err(VoiceError::Install("download checksum mismatch".into()));
         }
+        let mut verified = self.verified.lock().await;
+        verified.remove(destination);
         if cfg!(windows) {
             let _ = tokio::fs::remove_file(destination).await;
         }
@@ -764,6 +830,7 @@ async fn remove_superseded_engine(
 /// write is the commit point. If anything fails before it, the backup is renamed
 /// back over the destination, again in one step.
 struct EngineCommit {
+    verified: Arc<Mutex<HashMap<PathBuf, VerifiedFile>>>,
     root: PathBuf,
     staged: PathBuf,
     destination: PathBuf,
@@ -780,6 +847,11 @@ struct EngineCommit {
 
 impl EngineCommit {
     async fn run(self) -> VoiceResult<()> {
+        let mut verified = self.verified.lock().await;
+        verified.remove(&self.destination);
+        if let Some(previous) = &self.superseded {
+            verified.remove(&previous.path);
+        }
         let result = self.commit().await;
         let _ = tokio::fs::remove_file(&self.staged).await;
         if let Some(handoff) = &self.handoff {
@@ -1026,10 +1098,26 @@ fn ensure_managed_path(root: &Path, path: &Path) -> VoiceResult<()> {
 }
 
 async fn hash_file(path: &Path) -> VoiceResult<String> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|error| VoiceError::Corrupt(error.to_string()))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let hash = || -> std::io::Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            Ok(format!("{:x}", hasher.finalize()))
+        };
+        hash().map_err(|error| VoiceError::Corrupt(error.to_string()))
+    })
+    .await
+    .map_err(|error| VoiceError::Corrupt(format!("checksum task failed: {error}")))?
 }
 
 #[cfg(unix)]
@@ -1150,6 +1238,201 @@ pub(crate) async fn probe_engine(path: &Path, version: &str) -> VoiceResult<Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelling_verification_keeps_hash_admission_until_memoized() {
+        use std::sync::atomic::Ordering;
+        let directory = tempfile::tempdir().unwrap();
+        let gate = Arc::new(CommitGate::default());
+        let mut installer = ComponentInstaller::new(
+            directory.path().to_owned(),
+            "http://127.0.0.1:1",
+            "test",
+            "test",
+            |_| {},
+        );
+        installer.verification_gate = Some(gate.clone());
+        let installer = Arc::new(installer);
+        let path = directory.path().join("model");
+        std::fs::write(&path, b"good").unwrap();
+        let component = ManagedComponent {
+            kind: "model:fast".into(),
+            id: "model".into(),
+            target: None,
+            size_bytes: 4,
+            sha256: format!("{:x}", Sha256::digest(b"good")),
+            path,
+        };
+        let first = tokio::spawn({
+            let installer = installer.clone();
+            let component = component.clone();
+            async move { installer.verify(&component).await }
+        });
+        gate.reached.notified().await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let second = installer.verify(&component);
+        tokio::pin!(second);
+        assert!(futures_util::poll!(&mut second).is_pending());
+        assert!(
+            installer.verified.try_lock().is_err(),
+            "the verification job, not its cancelled waiter, owns admission"
+        );
+        assert_eq!(installer.verification_hashes.load(Ordering::Relaxed), 1);
+        gate.release.notify_one();
+        second.await.unwrap();
+        assert_eq!(
+            installer.verification_hashes.load(Ordering::Relaxed),
+            1,
+            "the second caller reuses the detached job's completed hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_memo_requires_metadata_and_expected_digest() {
+        use std::sync::atomic::Ordering;
+        let directory = tempfile::tempdir().unwrap();
+        let installer = ComponentInstaller::new(
+            directory.path().to_owned(),
+            "http://127.0.0.1:1",
+            "test",
+            "test",
+            |_| {},
+        );
+        let path = directory.path().join("model");
+        std::fs::write(&path, b"good").unwrap();
+        let mut component = ManagedComponent {
+            kind: "model:fast".into(),
+            id: "model".into(),
+            target: None,
+            size_bytes: 4,
+            sha256: format!("{:x}", Sha256::digest(b"good")),
+            path,
+        };
+        installer.verify(&component).await.unwrap();
+        installer.verify(&component).await.unwrap();
+        assert_eq!(installer.verification_hashes.load(Ordering::Relaxed), 1);
+
+        component.sha256 = format!("{:x}", Sha256::digest(b"evil"));
+        assert!(matches!(
+            installer.verify(&component).await,
+            Err(VoiceError::Corrupt(_))
+        ));
+        assert!(matches!(
+            installer.verify(&component).await,
+            Err(VoiceError::Corrupt(_))
+        ));
+        assert_eq!(
+            installer.verification_hashes.load(Ordering::Relaxed),
+            3,
+            "a different expectation rehashes and failures are never memoized"
+        );
+        component.sha256 = format!("{:x}", Sha256::digest(b"good"));
+        installer.verify(&component).await.unwrap();
+        assert_eq!(installer.verification_hashes.load(Ordering::Relaxed), 4);
+
+        let modified = std::fs::metadata(&component.path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::write(&component.path, b"evil").unwrap();
+        filetime::set_file_mtime(
+            &component.path,
+            filetime::FileTime::from_system_time(modified + Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert!(matches!(
+            installer.verify(&component).await,
+            Err(VoiceError::Corrupt(_))
+        ));
+        assert_eq!(installer.verification_hashes.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn downloaded_replacement_invalidates_verification_even_with_preserved_metadata() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let installer = ComponentInstaller::new(
+            directory.path().to_owned(),
+            "http://127.0.0.1:1",
+            "test",
+            "test",
+            |_| {},
+        );
+        let path = directory.path().join("models/model");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"good").unwrap();
+        let component = ManagedComponent {
+            kind: "model:fast".into(),
+            id: "model".into(),
+            target: None,
+            size_bytes: 4,
+            sha256: format!("{:x}", Sha256::digest(b"good")),
+            path,
+        };
+        installer.publish(component.clone()).await.unwrap();
+        installer.verify(&component).await.unwrap();
+        let modified = std::fs::metadata(&component.path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/model", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nevil")
+                .await
+                .unwrap();
+        });
+        let artifact = ModelArtifact {
+            model: VoiceModel::Fast,
+            file_name: "model",
+            url: Box::leak(url.into_boxed_str()),
+            size_bytes: 4,
+            sha256: Box::leak(format!("{:x}", Sha256::digest(b"evil")).into_boxed_str()),
+        };
+        let replacement = installer.install_model(&artifact).await.unwrap();
+        server.await.unwrap();
+        filetime::set_file_mtime(
+            &component.path,
+            filetime::FileTime::from_system_time(modified),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                installer.verify(&component).await,
+                Err(VoiceError::Corrupt(_))
+            ),
+            "publication must discard a success even if metadata is preserved"
+        );
+        installer.verify(&replacement).await.unwrap();
+        installer.verify(&replacement).await.unwrap();
+        assert_eq!(installer.verification_hashes.load(Ordering::Relaxed), 3);
+        installer.remove_managed().await.unwrap();
+        assert!(installer.verified.lock().await.is_empty());
+        assert!(!component.path.exists());
+    }
+
+    #[tokio::test]
+    async fn streaming_hash_covers_multiple_buffers_and_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model");
+        let bytes: Vec<u8> = (0..(3 * 64 * 1024 + 17)).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            hash_file(&path).await.unwrap(),
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(
+            hash_file(&path).await.unwrap(),
+            format!("{:x}", Sha256::digest([]))
+        );
+    }
 
     #[test]
     fn checksum_parser_requires_exact_asset_and_format() {
