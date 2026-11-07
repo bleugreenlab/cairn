@@ -2317,6 +2317,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // A run batch that outlived its call; read beside `agent_waits` by the
     // replay mutation boundary, so it lives where they do.
     ("run_batch_detached", TableScope::ProjectScoped),
+    // A result a restarted runner adopted for a batch it did not start; read
+    // beside `run_batch_detached` and `agent_waits`, so it lives where they do.
+    ("run_batch_adopted_outcomes", TableScope::ProjectScoped),
     ("artifact_content", TableScope::ProjectScoped),
     ("artifacts", TableScope::ProjectScoped),
     // Per-install progress of the one-time retirement backfill (CAIRN-4182):
@@ -3157,6 +3160,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "run_batch_detached",
         id_columns: &["job_id", "run_id"],
+    },
+    RekeyTableManifest {
+        table: "run_batch_adopted_outcomes",
+        id_columns: &["job_id"],
     },
     RekeyTableManifest {
         table: "artifact_content",

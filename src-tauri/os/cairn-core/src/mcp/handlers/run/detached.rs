@@ -73,9 +73,12 @@ pub(crate) struct DetachedBatch {
     pub(crate) created_ms: i64,
     pub(crate) settled_ms: Option<i64>,
     pub(crate) notified_ms: Option<i64>,
+    /// What a later runner process needs to settle and publish the batch from
+    /// a result it adopts (see [`super::adopted`]).
+    pub(crate) settlement: Option<super::PersistedSettlement>,
 }
 
-const COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms";
+const COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms,settlement_json";
 
 fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
     Ok(DetachedBatch {
@@ -95,6 +98,11 @@ fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
         created_ms: row.i64(13)?,
         settled_ms: row.opt_i64(14)?,
         notified_ms: row.opt_i64(15)?,
+        // A row this build cannot read keeps its batch settleable, with the
+        // precise report in place of the commit.
+        settlement: row
+            .opt_text(16)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -157,7 +165,7 @@ impl LiveBatch {
 static PLACED_HERE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(Default::default);
 
-fn placed_here(request_id: &str) -> bool {
+pub(crate) fn placed_here(request_id: &str) -> bool {
     PLACED_HERE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -348,13 +356,17 @@ pub(crate) async fn insert_converted(
         commits,
         label,
         identity,
+        settlement,
         ..
     } = condition
     else {
         return Ok(());
     };
+    let settlement = settlement
+        .as_ref()
+        .and_then(|settlement| serde_json::to_string(settlement).ok());
     c.execute(
-        "INSERT OR IGNORE INTO run_batch_detached(request_id,job_id,run_id,label,identity,commits,holds_branch,state,reason,created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,'running',?8,?9)",
+        "INSERT OR IGNORE INTO run_batch_detached(request_id,job_id,run_id,label,identity,commits,holds_branch,state,reason,created_ms,settlement_json) VALUES(?1,?2,?3,?4,?5,?6,?7,'running',?8,?9,?10)",
         params![
             request_id.as_str(),
             job_id,
@@ -364,25 +376,19 @@ pub(crate) async fn insert_converted(
             *commits as i64,
             condition.holds_branch() as i64,
             reason,
-            now_ms
+            now_ms,
+            settlement
         ],
     )
     .await?;
     Ok(())
 }
 
-/// What the call of a run-batch wait resolved after a restart is told. The
-/// batch may still be running on its machine, so nothing is cancelled.
-pub(crate) fn restart_text(request_id: &str) -> String {
-    format!(
-        "Cairn restarted while this batch was running. Nothing was cancelled: it may still be running on its machine, and its result reaches this job as a notice when that machine reports it. `{}` shows it now. Do not re-run it.",
-        handle_uri(request_id)
-    )
-}
-
 /// What a completion a machine still lists says about a batch whose runner
-/// restarted before it reported. Its full output went with the old process.
-fn completion_result(
+/// restarted before it reported, when the result itself never reached this
+/// runner: its machine evicted it past its retention bound, or delivered it to
+/// a runner process that did not live to record it.
+pub(crate) fn completion_result(
     completion: &cairn_common::executor_protocol::CellCompletion,
     commits: bool,
 ) -> (String, String) {
@@ -397,6 +403,18 @@ fn completion_result(
     let mut output = String::from(
         "Cairn restarted before this batch reported, so its full output was not recovered; its machine kept only the completion.",
     );
+    if let Some(eviction) = completion.result_evicted.as_ref() {
+        output.push_str(&format!(
+            " Its machine dropped the full result, past the {} MiB it retains of results Cairn has not yet received.",
+            eviction.bound_bytes / (1024 * 1024)
+        ));
+        if let Some(delta) = eviction.delta_commit.as_deref() {
+            output.push_str(&format!(
+                " The commit it sealed ({}) was dropped with it.",
+                &delta[..delta.len().min(12)]
+            ));
+        }
+    }
     if commits {
         output.push_str(" Its changes were not published: publication happens when Cairn receives the result, and it never did. Re-run it with its commit_msg if the work still matters.");
     }
@@ -431,11 +449,34 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                 if has_live_resolver(id) || batch_is_live(orch, id) {
                     continue;
                 }
+                // An adopted result settles the row through its driver, and
+                // its commit publishes there (`run::adopted`).
+                if !placed_here(id) {
+                    match super::adopted::has_open_adoption(&db, id).await {
+                        Ok(false) => {}
+                        Ok(true) => continue,
+                        Err(error) => {
+                            log::warn!("could not read whether run batch {id} has an adopted result: {error}");
+                            continue;
+                        }
+                    }
+                }
+                let placed_on = batch
+                    .settlement
+                    .as_ref()
+                    .and_then(|settlement| settlement.placed_on.as_ref());
                 let finished = if placed_here(id) {
                     mark_lost(
                         &db,
                         id,
                         "its batch ended in this runner without its result reaching Cairn",
+                    )
+                    .await
+                } else if placed_on.is_some_and(super::PlacedOn::colocated) {
+                    mark_lost(
+                        &db,
+                        id,
+                        "it ran on `local`, this machine's own executor, which stops with Cairn when Cairn restarts",
                     )
                     .await
                 } else {
@@ -495,7 +536,7 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
         let b = batch.clone();
         Box::pin(async move {
             c.execute(
-                &format!("INSERT INTO run_batch_detached({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"),
+                &format!("INSERT INTO run_batch_detached({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"),
                 params![
                     b.request_id.as_str(),
                     b.job_id.as_str(),
@@ -512,7 +553,10 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
                     b.lost_evidence.as_deref(),
                     b.created_ms,
                     b.settled_ms,
-                    b.notified_ms
+                    b.notified_ms,
+                    b.settlement
+                        .as_ref()
+                        .and_then(|settlement| serde_json::to_string(settlement).ok())
                 ],
             )
             .await?;
@@ -525,7 +569,7 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
 
 pub(crate) async fn load(db: &LocalDb, request_id: &str) -> Result<Option<DetachedBatch>, String> {
     db.query_opt(
-        &format!("SELECT {COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
+        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
         params![request_id.to_string()],
         from_row,
     )
@@ -536,7 +580,7 @@ pub(crate) async fn load(db: &LocalDb, request_id: &str) -> Result<Option<Detach
 /// Every detached batch of one job, newest first.
 pub(crate) async fn for_job(db: &LocalDb, job_id: &str) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
-        &format!(
+        format!(
             "SELECT {COLUMNS} FROM run_batch_detached WHERE job_id=?1 ORDER BY created_ms DESC"
         ),
         params![job_id.to_string()],
@@ -552,7 +596,7 @@ pub(crate) async fn running_for_job(
     job_id: &str,
 ) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
-        &format!("SELECT {COLUMNS} FROM run_batch_detached WHERE job_id=?1 AND state='running'"),
+        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE job_id=?1 AND state='running'"),
         params![job_id.to_string()],
         from_row,
     )
@@ -563,7 +607,7 @@ pub(crate) async fn running_for_job(
 /// Every batch still running detached in this database.
 pub(crate) async fn all_running(db: &LocalDb) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
-        &format!("SELECT {COLUMNS} FROM run_batch_detached WHERE state='running'"),
+        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE state='running'"),
         (),
         from_row,
     )
@@ -788,6 +832,7 @@ mod tests {
             created_ms: 1,
             settled_ms: None,
             notified_ms: None,
+            settlement: None,
         }
     }
 

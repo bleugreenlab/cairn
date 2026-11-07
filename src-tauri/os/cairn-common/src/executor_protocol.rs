@@ -7186,7 +7186,25 @@ pub struct LearnedResourceEstimate {
 /// resolve closed. An older runner ignores the new keys and holds on CPU and
 /// available memory as before, while the newer executor's own admission
 /// enforces the rest.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 166;
+///
+/// Version 167 (cairn/5536) makes a finished attempt's result outlive the
+/// runner process that granted it. The executor retains every `Result` it sends,
+/// keyed by request and attempt, until the runner answers
+/// [`ExecutorMessage::ResultAck`]. Each link session re-sends every retained
+/// result, stamped with that session, ahead of its opening account, and the
+/// attempt stays in [`FleetSnapshot::granted_attempts`] until the ack. A sealed
+/// delta stays pinned for exactly as long as its result is retained, and a
+/// runner whose staged copy died with its previous incarnation asks for it
+/// again with [`ExecutorMessage::ReauthorizeTransfers`], answered by
+/// [`ExecutorMessage::TransfersReauthorized`]. A result evicted past the
+/// machine's retention bound leaves a [`CellCompletion`] whose `resultEvicted`
+/// names what was dropped. Both peers must agree: a runner talking to an older
+/// executor would wait after a restart for a resend that never comes, and an
+/// older runner never acknowledges, so this executor would hold every result
+/// and list every finished attempt as granted, and the machine would never
+/// empty for an update. The handshake refuses mixed versions, so neither
+/// pairing attaches.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -12435,6 +12453,36 @@ pub struct CellCompletion {
     #[serde(default = "default_subscriber_count")]
     pub subscriber_count: usize,
     pub served_at_unix_ms: u64,
+    /// Present when this executor dropped the attempt's full result before the
+    /// runner acknowledged it, because its retained results passed the
+    /// machine's bound. This completion is then all that is left of the
+    /// attempt, and a sealed delta it carried was dropped with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_evicted: Option<ResultEviction>,
+}
+
+/// What an executor dropped when it evicted a retained result past its bound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResultEviction {
+    /// The sealed delta commit dropped with the result, when it carried one.
+    /// Its pin ended with the result, so nothing can publish it now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_commit: Option<String>,
+    /// The most this machine retains of unacknowledged results, in bytes.
+    pub bound_bytes: u64,
+}
+
+/// One transfer an executor still holds for an attempt, re-offered under the
+/// link it is on now. See [`ExecutorMessage::ReauthorizeTransfers`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "result", rename_all = "camelCase")]
+pub enum ReauthorizedTransfer {
+    /// The attempt's sealed mutation delta, rebuilt from its pin and uploaded
+    /// again under the current connection generation. `Err` says why it could
+    /// not be: the result is no longer retained, the pin is gone, or the pinned
+    /// commit is gone from the machine's store.
+    Delta(Result<DeltaUploadReceipt, String>),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -20311,6 +20359,35 @@ pub enum ExecutorMessage {
         attempt_id: String,
         outcome: CellOutcome,
     },
+    /// Runner → executor: the runner has decided what this result is for and
+    /// recorded that decision durably (the row that settles it, or nothing
+    /// durable claiming it), so the executor may forget it.
+    ///
+    /// Until this arrives the executor retains the result, re-sends it on
+    /// every new link session ahead of that session's opening account, keeps
+    /// its attempt in [`FleetSnapshot::granted_attempts`], and keeps any sealed
+    /// delta pinned. A runner that cannot decide yet sends nothing: a result
+    /// never acknowledged is re-sent, while one acknowledged wrongly is lost.
+    ResultAck {
+        request_id: String,
+        attempt_id: String,
+    },
+    /// Runner → executor: re-offer every transfer this attempt still holds
+    /// under the link it is on now, because the copy the runner staged earlier
+    /// died with the runner process that received it. The runner authorizes
+    /// the attempt's transfers on the current generation before sending this.
+    /// Answered by [`Self::TransfersReauthorized`].
+    ReauthorizeTransfers {
+        request_id: String,
+        attempt_id: String,
+    },
+    /// Executor → runner: the answer to [`Self::ReauthorizeTransfers`], one
+    /// entry per transfer the attempt holds.
+    TransfersReauthorized {
+        request_id: String,
+        attempt_id: String,
+        transfers: Vec<ReauthorizedTransfer>,
+    },
     #[serde(rename = "buildSlotOutput")]
     CellOutput {
         event: CellOutputEvent,
@@ -23723,6 +23800,7 @@ mod tests {
                     cached: false,
                     subscriber_count: 1,
                     served_at_unix_ms: 37,
+                    result_evicted: None,
                 }],
                 granted_attempts: vec![GrantedAttempt {
                     request_id: "executing".into(),

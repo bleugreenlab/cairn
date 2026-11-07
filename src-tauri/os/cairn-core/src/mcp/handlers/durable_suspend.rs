@@ -115,6 +115,12 @@ pub(crate) enum Condition {
         /// false so rows written before this existed keep holding.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         verdict_only: bool,
+        /// What a later runner process needs to settle and publish the batch
+        /// from a result it adopts after a restart, and where the batch was
+        /// placed. Absent on a host batch and on rows written before this
+        /// existed, whose commit then falls back to the precise report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settlement: Option<Box<super::run::PersistedSettlement>>,
     },
 }
 
@@ -2602,6 +2608,18 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
                     continue;
                 }
             }
+            // A run batch on a machine is not answered at boot: its machine
+            // may still be running it, and will send its result again once it
+            // reattaches. The wait stays parked for `run::adopted` to settle
+            // from that result, or from what the machine says became of it.
+            // A delivery claim the dead process held is reclaimed now all the
+            // same, or that later answer could never land.
+            if row_state == "pending"
+                && matches!(record.condition, Condition::RunBatch { host: false, .. })
+            {
+                reclaim_interrupted_delivery(&db, &SuspendedCall::of(&record), None).await;
+                continue;
+            }
             let (owned_orch, owned_db) = (orch.clone(), db.clone());
             tokio::spawn(async move {
                 if row_state == "resolving" {
@@ -2617,6 +2635,33 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
             });
         }
     }
+}
+
+/// Read through `idx_agent_waits_pending_run_batch`, whose predicate this
+/// spells exactly.
+const PENDING_RUN_BATCH_WAITS: &str = "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at FROM agent_waits INDEXED BY idx_agent_waits_pending_run_batch WHERE state = 'pending' AND kind = 'run_batch'";
+
+/// Every run-batch wait still pending in this database.
+pub(crate) async fn pending_run_batch_waits(db: &LocalDb) -> Result<Vec<Record>, String> {
+    db.query_all(PENDING_RUN_BATCH_WAITS, (), record_from_row)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The pending wait of one run batch, if it has one.
+pub(crate) async fn pending_run_batch_wait(
+    db: &LocalDb,
+    request_id: &str,
+) -> Result<Option<Record>, String> {
+    db.query_opt(
+        format!(
+            "{PENDING_RUN_BATCH_WAITS} AND json_extract(condition_json,'$.request_id')=?1 LIMIT 1"
+        ),
+        params![request_id.to_string()],
+        record_from_row,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// A suspension's [`Record`] from the first nine columns of an `agent_waits`
@@ -2854,6 +2899,7 @@ async fn stale_resolving(
 /// [`SWEEP_INTERVAL`]. Resolution belongs to the execution host, so only that
 /// host spawns this.
 pub(crate) fn spawn_scheduler(orch: Orchestrator) {
+    super::run::adopted::start(&orch);
     tokio::spawn(async move {
         let mut mcp = tokio::time::interval(super::mcp_continuation::SCHEDULER_INTERVAL);
         let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
@@ -2870,6 +2916,7 @@ pub(crate) fn spawn_scheduler(orch: Orchestrator) {
                             outcome.settled
                         );
                     }
+                    super::run::adopted::judge_unheard(&orch).await;
                     let lost = super::run::detached::sweep_unreported(&orch).await;
                     if lost > 0 {
                         log::warn!("{lost} detached run batch(es) can no longer report and were settled as lost");
@@ -2918,35 +2965,10 @@ async fn resolution_after_restart(
                 }
             }
         }
+        // Only a host batch reaches here (see `reconcile`): it ran inside the
+        // process that died, so nothing of it is left to wait for.
         Condition::RunBatch { request_id, .. } => {
-            // Written before the wait resolves, so the batch is never without
-            // an unsettled row; a crash in between converts it again.
-            let (job_id, run_id, condition) = (
-                record.job_id.clone(),
-                record.run_id.clone(),
-                record.condition.clone(),
-            );
-            let converted = db
-                .write(|c| {
-                    let (job_id, run_id, condition) =
-                        (job_id.clone(), run_id.clone(), condition.clone());
-                    Box::pin(async move {
-                        super::run::detached::insert_converted(
-                            c,
-                            &job_id,
-                            &run_id,
-                            &condition,
-                            "Cairn restarted while the batch ran",
-                            chrono::Utc::now().timestamp_millis(),
-                        )
-                        .await
-                    })
-                })
-                .await;
-            if let Err(error) = converted {
-                log::warn!("startup could not record run batch {request_id} as detached: {error}");
-            }
-            super::run::detached::restart_text(request_id)
+            super::run::adopted::host_restart_text(request_id)
         }
         // Level-triggered conditions re-arm from their own durable state, so a
         // restart simply asks them again.
@@ -3076,6 +3098,7 @@ mod tests {
             host: false,
             identity: None,
             verdict_only: false,
+            settlement: None,
         }
     }
 
@@ -3087,6 +3110,7 @@ mod tests {
             host: false,
             identity: None,
             verdict_only: false,
+            settlement: None,
         };
         record
     }
@@ -3455,27 +3479,710 @@ mod tests {
         }
     }
 
-    /// A run batch cannot be re-armed after a restart: the join handle and the
-    /// executor result channel were in memory. Reconciliation must therefore
-    /// resolve it exactly once to a typed failure that unblocks the agent, rather
-    /// than leaving a pending row nobody will ever satisfy.
-    ///
-    /// The restart is not evidence the batch died (it may still be running on
-    /// its machine), so it is not cancelled or declared lost: it becomes a
-    /// detached batch that keeps its identity and keeps holding its branch.
+    /// A restart is not evidence a remote batch died: its machine may still be
+    /// running it, and retains its result until a runner acknowledges it. So
+    /// reconciliation answers nothing at boot. The wait stays parked, with no
+    /// detached row and no result, for `run::adopted` to settle from the
+    /// machine's resent result or from what the machine says became of it.
     #[tokio::test]
-    async fn a_pending_run_batch_resolves_to_a_typed_host_restart_failure() {
+    async fn a_pending_remote_run_batch_stays_parked_through_a_restart() {
         let (orch, base, _) = durable_env().await;
         register_warm(&orch);
-        let mut record = run_batch_record(&base, true);
-        if let Condition::RunBatch { identity, .. } = &mut record.condition {
-            *identity = Some("{\"commands\":[]}".into());
+        let record = run_batch_record(&base, true);
+        insert(&orch.db.local, &record).await.unwrap();
+
+        reconcile(&orch).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(wait_state(&orch).await, "pending");
+        let detached: i64 = orch
+            .db
+            .local
+            .query_one("SELECT COUNT(*) FROM run_batch_detached", (), |r| r.i64(0))
+            .await
+            .unwrap();
+        assert_eq!(detached, 0, "nothing is released at boot");
+        assert_eq!(tool_result_count(&orch).await, 0);
+    }
+
+    /// cairn/5536: a batch that outlives a host restart, settled from the
+    /// result its machine retained and sent again, or from what its machine
+    /// says became of it. The restart is simulated by a fresh orchestrator over
+    /// a database holding the parked wait, whose process-local registries hold
+    /// nothing of the batch.
+    mod adoption {
+        use super::*;
+        use crate::mcp::handlers::run::{adopted, PersistedSettlement, PlacedOn};
+        use cairn_common::executor_protocol::{
+            CellOutcome, ExecutorMessage, MutationDelta, ProcessBatchItemOutcome,
+            ReauthorizedTransfer,
+        };
+        use tokio::sync::mpsc::UnboundedReceiver;
+
+        fn completed(orch: &Orchestrator, body: &str, delta: Option<&str>) -> CellOutcome {
+            let items: Vec<ProcessBatchItemOutcome> = serde_json::from_value(serde_json::json!([{
+                "header": "$ echo",
+                "body": body,
+                "succeeded": true,
+                "suspended": false,
+                "exitCode": 0,
+                "startedAtUnixMs": 1,
+                "finishedAtUnixMs": 2,
+                "durationMs": 1
+            }]))
+            .unwrap();
+            CellOutcome::Completed {
+                request_id: "request-1".into(),
+                attempt_id: "attempt-1".into(),
+                exit_code: Some(0),
+                output: serde_json::to_string(&items).unwrap(),
+                timed_out: false,
+                metadata: orch.fleet.execution_meta_for_test(),
+                mutation_delta: delta.map(|commit| {
+                    Box::new(MutationDelta {
+                        base_commit: "b".repeat(40),
+                        delta_commit: commit.into(),
+                        upload_receipt: None,
+                    })
+                }),
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+                node_scratch: None,
+            }
+        }
+
+        fn result(outcome: CellOutcome) -> ExecutorMessage {
+            ExecutorMessage::Result {
+                request_id: "request-1".into(),
+                attempt_id: "attempt-1".into(),
+                outcome,
+            }
+        }
+
+        fn with_settlement(record: &mut Record, settlement: PersistedSettlement) {
+            if let Condition::RunBatch {
+                settlement: slot, ..
+            } = &mut record.condition
+            {
+                *slot = Some(Box::new(settlement));
+            }
+        }
+
+        /// The next frame of `kind` this runner sent the machine, skipping others.
+        async fn next_frame(
+            frames: &mut UnboundedReceiver<ExecutorMessage>,
+            wanted: fn(&ExecutorMessage) -> bool,
+        ) -> ExecutorMessage {
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                    .await
+                    .expect("the runner sends the frame")
+                    .expect("the machine's link is open");
+                if wanted(&frame) {
+                    return frame;
+                }
+            }
+        }
+
+        fn is_ack(frame: &ExecutorMessage) -> bool {
+            matches!(frame, ExecutorMessage::ResultAck { .. })
+        }
+
+        fn no_ack_pending(frames: &mut UnboundedReceiver<ExecutorMessage>) -> bool {
+            while let Ok(frame) = frames.try_recv() {
+                if is_ack(&frame) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        async fn adopted_state(orch: &Orchestrator) -> Option<String> {
+            orch.db
+                .local
+                .query_opt(
+                    "SELECT state FROM run_batch_adopted_outcomes WHERE request_id='request-1'",
+                    (),
+                    |r| r.text(0),
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn resolution(orch: &Orchestrator) -> String {
+            for _ in 0..400 {
+                if wait_state(orch).await == "resolved" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(wait_state(orch).await, "resolved");
+            orch.db
+                .local
+                .query_one(
+                    "SELECT resolution_json FROM agent_waits WHERE id='wait-1'",
+                    (),
+                    |r| r.text(0),
+                )
+                .await
+                .unwrap()
+        }
+
+        async fn parked(orch: &Orchestrator, record: &Record) {
+            register_warm(orch);
+            insert(&orch.db.local, record).await.unwrap();
+            reconcile(orch).await;
+            assert_eq!(wait_state(orch).await, "pending");
+        }
+
+        /// Acceptance: a parked batch whose host restarts while its machine
+        /// keeps running it delivers its real result exactly once, and the
+        /// result is acknowledged only after its settled outcome is recorded.
+        /// A resent duplicate delivers nothing and is acknowledged again.
+        #[tokio::test]
+        async fn a_parked_batch_that_survives_a_restart_delivers_its_real_result_once() {
+            let (orch, base, _) = durable_env().await;
+            parked(&orch, &run_batch_record(&base, false)).await;
+            let mut frames = orch
+                .fleet
+                .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+            adopted::start(&orch);
+
+            let outcome = completed(&orch, "hello from exec-a", None);
+            orch.fleet
+                .handle_executor_message("exec-a", 1, result(outcome.clone()));
+            let ExecutorMessage::ResultAck {
+                request_id,
+                attempt_id,
+            } = next_frame(&mut frames, is_ack).await
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (request_id.as_str(), attempt_id.as_str()),
+                ("request-1", "attempt-1")
+            );
+            assert!(
+                matches!(
+                    adopted_state(&orch).await.as_deref(),
+                    Some("published" | "delivered")
+                ),
+                "acknowledged only once the settled outcome was recorded"
+            );
+
+            let resolution = resolution(&orch).await;
+            assert!(resolution.contains("hello from exec-a"), "{resolution}");
+            assert!(resolution.contains("exec-a"), "{resolution}");
+            assert_eq!(tool_result_count(&orch).await, 1);
+            assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+            for _ in 0..200 {
+                if adopted_state(&orch).await.as_deref() == Some("delivered") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(adopted_state(&orch).await.as_deref(), Some("delivered"));
+
+            orch.fleet
+                .handle_executor_message("exec-a", 1, result(outcome));
+            assert!(is_ack(&next_frame(&mut frames, is_ack).await));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                tool_result_count(&orch).await,
+                1,
+                "the duplicate delivered nothing"
+            );
+            assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+        }
+
+        /// Execution's condition 1: a result that arrives before this runner
+        /// can read its durable rows is not acknowledged, so its machine keeps
+        /// it, and it is adopted once the runner can decide.
+        #[tokio::test]
+        async fn a_result_that_arrives_before_the_runner_can_decide_is_kept_until_it_can() {
+            let (orch, base, _) = durable_env().await;
+            parked(&orch, &run_batch_record(&base, false)).await;
+            let mut frames = orch
+                .fleet
+                .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                result(completed(&orch, "early result", None)),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                no_ack_pending(&mut frames),
+                "nothing could decide, so nothing was acknowledged"
+            );
+            assert_eq!(adopted_state(&orch).await, None);
+
+            adopted::start(&orch);
+            assert!(is_ack(&next_frame(&mut frames, is_ack).await));
+            assert!(resolution(&orch).await.contains("early result"));
+        }
+
+        /// Acceptance: a machine that reattaches and reports neither the
+        /// attempt nor its completion resolves the wait to the typed lost
+        /// text, naming the machine it was placed on.
+        #[tokio::test]
+        async fn a_machine_that_reports_without_the_batch_resolves_it_as_lost() {
+            let (orch, base, _) = durable_env().await;
+            let mut record = run_batch_record(&base, false);
+            let placed = PlacedOn {
+                executor_id: "exec-a".into(),
+                name: "exec-a".into(),
+            };
+            with_settlement(
+                &mut record,
+                PersistedSettlement::for_test(None, None, Some(placed.clone())),
+            );
+            parked(&orch, &record).await;
+            let _frames = orch.fleet.attach_reported_machine_for_test("exec-a", &[]);
+
+            adopted::judge_unheard(&orch).await;
+
+            let resolution = resolution(&orch).await;
+            assert_eq!(
+                resolution,
+                adopted::lost_text("request-1", Some(&placed), false)
+            );
+            assert!(resolution.contains("placed on exec-a"), "{resolution}");
+        }
+
+        /// While its machine still holds the attempt, the wait stays parked.
+        #[tokio::test]
+        async fn a_batch_its_machine_still_holds_stays_parked() {
+            let (orch, base, _) = durable_env().await;
+            parked(&orch, &run_batch_record(&base, false)).await;
+            let _frames = orch
+                .fleet
+                .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+            orch.adoption.backdate_for_test(adopted::RELEASE_AFTER * 2);
+
+            adopted::judge_unheard(&orch).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(wait_state(&orch).await, "pending");
+        }
+
+        /// An executor ends its pin on a result's delta when the result is
+        /// acknowledged, and this machine is modeled by exactly that rule. An
+        /// adopted commit's delta has to be uploaded again after a restart, so
+        /// the result is acknowledged only after the driver has asked for the
+        /// delta and recorded the settlement; an acknowledgement any earlier
+        /// would leave the machine nothing to upload.
+        #[tokio::test]
+        async fn an_adopted_commit_is_acknowledged_only_after_its_delta_is_asked_for() {
+            let (orch, base, _) = durable_env().await;
+            let mut record = run_batch_record(&base, true);
+            with_settlement(
+                &mut record,
+                PersistedSettlement::for_test(
+                    Some("feat: the batch"),
+                    Some(orch.fleet.cell_request_for_test("request-1")),
+                    None,
+                ),
+            );
+            parked(&orch, &record).await;
+            let mut frames = orch
+                .fleet
+                .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+            adopted::start(&orch);
+
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                result(completed(&orch, "built it", Some(&"d".repeat(40)))),
+            );
+            let mut pin_released = false;
+            let (request_id, attempt_id) = loop {
+                match next_frame(&mut frames, |frame| {
+                    matches!(
+                        frame,
+                        ExecutorMessage::ResultAck { .. }
+                            | ExecutorMessage::ReauthorizeTransfers { .. }
+                    )
+                })
+                .await
+                {
+                    ExecutorMessage::ResultAck { .. } => pin_released = true,
+                    ExecutorMessage::ReauthorizeTransfers {
+                        request_id,
+                        attempt_id,
+                    } => break (request_id, attempt_id),
+                    _ => unreachable!(),
+                }
+            };
+            assert!(
+                !pin_released,
+                "the result was acknowledged, ending its delta's pin, before its delta was asked for"
+            );
+            assert!(no_ack_pending(&mut frames));
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                ExecutorMessage::TransfersReauthorized {
+                    request_id,
+                    attempt_id,
+                    transfers: vec![ReauthorizedTransfer::Delta(Err(
+                        "the model machine declines while it still pins the delta".into(),
+                    ))],
+                },
+            );
+
+            assert!(is_ack(&next_frame(&mut frames, is_ack).await));
+            assert!(
+                matches!(
+                    adopted_state(&orch).await.as_deref(),
+                    Some("published" | "delivered")
+                ),
+                "acknowledged once the settled outcome was recorded"
+            );
+            let resolution = resolution(&orch).await;
+            assert!(
+                resolution.contains("declines while it still pins"),
+                "{resolution}"
+            );
+        }
+
+        /// Tenet 1437, end to end. A commit_msg batch finishes while its host
+        /// is down, so the upload its machine made died with that process and
+        /// nothing here holds it staged. The restarted runner adopts the
+        /// result, asks the machine to upload the delta again, and publishes
+        /// what comes back through `settle_run_batch`: exactly one commit on
+        /// the agent branch, the check-on-write wave opened for it, the call
+        /// answered once, the row delivered, and the result acknowledged.
+        ///
+        /// The machine is modeled by the executor's rule that an
+        /// acknowledgement ends the delta's pin: acknowledged before it is
+        /// asked, it has nothing left to upload and says so.
+        #[tokio::test]
+        #[serial_test::serial(jj)]
+        async fn an_adopted_commit_is_published_once_after_its_machine_uploads_it_again() {
+            use crate::jj::tests::git_stdout;
+            use crate::mcp::handlers::run::slot_publication_tests::{stage_upload, straddle};
+            use cairn_common::executor_protocol::RepositoryLocator;
+
+            let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+                eprintln!("skipping an_adopted_commit_is_published_once: jj not resolvable");
+                return;
+            };
+            let (orch, base, _) = durable_env().await;
+            // The placement template the suspended batch persisted, in this
+            // seed's project.
+            fx.request.request_id = "request-1".into();
+            fx.request.project_id = "p".into();
+            fx.request.repository = RepositoryLocator::ColocatedPath {
+                project_id: "p".into(),
+                repository_id: "repository".into(),
+                absolute_path: fx.repository.to_string_lossy().into_owned(),
+            };
+            let mut record = run_batch_record(&base, true);
+            with_settlement(
+                &mut record,
+                PersistedSettlement::for_test(
+                    Some("feat: the batch"),
+                    Some(fx.request.clone()),
+                    None,
+                )
+                .publishing_to_for_test("p", &fx.repository, "feature", &fx.base),
+            );
+            parked(&orch, &record).await;
+            let mut frames = orch
+                .fleet
+                .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+            let generation = orch.fleet.link_generation("exec-a").unwrap();
+            let waves_before = orch.lane_claims.waves_opened_for_test();
+            adopted::start(&orch);
+
+            let mut outcome = completed(&orch, "built it", Some(&fx.delta.delta_commit));
+            if let CellOutcome::Completed {
+                mutation_delta: Some(delta),
+                ..
+            } = &mut outcome
+            {
+                delta.base_commit = fx.base.clone();
+            }
+            orch.fleet
+                .handle_executor_message("exec-a", 1, result(outcome));
+
+            let mut acked_before_asked = false;
+            let (request_id, attempt_id) = loop {
+                match next_frame(&mut frames, |frame| {
+                    matches!(
+                        frame,
+                        ExecutorMessage::ResultAck { .. }
+                            | ExecutorMessage::ReauthorizeTransfers { .. }
+                    )
+                })
+                .await
+                {
+                    ExecutorMessage::ResultAck { .. } => acked_before_asked = true,
+                    ExecutorMessage::ReauthorizeTransfers {
+                        request_id,
+                        attempt_id,
+                    } => break (request_id, attempt_id),
+                    _ => unreachable!(),
+                }
+            };
+            let staging = tempfile::tempdir().unwrap();
+            let transfer = if acked_before_asked {
+                Err(format!(
+                    "this machine no longer retains the result of request {request_id} attempt {attempt_id}"
+                ))
+            } else {
+                let mut request = fx.request.clone();
+                request.attempt_id = attempt_id.clone();
+                Ok(stage_upload(
+                    &orch,
+                    &fx,
+                    &request,
+                    "exec-a",
+                    generation,
+                    staging.path(),
+                ))
+            };
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                ExecutorMessage::TransfersReauthorized {
+                    request_id,
+                    attempt_id,
+                    transfers: vec![ReauthorizedTransfer::Delta(transfer)],
+                },
+            );
+
+            let resolution = resolution(&orch).await;
+            assert!(
+                resolution.contains("Committed changes"),
+                "the adopted commit is published: {resolution}"
+            );
+            assert!(resolution.contains("built it"), "{resolution}");
+            let landed = fx.bookmark();
+            assert_ne!(landed, fx.base, "the agent branch advanced");
+            assert_eq!(
+                git_stdout(&fx.repository, &["rev-parse", &format!("{landed}^")]),
+                fx.base,
+                "exactly one commit landed on the branch"
+            );
+            assert_eq!(fx.blob(&landed, "mine.rs"), "the batch's work");
+            assert!(resolution.contains(&landed), "{resolution}");
+            assert!(
+                orch.lane_claims.waves_opened_for_test() > waves_before,
+                "the landed commit opened its check-on-write wave"
+            );
+            assert_eq!(
+                tool_result_count(&orch).await,
+                1,
+                "the call is answered once"
+            );
+            assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+            for _ in 0..200 {
+                if adopted_state(&orch).await.as_deref() == Some("delivered") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(adopted_state(&orch).await.as_deref(), Some("delivered"));
+            assert!(is_ack(&next_frame(&mut frames, is_ack).await));
+            assert!(
+                !acked_before_asked,
+                "acknowledged only after the delta was asked for"
+            );
+        }
+
+        /// A commit whose delta its machine can no longer upload is reported
+        /// precisely, naming the delta, the machine and the reason, and nothing
+        /// is published.
+        #[tokio::test]
+        async fn a_commit_whose_delta_is_gone_gets_the_precise_report() {
+            let (orch, base, _) = durable_env().await;
+            let mut record = run_batch_record(&base, true);
+            with_settlement(
+                &mut record,
+                PersistedSettlement::for_test(
+                    Some("feat: the batch"),
+                    Some(orch.fleet.cell_request_for_test("request-1")),
+                    None,
+                ),
+            );
+            parked(&orch, &record).await;
+            let mut frames = orch
+                .fleet
+                .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+            adopted::start(&orch);
+
+            let delta = "d".repeat(40);
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                result(completed(&orch, "built it", Some(&delta))),
+            );
+            let asked = next_frame(&mut frames, |frame| {
+                matches!(frame, ExecutorMessage::ReauthorizeTransfers { .. })
+            })
+            .await;
+            let ExecutorMessage::ReauthorizeTransfers {
+                request_id,
+                attempt_id,
+            } = asked
+            else {
+                unreachable!()
+            };
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                ExecutorMessage::TransfersReauthorized {
+                    request_id,
+                    attempt_id,
+                    transfers: vec![ReauthorizedTransfer::Delta(Err(
+                        "pin gone: this machine no longer pins it".into(),
+                    ))],
+                },
+            );
+
+            let resolution = resolution(&orch).await;
+            assert!(
+                resolution.starts_with(crate::mcp::handlers::run::RUN_NOT_PUBLISHED),
+                "{resolution}"
+            );
+            assert!(resolution.contains(&delta[..12]), "{resolution}");
+            assert!(resolution.contains("exec-a"), "{resolution}");
+            assert!(resolution.contains("pin gone"), "{resolution}");
+            assert!(
+                resolution.contains("built it"),
+                "the full output follows: {resolution}"
+            );
+            assert!(!resolution.contains("Committed changes"), "{resolution}");
+        }
+
+        /// The bound: a machine that has not reconnected leaves the call parked
+        /// until this process has been up for the bound, then releases it into
+        /// a detached row whose branch hold stands. When the machine returns
+        /// with the result, that row settles and its notice is queued.
+        #[tokio::test]
+        async fn a_machine_that_stays_away_releases_the_call_and_settles_the_row_on_return() {
+            let (orch, base, _) = durable_env().await;
+            parked(&orch, &run_batch_record(&base, false)).await;
+
+            adopted::judge_unheard(&orch).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                wait_state(&orch).await,
+                "pending",
+                "before the bound, nothing moves"
+            );
+
+            orch.adoption.backdate_for_test(adopted::RELEASE_AFTER);
+            adopted::judge_unheard(&orch).await;
+            let resolution = resolution(&orch).await;
+            assert_eq!(resolution, adopted::release_text("request-1", &[], false));
+            let (state, holds): (String, i64) = orch
+                .db
+                .local
+                .query_one(
+                    "SELECT state, holds_branch FROM run_batch_detached WHERE request_id='request-1'",
+                    (),
+                    |r| Ok((r.text(0)?, r.i64(1)?)),
+                )
+                .await
+                .unwrap();
+            assert_eq!((state.as_str(), holds), ("running", 1), "the hold stands");
+
+            let mut frames = orch
+                .fleet
+                .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+            adopted::start(&orch);
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                result(completed(&orch, "finished while away", None)),
+            );
+            assert!(is_ack(&next_frame(&mut frames, is_ack).await));
+            let mut settled = None;
+            for _ in 0..400 {
+                let row: (String, Option<String>) = orch
+                    .db
+                    .local
+                    .query_one(
+                        "SELECT state, output FROM run_batch_detached WHERE request_id='request-1'",
+                        (),
+                        |r| Ok((r.text(0)?, r.opt_text(1)?)),
+                    )
+                    .await
+                    .unwrap();
+                if row.0 == "settled" {
+                    settled = row.1;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                settled
+                    .as_deref()
+                    .is_some_and(|output| output.contains("finished while away")),
+                "{settled:?}"
+            );
+            let notices: i64 = orch
+                .db
+                .local
+                .query_one(
+                    "SELECT COUNT(*) FROM suppressed_wakes WHERE source_kind='run_batch' AND source_ref='request-1'",
+                    (),
+                    |r| r.i64(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(notices, 1);
+            assert_eq!(
+                tool_result_count(&orch).await,
+                1,
+                "only the release answered the call"
+            );
+        }
+
+        /// A batch on the colocated executor cannot outlive the host (tenet
+        /// 316): its call is answered with the restart, naming the request and
+        /// `local`, without waiting.
+        #[tokio::test]
+        async fn a_local_batch_is_answered_with_the_restart_at_once() {
+            let (orch, base, _) = durable_env().await;
+            let mut record = run_batch_record(&base, true);
+            with_settlement(
+                &mut record,
+                PersistedSettlement::for_test(
+                    Some("feat: x"),
+                    None,
+                    Some(PlacedOn {
+                        executor_id: crate::fleet::COLOCATED_EXECUTOR_ID.into(),
+                        name: "local".into(),
+                    }),
+                ),
+            );
+            parked(&orch, &record).await;
+
+            adopted::judge_unheard(&orch).await;
+            let resolution = resolution(&orch).await;
+            assert_eq!(resolution, adopted::local_restart_text("request-1", true));
+            assert!(resolution.contains("request-1") && resolution.contains("`local`"));
+        }
+    }
+
+    /// A host batch ran inside the process that died, so there is nothing to
+    /// wait for: its call is answered at once, naming the request, and no
+    /// detached row is left running.
+    #[tokio::test]
+    async fn a_pending_host_run_batch_resolves_to_a_typed_host_restart() {
+        let (orch, base, _) = durable_env().await;
+        register_warm(&orch);
+        let mut record = run_batch_record(&base, false);
+        if let Condition::RunBatch { host, .. } = &mut record.condition {
+            *host = true;
         }
         insert(&orch.db.local, &record).await.unwrap();
 
         reconcile(&orch).await;
-
-        // Reconciliation drives its resolvers on spawned tasks.
         for _ in 0..200 {
             if wait_state(&orch).await == "resolved" {
                 break;
@@ -3483,7 +4190,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(wait_state(&orch).await, "resolved");
-
         let resolution = orch
             .db
             .local
@@ -3496,23 +4202,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolution,
-            super::super::run::detached::restart_text("request-1"),
-            "unexpected restart resolution"
+            super::super::run::adopted::host_restart_text("request-1")
         );
-        let (state, identity, holds): (String, Option<String>, i64) = orch
+        assert!(resolution.contains("request-1"));
+        let detached: i64 = orch
             .db
             .local
-            .query_one(
-                "SELECT state, identity, holds_branch FROM run_batch_detached WHERE request_id='request-1'",
-                (),
-                |r| Ok((r.text(0)?, r.opt_text(1)?, r.i64(2)?)),
-            )
+            .query_one("SELECT COUNT(*) FROM run_batch_detached", (), |r| r.i64(0))
             .await
             .unwrap();
-        assert_eq!(state, "running", "a restart settles nothing");
-        assert_eq!(identity.as_deref(), Some("{\"commands\":[]}"));
-        assert_eq!(holds, 1);
-        // Exactly one resume, exactly one delivered result.
+        assert_eq!(detached, 0);
         assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
         assert_eq!(tool_result_count(&orch).await, 1);
     }
@@ -6972,7 +7671,11 @@ mod tests {
     async fn a_claim_interrupted_by_a_restart_still_answers_its_call() {
         let (orch, base, _) = durable_env().await;
         register_warm(&orch);
-        let record = run_batch_record(&base, true);
+        // A host batch: the one kind of run batch a restart answers at boot.
+        let mut record = run_batch_record(&base, true);
+        if let Condition::RunBatch { host, .. } = &mut record.condition {
+            *host = true;
+        }
         insert(&orch.db.local, &record).await.unwrap();
         // The pre-restart host claimed delivery and died before appending.
         assert!(claim_result_delivery(&orch.db.local, "wait-1")
@@ -6995,6 +7698,40 @@ mod tests {
             "the interrupted claim must not swallow the answer"
         );
         assert!(results[0].1.contains("restarted"));
+    }
+
+    /// A remote batch's wait is not answered at boot, but a delivery claim its
+    /// dead process held is still reclaimed there, so the answer that arrives
+    /// later from the batch's machine lands exactly once.
+    #[tokio::test]
+    async fn a_parked_remote_batch_answered_after_a_restart_is_not_swallowed_by_a_dead_claim() {
+        let (orch, base, _) = durable_env().await;
+        register_warm(&orch);
+        let record = run_batch_record(&base, true);
+        insert(&orch.db.local, &record).await.unwrap();
+        assert!(claim_result_delivery(&orch.db.local, "wait-1")
+            .await
+            .unwrap());
+
+        reconcile(&orch).await;
+        assert_eq!(wait_state(&orch).await, "pending");
+        super::super::run::adopted::deliver_batch_result(
+            &orch,
+            &orch.db.local,
+            "request-1",
+            "succeeded",
+            "the batch's real result",
+        )
+        .await;
+
+        assert_eq!(wait_state(&orch).await, "resolved");
+        let results = tool_results(&orch).await;
+        assert_eq!(
+            results.len(),
+            1,
+            "the dead claim must not swallow the answer"
+        );
+        assert!(results[0].1.contains("the batch's real result"));
     }
 
     /// Why the reclaim is load-bearing rather than decorative: a held claim, on

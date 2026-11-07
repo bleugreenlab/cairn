@@ -206,10 +206,13 @@ pub fn publish_logical_revert(
 }
 
 enum ProposedTree {
-    DeltaCommit(String),
+    DeltaCommit { commit: String, key: Option<String> },
     Mutations(Vec<LogicalTreeMutation>),
     Revert(String),
 }
+
+/// The jj operation attribute a keyed publication records its key under.
+pub const PUBLICATION_KEY_ATTRIBUTE: &str = "cairn-publication-key";
 
 /// Atomically publish a complete proposed tree at one runner-owned logical
 /// bookmark. The caller serializes repository writers with Cairn's canonical
@@ -223,6 +226,33 @@ pub fn publish_logical_head(
     identity: Option<PublicationIdentity>,
     mode: PublicationMode,
 ) -> Result<LogicalHeadPublication, String> {
+    publish_logical_head_recorded(
+        repository_path,
+        bookmark,
+        expected_head,
+        delta_commit,
+        identity,
+        mode,
+        None,
+    )
+}
+
+/// [`publish_logical_head`], recording `key` on the landing's own jj
+/// operation when one is given.
+///
+/// The attribute is written by the same transaction that moves the bookmark,
+/// so it exists exactly when the landing does: a process that died between
+/// the ref moving and recording that it had leaves the answer in the operation
+/// log, where [`find_keyed_publication`] reads it.
+pub fn publish_logical_head_recorded(
+    repository_path: &Path,
+    bookmark: &str,
+    expected_head: &str,
+    delta_commit: &str,
+    identity: Option<PublicationIdentity>,
+    mode: PublicationMode,
+    key: Option<&str>,
+) -> Result<LogicalHeadPublication, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -231,10 +261,75 @@ pub fn publish_logical_head(
             repository_path,
             bookmark,
             expected_head,
-            ProposedTree::DeltaCommit(delta_commit.to_string()),
+            ProposedTree::DeltaCommit {
+                commit: delta_commit.to_string(),
+                key: key.map(str::to_string),
+            },
             identity,
             mode,
         ))
+}
+
+/// The commit a publication recorded under `key` landed on `bookmark`, if one
+/// did, read from the store's operation log back to `since_unix_ms`.
+///
+/// The walk stops at the first operation that ended before `since_unix_ms`,
+/// which bounds it by how long the work being asked about has existed rather
+/// than by the store's whole history.
+pub fn find_keyed_publication(
+    repository_path: &Path,
+    bookmark: &str,
+    key: &str,
+    since_unix_ms: i64,
+) -> Result<Option<String>, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("start publication lookup runtime: {error}"))?
+        .block_on(async {
+            let settings = jj_settings(None)?;
+            let stores = StoreFactories::default();
+            let mut working_copies: WorkingCopyFactories = HashMap::new();
+            working_copies.insert(
+                LocalWorkingCopy::name().to_string(),
+                Box::new(LocalWorkingCopyFactory {}),
+            );
+            let workspace = Workspace::load(&settings, repository_path, &stores, &working_copies)
+                .map_err(|error| {
+                format!("load repository for a publication lookup: {error}")
+            })?;
+            let repo = workspace
+                .repo_loader()
+                .load_at_head()
+                .await
+                .map_err(|error| format!("load operation for a publication lookup: {error}"))?;
+            let head = repo.operation().clone();
+            let operations = jj_lib::op_walk::walk_ancestors(std::slice::from_ref(&head));
+            let mut operations = std::pin::pin!(operations);
+            while let Some(operation) = operations.next().await {
+                let operation =
+                    operation.map_err(|error| format!("walk the operation log: {error}"))?;
+                let metadata = operation.metadata();
+                if metadata.time.end.timestamp.0 < since_unix_ms {
+                    break;
+                }
+                if metadata
+                    .attributes
+                    .get(PUBLICATION_KEY_ATTRIBUTE)
+                    .is_some_and(|recorded| recorded == key)
+                {
+                    let view = operation
+                        .view()
+                        .await
+                        .map_err(|error| format!("read a publication's view: {error}"))?;
+                    return Ok(view
+                        .get_local_bookmark(RefName::new(bookmark))
+                        .as_normal()
+                        .map(|commit| commit.hex()));
+                }
+            }
+            Ok(None)
+        })
 }
 
 async fn require_clean_logical_tree(
@@ -279,6 +374,10 @@ async fn publish_logical_head_inner(
     identity: Option<PublicationIdentity>,
     mode: PublicationMode,
 ) -> Result<LogicalHeadPublication, String> {
+    let key = match &proposed_tree {
+        ProposedTree::DeltaCommit { key, .. } => key.clone(),
+        _ => None,
+    };
     if bookmark.trim().is_empty() {
         return Err("logical-head bookmark must not be empty".to_string());
     }
@@ -320,7 +419,10 @@ async fn publish_logical_head_inner(
         .get_commit(&expected_id)
         .map_err(|error| format!("read expected logical head: {error}"))?;
     let (tree, affected_paths) = match proposed_tree {
-        ProposedTree::DeltaCommit(delta_commit) => {
+        ProposedTree::DeltaCommit {
+            commit: delta_commit,
+            ..
+        } => {
             require_clean_logical_tree(
                 &head.tree(),
                 &format!("parent of `{bookmark}` at {expected_head}"),
@@ -531,6 +633,9 @@ async fn publish_logical_head_inner(
     };
     tx.repo_mut()
         .set_local_bookmark_target(bookmark_name, RefTarget::normal(published.id().clone()));
+    if let Some(key) = key {
+        tx.set_attribute(PUBLICATION_KEY_ATTRIBUTE.to_string(), key);
+    }
     tx.commit(format!("publish logical head `{bookmark}`"))
         .await
         .map_err(|error| format!("commit logical-head publication transaction: {error}"))?;

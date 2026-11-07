@@ -1763,6 +1763,79 @@ pub struct Fleet {
     /// This runner process's identity in every journal it writes, set once
     /// when the journals attach.
     runner_incarnation: Arc<std::sync::OnceLock<String>>,
+    /// Results that arrived for no binding this process holds, for the
+    /// orchestrator's adoption to decide (`run::adopted`).
+    unbound_results: Arc<Mutex<UnboundResults>>,
+    /// Run batches whose results this process acknowledges only once the
+    /// batch's own settlement is done with them, by request id, with each
+    /// attempt and machine a result for it arrived from.
+    deferred_acks: Arc<Mutex<HashMap<String, DeferredAttempts>>>,
+    /// Reauthorization answers awaited, by attempt.
+    reauthorizations: Arc<Mutex<HashMap<RequestIdentity, ReauthorizationWaiter>>>,
+    /// Requests an unsettled durable row of an earlier runner process still
+    /// claims, named in every `WaitingRequests` so a machine still preparing
+    /// one does not retire it for want of a waiter.
+    adopting: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Where a machine's answer to `ReauthorizeTransfers` goes.
+/// The `(attempt_id, executor_id)` of each result a run batch's settlement
+/// acknowledges once it is done with them.
+type DeferredAttempts = Vec<(String, String)>;
+
+type ReauthorizationWaiter =
+    oneshot::Sender<Vec<cairn_common::executor_protocol::ReauthorizedTransfer>>;
+
+/// A result no binding in this process accounts for.
+#[derive(Clone, Debug)]
+pub(crate) struct UnboundResult {
+    pub(crate) executor_id: String,
+    pub(crate) machine: String,
+    pub(crate) request_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) outcome: CellOutcome,
+}
+
+#[derive(Default)]
+struct UnboundResults {
+    sink: Option<mpsc::UnboundedSender<UnboundResult>>,
+    /// Held until a sink is installed. Never acknowledged meanwhile: until the
+    /// orchestrator can read its durable rows nothing here can decide, and a
+    /// result acknowledged wrongly is lost for good.
+    pending: Vec<UnboundResult>,
+}
+
+/// Acknowledges a run batch's results when the batch's own settlement drops
+/// it: after the answer has reached whatever durable row or call it was for.
+/// Never dropped by a runner process that died first, which is the point.
+/// Dropped by a panic, it acknowledges nothing: a settlement that unwound is
+/// not one that finished.
+pub(crate) struct DeferredResultAck {
+    fleet: Fleet,
+    request_id: String,
+}
+
+impl Drop for DeferredResultAck {
+    fn drop(&mut self) {
+        let delivered = self
+            .fleet
+            .deferred_acks
+            .lock()
+            .unwrap()
+            .remove(&self.request_id)
+            .unwrap_or_default();
+        if std::thread::panicking() {
+            log::warn!(
+                "run batch {} unwound before its answer landed; its results stay on their machines",
+                self.request_id
+            );
+            return;
+        }
+        for (attempt_id, executor_id) in delivered {
+            self.fleet
+                .send_result_ack(&executor_id, &self.request_id, &attempt_id);
+        }
+    }
 }
 
 /// Grace after a residency response's link stops reporting progress.
@@ -6106,20 +6179,35 @@ impl Fleet {
                         *bound_generation
                     }
                     _ => {
+                        // Not this process's to settle: a runner that restarted
+                        // holds no binding for work an earlier process granted,
+                        // and the executor retains every result until one is
+                        // acknowledged and sends it again on each new link.
+                        // Adoption is driven only by what the machine declares
+                        // like this; the link generation having changed is
+                        // never read as the work's death (tenet 1239). Whether
+                        // a durable row still claims the batch is decided off
+                        // this frame, and nothing is acknowledged until it is.
                         let bound = match binding {
                             Some((bound, bound_generation)) => {
                                 format!("it is bound to {bound} at generation {bound_generation}")
                             }
-                            None => {
-                                "it is not bound to any machine (already settled, or never queued)"
-                                    .to_string()
-                            }
+                            None => "no binding in this runner process holds it".to_string(),
                         };
-                        log::warn!(
-                            "discarded the result of request {} attempt {} from executor_id={executor_id} generation {generation}: {bound}",
+                        log::info!(
+                            "result of request {} attempt {} from executor_id={executor_id} generation {generation} is not this process's to settle ({bound}); offering it for adoption",
                             key.0,
                             key.1,
                         );
+                        scrub_cell_outcome(&mut outcome);
+                        let machine = self.executor_name_for_text(executor_id);
+                        self.offer_unbound_result(UnboundResult {
+                            executor_id: executor_id.to_string(),
+                            machine,
+                            request_id: key.0,
+                            attempt_id: key.1,
+                            outcome,
+                        });
                         return false;
                     }
                 };
@@ -6162,7 +6250,28 @@ impl Fleet {
                     outcome,
                     unix_time_ms(),
                 );
+                self.acknowledge_settled_result(executor_id, &key);
                 self.binding_changed.notify_waiters();
+                false
+            }
+            ExecutorMessage::TransfersReauthorized {
+                request_id,
+                attempt_id,
+                transfers,
+            } => {
+                let waiter = self
+                    .reauthorizations
+                    .lock()
+                    .unwrap()
+                    .remove(&(request_id.clone(), attempt_id.clone()));
+                match waiter {
+                    Some(waiter) => {
+                        let _ = waiter.send(transfers);
+                    }
+                    None => log::warn!(
+                        "executor_id={executor_id} reauthorized the transfers of request {request_id} attempt {attempt_id}, which nothing here is waiting for"
+                    ),
+                }
                 false
             }
             // A machine takes responsibility for an entry it was offered. This
@@ -6726,6 +6835,7 @@ impl Fleet {
     /// The complete set is scoped to the bound executor and generation.
     fn waiting_request_ids(&self, executor_id: &str, generation: u64) -> Vec<String> {
         let mut ids = self.queue.waiting_request_ids(executor_id, generation);
+        ids.extend(self.adopting.lock().unwrap().iter().cloned());
         ids.sort();
         ids.dedup();
         ids
@@ -7185,6 +7295,7 @@ impl Fleet {
             cached: true,
             subscriber_count: 1,
             served_at_unix_ms,
+            result_evicted: None,
         });
         recent.truncate(32);
     }
@@ -14909,6 +15020,126 @@ impl Fleet {
         })
     }
 
+    /// The machine that has claimed the live attempt of `request_id`, if one
+    /// has. An attempt only offered to a machine names none.
+    pub(crate) fn claimed_executor_of(&self, request_id: &str) -> Option<String> {
+        let (attempt_id, _, _) = self.queue.attempt_binding_of(request_id)?;
+        self.queue
+            .claimed_binding_of(&(request_id.to_string(), attempt_id))
+            .map(|(executor_id, _)| executor_id)
+    }
+
+    /// The generation of the link a machine is attached on now.
+    pub(crate) fn link_generation(&self, executor_id: &str) -> Option<u64> {
+        self.lock_connections()
+            .get(executor_id)
+            .map(|entry| entry.generation)
+    }
+
+    /// Tell a machine the runner holds one of its results, on whatever link it
+    /// is attached on now. A machine not attached keeps the result and sends it
+    /// again when it is, and the decision is simply made again.
+    pub(crate) fn send_result_ack(&self, executor_id: &str, request_id: &str, attempt_id: &str) {
+        let Some(generation) = self.link_generation(executor_id) else {
+            return;
+        };
+        if let Err(error) = self.send_to(
+            executor_id,
+            generation,
+            ExecutorMessage::ResultAck {
+                request_id: request_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+            },
+        ) {
+            log::info!("could not acknowledge request {request_id} attempt {attempt_id} to executor_id={executor_id}: {error}; it will resend");
+        }
+    }
+
+    /// A result settled into its waiter in this process: acknowledge it now,
+    /// unless it belongs to a run batch whose settlement acknowledges it.
+    fn acknowledge_settled_result(&self, executor_id: &str, key: &RequestIdentity) {
+        {
+            let mut deferred = self.deferred_acks.lock().unwrap();
+            if let Some(delivered) = deferred.get_mut(&key.0) {
+                delivered.push((key.1.clone(), executor_id.to_string()));
+                return;
+            }
+        }
+        self.send_result_ack(executor_id, &key.0, &key.1);
+    }
+
+    /// Acknowledge this run batch's results only when the returned guard is
+    /// dropped, rather than when they settle into its waiter.
+    pub(crate) fn defer_result_ack(&self, request_id: &str) -> DeferredResultAck {
+        self.deferred_acks
+            .lock()
+            .unwrap()
+            .entry(request_id.to_string())
+            .or_default();
+        DeferredResultAck {
+            fleet: self.clone(),
+            request_id: request_id.to_string(),
+        }
+    }
+
+    /// Hand the orchestrator its adoption queue, with every result that
+    /// arrived before it could decide anything.
+    pub(crate) fn install_unbound_result_sink(&self, sink: mpsc::UnboundedSender<UnboundResult>) {
+        let mut results = self.unbound_results.lock().unwrap();
+        for result in std::mem::take(&mut results.pending) {
+            let _ = sink.send(result);
+        }
+        results.sink = Some(sink);
+    }
+
+    fn offer_unbound_result(&self, result: UnboundResult) {
+        let mut results = self.unbound_results.lock().unwrap();
+        let result = match results.sink.as_ref() {
+            Some(sink) => match sink.send(result) {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(result)) => result,
+            },
+            None => result,
+        };
+        results.sink = None;
+        results.pending.push(result);
+    }
+
+    /// Ask a machine to re-offer an attempt's transfers on its current link.
+    /// The caller authorizes them on that generation first.
+    pub(crate) fn reauthorize_transfers(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        request_id: &str,
+        attempt_id: &str,
+    ) -> Result<oneshot::Receiver<Vec<cairn_common::executor_protocol::ReauthorizedTransfer>>, String>
+    {
+        let key = (request_id.to_string(), attempt_id.to_string());
+        let (tx, rx) = oneshot::channel();
+        self.reauthorizations
+            .lock()
+            .unwrap()
+            .insert(key.clone(), tx);
+        if let Err(error) = self.send_to(
+            executor_id,
+            generation,
+            ExecutorMessage::ReauthorizeTransfers {
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+            },
+        ) {
+            self.reauthorizations.lock().unwrap().remove(&key);
+            return Err(error);
+        }
+        Ok(rx)
+    }
+
+    /// The requests earlier runner processes' durable rows still claim.
+    pub(crate) fn set_adopting(&self, request_ids: HashSet<String>) {
+        *self.adopting.lock().unwrap() = request_ids;
+    }
+
     fn send_to(
         &self,
         executor_id: &str,
@@ -21850,6 +22081,7 @@ mod tests {
             cached: false,
             subscriber_count: 1,
             served_at_unix_ms: 0,
+            result_evicted: None,
         }
     }
 
@@ -26630,6 +26862,86 @@ mod tests {
         fleet_entry_at(id, os, load, warm, NOW)
     }
 
+    /// What this runner sends a machine about its results: a settled result is
+    /// acknowledged at once unless a run batch deferred it, and then only when
+    /// the batch's guard drops; requests an earlier process's rows still claim
+    /// are named in every liveness report.
+    #[test]
+    fn results_are_acknowledged_when_their_consumer_is_done_and_adopted_requests_stay_alive() {
+        let fleet = Fleet::default();
+        let mut frames = fleet.attach_reported_machine_for_test("exec-a", &[]);
+        let acks = |frames: &mut mpsc::UnboundedReceiver<ExecutorMessage>| {
+            let mut acked = Vec::new();
+            while let Ok(frame) = frames.try_recv() {
+                if let ExecutorMessage::ResultAck {
+                    request_id,
+                    attempt_id,
+                } = frame
+                {
+                    acked.push(format!("{request_id}/{attempt_id}"));
+                }
+            }
+            acked
+        };
+
+        fleet.acknowledge_settled_result("exec-a", &("check".into(), "a1".into()));
+        assert_eq!(
+            acks(&mut frames),
+            ["check/a1"],
+            "an ordinary result is acknowledged as it settles"
+        );
+
+        let guard = fleet.defer_result_ack("batch");
+        fleet.acknowledge_settled_result("exec-a", &("batch".into(), "a1".into()));
+        fleet.acknowledge_settled_result("exec-a", &("batch".into(), "a2".into()));
+        assert!(
+            acks(&mut frames).is_empty(),
+            "a run batch's result waits for its answer to land"
+        );
+        drop(guard);
+        assert_eq!(acks(&mut frames), ["batch/a1", "batch/a2"]);
+        fleet.acknowledge_settled_result("exec-a", &("batch".into(), "a3".into()));
+        assert_eq!(
+            acks(&mut frames),
+            ["batch/a3"],
+            "once the batch is done, a late result is acknowledged as it settles"
+        );
+
+        fleet.set_adopting(["adopted".to_string()].into_iter().collect());
+        assert!(fleet
+            .waiting_request_ids("exec-a", 1)
+            .contains(&"adopted".to_string()));
+    }
+
+    /// What a batch's durable row names as its machine when placement did not
+    /// bind it: the machine that claimed its attempt, never one it was only
+    /// offered to.
+    #[test]
+    fn a_request_is_named_by_the_machine_that_claimed_it_never_by_an_offer() {
+        let fleet = Fleet::default();
+        assert_eq!(fleet.claimed_executor_of("batch"), None);
+        let (entry, _waiter) = queue::tests::enqueue(
+            &fleet.queue,
+            "batch",
+            cairn_common::executor_protocol::PlacementMobility::SpillEligible,
+        );
+        assert_eq!(fleet.claimed_executor_of("batch"), None);
+        assert!(fleet.queue.offer(&entry, "exec-b", "exec-b", 1, 2));
+        assert_eq!(
+            fleet.claimed_executor_of("batch"),
+            None,
+            "an offer is not a claim"
+        );
+        assert_eq!(
+            fleet.queue.claim(&entry, "exec-b", 1, 3),
+            queue::ClaimVerdict::Granted
+        );
+        assert_eq!(
+            fleet.claimed_executor_of("batch").as_deref(),
+            Some("exec-b")
+        );
+    }
+
     impl Fleet {
         /// Attach one test executor whose snapshot reports exactly `cells`, so a
         /// caller outside this module can exercise a decision that reads
@@ -26641,6 +26953,48 @@ mod tests {
             let (id, mut connection) = fleet_entry("executor-test", "linux", 0, &[]);
             Arc::make_mut(&mut connection.snapshot).cells = cells;
             self.lock_connections().insert(id, connection);
+        }
+
+        /// Attach one machine that has reported its account once, listing
+        /// `granted` as attempts it still holds, and hand back every frame this
+        /// runner sends it.
+        pub(crate) fn attach_reported_machine_for_test(
+            &self,
+            id: &str,
+            granted: &[(&str, &str)],
+        ) -> mpsc::UnboundedReceiver<ExecutorMessage> {
+            let (id, mut connection) = fleet_entry(id, "linux", 0, &[]);
+            let (sender, receiver) = mpsc::unbounded_channel();
+            connection.sender = sender;
+            connection.snapshots_received = 1;
+            Arc::make_mut(&mut connection.snapshot).granted_attempts = granted
+                .iter()
+                .map(
+                    |(request_id, attempt_id)| cairn_common::executor_protocol::GrantedAttempt {
+                        request_id: (*request_id).into(),
+                        attempt_id: (*attempt_id).into(),
+                    },
+                )
+                .collect();
+            self.lock_connections().insert(id, connection);
+            receiver
+        }
+
+        /// A placement template a test can persist a settlement with.
+        pub(crate) fn cell_request_for_test(&self, request_id: &str) -> CellRequest {
+            let mut request = targeted_request("linux");
+            request.request_id = request_id.into();
+            request
+        }
+
+        /// Execution metadata for a test's completed outcome.
+        pub(crate) fn execution_meta_for_test(
+            &self,
+        ) -> cairn_common::executor_protocol::CellExecutionMeta {
+            cairn_common::executor_protocol::CellExecutionMeta {
+                stop: None,
+                ..resource_profiles::oom_killed_for_test(0, None, 0, 1)
+            }
         }
 
         /// Attach one test executor named `name` whose posted health reports
@@ -36069,6 +36423,7 @@ mod tests {
             cached: false,
             subscriber_count: 1,
             served_at_unix_ms: 0,
+            result_evicted: None,
         }
     }
 

@@ -2373,7 +2373,7 @@ pub(super) mod tests {
         }
     }
 
-    fn enqueue(
+    pub(in crate::fleet) fn enqueue(
         queue: &ExecutionQueue,
         request_id: &str,
         mobility: PlacementMobility,

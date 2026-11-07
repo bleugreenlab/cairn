@@ -63,6 +63,12 @@ pub(crate) struct LaneClaims {
 }
 
 impl LaneClaims {
+    /// How many write waves this registry has opened.
+    #[cfg(test)]
+    pub(crate) fn waves_opened_for_test(&self) -> u64 {
+        self.lock().next_wave
+    }
+
     /// Open a write wave for `job_id`. It starts out planning, and a sibling's
     /// fold waits that out, because a wave that has not planned has not claimed.
     pub(crate) fn open_wave(self: &Arc<Self>, job_id: &str) -> WaveClaims {

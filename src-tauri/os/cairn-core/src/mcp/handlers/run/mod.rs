@@ -8,6 +8,7 @@
 //! [`checks`] (when:write check runners), [`hygiene`] (cwd advisories), and
 //! [`redact`] (secret redaction). [`handle_run`] wires them together.
 
+pub(crate) mod adopted;
 mod checks;
 mod commit_barrier;
 pub(crate) mod detached;
@@ -728,6 +729,12 @@ pub(crate) async fn publish_and_seal_slot_delta(
             let on_base = head == delta.base_commit;
             (head, String::new(), on_base)
         }
+        SlotPublicationOutcome::PublishedEarlier { head, export } => {
+            export.map_err(|error| {
+                format!("delta {head} was sealed locally but remains unpublished: {error}")
+            })?;
+            (head, String::new(), false)
+        }
     };
     let paths = crate::jj::parse_git_diff(&patch)
         .into_iter()
@@ -906,6 +913,20 @@ enum SlotPublicationOutcome {
     },
     /// The branch head's tree already carries this batch's content.
     AlreadyLanded { head: String },
+    /// This very batch's delta was published earlier, by a runner process that
+    /// ended before it could say so: its landing is in the store's operation
+    /// log under the batch's publication key. `export` is the branch ref's
+    /// export, climbed again in case that process ended between the two.
+    PublishedEarlier {
+        head: String,
+        export: Result<(), String>,
+    },
+}
+
+/// The key a routed batch's delta landing is recorded under, so a later runner
+/// process can tell whether it landed (see [`cairn_vcs::find_keyed_publication`]).
+pub(crate) fn publication_key(request_id: &str) -> String {
+    format!("run-batch:{request_id}")
 }
 
 #[derive(Debug)]
@@ -1010,6 +1031,13 @@ struct DeltaPublication<'a> {
     run_id: Option<&'a str>,
     /// The enclosing store-lock hold, whose phases this publication reports.
     trace: Option<&'a JjStoreOperationTrace>,
+    /// The key this landing is recorded under in the store's operation log.
+    /// `None` for a republished held delta, which has no batch of its own.
+    key: Option<String>,
+    /// Look for a landing already recorded under `key` since this instant
+    /// before landing anything. Set only when a runner process re-drives a
+    /// batch an earlier process may have published before it ended.
+    prior_since_ms: Option<i64>,
 }
 
 fn resolve_runner_publication_target(
@@ -1095,8 +1123,11 @@ struct PreparedSlot {
     /// locked publication authority and into a hold, so the run's session is
     /// judged however late the delta lands.
     run_id: Option<String>,
+    /// See [`DeltaPublication::prior_since_ms`].
+    prior_since_ms: Option<i64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slot_delta_publication<'a>(
     target: &'a RunnerPublicationTarget,
     request: &'a CellRequest,
@@ -1105,6 +1136,7 @@ fn slot_delta_publication<'a>(
     author: Option<&'a PublicationIdentity>,
     trace: Option<&'a JjStoreOperationTrace>,
     run_id: Option<&'a str>,
+    prior_since_ms: Option<i64>,
 ) -> DeltaPublication<'a> {
     DeltaPublication {
         repository: &target.repository,
@@ -1121,6 +1153,8 @@ fn slot_delta_publication<'a>(
             .and_then(|owner| owner.job_id.as_deref()),
         run_id,
         trace,
+        key: Some(publication_key(&request.request_id)),
+        prior_since_ms,
     }
 }
 
@@ -1148,7 +1182,8 @@ async fn prepare_slot_publication(
                 error,
             }
         })?;
-    let publication = slot_delta_publication(target, request, delta, message, author, None, None);
+    let publication =
+        slot_delta_publication(target, request, delta, message, author, None, None, None);
     let plan = match cairn_vcs::resolve_coordinate(&target.store_dir, &target.branch).await {
         Ok(head) => plan_integration(orch, &publication, head).await.ok(),
         Err(_) => None,
@@ -1157,6 +1192,7 @@ async fn prepare_slot_publication(
         available,
         plan,
         run_id: None,
+        prior_since_ms: None,
     })
 }
 
@@ -1180,6 +1216,7 @@ async fn land_prepared_slot_delta(
         available,
         plan,
         run_id,
+        prior_since_ms,
     } = prepared;
     let publication = slot_delta_publication(
         target,
@@ -1189,6 +1226,7 @@ async fn land_prepared_slot_delta(
         author,
         trace,
         run_id.as_deref(),
+        prior_since_ms,
     );
     match publish_available_delta(orch, &publication, plan).await {
         Ok(outcome) => Ok(SlotPublication {
@@ -1447,6 +1485,7 @@ async fn publish_available_delta(
         trace,
         ..
     } = *publication;
+    let key = publication.key.clone();
 
     // The authority check belongs here, inside the caller's store-lock hold and
     // before the head is even read: a batch prepared while its issue was open
@@ -1462,6 +1501,38 @@ async fn publish_available_delta(
             super::branch::PublicationAuthority::Unknown(error) => {
                 return Err(PublishFailure::Failed(format!(
                     "could not confirm that this job may still publish to `{branch}`: {error}"
+                )))
+            }
+        }
+    }
+
+    // A runner process that re-drives a batch an earlier process may have
+    // published asks the store first, under this lock: the landing recorded
+    // its key in the same transaction that moved the bookmark, so the answer
+    // survives a process that ended between the two and a landing that
+    // integrated onto a moved head under a commit id nobody recorded.
+    if let (Some(key), Some(since)) = (key.clone(), publication.prior_since_ms) {
+        let _checking = trace.map(|trace| trace.phase("find prior publication"));
+        let (store, bookmark) = (store_dir.to_path_buf(), branch.to_string());
+        let found = tokio::task::spawn_blocking(move || {
+            cairn_vcs::find_keyed_publication(&store, &bookmark, &key, since)
+        })
+        .await
+        .map_err(|error| format!("publication lookup worker failed: {error}"))?;
+        match found {
+            Ok(Some(head)) => {
+                let export = crate::jj::export_branch_head(
+                    &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+                    store_dir,
+                    branch,
+                )
+                .await;
+                return Ok(SlotPublicationOutcome::PublishedEarlier { head, export });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(PublishFailure::Failed(format!(
+                    "could not read whether an earlier Cairn process already published this batch: {error}"
                 )))
             }
         }
@@ -1529,7 +1600,10 @@ async fn publish_available_delta(
         store_dir,
         branch,
         &head,
-        crate::jj::ProposedPublication::DeltaCommit(proposed),
+        crate::jj::ProposedPublication::DeltaCommit(crate::jj::ProposedDelta {
+            commit: proposed,
+            key: publication.key.clone(),
+        }),
         identity,
         mode,
     )
@@ -1844,7 +1918,7 @@ fn straddled_conflict_message(head: &str, delta_commit: &str, paths: &[String]) 
 }
 
 #[cfg(test)]
-mod slot_publication_tests {
+pub(crate) mod slot_publication_tests {
     use super::*;
     use crate::db::DbState;
     use crate::jj::tests::{git, git_stdout, jj_bin};
@@ -1857,22 +1931,22 @@ mod slot_publication_tests {
     /// A colocated repository holding a `feature` bookmark, plus everything the
     /// runner has in hand at publication time: the routed request, the sealed
     /// delta, and the publication target.
-    struct Straddle {
+    pub(crate) struct Straddle {
         _home: tempfile::TempDir,
         _repo: tempfile::TempDir,
         jj: JjEnv,
-        repository: PathBuf,
+        pub(crate) repository: PathBuf,
         target: RunnerPublicationTarget,
-        request: CellRequest,
-        delta: crate::fleet::MutationDelta,
+        pub(crate) request: CellRequest,
+        pub(crate) delta: crate::fleet::MutationDelta,
         /// The commit the batch was routed at.
-        base: String,
+        pub(crate) base: String,
         /// Where the bookmark stands when the batch tries to publish.
         head: String,
     }
 
     impl Straddle {
-        fn bookmark(&self) -> String {
+        pub(crate) fn bookmark(&self) -> String {
             self.jj
                 .run(
                     &self.repository,
@@ -1890,7 +1964,7 @@ mod slot_publication_tests {
                 .unwrap()
         }
 
-        fn blob(&self, commit: &str, path: &str) -> String {
+        pub(crate) fn blob(&self, commit: &str, path: &str) -> String {
             git_stdout(&self.repository, &["show", &format!("{commit}:{path}")])
         }
 
@@ -1904,7 +1978,7 @@ mod slot_publication_tests {
     /// what the agent's batch wrote. Both are sealed off to the side, parented
     /// at the routed commit and referenced by nothing, which is the shape a
     /// delta actually arrives in. `None` when jj is not resolvable here.
-    async fn straddle(
+    pub(crate) async fn straddle(
         advance: Option<&[(&str, &str)]>,
         batch: &[(&str, &str)],
     ) -> Option<Straddle> {
@@ -1956,7 +2030,7 @@ mod slot_publication_tests {
                     &repository,
                     "feature",
                     &base,
-                    crate::jj::ProposedPublication::DeltaCommit(sibling),
+                    crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
                     None,
                     cairn_vcs::PublicationMode::Child {
                         description: "a sibling lands".into(),
@@ -2193,7 +2267,7 @@ mod slot_publication_tests {
             &fx.repository,
             "feature",
             &fx.base,
-            crate::jj::ProposedPublication::DeltaCommit(sibling),
+            crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
             None,
             cairn_vcs::PublicationMode::Child {
                 description: "a sibling lands".into(),
@@ -2386,6 +2460,23 @@ mod slot_publication_tests {
         fx: &mut Straddle,
         staging: &std::path::Path,
     ) -> cairn_common::executor_protocol::DeltaUploadReceipt {
+        let request = fx.request.clone();
+        let receipt = stage_upload(orch, fx, &request, "executor", 1, staging);
+        fx.delta.upload_receipt = Some(receipt.clone());
+        receipt
+    }
+
+    /// Stage `fx`'s delta as the upload `executor_id` makes for `request` on
+    /// its link `generation`, the way an executor's object channel does, and
+    /// return the receipt that upload is answered with.
+    pub(crate) fn stage_upload(
+        orch: &Orchestrator,
+        fx: &Straddle,
+        request: &CellRequest,
+        executor_id: &str,
+        generation: u64,
+        staging: &std::path::Path,
+    ) -> cairn_common::executor_protocol::DeltaUploadReceipt {
         let (pack, index) = cairn_codec::transfer::build_delta_pack(
             &fx.repository,
             &fx.delta.delta_commit,
@@ -2407,13 +2498,13 @@ mod slot_publication_tests {
         );
         let framed = cairn_codec::transfer::frame_pack(&pack, &validated.index);
         let receipt = cairn_common::executor_protocol::DeltaUploadReceipt {
-            receipt_id: "receipt-3231".into(),
+            receipt_id: format!("receipt-{}", request.attempt_id),
             coordinate: cairn_common::executor_protocol::ObjectTransferCoordinate {
-                repository: fx.request.repository.identity(),
-                request_id: fx.request.request_id.clone(),
-                attempt_id: fx.request.attempt_id.clone(),
-                executor_id: "executor".into(),
-                connection_generation: 1,
+                repository: request.repository.identity(),
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                executor_id: executor_id.into(),
+                connection_generation: generation,
             },
             base_commit: fx.base.clone(),
             delta_commit: fx.delta.delta_commit.clone(),
@@ -2425,11 +2516,10 @@ mod slot_publication_tests {
             .unwrap()
             .as_millis() as u64;
         orch.object_plane
-            .issue_credential("executor", "device", "runner", 1, now);
+            .issue_credential(executor_id, "device", "runner", generation, now);
         orch.object_plane
             .stage_delta(staging, receipt.clone(), &pack)
             .unwrap();
-        fx.delta.upload_receipt = Some(receipt.clone());
         receipt
     }
 
@@ -2955,6 +3045,81 @@ mod slot_publication_tests {
         }
     }
 
+    /// cairn/5536: exactly once must survive landing on a moved base. The
+    /// first runner process lands the batch on a head that moved under it, so
+    /// the landed commit is an integration whose id nobody recorded, and then
+    /// dies before saying it landed. The next process's re-drive asks the
+    /// store's operation log for a landing under the batch's key before it
+    /// lands anything: it finds that one, lands no second commit, and reports
+    /// the commit that did land.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_redriven_landing_on_a_moved_base_finds_the_first_and_lands_nothing() {
+        let Some(fx) = straddle(
+            Some(&[("advanced.rs", "after the advance\n")]),
+            &[("mine.rs", "the batch's work\n")],
+        )
+        .await
+        else {
+            eprintln!("skipping a_redriven_landing_on_a_moved_base: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator().await;
+        let started = chrono::Utc::now().timestamp_millis() - 60_000;
+
+        let SlotPublicationOutcome::Published { landed, .. } = publish_visible_slot_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "the batch",
+            None,
+            None,
+        )
+        .await
+        .expect("the first landing publishes")
+        .outcome
+        else {
+            panic!("expected a publication");
+        };
+        assert_ne!(
+            landed.head, fx.delta.delta_commit,
+            "landed as an integration onto the moved head, under a commit id the delta does not name"
+        );
+        assert_ne!(landed.head, fx.head);
+
+        let mut prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
+                .await
+                .expect("the delta prepares again");
+        prepared.prior_since_ms = Some(started);
+        let again = land_prepared_slot_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "the batch",
+            None,
+            None,
+            prepared,
+        )
+        .await
+        .expect("the re-drive settles")
+        .outcome;
+        match again {
+            SlotPublicationOutcome::PublishedEarlier { head, export } => {
+                assert_eq!(head, landed.head);
+                export.expect("the branch ref is exported again");
+            }
+            other => panic!("expected the earlier landing to be found, got {other:?}"),
+        }
+        assert_eq!(
+            bookmark_at(&fx, "feature"),
+            landed.head,
+            "no second commit landed"
+        );
+    }
+
     /// A carried commit the runner never received (it never reached the store,
     /// so nothing holds it) is published together with the batch built on it,
     /// rather than lost or waited on forever.
@@ -3047,7 +3212,7 @@ mod slot_publication_tests {
             &fx.repository,
             "later",
             &fx.base,
-            crate::jj::ProposedPublication::DeltaCommit(fx.delta.delta_commit.clone()),
+            crate::jj::ProposedPublication::DeltaCommit(fx.delta.delta_commit.clone().into()),
             None,
             cairn_vcs::PublicationMode::Child {
                 description: "the batch".into(),
@@ -4022,6 +4187,9 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     let (task_orch, task_request, task_control) = (orch.clone(), request.clone(), control.clone());
     let live = detached::LiveBatch::claim(&control.request_id);
+    // Registered before anything is placed, so no result of this batch is
+    // acknowledged before its answer has reached where it was going.
+    let result_ack = orch.fleet.defer_result_ack(&control.request_id);
     tokio::spawn(async move {
         let _live = live;
         let envelope = prepare_and_run_batch(
@@ -4045,7 +4213,9 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 refusal,
             );
         }
-        if let Err(answer) = answer_tx.send(BatchAnswer::from_envelope(envelope)) {
+        let mut answer = BatchAnswer::from_envelope(envelope);
+        answer._result_ack = Some(result_ack);
+        if let Err(answer) = answer_tx.send(answer) {
             log::warn!(
                 "run answer lost; batch {} settled: {}",
                 task_control.request_id,
@@ -4863,6 +5033,7 @@ async fn prepare_and_run_batch(
                 status_before,
                 marker_escape: marker_escape.clone(),
                 machine_notes,
+                prior_publication_since_ms: None,
             };
             return off_frame(|| {
                 run_routed_batch(orch, settlement, placement, batch, control, deadlines)
@@ -4906,6 +5077,7 @@ async fn prepare_and_run_batch(
         node_default: None,
         default_clear_notice: None,
         machine_notes,
+        prior_publication_since_ms: None,
     };
     let suspendable = batch.may_outlive_grace();
     off_frame(|| run_host_batch(orch, settlement, batch, control, deadlines, suspendable)).await
@@ -5591,9 +5763,250 @@ struct RunBatchSettlement {
     /// read, its index and the trailing `↳ machine:` line saying why
     /// (`read_equivalent`).
     machine_notes: Vec<(usize, String)>,
+    /// Set only on a settlement rebuilt by a later runner process for a batch
+    /// an earlier one may already have published: before landing, look for a
+    /// landing recorded under this batch's key since this instant.
+    prior_publication_since_ms: Option<i64>,
+}
+
+/// The machine a batch was placed on when its call suspended, named for the
+/// texts a restart writes about it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PlacedOn {
+    pub(crate) executor_id: String,
+    pub(crate) name: String,
+}
+
+impl PlacedOn {
+    /// The colocated executor is reaped with the runner that started it
+    /// (tenet 316), so a batch there cannot outlive a host restart.
+    pub(crate) fn colocated(&self) -> bool {
+        self.executor_id == crate::fleet::COLOCATED_EXECUTOR_ID
+    }
+}
+
+/// A [`super::branch::BranchResolution`] as a durable row holds it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedResolution {
+    project_id: String,
+    repository_path: std::path::PathBuf,
+    object_repository_path: std::path::PathBuf,
+    rev: String,
+    commit_id: String,
+    default_commit_id: String,
+    default_branch: String,
+}
+
+/// The data half of a [`RunBatchSettlement`], written into the batch's durable
+/// row when its call suspends or detaches.
+///
+/// A later runner process that adopts the batch's result rebuilds the
+/// settlement from this and settles through the same [`settle_run_batch`] a
+/// live batch does, so an adopted commit lands through the same fence,
+/// integration, store lock and check-on-write wave. What it cannot carry is
+/// what only an ambient batch on the host uses (a live checkout's VCS handle
+/// and its status before the batch), which no routed batch has.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedSettlement {
+    request: McpCallbackRequest,
+    #[serde(default)]
+    commit_msg: Option<String>,
+    #[serde(default)]
+    verdict_only: bool,
+    #[serde(default)]
+    revision_label: Option<String>,
+    #[serde(default)]
+    resolution: Option<PersistedResolution>,
+    #[serde(default)]
+    store_lock: Option<std::path::PathBuf>,
+    /// The placement template, its environment cleared: publication reads
+    /// the request's identity and repository from it, never its environment.
+    #[serde(default)]
+    routed_request: Option<CellRequest>,
+    cwd: String,
+    tool_use_id: String,
+    #[serde(default)]
+    cd_advisory: String,
+    #[serde(default)]
+    node_scratch_id: Option<String>,
+    #[serde(default)]
+    scratch_affinity: Option<String>,
+    #[serde(default)]
+    default_clear_notice: Option<String>,
+    #[serde(default)]
+    machine_notes: Vec<(usize, String)>,
+    /// The batch was placed away from its job's residence.
+    #[serde(default)]
+    detached: bool,
+    #[serde(default)]
+    pub(crate) placed_on: Option<PlacedOn>,
+}
+
+impl PersistedSettlement {
+    /// A settlement for the batch of `run-1`, as a test persists one.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        commit_msg: Option<&str>,
+        routed_request: Option<CellRequest>,
+        placed_on: Option<PlacedOn>,
+    ) -> Self {
+        Self {
+            request: McpCallbackRequest {
+                cwd: "/tmp".into(),
+                run_id: Some("run-1".into()),
+                tool: "run".into(),
+                payload: serde_json::json!({"commands": []}),
+                ..Default::default()
+            },
+            commit_msg: commit_msg.map(str::to_string),
+            verdict_only: false,
+            revision_label: None,
+            resolution: None,
+            store_lock: None,
+            routed_request,
+            cwd: "/tmp".into(),
+            tool_use_id: "tool-1".into(),
+            cd_advisory: String::new(),
+            node_scratch_id: None,
+            scratch_affinity: None,
+            default_clear_notice: None,
+            machine_notes: Vec::new(),
+            detached: false,
+            placed_on,
+        }
+    }
+
+    /// The same settlement, publishing to `repository`'s bookmark `rev`, which
+    /// was at `commit_id` when the batch was routed.
+    #[cfg(test)]
+    pub(crate) fn publishing_to_for_test(
+        mut self,
+        project_id: &str,
+        repository: &std::path::Path,
+        rev: &str,
+        commit_id: &str,
+    ) -> Self {
+        self.resolution = Some(PersistedResolution {
+            project_id: project_id.into(),
+            repository_path: repository.to_path_buf(),
+            object_repository_path: repository.to_path_buf(),
+            rev: rev.into(),
+            commit_id: commit_id.into(),
+            default_commit_id: commit_id.into(),
+            default_branch: "main".into(),
+        });
+        self.store_lock = Some(repository.to_path_buf());
+        self
+    }
+
+    pub(crate) fn commits(&self) -> bool {
+        self.commit_msg.is_some()
+    }
+
+    /// The placement template, which an adopted attempt's transfers are
+    /// authorized against.
+    pub(crate) fn routed_request(&self) -> Option<&CellRequest> {
+        self.routed_request.as_ref()
+    }
 }
 
 impl RunBatchSettlement {
+    /// The settlement's data half, for the batch's durable row.
+    fn persist(&self, residence: BatchResidence) -> PersistedSettlement {
+        PersistedSettlement {
+            request: self.request.clone(),
+            commit_msg: self.commit_msg.clone(),
+            verdict_only: self.verdict_only,
+            revision_label: self.revision_label.clone(),
+            resolution: self
+                .logical_resolution
+                .as_ref()
+                .map(|resolution| PersistedResolution {
+                    project_id: resolution.project_id.clone(),
+                    repository_path: resolution.repository_path.clone(),
+                    object_repository_path: resolution.object_repository_path.clone(),
+                    rev: resolution.rev.clone(),
+                    commit_id: resolution.commit_id.clone(),
+                    default_commit_id: resolution.default_commit_id.clone(),
+                    default_branch: resolution.default_branch.clone(),
+                }),
+            store_lock: self.store_lock.clone(),
+            routed_request: self.routed_request.clone().map(|mut request| {
+                request.env.clear();
+                request
+            }),
+            cwd: self.cwd.clone(),
+            tool_use_id: self.tool_use_id.clone(),
+            cd_advisory: self.cd_advisory.clone(),
+            node_scratch_id: self.node_scratch.as_ref().map(|scratch| scratch.id.clone()),
+            scratch_affinity: self.scratch_affinity.clone(),
+            default_clear_notice: self.default_clear_notice.clone(),
+            machine_notes: self.machine_notes.clone(),
+            detached: residence == BatchResidence::Detached,
+            placed_on: None,
+        }
+    }
+
+    /// Rebuild a settlement from its data half, in a runner process that did
+    /// not start the batch. Publication looks first for a landing an earlier
+    /// process recorded for it since `started_ms`.
+    pub(crate) async fn reconstruct(
+        orch: &Orchestrator,
+        persisted: &PersistedSettlement,
+        started_ms: i64,
+    ) -> (Self, BatchResidence) {
+        let run_context = super::run_context::lookup_run_routed(&orch.db, &persisted.request)
+            .await
+            .ok()
+            .map(|(context, _)| context);
+        let node_scratch = match persisted.node_scratch_id.as_deref() {
+            Some(id) => crate::node_scratch::owner::load(&orch.db.local, id)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let settlement = Self {
+            request: persisted.request.clone(),
+            run_context,
+            commit_msg: persisted.commit_msg.clone(),
+            verdict_only: persisted.verdict_only,
+            revision_label: persisted.revision_label.clone(),
+            logical_resolution: persisted.resolution.as_ref().map(|resolution| {
+                super::branch::BranchResolution {
+                    project_id: resolution.project_id.clone(),
+                    repository_path: resolution.repository_path.clone(),
+                    object_repository_path: resolution.object_repository_path.clone(),
+                    rev: resolution.rev.clone(),
+                    commit_id: resolution.commit_id.clone(),
+                    default_commit_id: resolution.default_commit_id.clone(),
+                    default_branch: resolution.default_branch.clone(),
+                }
+            }),
+            store_lock: persisted.store_lock.clone(),
+            routed_request: persisted.routed_request.clone(),
+            cwd: persisted.cwd.clone(),
+            tool_use_id: persisted.tool_use_id.clone(),
+            cd_advisory: persisted.cd_advisory.clone(),
+            interpreter_tip: None,
+            vcs: None,
+            status_before: None,
+            marker_escape: None,
+            node_scratch,
+            scratch_affinity: persisted.scratch_affinity.clone(),
+            node_default: None,
+            default_clear_notice: persisted.default_clear_notice.clone(),
+            machine_notes: persisted.machine_notes.clone(),
+            prior_publication_since_ms: Some(started_ms),
+        };
+        let residence = if persisted.detached {
+            BatchResidence::Detached
+        } else {
+            BatchResidence::Home
+        };
+        (settlement, residence)
+    }
+
     /// Whether the batch's tracked edits were undone rather than published.
     /// Decided by where the batch actually ran, which placement reports back:
     /// a batch can detach after its environment turns out to be elsewhere.
@@ -5932,11 +6345,12 @@ async fn run_routed_batch(
         may_park: true,
         verdict_only: settlement.verdict_only,
     });
+    control.set_persisted(settlement.persist(placement.residence));
     control.phase_done("prepare");
     let task_orch = orch.clone();
-    let stop_placement = control.stop_placement.clone();
+    let task_control = control.clone();
     let mut handle = tokio::spawn(async move {
-        place_and_run_batch(&task_orch, placement, batch, stop_placement).await
+        place_and_run_batch(&task_orch, placement, batch, task_control).await
     });
     let ceiling = deadlines.arrival + RUN_BATCH_CEILING;
     let (joined, ceiling_detail) = match tokio::time::timeout_at(ceiling, &mut handle).await {
@@ -6059,11 +6473,11 @@ async fn place_and_run_batch(
     orch: &Orchestrator,
     placement: BatchPlacement,
     batch: ResolvedRunBatch,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    control: std::sync::Arc<BatchControl>,
 ) -> BatchAttempts {
     let mut grant_without_result = None;
     let placed =
-        place_and_run_attempts(orch, placement, batch, cancelled, &mut grant_without_result).await;
+        place_and_run_attempts(orch, placement, batch, &control, &mut grant_without_result).await;
     BatchAttempts {
         placed,
         grant_without_result,
@@ -6076,11 +6490,12 @@ async fn place_and_run_attempts(
     orch: &Orchestrator,
     mut placement: BatchPlacement,
     batch: ResolvedRunBatch,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    control: &BatchControl,
     grant_without_result: &mut Option<crate::fleet::GrantWithoutResult>,
 ) -> PlacedBatch {
     use std::sync::atomic::Ordering;
 
+    let cancelled = control.stop_placement.clone();
     let request_id = placement.template.request_id.clone();
     // Before the home is acquired, and therefore before anything can wait: a
     // batch whose declared executor contradicts where it must run is answered
@@ -6181,6 +6596,19 @@ async fn place_and_run_attempts(
             BatchResidence::Home => fence,
             BatchResidence::Detached => None,
         };
+        // Where this attempt is bound, as far as placement knows before a
+        // machine claims it: what a restart's texts name the batch's machine.
+        let bound = request.pinned_executor_id.clone().or_else(|| {
+            (residence == BatchResidence::Home)
+                .then(|| home.as_ref().map(|home| home.executor_id.clone()))
+                .flatten()
+        });
+        if let Some(executor_id) = bound {
+            control.set_placed_on(PlacedOn {
+                name: orch.fleet.executor_name_for_text(&executor_id),
+                executor_id,
+            });
+        }
         let executed = orch.fleet.submit_run_batch(orch, request, attempt).await;
         if let Some(grant) = executed.grant_without_result {
             *grant_without_result = Some(grant);
@@ -6467,6 +6895,9 @@ struct BatchControl {
     verdict: std::sync::Mutex<Option<String>>,
     interrupter: std::sync::Mutex<Option<Interrupter>>,
     phases: std::sync::Mutex<(std::time::Instant, Vec<(&'static str, std::time::Duration)>)>,
+    /// What a durable record of this batch carries so a later runner process
+    /// can settle it; `None` for a host batch, which cannot outlive one.
+    persisted: std::sync::Mutex<Option<PersistedSettlement>>,
 }
 
 impl BatchControl {
@@ -6485,7 +6916,47 @@ impl BatchControl {
             verdict: std::sync::Mutex::new(None),
             interrupter: std::sync::Mutex::new(None),
             phases: std::sync::Mutex::new((std::time::Instant::now(), Vec::new())),
+            persisted: std::sync::Mutex::new(None),
         })
+    }
+
+    fn set_persisted(&self, persisted: PersistedSettlement) {
+        *self.persisted.lock().unwrap_or_else(|p| p.into_inner()) = Some(persisted);
+    }
+
+    fn set_placed_on(&self, placed: PlacedOn) {
+        if let Some(persisted) = self
+            .persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            persisted.placed_on = Some(placed);
+        }
+    }
+
+    /// The settlement's data half as it stands now, placement included.
+    fn persisted(&self) -> Option<PersistedSettlement> {
+        self.persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The data half a durable row records. Placement names the machine only
+    /// when it binds the batch itself (a pin, the job's home); otherwise this
+    /// names the machine that has claimed the batch's attempt by now.
+    fn persisted_for_record(&self, fleet: &crate::fleet::Fleet) -> Option<PersistedSettlement> {
+        let mut persisted = self.persisted()?;
+        if persisted.placed_on.is_none() {
+            persisted.placed_on = fleet
+                .claimed_executor_of(&self.request_id)
+                .map(|executor_id| PlacedOn {
+                    name: fleet.executor_name_for_text(&executor_id),
+                    executor_id,
+                });
+        }
+        Some(persisted)
     }
 
     fn facts(&self) -> BatchFacts {
@@ -6590,6 +7061,10 @@ struct BatchAnswer {
     /// An item's own suspension (a fence approval, an MCP continuation) owns
     /// the call now; nothing else may answer it.
     item_suspended: bool,
+    /// Acknowledges the batch's results to their machine once whoever received
+    /// this answer is done with it, durably or not at all; see
+    /// [`crate::fleet::DeferredResultAck`].
+    _result_ack: Option<crate::fleet::DeferredResultAck>,
 }
 
 impl BatchAnswer {
@@ -6613,6 +7088,7 @@ impl BatchAnswer {
             envelope,
             resume_text,
             item_suspended,
+            _result_ack: None,
         }
     }
 
@@ -6854,6 +7330,7 @@ async fn establish_durable_record(
             host: facts.host,
             identity: batch_identity(&request.payload).map(|identity| identity.to_string()),
             verdict_only: facts.verdict_only,
+            settlement: control.persisted_for_record(&orch.fleet).map(Box::new),
         },
         deadline: None,
         created: chrono::Utc::now().timestamp_millis(),
@@ -6896,7 +7373,7 @@ async fn establish_durable_record(
 /// Where a parked call's resolver gets the batch's answer.
 enum ParkedAnswer {
     /// Already in hand: the batch finished as its held call was answering.
-    Ready(BatchAnswer),
+    Ready(Box<BatchAnswer>),
     /// Still coming from the batch's task.
     Pending(tokio::sync::oneshot::Receiver<BatchAnswer>),
 }
@@ -6922,7 +7399,7 @@ fn spawn_parked_resolver(
     tokio::spawn(async move {
         let _live = live;
         let answer = match answer {
-            ParkedAnswer::Ready(answer) => answer,
+            ParkedAnswer::Ready(answer) => *answer,
             ParkedAnswer::Pending(mut rx) => loop {
                 tokio::select! {
                     answer = &mut rx => break answer.unwrap_or_else(|_| BatchAnswer::task_failed()),
@@ -7015,6 +7492,7 @@ async fn record_detached(
         created_ms: chrono::Utc::now().timestamp_millis(),
         settled_ms: None,
         notified_ms: None,
+        settlement: control.persisted_for_record(&orch.fleet),
     };
     detached::insert(&db, &batch).await?;
     Ok(DetachedRecord { db })
@@ -7335,7 +7813,7 @@ impl CallAnswer {
                             held.record,
                             held.db,
                             handoff,
-                            ParkedAnswer::Ready(answer),
+                            ParkedAnswer::Ready(Box::new(answer)),
                         );
                         self.finish(
                             AnswerOutcome::Parked,
@@ -7947,6 +8425,108 @@ async fn settle_routed_run_batch(
     .await
 }
 
+/// The line an adopted batch's result opens with.
+fn adopted_ran_on(machine: &str) -> String {
+    format!("Ran on **{machine}**; its result reached Cairn after Cairn restarted.")
+}
+
+/// Settle a result a later runner process adopted for a batch an earlier one
+/// started, through the same path a live batch settles: [`settle_routed_run_batch`]
+/// with the settlement rebuilt from its durable half. Returns the text a
+/// resumed call carries, and the verdict a notice states.
+pub(crate) async fn settle_adopted_result(
+    orch: &Orchestrator,
+    persisted: &PersistedSettlement,
+    started_ms: i64,
+    outcome: CellOutcome,
+    machine: &str,
+) -> (String, String) {
+    let (settlement, residence) =
+        RunBatchSettlement::reconstruct(orch, persisted, started_ms).await;
+    let notes = PlacementNotes {
+        ran_on: Some(adopted_ran_on(machine)),
+        ..PlacementNotes::default()
+    };
+    let settled =
+        settle_routed_run_batch(orch, &settlement, residence, outcome, None, None, notes).await;
+    let verdict = settled.verdict.clone();
+    (
+        BatchAnswer::from_envelope(settled_envelope(settled)).resume_text,
+        verdict,
+    )
+}
+
+/// An adopted result composed without publishing anything: its items' output
+/// under its machine's line, opened by `unpublished` when the batch carried a
+/// commit that cannot be published, saying why. The batch is never dropped.
+pub(crate) fn compose_adopted_result(
+    outcome: &CellOutcome,
+    machine: &str,
+    unpublished: Option<&str>,
+) -> (String, String) {
+    let notes = PlacementNotes {
+        ran_on: Some(adopted_ran_on(machine)),
+        ..PlacementNotes::default()
+    };
+    if let Some(text) = settled_failure_text(outcome, None, unpublished.is_some(), None, &notes) {
+        let verdict = detached::verdict_from_text(&text);
+        return (text, verdict);
+    }
+    let CellOutcome::Completed {
+        output,
+        mutation_delta,
+        metadata,
+        ..
+    } = outcome
+    else {
+        unreachable!("failure_without_result answers every outcome but a completion");
+    };
+    let (outcomes, body) = match serde_json::from_str::<
+        Vec<cairn_common::executor_protocol::ProcessBatchItemOutcome>,
+    >(output)
+    {
+        Ok(items) => {
+            let (outcomes, _) = pace::time_batch(items, None, metadata.duration_ms, None);
+            let body = compose_run_output(&outcomes);
+            (outcomes, body)
+        }
+        Err(error) => (
+            Vec::new(),
+            format!("(its output could not be read back: {error})"),
+        ),
+    };
+    let body = if body.is_empty() {
+        "(no output)".to_string()
+    } else {
+        body
+    };
+    let composed = format!("{}\n\n{body}", adopted_ran_on(machine));
+    let Some(reason) = unpublished else {
+        let settled = SettledRunBatch::settled(composed, outcomes);
+        let verdict = settled.verdict.clone();
+        return (
+            BatchAnswer::from_envelope(settled_envelope(settled)).resume_text,
+            verdict,
+        );
+    };
+    let sealed = match mutation_delta.as_deref() {
+        Some(delta) => format!(
+            "the commands ran and sealed commit {} on {machine}",
+            &delta.delta_commit[..delta.delta_commit.len().min(12)]
+        ),
+        None => format!("the commands ran on {machine}"),
+    };
+    let text = format!(
+        "{}\n\n{composed}",
+        RunFailure::NotPublished(format!(
+            "{sealed}, but it was not published because {reason}. Re-run the batch with its commit_msg to publish its changes; nothing it made is on the branch."
+        ))
+        .text()
+    );
+    let verdict = detached::verdict_from_text(&text);
+    (text, verdict)
+}
+
 /// A settled failure of a batch the node's default placed. A structural
 /// placement refusal is the default's to explain (drained, absent, braked, or
 /// short a toolchain); a failure after the batch ran is not.
@@ -8236,6 +8816,7 @@ async fn settle_run_batch(
                     {
                         Ok(mut prepared) => {
                             prepared.run_id = s.request.run_id.clone();
+                            prepared.prior_since_ms = s.prior_publication_since_ms;
                             Ok((prepared, target, message, delta, request))
                         }
                         Err(error) => Err((error, Some(target))),
@@ -8378,6 +8959,45 @@ async fn settle_run_batch(
                             worktree_changed: false,
                             committed: false,
                         },
+                        SlotPublicationOutcome::PublishedEarlier { head, export } => {
+                            let resolution = s
+                                .logical_resolution
+                                .as_ref()
+                                .expect("a routed publication has a logical resolution");
+                            let rungs = climb_landing_rungs(
+                                orch,
+                                &LandingRungs {
+                                    project_id: &resolution.project_id,
+                                    object_repository: &resolution.object_repository_path,
+                                    store_dir: &target.store_dir,
+                                    branch: &target.branch,
+                                    routed: routed.as_ref().map(|(run, db)| RoutedLanding {
+                                        job_id: &run.job_id,
+                                        project_id: &run.project_id,
+                                        db,
+                                    }),
+                                },
+                                &head,
+                                export,
+                            )
+                            .await;
+                            let mut message = match rungs.published {
+                                Err(error) => format!(
+                                    "⚠️ {}",
+                                    super::unpublished_commit_message(&head, &error)
+                                ),
+                                Ok(()) => format!(
+                                    "✓ Committed changes ({head}) — an earlier Cairn process published this batch before it ended, so it was not published again"
+                                ),
+                            };
+                            message.push_str(&rungs.warnings);
+                            message.push_str(&notes);
+                            CommitBarrierOutcome {
+                                message,
+                                worktree_changed: false,
+                                committed: true,
+                            }
+                        }
                         SlotPublicationOutcome::Published {
                             landed,
                             export,
@@ -10559,6 +11179,7 @@ pub(crate) mod host_batch_tests {
             node_default: None,
             default_clear_notice: None,
             machine_notes: Vec::new(),
+            prior_publication_since_ms: None,
         };
         let batch = HostBatch {
             request: request.clone(),

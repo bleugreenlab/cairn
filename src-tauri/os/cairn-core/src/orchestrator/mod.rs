@@ -924,6 +924,7 @@ impl OrchestratorBuilder {
             codemap_refresh_in_flight: Arc::new(Mutex::new(HashSet::new())),
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             suspension_resolvers: Arc::new(Mutex::new(HashSet::new())),
+            adoption: Arc::default(),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             review_deferrals: Arc::default(),
             review_durability_errors: Arc::new(Mutex::new(HashMap::new())),
@@ -2026,6 +2027,9 @@ pub struct Orchestrator {
     /// Held through `durable_suspend::claim_resolver`'s guard, so the periodic
     /// sweep never re-drives a row its own resolver is still working.
     pub(crate) suspension_resolvers: Arc<Mutex<HashSet<String>>>,
+    /// What this runner process adopts of results its predecessors' batches
+    /// left on their machines (`mcp::handlers::run::adopted`).
+    pub(crate) adoption: Arc<crate::mcp::handlers::run::adopted::AdoptionState>,
 }
 
 /// Resolve the `/embed` gateway token: account JWT preferred, anonymous device

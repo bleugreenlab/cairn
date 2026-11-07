@@ -585,8 +585,8 @@ async fn seed_held_run_call(db: &LocalDb, job: &str, turn: &str) {
     })
     .to_string();
     db.execute(
-        "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at,hold)
-         VALUES('wait-' || ?1, ?1, 'r-' || ?1, 's-' || ?1, ?2, 'toolu-held', ?3, NULL, 'pending', 1, 'inline')",
+        "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,kind,state,created_at,hold)
+         VALUES('wait-' || ?1, ?1, 'r-' || ?1, 's-' || ?1, ?2, 'toolu-held', ?3, NULL, 'run_batch', 'pending', 1, 'inline')",
         params![job, turn, condition],
     )
     .await
@@ -613,11 +613,12 @@ async fn held_tool_results(db: &LocalDb) -> Vec<String> {
     .unwrap()
 }
 
-/// The host died while a `run` call was held open on its socket. Exactly one
-/// thing may resume the turn: the held row's own reconciler, which gives it
-/// the typed lost-to-restart result. The stale-run sweep settles the turn as
-/// the park it becomes, so cairn/5143's boot resume never selects it as well.
-/// Both orders of the two sweeps hold that.
+/// The host died while a `run` call was held open on its socket, and the
+/// batch's machine may still be running it. Boot answers nothing: the held
+/// row becomes the park it would have been, and the stale-run sweep settles
+/// the turn that way, so cairn/5143's boot resume never selects it. Exactly
+/// one thing resumes the turn: the batch's own result when it reaches the
+/// row (cairn/5536). Both orders of the two sweeps hold that.
 async fn a_held_call_resumes_once_after_restart(name: &str, stale_sweep_first: bool) {
     let (orch, db, _prompts, _backend) = host(name).await;
     seed_node_job(&db, "jh", 1, "active").await;
@@ -647,6 +648,45 @@ async fn a_held_call_resumes_once_after_restart(name: &str, stale_sweep_first: b
         reconcile(&orch).await;
     }
 
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM agent_waits WHERE id = ?1",
+            "wait-jh"
+        )
+        .await
+        .as_deref(),
+        Some("pending"),
+        "boot answers nothing for a batch its machine may still be running"
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT COALESCE(hold, 'none') FROM agent_waits WHERE id = ?1",
+            "wait-jh"
+        )
+        .await
+        .as_deref(),
+        Some("none"),
+        "the held call became a park"
+    );
+    assert_eq!(settlement(&db, "turn-jh").await, "yielded/-");
+    assert!(held_tool_results(&db).await.is_empty());
+
+    let summary = resume(&orch).await;
+    assert_eq!(
+        summary.selected, 0,
+        "the boot resume must not resume a turn its wait will resume: {summary:?}"
+    );
+
+    crate::mcp::handlers::run::adopted::deliver_batch_result(
+        &orch,
+        &db,
+        "req-held",
+        "succeeded",
+        "the held batch's real result",
+    )
+    .await;
     let mut resolved = None;
     for _ in 0..200 {
         resolved = text(
@@ -661,7 +701,6 @@ async fn a_held_call_resumes_once_after_restart(name: &str, stale_sweep_first: b
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(resolved.as_deref(), Some("resolved"));
-    assert_eq!(settlement(&db, "turn-jh").await, "yielded/-");
     let results = held_tool_results(&db).await;
     assert_eq!(
         results.len(),
@@ -669,15 +708,9 @@ async fn a_held_call_resumes_once_after_restart(name: &str, stale_sweep_first: b
         "one answer for the held call: {results:?}"
     );
     assert!(
-        results[0].contains("restarted while the batch was still running"),
+        results[0].contains("the held batch's real result"),
         "{}",
         results[0]
-    );
-
-    let summary = resume(&orch).await;
-    assert_eq!(
-        summary.selected, 0,
-        "the boot resume must not resume a turn its wait already resumes: {summary:?}"
     );
     let successors: i64 = db
         .query_opt_i64(

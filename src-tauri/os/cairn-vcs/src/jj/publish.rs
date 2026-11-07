@@ -43,12 +43,26 @@ const INTEGRATION_DESCRIPTION: &str = "cairn: integrate straddled delta onto the
 #[derive(Clone)]
 pub enum ProposedPublication {
     /// A validated delta commit whose tree becomes the published tree.
-    DeltaCommit(String),
+    DeltaCommit(ProposedDelta),
     /// Ordered path mutations applied to the current head's tree without
     /// materializing it in any workspace.
     Mutations(Vec<crate::LogicalTreeMutation>),
     /// A reachable commit whose inverse is applied to the current head.
     Revert(String),
+}
+
+/// A delta commit proposed for a branch's logical head, and the key its landing
+/// is recorded under, if any (see [`crate::find_keyed_publication`]).
+#[derive(Clone, Debug)]
+pub struct ProposedDelta {
+    pub commit: String,
+    pub key: Option<String>,
+}
+
+impl From<String> for ProposedDelta {
+    fn from(commit: String) -> Self {
+        Self { commit, key: None }
+    }
 }
 
 /// A logical-head publication together with the export leg that makes it
@@ -161,6 +175,28 @@ pub async fn publish_logical_head_exported(
     .map_err(|error| format!("logical-head publication worker failed: {error}"))?
 }
 
+/// Export `branch` as the store holds it now into the backing checkout's
+/// `refs/heads/<branch>`: the second rung alone, for a publication whose first
+/// rung a process that has since ended already climbed. Runs under the
+/// caller's store lock, like the export leg of
+/// [`publish_logical_head_exported`].
+pub async fn export_branch_head(jj: &JjEnv, store: &Path, branch: &str) -> Result<(), String> {
+    let jj = jj.clone();
+    let store = store.to_path_buf();
+    let branch = branch.to_string();
+    tokio::task::spawn_blocking(move || {
+        export_bookmark_advance(
+            &jj,
+            &store,
+            true,
+            &branch,
+            &format!("re-export `{branch}` after a publication found already landed"),
+        )
+    })
+    .await
+    .map_err(|error| format!("branch export worker failed: {error}"))?
+}
+
 /// The first rung: one store transaction that writes the commit and moves the
 /// bookmark.
 fn land_logical_head(
@@ -172,9 +208,15 @@ fn land_logical_head(
     mode: crate::PublicationMode,
 ) -> Result<crate::LogicalHeadPublication, String> {
     match proposed {
-        ProposedPublication::DeltaCommit(delta) => {
-            crate::publish_logical_head(store, branch, expected_head, &delta, identity, mode)
-        }
+        ProposedPublication::DeltaCommit(delta) => crate::publish_logical_head_recorded(
+            store,
+            branch,
+            expected_head,
+            &delta.commit,
+            identity,
+            mode,
+            delta.key.as_deref(),
+        ),
         ProposedPublication::Mutations(mutations) => crate::publish_logical_mutations(
             store,
             branch,

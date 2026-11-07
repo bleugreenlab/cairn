@@ -1197,6 +1197,7 @@ mod tests {
                 host: false,
                 identity: None,
                 verdict_only: false,
+                settlement: None,
             },
         }
     }

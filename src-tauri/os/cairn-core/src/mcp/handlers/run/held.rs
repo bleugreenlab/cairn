@@ -477,6 +477,17 @@ pub(crate) async fn drain_held_publications(
                     already: false,
                 })));
             }
+            // Only a keyed re-drive asks for this; a held row carries no key.
+            Ok(SlotPublicationOutcome::PublishedEarlier { head, export }) => {
+                record_landed_here(&orch.db.local, &row.attempt_id, &head).await;
+                release_ref(&row).await;
+                drained.push(Drained::Landed(Box::new(LandedHeld {
+                    row,
+                    head,
+                    export,
+                    already: true,
+                })));
+            }
             // Already on the branch here, perhaps landed by a drain that never
             // settled. Whether the remote has it is still unknown, so it owes
             // the same rungs a fresh landing does.
@@ -571,6 +582,8 @@ async fn republish(
             job_id: row.job_id.as_deref(),
             run_id: row.run_id.as_deref(),
             trace,
+            key: None,
+            prior_since_ms: None,
         },
         None,
     )
@@ -1000,7 +1013,7 @@ mod tests {
 
     async fn unattributed_held_delta_is_stranded(attempt: &str, held_at: i64) {
         let db = crate::storage::migrated_test_db("held-unattributed.db").await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)

@@ -81,6 +81,36 @@ kind = "debt"
 issue = "cairn://p/cairn/6126"
 reason = "Reconcile and the stale-resolving sweep read pending waits by walking the table."
 
+# SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_jso
+[[allow]]
+file = "os/cairn-core/src/mcp/handlers/durable_suspend.rs"
+rule = "wide-scan"
+table = "agent_waits"
+statement = "5c3668239988ecf1"
+kind = "deliberate"
+issue = "cairn://p/cairn/5536"
+reason = "Judging parked run-batch waits after a restart reads every one of them, walking only idx_agent_waits_pending_run_batch."
+
+# SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_jso
+[[allow]]
+file = "os/cairn-core/src/mcp/handlers/durable_suspend.rs"
+rule = "wide-scan"
+table = "agent_waits"
+statement = "ef3b98dcb7f9e9ca"
+kind = "deliberate"
+issue = "cairn://p/cairn/5536"
+reason = "A run batch's request id lives only in its condition, so its parked wait is found by walking idx_agent_waits_pending_run_batch."
+
+# SELECT job_id,condition_json,created_at FROM agent_waits INDEXED BY idx_agent_wa
+[[allow]]
+file = "os/cairn-core/src/mcp/handlers/run/adopted.rs"
+rule = "wide-scan"
+table = "agent_waits"
+statement = "8c7ffb359c6e5fe5"
+kind = "deliberate"
+issue = "cairn://p/cairn/5536"
+reason = "Adopting a result finds the parked wait that claims its request by walking idx_agent_waits_pending_run_batch, which holds only parked run-batch waits."
+
 # SELECT id FROM agent_waits WHERE state='pending' AND created_at<=?1-?2 AND json_
 [[allow]]
 file = "os/cairn-core/src/mcp/handlers/mcp_continuation.rs"
