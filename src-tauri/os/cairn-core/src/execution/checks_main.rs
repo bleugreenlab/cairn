@@ -56,6 +56,10 @@
 //! by provisioning and load as well as by tree, so a diff across hosts reports
 //! the hosts as movement. Only when the executor has no complete row does the
 //! platform's newest row stand in, and the message says so (see [`Comparison`]).
+//! A lookup that fails, or that reads a full window of candidates without
+//! finding one, leaves the history unknown, not absent: the message says the
+//! comparison could not be read, keeps the row's measured verdict, and claims
+//! no movement and no merge list.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1456,11 +1460,7 @@ async fn report_lane(
         chain.as_ref(),
         &names,
     )
-    .await
-    .unwrap_or_else(|error| {
-        log::warn!("main cadence previous-row lookup failed: {error}");
-        Comparison::Baseline
-    });
+    .await;
     let bracket = match (bracket_base(&verdict, &comparison), repository, commit) {
         (Some(previous), Some(repository), Some(commit)) => {
             merge_bracket(
@@ -2400,6 +2400,11 @@ impl MainChain {
     pub(crate) fn is_empty(&self) -> bool {
         self.depth.is_empty()
     }
+
+    /// Every commit on the chain, in no particular order.
+    fn commits(&self) -> impl Iterator<Item = &str> {
+        self.depth.keys().map(String::as_str)
+    }
 }
 
 fn main_chain(orch: &Orchestrator, repository: &Path, tip: &str) -> Result<MainChain, String> {
@@ -2471,9 +2476,9 @@ struct RowFilter<'a> {
     chain_only: bool,
 }
 
-/// How many recorded rows [`latest_complete_row`] reads before placing them on
-/// main's chain: rows on agent branches and narrowed selections share the
-/// table, so the newest few by finish time are not enough.
+/// How many rows each of [`latest_complete_row`]'s reads returns, newest
+/// finish first. A read that returns this many may have left older candidates
+/// unread.
 const CANDIDATE_SCAN: i64 = 64;
 
 /// [`CANDIDATE_SCAN`] for a chain read from a branch's base: every main row
@@ -2500,6 +2505,14 @@ const PER_TEST_WHOLE_SUITE: &str = "selection = 'full' AND deferred_count = 0";
 /// ran, so its rows qualify by how they were armed instead: the cadence's own
 /// and manual runs, which always execute the whole-suite command, and no
 /// review or write row, which may have run a narrowed one.
+///
+/// Candidates are read by tree, not by recency: the cadence's own rows, and
+/// every row on one of the chain's commits. Agent branches' write and review
+/// rows share the table and outnumber main's by hundreds to one, so the newest
+/// rows by finish time can all be off the chain while main's own sit just
+/// behind them (cairn/6244). `Ok(None)` is a finding that no row qualifies.
+/// When a read came back full and nothing qualified, older rows went unread and
+/// nothing was found: that is an error, never `Ok(None)`.
 async fn latest_complete_row(
     db: &LocalDb,
     project_id: &str,
@@ -2508,6 +2521,9 @@ async fn latest_complete_row(
     filter: RowFilter<'_>,
     names: ExecutorNames<'_>,
 ) -> Result<Option<CadenceRow>, String> {
+    use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
+    use cairn_db::turso::Value as SqlValue;
+
     let whole_suite = match lane.verdict {
         LaneVerdict::PerTest => PER_TEST_WHOLE_SUITE,
         LaneVerdict::Exit => {
@@ -2515,59 +2531,96 @@ async fn latest_complete_row(
                 AND cadence IN ('main', 'manual')"
         }
     };
-    let candidates = db
-        .query_all(
-            format!(
-                "SELECT id, commit_sha, cadence FROM check_result_observations
-                  WHERE project_id = ?1 AND check_name = ?2 AND verdict_platform = ?3
-                    AND complete = 1 AND failure_kind IS NULL
-                    AND {whole_suite} AND id != ?4
-                    AND (?5 = '' OR input_hash = ?5)
-                    AND (?6 = '' OR executor_id = ?6)
-                    AND (?7 = 1 OR cadence = 'main')
-                    AND (?9 = '' OR commit_sha = ?9)
-                    AND (?10 = '' OR (executor_id IS NOT NULL AND executor_id != ?10))
-                  ORDER BY ran_at DESC LIMIT ?8"
-            ),
-            (
-                project_id.to_string(),
-                lane.check.clone(),
-                lane.platform.clone(),
-                filter.excluding.unwrap_or("").to_string(),
-                filter.input_hash.unwrap_or("").to_string(),
-                filter.executor_id.unwrap_or("").to_string(),
-                i64::from(filter.main_chain.is_some()),
-                if filter.chain_only {
-                    BASE_CANDIDATE_SCAN
-                } else {
-                    CANDIDATE_SCAN
-                },
-                filter.commit.unwrap_or("").to_string(),
-                filter.other_than_executor.unwrap_or("").to_string(),
-            ),
-            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut candidates: Vec<(String, usize)> = candidates
+    let mut narrowing = format!(
+        "project_id = ? AND check_name = ? AND verdict_platform = ?
+           AND complete = 1 AND failure_kind IS NULL AND {whole_suite}"
+    );
+    let mut params = vec![
+        SqlValue::Text(project_id.to_string()),
+        SqlValue::Text(lane.check.clone()),
+        SqlValue::Text(lane.platform.clone()),
+    ];
+    for (clause, value) in [
+        (" AND id != ?", filter.excluding),
+        (" AND input_hash = ?", filter.input_hash),
+        (" AND executor_id = ?", filter.executor_id),
+        (" AND commit_sha = ?", filter.commit),
+        (
+            " AND executor_id IS NOT NULL AND executor_id != ?",
+            filter.other_than_executor,
+        ),
+    ] {
+        if let Some(value) = value {
+            narrowing.push_str(clause);
+            params.push(SqlValue::Text(value.to_string()));
+        }
+    }
+    let scan = if filter.chain_only {
+        BASE_CANDIDATE_SCAN
+    } else {
+        CANDIDATE_SCAN
+    };
+    let read = |predicate: String, bound: Vec<SqlValue>| {
+        let sql = format!(
+            "SELECT id, commit_sha, cadence, ran_at FROM check_result_observations
+              WHERE {narrowing} AND {predicate}
+              ORDER BY ran_at DESC LIMIT {scan}"
+        );
+        async move {
+            db.query_all(sql, bound, |row| {
+                Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.i64(3)?))
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
+    };
+    let mut found = Vec::new();
+    let mut saturated = false;
+    if !filter.chain_only {
+        let rows = read("cadence = 'main'".to_string(), params.clone()).await?;
+        saturated |= rows.len() as i64 >= scan;
+        found.extend(rows);
+    }
+    if let Some(chain) = filter.main_chain {
+        let commits: Vec<&str> = chain.commits().collect();
+        for chunk in commits.chunks(IN_LIST_CHUNK - params.len()) {
+            let mut bound = params.clone();
+            bound.extend(
+                chunk
+                    .iter()
+                    .map(|commit| SqlValue::Text((*commit).to_string())),
+            );
+            let predicate = format!("commit_sha IN ({})", placeholders(chunk.len()));
+            let rows = read(predicate, bound).await?;
+            saturated |= rows.len() as i64 >= scan;
+            found.extend(rows);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut candidates: Vec<(String, (usize, std::cmp::Reverse<i64>))> = found
         .into_iter()
-        .filter_map(|(id, commit, cadence)| {
+        .filter(|(id, ..)| seen.insert(id.clone()))
+        .filter_map(|(id, commit, cadence, ran_at)| {
             let depth = filter.main_chain.and_then(|chain| chain.depth(&commit));
             if depth.is_none() && (filter.chain_only || cadence != "main") {
                 return None;
             }
-            Some((id, depth.unwrap_or(usize::MAX)))
+            Some((id, (depth.unwrap_or(usize::MAX), std::cmp::Reverse(ran_at))))
         })
         .collect();
-    // Stable, so rows on one tree keep the query's newest-finish-first order.
-    candidates.sort_by_key(|(_, depth)| *depth);
+    candidates.sort_by_key(|(_, order)| *order);
     for (id, _) in candidates {
-        if let CadenceVerdict::Complete(row) = lane
-            .verdict
-            .classify(load_row(db, project_key, &id, names).await?)
-        {
+        let row = load_row(db, project_key, &id, names)
+            .await
+            .map_err(|error| format!("candidate {id} could not be read: {error}"))?;
+        if let CadenceVerdict::Complete(row) = lane.verdict.classify(row) {
             return Ok(Some(row));
         }
+    }
+    if saturated {
+        return Err(format!(
+            "a read of the {scan} newest candidates held no complete whole-suite row, and older rows were not read"
+        ));
     }
     Ok(None)
 }
@@ -2720,9 +2773,13 @@ pub(crate) async fn rates_on_chain(
 /// What a cadence attempt is measured against. Two hosts of one platform
 /// differ by provisioning and load as well as by tree, so the previous row is
 /// chosen by executor first, and a comparison that crosses hosts says so.
+///
+/// History that could not be read is never history that does not exist: only
+/// lookups that succeeded and found nothing make a [`Comparison::Baseline`].
 #[derive(Clone, Debug, Default)]
 pub(crate) enum Comparison {
-    /// No complete row exists for the lane on any executor.
+    /// Every lookup succeeded, and no complete row exists for the lane on any
+    /// executor.
     #[default]
     Baseline,
     /// The previous complete row on the attempt's own executor: the diff is
@@ -2731,11 +2788,14 @@ pub(crate) enum Comparison {
     /// on whatever tree it ran. `peer` is another executor's complete row on
     /// the attempt's own commit, the only row a test is said to differ by
     /// host against: across trees, a merge in between explains a difference
-    /// as well as the host does (tenet 772).
+    /// as well as the host does (tenet 772). `unread` names the lookups for
+    /// `neighbour` and `peer` that failed: either one being unknown means
+    /// nothing separates this host from the others.
     SameExecutor {
         previous: CadenceRow,
         neighbour: Option<Box<CadenceRow>>,
         peer: Option<Box<CadenceRow>>,
+        unread: Unread,
     },
     /// The attempt's executor has no earlier complete row, so the platform's
     /// newest (another executor's) stands in, and host differences cannot be
@@ -2744,12 +2804,49 @@ pub(crate) enum Comparison {
     /// The attempt names no executor (a death), so the platform's newest
     /// complete row on any executor stands in.
     AnyExecutor { previous: CadenceRow },
+    /// The lookup that chooses the compared row failed, so the lane's history
+    /// is unknown. Nothing is measured against it: no movement, no merge list,
+    /// no coverage. `known` is the platform's newest complete row, when only
+    /// this host's own lookup failed. It is cited as evidence that history
+    /// exists and is never compared with.
+    Unavailable {
+        cause: String,
+        known: Option<Box<CadenceRow>>,
+    },
+}
+
+/// The optional lookups of a same-executor comparison that failed, each with
+/// its bounded cause.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Unread {
+    /// The platform's newest row on any executor: the window's neighbour, and
+    /// how far another host's row covers main.
+    pub(crate) neighbour: Option<String>,
+    /// Another executor's row on the attempt's own commit.
+    pub(crate) peer: Option<String>,
+}
+
+impl Unread {
+    fn any(&self) -> bool {
+        self.neighbour.is_some() || self.peer.is_some()
+    }
+}
+
+const SAME_HOST_LOOKUP: &str = "lookup of this host's previous complete row";
+const NEWEST_LOOKUP: &str = "lookup of the platform's newest complete row";
+const PEER_LOOKUP: &str = "lookup of another host's row on this commit";
+
+/// A failed lookup as a report states it: one line, bounded, so an error that
+/// carries a statement or a row's contents cannot flood the thread.
+fn lookup_failure(lookup: &str, error: &str) -> String {
+    let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("The {lookup} failed ({})", truncate(&error, 300))
 }
 
 impl Comparison {
     fn previous(&self) -> Option<&CadenceRow> {
         match self {
-            Comparison::Baseline => None,
+            Comparison::Baseline | Comparison::Unavailable { .. } => None,
             Comparison::SameExecutor { previous, .. }
             | Comparison::OtherExecutor { previous }
             | Comparison::AnyExecutor { previous } => Some(previous),
@@ -2761,7 +2858,14 @@ impl Comparison {
     /// so coverage ends here, not at the attempt's own host's previous row.
     fn coverage(&self) -> Option<&CadenceRow> {
         match self {
-            Comparison::Baseline => None,
+            Comparison::Baseline | Comparison::Unavailable { .. } => None,
+            // Another host's newer row may exist and was not read.
+            Comparison::SameExecutor {
+                unread: Unread {
+                    neighbour: Some(_), ..
+                },
+                ..
+            } => None,
             // `neighbour` is set exactly when another executor's row is newer.
             Comparison::SameExecutor {
                 previous,
@@ -2815,6 +2919,7 @@ fn select_comparison(
                 previous,
                 neighbour: neighbour.map(Box::new),
                 peer: peer.map(Box::new),
+                unread: Unread::default(),
             }
         }
         None => newest.map_or(Comparison::Baseline, |previous| Comparison::OtherExecutor {
@@ -2823,8 +2928,67 @@ fn select_comparison(
     }
 }
 
+/// [`select_comparison`] over lookups that may have failed. A failed lookup
+/// is unknown history, never absent history. When the lookup that chooses the
+/// compared row fails, the comparison is [`Comparison::Unavailable`]: this
+/// host's own when the attempt names an executor, else the platform's newest.
+/// When only an optional lookup fails after this host's previous row was
+/// found, that row is still compared, and the lookups that failed are named in
+/// [`Unread`].
+fn resolve_comparison(
+    executor_id: Option<&str>,
+    same_executor: Result<Option<CadenceRow>, String>,
+    newest: Result<Option<CadenceRow>, String>,
+    peer: Result<Option<CadenceRow>, String>,
+    chain: Option<&MainChain>,
+) -> Comparison {
+    let unavailable =
+        |lookup: &str, error: &str, known: Option<CadenceRow>| Comparison::Unavailable {
+            cause: lookup_failure(lookup, error),
+            known: known.map(Box::new),
+        };
+    let Some(executor_id) = executor_id else {
+        return match newest {
+            Ok(newest) => select_comparison(None, None, newest, None, chain),
+            Err(error) => unavailable(NEWEST_LOOKUP, &error, None),
+        };
+    };
+    match same_executor {
+        Err(error) => unavailable(SAME_HOST_LOOKUP, &error, newest.ok().flatten()),
+        Ok(None) => match newest {
+            Ok(newest) => select_comparison(Some(executor_id), None, newest, None, chain),
+            Err(error) => unavailable(NEWEST_LOOKUP, &error, None),
+        },
+        Ok(Some(previous)) => {
+            let unread = Unread {
+                neighbour: newest
+                    .as_ref()
+                    .err()
+                    .map(|error| lookup_failure(NEWEST_LOOKUP, error)),
+                peer: peer
+                    .as_ref()
+                    .err()
+                    .map(|error| lookup_failure(PEER_LOOKUP, error)),
+            };
+            let mut comparison = select_comparison(
+                Some(executor_id),
+                Some(previous),
+                newest.ok().flatten(),
+                peer.ok().flatten(),
+                chain,
+            );
+            if let Comparison::SameExecutor { unread: slot, .. } = &mut comparison {
+                *slot = unread;
+            }
+            comparison
+        }
+    }
+}
+
 /// What `current` (the attempt's own row, when it recorded one) is measured
-/// against: whole-suite rows of any cadence on `chain`, when it is known.
+/// against: whole-suite rows of any cadence on `chain`, when it is known. A
+/// lookup that fails is logged and carried into the comparison
+/// ([`resolve_comparison`]); it never reads as a lane with no history.
 async fn comparison_for(
     db: &LocalDb,
     project_id: &str,
@@ -2833,7 +2997,7 @@ async fn comparison_for(
     current: Option<&CadenceRow>,
     chain: Option<&MainChain>,
     names: ExecutorNames<'_>,
-) -> Result<Comparison, String> {
+) -> Comparison {
     let excluding = current.map(|row| row.id.as_str());
     let executor_id = current.and_then(|row| row.executor_id.as_deref());
     let same_executor = match executor_id {
@@ -2851,9 +3015,9 @@ async fn comparison_for(
                 },
                 names,
             )
-            .await?
+            .await
         }
-        None => None,
+        None => Ok(None),
     };
     let newest = latest_complete_row(
         db,
@@ -2867,7 +3031,7 @@ async fn comparison_for(
         },
         names,
     )
-    .await?;
+    .await;
     let peer = match (executor_id, current) {
         (Some(executor_id), Some(current)) => {
             latest_complete_row(
@@ -2884,17 +3048,25 @@ async fn comparison_for(
                 },
                 names,
             )
-            .await?
+            .await
         }
-        _ => None,
+        _ => Ok(None),
     };
-    Ok(select_comparison(
-        executor_id,
-        same_executor,
-        newest,
-        peer,
-        chain,
-    ))
+    for (lookup, result) in [
+        (SAME_HOST_LOOKUP, &same_executor),
+        (NEWEST_LOOKUP, &newest),
+        (PEER_LOOKUP, &peer),
+    ] {
+        if let Err(error) = result {
+            log::warn!(
+                "main cadence {} on {}: {}; the report says its history is unknown rather than absent",
+                lane.check,
+                lane.platform,
+                lookup_failure(lookup, error)
+            );
+        }
+    }
+    resolve_comparison(executor_id, same_executor, newest, peer, chain)
 }
 
 /// The line of a failure excerpt that says what went wrong. A Rust panic opens
@@ -3846,17 +4018,25 @@ fn failed_on(row: &CadenceRow, test: &str, condition: &HostCondition) -> bool {
 /// locked` reds on fedora were red there one tip earlier and on bgsrv-mac in
 /// between), so the group's failures are ordinary reds signed by the error they
 /// share. Without a row on this host there is nothing to separate the host from
-/// the tree, and no group reads as the host. Either way a failure already red at
-/// the compared row is never held under a host label: it is still red.
+/// the tree, and no group reads as the host; nor when the lookup for the
+/// window's other host or the same tree's peer failed, since the other host
+/// may have failed them too. Either way a failure already red at the compared
+/// row is never held under a host label: it is still red.
 fn row_diff<'a>(current: &'a CadenceRow, comparison: &'a Comparison) -> RowDiff<'a> {
     let previous = comparison.previous();
-    let (same_host, neighbour, peer) = match comparison {
+    let (same_host, neighbour, peer, others_read) = match comparison {
         Comparison::SameExecutor {
             previous,
             neighbour,
             peer,
-        } => (Some(previous), neighbour.as_deref(), peer.as_deref()),
-        _ => (None, None, None),
+            unread,
+        } => (
+            Some(previous),
+            neighbour.as_deref(),
+            peer.as_deref(),
+            !unread.any(),
+        ),
+        _ => (None, None, None, false),
     };
     let red_before =
         |test: &str| previous.is_some_and(|previous| passed_in(previous, test) == Some(false));
@@ -3888,7 +4068,10 @@ fn row_diff<'a>(current: &'a CadenceRow, comparison: &'a Comparison) -> RowDiff<
             .into_iter()
             .flatten()
             .find(|row| tests.iter().any(|test| failed_on(row, test, condition)));
-        if elsewhere.is_none() && condition.breadth(&passed_here_before) >= HOST_CONDITION_MIN {
+        if others_read
+            && elsewhere.is_none()
+            && condition.breadth(&passed_here_before) >= HOST_CONDITION_MIN
+        {
             diff.host_conditions.push(HostConditionGroup {
                 cause: HostCause::Error(condition),
                 tests: tests.into_iter().filter(|test| !red_before(test)).collect(),
@@ -4222,6 +4405,22 @@ fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) 
             short_commit(&previous.commit),
             age(row.ran_at_ms, previous.ran_at_ms)
         ),
+        Comparison::Unavailable { cause, known } => {
+            let mut line = format!(
+                "unknown. {cause}, so this row is not a baseline: nothing below is reported as moved, and no merges are listed since a compared row."
+            );
+            if let Some(known) = known {
+                line.push_str(&format!(
+                    " History exists: the newest complete row on {} is {}, the {} (commit `{}`, ran {} earlier), not compared with because this host's own previous row could not be read.",
+                    report.platform,
+                    known.reference,
+                    armed(known),
+                    short_commit(&known.commit),
+                    age(row.ran_at_ms, known.ran_at_ms)
+                ));
+            }
+            line
+        }
     };
     out.push_str(&format!("- Compared with: {line}\n"));
 }
@@ -4234,10 +4433,24 @@ fn render_peer(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow, r
         previous,
         neighbour,
         peer,
+        unread,
     } = report.comparison
     else {
         return;
     };
+    if let Some(cause) = &unread.peer {
+        out.push_str(&format!(
+            "- Same tree on another host: unknown. {cause}, so no red below is attributed to a host.\n"
+        ));
+    }
+    if let Some(cause) = &unread.neighbour {
+        out.push_str(&format!(
+            "- Other hosts in the window: unknown. {cause}, so no red below is attributed to a host.\n"
+        ));
+    }
+    if unread.any() {
+        return;
+    }
     if let Some(peer) = peer {
         out.push_str(&format!(
             "- Same tree on another host: {}, the {} (ran {} earlier). Host differences below are measured against it.\n",
@@ -4323,6 +4536,9 @@ fn render_host_census(
 fn render_exit_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
     let previous = report.comparison.previous();
     let movement = match previous {
+        None if matches!(report.comparison, Comparison::Unavailable { .. }) => {
+            "movement unknown: the compared row could not be read".to_string()
+        }
         None => "baseline".to_string(),
         Some(previous) => {
             let moved = match (previous.verdict_passed, row.verdict_passed) {
@@ -4361,13 +4577,18 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     if report.kind == LaneVerdict::Exit {
         return render_exit_complete(out, report, row);
     }
+    if let Comparison::Unavailable { .. } = report.comparison {
+        return render_uncompared(out, report, row);
+    }
     let previous = report.comparison.previous();
     let (neighbour, peer, cross_host) = match report.comparison {
         Comparison::SameExecutor {
             neighbour, peer, ..
         } => (neighbour.as_deref(), peer.as_deref(), None),
         Comparison::OtherExecutor { previous } => (None, None, Some(host(previous))),
-        Comparison::Baseline | Comparison::AnyExecutor { .. } => (None, None, None),
+        Comparison::Baseline | Comparison::AnyExecutor { .. } | Comparison::Unavailable { .. } => {
+            (None, None, None)
+        }
     };
     let diff = row_diff(row, report.comparison);
     let newly_red = group_size(&diff.newly_red);
@@ -4418,7 +4639,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     render_basis(out, report, row);
     render_peer(out, report, row, newly_red + first_red);
     render_host_conditions(out, row, &diff.host_conditions, previous, neighbour);
-    render_plan_audit(out, row, &diff);
+    render_plan_audit(out, row, Some(&diff));
     if newly_red > 0 {
         let title = match cross_host {
             Some(other) => format!("RED HERE, NOT RED ON `{other}`"),
@@ -4505,9 +4726,40 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     }
 }
 
+/// A per-test row whose compared row could not be looked up: its verdict and
+/// its failures as measured, with no claim about how either moved.
+fn render_uncompared(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
+    // Measured against no row, every failure lands in `newly_red`: here that
+    // is only the row's failures, grouped by signature, and none is called new.
+    let nothing = Comparison::Baseline;
+    let reds = row_diff(row, &nothing).newly_red;
+    out.push_str(&format!(
+        "**Main cadence · {} · {} on `{}` · `{}`: {} — movement unknown: the compared row could not be read**\n\n",
+        report.check,
+        report.platform,
+        host(row),
+        short_commit(&row.commit),
+        headline_clause(row, LaneVerdict::PerTest)
+    ));
+    row_identity(out, row, LaneVerdict::PerTest);
+    render_basis(out, report, row);
+    render_plan_audit(out, row, None);
+    let count = group_size(&reds);
+    if count > 0 {
+        out.push_str(&format!(
+            "\n**RED IN THIS ROW: {count} test{} in {} failure group{}** — whether each is new or was already red is unknown without the compared row.\n",
+            plural(count),
+            reds.len(),
+            plural(reds.len())
+        ));
+        render_groups(out, &reds, None);
+    }
+}
+
 /// The audit's section of a report: every gating finding by name, however many,
-/// because the identity is what a reader acts on.
-fn render_plan_audit(out: &mut String, row: &CadenceRow, diff: &RowDiff<'_>) {
+/// because the identity is what a reader acts on. Without `diff` (no compared
+/// row was read) the findings are listed with no movement.
+fn render_plan_audit(out: &mut String, row: &CadenceRow, diff: Option<&RowDiff<'_>>) {
     let Some(audit) = &row.plan_audit else {
         return;
     };
@@ -4520,11 +4772,19 @@ fn render_plan_audit(out: &mut String, row: &CadenceRow, diff: &RowDiff<'_>) {
     }
     let gating = row.audit_gating();
     if gating > 0 {
+        let movement = diff.map_or_else(
+            || "movement unknown".to_string(),
+            |diff| {
+                format!(
+                    "{} newly red, {} still red",
+                    diff.audit_newly_red.len(),
+                    diff.audit_still_red
+                )
+            },
+        );
         out.push_str(&format!(
-            "\n**PLAN AUDIT: {gating} gating finding{}** ({} newly red, {} still red). A finding is a statement that walks a wide row; its identity is file, rule, table and statement hash.\n",
-            plural(gating),
-            diff.audit_newly_red.len(),
-            diff.audit_still_red
+            "\n**PLAN AUDIT: {gating} gating finding{}** ({movement}). A finding is a statement that walks a wide row; its identity is file, rule, table and statement hash.\n",
+            plural(gating)
         ));
         for (finding, detail) in audit.gating() {
             out.push_str(&format!("- `{finding}` ({})", detail.status));
@@ -4537,7 +4797,7 @@ fn render_plan_audit(out: &mut String, row: &CadenceRow, diff: &RowDiff<'_>) {
             }
         }
     }
-    if !diff.audit_newly_green.is_empty() {
+    if let Some(diff) = diff.filter(|diff| !diff.audit_newly_green.is_empty()) {
         out.push_str(&format!(
             "\n**PLAN AUDIT NEWLY GREEN: {}**\n",
             diff.audit_newly_green.len()
@@ -4631,6 +4891,32 @@ fn render_incomplete(
             report.platform,
             since(previous)
         )),
+        Comparison::Unavailable { cause, known } => {
+            out.push_str(&format!(
+                "- Last complete row: unknown. {cause}, which does not mean none exists, so no merge list is given.\n"
+            ));
+            if let Some(known) = known {
+                out.push_str(&format!(
+                    "- Newest complete row on {}: {}, the {}, at {}. It shows history exists; it is not the compared row.\n",
+                    report.platform,
+                    known.reference,
+                    armed(known),
+                    since(known)
+                ));
+            }
+        }
+    }
+    if let Comparison::SameExecutor {
+        unread: Unread {
+            neighbour: Some(cause),
+            ..
+        },
+        ..
+    } = report.comparison
+    {
+        out.push_str(&format!(
+            "- Covered through: unknown. {cause}, so how far another host's row covers main is not known, and no merge list is given.\n"
+        ));
     }
     if let (Some(previous), Some(covering)) =
         (report.comparison.previous(), report.comparison.coverage())
@@ -4645,7 +4931,7 @@ fn render_incomplete(
             ));
         }
     }
-    if report.comparison.previous().is_some() && report.commit.is_some() {
+    if report.comparison.coverage().is_some() && report.commit.is_some() {
         render_bracket(
             out,
             "Merges not covered by a complete row on any executor",
@@ -4842,6 +5128,7 @@ mod tests {
             previous: previous.clone(),
             neighbour: None,
             peer: None,
+            unread: Unread::default(),
         }
     }
 
@@ -5880,6 +6167,7 @@ mod tests {
                         ))
                     }),
                     peer: None,
+                    unread: Unread::default(),
                 },
                 &Bracket::default(),
             )
@@ -6602,6 +6890,7 @@ mod tests {
             previous,
             neighbour: Some(Box::new(peer.clone())),
             peer: Some(Box::new(peer)),
+            unread: Unread::default(),
         };
         let text = report(
             &CadenceVerdict::Complete(current),
@@ -6727,6 +7016,7 @@ mod tests {
                     previous: previous.clone(),
                     neighbour: Some(Box::new(sp2.clone())),
                     peer: peer.map(Box::new),
+                    unread: Unread::default(),
                 },
                 &bracket,
             )
@@ -6759,6 +7049,7 @@ mod tests {
                 previous: previous.clone(),
                 neighbour: Some(Box::new(elsewhere)),
                 peer: None,
+                unread: Unread::default(),
             },
             &bracket,
         );
@@ -6831,6 +7122,7 @@ mod tests {
             previous: previous.clone(),
             neighbour: Some(Box::new(fedora)),
             peer: None,
+            unread: Unread::default(),
         };
         assert_eq!(
             bracket_base(&no_verdict, &comparison).map(|row| row.id.as_str()),
@@ -7023,11 +7315,7 @@ mod tests {
         let comparison = |current: Option<CadenceRow>| {
             let db = &db;
             let lane = &lane;
-            async move {
-                comparison_for(db, "p", "cairn", lane, current.as_ref(), None, &names)
-                    .await
-                    .unwrap()
-            }
+            async move { comparison_for(db, "p", "cairn", lane, current.as_ref(), None, &names).await }
         };
         let load = |id: &'static str| {
             let db = &db;
@@ -7082,6 +7370,7 @@ mod tests {
                 previous,
                 neighbour,
                 peer,
+                ..
             } => {
                 assert_eq!(previous.id, "f2");
                 assert!(neighbour.is_none(), "{neighbour:?}");
@@ -7148,11 +7437,7 @@ mod tests {
             let db = &db;
             let lane = &lane;
             let chain = with_chain.then_some(&chain);
-            async move {
-                comparison_for(db, "p", "cairn", lane, current.as_ref(), chain, &names)
-                    .await
-                    .unwrap()
-            }
+            async move { comparison_for(db, "p", "cairn", lane, current.as_ref(), chain, &names).await }
         };
         let passed: &[(&str, &str)] = &[("a", "passed")];
         let shaped = |id, executor, ran_at, cadence, commit, selection, failure_kind| Stored {
@@ -8148,6 +8433,450 @@ mod tests {
         .await
         .unwrap()
         .is_none());
+    }
+
+    /// cairn/6244: a lookup that fails is unknown history. It never reads as a
+    /// lane with no history, never invents movement, a merge list or host
+    /// attribution, and never erases a predecessor another lookup established.
+    #[test]
+    fn a_failed_lookup_is_unknown_history_never_absent_history() {
+        let broken =
+            || Err::<Option<CadenceRow>, _>("database is locked\nat statement SELECT".to_string());
+        let previous = on("sp2", all_passed("prev", HOUR));
+        let elsewhere = on("sp1", all_passed("sp1", HOUR + 500));
+        let current = on("sp2", all_passed("cur", HOUR + 1_000));
+        let complete = CadenceVerdict::Complete(current.clone());
+        let never_absent = |text: &str| {
+            assert!(!text.contains("No earlier complete"), "{text}");
+            assert!(!text.contains("has ever been recorded"), "{text}");
+            assert!(!text.contains("is the baseline"), "{text}");
+            assert!(
+                !text.contains("locked\nat"),
+                "the cause stays on one line: {text}"
+            );
+        };
+
+        // The optional peer lookup fails after this host's previous row was
+        // found: that row is still the comparison.
+        let compared = resolve_comparison(
+            Some("sp2"),
+            Ok(Some(previous.clone())),
+            Ok(Some(elsewhere.clone())),
+            broken(),
+            None,
+        );
+        match &compared {
+            Comparison::SameExecutor {
+                previous: kept,
+                neighbour,
+                peer,
+                unread,
+            } => {
+                assert_eq!(kept.id, "prev", "the predecessor stands");
+                assert_eq!(neighbour.as_deref().map(|row| row.id.as_str()), Some("sp1"));
+                assert!(peer.is_none());
+                assert!(
+                    unread.peer.is_some() && unread.neighbour.is_none(),
+                    "{unread:?}"
+                );
+            }
+            other => panic!("expected the same-host comparison kept, got {other:?}"),
+        }
+        assert!(!row_is_news(LaneVerdict::PerTest, &current, &compared));
+        let text = report(&complete, &compared, &Bracket::default());
+        never_absent(&text);
+        assert!(
+            text.contains("all 1 passed — 0 newly red, 0 newly green"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Compared with: cairn://p/cairn/check-observations/prev"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Same tree on another host: unknown. The lookup of another host's row on this commit failed (database is locked at statement SELECT), so no red below is attributed to a host."),
+            "{text}"
+        );
+        assert!(text.contains("Merges since the compared row"), "{text}");
+
+        // The neighbour lookup fails: the same-host diff stands, but how far
+        // another host covers main is unknown, so no merge is listed uncovered.
+        let compared = resolve_comparison(
+            Some("sp2"),
+            Ok(Some(previous.clone())),
+            broken(),
+            Ok(None),
+            None,
+        );
+        let death = CadenceVerdict::Death {
+            row: Some(current.clone()),
+            cause: "stopped making progress".into(),
+        };
+        assert!(compared.coverage().is_none());
+        assert!(bracket_base(&death, &compared).is_none());
+        let text = report(&death, &compared, &Bracket::default());
+        never_absent(&text);
+        assert!(
+            text.contains("- Last complete row: cairn://p/cairn/check-observations/prev"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Covered through: unknown. The lookup of the platform's newest complete row failed"),
+            "{text}"
+        );
+        assert!(!text.contains("Merges not covered"), "{text}");
+
+        // This host's own lookup fails: no comparison and the verdict as
+        // measured, with the platform's newest cited as evidence of history.
+        let compared = resolve_comparison(
+            Some("sp2"),
+            broken(),
+            Ok(Some(elsewhere.clone())),
+            Ok(None),
+            None,
+        );
+        assert!(
+            matches!(&compared, Comparison::Unavailable { known: Some(known), .. } if known.id == "sp1"),
+            "{compared:?}"
+        );
+        assert!(bracket_base(&complete, &compared).is_none());
+        assert!(row_is_news(LaneVerdict::PerTest, &current, &compared));
+        let text = report(&complete, &compared, &Bracket::default());
+        never_absent(&text);
+        assert!(
+            text.contains(
+                ": all 1 passed — movement unknown: the compared row could not be read**"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "- Compared with: unknown. The lookup of this host's previous complete row failed"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("History exists: the newest complete row on linux is cairn://p/cairn/check-observations/sp1"),
+            "{text}"
+        );
+        assert!(!text.contains("newly"), "{text}");
+        assert!(!text.contains("Merges"), "{text}");
+
+        // A red row with no comparison lists its failures, none called new.
+        let red = on(
+            "sp2",
+            row(
+                "red",
+                "bbbbbbbbbbbbbbbb",
+                HOUR + 1_000,
+                &[("t", failed("boom"))],
+            ),
+        );
+        let text = report(
+            &CadenceVerdict::Complete(red),
+            &compared,
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("**RED IN THIS ROW: 1 test in 1 failure group**"),
+            "{text}"
+        );
+        assert!(!text.to_lowercase().contains("newly red"), "{text}");
+
+        // An exit lane's row moves nowhere either.
+        let text = exit_report(&complete, &compared, &Bracket::default());
+        never_absent(&text);
+        assert!(
+            text.contains("— movement unknown: the compared row could not be read**"),
+            "{text}"
+        );
+        assert!(!text.contains("— baseline"), "{text}");
+
+        // No row on this host, and the platform lookup fails: unknown, not a
+        // cross-host comparison and not a baseline.
+        let compared = resolve_comparison(Some("sp2"), Ok(None), broken(), Ok(None), None);
+        assert!(
+            matches!(&compared, Comparison::Unavailable { known: None, .. }),
+            "{compared:?}"
+        );
+
+        // A death names no executor, so the platform lookup decides.
+        let compared = resolve_comparison(None, Ok(None), broken(), Ok(None), None);
+        let text = report(
+            &CadenceVerdict::Death {
+                row: None,
+                cause: "no machine".into(),
+            },
+            &compared,
+            &Bracket::default(),
+        );
+        never_absent(&text);
+        assert!(
+            text.contains("- Last complete row: unknown. The lookup of the platform's newest complete row failed (database is locked at statement SELECT), which does not mean none exists"),
+            "{text}"
+        );
+        assert!(!text.contains("Merges not covered"), "{text}");
+
+        // Controls: lookups that succeed and find nothing are a baseline, and a
+        // prior complete row on another host is a cross-host comparison.
+        let compared = resolve_comparison(Some("sp2"), Ok(None), Ok(None), Ok(None), None);
+        assert!(matches!(compared, Comparison::Baseline), "{compared:?}");
+        let text = report(&complete, &compared, &Bracket::default());
+        assert!(
+            text.contains(
+                "No earlier complete whole-suite row on main exists for rust-tests on linux"
+            ),
+            "{text}"
+        );
+        let compared = resolve_comparison(
+            Some("sp2"),
+            Ok(None),
+            Ok(Some(elsewhere.clone())),
+            broken(),
+            None,
+        );
+        assert!(
+            matches!(&compared, Comparison::OtherExecutor { previous } if previous.id == "sp1"),
+            "{compared:?}"
+        );
+    }
+
+    /// cairn/6244: a candidate that cannot be read fails the lookups that reach
+    /// it, and the comparison keeps what the other lookups found.
+    #[tokio::test]
+    async fn an_unreadable_candidate_leaves_history_unknown_and_keeps_the_predecessor() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        let lane = linux_lane();
+        let names = |executor: &str| executor.to_string();
+        let passed: &[(&str, &str)] = &[("a", "passed")];
+        let main_row = |id, executor, ran_at, commit| Stored {
+            id,
+            executor,
+            ran_at,
+            cadence: "main",
+            commit,
+            selection: "full",
+            failure_kind: None,
+            tests: passed,
+        };
+        store(&db, main_row("prev", "sp2", 1, "c-prev")).await;
+        store(&db, main_row("peer", "sp1", 2, "c-cur")).await;
+        store(&db, main_row("cur", "sp2", 3, "c-cur")).await;
+        let current = load_row(&db, "cairn", "cur", &names).await.unwrap();
+        let compare = || comparison_for(&db, "p", "cairn", &lane, Some(&current), None, &names);
+        // A test id stored as a blob: the row is listed, then cannot be loaded.
+        let unreadable = |id: &str| {
+            format!(
+                "INSERT INTO check_test_results (observation_id, test_id, status)
+                 VALUES('{id}', X'00', 'passed');"
+            )
+        };
+
+        match compare().await {
+            Comparison::SameExecutor { previous, peer, .. } => {
+                assert_eq!(previous.id, "prev");
+                assert_eq!(peer.as_deref().map(|row| row.id.as_str()), Some("peer"));
+            }
+            other => panic!("expected a same-executor comparison, got {other:?}"),
+        }
+
+        // The other host's row cannot be read: the platform's newest and the
+        // same-commit peer lookups fail, and this host's previous row stands.
+        db.execute_script(unreadable("peer")).await.unwrap();
+        let compared = compare().await;
+        match &compared {
+            Comparison::SameExecutor {
+                previous, unread, ..
+            } => {
+                assert_eq!(previous.id, "prev");
+                assert!(
+                    unread
+                        .neighbour
+                        .as_deref()
+                        .is_some_and(|cause| cause.contains("candidate peer could not be read")),
+                    "{unread:?}"
+                );
+                assert!(unread.peer.is_some(), "{unread:?}");
+            }
+            other => panic!("expected the predecessor kept, got {other:?}"),
+        }
+        let text = report(
+            &CadenceVerdict::Complete(current.clone()),
+            &compared,
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("all 1 passed — 0 newly red, 0 newly green"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Same tree on another host: unknown."),
+            "{text}"
+        );
+        assert!(!text.contains("No earlier complete"), "{text}");
+
+        // This host's previous row cannot be read either: unknown history.
+        db.execute_script(unreadable("prev")).await.unwrap();
+        let compared = compare().await;
+        assert!(
+            matches!(&compared, Comparison::Unavailable { known: None, cause } if cause.contains("candidate prev could not be read")),
+            "{compared:?}"
+        );
+        let text = report(
+            &CadenceVerdict::Complete(current.clone()),
+            &compared,
+            &Bracket::default(),
+        );
+        assert!(text.contains("- Compared with: unknown."), "{text}");
+        assert!(!text.contains("No earlier complete"), "{text}");
+    }
+
+    /// cairn/6244, the 2026-11-05 skip-census specimen: the 64 newest
+    /// whole-suite rows before sp2's cadence row were all agent-branch write
+    /// rows off main's chain, and main's own rows (sp1 three landings back, bbs
+    /// seven, sp1 twelve) sat just behind them. Read by recency, every lookup
+    /// found nothing and the report said no earlier row existed. Read by tree,
+    /// they answer.
+    #[tokio::test]
+    async fn main_rows_behind_a_window_of_agent_write_rows_still_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        let lane = linux_lane();
+        let names = |executor: &str| executor.to_string();
+        let chain = MainChain::from_log(
+            "tip\nm1\nm2\ne07\nm4\nm5\nm6\n5c7\nm8\nm9\nm10\nm11\nbaf\nm13\nm14\nold\n",
+        );
+        let passed: &[(&str, &str)] = &[("a", "passed")];
+        let at = |id, executor, ran_at, cadence, commit| Stored {
+            id,
+            executor,
+            ran_at,
+            cadence,
+            commit,
+            selection: "full",
+            failure_kind: None,
+            tests: passed,
+        };
+        let tip_row = |executor: &str| {
+            on(
+                executor,
+                row("cur", "tip", 10_000, &[("a", TestOutcome::Passed)]),
+            )
+        };
+        let compare = |current: CadenceRow| {
+            let (db, lane, chain) = (&db, &lane, &chain);
+            async move {
+                comparison_for(db, "p", "cairn", lane, Some(&current), Some(chain), &names).await
+            }
+        };
+
+        // Control: lookups that succeed over an empty history are a baseline.
+        assert!(matches!(
+            compare(tip_row("sp2")).await,
+            Comparison::Baseline
+        ));
+
+        for row in [
+            at("sp2-old", "sp2", 100, "main", "old"),
+            at("cf8", "sp1", 200, "main", "baf"),
+            at("83e", "bbs", 300, "main", "5c7"),
+            at("f26", "sp1", 400, "main", "e07"),
+        ] {
+            store(&db, row).await;
+        }
+        // More write rows than one read returns, every one newer than main's
+        // rows and on an agent branch.
+        for n in 0..CANDIDATE_SCAN + 6 {
+            let (id, commit) = (format!("w{n}"), format!("agent-{n}"));
+            let executor = if n % 2 == 0 { "sp1" } else { "sp2" };
+            store(
+                &db,
+                Stored {
+                    id: &id,
+                    executor,
+                    ran_at: 1_000 + n,
+                    cadence: "write",
+                    commit: &commit,
+                    selection: "full",
+                    failure_kind: None,
+                    tests: passed,
+                },
+            )
+            .await;
+        }
+
+        let current = tip_row("sp2");
+        let compared = compare(current.clone()).await;
+        match &compared {
+            Comparison::SameExecutor {
+                previous,
+                neighbour,
+                unread,
+                ..
+            } => {
+                assert_eq!(previous.id, "sp2-old");
+                assert_eq!(
+                    neighbour.as_deref().map(|row| row.id.as_str()),
+                    Some("f26"),
+                    "three landings back is the nearest other host's tree"
+                );
+                assert!(!unread.any(), "{unread:?}");
+            }
+            other => panic!("expected sp2's own earlier row, got {other:?}"),
+        }
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &compared,
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("Compared with: cairn://p/cairn/check-observations/h-sp2-old"),
+            "{text}"
+        );
+        assert!(!text.contains("No earlier complete"), "{text}");
+
+        // Control: a host with no row of its own compares across hosts with
+        // the nearest tree's prior complete main row.
+        match compare(tip_row("sp3")).await {
+            Comparison::OtherExecutor { previous } => assert_eq!(previous.id, "f26"),
+            other => panic!("expected a cross-host comparison, got {other:?}"),
+        }
+    }
+
+    /// A read that came back full with no complete row among it left what lies
+    /// behind it unread: unknown, not absent.
+    #[tokio::test]
+    async fn a_full_window_without_a_complete_row_is_not_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        let lane = linux_lane();
+        let names = |executor: &str| executor.to_string();
+        insert_observation(&db, "good", "bbs", 1, "main", &[("a", "passed")]).await;
+        // Complete-flagged rows with no tests: compile failures, never verdicts.
+        for n in 0..CANDIDATE_SCAN {
+            insert_observation(&db, &format!("z{n}"), "bbs", 2 + n, "main", &[]).await;
+        }
+        let error = latest_complete_row(&db, "p", "cairn", &lane, RowFilter::default(), &names)
+            .await
+            .unwrap_err();
+        assert!(error.contains("older rows were not read"), "{error}");
+
+        let compared = comparison_for(&db, "p", "cairn", &lane, None, None, &names).await;
+        assert!(
+            matches!(compared, Comparison::Unavailable { .. }),
+            "{compared:?}"
+        );
+        let text = report(
+            &CadenceVerdict::Death {
+                row: None,
+                cause: "no machine".into(),
+            },
+            &compared,
+            &Bracket::default(),
+        );
+        assert!(text.contains("- Last complete row: unknown."), "{text}");
+        assert!(!text.contains("has ever been recorded"), "{text}");
     }
 
     /// A typecheck lane is in flight for a minute or two, so the overview

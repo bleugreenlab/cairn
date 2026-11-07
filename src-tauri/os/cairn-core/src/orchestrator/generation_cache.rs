@@ -31,7 +31,7 @@ use crate::issues::crud::EncodedIssueList;
 use crate::jobs::queries::{IssueStatusSnapshot, ThreadStatusSnapshot};
 use crate::services::EventEmitter;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -498,6 +498,87 @@ struct Settled<V> {
 
 type Cell<V> = tokio::sync::OnceCell<Settled<V>>;
 
+/// How often a cache writes one line summarizing what it did.
+///
+/// Invalidations arrive far faster than anyone reads about them: on the 11-05
+/// production log the pending-delivery lists alone took about 1,500 a minute,
+/// and one line apiece made this module two thirds of the orchestrator log. The
+/// count is what is worth keeping, and a minute is enough resolution to read a
+/// rate from it.
+const ACTIVITY_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A cadenced rebuild at least this slow is logged at Info even when it
+/// published nothing new; a fast unchanged one is routine and logs at Debug.
+const SLOW_REBUILD: Duration = Duration::from_millis(250);
+
+/// One thing a cache did, for its activity summary.
+enum Activity<'a> {
+    Invalidated { key: &'a str, reason: &'static str },
+    Read(&'static str),
+    Rebuilt,
+}
+
+/// What a cache did since its last activity summary.
+///
+/// The summary is written lazily, by the first activity at least an interval
+/// after the window opened, so a cache that goes quiet writes nothing and the
+/// line it writes on waking reports the true length of the window it covers.
+#[derive(Default)]
+struct ActivityTally {
+    since: Option<Instant>,
+    invalidations: BTreeMap<&'static str, u64>,
+    keys: HashSet<String>,
+    reads: BTreeMap<&'static str, u64>,
+    rebuilds: u64,
+}
+
+impl ActivityTally {
+    /// Count `activity`, and return the summary line's body when this closes
+    /// the window.
+    fn record(&mut self, activity: Activity<'_>, now: Instant) -> Option<String> {
+        let since = *self.since.get_or_insert(now);
+        match activity {
+            Activity::Invalidated { key, reason } => {
+                *self.invalidations.entry(reason).or_default() += 1;
+                if !self.keys.contains(key) {
+                    self.keys.insert(key.to_string());
+                }
+            }
+            Activity::Read(outcome) => *self.reads.entry(outcome).or_default() += 1,
+            Activity::Rebuilt => self.rebuilds += 1,
+        }
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < ACTIVITY_SUMMARY_INTERVAL {
+            return None;
+        }
+        let summary = self.summary(elapsed);
+        *self = Self::default();
+        Some(summary)
+    }
+
+    fn summary(&self, elapsed: Duration) -> String {
+        let tally = |counts: &BTreeMap<&'static str, u64>| {
+            if counts.is_empty() {
+                return "none".to_string();
+            }
+            counts
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "interval_s={} invalidations={} keys={} by_reason={} reads={} rebuilds={}",
+            elapsed.as_secs(),
+            self.invalidations.values().sum::<u64>(),
+            self.keys.len(),
+            tally(&self.invalidations),
+            tally(&self.reads),
+            self.rebuilds,
+        )
+    }
+}
+
 /// What a read accepts as current.
 #[derive(Clone, Copy, Debug)]
 enum Freshness {
@@ -526,6 +607,10 @@ pub(crate) struct GenerationCacheCounters {
 struct GenerationCacheState<V> {
     generations: HashMap<String, u64>,
     cells: HashMap<(String, u64), Arc<Cell<V>>>,
+    /// Invalidations per key since that key was last computed, reported on the
+    /// `computed` line so cause and effect stay together.
+    invalidations_since_compute: HashMap<String, u64>,
+    activity: ActivityTally,
 }
 
 impl<V> Default for GenerationCacheState<V> {
@@ -533,6 +618,8 @@ impl<V> Default for GenerationCacheState<V> {
         Self {
             generations: HashMap::new(),
             cells: HashMap::new(),
+            invalidations_since_compute: HashMap::new(),
+            activity: ActivityTally::default(),
         }
     }
 }
@@ -615,8 +702,20 @@ impl<V: Clone> GenerationCache<V> {
         *generation = generation.wrapping_add(1);
         let generation = *generation;
         state.cells.retain(|(cached_key, _), _| cached_key != key);
-        log::debug!("{label} cache invalidated key={key} generation={generation} reason={reason}");
+        *state
+            .invalidations_since_compute
+            .entry(key.to_string())
+            .or_default() += 1;
+        Self::note_locked(state, label, Activity::Invalidated { key, reason });
         generation
+    }
+
+    /// Count `activity`, writing the cache's activity summary when it closes an
+    /// interval.
+    fn note_locked(state: &mut GenerationCacheState<V>, label: &str, activity: Activity<'_>) {
+        if let Some(summary) = state.activity.record(activity, Instant::now()) {
+            log::debug!("{label} cache activity {summary}");
+        }
     }
 
     /// Advance a key's generation and drop everything materialized under the old
@@ -740,7 +839,7 @@ impl<V: Clone> GenerationCache<V> {
         Fut: Future<Output = Option<V>>,
     {
         loop {
-            let (generation, cell, state_kind) = {
+            let (generation, cell, state_kind, invalidations) = {
                 let mut state = self.state.lock().ok()?;
                 let mut generation = *state.generations.entry(key.to_string()).or_default();
                 if let Freshness::Within(max_age) = freshness {
@@ -788,17 +887,22 @@ impl<V: Clone> GenerationCache<V> {
                     .entry(cell_key)
                     .or_insert_with(|| Arc::new(Cell::new()))
                     .clone();
-                (generation, cell, state_kind)
+                let invalidations = if state_kind == "miss" {
+                    state
+                        .invalidations_since_compute
+                        .remove(key)
+                        .unwrap_or_default()
+                } else {
+                    0
+                };
+                Self::note_locked(&mut state, self.label, Activity::Read(state_kind));
+                (generation, cell, state_kind, invalidations)
             };
             match state_kind {
                 "hit" => self.hits.fetch_add(1, Ordering::Relaxed),
                 "coalesced" => self.coalesced.fetch_add(1, Ordering::Relaxed),
                 _ => self.misses.fetch_add(1, Ordering::Relaxed),
             };
-            log::debug!(
-                "{} cache {state_kind} key={key} generation={generation}",
-                self.label
-            );
 
             let started = Instant::now();
             let value = cell
@@ -814,7 +918,7 @@ impl<V: Clone> GenerationCache<V> {
                 .clone();
             if state_kind == "miss" {
                 log::info!(
-                    "{} computed key={key} generation={generation} duration_ms={}",
+                    "{} computed key={key} generation={generation} duration_ms={} invalidations={invalidations}",
                     self.label,
                     started.elapsed().as_millis()
                 );
@@ -901,6 +1005,9 @@ struct Slot<V> {
     /// after a publish, so a rebuild slower than the floor still occupies a
     /// worker at most half the time.
     last_duration: Duration,
+    /// Invalidations since the last rebuild began, reported on its `computed`
+    /// line.
+    invalidations: u64,
 }
 
 impl<V> Default for Slot<V> {
@@ -915,6 +1022,7 @@ impl<V> Default for Slot<V> {
             waiters: Vec::new(),
             wake: Arc::new(tokio::sync::Notify::new()),
             last_duration: Duration::ZERO,
+            invalidations: 0,
         }
     }
 }
@@ -978,6 +1086,10 @@ pub(crate) struct CadencedCache<V> {
     slots: Mutex<HashMap<String, Slot<V>>>,
     runtime: Mutex<Option<tokio::runtime::Handle>>,
     rebuilds: AtomicU64,
+    /// Never taken while `slots` is held.
+    activity: Mutex<ActivityTally>,
+    #[cfg(test)]
+    activity_summaries: AtomicU64,
 }
 
 /// Hands a key back if its driver ends without doing so itself: cancelled with
@@ -1037,7 +1149,31 @@ where
             slots: Mutex::new(HashMap::new()),
             runtime: Mutex::new(tokio::runtime::Handle::try_current().ok()),
             rebuilds: AtomicU64::new(0),
+            activity: Mutex::new(ActivityTally::default()),
+            #[cfg(test)]
+            activity_summaries: AtomicU64::new(0),
         })
+    }
+
+    /// Count `activity`, writing the cache's activity summary when it closes an
+    /// interval.
+    fn note(&self, activity: Activity<'_>) {
+        let summary = self
+            .activity
+            .lock()
+            .ok()
+            .and_then(|mut tally| tally.record(activity, Instant::now()));
+        if let Some(summary) = summary {
+            #[cfg(test)]
+            self.activity_summaries.fetch_add(1, Ordering::Relaxed);
+            log::debug!("{} cache activity {summary}", self.label);
+        }
+    }
+
+    /// How many activity summaries this cache has written.
+    #[cfg(test)]
+    pub(crate) fn activity_summaries(&self) -> u64 {
+        self.activity_summaries.load(Ordering::Relaxed)
     }
 
     /// Run this cache's drivers on `runtime` from now on. The orchestrator binds
@@ -1177,15 +1313,11 @@ where
             };
             let slot = slots.entry(key.to_string()).or_default();
             slot.generation += 1;
+            slot.invalidations += 1;
             if urgent && slot.published.is_some() {
                 slot.urgent = true;
                 slot.wake.notify_one();
             }
-            log::debug!(
-                "{} cache invalidated key={key} generation={} reason={reason}",
-                self.label,
-                slot.generation
-            );
             if slot.owes_rebuild(tokio::time::Instant::now()) {
                 self.drive_locked(key, slot);
                 false
@@ -1199,6 +1331,7 @@ where
                 false
             }
         };
+        self.note(Activity::Invalidated { key, reason });
         if announce_idle {
             (self.announce)(key);
         }
@@ -1301,7 +1434,7 @@ where
             let Some(cache) = this.upgrade() else {
                 return;
             };
-            let generation = {
+            let (generation, invalidations) = {
                 let Ok(mut slots) = cache.slots.lock() else {
                     return;
                 };
@@ -1309,9 +1442,10 @@ where
                     return;
                 };
                 slot.urgent = false;
-                slot.generation
+                (slot.generation, std::mem::take(&mut slot.invalidations))
             };
             cache.rebuilds.fetch_add(1, Ordering::Relaxed);
+            cache.note(Activity::Rebuilt);
             let rebuild = (cache.rebuild)(key.clone());
             let label = cache.label;
             drop(cache);
@@ -1358,9 +1492,17 @@ where
                 (std::mem::take(&mut slot.waiters), changed)
             };
             match &outcome {
-                Ok(_) => log::info!(
-                    "{label} computed key={key} generation={generation} duration_ms={duration_ms} published changed={changed}"
-                ),
+                Ok(_) => {
+                    let level = if changed || duration >= SLOW_REBUILD {
+                        log::Level::Info
+                    } else {
+                        log::Level::Debug
+                    };
+                    log::log!(
+                        level,
+                        "{label} computed key={key} generation={generation} duration_ms={duration_ms} published changed={changed} invalidations={invalidations}"
+                    );
+                }
                 Err(error) => log::warn!(
                     "{label} rebuild failed key={key} generation={generation} duration_ms={duration_ms}: {error}"
                 ),
@@ -1888,7 +2030,71 @@ mod tests {
         assert_eq!(computations.load(Ordering::SeqCst), 3);
     }
 
+    /// A burst of invalidations inside one interval is one summary line that
+    /// still carries the count, not a line per invalidation.
+    #[test]
+    fn invalidations_within_an_interval_are_one_summary() {
+        let mut tally = ActivityTally::default();
+        let start = Instant::now();
+        for n in 0..1_000u32 {
+            let at = start + Duration::from_millis(u64::from(n) * 50);
+            assert_eq!(
+                tally.record(
+                    Activity::Invalidated {
+                        key: "job",
+                        reason: "pending-delivery-input",
+                    },
+                    at,
+                ),
+                None,
+                "invalidation {n} is inside the interval"
+            );
+        }
+        tally.record(Activity::Rebuilt, start + Duration::from_secs(10));
+        let summary = tally
+            .record(
+                Activity::Invalidated {
+                    key: "other",
+                    reason: "pending-delivery-carrier",
+                },
+                start + ACTIVITY_SUMMARY_INTERVAL,
+            )
+            .expect("the first activity past the interval closes it");
+        assert_eq!(
+            summary,
+            "interval_s=60 invalidations=1001 keys=2 \
+             by_reason=pending-delivery-carrier:1,pending-delivery-input:1000 \
+             reads=none rebuilds=1"
+        );
+        assert_eq!(
+            tally.record(Activity::Read("hit"), start + ACTIVITY_SUMMARY_INTERVAL),
+            None,
+            "and the next activity opens a fresh window"
+        );
+    }
+
     // ── The cadenced cache ──
+
+    /// N invalidations of one key write at most one activity summary, and the
+    /// rebuild that follows them is told how many there were.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalidating_a_key_n_times_logs_at_most_one_summary() {
+        let c = cadenced(Duration::from_secs(1));
+        c.cache.get("k").await.unwrap();
+        for _ in 0..500 {
+            c.cache.invalidate("k", "test");
+        }
+        assert!(
+            c.cache.activity_summaries() <= 1,
+            "500 invalidations wrote {} summaries",
+            c.cache.activity_summaries()
+        );
+        assert_eq!(
+            c.cache.generation("k"),
+            500,
+            "every invalidation still counted"
+        );
+    }
 
     /// A cadenced cache over one number, with its rebuild count, the number a
     /// rebuild will publish, an optional rebuild duration, and every
