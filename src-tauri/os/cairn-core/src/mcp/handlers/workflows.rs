@@ -54,7 +54,8 @@ pub(crate) async fn invoke_workflow(
             .and_then(|(_, path)| path),
     };
 
-    let workflow = match get_workflow(&orch.config_dir, &workflow_id, project_path.as_deref()) {
+    let roots = cairn_config::library::LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let workflow = match get_workflow(&roots, &workflow_id) {
         Ok(Some(workflow)) => workflow,
         Ok(None) => return format!("Workflow not found: {workflow_id}"),
         Err(e) => return format!("Error loading workflow `{workflow_id}`: {e}"),

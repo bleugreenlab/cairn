@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::pack::{self, ContentHash, PackItem, PackItemKind};
+use crate::config::pack::{self, PackItem, PackItemKind};
 use crate::library::{PackAuthority, OPERATOR_ONLY_PACK_ACT};
 use crate::orchestrator::Orchestrator;
 use crate::services::{RealFileSystem, RealGitClient};
@@ -34,8 +34,10 @@ pub struct PackMutationResult {
     pub changed_paths: Vec<String>,
     /// Paths an uninstall deleted.
     pub removed_paths: Vec<String>,
-    /// Paths an uninstall left in place because the user had edited them.
-    pub kept_paths: Vec<String>,
+    /// Bare names this pack now shares with another installed pack. Resolving
+    /// one is refused until something local defines it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collisions: Vec<pack::PackCollision>,
     /// Items a restore brought back.
     pub restored_items: Vec<PackItem>,
     /// The single item a removal took out.
@@ -352,153 +354,12 @@ pub fn export_agent_plugin(
     })
 }
 
-/// Replace one live local copy with the pack's currently shipped item.
-///
-/// Reset is deliberately distinct from restoring a removed item: it requires a
-/// live fork, and it is the only operation that may remove a workspace MCP
-/// shadow in favor of the pack definition. Resetting a machine service puts the
-/// shipped declaration back in force, so it is the operator's, like installing
-/// one.
-pub fn reset_pack_item(
-    orch: &Orchestrator,
-    pack_id: &str,
-    kind: PackItemKind,
-    item_id: &str,
-    authority: PackAuthority,
-) -> Result<PackMutationResult, String> {
-    let mut lock = pack::lock::read_lock(&orch.config_dir, pack_id)
-        .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
-    let manifest = shipped_manifest(orch, &lock)?;
-    if !manifest
-        .items()
-        .iter()
-        .any(|item| item.kind == kind && item.id == item_id)
-    {
-        return Err(format!(
-            "Pack `{pack_id}` does not currently ship {} `{item_id}`",
-            kind.as_str()
-        ));
-    }
-    if kind == PackItemKind::Service && authority != PackAuthority::Operator {
-        return Err(machine_service_refusal(
-            &format!("Resetting machine service `{pack_id}/{item_id}` to the shipped version"),
-            pack_id,
-        ));
-    }
-    let item = lock.item(kind, item_id).cloned().ok_or_else(|| {
-        format!(
-            "Pack `{pack_id}` does not carry {} `{item_id}`",
-            kind.as_str()
-        )
-    })?;
-    // A fork the lock has not recorded yet (an edit since the last sync) is
-    // just as much the user's copy, and the catalog already offers its reset.
-    let unrecorded_edit = kind != PackItemKind::Mcp
-        && item.path.as_deref().is_some_and(|path| {
-            pack::hash_item_path(
-                kind,
-                &orch.config_dir,
-                &pack::item_destination(&orch.config_dir, pack_id, kind, path),
-            )
-            .and_then(|current| pack::matches_baseline(&orch.config_dir, &item, &current))
-            .is_ok_and(|matches| !matches)
-        });
-    if !item.forked && !unrecorded_edit {
-        return Err(format!(
-            "{} `{item_id}` is already using pack `{pack_id}`'s version",
-            kind.as_str()
-        ));
-    }
-
-    let baseline = match kind {
-        PackItemKind::Mcp => {
-            let definitions =
-                pack::mcp::parse_pack_mcp_file(&pack::lock::mcp_path(&orch.config_dir, pack_id))?
-                    .servers;
-            let definition = definitions.get(item_id).ok_or_else(|| {
-                format!("Installed pack `{pack_id}` has no MCP definition `{item_id}`")
-            })?;
-            pack::hash_mcp_definition(definition)?
-        }
-        _ => {
-            let path = item
-                .path
-                .as_deref()
-                .ok_or_else(|| format!("{} `{item_id}` has no materialized path", kind.as_str()))?;
-            match pack::hash_item_path(
-                kind,
-                &orch.config_dir,
-                &pack::item_destination(&orch.config_dir, pack_id, kind, path),
-            )? {
-                ContentHash::Present(hash) => hash,
-                ContentHash::Missing => {
-                    return Err(format!(
-                        "{} `{item_id}` is missing; restore it instead",
-                        kind.as_str()
-                    ))
-                }
-            }
-        }
-    };
-
-    if kind == PackItemKind::Mcp {
-        crate::config::mcp_tools::remove_server(
-            &orch.config_dir,
-            crate::config::mcp_tools::ToolScope::Workspace,
-            item_id,
-        )?;
-    }
-    let previous_lock = lock.clone();
-    lock.reset_item_baseline(kind, item_id, baseline);
-    pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &lock)?;
-    if kind == PackItemKind::Mcp {
-        // The shadow only: deleting the server would record it as removed from
-        // the pack, and the re-sync below would then withhold the very
-        // definition this reset restores.
-        if let Err(error) =
-            crate::config::mcp_servers::delete_workspace_mcp_shadow(&orch.config_dir, item_id)
-        {
-            let _ = pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &previous_lock);
-            return Err(error);
-        }
-    }
-
-    let result = resync_from_shipped(orch, &lock, manifest).inspect_err(|_| {
-        let _ = pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &previous_lock);
-    })?;
-
-    orch.emit_pack_registry_change();
-    Ok(PackMutationResult {
-        action: "reset-item".to_string(),
-        pack_id: pack_id.to_string(),
-        changed_paths: result.changed_paths,
-        summary: format!(
-            "Reset {} `{item_id}` to pack '{pack_id}'s version",
-            kind.as_str()
-        ),
-        ..Default::default()
-    })
-}
+/// The refusal for the retired `reset-item` action, naming what replaced it.
+pub const RESET_ITEM_RETIRED: &str = "reset-item is retired: pack items are read where their pack installed them and never copied out, so there is no copy to reset. Delete your own definition (for example delete cairn://agents/<name>) and the pack's resolves again.";
 
 /// Ids of every pack the app bundle ships, for collision refusals.
 fn shipped_pack_ids(orch: &Orchestrator) -> Vec<String> {
     crate::library::shipped_ids(&orch.config_dir).unwrap_or_default()
-}
-
-/// What an installed pack shipped: the app bundle's copy for a bundled pack,
-/// the verified snapshot for a local or library one.
-fn shipped_manifest(
-    orch: &Orchestrator,
-    lock: &pack::PackLock,
-) -> Result<pack::PackManifest, String> {
-    match lock.source.kind {
-        pack::PackSourceKind::Bundled => {
-            let resource_dir = source_dir(orch)?;
-            pack::available_pack(&resource_dir, &lock.id)
-                .ok_or_else(|| format!("No pack `{}` is shipped in {resource_dir:?}", lock.id))
-        }
-        _ => crate::library::snapshot_manifest(&orch.config_dir, lock),
-    }
 }
 
 /// Sync an installed pack again from what it shipped, without fetching.
@@ -960,23 +821,16 @@ pub fn apply_pack_delete(orch: &Orchestrator, pack_id: &str) -> Result<PackMutat
             server,
         )?;
     }
-    let mut summary = format!(
-        "Uninstalled pack '{pack_id}' — removed {} item(s)",
+    let summary = format!(
+        "Uninstalled pack '{pack_id}' — removed {} item(s); your own definitions are separate files and stay",
         result.removed.len()
     );
-    if !result.kept.is_empty() {
-        summary.push_str(&format!(
-            "; kept your edited copies of {}",
-            result.kept.join(", ")
-        ));
-    }
 
     orch.emit_pack_registry_change();
     Ok(PackMutationResult {
         action: "uninstall".to_string(),
         pack_id: pack_id.to_string(),
         removed_paths: result.removed,
-        kept_paths: result.kept,
         summary,
         ..Default::default()
     })
@@ -985,12 +839,11 @@ pub fn apply_pack_delete(orch: &Orchestrator, pack_id: &str) -> Result<PackMutat
 /// Take ONE item out of an installed pack, leaving the pack installed and still
 /// updating around the gap.
 ///
-/// The deletion itself runs through the same kind-specific function an ordinary
-/// "delete this agent" performs, which is what records the removal against the
-/// owning pack (`pack::note_removed_item`). Doing it any other way would give
-/// the settings screen a second definition of what deleting a skill means — and
-/// would, for an MCP server, be the difference between dropping a connector and
-/// discarding the credential behind it.
+/// A library item is read where its pack installed it, so its removal is the
+/// lock's record alone (tenet 1121); the item stays on disk and resolution
+/// skips it. An MCP server and a machine service run through their own
+/// deletes, which for an MCP server is the difference between dropping a
+/// connector and discarding the credential behind it.
 pub fn apply_pack_item_removal(
     orch: &Orchestrator,
     pack_id: &str,
@@ -1037,17 +890,23 @@ pub fn apply_pack_item_removal(
 
     let config_dir = orch.config_dir.as_path();
     match kind {
-        PackItemKind::Agent => crate::config::agents::delete_agent(config_dir, item_id, None)?,
-        PackItemKind::Skill => crate::config::skills::delete_skill(config_dir, item_id, None)?,
-        PackItemKind::Recipe => crate::config::recipes::delete_recipe(config_dir, item_id, None)?,
-        PackItemKind::Response => {
-            crate::config::responses::delete_response(config_dir, item_id, None)?;
-        }
-        PackItemKind::Route => {
-            crate::config::routes::delete_route(config_dir, item_id, None)?;
-        }
-        PackItemKind::Workflow => {
-            crate::config::workflows::delete_workflow(config_dir, item_id, None)?
+        // A library item is read in place, so removing it from its pack is
+        // only the record: the pack's file stays, and resolution skips it.
+        PackItemKind::Agent
+        | PackItemKind::Skill
+        | PackItemKind::Recipe
+        | PackItemKind::Response
+        | PackItemKind::Route
+        | PackItemKind::Workflow => {
+            pack::lock::record_removal_from(&RealFileSystem, config_dir, pack_id, kind, item_id)?;
+            if kind == PackItemKind::Agent {
+                // The user's pin for it goes with the decision to remove it.
+                let mut pins = cairn_config::agent_pins::load_pins(config_dir);
+                if pins.get(item_id).is_some() {
+                    pins.set(item_id, cairn_config::agent_pins::AgentPin::default());
+                    cairn_config::agent_pins::save_pins(config_dir, &pins)?;
+                }
+            }
         }
         PackItemKind::Service => {
             crate::config::machine_services::delete_pack_service(orch, pack_id, item_id)?;
@@ -1111,19 +970,13 @@ pub(super) fn dispatch_pack_action(
     pack_id: &str,
 ) -> Result<PackMutationResult, String> {
     let action = super::payload_trimmed_non_empty_str(payload, "action", &[])
-        .ok_or("payload.action is required (install | update | restore | reset-item)")?;
+        .ok_or("payload.action is required (install | update | restore | export)")?;
     if action == "export" {
         let path = super::payload_trimmed_non_empty_str(payload, "path", &[])
             .ok_or("payload.path is required for export")?;
         export_agent_plugin(orch, pack_id, Path::new(path))
     } else if action == "reset-item" {
-        let kind = super::payload_trimmed_non_empty_str(payload, "kind", &[])
-            .ok_or("payload.kind is required for reset-item")?;
-        let item_id = super::payload_trimmed_non_empty_str(payload, "itemId", &[])
-            .ok_or("payload.itemId is required for reset-item")?;
-        let kind =
-            PackItemKind::parse(kind).ok_or_else(|| format!("Unknown pack item kind `{kind}`"))?;
-        reset_pack_item(orch, pack_id, kind, item_id, PackAuthority::Agent)
+        Err(RESET_ITEM_RETIRED.to_string())
     } else {
         apply_pack_action(orch, action, pack_id)
     }
@@ -1333,46 +1186,6 @@ mod tests {
         assert_workspace_catalog_withdrawn(&ws, &before);
     }
 
-    #[tokio::test]
-    async fn reset_withdraws_the_fork_catalog_before_restoring_pack_definition() {
-        let ws = workspace().await;
-        apply_pack_action(&ws.orch, "install", "matlab").unwrap();
-        // An MCP fork is an edit to the pack's installed layer; a settings entry
-        // only shadows it. Make both, so the reset must undo both.
-        write(
-            &pack::lock::mcp_path(&ws.home, "matlab"),
-            "mcpServers:\n  matlab:\n    type: stdio\n    command: forked-matlab\n",
-        );
-        write(
-            &ws.home.join("settings.yaml"),
-            "mcpServers:\n  matlab:\n    type: stdio\n    command: user-matlab\n",
-        );
-        apply_pack_action(&ws.orch, "update", "matlab").unwrap();
-        assert!(
-            pack::lock::read_lock(&ws.home, "matlab")
-                .unwrap()
-                .item(PackItemKind::Mcp, "matlab")
-                .unwrap()
-                .forked
-        );
-        let before = seed_catalogs(&ws);
-
-        reset_pack_item(
-            &ws.orch,
-            "matlab",
-            PackItemKind::Mcp,
-            "matlab",
-            PackAuthority::Agent,
-        )
-        .unwrap();
-
-        assert_workspace_catalog_withdrawn(&ws, &before);
-        assert!(
-            !crate::config::mcp_servers::load_settings_mcp_servers(&ws.home).contains_key("matlab")
-        );
-        assert!(pack::mcp::load_pack_mcp_servers(&ws.home).contains_key("matlab"));
-    }
-
     /// The fixture's `core` ships the probe service, so acting on it is the
     /// operator's.
     fn as_operator(
@@ -1448,7 +1261,10 @@ mod tests {
         assert!(selected_on(&ws, &key).is_empty(), "overrides included");
 
         as_operator(&ws, "restore", "core").unwrap();
-        assert!(ws.home.join("services/probe/service.yaml").exists());
+        assert!(pack::lock::read_lock(&ws.home, "core")
+            .unwrap()
+            .item(PackItemKind::Service, "probe")
+            .is_some());
         assert!(selected_on(&ws, &key).is_empty(), "restore selects nothing");
 
         select_probe(&ws, &key);
@@ -1615,7 +1431,7 @@ mod tests {
                 "responses/conveyor.md",
             ),
             ("core", PackItemKind::Route, "ping", "routes/ping.yaml"),
-            ("core", PackItemKind::Service, "probe", "services/probe"),
+            ("core", PackItemKind::Service, "probe", ""),
             ("core", PackItemKind::Skill, "example", "skills/example"),
             ("core", PackItemKind::Workflow, "flow", "workflows/flow"),
             ("matlab", PackItemKind::Mcp, "matlab", ""),
@@ -1627,8 +1443,8 @@ mod tests {
             assert_eq!(result.removed_item.as_ref().unwrap().kind, kind);
             if !path.is_empty() {
                 assert!(
-                    !ws.home.join(path).exists(),
-                    "{path} should be gone after removing {kind:?} `{id}`"
+                    ws.home.join("packs").join(pack_id).join(path).exists(),
+                    "{path} stays staged after removing {kind:?} `{id}`, so restoring it is only the record"
                 );
             }
             assert_eq!(
@@ -1655,32 +1471,25 @@ mod tests {
         ] {
             assert!(!restored.restored_items.is_empty());
         }
-        for path in [
-            "agents/explore.md",
-            "recipes/default.yaml",
-            "responses/conveyor.md",
-            "routes/ping.yaml",
-            "services/probe/service.yaml",
-            "skills/example/SKILL.md",
-            "workflows/flow/workflow.yaml",
-        ] {
-            assert!(
-                ws.home.join(path).exists(),
-                "restore must bring back {path}"
-            );
-        }
+        let roots = cairn_config::library::LibraryRoots::workspace(&ws.home);
+        // The fixture's agent body does not parse; it resolves all the same.
+        assert!(!matches!(
+            crate::config::agents::resolve_agent(&roots, "explore"),
+            Err(error) if error.is_not_found()
+        ));
+        assert!(crate::config::skills::get_skill(&roots, "example")
+            .unwrap()
+            .is_some());
         assert!(crate::config::pack::mcp::load_pack_mcp_servers(&ws.home).contains_key("matlab"));
         for (pack_id, kind, id, _) in cases {
             assert_eq!(
                 item_state(&ws, pack_id, kind.as_str(), id),
-                Some(PackItemState::PackOwned),
-                "restored {kind:?} `{id}` in pack `{pack_id}` must return to pack ownership"
+                Some(PackItemState::InUse),
+                "restored {kind:?} `{id}` in pack `{pack_id}` must be in use again"
             );
         }
     }
 
-    /// An edit saved between syncs is the user's copy at once: the catalog
-    /// says so, says the app ships something different, shows both sides,
     /// A provider pack shipped beside `core`, installed into `ws`.
     fn install_provider_fixture(ws: &Workspace) -> PathBuf {
         let root = source_pack(&ws.resources, "search-fixture");
@@ -1698,39 +1507,6 @@ mod tests {
         );
         apply_pack_action(&ws.orch, "install", "search-fixture").unwrap();
         root
-    }
-
-    /// Reset reads a provider's and a credential's real home, the pack layer.
-    #[tokio::test]
-    async fn reset_restores_edited_provider_and_credential_declarations() {
-        let ws = workspace().await;
-        let shipped = install_provider_fixture(&ws);
-        for (kind, id, rel) in [
-            (
-                PackItemKind::Provider,
-                "web-search",
-                "providers/web-search.yaml",
-            ),
-            (
-                PackItemKind::Credential,
-                "api-key",
-                "credentials/api-key.yaml",
-            ),
-        ] {
-            let installed = ws.home.join("packs/search-fixture").join(rel);
-            let original = std::fs::read_to_string(shipped.join(rel)).unwrap();
-            std::fs::write(&installed, format!("{original}# edited\n")).unwrap();
-            assert_eq!(
-                item_state(&ws, "search-fixture", kind.as_str(), id),
-                Some(PackItemState::EditedByUser)
-            );
-            reset_pack_item(&ws.orch, "search-fixture", kind, id, PackAuthority::Agent).unwrap();
-            assert_eq!(std::fs::read_to_string(&installed).unwrap(), original);
-            assert_eq!(
-                item_state(&ws, "search-fixture", kind.as_str(), id),
-                Some(PackItemState::PackOwned)
-            );
-        }
     }
 
     /// A failed mutation's rollback covers the declarations in the pack layer,
@@ -1770,9 +1546,11 @@ mod tests {
         );
     }
 
-    /// and its reset works before any sync has recorded the fork.
+    /// A definition of the user's at a pack item's name is in front of it the
+    /// moment it is written: the catalog says so, and the diff shows the
+    /// pack's version beside it.
     #[tokio::test]
-    async fn an_unsynced_edit_reads_as_a_copy_behind_shipped_and_resets() {
+    async fn your_definition_in_front_reads_as_shadowed_and_diffs_against_the_pack() {
         let ws = workspace().await;
         write(&ws.home.join("agents/explore.md"), "my agent\n");
 
@@ -1789,9 +1567,9 @@ mod tests {
             .iter()
             .find(|item| item.kind == "agent" && item.id == "explore")
             .unwrap();
-        assert_eq!(item.state, PackItemState::EditedByUser);
-        assert!(item.behind_shipped);
-        assert_eq!((entry.edited_count, entry.behind_count), (1, 1));
+        assert_eq!(item.state, PackItemState::Shadowed);
+        assert_eq!(item.shadowed_by.as_deref(), Some("~"));
+        assert_eq!(entry.shadowed_count, 1);
 
         let diff = crate::resources::packs::pack_item_diff(
             &ws.home,
@@ -1804,35 +1582,20 @@ mod tests {
         assert_eq!(diff.files[0].shipped.as_deref(), Some("bundle agent\n"));
         assert_eq!(diff.files[0].yours.as_deref(), Some("my agent\n"));
 
-        // A skill differs only in the files that differ; Finder metadata is no file.
-        write(&ws.home.join("skills/example/.DS_Store"), "finder");
-        write(&ws.home.join("skills/example/notes.md"), "mine\n");
-        let skill = crate::resources::packs::pack_item_diff(
-            &ws.home,
-            "core",
-            PackItemKind::Skill,
-            "example",
-        )
-        .unwrap();
-        assert_eq!(skill.files.len(), 1);
-        assert_eq!(skill.files[0].path, "skills/example/notes.md");
-        assert_eq!(skill.files[0].shipped, None);
-
-        reset_pack_item(
-            &ws.orch,
-            "core",
-            PackItemKind::Agent,
-            "explore",
-            PackAuthority::Agent,
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(ws.home.join("agents/explore.md")).unwrap(),
-            "bundle agent\n"
-        );
+        // Deleting your definition is plain deletion; the pack's is in use again.
+        std::fs::remove_file(ws.home.join("agents/explore.md")).unwrap();
         assert_eq!(
             item_state(&ws, "core", "agent", "explore"),
-            Some(PackItemState::PackOwned)
+            Some(PackItemState::InUse)
+        );
+        assert!(
+            dispatch_pack_action(
+                &ws.orch,
+                &serde_json::json!({"action": "reset-item", "kind": "agent", "itemId": "explore"}),
+                "core"
+            )
+            .unwrap_err()
+                == RESET_ITEM_RETIRED
         );
     }
 
@@ -1908,11 +1671,10 @@ mod tests {
         }
     }
 
-    /// An update must name the files it refused to overwrite. Flattened into
-    /// prose those names can only be re-parsed; the settings screen reports them
-    /// from the structured field.
+    /// An update applies in place and never reaches the user's own definition
+    /// in front of the pack's item.
     #[tokio::test]
-    async fn an_update_preserves_a_local_copy_and_the_catalog_marks_it() {
+    async fn an_update_applies_in_place_and_leaves_your_definition_in_front() {
         let ws = workspace().await;
         write(&ws.home.join("agents/explore.md"), "mine now\n");
 
@@ -1924,31 +1686,33 @@ mod tests {
 
         assert_eq!(result.action, "update");
         assert_eq!(
+            std::fs::read_to_string(ws.home.join("packs/core/agents/explore.md")).unwrap(),
+            "shipped v2\n"
+        );
+        assert_eq!(
             item_state(&ws, "core", "agent", "explore"),
-            Some(PackItemState::EditedByUser)
+            Some(PackItemState::Shadowed)
         );
         assert_eq!(
             std::fs::read_to_string(ws.home.join("agents/explore.md")).unwrap(),
             "mine now\n",
-            "an update must not overwrite what the user made theirs"
         );
     }
 
-    /// An uninstall's two lists are different promises: what it deleted, and
-    /// what it deliberately left behind.
+    /// An uninstall removes the pack's own directory; a definition of the
+    /// user's is a separate file and stays.
     #[tokio::test]
-    async fn an_uninstall_separates_what_it_removed_from_what_it_kept() {
+    async fn an_uninstall_removes_the_pack_and_keeps_your_definitions() {
         let ws = workspace().await;
         write(&ws.home.join("agents/explore.md"), "mine now\n");
 
         let result = apply_pack_delete(&ws.orch, "core").unwrap();
         assert_eq!(result.action, "uninstall");
-        assert_eq!(result.kept_paths, vec!["agents/explore.md".to_string()]);
         assert!(result
             .removed_paths
-            .contains(&"recipes/default.yaml".to_string()));
+            .contains(&"packs/core/recipes/default.yaml".to_string()));
         assert!(ws.home.join("agents/explore.md").exists());
-        assert!(!ws.home.join("recipes/default.yaml").exists());
+        assert!(!ws.home.join("packs/core/recipes").exists());
 
         let catalog = pack_catalog(
             &ws.home,
@@ -2025,12 +1789,16 @@ mod tests {
 
         refused(apply_pack_action(&ws.orch, "install", "solo").unwrap_err());
         assert!(pack::lock::read_lock(&ws.home, "solo").is_none());
-        assert!(!ws.home.join("services/solo").exists());
-        assert!(!ws.home.join("skills/solo").exists());
+        assert!(!ws.home.join("packs/solo").exists());
         assert_eq!(pack_events(&ws), events, "a refusal emits nothing");
 
         as_operator(&ws, "install", "solo").unwrap();
-        assert!(ws.home.join("services/solo/service.yaml").is_file());
+        let ships_solo = |ws: &Workspace| {
+            pack::lock::read_lock(&ws.home, "solo")
+                .is_some_and(|lock| lock.item(PackItemKind::Service, "solo").is_some())
+        };
+        assert!(ships_solo(&ws));
+        assert!(!ws.home.join("services/solo").exists(), "never mirrored");
 
         refused(apply_pack_action(&ws.orch, "update", "solo").unwrap_err());
         as_operator(&ws, "update", "solo").unwrap();
@@ -2044,39 +1812,10 @@ mod tests {
             lock,
             "a refused restore leaves the removal recorded"
         );
-        assert!(!ws.home.join("services/solo").exists());
+        assert!(!ships_solo(&ws));
         assert_eq!(pack_events(&ws), events);
         as_operator(&ws, "restore", "solo").unwrap();
-        assert!(ws.home.join("services/solo/service.yaml").is_file());
-
-        let declaration = ws.home.join("services/solo/service.yaml");
-        write(&declaration, "name: Mine\n");
-        refused(
-            reset_pack_item(
-                &ws.orch,
-                "solo",
-                PackItemKind::Service,
-                "solo",
-                PackAuthority::Agent,
-            )
-            .unwrap_err(),
-        );
-        assert_eq!(
-            std::fs::read_to_string(&declaration).unwrap(),
-            "name: Mine\n"
-        );
-        reset_pack_item(
-            &ws.orch,
-            "solo",
-            PackItemKind::Service,
-            "solo",
-            PackAuthority::Operator,
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&declaration).unwrap(),
-            PROBE_SERVICE
-        );
+        assert!(ships_solo(&ws));
     }
 
     /// A restore discards the removal records BEFORE the sync that materializes
@@ -2165,18 +1904,17 @@ mod tests {
         let plugin = ws._temp.path().join("plugin");
         write_failure_plugin(&plugin, "first import\n", "old-command");
 
-        std::fs::remove_dir_all(ws.home.join("skills")).unwrap();
-        std::fs::write(ws.home.join("skills"), "blocks skill directory\n").unwrap();
-        import_agent_plugin(&ws.orch, &plugin).expect_err("later item must fail");
-        assert!(!ws.home.join("agents/first.md").exists());
+        // A file where the sync assembles the pack's next tree blocks staging.
+        let blocker = pack::lock::pack_dir(&ws.home, "rollback-plugin").join(".incoming");
+        write(&blocker, "blocks staging\n");
+        import_agent_plugin(&ws.orch, &plugin).expect_err("staging must fail");
         assert!(pack::lock::read_lock(&ws.home, "rollback-plugin").is_none());
         assert!(!pack::lock::mcp_path(&ws.home, "rollback-plugin").exists());
         assert!(!pack::lock::pack_dir(&ws.home, "rollback-plugin")
             .join("source")
             .exists());
 
-        std::fs::remove_file(ws.home.join("skills")).unwrap();
-        std::fs::create_dir_all(ws.home.join("skills")).unwrap();
+        std::fs::remove_file(&blocker).unwrap();
         import_agent_plugin(&ws.orch, &plugin).unwrap();
         let source = pack::lock::pack_dir(&ws.home, "rollback-plugin").join("source");
         let lock_before =
@@ -2190,19 +1928,12 @@ mod tests {
             .find(|item| item.kind == PackItemKind::Response)
             .and_then(|item| item.path.as_deref())
             .unwrap();
-        let agent_before = std::fs::read(ws.home.join(agent_path)).unwrap();
-        let skill_path = installed_lock
-            .items
-            .iter()
-            .find(|item| item.kind == PackItemKind::Workflow)
-            .and_then(|item| item.path.as_deref())
-            .unwrap();
+        let installed = |path: &str| ws.home.join("packs/rollback-plugin").join(path);
+        let agent_before = std::fs::read(installed(agent_path)).unwrap();
         write_failure_plugin(&plugin, "updated before failure\n", "new-command");
-        std::fs::remove_dir_all(ws.home.join(skill_path)).unwrap();
-        std::fs::write(ws.home.join(skill_path), "blocks replacement\n").unwrap();
-        let skill_before = std::fs::read(ws.home.join(skill_path)).unwrap();
+        write(&blocker, "blocks staging\n");
         let error = apply_pack_action(&ws.orch, "update", "rollback-plugin")
-            .expect_err("later item must fail");
+            .expect_err("staging must fail");
         assert!(!error.contains("rollback failed"), "{error}");
 
         assert_eq!(
@@ -2217,14 +1948,7 @@ mod tests {
             std::fs::read(source.join("plugin.json")).unwrap(),
             source_before
         );
-        assert_eq!(
-            std::fs::read(ws.home.join(agent_path)).unwrap(),
-            agent_before
-        );
-        assert_eq!(
-            std::fs::read(ws.home.join(skill_path)).unwrap(),
-            skill_before
-        );
+        assert_eq!(std::fs::read(installed(agent_path)).unwrap(), agent_before);
     }
 
     #[tokio::test]
@@ -2258,7 +1982,10 @@ mod tests {
         import_agent_plugin(&ws.orch, &plugin).unwrap();
         let lock = pack::lock::read_lock(&ws.home, "skill-check").unwrap();
         assert!(lock.item(PackItemKind::Skill, "good").is_some());
-        assert!(ws.home.join("skills/good/SKILL.md").is_file());
+        assert!(ws
+            .home
+            .join("packs/skill-check/skills/good/SKILL.md")
+            .is_file());
     }
 
     #[tokio::test]
@@ -2545,15 +2272,81 @@ mod tests {
         assert!(!entry.update_available && !entry.update_needs_review);
     }
 
+    /// Every file under `dir`, by relative path, with its bytes.
+    fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    out.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    /// Library condition 1 on cairn/6323: reading packs in place keeps update
+    /// review. An index update that changes a stdio server's command leaves
+    /// `packs/<id>/` byte-identical through a refresh and a startup sync, and
+    /// only the operator's apply changes it.
     #[tokio::test]
-    async fn a_content_update_applies_on_refresh_and_leaves_your_copy_alone() {
+    async fn an_index_update_changing_a_stdio_command_leaves_the_pack_untouched_until_applied() {
+        let mut fixture = LibraryFixture::new();
+        stdio_connector(&fixture, "acme", "acme-mcp");
+        fixture.publish();
+        let ws = library_workspace(&fixture).await;
+        refresh_library_sources(&ws.orch, true);
+        apply_pack_action(&ws.orch, "install", "acme").unwrap();
+        let pack_dir = pack::lock::pack_dir(&ws.home, "acme");
+        let installed = tree(&pack_dir);
+
+        stdio_connector(&fixture, "acme", "acme-mcp-v2");
+        fixture.publish();
+        refresh_library_sources(&ws.orch, true);
+        assert_eq!(
+            tree(&pack_dir),
+            installed,
+            "a refresh leaves the pack as installed"
+        );
+
+        sync_workspace_packs(
+            &RealGitClient,
+            &RealFileSystem,
+            &ws.resources,
+            &ws.home,
+            "1.0.0",
+        )
+        .unwrap();
+        assert_eq!(
+            tree(&pack_dir),
+            installed,
+            "startup re-stages only the version the lock records"
+        );
+
+        apply_pack_action_as(&ws.orch, "update", "acme", PackAuthority::Operator).unwrap();
+        assert_ne!(tree(&pack_dir), installed);
+        assert!(mcp_layer(&ws, "acme").contains("acme-mcp-v2"));
+    }
+
+    #[tokio::test]
+    async fn a_content_update_applies_on_refresh_under_your_definition() {
         let mut fixture = LibraryFixture::new();
         guides_pack(&fixture, "v1", "v1");
         fixture.publish();
         let ws = library_workspace(&fixture).await;
         refresh_library_sources(&ws.orch, true);
         apply_pack_action(&ws.orch, "install", "guides").unwrap();
-        write(&ws.home.join("skills/tips/SKILL.md"), "mine\n");
+        write(
+            &ws.home.join("skills/tips/SKILL.md"),
+            "---\nname: tips\ndescription: mine\n---\nmine\n",
+        );
 
         guides_pack(&fixture, "v2", "v2");
         fixture.publish();
@@ -2564,43 +2357,40 @@ mod tests {
             "{report:?}"
         );
         assert!(
-            std::fs::read_to_string(ws.home.join("skills/notes/SKILL.md"))
+            std::fs::read_to_string(ws.home.join("packs/guides/skills/notes/SKILL.md"))
                 .unwrap()
                 .contains("v2")
         );
-        assert_eq!(
-            std::fs::read_to_string(ws.home.join("skills/tips/SKILL.md")).unwrap(),
-            "mine\n",
-            "latest is always latest, except for your copy"
+        assert!(
+            std::fs::read_to_string(ws.home.join("packs/guides/skills/tips/SKILL.md"))
+                .unwrap()
+                .contains("v2"),
+            "latest is always latest, in the pack"
+        );
+        assert!(
+            std::fs::read_to_string(ws.home.join("skills/tips/SKILL.md"))
+                .unwrap()
+                .contains("mine")
         );
         assert_eq!(
             item_state(&ws, "guides", "skill", "tips"),
-            Some(PackItemState::EditedByUser)
+            Some(PackItemState::Shadowed)
         );
-        let catalog = pack_catalog(
-            &ws.home,
-            &ws.orch.library,
-            &crate::config::machine_services::MachineServiceSnapshot::empty(),
-        );
-        let tips = catalog
-            .find("guides")
-            .unwrap()
-            .items
-            .iter()
-            .find(|item| item.id == "tips")
-            .unwrap();
-        assert!(tips.behind_shipped, "your copy, behind shipped");
 
-        // Remove and restore come back from the snapshot, without a fetch.
+        // Remove and restore are the record alone, without a fetch.
         apply_pack_item_removal(&ws.orch, "guides", PackItemKind::Skill, "notes").unwrap();
-        assert!(!ws.home.join("skills/notes").exists());
+        let roots = cairn_config::library::LibraryRoots::workspace(&ws.home);
+        assert!(crate::config::skills::get_skill(&roots, "notes")
+            .unwrap()
+            .is_none());
         let restored = apply_pack_action(&ws.orch, "restore", "guides").unwrap();
         assert_eq!(restored.restored_items.len(), 1);
-        assert!(
-            std::fs::read_to_string(ws.home.join("skills/notes/SKILL.md"))
-                .unwrap()
-                .contains("v2")
-        );
+        let roots = cairn_config::library::LibraryRoots::workspace(&ws.home);
+        assert!(crate::config::skills::get_skill(&roots, "notes")
+            .unwrap()
+            .unwrap()
+            .prompt
+            .contains("v2"));
     }
 
     #[tokio::test]
@@ -2693,26 +2483,26 @@ mod tests {
         );
     }
 
+    /// Installing a pack that ships a name you already define is no conflict:
+    /// your definition stays in front, untouched, and the pack's sits behind.
     #[tokio::test]
-    async fn installing_over_your_own_skill_is_refused_naming_both_sides() {
+    async fn installing_a_pack_under_your_own_skill_keeps_yours_in_front() {
         let mut fixture = LibraryFixture::new();
         guides_pack(&fixture, "v1", "v1");
         fixture.publish();
         let ws = library_workspace(&fixture).await;
         refresh_library_sources(&ws.orch, true);
-        write(
-            &ws.home.join("skills/notes/SKILL.md"),
-            "---\nname: notes\n---\nmine\n",
+        let mine = "---\nname: notes\ndescription: mine\n---\nmine\n";
+        write(&ws.home.join("skills/notes/SKILL.md"), mine);
+        apply_pack_action(&ws.orch, "install", "guides").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.home.join("skills/notes/SKILL.md")).unwrap(),
+            mine
         );
-        let error = apply_pack_action(&ws.orch, "install", "guides").unwrap_err();
-        assert!(
-            error.starts_with(
-                "you already have your own skill `notes` at `skills/notes`, which no pack installed"
-            ),
-            "{error}"
+        assert_eq!(
+            item_state(&ws, "guides", "skill", "notes"),
+            Some(PackItemState::Shadowed)
         );
-        assert!(error.contains(&fixture.source().url), "{error}");
-        assert!(pack::lock::read_lock(&ws.home, "guides").is_none());
         assert!(stage_dirs(&ws).is_empty());
     }
 

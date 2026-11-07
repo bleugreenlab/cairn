@@ -3,6 +3,7 @@ use crate::backends::run_state::run_backend_db;
 use crate::backends::AgentBackend;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
+use cairn_config::library::LibraryRoots;
 use cairn_db::turso::params;
 use cairn_models::codex::app_server::AppServerClient;
 use serde_json::Value;
@@ -195,10 +196,13 @@ fn load_codex_allowed_tools_for_run(
         None
     }
     .or_else(|| {
-        config_agents::get_agent(&orch.config_dir, &agent_config_id, project_path.as_deref())
-            .ok()
-            .flatten()
-            .map(|agent| (agent.tools, agent.disallowed_tools.unwrap_or_default()))
+        config_agents::get_agent(
+            &LibraryRoots::at(&orch.config_dir, project_path.as_deref()),
+            &agent_config_id,
+        )
+        .ok()
+        .flatten()
+        .map(|agent| (agent.tools, agent.disallowed_tools.unwrap_or_default()))
     });
 
     let Some((tools, disallowed_tools)) = tool_config else {

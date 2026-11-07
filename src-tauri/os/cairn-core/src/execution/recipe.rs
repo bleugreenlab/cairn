@@ -7,11 +7,11 @@
 //! Functions taking `&Orchestrator` also need config/settings access.
 
 use cairn_common::ids;
+use cairn_config::library::LibraryRoots;
 use cairn_models::types::catalog::VerbKind;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::get_recipe_from_files;
 use crate::models::Continuity;
 
 pub(crate) fn get_selected_recipe(
@@ -20,18 +20,23 @@ pub(crate) fn get_selected_recipe(
     project_id: &str,
     recipe_id: &str,
 ) -> Result<crate::models::Recipe, String> {
-    let file_recipe =
-        crate::config::recipes::get_recipe(config_dir, recipe_id, Some(project_path))?
-            .ok_or_else(|| format!("Recipe not found: {recipe_id}"))?;
+    let file_recipe = crate::config::recipes::get_recipe(
+        &LibraryRoots::at(config_dir, Some(project_path)),
+        recipe_id,
+    )?
+    .ok_or_else(|| format!("Recipe not found: {recipe_id}"))?;
+    // The policy names recipes by id; a pack-pinned address is checked as the
+    // recipe it resolved to.
+    let id = file_recipe.recipe.id.as_str();
     let policy = crate::config::contextual_packages::load_contextual_packages(Some(project_path));
     let selection = policy.selection(
         crate::config::contextual_packages::ContextualPackageKind::Recipe,
-        recipe_id,
+        id,
         &file_recipe.bundles,
     );
     if !policy.is_selected(
         crate::config::contextual_packages::ContextualPackageKind::Recipe,
-        recipe_id,
+        id,
         &file_recipe.bundles,
     ) {
         let reason = if matches!(
@@ -372,7 +377,7 @@ async fn launch_recipe_execution(
     let mut snapshot = build_execution_snapshot_from_files(
         orch,
         Some(&project_path),
-        &recipe.id,
+        &recipe,
         Some(issue_id),
         project_id,
         trigger_type.clone(),
@@ -389,8 +394,10 @@ async fn launch_recipe_execution(
         Some(LaunchCustomization::Deltas(deltas)) => {
             let resolve_agent =
                 |agent_id: &str| -> Result<Option<crate::models::AgentSnapshot>, String> {
-                    match config_agents::get_agent(&orch.config_dir, agent_id, Some(&project_path))
-                    {
+                    match config_agents::get_agent(
+                        &LibraryRoots::at(&orch.config_dir, Some(&project_path)),
+                        agent_id,
+                    ) {
                         Ok(Some(file_agent)) => Ok(Some(file_agent.snapshot())),
                         Ok(None) => Ok(None),
                         Err(error) => Err(format!("Failed to load agent '{agent_id}': {error}")),
@@ -430,9 +437,10 @@ async fn launch_recipe_execution(
         if !new_agent_ids.is_empty() {
             // Load each new agent
             for agent_id in new_agent_ids {
-                if let Ok(Some(file_agent)) =
-                    config_agents::get_agent(&orch.config_dir, &agent_id, Some(&project_path))
-                {
+                if let Ok(Some(file_agent)) = config_agents::get_agent(
+                    &LibraryRoots::at(&orch.config_dir, Some(&project_path)),
+                    &agent_id,
+                ) {
                     snapshot
                         .agents
                         .insert(agent_id.clone(), file_agent.snapshot());
@@ -592,7 +600,7 @@ pub async fn start_manual_execution_impl(
     let mut snapshot = build_execution_snapshot_from_files(
         orch,
         Some(&project_path),
-        &recipe.id,
+        &recipe,
         None,
         project_id,
         TriggerType::Manual,
@@ -676,7 +684,7 @@ pub(crate) async fn start_event_triggered_execution(
     let snapshot = build_execution_snapshot_from_files(
         orch,
         Some(&project_path),
-        &recipe.id,
+        recipe,
         issue_id,
         project_id,
         trigger_type,
@@ -952,8 +960,11 @@ pub async fn resolve_recipe_launch(
         &ladder.default_models,
         offered,
         |agent_id| {
-            config_agents::get_agent(&config_dir, agent_id, Some(&project_path))
-                .map_err(|e| e.to_string())
+            config_agents::get_agent(
+                &LibraryRoots::at(&config_dir, Some(&project_path)),
+                agent_id,
+            )
+            .map_err(|e| e.to_string())
         },
         |allotment, constraints| {
             orch.select_models(
@@ -1579,7 +1590,23 @@ pub(crate) async fn resolve_filed_recipe_id(
     let project_path = project_repo_path(db, project_id)
         .await?
         .map(std::path::PathBuf::from);
-    let resolved = crate::config::recipes::get_recipe(config_dir, recipe, project_path.as_deref())?;
+    let resolved = crate::config::recipes::get_recipe(
+        &LibraryRoots::at(config_dir, project_path.as_deref()),
+        recipe,
+    )?;
+    // A pack-pinned address names one pack's recipe; its stem would let the
+    // launch resolve whatever stands in front of it.
+    if resolved.is_some()
+        && matches!(
+            cairn_config::library::LibraryRef::parse(
+                cairn_config::library::LibraryKind::Recipe,
+                recipe
+            ),
+            Ok(cairn_config::library::LibraryRef::Pack { .. })
+        )
+    {
+        return Ok(Some(recipe.to_string()));
+    }
     Ok(Some(resolved.map_or_else(
         || recipe.to_string(),
         |file_recipe| file_recipe.recipe.id,
@@ -1611,18 +1638,22 @@ async fn resolve_owning_db_for_project(
         .map_err(|e| e.to_string())
 }
 
+/// Snapshot `recipe` as the caller resolved it. The recipe is passed in, not
+/// looked up again by id: a pack-pinned launch (`cairn://packs/<pack>/recipes/
+/// <name>`) resolved a specific pack's recipe, and re-resolving its bare id
+/// would snapshot whatever stands in front of it, or refuse on a collision.
 #[allow(clippy::too_many_arguments)]
 fn build_execution_snapshot_from_files(
     orch: &Orchestrator,
     project_path: Option<&Path>,
-    recipe_id: &str,
+    recipe: &crate::models::Recipe,
     issue_id: Option<&str>,
     project_id: &str,
     trigger_type: TriggerType,
     event_payload: Option<serde_json::Value>,
 ) -> Result<ExecutionSnapshot, String> {
     let config_dir = orch.config_dir.as_path();
-    let recipe = get_recipe_from_files(config_dir, project_path, recipe_id)?;
+    let recipe = recipe.clone();
     // Every launch path builds its snapshot here, so this is where a decision
     // node with nothing to answer it is refused: at launch, never mid-run
     // where it would only block.
@@ -1650,7 +1681,8 @@ fn build_execution_snapshot_from_files(
         })
         .collect();
     for agent_id in agent_ids {
-        if let Ok(Some(file_agent)) = config_agents::get_agent(config_dir, &agent_id, project_path)
+        if let Ok(Some(file_agent)) =
+            config_agents::get_agent(&LibraryRoots::at(config_dir, project_path), &agent_id)
         {
             for (skill_id, skill_snapshot) in &all_skills {
                 skills
@@ -1680,7 +1712,8 @@ fn load_all_skills(
     project_path: Option<&Path>,
 ) -> std::collections::HashMap<String, SkillSnapshot> {
     let mut skills = std::collections::HashMap::new();
-    if let Ok(file_skills) = config_skills::list_skills(config_dir, project_path) {
+    if let Ok(file_skills) = config_skills::list_skills(&LibraryRoots::at(config_dir, project_path))
+    {
         for result in file_skills {
             if let ConfigResult::Ok(skill) = result {
                 // config_root_subdirs yields project first, so keep the first
@@ -1706,6 +1739,8 @@ mod tests {
     use crate::execution::model_selection::tests::{run_entries, windows};
     use crate::models::{AgentNodeConfig, Model, NodePosition, RecipeEdge, RecipeTrigger};
     use cairn_config::allotment::NodeConstraints;
+    #[allow(unused_imports)]
+    use cairn_config::library::{LibraryRoots, Origin};
 
     fn agent_node(id: &str, agent_id: &str) -> RecipeNode {
         RecipeNode {
@@ -1775,7 +1810,7 @@ mod tests {
             hooks: None,
             icon: None,
             bundles: Vec::new(),
-            is_project_scoped: true,
+            origin: Origin::Project { key: "demo".into() },
             file_path: std::path::PathBuf::new(),
             seed_budget_tokens: None,
             seed_eras: None,
@@ -2009,5 +2044,84 @@ mod tests {
             serde_json::json!({"kind": "tier", "value": "lg"})
         )
         .is_err());
+    }
+
+    fn recipe_yaml(name: &str) -> String {
+        format!(
+            "cairnVersion: 1\nname: {name}\ntrigger: manual\nnodes:\n  - id: trigger-1\n    type: trigger\n    name: Trigger\n    position: 0@0\nedges: []\n"
+        )
+    }
+
+    /// A launch that names `cairn://packs/<pack>/recipes/<name>` snapshots that
+    /// pack's recipe: not a workspace recipe standing in front of it, and not a
+    /// refusal when another pack defines the same name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pack_pinned_launch_snapshots_the_pinned_pack_s_recipe() {
+        use cairn_config::library::{test_support, LibraryKind};
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("home");
+        let project_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        test_support::install_pack_lock(&config_dir, "core", &[]);
+        test_support::write_item(
+            &test_support::pack_root(&config_dir, "core"),
+            LibraryKind::Recipe,
+            "build",
+            &recipe_yaml("Core Build"),
+        );
+        test_support::write_item(
+            &config_dir,
+            LibraryKind::Recipe,
+            "build",
+            &recipe_yaml("My Build"),
+        );
+
+        let local = Arc::new(crate::storage::migrated_test_db("pinned-launch.db").await);
+        let index = Arc::new(
+            crate::storage::SearchIndex::open_or_create(temp.path().join("index")).unwrap(),
+        );
+        let dbs = Arc::new(crate::db::DbState::new(local, index));
+        let services = Arc::new(crate::services::testing::TestServicesBuilder::new().build());
+        let orch =
+            crate::orchestrator::OrchestratorBuilder::new(dbs, services, config_dir.clone()).build();
+
+        let snapshot_of = |reference: &str| {
+            let recipe = get_selected_recipe(&config_dir, &project_dir, "p", reference)?;
+            build_execution_snapshot_from_files(
+                &orch,
+                Some(&project_dir),
+                &recipe,
+                None,
+                "p",
+                TriggerType::Manual,
+                None,
+            )
+        };
+
+        // The workspace's recipe stands in front of the pack's.
+        assert_eq!(snapshot_of("build").unwrap().recipe.name, "My Build");
+        assert_eq!(
+            snapshot_of("cairn://packs/core/recipes/build").unwrap().recipe.name,
+            "Core Build"
+        );
+
+        // Two packs and nothing local: the bare name is refused, each pin is not.
+        std::fs::remove_file(config_dir.join("recipes/build.yaml")).unwrap();
+        test_support::install_pack_lock(&config_dir, "extra", &[]);
+        test_support::write_item(
+            &test_support::pack_root(&config_dir, "extra"),
+            LibraryKind::Recipe,
+            "build",
+            &recipe_yaml("Extra Build"),
+        );
+        assert!(snapshot_of("build").is_err());
+        assert_eq!(
+            snapshot_of("cairn://packs/core/recipes/build").unwrap().recipe.name,
+            "Core Build"
+        );
+        assert_eq!(
+            snapshot_of("cairn://packs/extra/recipes/build").unwrap().recipe.name,
+            "Extra Build"
+        );
     }
 }

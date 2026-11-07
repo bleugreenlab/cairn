@@ -1,11 +1,10 @@
 //! Resource packs: the unit of offering and installing Cairn resources.
 //!
-//! A pack is a **source-side** grouping. Installing one copies its contents into
-//! the flat `~/.cairn` layout (`agents/`, `recipes/`, `responses/`, `routes/`,
-//! `services/`, `skills/`, `workflows/`) that discovery and global ids already assume — packs do not
-//! namespace what they install. That is what makes repacking the shipped tree a
-//! pure file move: an existing workspace's files already sit at exactly the
-//! paths a pack-aware sync would write, so the migration writes nothing.
+//! Installing a pack stages its items under `packs/<id>/`, at the same paths
+//! they have in the pack's source, and they are read there (tenet 1434). A
+//! pack's files are never copied out into the workspace and never edited; a
+//! user's own definition is a different file in front of the pack's, resolved
+//! nearest-first by `cairn_config::library`.
 //!
 //! - [`manifest`] describes a pack at its source (native `cairn-pack.yaml`, an
 //!   ingested Claude Code plugin, a bare `SKILL.md`, or bare conventions).
@@ -21,9 +20,9 @@ pub mod library;
 pub mod lock;
 pub mod manifest;
 pub mod mcp;
+pub mod migrate_v3;
 pub mod provider;
 pub mod provider_options;
-pub mod restore;
 pub mod server_config;
 
 use std::path::{Path, PathBuf};
@@ -33,7 +32,6 @@ use sha2::{Digest, Sha256};
 pub use install::*;
 pub use lock::{installed_packs, PackLock, PackLockItem, PackSource, PackSourceKind, UpstreamRef};
 pub use manifest::{ItemRuns, PackFormat, PackItem, PackItemKind, PackManifest};
-pub use restore::{bundled_resource_ids, mirror_bundle_resources, RestoreResult};
 
 use crate::server_config::McpServerConfig;
 use cairn_platform::services::{guarded_resolve_file, guarded_tree_files};
@@ -70,19 +68,6 @@ pub fn hash_tree(root: &Path) -> Result<ContentHash, String> {
         return Ok(ContentHash::Missing);
     }
     Ok(ContentHash::Present(hash_tree_present(root, false)?))
-}
-
-/// The tree hash as it was computed before OS metadata was excluded.
-///
-/// Lock baselines recorded by earlier builds hashed whatever `.DS_Store` sat in
-/// a skill or workflow directory at the time. Comparing such a baseline against
-/// [`hash_tree`] would read that file's absence from the new hash as a user
-/// edit, so ownership checks fall back to this before declaring a fork.
-pub fn hash_tree_including_os_metadata(root: &Path) -> Result<ContentHash, String> {
-    if !root.exists() {
-        return Ok(ContentHash::Missing);
-    }
-    Ok(ContentHash::Present(hash_tree_present(root, true)?))
 }
 
 /// Whether a package-relative path is metadata a file browser or archiver
@@ -131,7 +116,7 @@ pub fn hash_mcp_definition(config: &McpServerConfig) -> Result<String, String> {
 
 /// Recursively sort every object key, so a value holding `HashMap`s serializes
 /// to the same bytes on every run.
-pub(crate) fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+pub fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(values) => {
             serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
@@ -147,11 +132,9 @@ pub(crate) fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Content directories a pack may ship, and the exact subtrees a workspace
-/// install materializes. Flat dirs (`agents`, `recipes`, `responses`, `routes`)
-/// are per-file copy-when-missing with in-place pack updates; package dirs
-/// (`services`, `skills`, `workflows`) are whole-directory copy-when-missing and
-/// never overwritten, so a user's edited package is preserved.
+/// Content directories a pack may ship. Each is also a directory a user's own
+/// definitions live in, in the workspace or a project, except `services`: a
+/// machine service only ever runs from the app bundle's declaration.
 pub const CONTENT_DIRS: [&str; 7] = [
     "agents",
     "recipes",
@@ -162,19 +145,15 @@ pub const CONTENT_DIRS: [&str; 7] = [
     "workflows",
 ];
 
-/// Content directories a pack may ship that install into the pack's own
-/// `packs/<id>/` layer instead of the flat workspace (see
+/// Content directories a pack may ship that only ever live in a pack: no
+/// user layer defines a credential or provider (see
 /// [`PackItemKind::in_pack_layer`]).
 pub const PACK_LAYER_DIRS: [&str; 2] = [provider::CREDENTIALS_DIR, provider::PROVIDERS_DIR];
 
 /// Where an installed file item lives, relative to the workspace config home:
-/// its own path for a flat kind, under `packs/<id>/` for a pack-layer kind.
-pub fn item_destination_rel(pack_id: &str, kind: PackItemKind, path: &str) -> String {
-    if kind.in_pack_layer() {
-        format!("{}/{pack_id}/{path}", lock::PACKS_DIR)
-    } else {
-        path.to_string()
-    }
+/// `packs/<id>/<its path in the pack>`, for every kind.
+pub fn item_destination_rel(pack_id: &str, _kind: PackItemKind, path: &str) -> String {
+    format!("{}/{pack_id}/{path}", lock::PACKS_DIR)
 }
 
 /// [`item_destination_rel`] joined onto `config_dir`.
@@ -254,8 +233,8 @@ pub fn discover_available_packs(resource_dir: &Path) -> Vec<PackManifest> {
     packs
 }
 
-/// Record that a workspace item the user just deleted came from an installed
-/// pack, so the next sync does not copy it straight back.
+/// Record that the user removed an item from whichever installed pack ships
+/// it, so the pack keeps updating around the gap.
 ///
 /// Best-effort and side-effect-only: an item no installed pack claims is simply
 /// the user's own content, and a lock that cannot be written is logged rather
@@ -279,14 +258,19 @@ pub fn available_pack(resource_dir: &Path, id: &str) -> Option<PackManifest> {
 }
 
 /// Content hash of every file under `root`, path-and-length framed so a rename
-/// cannot collide with an edit. This is the per-pack replacement for the old
-/// single global `.bundle-sync` marker: an unchanged hash short-circuits that
-/// pack's sync entirely.
+/// cannot collide with an edit. An unchanged hash is how a sync knows a
+/// pack's source has not moved.
 pub fn content_hash(root: &Path) -> Result<String, String> {
     hash_tree_present(root, false)
 }
 
-fn hash_tree_present(root: &Path, include_os_metadata: bool) -> Result<String, String> {
+/// Every file under `root` as `(prefix/relative path, bytes)`, OS metadata
+/// left out unless asked for.
+pub(crate) fn tree_entries(
+    root: &Path,
+    prefix: &str,
+    include_os_metadata: bool,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut entries = Vec::new();
     if root.exists() {
         for file in guarded_tree_files(root)? {
@@ -301,9 +285,18 @@ fn hash_tree_present(root: &Path, include_os_metadata: bool) -> Result<String, S
                 .join("/");
             let bytes = std::fs::read(&file.resolved_path)
                 .map_err(|e| format!("Failed to read resource {:?}: {e}", file.resolved_path))?;
-            entries.push((relative_path, bytes));
+            entries.push((format!("{prefix}{relative_path}"), bytes));
         }
     }
+    Ok(entries)
+}
+
+pub(crate) fn hash_tree_present(root: &Path, include_os_metadata: bool) -> Result<String, String> {
+    Ok(hash_entries(tree_entries(root, "", include_os_metadata)?))
+}
+
+/// The framed hash of a set of `(path, bytes)` entries, in path order.
+pub(crate) fn hash_entries(mut entries: Vec<(String, Vec<u8>)>) -> String {
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     let mut hasher = Sha256::new();
@@ -315,7 +308,7 @@ fn hash_tree_present(root: &Path, include_os_metadata: bool) -> Result<String, S
         hasher.update((file_hash.len() as u64).to_le_bytes());
         hasher.update(file_hash.as_bytes());
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -457,12 +450,7 @@ mod tests {
         assert_eq!(
             hash_tree(&skill).unwrap(),
             clean,
-            "opening a skill in Finder must not fork it"
-        );
-        assert_ne!(
-            hash_tree_including_os_metadata(&skill).unwrap(),
-            clean,
-            "the legacy hash still sees metadata, which is what lets old baselines match"
+            "opening a skill in Finder must not change it"
         );
 
         write(&skill.join(".meta.json"), "{\"source\":\"agent\"}");
@@ -486,7 +474,7 @@ mod tests {
         assert_eq!(
             hash(&service),
             clean,
-            "opening it in Finder must not fork it"
+            "opening it in Finder must not change it"
         );
 
         write(&service.join("service.yaml"), "name: Mine\n");

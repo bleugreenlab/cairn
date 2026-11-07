@@ -22,8 +22,7 @@ use crate::config::pack::library::{EntryOrigin, EntryRefusal, IndexEntry, Librar
 use crate::config::pack::mcp::McpVarRequirement;
 use crate::config::pack::server_config::McpServerConfig;
 use crate::config::pack::{
-    self, ContentHash, ItemRuns, PackItem, PackItemKind, PackLock, PackManifest, PackSourceKind,
-    UpstreamRef,
+    self, ItemRuns, PackItem, PackItemKind, PackLock, PackManifest, PackSourceKind, UpstreamRef,
 };
 use crate::library::{LibraryContext, PendingUpdate, RuntimeChange};
 use crate::project_services::declaration::Transport;
@@ -206,24 +205,27 @@ impl PackState {
     }
 }
 
-/// What has happened to one item of an installed pack.
+/// Whether one item of an installed pack is what its name resolves to.
 ///
-/// This is the backend's verdict, not a hint: an update preserves an
-/// `EditedByUser` local copy, an uninstall keeps it, and
-/// a `RemovedByUser` item stays out until the pack is explicitly restored.
+/// A pack's item is read where the pack installed it and never edited, so
+/// this is a fact about resolution, not ownership: the pack's item is in use,
+/// or a definition of the user's is in front of it, or another pack defines
+/// the same name and resolving it is refused, or the user removed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PackItemState {
-    PackOwned,
-    EditedByUser,
+    InUse,
+    Shadowed,
+    Collides,
     RemovedByUser,
 }
 
 impl PackItemState {
     pub fn as_str(self) -> &'static str {
         match self {
-            PackItemState::PackOwned => "pack-owned",
-            PackItemState::EditedByUser => "edited-by-user",
+            PackItemState::InUse => "in-use",
+            PackItemState::Shadowed => "shadowed",
+            PackItemState::Collides => "collides",
             PackItemState::RemovedByUser => "removed-by-user",
         }
     }
@@ -240,11 +242,13 @@ pub struct PackCatalogItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub state: PackItemState,
-    /// For the user's copy of a file-backed item: whether the version the app
-    /// ships now differs from it. This is the case worth acting on -- a copy
-    /// that merely equals the shipped one costs nothing to keep.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub behind_shipped: bool,
+    /// For a shadowed item, what is in front of it: `~` (the workspace) for a
+    /// library item, `settings` for an MCP server the user defines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadowed_by: Option<String>,
+    /// For a colliding item, the other installed packs defining its name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collides_with: Vec<String>,
     /// Why an MCP item cannot connect yet, straight from the registry that
     /// decides it. The UI renders this verdict; it never re-derives one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -470,11 +474,9 @@ pub struct PackCatalogEntry {
     pub items: Vec<PackCatalogItem>,
     /// Live (non-removed) item counts by kind.
     pub counts: Vec<PackContentCount>,
-    /// How many items are the user's copies, and how many of those the app now
-    /// ships differently -- the line a pack row states so a frozen copy is
-    /// visible without opening the pack.
-    pub edited_count: usize,
-    pub behind_count: usize,
+    /// How many items a definition of the user's stands in front of, the line
+    /// a pack row states so a shadowed item is visible without opening it.
+    pub shadowed_count: usize,
     /// The catalog section this entry belongs in: [`PACK_ENTRY_KIND`] for a
     /// bundle, or the kind of the one item it ships. See [`entry_kind`].
     pub entry_kind: String,
@@ -516,11 +518,11 @@ fn entry_kind(items: &[PackCatalogItem]) -> String {
 }
 
 impl PackCatalogEntry {
-    /// Items the user has made theirs.
-    fn edited_items(&self) -> Vec<&PackCatalogItem> {
+    /// Items a definition of the user's stands in front of.
+    fn shadowed_items(&self) -> Vec<&PackCatalogItem> {
         self.items
             .iter()
-            .filter(|item| item.state == PackItemState::EditedByUser)
+            .filter(|item| item.state == PackItemState::Shadowed)
             .collect()
     }
 
@@ -688,6 +690,8 @@ pub fn pack_catalog(
     let resource_dir = pack::source_dir(config_dir);
     let mcp_entries = workspace_mcp_entries(config_dir, machines);
     let (views, sources) = pack_views(resource_dir.as_deref(), config_dir, library);
+    let resolved =
+        crate::config::library_index(&cairn_config::library::LibraryRoots::workspace(config_dir));
     let packs = views
         .iter()
         .map(|view| {
@@ -696,6 +700,7 @@ pub fn pack_catalog(
                 resource_dir.as_deref(),
                 view,
                 &mcp_entries,
+                &resolved,
                 library,
                 machines,
             )
@@ -713,6 +718,7 @@ fn project(
     resource_dir: Option<&Path>,
     view: &PackView,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
+    resolved: &ResolvedIndex,
     library: &LibraryContext,
     machines: &MachineServiceSnapshot,
 ) -> PackCatalogEntry {
@@ -735,10 +741,10 @@ fn project(
         .into_iter()
         .map(|item| {
             let kind = item.kind;
-            let verdict = file_item_verdict(config_dir, view, &item);
-            let state = item_state(&view.id, &item, verdict.edited, mcp_entries);
-            let mut entry = catalog_item(item, state, mcp_entries);
-            entry.behind_shipped = verdict.behind;
+            let resolution = item_resolution(&view.id, &item, mcp_entries, resolved);
+            let mut entry = catalog_item(item, resolution.state, mcp_entries);
+            entry.shadowed_by = resolution.shadowed_by;
+            entry.collides_with = resolution.collides_with;
             classify(&mut entry, kind);
             if kind == PackItemKind::Service && view.installed.is_some() {
                 entry.machine_service =
@@ -828,11 +834,10 @@ fn project(
             })
             .collect(),
         entry_kind: entry_kind(&items),
-        edited_count: items
+        shadowed_count: items
             .iter()
-            .filter(|item| item.state == PackItemState::EditedByUser)
+            .filter(|item| item.state == PackItemState::Shadowed)
             .count(),
-        behind_count: items.iter().filter(|item| item.behind_shipped).count(),
         items,
     }
 }
@@ -898,18 +903,16 @@ fn machine_service_item(
     })
 }
 
-#[derive(Default)]
-struct ItemVerdict {
-    edited: bool,
-    behind: bool,
-}
+/// What each bare name resolves to in the workspace (see
+/// [`crate::config::library_index`]).
+type ResolvedIndex = BTreeMap<
+    (cairn_config::library::LibraryKind, String),
+    (
+        cairn_config::library::Origin,
+        cairn_config::library::ListedStatus,
+    ),
+>;
 
-/// Whether one file-backed item is the user's copy, and whether the app ships
-/// something different from it.
-///
-/// Read live from content hashes against the lock baseline and the shipped
-/// source -- never from Git -- so an edit saved a moment ago reads as the
-/// user's copy before the next sync records the fork.
 /// Fill a provider or credential item from its declaration: the installed
 /// layer when the pack is installed (with the credential's presence and the
 /// provider's readiness), else the shipped source (presence always false).
@@ -998,44 +1001,6 @@ fn describe_web_service_item(
     }
 }
 
-fn file_item_verdict(config_dir: &Path, view: &PackView, item: &PackItem) -> ItemVerdict {
-    let Some(locked) = view
-        .installed
-        .as_ref()
-        .and_then(|lock| lock.item(item.kind, &item.id))
-    else {
-        return ItemVerdict::default();
-    };
-    let (Some(path), Some(_)) = (&item.path, &locked.content_hash) else {
-        return ItemVerdict {
-            edited: locked.forked,
-            behind: false,
-        };
-    };
-    let current = pack::hash_item_path(
-        item.kind,
-        config_dir,
-        &pack::item_destination(config_dir, &view.id, item.kind, path),
-    )
-    .unwrap_or(ContentHash::Missing);
-    if current == ContentHash::Missing {
-        return ItemVerdict {
-            edited: locked.forked,
-            behind: false,
-        };
-    }
-    let edited =
-        locked.forked || !pack::matches_baseline(config_dir, locked, &current).unwrap_or(false);
-    let behind = edited
-        && view.shipped_root(config_dir).is_some_and(|root| {
-            matches!(
-                pack::hash_item_path(item.kind, &root, &root.join(path)),
-                Ok(shipped @ ContentHash::Present(_)) if shipped != current
-            )
-        });
-    ItemVerdict { edited, behind }
-}
-
 fn source_info(view: &PackView, library: &LibraryContext) -> PackSourceInfo {
     let bundled = || PackSourceInfo {
         kind: "bundled".to_string(),
@@ -1098,35 +1063,61 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Whether the user has taken ownership of one live item.
+struct ItemResolution {
+    state: PackItemState,
+    shadowed_by: Option<String>,
+    collides_with: Vec<String>,
+}
+
+/// Whether one live item of pack `pack_id` is what its name resolves to.
 ///
-/// A live item is the user's copy when its lock records a fork or its content
-/// no longer matches the baseline (`edited`, see [`file_item_verdict`]). An MCP
-/// server additionally becomes the user's copy when the resolved registry no
-/// longer attributes it to this pack:
-/// a user who saved their own version of a pack server shadows it in
-/// `settings.yaml`, and the entry's origin flips to `workspace`.
-fn item_state(
+/// A library item is shadowed when a definition of the user's resolves in
+/// front of it, and collides when another pack defines the same name with
+/// nothing local in front. An MCP server is shadowed when the user's own
+/// `settings.yaml` defines a server of that name, which the registry then
+/// attributes to the workspace instead of this pack.
+fn item_resolution(
     pack_id: &str,
     item: &PackItem,
-    edited: bool,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
-) -> PackItemState {
-    let forked = edited;
+    resolved: &ResolvedIndex,
+) -> ItemResolution {
+    use cairn_config::library::{LibraryKind, ListedStatus, Origin};
+    let in_use = ItemResolution {
+        state: PackItemState::InUse,
+        shadowed_by: None,
+        collides_with: Vec::new(),
+    };
     if item.kind == PackItemKind::Mcp {
         let shadowed = mcp_entries
             .get(&item.id)
             .is_some_and(|entry| entry.origin != format!("pack:{pack_id}"));
-        return if forked || shadowed {
-            PackItemState::EditedByUser
+        return if shadowed {
+            ItemResolution {
+                state: PackItemState::Shadowed,
+                shadowed_by: Some("settings".to_string()),
+                collides_with: Vec::new(),
+            }
         } else {
-            PackItemState::PackOwned
+            in_use
         };
     }
-    if forked {
-        PackItemState::EditedByUser
-    } else {
-        PackItemState::PackOwned
+    let Some(kind) = LibraryKind::from_pack_kind(item.kind) else {
+        return in_use;
+    };
+    match resolved.get(&(kind, item.id.clone())) {
+        Some((Origin::Pack { id }, ListedStatus::Active)) if id == pack_id => in_use,
+        Some((origin, ListedStatus::Active)) => ItemResolution {
+            state: PackItemState::Shadowed,
+            shadowed_by: Some(origin.label()),
+            collides_with: Vec::new(),
+        },
+        Some((_, ListedStatus::Collision { packs })) => ItemResolution {
+            state: PackItemState::Collides,
+            shadowed_by: None,
+            collides_with: packs.iter().filter(|p| *p != pack_id).cloned().collect(),
+        },
+        _ => in_use,
     }
 }
 
@@ -1143,7 +1134,8 @@ fn catalog_item(
         id: item.id,
         path: item.path,
         state,
-        behind_shipped: false,
+        shadowed_by: None,
+        collides_with: Vec::new(),
         not_ready: entry.and_then(|e| e.not_ready.clone()),
         setup: entry.map(|e| e.setup.clone()).unwrap_or_default(),
         runs: ItemRuns::Content,
@@ -1154,8 +1146,8 @@ fn catalog_item(
     }
 }
 
-/// The shipped and installed text of one pack item, for a side-by-side view of
-/// what a reset would replace.
+/// The pack's text of one item beside the user's own definition of the same
+/// name, for a side-by-side view of what that definition changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackItemDiff {
@@ -1170,12 +1162,12 @@ pub struct PackItemDiff {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackItemFileDiff {
-    /// Workspace-relative path.
+    /// The item-relative path, the same in the pack and in the workspace.
     pub path: String,
-    /// Absent when the app does not ship this file.
+    /// Absent when the pack's item has no such file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shipped: Option<String>,
-    /// Absent when the workspace copy has no such file.
+    /// Absent when your definition has no such file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yours: Option<String>,
     /// True when either side is not UTF-8; neither text is sent.
@@ -1183,40 +1175,34 @@ pub struct PackItemFileDiff {
     pub binary: bool,
 }
 
-/// Compare one file-backed item of a pack with the workspace copy: the app's
-/// copy for a bundled pack, the verified snapshot for a local or library one.
+/// Compare one item of an installed pack, as installed under `packs/<id>/`,
+/// with the workspace's own definition of the same name, which sits at the
+/// same relative path in the workspace.
 pub fn pack_item_diff(
     config_dir: &Path,
     pack_id: &str,
     kind: PackItemKind,
     item_id: &str,
 ) -> Result<PackItemDiff, String> {
-    let manifest = match pack::lock::read_lock(config_dir, pack_id) {
-        Some(lock) if lock.source.kind != PackSourceKind::Bundled => {
-            crate::library::snapshot_manifest(config_dir, &lock)?
-        }
-        _ => {
-            let resource_dir = pack::source_dir(config_dir)
-                .ok_or("This workspace has no recorded app resource directory yet")?;
-            pack::available_pack(&resource_dir, pack_id)
-                .ok_or_else(|| format!("No pack `{pack_id}` is shipped"))?
-        }
-    };
-    let item = manifest
-        .items()
-        .into_iter()
+    let lock = pack::lock::read_lock(config_dir, pack_id)
+        .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
+    let item = lock
+        .items
+        .iter()
+        .map(pack::PackLockItem::manifest_item)
+        .chain(lock.removed.iter().cloned())
         .find(|item| item.kind == kind && item.id == item_id)
         .ok_or_else(|| {
             format!(
-                "Pack `{pack_id}` does not ship {} `{item_id}`",
+                "Pack `{pack_id}` does not carry {} `{item_id}`",
                 kind.as_str()
             )
         })?;
     let path = item
         .path
         .ok_or_else(|| format!("{} `{item_id}` has no file to compare", kind.as_str()))?;
-    let shipped_root = manifest.root.join(&path);
-    let yours_root = pack::item_destination(config_dir, pack_id, kind, &path);
+    let shipped_root = pack::item_destination(config_dir, pack_id, kind, &path);
+    let yours_root = config_dir.join(&path);
 
     let mut files = Vec::new();
     if matches!(
@@ -1314,12 +1300,24 @@ fn item_label(item: &PackCatalogItem) -> String {
         });
     }
     match item.state {
-        PackItemState::EditedByUser if item.behind_shipped => {
-            label.push_str(" (your copy, behind shipped)")
-        }
-        PackItemState::EditedByUser => label.push_str(" (your copy)"),
+        PackItemState::Shadowed => label.push_str(&format!(
+            " (shadowed by {})",
+            match item.shadowed_by.as_deref() {
+                Some("settings") => "your settings.yaml".to_string(),
+                Some(origin) => format!("your {origin} definition"),
+                None => "your definition".to_string(),
+            }
+        )),
+        PackItemState::Collides => label.push_str(&format!(
+            " (collides with {})",
+            item.collides_with
+                .iter()
+                .map(|pack| format!("pack:{pack}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
         PackItemState::RemovedByUser => label.push_str(" (removed by you)"),
-        PackItemState::PackOwned => {}
+        PackItemState::InUse => {}
     }
     label
 }
@@ -1724,7 +1722,7 @@ fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
             if !entry.description.is_empty() {
                 out.push_str(&format!("{}\n\n", entry.description));
             }
-            if let Some(line) = copies_line(entry) {
+            if let Some(line) = shadowed_line(entry) {
                 out.push_str(&format!("{line}\n\n"));
             }
             render_items(&mut out, entry);
@@ -1734,21 +1732,10 @@ fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
     out
 }
 
-/// "2 your copies (1 behind shipped)", or nothing when every item is the pack's.
-pub(crate) fn copies_line(entry: &PackCatalogEntry) -> Option<String> {
-    if entry.edited_count == 0 {
-        return None;
-    }
-    let noun = if entry.edited_count == 1 {
-        "copy"
-    } else {
-        "copies"
-    };
-    let mut line = format!("Your {noun}: {}", entry.edited_count);
-    if entry.behind_count > 0 {
-        line.push_str(&format!(" ({} behind shipped)", entry.behind_count));
-    }
-    Some(line)
+/// "Shadowed by your definitions: 2", or nothing when every item is in use.
+pub(crate) fn shadowed_line(entry: &PackCatalogEntry) -> Option<String> {
+    (entry.shadowed_count > 0)
+        .then(|| format!("Shadowed by your definitions: {}", entry.shadowed_count))
 }
 
 /// What is actually in this workspace wins over what the app ships, so a pack
@@ -1883,23 +1870,31 @@ fn render_pack(entry: &PackCatalogEntry) -> String {
     render_machine_services(&mut out, entry);
     render_web_services(&mut out, entry);
 
-    let edited = entry.edited_items();
-    if !edited.is_empty() {
-        out.push_str("## Your copies\n\n");
+    let shadowed = entry.shadowed_items();
+    if !shadowed.is_empty() {
+        out.push_str("## Shadowed by your definitions\n\n");
         out.push_str(
-            "These local copies are yours. Pack updates leave them untouched, and an uninstall \
-             keeps them. One marked behind shipped is frozen at an older version than the app now \
-             ships. Reset an item explicitly with `patch {action:\"reset-item\", kind, itemId}` to \
-             replace it with the current pack version.\n\n",
+            "A definition of yours resolves in front of each of these. The pack's own version is \
+             still installed, keeps updating, and stays addressable at its pack address. Delete \
+             your definition to use the pack's again.\n\n",
         );
-        for item in edited {
-            let label = item.path.as_deref().unwrap_or(&item.id);
-            let behind = if item.behind_shipped {
-                " — behind shipped"
-            } else {
-                ""
-            };
-            out.push_str(&format!("- {} `{label}`{behind}\n", item.kind));
+        for item in shadowed {
+            let address = cairn_config::library::LibraryKind::parse(&item.kind)
+                .map(|kind| cairn_config::library::pack_item_uri(&entry.id, kind, &item.id));
+            match address {
+                Some(address) => out.push_str(&format!(
+                    "- {} `{}` — shadowed by {}; the pack's: {address}\n",
+                    item.kind,
+                    item.id,
+                    item.shadowed_by.as_deref().unwrap_or("~")
+                )),
+                None => out.push_str(&format!(
+                    "- {} `{}` — shadowed by {}\n",
+                    item.kind,
+                    item.id,
+                    item.shadowed_by.as_deref().unwrap_or("~")
+                )),
+            }
         }
         out.push('\n');
     }
@@ -1939,7 +1934,8 @@ mod tests {
             id: id.to_string(),
             path: (kind != "mcp").then(|| format!("{kind}s/{id}")),
             state,
-            behind_shipped: false,
+            shadowed_by: None,
+            collides_with: Vec::new(),
             not_ready: None,
             setup: Vec::new(),
             runs: ItemRuns::Content,
@@ -1977,8 +1973,8 @@ mod tests {
             notes: vec![],
             items: vec![
                 PackCatalogItem {
-                    behind_shipped: true,
-                    ..item("skill", "matlab", PackItemState::EditedByUser)
+                    shadowed_by: Some("~".into()),
+                    ..item("skill", "matlab", PackItemState::Shadowed)
                 },
                 item("mcp", "matlab", PackItemState::RemovedByUser),
             ],
@@ -1986,8 +1982,7 @@ mod tests {
                 kind: "skill".into(),
                 count: 1,
             }],
-            edited_count: 1,
-            behind_count: 1,
+            shadowed_count: 1,
             entry_kind: PACK_ENTRY_KIND.into(),
         }
     }
@@ -1995,7 +1990,7 @@ mod tests {
     /// A manifest carrying exactly one item, classified the way the projection
     /// classifies it.
     fn single(id: &str, kind: &str) -> PackCatalogEntry {
-        let items = vec![item(kind, id, PackItemState::PackOwned)];
+        let items = vec![item(kind, id, PackItemState::InUse)];
         PackCatalogEntry {
             id: id.into(),
             name: capitalize(id),
@@ -2026,20 +2021,21 @@ mod tests {
             "{page}"
         );
         assert!(
-            page.contains("matlab (your copy, behind shipped)"),
+            page.contains("matlab (shadowed by your ~ definition)"),
             "{page}"
         );
         assert!(
-            page.contains("skill `skills/matlab` — behind shipped"),
+            page.contains(
+                "- skill `matlab` — shadowed by ~; the pack's: cairn://packs/matlab/skills/matlab"
+            ),
             "{page}"
         );
         assert_eq!(
-            copies_line(&entry()).as_deref(),
-            Some("Your copy: 1 (1 behind shipped)")
+            shadowed_line(&entry()).as_deref(),
+            Some("Shadowed by your definitions: 1")
         );
         assert!(page.contains("matlab (removed by you)"), "{page}");
-        assert!(page.contains("## Your copies"), "{page}");
-        assert!(page.contains("- skill `skills/matlab`"), "{page}");
+        assert!(page.contains("## Shadowed by your definitions"), "{page}");
         assert!(page.contains("## Removed by you"), "{page}");
         assert!(page.contains("- mcp `matlab`"), "{page}");
         assert!(page.contains("Source: Bundled\n"), "{page}");

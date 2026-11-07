@@ -2397,6 +2397,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "usage_window_readings",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    ("main_incident_sources", TableScope::ProjectScoped),
+    ("main_incident_budget", TableScope::ProjectScoped),
+    ("main_incidents", TableScope::ProjectScoped),
+    ("main_incident_evidence", TableScope::ProjectScoped),
     ("check_result_cache", TableScope::ProjectScoped),
     // CAIRN-4665: the durable record of which execution stopped owning an
     // issue's attempt, and the work item that interrupts its surviving agents.
@@ -2716,6 +2720,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     (
         "project_learned_requirements",
         TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // The operator's trust in a checkout's library definitions on this
+    // install, and the authority they confirmed. One operator's decision about
+    // one machine's checkout, so never synced.
+    (
+        "project_library_trust",
+        TableScope::Private(PrivateReason::HostConfiguration),
+    ),
+    (
+        "project_library_confirmations",
+        TableScope::Private(PrivateReason::HostConfiguration),
     ),
     // Work this runner granted to one of its own machines and has not yet seen
     // end. Names executor identities that mean nothing on another install.
@@ -3158,6 +3173,22 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "attention_read_cursors",
         id_columns: &["recipient", "source"],
+    },
+    RekeyTableManifest {
+        table: "main_incident_sources",
+        id_columns: &["project_id", "observation_id"],
+    },
+    RekeyTableManifest {
+        table: "main_incident_budget",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "main_incidents",
+        id_columns: &["project_id", "issue_id"],
+    },
+    RekeyTableManifest {
+        table: "main_incident_evidence",
+        id_columns: &["project_id", "issue_id", "observation_id", "comment_id"],
     },
     RekeyTableManifest {
         table: "check_result_cache",

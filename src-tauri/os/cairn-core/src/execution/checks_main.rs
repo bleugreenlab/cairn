@@ -61,6 +61,9 @@
 //! comparison could not be read, keeps the row's measured verdict, and claims
 //! no movement and no merge list.
 
+mod incident_sources;
+mod incidents;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -301,10 +304,21 @@ struct Standing {
 /// What an attempt was attempting, beyond its verdict: the inputs it would
 /// have answered, once the contract resolved, and whether Cairn declined to
 /// run them because the lane is suppressed.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct Attempted {
     inputs: Option<String>,
     suppressed: bool,
+    event_id: String,
+}
+
+impl Default for Attempted {
+    fn default() -> Self {
+        Self {
+            inputs: None,
+            suppressed: false,
+            event_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
 }
 
 /// An attempt as the announce step weighs it.
@@ -375,6 +389,8 @@ pub(crate) struct CadenceSlots {
     /// complete row ends it. In memory like `outcomes`, so after a restart a
     /// lane's first non-verdict announces again.
     standing: HashMap<(String, LaneKey), Standing>,
+    /// Extra filing notices share a project bound across its hosts and lanes.
+    filing_notices: HashMap<String, i64>,
     /// Whether the startup default-advance catch-up has observed origin. Until
     /// it has, a pass must not fetch; see [`run_pass`].
     origin_observed: bool,
@@ -806,6 +822,8 @@ fn start_lane(orch: &Orchestrator, tip: Tip, lane: CadenceLane, trigger: Trigger
 /// heartbeat tick.
 pub(crate) async fn spawn_all_current(orch: &Orchestrator, trigger: Trigger) {
     for db in orch.db.all_dbs().await {
+        incident_sources::retry(orch, &db).await;
+        retry_incident_intents(orch, &db).await;
         let projects = db
             .query_all(
                 "SELECT id, repo_path, default_branch FROM projects WHERE repo_path != '' AND default_branch IS NOT NULL",
@@ -1180,6 +1198,9 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
     let context = &tip.context(trigger);
     match attempt_lane(orch, db.clone(), context, lane).await {
         LaneAttempt::Covered(row) => {
+            // The observation may have committed immediately before a crash or
+            // a failed issue write. Coverage must not skip that filing retry.
+            replay_covered_incidents(orch, &db, context, lane, &row).await;
             let rearmed = {
                 let mut slots = orch.main_cadence.lock().unwrap();
                 slots.settled(
@@ -1318,6 +1339,7 @@ async fn attempt_lane(
     let attempted = Attempted {
         inputs: Some(contract.context.input_hash.clone()),
         suppressed: false,
+        ..Default::default()
     };
     let attempt = |verdict: CadenceVerdict, suppressed: bool| {
         LaneAttempt::Verdict(
@@ -1438,6 +1460,20 @@ async fn report_lane(
     verdict: CadenceVerdict,
     attempted: &Attempted,
 ) {
+    let captured_at = now_ms();
+    let source = incident_sources::capture(
+        db,
+        project_id,
+        lane,
+        commit,
+        &verdict,
+        attempted,
+        captured_at,
+    )
+    .await;
+    if let Err(error) = &source {
+        log::error!("main incident source capture failed: {error}; outcome: {verdict:?}");
+    }
     let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
     // Without the chain (a pass that failed before resolving the tip, or an
     // unreadable log), only the cadence's own rows can be placed on main.
@@ -1514,7 +1550,21 @@ async fn report_lane(
         now_ms: now,
         rearmed: rearmed.as_ref(),
     };
-    let content = render_report(&report);
+    let filing_note = incident_note(
+        orch,
+        db,
+        project_id,
+        project_key,
+        &lane.notify,
+        &report,
+        source
+            .as_ref()
+            .ok()
+            .and_then(|s| s.as_deref())
+            .map(|key| (key, captured_at)),
+    )
+    .await;
+    let content = format!("{}{filing_note}", render_report(&report));
     orch.main_cadence.lock().unwrap().settled(
         project_id,
         LaneOutcome {
@@ -1549,7 +1599,8 @@ async fn report_lane(
         .wake(project_id, lane, observed, now);
     // A boot re-arm cites the pass the restart cancelled, which only its own
     // report names.
-    let wake = if rearmed.is_some() {
+    let filing_news = filing_notice_due(orch, project_id, &filing_note, now);
+    let wake = if rearmed.is_some() || filing_news {
         Wake::Announce
     } else {
         wake
@@ -1565,6 +1616,196 @@ async fn report_lane(
             lane.check,
             lane.platform
         ),
+    }
+}
+
+fn filing_notice_due(orch: &Orchestrator, project_id: &str, note: &str, now: i64) -> bool {
+    if note.is_empty() {
+        return false;
+    }
+    let mut slots = orch.main_cadence.lock().unwrap();
+    if slots
+        .filing_notices
+        .get(project_id)
+        .is_some_and(|last| now - last < SILENCE_BOUND_MS)
+    {
+        return false;
+    }
+    slots.filing_notices.insert(project_id.to_string(), now);
+    true
+}
+
+async fn retry_incident_intents(orch: &Orchestrator, db: &LocalDb) {
+    match crate::execution::main_incidents_store::drain_pending(db, now_ms() / 1000).await {
+        Ok(links) => {
+            let mut notices: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+            for link in links.into_iter().filter(|link| link.created) {
+                let Some((project, number)) = link
+                    .issue_uri
+                    .strip_prefix("cairn://p/")
+                    .and_then(|uri| uri.split_once('/'))
+                else {
+                    continue;
+                };
+                let Ok(number) = number.parse::<i64>() else {
+                    continue;
+                };
+                match db.query_opt(
+                    "SELECT p.id,t.name FROM issues i JOIN projects p ON p.id=i.project_id
+                     JOIN threads t ON t.id=i.parent_thread_id WHERE p.key=?1 AND i.number=?2",
+                    (project.to_string(), number), |row| Ok((row.text(0)?,row.text(1)?)),
+                ).await {
+                    Ok(Some(owner)) => notices.entry(owner).or_default().push(link.issue_uri),
+                    other => log::warn!("main incident retry filed an issue but could not resolve its owner: {other:?}"),
+                }
+            }
+            for ((project, thread), links) in notices {
+                let content = format!(
+                    "Durable main incident filing resumed (no executions started):\n{}",
+                    links
+                        .iter()
+                        .map(|uri| format!("- {uri}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                if filing_notice_due(orch, &project, &content, now_ms()) {
+                    deliver(orch, db, &project, &thread, &content).await;
+                }
+            }
+        }
+        Err(error) => log::error!(
+            "main incident startup/heartbeat retry failed; pending evidence retained: {error}"
+        ),
+    }
+}
+
+async fn incident_note(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    notify: &str,
+    report: &CadenceReport<'_>,
+    delivery: Option<(&str, i64)>,
+) -> String {
+    let result = match crate::issues::crud::installation_machine_authorship(
+        orch.anon_device_manager.device_id(),
+        orch.services.clock.now(),
+    ) {
+        Ok(authorship) => {
+            incidents::record(
+                db,
+                project_id,
+                project_key,
+                notify,
+                report,
+                authorship,
+                delivery,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Some((event_key, _)) = delivery {
+        if let Err(error) = crate::execution::main_incidents_store::finish_source(
+            db,
+            project_id,
+            event_key,
+            result.as_ref().err().map(ToString::to_string),
+            now_ms() / 1000,
+        )
+        .await
+        {
+            return format!(
+                "\nIncident source acknowledgement failed: {error}; retained for retry.\n"
+            );
+        }
+    }
+    let mut note = match result {
+        Ok(note) => note,
+        Err(error) => {
+            log::error!(
+                "main incident filing failed; durable source retained for cadence retry: {error}"
+            );
+            format!("\n**Incident filing failed:** {error}. The durable source remains available for the existing cadence to retry.\n")
+        }
+    };
+    match crate::execution::main_incidents_store::source_health(
+        db,
+        Some(project_id),
+        now_ms() / 1000,
+    )
+    .await
+    {
+        Ok(health) if health.pending > 0 => note.push_str(&format!(
+            "\n{health}. The existing cadence retries these sources.\n"
+        )),
+        Err(error) => note.push_str(&format!(
+            "\nIncident source backlog could not be read: {error}.\n"
+        )),
+        _ => {}
+    }
+    note
+}
+
+async fn replay_covered_incidents(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    context: &PassContext<'_>,
+    lane: &CadenceLane,
+    row: &CadenceRow,
+) {
+    let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
+    let chain = main_chain(orch, context.repository, &row.commit).ok();
+    let comparison = comparison_for(
+        db,
+        context.project_id,
+        context.project_key,
+        lane,
+        Some(row),
+        chain.as_ref(),
+        &names,
+    )
+    .await;
+    let bracket = match comparison.previous() {
+        Some(previous) => {
+            merge_bracket(
+                orch,
+                db,
+                context.project_id,
+                context.project_key,
+                context.repository,
+                &previous.commit,
+                &row.commit,
+            )
+            .await
+        }
+        None => Bracket::default(),
+    };
+    let verdict = CadenceVerdict::Complete(row.clone());
+    let report = CadenceReport {
+        check: &lane.check,
+        platform: &lane.platform,
+        kind: lane.verdict,
+        commit: Some(&row.commit),
+        verdict: &verdict,
+        comparison: &comparison,
+        bracket: &bracket,
+        now_ms: now_ms(),
+        rearmed: None,
+    };
+    let note = incident_note(
+        orch,
+        db,
+        context.project_id,
+        context.project_key,
+        &lane.notify,
+        &report,
+        Some((&format!("observation:{}", row.id), row.ran_at_ms)),
+    )
+    .await;
+    if filing_notice_due(orch, context.project_id, &note, report.now_ms) {
+        deliver(orch, db, context.project_id, &lane.notify, &note).await;
     }
 }
 
@@ -8097,6 +8338,7 @@ mod tests {
         Attempted {
             inputs: Some(hash.into()),
             suppressed,
+            ..Default::default()
         }
     }
 

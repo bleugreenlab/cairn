@@ -1,4 +1,5 @@
 use super::*;
+use cairn_config::library::LibraryRoots;
 
 // ============================================================================
 // create_child_task
@@ -40,15 +41,17 @@ pub fn create_child_task(
     let config_dir = orch.config_dir.clone();
     let mut agent_config: AgentConfig = {
         let file_agent = match config_agents::get_agent(
-            &config_dir,
+            &LibraryRoots::at(&config_dir, project_path.as_deref()),
             &input.subagent_type,
-            project_path.as_deref(),
         ) {
             Ok(Some(agent)) => agent,
             Ok(None) => {
                 // Fall back to searching by name
-                let agents = config_agents::list_agents(&config_dir, project_path.as_deref())
-                    .unwrap_or_default();
+                let agents = config_agents::list_agents(&LibraryRoots::at(
+                    &config_dir,
+                    project_path.as_deref(),
+                ))
+                .unwrap_or_default();
                 let mut found = None;
                 for result in agents {
                     if let ConfigResult::Ok(agent) = result {

@@ -21,6 +21,7 @@
 //!
 //! [`Complete`]: cairn_models::interface::complete::Complete
 
+use cairn_config::library::LibraryRoots;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -210,11 +211,11 @@ impl crate::embeddings::resources::ResourceSource for Orchestrator {
     }
 
     fn skills(&self) -> Vec<crate::embeddings::resources::ResourceTarget> {
-        crate::config::skills::list_skills(&self.config_dir, None)
+        crate::config::skills::list_skills(&LibraryRoots::workspace(&self.config_dir))
             .unwrap_or_default()
             .into_iter()
             .filter_map(|skill| match skill {
-                crate::config::ConfigResult::Ok(skill) if !skill.is_project_scoped => Some(
+                crate::config::ConfigResult::Ok(skill) if !skill.is_project_scoped() => Some(
                     crate::embeddings::resources::skill_embed_target(&skill.id, &skill.description),
                 ),
                 _ => None,

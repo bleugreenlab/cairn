@@ -10,6 +10,7 @@ use crate::models::AgentConfig;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::protocol::CallbackResponse;
+use cairn_config::library::LibraryRoots;
 use cairn_models::turn::SuspendKind;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -54,30 +55,30 @@ async fn resolve_task_agent_config(
     payload: &DelegatedTaskPayload,
 ) -> Result<AgentConfig, String> {
     let config_dir = orch.config_dir.clone();
-    let file_agent =
-        match config_agents::get_agent(&config_dir, &payload.subagent_type, project_path) {
-            Ok(Some(agent)) => agent,
-            Ok(None) => {
-                let agents =
-                    config_agents::list_agents(&config_dir, project_path).unwrap_or_default();
-                let mut found = None;
-                for result in agents {
-                    if let crate::config::ConfigResult::Ok(agent) = result {
-                        if agent.name == payload.subagent_type {
-                            found = Some(agent);
-                            break;
-                        }
-                    }
-                }
-                match found {
-                    Some(agent) => agent,
-                    None => {
-                        return Err(format!("Agent config not found: {}", payload.subagent_type))
+    let file_agent = match config_agents::get_agent(
+        &LibraryRoots::at(&config_dir, project_path),
+        &payload.subagent_type,
+    ) {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            let agents = config_agents::list_agents(&LibraryRoots::at(&config_dir, project_path))
+                .unwrap_or_default();
+            let mut found = None;
+            for result in agents {
+                if let crate::config::ConfigResult::Ok(agent) = result {
+                    if agent.name == payload.subagent_type {
+                        found = Some(agent);
+                        break;
                     }
                 }
             }
-            Err(e) => return Err(format!("Failed to load agent config: {}", e)),
-        };
+            match found {
+                Some(agent) => agent,
+                None => return Err(format!("Agent config not found: {}", payload.subagent_type)),
+            }
+        }
+        Err(e) => return Err(format!("Failed to load agent config: {}", e)),
+    };
 
     let policy = crate::config::contextual_packages::load_contextual_packages(project_path);
     let selection = policy.selection(

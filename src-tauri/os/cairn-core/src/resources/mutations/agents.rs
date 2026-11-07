@@ -6,6 +6,7 @@
 //! `parse_agent_markdown` — the exact loader path — so malformed agents are
 //! rejected rather than written.
 
+use cairn_config::library::{LibraryKind, LibraryRoots, Origin};
 use std::path::PathBuf;
 
 use cairn_common::uri::{build_agent_uri, build_project_agent_uri};
@@ -124,21 +125,39 @@ fn validate_roundtrip(agent: &FileAgent) -> Result<(), String> {
     parse_agent_markdown(&markdown).map(|_| ())
 }
 
-fn agent_file_exists(
-    orch: &Orchestrator,
-    id: &str,
-    is_project_scoped: bool,
-    project_path: Option<&std::path::Path>,
-) -> bool {
-    let dir = if is_project_scoped {
-        match project_path {
-            Some(pp) => pp.join(".cairn").join("agents"),
-            None => return false,
+fn agent_file_exists(roots: &LibraryRoots, id: &str, layer: &Origin) -> bool {
+    roots
+        .layer_dir(LibraryKind::Agent, layer)
+        .is_some_and(|dir| dir.join(format!("{id}.md")).exists())
+}
+
+/// The agent a write addresses: the project's own for an explicit project,
+/// else whatever the name resolves to.
+fn addressed_agent(
+    roots: &LibraryRoots,
+    agent_id: &str,
+    explicit_project: Option<&str>,
+) -> Result<FileAgent, String> {
+    let resolved = match (explicit_project, roots.project_origin()) {
+        (Some(_), Some(layer)) => {
+            config_agents::resolve_agent(roots, agent_id).and_then(|resolved| {
+                if resolved.origin == layer {
+                    Ok(resolved)
+                } else {
+                    Err(cairn_config::library::ResolveError::NotFound {
+                        kind: LibraryKind::Agent,
+                        name: agent_id.to_string(),
+                    })
+                }
+            })
         }
-    } else {
-        orch.config_dir.join("agents")
+        _ => config_agents::resolve_agent(roots, agent_id),
     };
-    dir.join(format!("{id}.md")).exists()
+    match resolved {
+        Ok(resolved) => Ok(resolved.item),
+        Err(error) if error.is_not_found() => Err(not_found(agent_id, explicit_project)),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub(super) async fn apply_agent_create(
@@ -154,12 +173,10 @@ pub(super) async fn apply_agent_create(
         return Err("Could not derive an agent id from payload.name".to_string());
     }
 
-    let is_project_scoped = explicit_project.is_some();
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
-    if is_project_scoped && project_path.is_none() {
-        return Err("Project path required for a project-scoped agent".to_string());
-    }
-    if agent_file_exists(orch, &id, is_project_scoped, project_path.as_deref()) {
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let layer = super::write_layer(payload, &roots, explicit_project)?.unwrap_or(Origin::Workspace);
+    if agent_file_exists(&roots, &id, &layer) {
         return Err(format!("Agent already exists: {id}"));
     }
 
@@ -176,7 +193,7 @@ pub(super) async fn apply_agent_create(
         hooks: None,
         icon: None,
         bundles: Vec::new(),
-        is_project_scoped,
+        origin: layer,
         file_path: PathBuf::new(),
         seed_budget_tokens: None,
         seed_eras: None,
@@ -184,9 +201,9 @@ pub(super) async fn apply_agent_create(
     apply_fields(&mut agent, payload)?;
     validate_roundtrip(&agent)?;
 
-    let path = config_agents::save_agent(&orch.config_dir, &agent, project_path.as_deref())?;
+    let path = config_agents::save_agent(&roots, &agent, None)?;
     crate::config::commit_config_paths(
-        std::slice::from_ref(&path),
+        &config_agents::agent_stage_paths(&roots, &path),
         &format!("cairn: create agent {id}"),
     );
     let agent_uri = match explicit_project {
@@ -204,9 +221,10 @@ pub(super) async fn apply_agent_patch(
     explicit_project: Option<&str>,
 ) -> Result<String, String> {
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
-    let mut agent = config_agents::get_agent(&orch.config_dir, agent_id, project_path.as_deref())?
-        .filter(|a| explicit_project.is_none() || a.is_project_scoped)
-        .ok_or_else(|| not_found(agent_id, explicit_project))?;
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let mut agent = addressed_agent(&roots, agent_id, explicit_project)?;
+    let layer = super::write_layer(payload, &roots, explicit_project)?
+        .filter(|layer| *layer != agent.origin);
 
     if let Some(name) = super::payload_trimmed_non_empty_str(payload, "name", &[]) {
         agent.name = name.to_string();
@@ -214,9 +232,9 @@ pub(super) async fn apply_agent_patch(
     apply_fields(&mut agent, payload)?;
     validate_roundtrip(&agent)?;
 
-    let path = config_agents::save_agent(&orch.config_dir, &agent, project_path.as_deref())?;
+    let path = config_agents::save_agent(&roots, &agent, layer.as_ref())?;
     crate::config::commit_config_paths(
-        &config_agents::agent_stage_paths(&path),
+        &config_agents::agent_stage_paths(&roots, &path),
         &format!("cairn: update agent {agent_id}"),
     );
     Ok(format!("Updated agent '{agent_id}'"))
@@ -229,18 +247,18 @@ pub(super) async fn apply_agent_delete(
     explicit_project: Option<&str>,
 ) -> Result<String, String> {
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
-    let Some(agent) =
-        config_agents::get_agent(&orch.config_dir, agent_id, project_path.as_deref())?
-            .filter(|a| explicit_project.is_none() || a.is_project_scoped)
-    else {
-        return Err(not_found(agent_id, explicit_project));
-    };
-    config_agents::delete_agent(&orch.config_dir, agent_id, project_path.as_deref())?;
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let agent = addressed_agent(&roots, agent_id, explicit_project)?;
+    let changed = config_agents::delete_agent(&roots, agent_id, Some(&agent.origin))?
+        .ok_or_else(|| not_found(agent_id, explicit_project))?;
     crate::config::commit_config_paths(
-        &config_agents::agent_stage_paths(&agent.file_path),
+        &config_agents::agent_stage_paths(&roots, &changed),
         &format!("cairn: delete agent {agent_id}"),
     );
-    Ok(format!("Deleted agent '{agent_id}'"))
+    Ok(match agent.origin.pack_id() {
+        Some(pack) => format!("Removed agent '{agent_id}' from pack {pack}"),
+        None => format!("Deleted agent '{agent_id}'"),
+    })
 }
 
 fn not_found(agent_id: &str, explicit_project: Option<&str>) -> String {

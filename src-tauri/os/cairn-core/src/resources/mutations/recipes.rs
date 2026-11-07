@@ -6,6 +6,7 @@
 //! rather than written. The id is taken from `payload.id` or slugified from the
 //! recipe name, matching the filename = id convention.
 
+use cairn_config::library::{self, LibraryKind, LibraryRoots, Origin};
 use std::path::PathBuf;
 
 use cairn_common::uri::{build_project_recipe_uri, build_recipe_uri};
@@ -16,23 +17,32 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::models::RecipeFile;
 use crate::orchestrator::Orchestrator;
 
-fn recipe_file_exists(
-    orch: &Orchestrator,
-    id: &str,
-    is_project_scoped: bool,
-    project_path: Option<&std::path::Path>,
-) -> bool {
-    let dir = if is_project_scoped {
-        match project_path {
-            Some(pp) => pp.join(".cairn").join("recipes"),
-            None => return false,
-        }
-    } else {
-        orch.config_dir.join("recipes")
+fn recipe_file_exists(roots: &LibraryRoots, id: &str, layer: &Origin) -> bool {
+    roots
+        .layer_dir(LibraryKind::Recipe, layer)
+        .is_some_and(|dir| {
+            ["yaml", "yml"]
+                .iter()
+                .any(|ext| dir.join(format!("{id}.{ext}")).exists())
+        })
+}
+
+/// The recipe a write addresses: the project's own for an explicit project,
+/// else whatever the id resolves to.
+fn addressed_recipe(
+    roots: &LibraryRoots,
+    recipe_id: &str,
+    explicit_project: Option<&str>,
+) -> Result<FileRecipe, String> {
+    let resolved = match (explicit_project, roots.project_origin()) {
+        (Some(_), Some(layer)) => config_recipes::resolve_recipe_in(roots, &layer, recipe_id),
+        _ => config_recipes::resolve_recipe(roots, recipe_id),
     };
-    ["yaml", "yml"]
-        .iter()
-        .any(|ext| dir.join(format!("{id}.{ext}")).exists())
+    match resolved {
+        Ok(resolved) => Ok(resolved.item),
+        Err(error) if error.is_not_found() => Err(not_found(recipe_id, explicit_project)),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn parse_and_validate(content: &str) -> Result<RecipeFile, String> {
@@ -44,8 +54,8 @@ fn parse_and_validate(content: &str) -> Result<RecipeFile, String> {
     Ok(recipe_file)
 }
 
-fn build_file_recipe(recipe_file: RecipeFile, id: &str, is_project_scoped: bool) -> FileRecipe {
-    let (ws_id, proj_id) = if is_project_scoped {
+fn build_file_recipe(recipe_file: RecipeFile, id: &str, origin: Origin) -> FileRecipe {
+    let (ws_id, proj_id) = if origin.is_project() {
         (None, None)
     } else {
         (Some("default".to_string()), None)
@@ -56,7 +66,7 @@ fn build_file_recipe(recipe_file: RecipeFile, id: &str, is_project_scoped: bool)
     FileRecipe {
         recipe,
         bundles,
-        is_project_scoped,
+        origin,
         file_path: PathBuf::new(),
     }
 }
@@ -79,18 +89,15 @@ pub(super) async fn apply_recipe_create(
         return Err("Could not derive recipe id from payload.id or the recipe name".to_string());
     }
 
-    let is_project_scoped = explicit_project.is_some();
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
-    if is_project_scoped && project_path.is_none() {
-        return Err("Project path required for a project-scoped recipe".to_string());
-    }
-    if recipe_file_exists(orch, &id, is_project_scoped, project_path.as_deref()) {
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let layer = super::write_layer(payload, &roots, explicit_project)?.unwrap_or(Origin::Workspace);
+    if recipe_file_exists(&roots, &id, &layer) {
         return Err(format!("Recipe already exists: {id}"));
     }
 
-    let file_recipe = build_file_recipe(recipe_file, &id, is_project_scoped);
-    let path =
-        config_recipes::save_recipe(&orch.config_dir, &file_recipe, project_path.as_deref())?;
+    let file_recipe = build_file_recipe(recipe_file, &id, layer);
+    let path = config_recipes::save_recipe(&roots, &file_recipe, None)?;
     crate::config::commit_config_paths(
         std::slice::from_ref(&path),
         &format!("cairn: create recipe {id}"),
@@ -119,17 +126,28 @@ pub(super) async fn apply_recipe_patch(
     explicit_project: Option<&str>,
 ) -> Result<String, String> {
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
     // Confirm the recipe exists in the addressed scope before overwriting.
-    let existing =
-        config_recipes::get_recipe(&orch.config_dir, recipe_id, project_path.as_deref())?;
-    let exists_in_scope = match &existing {
-        Some(recipe) => explicit_project.is_none() || recipe.is_project_scoped,
-        None => false,
-    };
-    if !exists_in_scope {
-        return Err(not_found(recipe_id, explicit_project));
+    let existing = addressed_recipe(&roots, recipe_id, explicit_project)?;
+    let target = super::write_layer(payload, &roots, explicit_project)?
+        .unwrap_or_else(|| existing.origin.clone());
+    if let Origin::Pack { id: pack } = &target {
+        return Err(library::pack_edit_refusal(
+            LibraryKind::Recipe,
+            &existing.recipe.id,
+            pack,
+        ));
     }
-    let existing = existing.expect("exists_in_scope implies a loaded recipe");
+    // Same layer: the file it was read from. Another layer: a new definition
+    // there, in front of the one it was read from.
+    let write_path = if target == existing.origin {
+        existing.file_path.clone()
+    } else {
+        roots
+            .layer_dir(LibraryKind::Recipe, &target)
+            .ok_or("Project path required for a project-scoped recipe")?
+            .join(format!("{}.yaml", existing.recipe.id))
+    };
 
     let has_text_replacement =
         payload.get("old_string").is_some() || payload.get("new_string").is_some();
@@ -146,10 +164,13 @@ pub(super) async fn apply_recipe_patch(
             );
         }
         let updated = apply_recipe_text_replacement(payload, &existing)?;
-        std::fs::write(&existing.file_path, &updated)
+        if let Some(dir) = write_path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create directory: {e}"))?;
+        }
+        std::fs::write(&write_path, &updated)
             .map_err(|e| format!("Failed to write recipe file: {e}"))?;
         crate::config::commit_config_paths(
-            std::slice::from_ref(&existing.file_path),
+            std::slice::from_ref(&write_path),
             &format!("cairn: edit recipe {recipe_id}"),
         );
         return Ok(format!("Edited recipe '{recipe_id}'"));
@@ -162,10 +183,9 @@ pub(super) async fn apply_recipe_patch(
         )?;
     let recipe_file = parse_and_validate(content)?;
 
-    let is_project_scoped = explicit_project.is_some();
-    let file_recipe = build_file_recipe(recipe_file, recipe_id, is_project_scoped);
-    let path =
-        config_recipes::save_recipe(&orch.config_dir, &file_recipe, project_path.as_deref())?;
+    let mut file_recipe = build_file_recipe(recipe_file, &existing.recipe.id, target);
+    file_recipe.file_path = write_path;
+    let path = config_recipes::save_recipe(&roots, &file_recipe, None)?;
     crate::config::commit_config_paths(
         std::slice::from_ref(&path),
         &format!("cairn: update recipe {recipe_id}"),
@@ -224,24 +244,18 @@ pub(super) async fn apply_recipe_delete(
     explicit_project: Option<&str>,
 ) -> Result<String, String> {
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
-    let existing =
-        config_recipes::get_recipe(&orch.config_dir, recipe_id, project_path.as_deref())?;
-    let exists_in_scope = match &existing {
-        Some(recipe) => explicit_project.is_none() || recipe.is_project_scoped,
-        None => false,
-    };
-    if !exists_in_scope {
-        return Err(not_found(recipe_id, explicit_project));
-    }
-    let deleted_path = existing.as_ref().map(|r| r.file_path.clone());
-    config_recipes::delete_recipe(&orch.config_dir, recipe_id, project_path.as_deref())?;
-    if let Some(path) = deleted_path {
-        crate::config::commit_config_paths(
-            std::slice::from_ref(&path),
-            &format!("cairn: delete recipe {recipe_id}"),
-        );
-    }
-    Ok(format!("Deleted recipe '{recipe_id}'"))
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let existing = addressed_recipe(&roots, recipe_id, explicit_project)?;
+    let changed = config_recipes::delete_recipe(&roots, recipe_id, Some(&existing.origin))?
+        .ok_or_else(|| not_found(recipe_id, explicit_project))?;
+    crate::config::commit_config_paths(
+        std::slice::from_ref(&changed),
+        &format!("cairn: delete recipe {recipe_id}"),
+    );
+    Ok(match existing.origin.pack_id() {
+        Some(pack) => format!("Removed recipe '{recipe_id}' from pack {pack}"),
+        None => format!("Deleted recipe '{recipe_id}'"),
+    })
 }
 
 fn not_found(recipe_id: &str, explicit_project: Option<&str>) -> String {

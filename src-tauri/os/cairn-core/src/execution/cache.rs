@@ -7062,6 +7062,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_incident_source_is_atomic_with_the_canonical_observation() {
+        let db = cache_db().await;
+        let mut invalid = observation("main-invalid", "commit-invalid", "env-a");
+        invalid.cadence = "main".into();
+        invalid.tests[0].status = "unknown".into();
+        assert!(record_fresh_check_observation(db.clone(), invalid).is_err());
+        assert_eq!(
+            db.query_one("SELECT COUNT(*) FROM main_incident_sources", (), |row| row
+                .i64(0))
+                .await
+                .unwrap(),
+            0
+        );
+
+        db.execute_batch(
+            "CREATE TRIGGER reject_main_source BEFORE INSERT ON main_incident_sources
+             BEGIN SELECT RAISE(ABORT,'source write failure'); END;",
+        )
+        .await
+        .unwrap();
+        let mut blocked = observation("main-source-blocked", "commit-blocked", "env-a");
+        blocked.cadence = "main".into();
+        assert!(record_fresh_check_observation(db.clone(), blocked).is_err());
+        assert_eq!(
+            db.query_one(
+                "SELECT COUNT(*) FROM check_result_observations WHERE id='main-source-blocked'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            0,
+            "source failure must roll back canonical observation"
+        );
+        db.execute_batch("DROP TRIGGER reject_main_source;")
+            .await
+            .unwrap();
+
+        let mut valid = observation("main-valid", "commit-valid", "env-a");
+        valid.cadence = "main".into();
+        record_fresh_check_observation(db.clone(), valid.clone()).unwrap();
+        record_fresh_check_observation(db.clone(), valid).unwrap();
+        let sources = crate::execution::main_incidents_store::pending_sources(&db, 10)
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].draft.observation_id.as_deref(),
+            Some("main-valid")
+        );
+        assert_eq!(sources[0].draft.event_key, "observation:main-valid");
+        db.execute(
+            "DELETE FROM check_result_observations WHERE id='main-valid'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.query_one(
+                "SELECT COUNT(*) FROM check_result_observations WHERE id='main-valid'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            1,
+            "pending source retains its canonical observation"
+        );
+        crate::execution::main_incidents_store::finish_source(
+            &db,
+            "project-a",
+            "observation:main-valid",
+            None,
+            99,
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "DELETE FROM check_result_observations WHERE id='main-valid'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.query_one(
+                "SELECT COUNT(*) FROM check_result_observations WHERE id='main-valid'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            0,
+            "processed source no longer holds retention"
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_test_row_rolls_back_entire_fresh_observation() {
         let db = cache_db().await;
         let mut invalid = observation("obs-invalid", "commit-invalid", "env-a");

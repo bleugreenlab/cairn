@@ -133,13 +133,39 @@ pub(super) async fn patch(
     let context_path = context_path(o, r, p).await?;
     crate::routes::validate_references(o, &route, context_path.as_deref()).await?;
     refuse_unanswerable(o, &route, p).await?;
-    let path = root(o, p).await?.join(format!("{id}.yaml"));
+    let mut path = root(o, p).await?.join(format!("{id}.yaml"));
     if !path.exists() {
-        return Err(format!("Route not found: {id}"));
+        // Only a pack's own route may stand behind a missing local file, and
+        // it is never edited: naming the workspace layer defines one in
+        // front of it.
+        let roots = cairn_config::library::LibraryRoots::workspace(&o.config_dir);
+        match crate::config::routes::resolve_route(&roots, id) {
+            Ok(resolved) => match resolved.origin.pack_id() {
+                Some(pack)
+                    if p.is_none()
+                        && super::payload_trimmed_non_empty_str(pay, "layer", &[])
+                            == Some("workspace") =>
+                {
+                    let _ = pack;
+                    path = o.config_dir.join("routes").join(format!("{id}.yaml"));
+                }
+                Some(pack) => {
+                    return Err(cairn_config::library::pack_edit_refusal(
+                        cairn_config::library::LibraryKind::Route,
+                        id,
+                        pack,
+                    ))
+                }
+                None => return Err(format!("Route not found: {id}")),
+            },
+            Err(_) => return Err(format!("Route not found: {id}")),
+        }
     }
     if dry {
         return Ok(format!("Would update route '{id}'"));
     }
+    std::fs::create_dir_all(path.parent().expect("a route file has a directory"))
+        .map_err(|e| e.to_string())?;
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
     crate::config::commit_config_paths(&[path], &format!("cairn: update route {id}"));
     emit_change(o, "modified", id);
@@ -159,25 +185,28 @@ pub(super) async fn delete(
         }
         None => None,
     };
-    let path = project
-        .as_ref()
-        .map_or_else(
-            || o.config_dir.join("routes"),
-            |project| project.join(".cairn/routes"),
-        )
-        .join(format!("{id}.yaml"));
-    if !path.exists() {
+    let roots = cairn_config::library::LibraryRoots::at(&o.config_dir, project.as_deref());
+    let layer = p.and(roots.project_origin());
+    let exists = match &layer {
+        Some(_) => crate::config::routes::get_project_route(&roots, id)
+            .map(|route| route.is_some())
+            .unwrap_or(true),
+        None => crate::config::routes::get_route(&roots, id)
+            .map(|route| route.is_some())
+            .unwrap_or(false),
+    };
+    if !exists {
         return Err(format!("Route not found: {id}"));
     }
     if dry {
         return Ok(format!("Would delete route '{id}'"));
     }
-    // Through the config module, so a workspace route an installed pack ships
-    // is recorded as removed instead of copied straight back by the next pack
-    // sync. The existence check pinned the scope, so its project-then-workspace
-    // order resolves to this same file.
-    crate::config::routes::delete_route(&o.config_dir, id, project.as_deref())?;
-    crate::config::commit_config_paths(&[path], &format!("cairn: delete route {id}"));
+    // An explicit project deletes only the project's own file; otherwise the
+    // definition the id resolves to goes: a local file outright, or a pack's
+    // own route recorded as removed from its pack.
+    let changed = crate::config::routes::delete_route(&roots, id, layer.as_ref())?
+        .ok_or_else(|| format!("Route not found: {id}"))?;
+    crate::config::commit_config_paths(&[changed], &format!("cairn: delete route {id}"));
     emit_change(o, "removed", id);
     if project.is_none() {
         o.emit_pack_registry_change();

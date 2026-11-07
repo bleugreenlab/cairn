@@ -27,7 +27,16 @@ pub struct CanonDestination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleCanonHome {
     Workspace,
-    Project { project_id: String },
+    Project {
+        project_id: String,
+    },
+    /// The role is an installed pack's agent. A pack is read in place and
+    /// never edited, so its canon belongs in the pack's source; writing a
+    /// workspace definition in front of it would freeze the role at this
+    /// version of the pack.
+    Pack {
+        pack_id: String,
+    },
 }
 
 fn candidate(path: PathBuf, kind: CanonDestinationKind) -> CanonDestinationCandidate {
@@ -55,7 +64,14 @@ where
         }
     }
 
-    RoleCanonHome::Workspace
+    let roots = cairn_config::library::LibraryRoots::workspace(config_dir);
+    match crate::config::agents::resolve_agent(&roots, role) {
+        Ok(resolved) => match resolved.origin {
+            cairn_config::library::Origin::Pack { id } => RoleCanonHome::Pack { pack_id: id },
+            _ => RoleCanonHome::Workspace,
+        },
+        Err(_) => RoleCanonHome::Workspace,
+    }
 }
 
 fn resolve_canon_destination(
@@ -166,6 +182,42 @@ mod tests {
 
         let home = resolve_role_canon_home(&config, "integrator", [("project-1", repo.as_path())]);
         assert_eq!(home, RoleCanonHome::Workspace);
+    }
+
+    #[test]
+    fn a_pack_role_s_canon_is_homed_in_its_pack_not_a_new_workspace_shadow() {
+        use cairn_config::library::{test_support, LibraryKind};
+        let temp = tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        test_support::install_pack_lock(&config, "core", &[]);
+        test_support::write_item(
+            &test_support::pack_root(&config, "core"),
+            LibraryKind::Agent,
+            "integrator",
+            "---\nname: integrator\ndescription: d\ntools: Read\n---\n\nIntegrate.\n",
+        );
+
+        let home = resolve_role_canon_home(&config, "integrator", []);
+        assert_eq!(
+            home,
+            RoleCanonHome::Pack {
+                pack_id: "core".to_string()
+            }
+        );
+        assert!(!config.join("agents/integrator.md").exists());
+
+        // A workspace definition in front of the pack's is the workspace's.
+        test_support::write_item(
+            &config,
+            LibraryKind::Agent,
+            "integrator",
+            "---\nname: integrator\ndescription: d\ntools: Read\n---\n\nMine.\n",
+        );
+        assert_eq!(
+            resolve_role_canon_home(&config, "integrator", []),
+            RoleCanonHome::Workspace
+        );
     }
 
     #[test]

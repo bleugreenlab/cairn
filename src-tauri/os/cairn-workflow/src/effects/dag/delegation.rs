@@ -14,7 +14,8 @@ fn ensure_agent_snapshot(
     {
         // Loud: a missing agent fails materialization visibly rather than
         // degrading to a placeholder.
-        let file_agent = config_agents::get_agent(config_dir, entry.key(), project_path)
+        let roots = cairn_config::library::LibraryRoots::at(config_dir, project_path);
+        let file_agent = config_agents::get_agent(&roots, entry.key())
             .map_err(|e| format!("Failed to load agent '{agent_id}': {e}"))?
             .ok_or_else(|| {
                 format!("Agent config not found during delegation expansion: {agent_id}")

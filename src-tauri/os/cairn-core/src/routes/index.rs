@@ -18,6 +18,7 @@
 //! A count or rowid fingerprint is not enough: a rebuild deletes and reinserts
 //! rows, and an edit that keeps the clause count can reuse the same rowids.
 
+use cairn_config::library::LibraryRoots;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -201,8 +202,7 @@ impl TriggerIndex {
             return Ok(set);
         }
         let set = Arc::new(RouteSet::build(crate::config::routes::list_routes(
-            config_dir,
-            project_path,
+            &LibraryRoots::at(config_dir, project_path),
         )?));
         self.routes.lock().expect("route index poisoned").insert(
             key,

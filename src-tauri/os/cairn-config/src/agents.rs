@@ -1,15 +1,20 @@
 //! Agent configuration file reading.
 //!
-//! Agents are stored as markdown files with YAML frontmatter.
-//! - Workspace-scoped: `~/.cairn/agents/`
-//! - Project-scoped: `[project-dir]/.cairn/agents/`
+//! Agents are markdown files with YAML frontmatter, one per layer directory
+//! (`agents/<id>.md` in a project's `.cairn/`, the workspace, or an installed
+//! pack), resolved nearest-first through [`crate::library`].
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 use crate::agent_markdown::{agent_to_markdown, parse_agent_markdown, AgentExportData};
 use crate::agent_pins::{self, AgentPin};
 use crate::allotment::AllotmentEntry;
+use crate::library::{
+    self, LibraryItem, LibraryKind, LibraryRef, LibraryRoots, Listed, Origin, ResolveError,
+    Resolved,
+};
 use crate::models::Fence;
 
 use super::{id_from_path, ConfigResult};
@@ -40,13 +45,82 @@ pub struct FileAgent {
     pub seed_budget_tokens: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_eras: Option<i32>,
-    /// Whether this agent is project-scoped (vs workspace-scoped)
-    pub is_project_scoped: bool,
+    /// The layer this agent was read from, or the layer a new one is for.
+    pub origin: Origin,
     /// Path to the source file
     pub file_path: PathBuf,
 }
 
+impl LibraryItem for FileAgent {
+    fn library_id(&self) -> &str {
+        &self.id
+    }
+
+    /// An agent's tool grant is always authority, even when empty, so every
+    /// project agent is confirmed before it runs. Every field is named below,
+    /// so one added to `FileAgent` does not compile until it is classified.
+    fn authority(&self) -> Map<String, Value> {
+        let FileAgent {
+            // The name resolution keys it by.
+            id: _,
+            // Prose.
+            name: _,
+            description: _,
+            prompt: _,
+            tools,
+            models,
+            fence,
+            disallowed_tools,
+            skills,
+            hooks,
+            // Its picture in the UI.
+            icon: _,
+            // Which bundled sets list it: catalog metadata.
+            bundles: _,
+            seed_budget_tokens,
+            seed_eras,
+            origin: _,
+            file_path: _,
+        } = self;
+        let mut fields = Map::new();
+        fields.insert("tools".into(), json!(tools));
+        if let Some(denied) = disallowed_tools {
+            fields.insert("disallowedTools".into(), json!(denied));
+        }
+        if let Some(fence) = fence {
+            fields.insert(
+                "fence".into(),
+                serde_json::to_value(fence).unwrap_or(Value::Null),
+            );
+        }
+        if let Some(skills) = skills {
+            fields.insert("skills".into(), json!(skills));
+        }
+        if !models.is_empty() {
+            fields.insert(
+                "models".into(),
+                serde_json::to_value(models).unwrap_or(Value::Null),
+            );
+        }
+        if let Some(hooks) = hooks {
+            fields.insert("hooks".into(), hooks.clone());
+        }
+        // How much earlier history is seeded into its context: what it spends.
+        if let Some(tokens) = seed_budget_tokens {
+            fields.insert("seedBudgetTokens".into(), json!(tokens));
+        }
+        if let Some(eras) = seed_eras {
+            fields.insert("seedEras".into(), json!(eras));
+        }
+        fields
+    }
+}
+
 impl FileAgent {
+    pub fn is_project_scoped(&self) -> bool {
+        self.origin.is_project()
+    }
+
     /// This agent as the runtime config a job launches with in `project_id`,
     /// with no model chosen yet.
     pub fn agent_config(&self, project_id: &str) -> crate::models::AgentConfig {
@@ -57,8 +131,8 @@ impl FileAgent {
             prompt: self.prompt.clone(),
             tools: self.tools.clone(),
             models: self.models.clone(),
-            workspace_id: (!self.is_project_scoped).then(|| "workspace".to_string()),
-            project_id: self.is_project_scoped.then(|| project_id.to_string()),
+            workspace_id: (!self.origin.is_project()).then(|| "workspace".to_string()),
+            project_id: self.origin.is_project().then(|| project_id.to_string()),
             created_at: 0,
             updated_at: 0,
             disallowed_tools: self.disallowed_tools.clone(),
@@ -98,141 +172,177 @@ impl FileAgent {
     }
 }
 
-/// List all agents from files
-///
-/// Reads workspace-scoped agents from `~/.cairn/agents/`.
-/// If project_path is Some, also includes agents from `[project_path]/.cairn/agents/`.
-pub fn list_agents(
-    config_dir: &Path,
-    project_path: Option<&Path>,
-) -> Result<Vec<ConfigResult<FileAgent>>, String> {
-    let mut results = vec![];
-    let pins = agent_pins::load_pins(config_dir);
+fn load_agent_in(dir: &Path, id: &str, origin: &Origin) -> Option<ConfigResult<FileAgent>> {
+    let path = dir.join(format!("{id}.md"));
+    path.is_file()
+        .then(|| load_agent_file(&path, origin.clone()))
+}
 
-    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "agents") {
-        if !dir.exists() || !dir.is_dir() {
+fn enumerate_agents(
+    dir: &Path,
+    origin: &Origin,
+) -> Result<Vec<(String, ConfigResult<FileAgent>)>, String> {
+    let mut results = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| format!("Failed to read agents directory: {e}"))?
+    {
+        let path = entry
+            .map_err(|e| format!("Failed to read directory entry: {e}"))?
+            .path();
+        if path.is_dir() || path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        for entry in std::fs::read_dir(&dir)
-            .map_err(|e| format!("Failed to read agents directory: {}", e))?
-        {
-            let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-            let path = entry.path();
-            if path.is_dir() || path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let mut result = load_agent_file(&path, is_project_scoped);
-            if let ConfigResult::Ok(agent) = &mut result {
-                apply_workspace_pin(&pins, agent);
-            }
-            results.push(result);
+        if let Some(id) = id_from_path(&path) {
+            results.push((id, load_agent_file(&path, origin.clone())));
         }
     }
-
     Ok(results)
 }
 
-/// Overlay the workspace pin for a workspace-scoped agent. Project agents are
-/// never pack-owned, so the workspace pin document does not reach them.
-fn apply_workspace_pin(pins: &agent_pins::AgentPins, agent: &mut FileAgent) {
-    if agent.is_project_scoped {
-        return;
-    }
+/// Every agent definition across the layers, with its origin and what it
+/// shadows, the user's pins applied (tenet 1133: over whichever layer).
+pub fn list_agent_rows(roots: &LibraryRoots) -> Result<Vec<Listed<FileAgent>>, String> {
+    let pins = agent_pins::load_pins(&roots.workspace);
+    Ok(roots
+        .list(LibraryKind::Agent, enumerate_agents)?
+        .into_iter()
+        .map(|row| {
+            row.map(|mut agent| {
+                apply_pin(&pins, &mut agent);
+                agent
+            })
+        })
+        .collect())
+}
+
+/// The agents in force, one per name.
+pub fn list_agents(roots: &LibraryRoots) -> Result<Vec<ConfigResult<FileAgent>>, String> {
+    Ok(library::active(list_agent_rows(roots)?))
+}
+
+fn apply_pin(pins: &agent_pins::AgentPins, agent: &mut FileAgent) {
     if let Some(pin) = pins.get(&agent.id) {
         pin.apply(agent);
     }
 }
 
-/// Get a specific agent by ID
-///
-/// Checks project-scoped first (if project_path provided), then workspace-scoped.
-pub fn get_agent(
-    config_dir: &Path,
-    id: &str,
-    project_path: Option<&Path>,
-) -> Result<Option<FileAgent>, String> {
-    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "agents") {
-        let path = dir.join(format!("{}.md", id));
-        if path.exists() {
-            return match load_agent_file(&path, is_project_scoped) {
-                ConfigResult::Ok(mut agent) => {
-                    apply_workspace_pin(&agent_pins::load_pins(config_dir), &mut agent);
-                    Ok(Some(agent))
-                }
-                ConfigResult::Err { error, .. } => Err(error),
-            };
+/// Resolve an agent reference (a bare id or `cairn://packs/<pack>/agents/<id>`)
+/// nearest-first, with the user's pins applied.
+pub fn resolve_agent(
+    roots: &LibraryRoots,
+    reference: &str,
+) -> Result<Resolved<FileAgent>, ResolveError> {
+    let reference = LibraryRef::parse(LibraryKind::Agent, reference).map_err(|error| {
+        ResolveError::Invalid {
+            path: PathBuf::new(),
+            error,
+            origin: None,
         }
-    }
-
-    Ok(None)
+    })?;
+    let mut resolved = roots.resolve(LibraryKind::Agent, &reference, load_agent_in)?;
+    apply_pin(&agent_pins::load_pins(&roots.workspace), &mut resolved.item);
+    Ok(resolved)
 }
 
-/// Save an agent.
+/// The agent a reference resolves to, `None` when nothing defines it. Any
+/// other failure (untrusted, unconfirmed, a collision) is an error naming why.
+pub fn get_agent(roots: &LibraryRoots, id: &str) -> Result<Option<FileAgent>, String> {
+    match resolve_agent(roots, id) {
+        Ok(resolved) => Ok(Some(resolved.item)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// A pack agent loaded as its pack ships it, with no pins.
+fn pack_version(roots: &LibraryRoots, pack: &str, id: &str) -> Result<FileAgent, String> {
+    let reference = LibraryRef::Pack {
+        pack: pack.to_string(),
+        name: id.to_string(),
+    };
+    Ok(roots
+        .resolve(LibraryKind::Agent, &reference, load_agent_in)?
+        .item)
+}
+
+/// Save an agent into a definite layer.
 ///
-/// Uses the agent's file_path if set, otherwise determines path from is_project_scoped.
-/// For project-scoped agents without file_path, project_path must be provided.
-///
-/// For a workspace agent an installed pack ships, the pinnable keys (`icon`,
-/// `models`) are recorded in the pin document rather than the file, and the
-/// file is rewritten only when something else changed. Setting an allotment
-/// on a shipped agent therefore leaves its file byte-identical and pack-owned,
-/// and the pin survives both pack updates and a reset to the pack version.
-/// Returns the agent file's path; callers stage [`agent_stage_paths`].
+/// `layer` names where to write; `None` writes back where the agent was read
+/// from (`agent.origin`). A pack's own agent is never edited: saving one with
+/// no layer may change only its pins (`icon`, `models`), which go to the pin
+/// document, and anything else is refused. Saving one into the workspace or a
+/// project writes a definition there, in front of the pack's, and keeps its
+/// pinnable keys in the pin document. A workspace or project agent's file
+/// carries every key, and any pin for it is cleared so the file is what
+/// applies. Returns the path written; callers stage [`agent_stage_paths`].
 pub fn save_agent(
-    config_dir: &Path,
+    roots: &LibraryRoots,
     agent: &FileAgent,
-    project_path: Option<&Path>,
+    layer: Option<&Origin>,
 ) -> Result<PathBuf, String> {
-    let path = resolve_save_path(config_dir, agent, project_path)?;
-    if agent.is_project_scoped {
-        write_agent_file(&path, agent)?;
-        return Ok(path);
+    let target = layer.unwrap_or(&agent.origin);
+    let mut pins = agent_pins::load_pins(&roots.workspace);
+
+    if let Origin::Pack { id: pack } = target {
+        let shipped = pack_version(roots, pack, &agent.id)?;
+        let (file_agent, pin) = split_pins(agent, &shipped);
+        if !same_definition(&file_agent, &shipped) {
+            return Err(library::pack_edit_refusal(
+                LibraryKind::Agent,
+                &agent.id,
+                pack,
+            ));
+        }
+        if pins.get(&agent.id).cloned().unwrap_or_default() != pin {
+            pins.set(&agent.id, pin);
+        }
+        return agent_pins::save_pins(&roots.workspace, &pins);
     }
 
-    let mut pins = agent_pins::load_pins(config_dir);
-    let pack_owned = path == config_dir.join("agents").join(format!("{}.md", agent.id))
-        && super::pack::installed_packs(config_dir).iter().any(|lock| {
-            lock.item(super::pack::PackItemKind::Agent, &agent.id)
-                .is_some()
-        });
-    let on_disk = match pack_owned.then(|| load_agent_file(&path, false)) {
-        Some(ConfigResult::Ok(on_disk)) => Some(on_disk),
-        _ => None,
+    // Written back where it was read from unless a layer is named.
+    let path = if layer.is_none() && !agent.file_path.as_os_str().is_empty() {
+        agent.file_path.clone()
+    } else {
+        roots
+            .layer_dir(LibraryKind::Agent, target)
+            .ok_or("Project path required for project-scoped agent")?
+            .join(format!("{}.md", agent.id))
     };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("Failed to create agents directory: {e}"))?;
+    }
 
-    let Some(on_disk) = on_disk else {
-        // Not something a pack ships: the file carries every key, and any pin
-        // left from when it was (a retired pack item) would only shadow it.
-        write_agent_file(&path, agent)?;
-        if pins.get(&agent.id).is_some() {
-            pins.set(&agent.id, AgentPin::default());
-            agent_pins::save_pins(config_dir, &pins)?;
+    if let Origin::Pack { id: pack } = &agent.origin {
+        // A definition placed in front of a pack's: its pins stay pins.
+        let shipped = pack_version(roots, pack, &agent.id)?;
+        let (mut file_agent, pin) = split_pins(agent, &shipped);
+        file_agent.origin = target.clone();
+        write_agent_file(&path, &file_agent)?;
+        if pins.get(&agent.id).cloned().unwrap_or_default() != pin {
+            pins.set(&agent.id, pin);
+            agent_pins::save_pins(&roots.workspace, &pins)?;
         }
         return Ok(path);
-    };
-
-    let (file_agent, pin) = split_pins(agent, &on_disk);
-    if !same_definition(&file_agent, &on_disk) {
-        write_agent_file(&path, &file_agent)?;
     }
-    if pins.get(&agent.id).cloned().unwrap_or_default() != pin {
-        pins.set(&agent.id, pin);
-        agent_pins::save_pins(config_dir, &pins)?;
+
+    write_agent_file(&path, agent)?;
+    if pins.get(&agent.id).is_some() {
+        pins.set(&agent.id, AgentPin::default());
+        agent_pins::save_pins(&roots.workspace, &pins)?;
     }
     Ok(path)
 }
 
-/// Every path a save or delete of the agent at `primary_path` may have changed:
-/// the file itself and, for a workspace agent, the pin document beside it.
-pub fn agent_stage_paths(primary_path: &Path) -> Vec<PathBuf> {
+/// Every path a save or delete of an agent may have changed: the file (or the
+/// lock recording a pack removal) and the workspace pin document.
+pub fn agent_stage_paths(roots: &LibraryRoots, primary_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![primary_path.to_path_buf()];
-    if let Some(config_dir) = primary_path.parent().and_then(Path::parent) {
-        let pins = agent_pins::pins_path(config_dir);
-        // Only an existing document: staging an absent, untracked path would
-        // fail the whole commit.
-        if pins.exists() {
-            paths.push(pins);
-        }
+    let pins = agent_pins::pins_path(&roots.workspace);
+    // Only an existing document: staging an absent, untracked path would fail
+    // the whole commit.
+    if pins.exists() && pins != primary_path {
+        paths.push(pins);
     }
     paths
 }
@@ -281,7 +391,7 @@ fn split_pins(desired: &FileAgent, on_disk: &FileAgent) -> (FileAgent, AgentPin)
 
 /// Whether two agents define the same thing, ignoring formatting the editors
 /// normalize away (surrounding whitespace, an explicit default fence, an empty
-/// versus absent deny-list). Anything this calls different forks a pack file.
+/// versus absent deny-list). Anything this calls different is more than a pin.
 fn same_definition(a: &FileAgent, b: &FileAgent) -> bool {
     let denied = |agent: &FileAgent| agent.disallowed_tools.clone().unwrap_or_default();
     a.name == b.name
@@ -297,37 +407,6 @@ fn same_definition(a: &FileAgent, b: &FileAgent) -> bool {
         && a.bundles == b.bundles
         && a.seed_budget_tokens == b.seed_budget_tokens
         && a.seed_eras == b.seed_eras
-}
-
-fn resolve_save_path(
-    config_dir: &Path,
-    agent: &FileAgent,
-    project_path: Option<&Path>,
-) -> Result<PathBuf, String> {
-    // Determine target path
-    let path = if agent.file_path.as_os_str().is_empty() {
-        // No existing path - determine from scope
-        if agent.is_project_scoped {
-            let proj_path = project_path.ok_or("Project path required for project-scoped agent")?;
-            let dir = proj_path.join(".cairn").join("agents");
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("Failed to create project agents directory: {}", e))?;
-            dir.join(format!("{}.md", agent.id))
-        } else {
-            let dir = config_dir.join("agents");
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("Failed to create agents directory: {}", e))?;
-            dir.join(format!("{}.md", agent.id))
-        }
-    } else {
-        // Use existing path, ensure parent directory exists
-        if let Some(parent) = agent.file_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory: {}", e))?;
-        }
-        agent.file_path.clone()
-    };
-    Ok(path)
 }
 
 fn write_agent_file(path: &Path, agent: &FileAgent) -> Result<(), String> {
@@ -351,96 +430,53 @@ fn write_agent_file(path: &Path, agent: &FileAgent) -> Result<(), String> {
     std::fs::write(path, markdown).map_err(|e| format!("Failed to write agent file: {}", e))
 }
 
-/// Delete an agent file
-pub fn delete_agent(
-    config_dir: &Path,
-    id: &str,
-    project_path: Option<&Path>,
-) -> Result<(), String> {
-    // Try project-scoped first if project specified
-    if let Some(proj_path) = project_path {
-        let path = proj_path
-            .join(".cairn")
-            .join("agents")
-            .join(format!("{}.md", id));
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("Failed to delete agent file: {}", e))?;
-            return Ok(());
-        }
-    }
-
-    // Try workspace-scoped
-    let path = config_dir.join("agents").join(format!("{}.md", id));
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete agent file: {}", e))?;
-        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Agent, id);
-        // Deleting is the user's decision about the whole agent; a pin left
-        // behind would silently re-apply if the item were ever restored.
-        let mut pins = agent_pins::load_pins(config_dir);
-        if pins.get(id).is_some() {
-            pins.set(id, AgentPin::default());
-            agent_pins::save_pins(config_dir, &pins)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// List agents from Claude Code directories (for import)
+/// Delete the agent `id` resolves to, or the one in `layer` when named.
 ///
-/// Reads user-level agents from `~/.claude/agents/`.
-/// If project_path is Some, also includes agents from `[project_path]/.claude/agents/`.
-#[allow(dead_code)]
-pub fn list_claude_agents(
-    project_path: Option<&Path>,
-) -> Result<Vec<ConfigResult<FileAgent>>, String> {
-    let mut results = vec![];
-
-    // User-level: ~/.claude/agents/
-    if let Some(home) = dirs::home_dir() {
-        let user_dir = home.join(".claude").join("agents");
-        if user_dir.exists() && user_dir.is_dir() {
-            for entry in std::fs::read_dir(&user_dir)
-                .map_err(|e| format!("Failed to read ~/.claude/agents: {}", e))?
-            {
-                let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-                let path = entry.path();
-
-                // Skip directories and non-.md files
-                if path.is_dir() || path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-
-                results.push(load_agent_file(&path, false));
+/// A workspace or project definition is deleted outright and nothing else is
+/// recorded; whatever it shadowed resolves again. A pack's own agent is
+/// recorded as removed from its pack (tenet 1121), since there is no local
+/// file to delete. Either way the user's pin for the agent is cleared. Returns
+/// the path that changed (`None` when nothing defined it), for the commit.
+pub fn delete_agent(
+    roots: &LibraryRoots,
+    id: &str,
+    layer: Option<&Origin>,
+) -> Result<Option<PathBuf>, String> {
+    let (origin, path) = match layer {
+        Some(origin) => {
+            let Some(dir) = roots.layer_dir(LibraryKind::Agent, origin) else {
+                return Err(format!("No {origin} layer to delete agent `{id}` from"));
+            };
+            let path = dir.join(format!("{id}.md"));
+            if !path.is_file() {
+                return Ok(None);
             }
+            (origin.clone(), path)
         }
+        None => match resolve_agent(roots, id) {
+            Ok(resolved) => (resolved.origin, resolved.item.file_path),
+            Err(ResolveError::Invalid {
+                path,
+                origin: Some(origin),
+                ..
+            }) => (origin, path),
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        },
+    };
+    let changed = library::remove_definition(roots, LibraryKind::Agent, id, &origin, &path)?;
+    // Deleting is the user's decision about the whole agent; a pin left
+    // behind would silently re-apply to whatever resolves next.
+    let mut pins = agent_pins::load_pins(&roots.workspace);
+    if pins.get(id).is_some() {
+        pins.set(id, AgentPin::default());
+        agent_pins::save_pins(&roots.workspace, &pins)?;
     }
-
-    // Project-level: [project]/.claude/agents/
-    if let Some(proj_path) = project_path {
-        let proj_dir = proj_path.join(".claude").join("agents");
-        if proj_dir.exists() && proj_dir.is_dir() {
-            for entry in std::fs::read_dir(&proj_dir)
-                .map_err(|e| format!("Failed to read project .claude/agents: {}", e))?
-            {
-                let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-                let path = entry.path();
-
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-
-                results.push(load_agent_file(&path, true));
-            }
-        }
-    }
-
-    Ok(results)
+    Ok(Some(changed))
 }
 
 /// Load a single agent file
-fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAgent> {
+fn load_agent_file(path: &Path, origin: Origin) -> ConfigResult<FileAgent> {
     let id = match id_from_path(path) {
         Some(id) => id,
         None => {
@@ -477,7 +513,7 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
             bundles: parsed.bundles,
             seed_budget_tokens: parsed.seed_budget_tokens,
             seed_eras: parsed.seed_eras,
-            is_project_scoped,
+            origin,
             file_path: path.to_path_buf(),
         }),
         Err(e) => ConfigResult::Err {
@@ -490,64 +526,85 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::test_support::*;
     use tempfile::tempdir;
+
+    fn agent_body(name: &str, tools: &str) -> String {
+        format!("---\nname: {name}\ndescription: d\ntools: {tools}\n---\n\n{name} prompt.")
+    }
 
     #[test]
     fn get_agent_walks_project_then_workspace() {
         let temp = tempdir().unwrap();
         let config_dir = temp.path().join("config");
         let project_dir = temp.path().join("project");
-        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
-        std::fs::create_dir_all(project_dir.join(".cairn/agents")).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        write_item(
+            &config_dir,
+            LibraryKind::Agent,
+            "shared",
+            &agent_body("Workspace", "Read"),
+        );
+        let project_file = write_item(
+            &project_root(&project_dir),
+            LibraryKind::Agent,
+            "shared",
+            &agent_body("Project", "Read"),
+        );
+        write_item(
+            &config_dir,
+            LibraryKind::Agent,
+            "workspace-only",
+            &agent_body("Workspace Only", "Read"),
+        );
+        let shared_tools = get_agent(
+            &LibraryRoots::workspace(&config_dir).with_project(project(
+                &project_dir,
+                "demo",
+                trusted(&[]),
+            )),
+            "shared",
+        )
+        .unwrap_err();
+        assert!(
+            shared_tools.contains("whose fence and tools the operator has not confirmed"),
+            "{shared_tools}"
+        );
 
-        std::fs::write(
-            config_dir.join("agents/shared.md"),
-            "---\nname: Workspace\ndescription: workspace agent\ntools:
-  - Read\n---\n\nWorkspace prompt.",
-        )
-        .unwrap();
-        std::fs::write(
-            project_dir.join(".cairn/agents/shared.md"),
-            "---\nname: Project\ndescription: project agent\ntools:
-  - Read\n---\n\nProject prompt.",
-        )
-        .unwrap();
-        std::fs::write(
-            config_dir.join("agents/workspace-only.md"),
-            "---\nname: Workspace Only\ndescription: workspace only\ntools:
-  - Read\n---\n\nWorkspace only prompt.",
-        )
-        .unwrap();
+        let ConfigResult::Ok(defined) = load_agent_file(&project_file, Origin::Workspace) else {
+            panic!("the project agent parses");
+        };
+        let confirmed = defined.authority();
+        assert!(confirmed.contains_key("tools") && confirmed.contains_key("fence"));
+        let roots = LibraryRoots::workspace(&config_dir).with_project(project(
+            &project_dir,
+            "demo",
+            trusted(&[(LibraryKind::Agent, "shared", confirmed)]),
+        ));
 
-        let shared = get_agent(&config_dir, "shared", Some(&project_dir))
-            .unwrap()
-            .unwrap();
+        let shared = get_agent(&roots, "shared").unwrap().unwrap();
         assert_eq!(shared.name, "Project");
-        assert!(shared.is_project_scoped);
+        assert!(shared.is_project_scoped());
 
-        let workspace = get_agent(&config_dir, "workspace-only", Some(&project_dir))
-            .unwrap()
-            .unwrap();
+        let workspace = get_agent(&roots, "workspace-only").unwrap().unwrap();
         assert_eq!(workspace.name, "Workspace Only");
-        assert!(!workspace.is_project_scoped);
+        assert_eq!(workspace.origin, Origin::Workspace);
 
-        assert!(get_agent(&config_dir, "missing", Some(&project_dir))
-            .unwrap()
-            .is_none());
+        assert!(get_agent(&roots, "missing").unwrap().is_none());
     }
 
-    /// An agent no pack claims keeps every key in its own file, and saving it
-    /// clears any pin left from when a pack shipped it.
+    /// A workspace agent keeps every key in its own file, and saving it clears
+    /// any pin so the file is what applies.
     #[test]
-    fn an_unclaimed_agent_keeps_its_pins_in_the_file() {
+    fn a_workspace_agent_keeps_its_pins_in_the_file() {
         let temp = tempdir().unwrap();
         let config_dir = temp.path();
-        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
-        std::fs::write(
-            config_dir.join("agents/mine.md"),
-            "---\nname: Mine\ndescription: d\ntools: Read\n---\n\nPrompt.",
-        )
-        .unwrap();
+        write_item(
+            config_dir,
+            LibraryKind::Agent,
+            "mine",
+            &agent_body("Mine", "Read"),
+        );
         let mut stale = agent_pins::AgentPins::default();
         stale.set(
             "mine",
@@ -557,8 +614,9 @@ mod tests {
             },
         );
         agent_pins::save_pins(config_dir, &stale).unwrap();
+        let roots = LibraryRoots::workspace(config_dir);
 
-        let mut agent = get_agent(config_dir, "mine", None).unwrap().unwrap();
+        let mut agent = get_agent(&roots, "mine").unwrap().unwrap();
         assert_eq!(
             agent.icon.as_deref(),
             Some("old"),
@@ -566,13 +624,72 @@ mod tests {
         );
         agent.models = vec![AllotmentEntry::Pool("lg".into())];
         agent.icon = None;
-        save_agent(config_dir, &agent, None).unwrap();
+        save_agent(&roots, &agent, None).unwrap();
 
         let text = std::fs::read_to_string(config_dir.join("agents/mine.md")).unwrap();
         assert!(text.contains("models: [lg]"), "{text}");
         assert!(agent_pins::load_pins(config_dir).get("mine").is_none());
-        let reloaded = get_agent(config_dir, "mine", None).unwrap().unwrap();
+        let reloaded = get_agent(&roots, "mine").unwrap().unwrap();
         assert_eq!(reloaded.icon, None);
+    }
+
+    /// Editing a pack's agent: a pin-only change touches only the pin
+    /// document; anything more is refused unless it names a layer, which puts
+    /// a definition in front of the pack's and leaves the pack's file alone.
+    #[test]
+    fn a_pack_agent_is_pinned_or_shadowed_but_never_edited() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path();
+        install_pack_lock(config_dir, "core", &[]);
+        let shipped = write_item(
+            &pack_root(config_dir, "core"),
+            LibraryKind::Agent,
+            "build",
+            &agent_body("Build", "Read"),
+        );
+        let before = std::fs::read(&shipped).unwrap();
+        let roots = LibraryRoots::workspace(config_dir);
+
+        let mut agent = get_agent(&roots, "build").unwrap().unwrap();
+        assert_eq!(agent.origin, Origin::Pack { id: "core".into() });
+        agent.icon = Some("hammer".into());
+        save_agent(&roots, &agent, None).unwrap();
+        assert_eq!(std::fs::read(&shipped).unwrap(), before);
+        assert_eq!(
+            get_agent(&roots, "build").unwrap().unwrap().icon.as_deref(),
+            Some("hammer")
+        );
+
+        agent.prompt = "Changed.".into();
+        let refusal = save_agent(&roots, &agent, None).unwrap_err();
+        assert!(refusal.contains("pack items are never edited"), "{refusal}");
+
+        let written = save_agent(&roots, &agent, Some(&Origin::Workspace)).unwrap();
+        assert_eq!(written, config_dir.join("agents/build.md"));
+        assert_eq!(std::fs::read(&shipped).unwrap(), before);
+        let resolved = resolve_agent(&roots, "build").unwrap();
+        assert_eq!(resolved.origin, Origin::Workspace);
+        assert_eq!(resolved.shadows, vec![Origin::Pack { id: "core".into() }]);
+        assert_eq!(resolved.item.prompt, "Changed.");
+        assert_eq!(
+            resolved.item.icon.as_deref(),
+            Some("hammer"),
+            "pins still apply"
+        );
+
+        // Deleting the workspace definition is plain deletion: the pack's
+        // agent resolves again and nothing is recorded against the pack.
+        delete_agent(&roots, "build", None).unwrap();
+        assert!(!config_dir.join("agents/build.md").exists());
+        let roots = LibraryRoots::workspace(config_dir);
+        assert_eq!(
+            resolve_agent(&roots, "build").unwrap().origin,
+            Origin::Pack { id: "core".into() }
+        );
+        assert!(crate::pack::lock::read_lock(config_dir, "core")
+            .unwrap()
+            .removed
+            .is_empty());
     }
 
     #[test]
@@ -594,7 +711,7 @@ You are a test agent.
 
         std::fs::write(&path, content).unwrap();
 
-        let result = load_agent_file(&path, false);
+        let result = load_agent_file(&path, Origin::Workspace);
         match result {
             ConfigResult::Ok(agent) => {
                 assert_eq!(agent.id, "test-agent");
@@ -608,7 +725,7 @@ You are a test agent.
                         AllotmentEntry::parse("claude/sonnet").unwrap()
                     ]
                 );
-                assert!(!agent.is_project_scoped);
+                assert_eq!(agent.origin, Origin::Workspace);
                 assert!(agent.prompt.contains("test agent"));
             }
             ConfigResult::Err { error, .. } => panic!("Failed to load: {}", error),

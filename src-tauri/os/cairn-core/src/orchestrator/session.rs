@@ -10,6 +10,7 @@ use crate::agent_process::stream::TranscriptEvent;
 use crate::backends::{self, SessionConfig, SessionStart};
 use crate::identity::CredentialStoreExt;
 use crate::models::Model;
+use cairn_config::library::LibraryRoots;
 use cairn_models::wire::claude_stream::ClaudeEvent;
 use cairn_session::agent_process::stream::TranscriptJson;
 
@@ -2396,9 +2397,11 @@ pub fn start_agent_session(
         use crate::config::contextual_packages::ContextualPackageKind;
         use crate::config::{agents as config_agents, ConfigResult};
         let mut by_id = std::collections::BTreeMap::new();
-        for result in
-            config_agents::list_agents(&orch.config_dir, db_context.project_path.as_deref())
-                .unwrap_or_default()
+        for result in config_agents::list_agents(&LibraryRoots::at(
+            &orch.config_dir,
+            db_context.project_path.as_deref(),
+        ))
+        .unwrap_or_default()
         {
             if let ConfigResult::Ok(agent) = result {
                 by_id.entry(agent.id.clone()).or_insert(agent);
@@ -2528,9 +2531,11 @@ pub fn start_agent_session(
 
         // Get list of available skills from files
         let available_skills_for_prompt: Vec<(String, String, String)> = {
-            let skills =
-                config_skills::list_skills(&orch.config_dir, project_path_for_prompt.as_deref())
-                    .unwrap_or_default();
+            let skills = config_skills::list_skills(&LibraryRoots::at(
+                &orch.config_dir,
+                project_path_for_prompt.as_deref(),
+            ))
+            .unwrap_or_default();
             let mut by_id = std::collections::BTreeMap::new();
             for result in skills {
                 if let ConfigResult::Ok(skill) = result {

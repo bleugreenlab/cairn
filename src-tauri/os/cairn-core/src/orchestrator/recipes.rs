@@ -3,6 +3,7 @@
 //! File-based recipe management: workspace-scoped (`~/.cairn/recipes/`) vs
 //! project-scoped (`[project]/.cairn/recipes/`).
 
+use cairn_config::library::{LibraryRoots, Origin};
 use std::path::{Path, PathBuf};
 
 use crate::config::{recipes as config_recipes, slugify, ConfigResult};
@@ -61,7 +62,7 @@ impl ConfigResource for RecipeResource {
         config_dir: &Path,
         project_path: Option<&Path>,
     ) -> Result<Vec<ConfigResult<Self::File>>, String> {
-        config_recipes::list_recipes(config_dir, project_path)
+        config_recipes::list_recipes(&LibraryRoots::at(config_dir, project_path))
     }
 
     fn get_file(
@@ -69,23 +70,32 @@ impl ConfigResource for RecipeResource {
         id: &str,
         project_path: Option<&Path>,
     ) -> Result<Option<Self::File>, String> {
-        config_recipes::get_recipe(config_dir, id, project_path)
+        config_recipes::get_recipe(&LibraryRoots::at(config_dir, project_path), id)
     }
 
     fn save_file(
         config_dir: &Path,
         file: &Self::File,
         project_path: Option<&Path>,
+        layer: Option<&Origin>,
     ) -> Result<PathBuf, String> {
-        config_recipes::save_recipe(config_dir, file, project_path)
+        config_recipes::save_recipe(&LibraryRoots::at(config_dir, project_path), file, layer)
     }
 
-    fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String> {
-        config_recipes::delete_recipe(config_dir, id, project_path)
+    fn delete_file(
+        config_dir: &Path,
+        id: &str,
+        project_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>, String> {
+        config_recipes::delete_recipe(&LibraryRoots::at(config_dir, project_path), id, None)
+    }
+
+    fn file_origin(file: &Self::File) -> Origin {
+        file.origin.clone()
     }
 
     fn file_is_project_scoped(file: &Self::File) -> bool {
-        file.is_project_scoped
+        file.is_project_scoped()
     }
 
     fn file_bundles(file: &Self::File) -> &[String] {
@@ -124,7 +134,7 @@ impl ConfigResource for RecipeResource {
     fn build_create_file(
         input: Self::CreateInput,
         id: String,
-        is_project_scoped: bool,
+        origin: Origin,
         now: i64,
     ) -> Self::File {
         let recipe = Recipe {
@@ -147,7 +157,7 @@ impl ConfigResource for RecipeResource {
         config_recipes::FileRecipe {
             recipe,
             bundles: Vec::new(),
-            is_project_scoped,
+            origin,
             file_path: PathBuf::new(),
         }
     }
@@ -170,7 +180,7 @@ impl ConfigResource for RecipeResource {
         existing: &Self::File,
         input: Self::UpdateInput,
         _id: &str,
-        new_is_project_scoped: bool,
+        new_origin: Origin,
         scope_changing: bool,
         now: i64,
     ) -> Self::File {
@@ -191,7 +201,7 @@ impl ConfigResource for RecipeResource {
         if let Some(edges) = input.edges {
             recipe.edges = edges;
         }
-        recipe.workspace_id = if new_is_project_scoped {
+        recipe.workspace_id = if new_origin.is_project() {
             None
         } else {
             Some("default".to_string())
@@ -202,7 +212,7 @@ impl ConfigResource for RecipeResource {
         config_recipes::FileRecipe {
             recipe,
             bundles: existing.bundles.clone(),
-            is_project_scoped: new_is_project_scoped,
+            origin: new_origin,
             file_path: if scope_changing {
                 PathBuf::new()
             } else {
@@ -236,7 +246,7 @@ impl ConfigResource for RecipeResource {
     fn build_scoped_copy(
         source: &Self::File,
         id: &str,
-        is_project_scoped: bool,
+        origin: Origin,
         workspace_id: Option<String>,
         project_id: Option<String>,
         now: i64,
@@ -251,7 +261,7 @@ impl ConfigResource for RecipeResource {
         config_recipes::FileRecipe {
             recipe,
             bundles: source.bundles.clone(),
-            is_project_scoped,
+            origin,
             file_path: PathBuf::new(),
         }
     }
@@ -276,18 +286,20 @@ impl Orchestrator {
         &self,
         config_root: &Path,
         recipe: Recipe,
-        is_project_scoped: bool,
-        file_path: PathBuf,
         project_path: Option<&Path>,
         event: RecipeChangeEvent<'_>,
     ) -> Result<Recipe, String> {
         let file_recipe = config_recipes::FileRecipe {
             recipe: recipe.clone(),
             bundles: Vec::new(),
-            is_project_scoped,
-            file_path,
+            origin: config_resource::scope_origin(project_path),
+            file_path: PathBuf::new(),
         };
-        let saved_path = config_recipes::save_recipe(config_root, &file_recipe, project_path)?;
+        let saved_path = config_recipes::save_recipe(
+            &LibraryRoots::at(config_root, project_path),
+            &file_recipe,
+            None,
+        )?;
         let action = if event.config_action == "created" {
             "create"
         } else {
@@ -345,12 +357,26 @@ impl Orchestrator {
         project_id: Option<&str>,
         workspace_id: Option<&str>,
     ) -> Result<Recipe, String> {
+        self.update_recipe_in_layer(recipe_id, input, project_id, workspace_id, None)
+    }
+
+    /// Update a recipe, saving an edit to a pack's recipe as the user's own
+    /// definition in `target_layer` (`workspace` or `project`).
+    pub fn update_recipe_in_layer(
+        &self,
+        recipe_id: &str,
+        input: UpdateRecipe,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+        target_layer: Option<&str>,
+    ) -> Result<Recipe, String> {
         config_resource::update_config::<RecipeResource>(
             self,
             recipe_id,
             input,
             project_id,
             workspace_id,
+            target_layer,
         )
     }
 
@@ -442,9 +468,11 @@ impl Orchestrator {
             }
         };
 
-        let existing =
-            config_recipes::get_recipe(&config_root, recipe_id, project_path.as_deref())?
-                .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
+        let existing = config_recipes::get_recipe(
+            &LibraryRoots::at(&config_root, project_path.as_deref()),
+            recipe_id,
+        )?
+        .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
 
         let new_id = slugify(new_name);
         let now = chrono::Utc::now().timestamp();
@@ -458,18 +486,17 @@ impl Orchestrator {
         new_recipe.created_at = now;
         new_recipe.updated_at = now;
 
-        let file_path = existing
-            .file_path
-            .parent()
-            .map(|p| p.join(format!("{}.yaml", new_id)))
-            .ok_or_else(|| "Invalid source recipe path".to_string())?;
-
+        // The copy lands in the layer the duplicate was asked for, never
+        // inside a pack the source may have come from.
+        let target_project = if existing.is_project_scoped() {
+            project_path.as_deref()
+        } else {
+            None
+        };
         self.save_recipe_change(
             &config_root,
             new_recipe,
-            existing.is_project_scoped,
-            file_path,
-            project_path.as_deref(),
+            target_project,
             RecipeChangeEvent {
                 event_id: &new_id,
                 config_action: "created",
@@ -508,9 +535,11 @@ impl Orchestrator {
                 None => self.config_dir.clone(),
             }
         };
-        let file_recipe =
-            config_recipes::get_recipe(&read_root, recipe_id, project_path.as_deref())?
-                .ok_or_else(|| format!("Recipe '{}' not found", recipe_id))?;
+        let file_recipe = config_recipes::get_recipe(
+            &LibraryRoots::at(&read_root, project_path.as_deref()),
+            recipe_id,
+        )?
+        .ok_or_else(|| format!("Recipe '{}' not found", recipe_id))?;
 
         let file: RecipeFile = file_recipe.recipe.into();
         match format.to_lowercase().as_str() {
@@ -561,24 +590,9 @@ impl Orchestrator {
         let id = slugify(&recipe.name);
         recipe.id = id.clone();
 
-        let is_project_scoped = project_path.is_some();
-        let file_path = if let Some(ref proj_path) = project_path {
-            let recipes_dir = proj_path.join(".cairn").join("recipes");
-            std::fs::create_dir_all(&recipes_dir)
-                .map_err(|e| format!("Failed to create project recipes directory: {}", e))?;
-            recipes_dir.join(format!("{}.yaml", id))
-        } else {
-            let recipes_dir = config_root.join("recipes");
-            std::fs::create_dir_all(&recipes_dir)
-                .map_err(|e| format!("Failed to create recipes directory: {}", e))?;
-            recipes_dir.join(format!("{}.yaml", id))
-        };
-
         self.save_recipe_change(
             &config_root,
             recipe,
-            is_project_scoped,
-            file_path,
             project_path.as_deref(),
             RecipeChangeEvent {
                 event_id: &id,
@@ -631,6 +645,8 @@ mod tests {
     use super::RecipeResource;
     use crate::models::{Recipe, RecipeTrigger, UpdateRecipe};
     use crate::orchestrator::config_resource::ConfigResource;
+    #[allow(unused_imports)]
+    use cairn_config::library::{LibraryRoots, Origin};
     use std::path::PathBuf;
 
     fn existing_recipe(is_system: bool) -> crate::config::recipes::FileRecipe {
@@ -653,7 +669,7 @@ mod tests {
                 updated_at: 1,
             },
             bundles: Vec::new(),
-            is_project_scoped: false,
+            origin: Origin::Workspace,
             file_path: PathBuf::from("recipe.yaml"),
         }
     }
@@ -677,7 +693,7 @@ mod tests {
             &existing_recipe(true),
             update_input(Some(false)),
             "recipe",
-            false,
+            Origin::Workspace,
             false,
             2,
         );
@@ -691,7 +707,7 @@ mod tests {
             &existing_recipe(true),
             update_input(None),
             "recipe",
-            false,
+            Origin::Workspace,
             false,
             2,
         );

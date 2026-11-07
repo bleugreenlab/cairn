@@ -100,7 +100,21 @@ pub(crate) fn role_home_project_id(orch: &Orchestrator, role: &str) -> Result<St
         .map(|(project_id, path)| (project_id.as_str(), path.as_path()));
     match resolve_role_canon_home(&orch.config_dir, role, project_refs) {
         RoleCanonHome::Project { project_id } => Ok(project_id),
-        RoleCanonHome::Workspace => Ok("workspace".to_string()),
+        // A pack role's memories are the workspace's to triage; the seed tells
+        // the integrator the canon itself belongs in the pack's source.
+        RoleCanonHome::Workspace | RoleCanonHome::Pack { .. } => Ok("workspace".to_string()),
+    }
+}
+
+/// The pack whose agent defines `role`, when nothing local stands in front.
+fn role_canon_pack(orch: &Orchestrator, role: &str) -> Option<String> {
+    let projects = orch.all_project_paths().ok()?;
+    let project_refs = projects
+        .iter()
+        .map(|(project_id, path)| (project_id.as_str(), path.as_path()));
+    match resolve_role_canon_home(&orch.config_dir, role, project_refs) {
+        RoleCanonHome::Pack { pack_id } => Some(pack_id),
+        _ => None,
     }
 }
 
@@ -164,21 +178,34 @@ fn role_prompt_under_triage(orch: &Orchestrator, target: &ScopeTarget) -> Option
     }
 
     let project_id = (target.project_id != "workspace").then_some(target.project_id.as_str());
+    let pack_note = role_canon_pack(orch, &target.scope_value)
+        .map(|pack| {
+            format!(
+                "Role `{role}` is defined by the `{pack}` pack \
+                 (cairn://packs/{pack}/agents/{role}), which is read where it is installed and \
+                 never edited. Canon for this role belongs in the `{pack}` pack's source. Do not \
+                 write a workspace or project definition in front of it to hold canon: that \
+                 would freeze the role at this version of the pack.\n\n",
+                role = target.scope_value
+            )
+        })
+        .unwrap_or_default();
     Some(
-        match orch.get_agent_config(&target.scope_value, project_id) {
-            Ok(Some(agent)) => format!(
-                "## Role prompt under triage\n\nRole `{}`:\n\n```markdown\n{}\n```\n\n",
-                target.scope_value, agent.prompt
-            ),
-            Ok(None) => format!(
-                "## Role prompt under triage\n\n_No live role prompt found for `{}`._\n\n",
-                target.scope_value
-            ),
-            Err(error) => format!(
-                "## Role prompt under triage\n\n_Unable to load role prompt `{}`: {error}_\n\n",
-                target.scope_value
-            ),
-        },
+        pack_note
+            + &match orch.get_agent_config(&target.scope_value, project_id) {
+                Ok(Some(agent)) => format!(
+                    "## Role prompt under triage\n\nRole `{}`:\n\n```markdown\n{}\n```\n\n",
+                    target.scope_value, agent.prompt
+                ),
+                Ok(None) => format!(
+                    "## Role prompt under triage\n\n_No live role prompt found for `{}`._\n\n",
+                    target.scope_value
+                ),
+                Err(error) => format!(
+                    "## Role prompt under triage\n\n_Unable to load role prompt `{}`: {error}_\n\n",
+                    target.scope_value
+                ),
+            },
     )
 }
 
@@ -1090,6 +1117,7 @@ mod tests {
             agent_markdown_with_prompt("Builder", "Builder-specific canon."),
         )
         .unwrap();
+        crate::config::trust_for_test(&test.orch.config_dir, &test.project_dir, "prj");
         let memory = memory("role-memory", "project-1", "role memory");
         let target = ScopeTarget {
             scope: "role".to_string(),

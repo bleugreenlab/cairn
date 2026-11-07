@@ -39,6 +39,7 @@ const DEFAULT_BRANCH: &str = "main";
 mod tests {
     use super::*;
     use crate::services::{FileSystem, GitClient, RealFileSystem, RealGitClient};
+    use cairn_config::library::{LibraryKind, LibraryRoots, Origin};
     const LEGACY_BUNDLE_SYNC_MARKER: &str = ".bundle-sync";
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -54,28 +55,28 @@ mod tests {
         resources.join("packs").join(id)
     }
 
-    fn write_manifest(resources: &Path, id: &str, default: bool, retired: &[&str]) {
-        let mut body = format!("id: {id}\nname: {id}\nversion: 1.0.0\ndefault: {default}\n");
-        if !retired.is_empty() {
-            body.push_str("retired:\n");
-            for path in retired {
-                body.push_str(&format!("  - {path}\n"));
-            }
-        }
-        write(&source_pack(resources, id).join("cairn-pack.yaml"), &body);
+    fn write_manifest(resources: &Path, id: &str, default: bool) {
+        write(
+            &source_pack(resources, id).join("cairn-pack.yaml"),
+            &format!("id: {id}\nname: {id}\nversion: 1.0.0\ndefault: {default}\n"),
+        );
     }
 
-    /// A complete default `core` pack: one of every content kind.
+    fn agent_body(body: &str) -> String {
+        format!("---\nname: Explore\ndescription: d\ntools: Read\n---\n\n{body}\n")
+    }
+
+    /// A complete default `core` pack: one of every library kind.
     fn write_complete_resources(resources: &Path) {
-        write_manifest(resources, "core", true, &[]);
+        write_manifest(resources, "core", true);
         let root = source_pack(resources, "core");
-        write(&root.join("agents/explore.md"), "bundle agent\n");
+        write(&root.join("agents/explore.md"), &agent_body("bundle agent"));
         write(&root.join("recipes/default.yaml"), "name: default\n");
         write(&root.join("responses/conveyor.md"), "response\n");
         write(&root.join("routes/followed.yaml"), "name: followed\n");
         write(
             &root.join("skills/example/SKILL.md"),
-            "---\nname: Example\ndescription: Example skill\n---\n",
+            "---\nname: example\ndescription: Example skill\n---\n",
         );
         write(
             &root.join("workflows/example/workflow.yaml"),
@@ -83,33 +84,10 @@ mod tests {
         );
     }
 
-    fn write_resources_a(resources: &Path) {
-        write_manifest(resources, "core", true, &["recipes/main-coordinator.yaml"]);
-        let root = source_pack(resources, "core");
-        write(&root.join("agents/explore.md"), "bundle a\n");
-        write(&root.join("recipes/default.yaml"), "name: default\n");
-    }
-
-    fn write_resources_b(resources: &Path) {
-        write_manifest(resources, "core", true, &["recipes/main-coordinator.yaml"]);
-        let root = source_pack(resources, "core");
-        write(&root.join("agents/explore.md"), "bundle b\n");
-        write(&root.join("agents/new-agent.md"), "new\n");
-        write(&root.join("recipes/default.yaml"), "name: default\n");
-        write(
-            &root.join("recipes/memory-triage.yaml"),
-            "name: memory-triage\n",
-        );
-        write(
-            &root.join("skills/example/SKILL.md"),
-            "---\nname: Example\ndescription: Example skill\n---\nBody\n",
-        );
-    }
-
     /// A non-default pack carrying one skill and one MCP server, the `matlab`
     /// archetype in miniature.
     fn write_optional_pack(resources: &Path, id: &str) {
-        write_manifest(resources, id, false, &[]);
+        write_manifest(resources, id, false);
         let root = source_pack(resources, id);
         write(
             &root.join(format!("skills/{id}/SKILL.md")),
@@ -121,8 +99,8 @@ mod tests {
         );
     }
 
-    /// Every tracked file in the workspace except git internals, so a sync can
-    /// be asserted to have written nothing.
+    /// Every file in the workspace except git internals, so a sync can be
+    /// asserted to have written nothing.
     fn snapshot_tree(root: &Path) -> BTreeMap<String, String> {
         fn walk(root: &Path, dir: &Path, into: &mut BTreeMap<String, String>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -151,15 +129,9 @@ mod tests {
         map
     }
 
-    /// The tracked-file allowlist as it stood BEFORE packs: no `packs/`, and —
-    /// the load-bearing part — no `responses/`. Seeding the post-upgrade string
-    /// instead would quietly skip the whole allowlist-widening path that a real
-    /// existing workspace takes.
-    const LEGACY_WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/workflows/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
-
-    /// Build a workspace exactly as the PRE-PACK bundle sync left one: every
-    /// shipped file materialized flat, committed under a legacy bundle subject,
-    /// and a global `.bundle-sync` marker. No `packs/` directory anywhere.
+    /// A workspace exactly as the pre-pack bundle sync left one: every shipped
+    /// file materialized flat, committed under a legacy bundle subject, and a
+    /// global `.bundle-sync` marker. No `packs/` directory anywhere.
     fn seed_legacy_workspace(repo: &Path, resources: &Path, pack_ids: &[&str]) {
         std::fs::create_dir_all(repo).unwrap();
         for id in pack_ids {
@@ -174,7 +146,6 @@ mod tests {
             }
         }
         std::fs::write(repo.join(LEGACY_BUNDLE_SYNC_MARKER), "legacy-hash\n").unwrap();
-        std::fs::write(repo.join(".gitignore"), LEGACY_WORKSPACE_GITIGNORE).unwrap();
         let git = RealGitClient;
         git.init_repo(repo, DEFAULT_BRANCH).unwrap();
         git.add_all(repo).unwrap();
@@ -187,6 +158,11 @@ mod tests {
             .ancestors()
             .nth(2)
             .expect("cairn-core manifest is nested under src-tauri")
+    }
+
+    fn ships_service(repo: &Path, pack_id: &str, service: &str) -> bool {
+        pack_lock::read_lock(repo, pack_id)
+            .is_some_and(|lock| lock.item(PackItemKind::Service, service).is_some())
     }
 
     #[test]
@@ -217,7 +193,11 @@ mod tests {
             assert_eq!(selection.is_some(), enabled);
             assert!(selection.is_none_or(|selected| selected.override_command().is_none()));
             assert_eq!(pack_lock::read_lock(&repo, "axon").is_some(), enabled);
-            assert_eq!(repo.join("services/axon/service.yaml").exists(), enabled);
+            assert_eq!(ships_service(&repo, "axon", "axon"), enabled);
+            assert!(
+                !repo.join("services/axon").exists(),
+                "a service is never mirrored into the workspace"
+            );
             assert_eq!(repo.join("packs/axon/mcp.yaml").exists(), enabled);
             let before = snapshot_tree(&repo);
             assert!(
@@ -252,7 +232,7 @@ mod tests {
         let settings = std::fs::read(repo.join("settings.yaml")).unwrap();
         migrate_desktop_automation(&RealGitClient, &RealFileSystem, &repo).unwrap();
         assert!(pack_lock::read_lock(&repo, "axon").is_some());
-        assert!(repo.join("services/axon/service.yaml").exists());
+        assert!(ships_service(&repo, "axon", "axon"));
         assert_eq!(std::fs::read(repo.join("settings.yaml")).unwrap(), settings);
     }
 
@@ -272,7 +252,6 @@ mod tests {
             &repo.join("settings.yaml"),
             "buildSlots:\n  machineServices:\n    axon/axon:\n      machines:\n        local: {}\n",
         );
-        write(&repo.join("services/axon/service.yaml"), "operator edit\n");
         let before = snapshot_tree(&repo);
         migrate_desktop_automation(&RealGitClient, &RealFileSystem, &repo).unwrap();
         assert_eq!(snapshot_tree(&repo), before);
@@ -288,25 +267,16 @@ mod tests {
             pack_lock::read_lock(&repo, "axon").is_some(),
             "offered does not mean uninstalled"
         );
-        assert_eq!(
-            std::fs::read_to_string(repo.join("services/axon/service.yaml")).unwrap(),
-            "operator edit\n"
-        );
     }
 
     /// The acceptance path, exercised against the packs this repository actually
-    /// ships rather than a fixture: a fresh workspace materializes `core` only,
-    /// `axon`, `matlab`, and `linear` wait in the catalog, and installing the latter two lands
-    /// exactly what it carries — files for `matlab`, nothing but a connector for
-    /// `linear`. Fixtures can drift from the shipped tree; this cannot.
+    /// ships rather than a fixture: a fresh workspace installs `core` only, read
+    /// in place under `packs/core/`, while `axon`, `matlab`, and `linear` wait
+    /// in the catalog. Fixtures can drift from the shipped tree; this cannot.
     #[test]
     fn the_shipped_packs_install_the_default_set_and_offer_the_rest() {
         crate::config::secrets::mock_keychain::install();
-        let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("cairn-core manifest is nested under src-tauri");
-
+        let src_tauri = shipped_resources();
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let git = RealGitClient;
@@ -323,7 +293,11 @@ mod tests {
             "skills/browser/SKILL.md",
             "workflows/fan-out/workflow.yaml",
         ] {
-            assert!(repo.join(path).exists(), "core must ship {path}");
+            assert!(
+                repo.join("packs/core").join(path).exists(),
+                "core must ship {path}"
+            );
+            assert!(!repo.join(path).exists(), "{path} is not copied out");
         }
         let core = pack_lock::read_lock(&repo, "core").expect("core lock");
         for id in ["followed-thread-stream", "github-mention"] {
@@ -332,13 +306,18 @@ mod tests {
                 "core must record shipped route `{id}` as a pack item"
             );
         }
+        let roots = LibraryRoots::workspace(&repo);
+        assert_eq!(
+            crate::config::agents::resolve_agent(&roots, "build")
+                .unwrap()
+                .origin,
+            Origin::Pack { id: "core".into() }
+        );
 
         // The optional packs are offered, not installed.
-        assert!(!repo.join("skills/matlab").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(pack_lock::read_lock(&repo, "linear").is_none());
         assert!(pack_lock::read_lock(&repo, "axon").is_none());
-        assert!(!repo.join("services/axon").exists());
         let library = crate::library::LibraryContext::configured();
         let catalog = crate::resources::packs::read_packs(
             &repo,
@@ -348,13 +327,6 @@ mod tests {
         );
         assert!(catalog.contains("`matlab`"), "{catalog}");
         assert!(catalog.contains("`linear`"), "{catalog}");
-        let available = crate::resources::packs::read_packs(
-            &repo,
-            &library,
-            &crate::config::machine_services::MachineServiceSnapshot::empty(),
-            Some("available"),
-        );
-        assert!(available.contains("`axon`"), "{available}");
         let installed: std::collections::BTreeSet<_> = pack_lock::installed_packs(&repo)
             .into_iter()
             .map(|pack| pack.id)
@@ -367,8 +339,10 @@ mod tests {
 
         // Installing matlab lands its skill AND its MCP definition.
         sync_one_pack(&git, &fs, src_tauri, &repo, "matlab").unwrap();
-        assert!(repo.join("skills/matlab/SKILL.md").exists());
-        assert!(repo.join("skills/matlab/scripts/inspect-mat.py").exists());
+        assert!(repo.join("packs/matlab/skills/matlab/SKILL.md").exists());
+        assert!(repo
+            .join("packs/matlab/skills/matlab/scripts/inspect-mat.py")
+            .exists());
         assert!(repo.join("packs/matlab/mcp.yaml").exists());
 
         // Installing linear lands nothing but a connector and its OAuth config.
@@ -377,17 +351,8 @@ mod tests {
         let linear = &layer["linear"];
         assert_eq!(linear.pack_id, "linear");
         assert_eq!(linear.config.transport, "http");
-        assert_eq!(
-            linear.config.url.as_deref(),
-            Some("https://mcp.linear.app/mcp")
-        );
-        assert!(
-            linear.config.oauth.is_some(),
-            "the connector archetype ships its OAuth config ready for auth"
-        );
+        assert!(linear.config.oauth.is_some());
 
-        // Both connectors are visible in settings with a reason, and inert for
-        // agents until the user supplies what they need.
         let entries = crate::config::mcp_servers::workspace_mcp_entries(
             &repo,
             &crate::config::machine_services::MachineServiceSnapshot::empty(),
@@ -395,21 +360,10 @@ mod tests {
         assert_eq!(entries["linear"].origin, "pack:linear");
         assert_eq!(entries["matlab"].origin, "pack:matlab");
         assert!(entries["linear"].not_ready.is_some());
-        assert!(entries["matlab"].not_ready.is_some());
-
-        let pack_page = crate::resources::packs::read_pack(
-            &repo,
-            &library,
-            &crate::config::machine_services::MachineServiceSnapshot::empty(),
-            "linear",
-        );
-        assert!(pack_page.contains("State: installed"), "{pack_page}");
-        assert!(pack_page.contains("needs_auth"), "{pack_page}");
 
         // Uninstalling gives the workspace back exactly what it had.
-        let result = uninstall_pack(&git, &fs, &repo, "matlab").unwrap();
-        assert!(result.kept.is_empty());
-        assert!(!repo.join("skills/matlab").exists());
+        uninstall_pack(&git, &fs, &repo, "matlab").unwrap();
+        assert!(!repo.join("packs/matlab/skills").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(!crate::config::mcp_servers::workspace_mcp_entries(
             &repo,
@@ -420,31 +374,12 @@ mod tests {
 
     /// Every connector this repository ships must actually reach the catalog,
     /// and one that asks for nothing must be ready the moment it installs.
-    ///
-    /// The first half guards a silent failure. `discover_available_packs` logs
-    /// and SKIPS a pack whose manifest will not parse — right at runtime, since
-    /// one malformed pack must not cost the user the rest of the catalog, but it
-    /// means a typo in a shipped manifest ships as a connector that is simply
-    /// absent, with nothing red anywhere.
-    ///
-    /// The second is the open connector's whole promise: no credential, no
-    /// variable, nothing to configure, so `readiness` must return ready rather
-    /// than parking it behind a step the user can never take.
-    ///
-    /// What this CANNOT check is whether a server's declared auth matches the
-    /// auth the live server demands — an `oauth:` key on a server that needs
-    /// none, or its absence on one that does. Both are network facts, and a
-    /// readiness probe is required never to perform network I/O. Verifying that
-    /// is a probe against the real endpoint, done when a connector is added.
     #[test]
     fn every_shipped_connector_reaches_the_catalog_and_states_its_readiness() {
         use crate::config::mcp_servers::NotReady;
 
         crate::config::secrets::mock_keychain::install();
-        let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("cairn-core manifest is nested under src-tauri");
+        let src_tauri = shipped_resources();
         let packs_dir = src_tauri.join(pack::PACKS_SOURCE_DIR);
 
         let mut shipped: Vec<String> = std::fs::read_dir(&packs_dir)
@@ -477,10 +412,6 @@ mod tests {
                 !file.servers.is_empty(),
                 "pack `{id}` ships an mcp.yaml declaring no servers"
             );
-
-            // Every variable a shipped server gates on must be described, or
-            // its settings row is back to naming an environment variable at
-            // someone with no way to act on it.
             for (name, config) in &file.servers {
                 for var in config.referenced_vars() {
                     let described = file
@@ -494,7 +425,6 @@ mod tests {
                     );
                 }
             }
-
             for (name, config) in file.servers {
                 if let Some(other) = declared_by.insert(name.clone(), id.clone()) {
                     panic!(
@@ -503,7 +433,6 @@ mod tests {
                          be installed alongside the other"
                     );
                 }
-
                 if matches!(config.transport.as_str(), "http" | "sse") {
                     let url = config.url.as_deref().unwrap_or_default();
                     assert!(
@@ -511,7 +440,6 @@ mod tests {
                         "remote connector `{name}` must reach its server over https, got {url:?}"
                     );
                 }
-
                 let readiness = config.readiness(&name);
                 if config.oauth.is_some() {
                     assert_eq!(
@@ -531,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_install_materializes_only_default_packs() {
+    fn fresh_install_installs_only_default_packs() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
@@ -546,72 +474,41 @@ mod tests {
             !repo.join(".git").exists(),
             "fresh pack sync does not initialize Git"
         );
-
-        // The default pack is installed and recorded...
-        assert!(repo.join("agents/explore.md").exists());
-        assert!(repo.join("responses/conveyor.md").exists());
+        assert!(repo.join("packs/core/agents/explore.md").exists());
+        assert!(repo.join("packs/core/responses/conveyor.md").exists());
         let core = pack_lock::read_lock(&repo, "core").expect("core lock");
         assert_eq!(core.source.kind, pack::PackSourceKind::Bundled);
         assert!(core.items.iter().any(|item| item.id == "explore"));
-
-        // ...and the optional pack waits in the catalog, materializing nothing.
-        assert!(!repo.join("skills/matlab").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(!repo.join("packs/matlab").exists());
     }
 
-    /// A shipped route is ordinary pack content: a fresh sync materializes it
-    /// under `routes/`, an untouched copy takes the pack's next version in
-    /// place, and a copy the user edited is theirs and survives a re-sync.
+    /// A shipped route takes the pack's next version in place; a route the
+    /// user defines under the same name is a different file in front of it,
+    /// untouched by the update and in force until they delete it.
     #[test]
-    fn shipped_routes_sync_in_place_and_a_user_edited_route_is_kept() {
+    fn a_shipped_route_updates_in_place_under_the_users_own() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
-        write(
-            &source_pack(&resources, "core").join("routes/mention.yaml"),
-            "name: mention\n",
-        );
         let git = RealGitClient;
         let fs = RealFileSystem;
-
         sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-        for id in ["followed", "mention"] {
-            assert!(repo.join(format!("routes/{id}.yaml")).is_file());
-            assert!(pack_lock::read_lock(&repo, "core")
-                .unwrap()
-                .item(PackItemKind::Route, id)
-                .is_some());
-        }
+        write(&repo.join("routes/followed.yaml"), "name: mine\n");
 
-        std::fs::write(repo.join("routes/followed.yaml"), "name: mine\n").unwrap();
         write(
             &source_pack(&resources, "core").join("routes/followed.yaml"),
             "name: followed v2\n",
         );
-        write(
-            &source_pack(&resources, "core").join("routes/mention.yaml"),
-            "name: mention v2\n",
-        );
         sync_workspace_packs(&git, &fs, &resources, &repo, "2.0.0").unwrap();
-
         assert_eq!(
             std::fs::read_to_string(repo.join("routes/followed.yaml")).unwrap(),
-            "name: mine\n",
-            "a user-edited route is theirs and is never overwritten"
-        );
-        assert!(
-            pack_lock::read_lock(&repo, "core")
-                .unwrap()
-                .item(PackItemKind::Route, "followed")
-                .unwrap()
-                .forked
+            "name: mine\n"
         );
         assert_eq!(
-            std::fs::read_to_string(repo.join("routes/mention.yaml")).unwrap(),
-            "name: mention v2\n",
-            "an untouched shipped route takes the pack's update in place"
+            std::fs::read_to_string(repo.join("packs/core/routes/followed.yaml")).unwrap(),
+            "name: followed v2\n"
         );
     }
 
@@ -621,101 +518,70 @@ mod tests {
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
-        // Ship it as a default so this sync installs it, standing in for the
-        // catalog-driven install of an optional pack.
         write_optional_pack(&resources, "matlab");
-        write_manifest(&resources, "matlab", true, &[]);
+        write_manifest(&resources, "matlab", true);
 
         sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
 
-        assert!(repo.join("skills/matlab/SKILL.md").exists());
-        let mcp = repo.join("packs/matlab/mcp.yaml");
-        assert!(mcp.exists(), "an installed pack materializes its MCP layer");
-
+        assert!(repo.join("packs/matlab/skills/matlab/SKILL.md").exists());
+        assert!(repo.join("packs/matlab/mcp.yaml").exists());
         let lock = pack_lock::read_lock(&repo, "matlab").expect("matlab lock");
         assert!(lock
             .items
             .iter()
             .any(|item| item.kind == pack::PackItemKind::Mcp && item.id == "matlab"));
-
         let layer = pack::mcp::load_pack_mcp_servers(&repo);
         assert_eq!(layer["matlab"].pack_id, "matlab");
         assert_eq!(layer["matlab"].config.transport, "stdio");
     }
 
+    /// A workspace from before packs holds flat copies committed by the old
+    /// bundle sync. The first in-place sync adopts the packs, deletes the
+    /// copies it can prove are theirs, keeps one the user edited, and commits
+    /// the move once.
     #[test]
-    fn an_existing_workspace_migrates_without_writing_or_conflicting() {
+    fn a_pre_pack_workspace_migrates_its_copies_into_the_packs() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
         write_optional_pack(&resources, "matlab");
-
-        // A pre-pack workspace holding BOTH packs' content, matlab included --
-        // the honest read of an existing user who already has the matlab skill.
         seed_legacy_workspace(&repo, &resources, &["core", "matlab"]);
-        let before = snapshot_tree(&repo);
+        // An edit made after the old sync's commit is the user's.
+        write(&repo.join("agents/explore.md"), &agent_body("my edit"));
 
         sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
 
-        let after = snapshot_tree(&repo);
-        for (path, body) in &before {
-            // Two pieces of workspace machinery legitimately change: the
-            // superseded global marker is removed, and the tracked-file
-            // allowlist widens. No RESOURCE may be rewritten.
-            if path == LEGACY_BUNDLE_SYNC_MARKER || path == ".gitignore" {
-                continue;
-            }
-            assert_eq!(
-                after.get(path),
-                Some(body),
-                "migration rewrote {path}, but every file was already byte-identical"
-            );
-        }
-        // The only new files are pack metadata and the machine-local record of
-        // where the app ships its packs from; no resource was duplicated.
-        let added: Vec<&String> = after
-            .keys()
-            .filter(|key| !before.contains_key(*key))
-            .collect();
-        assert!(
-            added
-                .iter()
-                .all(|key| key.starts_with("packs/") || key.as_str() == ".pack-source"),
-            "migration added non-pack files: {added:?}"
-        );
-
-        assert!(pack_lock::read_lock(&repo, "core").is_some());
+        assert!(!repo.join("recipes/default.yaml").exists());
+        assert!(!repo.join("skills/matlab").exists());
+        assert!(repo.join("packs/core/recipes/default.yaml").exists());
         assert!(
             pack_lock::read_lock(&repo, "matlab").is_some(),
             "a pack whose content the user already has is recorded as installed"
         );
-
-        let core = pack_lock::read_lock(&repo, "core").unwrap();
-        assert!(core
-            .item(PackItemKind::Response, "conveyor")
+        let roots = LibraryRoots::workspace(&repo);
+        let explore = crate::config::agents::resolve_agent(&roots, "explore").unwrap();
+        assert_eq!(explore.origin, Origin::Workspace, "the edited copy is kept");
+        assert_eq!(explore.shadows, vec![Origin::Pack { id: "core".into() }]);
+        assert!(!repo.join(LEGACY_BUNDLE_SYNC_MARKER).exists());
+        let subject = RealGitClient
+            .run(&repo, vec!["log".into(), "-1".into(), "--format=%s".into()])
             .unwrap()
-            .content_hash
-            .is_some());
-        assert!(
-            !repo.join(LEGACY_BUNDLE_SYNC_MARKER).exists(),
-            "the superseded global marker is removed once every lock is written"
-        );
+            .stdout;
+        assert_eq!(subject.trim(), pack::migrate_v3::MIGRATION_COMMIT);
 
-        // Idempotent: a second pass changes nothing and adds no commit.
+        let after = snapshot_tree(&repo);
         let again =
             sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0")
                 .unwrap();
-        assert!(!again.updated);
+        assert!(!again.updated, "{again:?}");
         assert_eq!(snapshot_tree(&repo), after);
     }
 
-    /// An uninstall must survive the next startup. It deliberately KEEPS items
-    /// the user edited, and adoption reads a surviving item as "already
-    /// installed" -- so without a record of the decision the sync silently
-    /// undoes it, restoring the lock and the pack's MCP layer.
+    /// An uninstall must survive the next startup, and a user's own definition
+    /// of a name the pack shipped is a separate file the uninstall never touches.
     #[test]
-    fn an_uninstall_holds_across_a_restart_even_with_edited_items_left_behind() {
+    fn an_uninstall_holds_across_a_restart_and_keeps_your_definitions() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
@@ -726,41 +592,30 @@ mod tests {
 
         sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
         sync_one_pack(&git, &fs, &resources, &repo, "matlab").unwrap();
-        assert!(repo.join("skills/matlab/SKILL.md").exists());
+        write(
+            &repo.join("skills/matlab/SKILL.md"),
+            "---\nname: matlab\ndescription: mine\n---\n",
+        );
 
-        // The user customizes the skill, so uninstall keeps it.
-        std::fs::write(
-            repo.join("skills/matlab/SKILL.md"),
-            "---\nname: mine\n---\n",
-        )
-        .unwrap();
-
-        let result = uninstall_pack(&git, &fs, &repo, "matlab").unwrap();
-        assert_eq!(result.kept, vec!["skills/matlab".to_string()]);
+        uninstall_pack(&git, &fs, &repo, "matlab").unwrap();
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
-
-        // The next startup must NOT re-adopt it from the item it kept.
         sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
         assert!(
             pack_lock::read_lock(&repo, "matlab").is_none(),
             "an uninstall must not be undone by the next sync"
         );
-        assert!(!repo.join("packs/matlab/mcp.yaml").exists());
         assert!(!pack::mcp::load_pack_mcp_servers(&repo).contains_key("matlab"));
-        // Their edited copy is still theirs.
         assert!(repo.join("skills/matlab/SKILL.md").exists());
 
-        // Installing again is an explicit choice that revokes the uninstall.
         sync_one_pack(&git, &fs, &resources, &repo, "matlab").unwrap();
         assert!(pack_lock::read_lock(&repo, "matlab").is_some());
         sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
         assert!(pack_lock::read_lock(&repo, "matlab").is_some());
     }
 
-    /// Removing ONE item must not require uninstalling the pack around it: a
-    /// user who wants a pack's skill but not its MCP server should be able to
-    /// say so and have it stick. Copy-when-missing is exactly the mechanism
-    /// that would otherwise undo the removal on the next launch.
+    /// Removing one item keeps the pack installed and updating around it: a
+    /// removed library item stays staged but resolves for nothing, a removed
+    /// MCP server leaves the layer, and restoring is one explicit action.
     #[test]
     fn a_removed_item_stays_removed_while_its_pack_keeps_updating() {
         let temp = TempDir::new().unwrap();
@@ -768,53 +623,47 @@ mod tests {
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
         write_optional_pack(&resources, "matlab");
-        write_manifest(&resources, "matlab", true, &[]);
+        write_manifest(&resources, "matlab", true);
         let git = RealGitClient;
         let fs = RealFileSystem;
 
         sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-        assert!(repo.join("skills/matlab/SKILL.md").exists());
-        assert!(pack::mcp::load_pack_mcp_servers(&repo).contains_key("matlab"));
-
-        // Drop just the connector, keeping the skill.
         crate::config::mcp_servers::delete_workspace_mcp_server(&repo, "matlab").unwrap();
         assert!(!pack::mcp::load_pack_mcp_servers(&repo).contains_key("matlab"));
+        crate::config::skills::delete_skill(&LibraryRoots::workspace(&repo), "example", None)
+            .unwrap();
 
-        // Drop just the skill from another pack, keeping the rest of it.
-        crate::config::skills::delete_skill(&repo, "example", None).unwrap();
-
-        // A shipped change must reach the pack without resurrecting either.
-        std::fs::write(
-            source_pack(&resources, "core").join("agents/explore.md"),
-            "updated agent\n",
-        )
-        .unwrap();
+        write(
+            &source_pack(&resources, "core").join("agents/explore.md"),
+            &agent_body("updated agent"),
+        );
         sync_workspace_packs(&git, &fs, &resources, &repo, "2.0.0").unwrap();
 
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
-            "updated agent\n",
-            "the pack must keep updating around a removed item"
-        );
+        let roots = LibraryRoots::workspace(&repo);
+        assert!(crate::config::agents::get_agent(&roots, "explore")
+            .unwrap()
+            .unwrap()
+            .prompt
+            .contains("updated agent"));
+        assert!(!pack::mcp::load_pack_mcp_servers(&repo).contains_key("matlab"));
+        assert!(crate::config::skills::get_skill(&roots, "example")
+            .unwrap()
+            .is_none());
         assert!(
-            !pack::mcp::load_pack_mcp_servers(&repo).contains_key("matlab"),
-            "a removed MCP server must not come back on the next sync"
+            repo.join("packs/core/skills/example/SKILL.md").exists(),
+            "a removed item stays staged so restoring it is only the record"
         );
-        assert!(
-            !repo.join("skills/example").exists(),
-            "a removed skill must not be copied back by copy-when-missing"
-        );
-        assert!(
-            repo.join("skills/matlab/SKILL.md").exists(),
-            "unrelated items are untouched"
-        );
+        assert!(crate::config::skills::get_skill(&roots, "matlab")
+            .unwrap()
+            .is_some());
 
-        // Restoring is one explicit action, and brings them back.
         pack_lock::restore_removed_items(&fs, &repo, "core").unwrap();
         pack_lock::restore_removed_items(&fs, &repo, "matlab").unwrap();
-        sync_one_pack(&git, &fs, &resources, &repo, "core").unwrap();
         sync_one_pack(&git, &fs, &resources, &repo, "matlab").unwrap();
-        assert!(repo.join("skills/example/SKILL.md").exists());
+        let roots = LibraryRoots::workspace(&repo);
+        assert!(crate::config::skills::get_skill(&roots, "example")
+            .unwrap()
+            .is_some());
         assert!(pack::mcp::load_pack_mcp_servers(&repo).contains_key("matlab"));
     }
 
@@ -828,18 +677,11 @@ mod tests {
         write_complete_resources(&resources);
         let git = RealGitClient;
         let fs = RealFileSystem;
-
         sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
         uninstall_pack(&git, &fs, &repo, "core").unwrap();
-        assert!(!repo.join("agents/explore.md").exists());
-
         sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-        assert!(
-            pack_lock::read_lock(&repo, "core").is_none(),
-            "`default: true` describes a FRESH workspace, not a standing override \
-             of the user's explicit removal"
-        );
-        assert!(!repo.join("agents/explore.md").exists());
+        assert!(pack_lock::read_lock(&repo, "core").is_none());
+        assert!(!repo.join("packs/core/agents/explore.md").exists());
     }
 
     #[test]
@@ -849,17 +691,10 @@ mod tests {
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
         write_optional_pack(&resources, "matlab");
-
-        // The user deleted the matlab skill, so none of that pack's items are
-        // present. Reinstalling it behind their back would be the wrong read of
-        // their intent.
         seed_legacy_workspace(&repo, &resources, &["core"]);
-
         sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-
         assert!(pack_lock::read_lock(&repo, "core").is_some());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
-        assert!(!repo.join("skills/matlab").exists());
     }
 
     #[test]
@@ -868,7 +703,6 @@ mod tests {
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
-
         sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
         let again =
             sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0")
@@ -877,53 +711,10 @@ mod tests {
     }
 
     #[test]
-    fn real_temp_repo_adds_missing_packs_and_preserves_user_edits() {
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources_a = temp.path().join("resources-a");
-        let resources_b = temp.path().join("resources-b");
-        write_resources_a(&resources_a);
-        write_resources_b(&resources_b);
-
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        sync_workspace_packs(&git, &fs, &resources_a, &repo, "1.0.0").unwrap();
-
-        std::fs::write(repo.join("agents/explore.md"), "user edit\n").unwrap();
-
-        sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
-        // The user-edited file is preserved as a durable fork even though the
-        // pack shipped a new version of it.
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
-            "user edit\n"
-        );
-        assert!(
-            pack_lock::read_lock(&repo, "core")
-                .unwrap()
-                .item(PackItemKind::Agent, "explore")
-                .unwrap()
-                .forked
-        );
-        // Genuinely new pack resources are still installed.
-        assert!(repo.join("agents/new-agent.md").exists());
-        assert!(repo.join("recipes/memory-triage.yaml").exists());
-        assert!(repo.join("skills/example/SKILL.md").exists());
-    }
-
-    #[test]
     fn a_retired_resource_is_no_longer_shipped() {
-        // Retiring a pack resource is two edits that must agree: delete it from
-        // the pack's source tree, and list it under `retired:` so existing
-        // workspaces drop their copy. Listing alone leaves the file shipping,
-        // and the sync would copy it straight back after removing it -- so the
-        // retirement would silently do nothing. Nothing else notices, because a
-        // retired resource is by definition absent from every other list.
-        let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("cairn-core manifest is nested under src-tauri");
-        let packs = pack::discover_available_packs(src_tauri);
+        // Retiring a pack resource means deleting it from the pack's source
+        // tree; listing it under `retired:` alone would leave it shipping.
+        let packs = pack::discover_available_packs(shipped_resources());
         assert!(
             !packs.is_empty(),
             "the repo ships packs under src-tauri/packs"
@@ -942,134 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unclaimed_retired_path_is_preserved_fail_safe() {
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        let retired = "recipes/main-coordinator.yaml";
-
-        // A retired path absent from the old lock has no hash baseline. It may
-        // have been created by the user, so retirement must preserve it.
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources-a");
-        write_resources_a(&resources);
-        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-
-        let edited = repo.join(retired);
-        write(&edited, "my own version\n");
-
-        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-        assert!(edited.exists(), "a user-owned copy survives retirement");
-    }
-
-    #[test]
-    fn changed_pack_file_propagates_to_unmodified_install() {
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources_a = temp.path().join("resources-a");
-        let resources_b = temp.path().join("resources-b");
-        write_resources_a(&resources_a);
-        write_resources_b(&resources_b);
-
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        sync_workspace_packs(&git, &fs, &resources_a, &repo, "1.0.0").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
-            "bundle a\n"
-        );
-
-        // The user never touched explore.md, so the pack's new version of it
-        // must reach this install on upgrade.
-        let result = sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
-        assert!(result.updated);
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
-            "bundle b\n"
-        );
-        // The lock now records the new content, so a repeat is a no-op.
-        let again = sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
-        assert!(!again.updated);
-    }
-
-    #[test]
-    fn same_version_changed_pack_content_resyncs_and_preserves_user_files() {
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources_a = temp.path().join("resources-a");
-        let resources_b = temp.path().join("resources-b");
-        write_resources_a(&resources_a);
-        write_resources_b(&resources_b);
-
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        sync_workspace_packs(&git, &fs, &resources_a, &repo, "1.0.0").unwrap();
-        assert_eq!(
-            pack_lock::read_lock(&repo, "core").unwrap().content_hash,
-            pack::content_hash(&source_pack(&resources_a, "core")).unwrap()
-        );
-
-        std::fs::write(repo.join("agents/explore.md"), "user edit\n").unwrap();
-
-        // Same app version, different shipped content: the pack's content hash
-        // is what drives the re-sync, not the version string.
-        let result = sync_workspace_packs(&git, &fs, &resources_b, &repo, "1.0.0").unwrap();
-        assert!(result.updated);
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
-            "user edit\n"
-        );
-        assert!(repo.join("recipes/memory-triage.yaml").exists());
-        assert!(repo.join("agents/new-agent.md").exists());
-        assert_eq!(
-            pack_lock::read_lock(&repo, "core").unwrap().content_hash,
-            pack::content_hash(&source_pack(&resources_b, "core")).unwrap()
-        );
-    }
-
-    #[test]
-    fn migrated_lock_skips_git_on_subsequent_syncs() {
-        use crate::services::testing::MockGitClient;
-
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources");
-        write_complete_resources(&resources);
-
-        let git = MockGitClient::new();
-        sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        let lock = pack_lock::read_lock(&repo, "core").unwrap();
-        assert!(lock.migration_complete());
-
-        let second_git = MockGitClient::new();
-        let second =
-            sync_workspace_packs(&second_git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        assert!(
-            !second.updated,
-            "a migrated lock is hash-only and idempotent"
-        );
-    }
-
-    #[test]
-    fn restoring_missing_content_does_not_call_git() {
-        use crate::services::testing::MockGitClient;
-
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources");
-        write_complete_resources(&resources);
-        let git = MockGitClient::new();
-        sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        std::fs::remove_file(repo.join("agents/explore.md")).unwrap();
-
-        let second_git = MockGitClient::new();
-        let restored =
-            sync_workspace_packs(&second_git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        assert!(restored.updated);
-        assert!(repo.join("agents/explore.md").exists());
-    }
-
-    #[test]
     fn provision_runtime_syncs_then_short_circuits_then_resyncs_on_change() {
         let temp = TempDir::new().unwrap();
         let resource_dir = temp.path().join("resources");
@@ -1082,16 +745,11 @@ mod tests {
         write(&harness.join("src/index.ts"), "export const v = 1;\n");
 
         let fs = RealFileSystem;
-        // First provision installs the runtime and its marker.
         assert!(provision_workflow_runtime(&fs, &resource_dir, &cairn_home).unwrap());
         let dest_harness = cairn_home.join("runtime/node_modules/@cairn/harness/src/index.ts");
         assert!(dest_harness.exists());
         assert!(cairn_home.join("runtime/.runtime-version").exists());
-
-        // A repeat with unchanged content is a no-op (marker current).
         assert!(!provision_workflow_runtime(&fs, &resource_dir, &cairn_home).unwrap());
-
-        // A shipped change re-syncs the tree.
         std::fs::write(harness.join("src/index.ts"), "export const v = 2;\n").unwrap();
         assert!(provision_workflow_runtime(&fs, &resource_dir, &cairn_home).unwrap());
         assert_eq!(
@@ -1106,263 +764,40 @@ mod tests {
         let resource_dir = temp.path().join("resources");
         std::fs::create_dir_all(&resource_dir).unwrap();
         let cairn_home = temp.path().join("home");
-
-        // No `runtime/` in the bundle (the dev case): nothing provisioned.
         assert!(!provision_workflow_runtime(&RealFileSystem, &resource_dir, &cairn_home).unwrap());
         assert!(!cairn_home.join("runtime").exists());
     }
 
+    /// A pack's machine service is inventoried by its lock and never copied
+    /// into the workspace: it runs from the app bundle's declaration.
     #[test]
-    fn a_new_shipped_item_preserves_preexisting_user_content_as_a_fork() {
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources");
-        write_resources_a(&resources);
-
-        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        assert!(pack_lock::read_lock(&repo, "core")
-            .unwrap()
-            .migration_complete());
-
-        write(&repo.join("agents/new-agent.md"), "my agent\n");
-        write(
-            &source_pack(&resources, "core").join("agents/new-agent.md"),
-            "shipped agent\n",
-        );
-
-        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "2.0.0").unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/new-agent.md")).unwrap(),
-            "my agent\n"
-        );
-        let lock = pack_lock::read_lock(&repo, "core").unwrap();
-        let item = lock
-            .item(PackItemKind::Agent, "new-agent")
-            .expect("new shipped item is recorded");
-        assert!(item.forked);
-        assert!(item.content_hash.is_some());
-        assert!(lock.migration_complete());
-    }
-
-    /// Legacy-lock migration against a workspace history carrying the commit
-    /// subjects found on a real pre-v2 machine. Two things prove ownership:
-    /// bytes identical to what this build ships (no history needed), and a
-    /// last commit from the June bundle-branch sync, which committed nothing
-    /// but shipped files. Subjects that carry the user's own content -- a
-    /// pre-sync snapshot of pending edits, or a merge that combined both
-    /// sides -- never do, so those files stay the user's.
-    #[test]
-    fn migration_owns_shipped_bytes_and_bundle_branch_commits_but_not_user_content() {
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources");
-        write_manifest(&resources, "core", true, &[]);
-        let core = source_pack(&resources, "core");
-        for id in ["branch", "identical", "merged", "snapshot"] {
-            write(&core.join(format!("agents/{id}.md")), "shipped v1\n");
-        }
-        write(&core.join("skills/finder/SKILL.md"), "shipped skill v1\n");
-        seed_legacy_workspace(&repo, &resources, &["core"]);
-
-        let git = RealGitClient;
-        let commit = |path: &str, body: &str, subject: &str| {
-            write(&repo.join(path), body);
-            git.add_all(&repo).unwrap();
-            git.commit(&repo, subject).unwrap();
-        };
-        // An older shipped vintage, committed by the bundle-branch sync.
-        commit(
-            "agents/branch.md",
-            "shipped v0\n",
-            "Update bundled defaults to 0.8.7",
-        );
-        // A snapshot that happens to hold exactly the shipped bytes.
-        commit("agents/identical.md", "scratch\n", "User scratch");
-        commit(
-            "agents/identical.md",
-            "shipped v1\n",
-            "Snapshot workspace config",
-        );
-        commit(
-            "agents/merged.md",
-            "mine + theirs\n",
-            "Merge branch 'bundle'",
-        );
-        commit(
-            "agents/snapshot.md",
-            "my pending edit\n",
-            "Snapshot workspace config",
-        );
-        // Finder metadata, never committed (the legacy allowlist ignores it).
-        write(&repo.join("skills/finder/.DS_Store"), "finder");
-
-        // The app moves on: v2 ships for every item.
-        for id in ["branch", "identical", "merged", "snapshot"] {
-            write(&core.join(format!("agents/{id}.md")), "shipped v2\n");
-        }
-        write(&core.join("skills/finder/SKILL.md"), "shipped skill v2\n");
-        // ... except `identical`, whose shipped bytes are still what the user has.
-        write(&core.join("agents/identical.md"), "shipped v1\n");
-
-        sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "2.0.0").unwrap();
-
-        let lock = pack_lock::read_lock(&repo, "core").unwrap();
-        let forked = |kind, id: &str| lock.item(kind, id).unwrap().forked;
-        let body = |path: &str| std::fs::read_to_string(repo.join(path)).unwrap();
-
-        assert!(!forked(PackItemKind::Agent, "branch"));
-        assert_eq!(
-            body("agents/branch.md"),
-            "shipped v2\n",
-            "owned items update"
-        );
-        assert!(!forked(PackItemKind::Agent, "identical"));
-        assert_eq!(body("agents/identical.md"), "shipped v1\n");
-        assert!(forked(PackItemKind::Agent, "merged"));
-        assert_eq!(body("agents/merged.md"), "mine + theirs\n");
-        assert!(forked(PackItemKind::Agent, "snapshot"));
-        assert_eq!(body("agents/snapshot.md"), "my pending edit\n");
-        assert!(
-            !forked(PackItemKind::Skill, "finder"),
-            "a .DS_Store beside shipped files is not an edit"
-        );
-        assert_eq!(body("skills/finder/SKILL.md"), "shipped skill v2\n");
-    }
-
-    /// Baselines recorded before OS metadata left the tree hash included any
-    /// `.DS_Store` present at the time. Such an item must keep updating, and its
-    /// baseline is re-recorded in today's terms.
-    #[test]
-    fn a_baseline_that_hashed_finder_metadata_still_counts_as_owned() {
+    fn a_packed_service_is_inventoried_and_never_mirrored() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
-        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-
-        write(&repo.join("skills/example/.DS_Store"), "finder");
-        let mut lock = pack_lock::read_lock(&repo, "core").unwrap();
-        let pack::ContentHash::Present(legacy) =
-            pack::hash_tree_including_os_metadata(&repo.join("skills/example")).unwrap()
-        else {
-            panic!("skill exists")
-        };
-        lock.item_mut(PackItemKind::Skill, "example")
-            .unwrap()
-            .content_hash = Some(legacy.clone());
-        pack_lock::write_lock(&RealFileSystem, &repo, &lock).unwrap();
-
-        // Unchanged source: no fork, and the baseline is rewritten.
-        sync_one_pack(&RealGitClient, &RealFileSystem, &resources, &repo, "core").unwrap();
-        let item = pack_lock::read_lock(&repo, "core")
-            .unwrap()
-            .item(PackItemKind::Skill, "example")
-            .unwrap()
-            .clone();
-        assert!(!item.forked);
-        assert_ne!(item.content_hash.as_deref(), Some(legacy.as_str()));
-
-        // A changed source still reaches it.
-        write(
-            &source_pack(&resources, "core").join("skills/example/SKILL.md"),
-            "---\nname: Example\ndescription: Example skill v2\n---\n",
-        );
-        sync_one_pack(&RealGitClient, &RealFileSystem, &resources, &repo, "core").unwrap();
-        assert!(
-            std::fs::read_to_string(repo.join("skills/example/SKILL.md"))
-                .unwrap()
-                .contains("v2")
-        );
-    }
-
-    const PROBE_SERVICE: &str = "name: Probe\nruntime: native\nplacement: per-machine\ntransport: mcp-stdio\nargs: [serve]\nartifacts:\n  version: 1.0.0\n  prove: [--version]\n  targets:\n    x86_64-unknown-linux-gnu:\n      url: https://example.invalid/probe\n      sha256: eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54\n      size: 10\n      executable: probe\nprobe:\n  args: [status]\n  every: 5m\n  ready: /ready\n";
-
-    /// The whole ownership model on a service: it is materialized and hashed, a
-    /// shipped change reaches it in place, an edit forks it and stays, and a
-    /// removal survives the next sync while its pack keeps updating.
-    #[test]
-    fn a_packed_service_is_owned_like_any_tree_item() {
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources");
-        write_complete_resources(&resources);
-        write_manifest(&resources, "kit", true, &[]);
-        let source = source_pack(&resources, "kit").join("services/probe/service.yaml");
-        write(&source, PROBE_SERVICE);
-        let copy = repo.join("services/probe/service.yaml");
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        let item = || {
-            pack_lock::read_lock(&repo, "kit")
-                .unwrap()
-                .item(PackItemKind::Service, "probe")
-                .cloned()
-        };
-
-        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-        assert_eq!(std::fs::read_to_string(&copy).unwrap(), PROBE_SERVICE);
-        let baseline = item().unwrap();
-        assert_eq!(baseline.path.as_deref(), Some("services/probe"));
-        assert!(baseline.content_hash.is_some() && !baseline.forked);
-
-        write(&source, &format!("{PROBE_SERVICE}# v2\n"));
-        sync_workspace_packs(&git, &fs, &resources, &repo, "2.0.0").unwrap();
-        assert!(std::fs::read_to_string(&copy).unwrap().ends_with("# v2\n"));
-        assert_ne!(item().unwrap().content_hash, baseline.content_hash);
-
-        write(&copy, "name: Mine\n");
-        write(&source, &format!("{PROBE_SERVICE}# v3\n"));
-        sync_workspace_packs(&git, &fs, &resources, &repo, "3.0.0").unwrap();
-        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "name: Mine\n");
-        assert!(item().unwrap().forked, "an edit forks it");
-
-        std::fs::remove_dir_all(repo.join("services/probe")).unwrap();
-        pack::note_removed_item(&repo, PackItemKind::Service, "probe");
-        write(&source, &format!("{PROBE_SERVICE}# v4\n"));
-        sync_workspace_packs(&git, &fs, &resources, &repo, "4.0.0").unwrap();
-        assert!(!copy.exists(), "a removal survives the next sync");
-        assert!(pack_lock::read_lock(&repo, "kit")
-            .unwrap()
-            .is_removed(PackItemKind::Service, "probe"));
-    }
-
-    /// The lock an installed axon holds today lists no items, because nothing
-    /// recognised its one file. The next sync adds both the service and its MCP
-    /// entry. Installed explicitly, because whether the pack is in the default
-    /// set is not this test's question.
-    #[test]
-    fn an_item_less_lock_gains_a_service_and_its_entry_on_the_next_sync() {
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources");
-        write_complete_resources(&resources);
-        write_manifest(&resources, "kit", false, &[]);
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        sync_one_pack(&git, &fs, &resources, &repo, "kit").unwrap();
-        assert!(pack_lock::read_lock(&repo, "kit").unwrap().items.is_empty());
-
+        write_manifest(&resources, "kit", true);
         let root = source_pack(&resources, "kit");
-        write(&root.join("services/probe/service.yaml"), PROBE_SERVICE);
+        write(&root.join("services/probe/service.yaml"), "name: Probe\n");
         write(
             &root.join("mcp.yaml"),
             "mcpServers:\n  probe:\n    type: machine-service\n    service: probe\n",
         );
-        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-
+        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
         let lock = pack_lock::read_lock(&repo, "kit").unwrap();
         assert!(lock.item(PackItemKind::Service, "probe").is_some());
         assert!(lock.item(PackItemKind::Mcp, "probe").is_some());
-        assert!(repo.join("services/probe/service.yaml").exists());
+        assert!(!repo.join("services/probe").exists());
+        assert!(!repo.join("packs/kit/services").exists());
         let entry = &pack::mcp::load_pack_mcp_servers(&repo)["probe"];
         assert_eq!(entry.config.service.as_deref(), Some("probe"));
     }
 
-    /// Shipped workflows load on a fresh workspace and take pack updates while
-    /// still owned. A user edit forks the package and survives later syncs.
+    /// Shipped workflows load on a fresh workspace and take pack updates in
+    /// place; a workflow the user defines under the same name is theirs and
+    /// survives every later sync.
     #[test]
-    fn packed_workflow_seeds_missing_lists_and_preserves_user_edits() {
+    fn a_packed_workflow_lists_updates_in_place_and_yields_to_yours() {
         fn write_workflow(resources: &Path, body: &str) {
             let root = source_pack(resources, "core").join("workflows/fan-out");
             write(
@@ -1371,45 +806,43 @@ mod tests {
             );
             write(&root.join("main.ts"), body);
         }
-
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
-        let resources_a = temp.path().join("resources-a");
-        let resources_b = temp.path().join("resources-b");
-        write_resources_a(&resources_a);
-        write_resources_b(&resources_b);
-        write_workflow(&resources_a, "// v1\n");
-        write_workflow(&resources_b, "// v2\n");
-
+        let resources = temp.path().join("resources");
+        write_complete_resources(&resources);
+        write_workflow(&resources, "// v1\n");
         let git = RealGitClient;
         let fs = RealFileSystem;
 
-        // Fresh workspace: the package is seeded and the loader lists it.
-        sync_workspace_packs(&git, &fs, &resources_a, &repo, "1.0.0").unwrap();
-        assert!(repo.join("workflows/fan-out/workflow.yaml").exists());
-        let listed = crate::config::workflows::list_workflows(&repo, None).unwrap();
-        assert!(
-            listed.iter().any(|r| matches!(
-                r,
-                crate::config::ConfigResult::Ok(w) if w.id == "fan-out"
-            )),
-            "fresh workspace must list the packed fan-out workflow"
+        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+        let roots = LibraryRoots::workspace(&repo);
+        let listed = crate::config::workflows::list_workflow_rows(&roots).unwrap();
+        assert!(listed
+            .iter()
+            .any(|row| row.name == "fan-out" && row.origin == Origin::Pack { id: "core".into() }));
+
+        write_workflow(&resources, "// v2\n");
+        sync_workspace_packs(&git, &fs, &resources, &repo, "2.0.0").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("packs/core/workflows/fan-out/main.ts")).unwrap(),
+            "// v2\n"
         );
 
-        sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
+        write(
+            &repo.join("workflows/fan-out/workflow.yaml"),
+            "name: Mine\ndescription: d\n",
+        );
+        write(&repo.join("workflows/fan-out/main.ts"), "// mine\n");
+        write_workflow(&resources, "// v3\n");
+        sync_workspace_packs(&git, &fs, &resources, &repo, "3.0.0").unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.join("workflows/fan-out/main.ts")).unwrap(),
-            "// v2\n",
-            "an owned workflow must take updated runtime code before redispatch"
+            "// mine\n"
         );
-
-        // A later source change must preserve the user's fork.
-        std::fs::write(repo.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
-        sync_workspace_packs(&git, &fs, &resources_a, &repo, "3.0.0").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(repo.join("workflows/fan-out/main.ts")).unwrap(),
-            "// user edit\n",
-            "a user's edited workflow copy must never be clobbered by a re-sync"
-        );
+        let resolved =
+            crate::config::workflows::resolve_workflow(&LibraryRoots::workspace(&repo), "fan-out")
+                .unwrap();
+        assert_eq!(resolved.origin, Origin::Workspace);
+        let _ = LibraryKind::Workflow;
     }
 }

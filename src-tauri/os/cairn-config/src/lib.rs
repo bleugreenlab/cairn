@@ -15,6 +15,7 @@ pub mod contextual_packages;
 pub mod fleet;
 pub mod inference;
 pub mod legacy_presets;
+pub mod library;
 pub mod markdown_frontmatter;
 pub mod project_reference;
 pub mod project_settings;

@@ -14,6 +14,7 @@
 //! SAME run_id so the journal replays completed calls.
 #![allow(dead_code)]
 
+use cairn_config::library::LibraryRoots;
 use std::path::{Path, PathBuf};
 
 use super::turns::create_initial_turn_db;
@@ -886,9 +887,8 @@ pub async fn launch_standalone_workflow(
     // 2. Resolve the workflow package + validate args through the SAME validator
     //    the agent invoke path uses (one validator, not a parallel one).
     let workflow = crate::config::workflows::get_workflow(
-        &orch.config_dir,
+        &LibraryRoots::at(&orch.config_dir, project_path.as_deref()),
         workflow_id,
-        project_path.as_deref(),
     )?
     .ok_or_else(|| format!("Workflow not found: {workflow_id}"))?;
     if !args_json.is_object() {

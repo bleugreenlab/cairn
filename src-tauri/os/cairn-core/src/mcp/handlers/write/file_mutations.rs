@@ -10,6 +10,7 @@ use crate::mcp::file_targets::{
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
+use cairn_config::library::LibraryRoots;
 use cairn_db::turso::params;
 use cairn_vcs::PublicationIdentity;
 use serde::Deserialize;
@@ -318,9 +319,8 @@ async fn get_agent_commit_prefix_async(
     };
 
     match config_agents::get_agent(
-        &orch.config_dir,
+        &LibraryRoots::at(&orch.config_dir, Some(std::path::Path::new(&repo_path))),
         &agent_id,
-        Some(std::path::Path::new(&repo_path)),
     ) {
         Ok(Some(agent)) => Ok(format!("[{}] ", agent.name)),
         _ => Ok(String::new()),

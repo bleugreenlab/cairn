@@ -1,38 +1,26 @@
 //! Agent resource reads: the `cairn://agents` collection and single agents.
 //!
 //! Mirrors the recipes read surface, file-backed via `config::agents`. The
-//! contextual collection lists workspace + current-project agents (project
-//! shadows workspace by id); an explicit project collection is project-only.
+//! contextual collection lists every agent the resolver sees across the
+//! current project, the workspace and installed packs, each with the layer it
+//! resolves from and what it shadows; a project definition that is skipped
+//! (untrusted or unconfirmed) is listed with why. An explicit project
+//! collection is project-only.
 
-use std::collections::BTreeMap;
+use cairn_config::library::{self, LibraryKind, LibraryRoots, Listed};
 use std::path::PathBuf;
 
+use super::library_listing::{origin_lines, render_collection, Links};
 use crate::config::agents::{self as config_agents, FileAgent};
-use crate::config::ConfigResult;
 use crate::mcp::handlers::skills_resources::{current_run_project, project_path_by_key};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::{build_agent_uri, build_project_agent_uri};
 
-fn scope_label(agent: &FileAgent) -> &'static str {
-    if agent.is_project_scoped {
-        "project"
-    } else {
-        "workspace"
-    }
-}
-
-/// Canonical URI for an agent: project-scoped when it lives in a project, else workspace.
-fn agent_link(agent: &FileAgent, project_key: Option<&str>) -> String {
-    if agent.is_project_scoped {
-        match project_key {
-            Some(project) => build_project_agent_uri(project, &agent.id),
-            None => build_agent_uri(&agent.id),
-        }
-    } else {
-        build_agent_uri(&agent.id)
-    }
-}
+const LINKS: Links = Links {
+    bare: build_agent_uri,
+    project: build_project_agent_uri,
+};
 
 /// Resolve the project key + repo path for the requested scope. Mirrors recipes.
 async fn resolve_scope(
@@ -65,43 +53,31 @@ pub(crate) async fn read_agents_collection(
         Err(e) => return e,
     };
 
-    let agents = match config_agents::list_agents(&orch.config_dir, project_path.as_deref()) {
-        Ok(agents) => agents,
+    let rows = match config_agents::list_agent_rows(&LibraryRoots::at(
+        &orch.config_dir,
+        project_path.as_deref(),
+    )) {
+        Ok(rows) => rows,
         Err(e) => return format!("Error listing agents: {e}"),
     };
+    render_rows(rows, project_key.as_deref(), explicit_project.is_some())
+}
 
-    let mut by_id: BTreeMap<String, FileAgent> = BTreeMap::new();
-    for result in agents {
-        if let ConfigResult::Ok(agent) = result {
-            // config_root_subdirs yields project first, so keep the first
-            // occurrence for each id to let project agents shadow workspace.
-            by_id.entry(agent.id.clone()).or_insert(agent);
-        }
-    }
-
-    let header = match project_key.as_deref() {
-        Some(key) => format!("# Agents — {key} context\n\n"),
-        None => "# Agents — workspace\n\n".to_string(),
-    };
-    let mut out = header;
-    out.push_str(&format!("{} agent(s)\n\n", by_id.len()));
-
-    if by_id.is_empty() {
-        out.push_str("No agents found.\n\n");
-    } else {
-        for agent in by_id.values() {
-            out.push_str(&format!(
-                "- [{}]({}) [{}] — {}\n",
-                agent.id,
-                agent_link(agent, project_key.as_deref()),
-                scope_label(agent),
-                agent.name,
-            ));
-        }
-        out.push('\n');
-    }
-
-    out
+fn render_rows(
+    rows: Vec<Listed<FileAgent>>,
+    project_key: Option<&str>,
+    project_only: bool,
+) -> String {
+    render_collection(
+        "Agents",
+        "agent",
+        LibraryKind::Agent,
+        rows,
+        project_key,
+        project_only,
+        &LINKS,
+        |agent: &FileAgent| agent.name.clone(),
+    )
 }
 
 /// Render a single agent: id, name, description, tier, tools, and actions.
@@ -116,25 +92,35 @@ pub(crate) async fn read_agent(
         Err(e) => return e,
     };
 
-    let agent = match config_agents::get_agent(&orch.config_dir, agent_id, project_path.as_deref())
-    {
-        Ok(Some(agent)) => agent,
-        Ok(None) => return not_found(agent_id, explicit_project),
-        Err(e) => return format!("Error loading agent: {e}"),
+    let resolved = match config_agents::resolve_agent(
+        &LibraryRoots::at(&orch.config_dir, project_path.as_deref()),
+        agent_id,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) if error.is_not_found() => return not_found(agent_id, explicit_project),
+        // Untrusted, unconfirmed, colliding or unreadable: the refusal names
+        // the definition and what the operator does about it.
+        Err(error) => return format!("{error}\n"),
     };
 
     // Explicit project scope is project-only: never resolve a shared workspace
     // agent behind an explicit project URI.
-    if explicit_project.is_some() && !agent.is_project_scoped {
+    if explicit_project.is_some() && !resolved.origin.is_project() {
         return not_found(agent_id, explicit_project);
     }
+    render_agent(&resolved)
+}
 
-    let mut out = format!(
-        "# Agent `{}` — {}\n\n[{}]\n\n",
-        agent.id,
-        agent.name,
-        scope_label(&agent),
-    );
+fn render_agent(resolved: &library::Resolved<FileAgent>) -> String {
+    let agent = &resolved.item;
+    let mut out = format!("# Agent `{}` — {}\n\n", agent.id, agent.name);
+    out.push_str(&origin_lines(
+        LibraryKind::Agent,
+        &agent.id,
+        &resolved.origin,
+        &resolved.shadows,
+    ));
+    out.push('\n');
     if !agent.description.is_empty() {
         out.push_str(&format!("{}\n\n", agent.description));
     }
@@ -194,42 +180,84 @@ mod tests {
         .unwrap();
     }
 
-    /// Render the collection directly from loaded agents, bypassing run-context
-    /// resolution (which needs a DB). Mirrors `read_agents_collection`'s body.
-    fn render_collection(config_dir: &Path, project_path: Option<&Path>) -> String {
-        let agents = config_agents::list_agents(config_dir, project_path).unwrap();
-        let mut by_id: BTreeMap<String, FileAgent> = BTreeMap::new();
-        for result in agents {
-            if let ConfigResult::Ok(agent) = result {
-                by_id.entry(agent.id.clone()).or_insert(agent);
-            }
-        }
-
-        let mut out = String::new();
-        for agent in by_id.values() {
-            out.push_str(&format!(
-                "- [{}]({}) [{}] — {}\n",
-                agent.id,
-                agent_link(agent, Some("cairn")),
-                scope_label(agent),
-                agent.name,
-            ));
-        }
-        out
+    fn render(roots: &LibraryRoots) -> String {
+        render_rows(
+            config_agents::list_agent_rows(roots).unwrap(),
+            Some("cairn"),
+            false,
+        )
     }
 
     #[test]
-    fn project_agent_shadows_workspace_by_id() {
+    fn a_trusted_project_agent_shadows_the_workspace_s_and_says_so() {
         let temp = tempdir().unwrap();
         let config_dir = temp.path().join("config");
         let project_dir = temp.path().join("project");
         write_agent(&config_dir, "shared", "Workspace Version");
         write_project_agent(&project_dir, "shared", "Project Version");
 
-        let rendered = render_collection(&config_dir, Some(&project_dir));
-        // Project version wins and links project-scoped.
-        assert!(rendered.contains("cairn://p/cairn/agents/shared"));
-        assert!(rendered.contains("[project] — Project Version"));
-        assert!(!rendered.contains("Workspace Version"));
+        let rendered = render(&crate::config::trusted_roots(&config_dir, &project_dir));
+        assert!(
+            rendered.contains("cairn://p/cairn/agents/shared"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("[@, shadows ~] — Project Version"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Workspace Version"), "{rendered}");
+    }
+
+    #[test]
+    fn an_untrusted_project_agent_is_listed_as_skipped_and_the_workspace_s_is_in_force() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let project_dir = temp.path().join("project");
+        write_agent(&config_dir, "shared", "Workspace Version");
+        write_project_agent(&project_dir, "shared", "Project Version");
+
+        let rendered = render(&LibraryRoots::workspace(&config_dir).with_project(
+            library::test_support::project(&project_dir, "cairn", library::ProjectTrust::Untrusted),
+        ));
+        let (in_force, skipped) = rendered.split_once("## Not in force").unwrap();
+        assert!(in_force.contains("[~] — Workspace Version"), "{rendered}");
+        assert!(
+            skipped.contains("[@, untrusted: skipped] — Project Version"),
+            "{rendered}"
+        );
+        assert!(skipped.contains(library::TRUST_SETTINGS_PLACE));
+    }
+
+    #[test]
+    fn a_pack_agent_links_its_pack_address_and_a_workspace_one_in_front_names_it() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        library::test_support::install_pack_lock(&config_dir, "core", &[]);
+        write_agent(
+            &library::test_support::pack_root(&config_dir, "core"),
+            "build",
+            "Pack Build",
+        );
+        write_agent(&config_dir, "mine", "Mine");
+        let rendered = render(&LibraryRoots::workspace(&config_dir));
+        assert!(
+            rendered.contains("(cairn://packs/core/agents/build) [pack:core] — Pack Build"),
+            "{rendered}"
+        );
+
+        write_agent(&config_dir, "build", "My Build");
+        let roots = LibraryRoots::workspace(&config_dir);
+        let rendered = render(&roots);
+        assert!(
+            rendered.contains("[~, shadows pack:core] — My Build"),
+            "{rendered}"
+        );
+        let detail = render_agent(&config_agents::resolve_agent(&roots, "build").unwrap());
+        assert!(detail.contains("Origin: ~\n"), "{detail}");
+        assert!(
+            detail.contains("Shadows: pack:core (cairn://packs/core/agents/build)"),
+            "{detail}"
+        );
     }
 }

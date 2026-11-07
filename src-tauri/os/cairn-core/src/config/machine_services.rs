@@ -182,19 +182,18 @@ pub(crate) fn machine_service_entry(
 /// Remove the service `id` from `pack_id`, leaving the pack installed.
 ///
 /// The caller announces the change, which is what drains the service's cells.
+/// Take a machine service out of its pack: record the removal (a service runs
+/// from the app bundle's declaration, so there is no copy to delete) and clear
+/// every machine's selection of it.
 pub fn delete_pack_service(orch: &Orchestrator, pack_id: &str, id: &str) -> Result<(), String> {
-    delete_service_copy(&orch.config_dir, id)?;
+    pack::lock::record_removal_from(
+        &crate::services::RealFileSystem,
+        &orch.config_dir,
+        pack_id,
+        PackItemKind::Service,
+        id,
+    )?;
     clear_selections(orch, [MachineServiceKey::new(pack_id, id)?])
-}
-
-fn delete_service_copy(config_dir: &Path, id: &str) -> Result<(), String> {
-    let dir = config_dir.join(pack::manifest::SERVICES_DIR).join(id);
-    if dir.is_dir() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("Failed to delete service directory: {e}"))?;
-        pack::note_removed_item(config_dir, PackItemKind::Service, id);
-    }
-    Ok(())
 }
 
 /// Clear every machine's selection of `keys`, overrides included. Writes nothing

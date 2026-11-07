@@ -59,6 +59,50 @@ pub const BROKERED_ONLY_REFUSAL: &str = concat!(
     "decision, so it is not affected by the filesystem fence."
 );
 
+/// What an agent is told when it tries to write inside an installed pack.
+pub const INSTALLED_PACK_REFUSAL: &str = concat!(
+    "Denied: installed packs (~/.cairn/packs/) are read where they are installed and never edited, ",
+    "so an update can replace them and every reader sees what the pack shipped. To change what a ",
+    "pack item does, write your own definition in front of it: write its address ",
+    "(cairn://agents/<name>, cairn://skills/<name>, ...) with `layer: workspace` or ",
+    "`layer: project`, and the pack's own version stays at cairn://packs/<pack>/<kind>/<name>. ",
+    "This is not a containment decision, so it is not affected by the filesystem fence."
+);
+
+/// The directory installed packs are read from.
+pub fn installed_packs_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("packs")
+}
+
+/// Whether `candidate` lies inside `dir` (or is `dir`), comparing resolved
+/// identity and spelling like [`resolves_to`], and ignoring case where the
+/// platform's default filesystem does.
+fn lies_within(candidate: &Path, dir: &Path) -> bool {
+    let inside = |candidate: &Path, dir: &Path| {
+        if candidate.starts_with(dir) {
+            return true;
+        }
+        if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            let (Some(candidate), Some(dir)) = (candidate.to_str(), dir.to_str()) else {
+                return false;
+            };
+            return Path::new(&candidate.to_ascii_lowercase())
+                .starts_with(Path::new(&dir.to_ascii_lowercase()));
+        }
+        false
+    };
+    inside(
+        &best_effort_canonical(candidate),
+        &best_effort_canonical(dir),
+    ) || inside(&lexically_normalize(candidate), &lexically_normalize(dir))
+}
+
+/// Whether `candidate` is inside an installed pack: no agent writes there,
+/// because a pack is read in place and a local definition goes in front of it.
+pub fn is_installed_pack_path(candidate: &Path, config_dir: &Path) -> bool {
+    lies_within(candidate, &installed_packs_dir(config_dir))
+}
+
 /// The workspace configuration document for this install.
 pub fn workspace_settings_path(config_dir: &Path) -> PathBuf {
     config_dir.join("settings.yaml")
@@ -205,6 +249,9 @@ pub fn denied_path_refusal(config_dir: &Path, path: &Path) -> Option<&'static st
     if is_operator_credential_path(path, config_dir) {
         return Some(OPERATOR_CREDENTIAL_REFUSAL);
     }
+    if is_installed_pack_path(path, config_dir) {
+        return Some(INSTALLED_PACK_REFUSAL);
+    }
     None
 }
 
@@ -302,6 +349,38 @@ pub fn structured_change_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_inside_an_installed_pack_is_writable_however_it_is_spelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".cairn");
+        let agent = config.join("packs/core/agents/build.md");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, "---\nname: build\n---\n").unwrap();
+
+        for path in [
+            agent.clone(),
+            config.join("packs/core/agents/new.md"),
+            config.join("agents/../packs/core/agents/build.md"),
+            config.join("packs"),
+        ] {
+            assert_eq!(
+                denied_path_refusal(&config, &path),
+                Some(INSTALLED_PACK_REFUSAL),
+                "{}",
+                path.display()
+            );
+        }
+        // A definition in front of the pack's is where edits go.
+        assert_eq!(
+            denied_path_refusal(&config, &config.join("agents/build.md")),
+            None
+        );
+        assert_eq!(
+            denied_path_refusal(&config, &config.join("packs-notes.md")),
+            None
+        );
+    }
 
     #[test]
     fn the_document_itself_is_protected_however_it_is_spelled() {

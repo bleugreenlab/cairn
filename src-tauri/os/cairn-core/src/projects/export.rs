@@ -200,6 +200,14 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
         "one operator's closes in their notification center on this install, keyed by derived entry keys; it describes the operator, not the project, and an entry with no dismissal is simply open again",
     ),
     (
+        "project_library_trust",
+        "the operator's trust in this checkout's library definitions on this install; a destination's operator decides for themselves, so an imported project starts untrusted",
+    ),
+    (
+        "project_library_confirmations",
+        "the authority this install's operator confirmed for the checkout's definitions; like the trust it belongs to, a decision the destination's operator makes again",
+    ),
+    (
         "page_calls",
         "an audit trail of what this install's viewers opened and what their open page frames read; it describes the viewers, not the project, and pages themselves export as artifacts",
     ),

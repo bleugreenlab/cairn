@@ -1,5 +1,6 @@
 //! Pure Response definition parsing, template rendering, and output validation.
 
+use cairn_config::library::LibraryRoots;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -749,10 +750,13 @@ pub async fn invoke(
     interrupt: Option<&InvocationInterrupt>,
 ) -> Result<ResponseOutcome, ResponseError> {
     let (_, _, _, project_id, project_path) = caller.fields();
-    let file = crate::config::responses::get_response(&orch.config_dir, id, project_path)
-        .map_err(ResponseError::Upstream)?
-        .ok_or_else(|| ResponseError::UnknownResponse(id.to_string()))?;
-    let definition_project_id = if file.is_project_scoped {
+    let file = crate::config::responses::get_response(
+        &LibraryRoots::at(&orch.config_dir, project_path),
+        id,
+    )
+    .map_err(ResponseError::Upstream)?
+    .ok_or_else(|| ResponseError::UnknownResponse(id.to_string()))?;
+    let definition_project_id = if file.is_project_scoped() {
         Some(
             project_id
                 .ok_or_else(|| {
@@ -1397,7 +1401,7 @@ pub enum ValidatedOutput {
     Json(Value),
 }
 
-fn default_timeout() -> Duration {
+pub(crate) fn default_timeout() -> Duration {
     Duration::from_secs(15)
 }
 

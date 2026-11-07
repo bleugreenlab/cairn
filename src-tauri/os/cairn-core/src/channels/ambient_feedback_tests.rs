@@ -858,6 +858,19 @@ async fn the_read_filters_and_refuses_unknown_values() {
     };
     let all = read(vec![]).await;
     assert!(all.contains("3 rows; 0 unrecorded"), "{all}");
+    let limited = read(vec![param("limit", "1")]).await;
+    assert!(
+        limited.contains("3 rows; 0 unrecorded") && limited.contains("Showing 1."),
+        "{limited}"
+    );
+    assert_eq!(
+        limited
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .count(),
+        1,
+        "{limited}"
+    );
     let docs = read(vec![param("thread", DOCS)]).await;
     assert!(
         docs.contains("1 rows") && docs.contains("→ cairn://p/cairn/docs"),

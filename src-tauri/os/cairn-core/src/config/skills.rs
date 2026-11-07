@@ -12,11 +12,19 @@
 //!   .meta.json        <- Cairn-internal provenance
 //! ```
 //!
-//! - Workspace-scoped: `~/.cairn/skills/`
-//! - Project-scoped: `[project-dir]/.cairn/skills/`
+//! One skill directory per layer (`skills/<id>/` in a project's `.cairn/`, the
+//! workspace, or an installed pack), resolved nearest-first through
+//! [`cairn_config::library`].
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+
+use cairn_config::library::{
+    self, LibraryItem, LibraryKind, LibraryRef, LibraryRoots, Listed, Origin, ResolveError,
+    Resolved,
+};
 
 use crate::skills::{parse_skill_markdown, skill_to_markdown_spec, SkillExportDataSpec};
 
@@ -62,7 +70,8 @@ pub struct FileSkill {
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub bundles: Vec<String>,
-    pub is_project_scoped: bool,
+    /// The layer this skill was read from, or the layer a new one is for.
+    pub origin: Origin,
     /// Path to SKILL.md
     pub file_path: PathBuf,
     /// Path to the skill directory
@@ -77,163 +86,279 @@ pub struct FileSkill {
     pub has_assets: bool,
 }
 
-/// List all skills from directories.
-pub fn list_skills(
-    config_dir: &Path,
-    project_path: Option<&Path>,
-) -> Result<Vec<ConfigResult<FileSkill>>, String> {
-    let mut results = vec![];
-    let mut project_migrated = false;
-
-    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "skills") {
-        if dir.exists() && dir.is_dir() {
-            let mut migrated = false;
-            scan_skills_dir(&dir, is_project_scoped, &mut results, &mut migrated)?;
-            if migrated && is_project_scoped {
-                project_migrated = true;
-            }
-        }
+impl FileSkill {
+    pub fn is_project_scoped(&self) -> bool {
+        self.origin.is_project()
     }
-
-    // A project-scoped legacy `.md` skill was rewritten to directory format in
-    // the canonical checkout; commit it so it does not float as dirty state.
-    if project_migrated {
-        if let Some(project_path) = project_path {
-            super::commit_project_config_change(project_path, "cairn: migrate skills");
-        }
-    }
-
-    Ok(results)
 }
 
-fn scan_skills_dir(
+/// A skill's authority: the tools it lets an agent use without asking, and
+/// the scripts it ships for an agent to run. Every field is named below, so a
+/// field added to `FileSkill` does not compile until it is classified.
+impl LibraryItem for FileSkill {
+    fn library_id(&self) -> &str {
+        &self.id
+    }
+
+    fn authority(&self) -> Map<String, Value> {
+        let FileSkill {
+            // The name resolution keys it by.
+            id: _,
+            // Prose: `SKILL.md`'s frontmatter text and body.
+            name: _,
+            description: _,
+            prompt: _,
+            allowed_tools,
+            // Which bundled sets list it: catalog metadata.
+            bundles: _,
+            origin: _,
+            file_path: _,
+            // Where the scripts below are read from.
+            dir_path,
+            // Provenance: who wrote it and from which issue.
+            meta: _,
+            // References and assets are documents the agent reads; the
+            // scripts directory is hashed below rather than flagged.
+            has_references: _,
+            has_scripts: _,
+            has_assets: _,
+        } = self;
+        let mut fields = Map::new();
+        if let Some(tools) = allowed_tools {
+            fields.insert("allowedTools".into(), json!(tools));
+        }
+        let scripts = dir_path.join("scripts");
+        if scripts.is_dir() {
+            let hash = match cairn_packs::hash_tree(&scripts) {
+                Ok(cairn_packs::ContentHash::Present(hash)) => hash,
+                Ok(cairn_packs::ContentHash::Missing) => String::new(),
+                // An unreadable tree never matches a confirmation.
+                Err(error) => format!("unreadable: {error}"),
+            };
+            fields.insert("scripts".into(), json!(hash));
+        }
+        fields
+    }
+}
+
+/// Whether a layer's legacy `.md` skills may be rewritten in place: the
+/// workspace's and a project's, never a pack's.
+fn migrates(origin: &Origin) -> bool {
+    !matches!(origin, Origin::Pack { .. })
+}
+
+fn load_skill_in(
     dir: &Path,
-    is_project_scoped: bool,
-    results: &mut Vec<ConfigResult<FileSkill>>,
-    migrated: &mut bool,
-) -> Result<(), String> {
+    id: &str,
+    origin: &Origin,
+    migrated: &Cell<bool>,
+) -> Option<ConfigResult<FileSkill>> {
+    let dir_path = dir.join(id);
+    if dir_path.join("SKILL.md").exists() {
+        return Some(load_skill_dir(&dir_path, origin.clone()));
+    }
+    let legacy_path = dir.join(format!("{id}.md"));
+    if !legacy_path.is_file() || !migrates(origin) {
+        return None;
+    }
+    match migrate_legacy_skill(dir, id) {
+        Ok(()) => {
+            migrated.set(true);
+            Some(load_skill_dir(&dir_path, origin.clone()))
+        }
+        Err(error) => Some(ConfigResult::Err {
+            path: legacy_path,
+            error,
+        }),
+    }
+}
+
+fn enumerate_skills(
+    dir: &Path,
+    origin: &Origin,
+    migrated: &Cell<bool>,
+) -> Result<Vec<(String, ConfigResult<FileSkill>)>, String> {
     let entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("Failed to read skills directory: {}", e))?
         .filter_map(|e| e.ok())
         .collect();
 
-    // Collect directory skill IDs first
+    let mut results = Vec::new();
     let mut dir_ids = std::collections::HashSet::new();
     for entry in &entries {
         let path = entry.path();
         if path.is_dir() && path.join("SKILL.md").exists() {
             if let Some(id) = path.file_name().and_then(|n| n.to_str()) {
                 dir_ids.insert(id.to_string());
+                results.push((id.to_string(), load_skill_dir(&path, origin.clone())));
             }
-            results.push(load_skill_dir(&path, is_project_scoped));
         }
     }
 
-    // Auto-migrate legacy .md files that don't already have a directory
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
-            if let Some(id) = super::id_from_path(&path) {
-                if !dir_ids.contains(&id) {
-                    match migrate_legacy_skill(dir, &id) {
-                        Ok(()) => {
-                            *migrated = true;
-                            log::info!("Auto-migrated legacy skill: {}", id);
-                            let migrated_dir = dir.join(&id);
-                            results.push(load_skill_dir(&migrated_dir, is_project_scoped));
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to auto-migrate skill {}: {}", id, e);
-                            results.push(ConfigResult::Err {
-                                path: path.clone(),
-                                error: format!("Legacy skill needs migration: {}", e),
-                            });
-                        }
-                    }
+    // Auto-migrate legacy .md files that don't already have a directory.
+    if migrates(origin) {
+        for entry in &entries {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(id) = super::id_from_path(&path) else {
+                continue;
+            };
+            if dir_ids.contains(&id) {
+                continue;
+            }
+            match migrate_legacy_skill(dir, &id) {
+                Ok(()) => {
+                    migrated.set(true);
+                    log::info!("Auto-migrated legacy skill: {}", id);
+                    let migrated_dir = dir.join(&id);
+                    results.push((id, load_skill_dir(&migrated_dir, origin.clone())));
+                }
+                Err(e) => {
+                    log::warn!("Failed to auto-migrate skill {}: {}", id, e);
+                    results.push((
+                        id,
+                        ConfigResult::Err {
+                            path: path.clone(),
+                            error: format!("Legacy skill needs migration: {}", e),
+                        },
+                    ));
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(results)
 }
 
-/// Get a specific skill by ID.
-///
-/// Auto-migrates legacy `.md` files to directory format on access.
-pub fn get_skill(
-    config_dir: &Path,
-    id: &str,
-    project_path: Option<&Path>,
-) -> Result<Option<FileSkill>, String> {
-    for (skills_dir, is_project_scoped) in
-        super::config_root_subdirs(config_dir, project_path, "skills")
-    {
-        let mut migrated = false;
-        let skill = get_skill_from_dir(&skills_dir, id, is_project_scoped, &mut migrated)?;
-        // A project-scoped legacy `.md` skill was rewritten to directory format in
-        // the canonical checkout; commit it so it does not float as dirty state.
-        if migrated && is_project_scoped {
-            if let Some(project_path) = project_path {
-                super::commit_project_config_change(
-                    project_path,
-                    &format!("cairn: migrate skill {id}"),
-                );
-            }
-        }
-        if let Some(skill) = skill {
-            return Ok(Some(skill));
+/// A project-scoped legacy `.md` skill rewritten to directory format lands in
+/// the canonical checkout; commit it so it does not float as dirty state.
+fn commit_project_migration(roots: &LibraryRoots, migrated: &Cell<bool>, msg: &str) {
+    if migrated.get() {
+        if let Some(project) = &roots.project {
+            super::commit_project_config_change(&project.path, msg);
         }
     }
-    Ok(None)
 }
 
-/// Try to load a skill from a skills directory, auto-migrating legacy files.
-fn get_skill_from_dir(
-    skills_dir: &Path,
+/// Every skill definition across the layers, with its origin and what it
+/// shadows.
+pub fn list_skill_rows(roots: &LibraryRoots) -> Result<Vec<Listed<FileSkill>>, String> {
+    let project_migrated = Cell::new(false);
+    let rows = roots.list(LibraryKind::Skill, |dir, origin| {
+        let migrated = Cell::new(false);
+        let entries = enumerate_skills(dir, origin, &migrated)?;
+        if migrated.get() && origin.is_project() {
+            project_migrated.set(true);
+        }
+        Ok(entries)
+    })?;
+    commit_project_migration(roots, &project_migrated, "cairn: migrate skills");
+    Ok(rows)
+}
+
+/// The skills in force, one per name.
+pub fn list_skills(roots: &LibraryRoots) -> Result<Vec<ConfigResult<FileSkill>>, String> {
+    Ok(library::active(list_skill_rows(roots)?))
+}
+
+fn resolve_with(
+    roots: &LibraryRoots,
     id: &str,
-    is_project_scoped: bool,
-    migrated: &mut bool,
-) -> Result<Option<FileSkill>, String> {
-    let dir_path = skills_dir.join(id);
-    if dir_path.join("SKILL.md").exists() {
-        return match load_skill_dir(&dir_path, is_project_scoped) {
-            ConfigResult::Ok(skill) => Ok(Some(skill)),
-            ConfigResult::Err { error, .. } => Err(error),
-        };
-    }
-
-    // Auto-migrate legacy file if present
-    let legacy_path = skills_dir.join(format!("{}.md", id));
-    if legacy_path.exists() {
-        migrate_legacy_skill(skills_dir, id)?;
-        *migrated = true;
-        return match load_skill_dir(&dir_path, is_project_scoped) {
-            ConfigResult::Ok(skill) => Ok(Some(skill)),
-            ConfigResult::Err { error, .. } => Err(error),
-        };
-    }
-
-    Ok(None)
+    resolve: impl FnOnce(
+        &dyn Fn(&Path, &str, &Origin) -> Option<ConfigResult<FileSkill>>,
+    ) -> Result<Resolved<FileSkill>, ResolveError>,
+) -> Result<Resolved<FileSkill>, ResolveError> {
+    let project_migrated = Cell::new(false);
+    let load = |dir: &Path, name: &str, origin: &Origin| {
+        let migrated = Cell::new(false);
+        let entry = load_skill_in(dir, name, origin, &migrated);
+        if migrated.get() && origin.is_project() {
+            project_migrated.set(true);
+        }
+        entry
+    };
+    let resolved = resolve(&load);
+    commit_project_migration(
+        roots,
+        &project_migrated,
+        &format!("cairn: migrate skill {id}"),
+    );
+    resolved
 }
 
-/// Save a skill directory with spec-compliant SKILL.md.
+/// Resolve a skill reference (a skill id or
+/// `cairn://packs/<pack>/skills/<id>`) nearest-first. Auto-migrates a legacy
+/// `.md` skill in the workspace or project on access.
+pub fn resolve_skill(
+    roots: &LibraryRoots,
+    reference: &str,
+) -> Result<Resolved<FileSkill>, ResolveError> {
+    let parsed = LibraryRef::parse(LibraryKind::Skill, reference).map_err(|error| {
+        ResolveError::Invalid {
+            path: PathBuf::new(),
+            error,
+            origin: None,
+        }
+    })?;
+    resolve_with(roots, parsed.name(), |load| {
+        roots.resolve(LibraryKind::Skill, &parsed, load)
+    })
+}
+
+/// Resolve skill `id` in one layer only (see [`LibraryRoots::resolve_in`]).
+pub fn resolve_skill_in(
+    roots: &LibraryRoots,
+    layer: &Origin,
+    id: &str,
+) -> Result<Resolved<FileSkill>, ResolveError> {
+    resolve_with(roots, id, |load| {
+        roots.resolve_in(LibraryKind::Skill, layer, id, load)
+    })
+}
+
+/// The skill a reference resolves to, `None` when nothing defines it.
+pub fn get_skill(roots: &LibraryRoots, id: &str) -> Result<Option<FileSkill>, String> {
+    match resolve_skill(roots, id) {
+        Ok(resolved) => Ok(Some(resolved.item)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Save a skill directory with spec-compliant SKILL.md into a definite layer:
+/// `layer`, or where the skill was read from when `None`. A pack's own skill
+/// is never written; saving one into the workspace or a project defines it
+/// there, in front of the pack's, carrying its package files with it.
 pub fn save_skill(
-    config_dir: &Path,
+    roots: &LibraryRoots,
     skill: &FileSkill,
-    project_path: Option<&Path>,
+    layer: Option<&Origin>,
     meta_update: Option<SkillMetaUpdate>,
 ) -> Result<PathBuf, String> {
-    let skills_dir = if skill.is_project_scoped {
-        let proj_path = project_path.ok_or("Project path required for project-scoped skill")?;
-        proj_path.join(".cairn").join("skills")
+    let target = layer.unwrap_or(&skill.origin);
+    if let Origin::Pack { id: pack } = target {
+        return Err(library::pack_edit_refusal(
+            LibraryKind::Skill,
+            &skill.id,
+            pack,
+        ));
+    }
+    // Written back where it was read from unless a layer is named.
+    let skill_dir = if layer.is_none() && !skill.dir_path.as_os_str().is_empty() {
+        skill.dir_path.clone()
     } else {
-        config_dir.join("skills")
+        roots
+            .layer_dir(LibraryKind::Skill, target)
+            .ok_or("Project path required for project-scoped skill")?
+            .join(&skill.id)
     };
-
-    let skill_dir = skills_dir.join(&skill.id);
     std::fs::create_dir_all(&skill_dir)
         .map_err(|e| format!("Failed to create skill directory: {}", e))?;
+    if skill.origin.pack_id().is_some() && skill.dir_path.is_dir() && skill.dir_path != skill_dir {
+        copy_skill_package(&skill.dir_path, &skill_dir)?;
+    }
 
     let markdown = skill_to_markdown_spec(SkillExportDataSpec {
         slug: &skill.id,
@@ -325,27 +450,48 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Delete a skill directory.
+/// Delete the skill `id` resolves to, or the one in `layer` when named. A
+/// workspace or project skill's directory is deleted outright; a pack's own
+/// skill is recorded as removed from its pack. Returns the path that changed
+/// (`None` when nothing defined it).
 pub fn delete_skill(
-    config_dir: &Path,
+    roots: &LibraryRoots,
     id: &str,
-    project_path: Option<&Path>,
-) -> Result<(), String> {
-    if let Some(proj_path) = project_path {
-        let dir_path = proj_path.join(".cairn").join("skills").join(id);
-        if dir_path.exists() && dir_path.is_dir() {
-            return std::fs::remove_dir_all(&dir_path)
-                .map_err(|e| format!("Failed to delete skill directory: {}", e));
+    layer: Option<&Origin>,
+) -> Result<Option<PathBuf>, String> {
+    let (origin, dir) = match layer {
+        Some(origin @ (Origin::Project { .. } | Origin::Workspace)) => {
+            let dir = roots
+                .layer_dir(LibraryKind::Skill, origin)
+                .ok_or_else(|| format!("No {origin} layer to delete skill `{id}` from"))?
+                .join(id);
+            if !dir.is_dir() {
+                return Ok(None);
+            }
+            (origin.clone(), dir)
         }
-    }
-
-    let dir_path = config_dir.join("skills").join(id);
-    if dir_path.exists() && dir_path.is_dir() {
-        std::fs::remove_dir_all(&dir_path)
-            .map_err(|e| format!("Failed to delete skill directory: {}", e))?;
-        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Skill, id);
-    }
-    Ok(())
+        Some(origin) => match resolve_skill_in(roots, origin, id) {
+            Ok(resolved) => (resolved.origin, resolved.item.dir_path),
+            Err(ResolveError::Invalid {
+                path,
+                origin: Some(origin),
+                ..
+            }) => (origin, path.parent().map(Path::to_path_buf).unwrap_or(path)),
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        },
+        None => match resolve_skill(roots, id) {
+            Ok(resolved) => (resolved.origin, resolved.item.dir_path),
+            Err(ResolveError::Invalid {
+                path,
+                origin: Some(origin),
+                ..
+            }) => (origin, path.parent().map(Path::to_path_buf).unwrap_or(path)),
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        },
+    };
+    library::remove_definition(roots, LibraryKind::Skill, id, &origin, &dir).map(Some)
 }
 
 /// Migrate a single legacy skill file to directory format.
@@ -392,7 +538,8 @@ fn migrate_legacy_skill(skills_dir: &Path, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Migrate all legacy skills in workspace and project dirs.
+/// Migrate all legacy skills in the workspace and project layers. Pack
+/// layers are never rewritten.
 pub fn migrate_all_legacy_skills(config_dir: &Path, project_path: Option<&Path>) -> Vec<String> {
     let mut migrated = vec![];
     let mut dirs = vec![config_dir.join("skills")];
@@ -426,7 +573,7 @@ pub fn migrate_all_legacy_skills(config_dir: &Path, project_path: Option<&Path>)
     migrated
 }
 
-fn load_skill_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<FileSkill> {
+fn load_skill_dir(dir_path: &Path, origin: Origin) -> ConfigResult<FileSkill> {
     let id = match dir_path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name.to_string(),
         None => {
@@ -456,7 +603,7 @@ fn load_skill_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<File
             prompt: parsed.prompt,
             allowed_tools: parsed.allowed_tools,
             bundles: parsed.bundles,
-            is_project_scoped,
+            origin,
             file_path: skill_md_path,
             dir_path: dir_path.to_path_buf(),
             meta: load_meta(dir_path),
@@ -480,6 +627,8 @@ fn load_meta(dir_path: &Path) -> Option<SkillMeta> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use cairn_config::library::{LibraryRoots, Origin};
     use tempfile::tempdir;
 
     fn write_skill_md(dir: &std::path::Path, markdown: &str) {
@@ -523,7 +672,7 @@ mod tests {
                 continue;
             }
             let id = path.file_name().unwrap().to_str().unwrap().to_string();
-            match load_skill_dir(&path, false) {
+            match load_skill_dir(&path, Origin::Workspace) {
                 ConfigResult::Ok(skill) => {
                     assert!(
                         !skill.description.trim().is_empty(),
@@ -548,7 +697,7 @@ mod tests {
         let skill_dir = temp.path().join("skills").join("testing");
         write_skill_md(&skill_dir, "---\nname: testing\ndescription: Test skill\nallowed-tools: Read Grep\nmetadata:\n  model: sonnet\n  display-name: Testing\n---\n\nRun the tests.\n");
 
-        match load_skill_dir(&skill_dir, false) {
+        match load_skill_dir(&skill_dir, Origin::Workspace) {
             ConfigResult::Ok(s) => {
                 assert_eq!(s.id, "testing");
                 assert_eq!(s.name, "Testing");
@@ -572,7 +721,7 @@ mod tests {
         )
         .unwrap();
 
-        match load_skill_dir(&d, false) {
+        match load_skill_dir(&d, Origin::Workspace) {
             ConfigResult::Ok(s) => {
                 let m = s.meta.unwrap();
                 assert_eq!(m.created_by, Some("Reviewer".to_string()));
@@ -591,7 +740,7 @@ mod tests {
         std::fs::create_dir_all(d.join("assets")).unwrap();
         write_skill_md(&d, "---\nname: testing\ndescription: Test\n---\n\nPrompt.");
 
-        match load_skill_dir(&d, false) {
+        match load_skill_dir(&d, Origin::Workspace) {
             ConfigResult::Ok(s) => {
                 assert!(s.has_references && s.has_scripts && s.has_assets);
             }
@@ -605,7 +754,7 @@ mod tests {
         let d = temp.path().join("skills").join("testing");
         std::fs::create_dir_all(&d).unwrap();
         assert!(matches!(
-            load_skill_dir(&d, false),
+            load_skill_dir(&d, Origin::Workspace),
             ConfigResult::Err { .. }
         ));
     }
@@ -623,7 +772,7 @@ mod tests {
             prompt: "Do things.".into(),
             allowed_tools: Some(vec!["Read".into(), "Grep".into()]),
             bundles: vec!["coding".into()],
-            is_project_scoped: false,
+            origin: Origin::Workspace,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),
             meta: None,
@@ -633,7 +782,7 @@ mod tests {
         };
 
         save_skill(
-            cfg,
+            &LibraryRoots::workspace(cfg),
             &skill,
             None,
             Some(SkillMetaUpdate {
@@ -644,7 +793,9 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = get_skill(cfg, "testing", None).unwrap().unwrap();
+        let loaded = get_skill(&LibraryRoots::workspace(cfg), "testing")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.id, "testing");
         assert_eq!(
             loaded.allowed_tools,
@@ -673,7 +824,7 @@ mod tests {
             prompt: "Updated.".into(),
             allowed_tools: None,
             bundles: Vec::new(),
-            is_project_scoped: false,
+            origin: Origin::Workspace,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),
             meta: None,
@@ -682,7 +833,7 @@ mod tests {
             has_assets: false,
         };
         save_skill(
-            cfg,
+            &LibraryRoots::workspace(cfg),
             &skill,
             None,
             Some(SkillMetaUpdate {
@@ -706,7 +857,7 @@ mod tests {
         let d = cfg.join("skills/testing");
         write_skill_md(&d, "---\nname: testing\ndescription: Test\n---\n\nPrompt.");
 
-        delete_skill(cfg, "testing", None).unwrap();
+        delete_skill(&LibraryRoots::workspace(cfg), "testing", None).unwrap();
         assert!(!d.exists());
     }
 
@@ -760,7 +911,7 @@ mod tests {
             "---\nname: valid-skill\ndescription: Valid\n---\n\nPrompt.",
         );
 
-        let results = list_skills(temp.path(), None).unwrap();
+        let results = list_skills(&LibraryRoots::workspace(temp.path())).unwrap();
         // Should have 2: the valid dir + the auto-migrated legacy
         assert_eq!(results.len(), 2);
         let mut ids: Vec<String> = results
@@ -834,7 +985,7 @@ mod tests {
         );
 
         // Delete with project_path — should remove project version
-        delete_skill(cfg, "my-skill", Some(&proj)).unwrap();
+        delete_skill(&crate::config::trusted_roots(cfg, &proj), "my-skill", None).unwrap();
 
         // Project version gone, workspace version intact
         assert!(!proj_dir.exists());
@@ -861,9 +1012,11 @@ mod tests {
             "---\nname: my-skill\ndescription: Project version\n---\n\nProj.",
         );
 
-        let skill = get_skill(cfg, "my-skill", Some(&proj)).unwrap().unwrap();
+        let skill = get_skill(&crate::config::trusted_roots(cfg, &proj), "my-skill")
+            .unwrap()
+            .unwrap();
         assert_eq!(skill.description, "Project version");
-        assert!(skill.is_project_scoped);
+        assert!(skill.is_project_scoped());
     }
 
     #[test]
@@ -958,9 +1111,15 @@ mod tests {
         commit_all(&project, "seed legacy skill");
 
         // Resolving the skill migrates legacy.md -> legacy/SKILL.md and commits it.
-        let skill = get_skill(&config_dir, "legacy", Some(&project))
-            .unwrap()
-            .unwrap();
+        // It carries no authority, so trusting the project is enough.
+        let roots = LibraryRoots::workspace(&config_dir).with_project(
+            cairn_config::library::test_support::project(
+                &project,
+                "demo",
+                cairn_config::library::test_support::trusted(&[]),
+            ),
+        );
+        let skill = get_skill(&roots, "legacy").unwrap().unwrap();
         assert!(skill.dir_path.join("SKILL.md").exists());
         assert!(!skills_dir.join("legacy.md").exists());
 

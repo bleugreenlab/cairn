@@ -1236,7 +1236,7 @@ async fn dispatch_into(
             break;
         }
         firing_count += 1;
-        let scope_key = if route.is_project_scoped {
+        let scope_key = if route.is_project_scoped() {
             format!("project:{}", context.project_id.unwrap_or("unknown"))
         } else {
             "workspace".to_string()

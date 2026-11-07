@@ -1,8 +1,13 @@
 //! Pack-aware workspace sync.
 //!
-//! Pack locks are the live ownership authority. Each installed item records the
-//! hash Cairn last materialized and a durable fork bit. Git is consulted only to
-//! classify pre-v2 locks once; migrated packs never invoke Git again.
+//! A pack's items are staged under `packs/<id>/`, at the paths they have in
+//! the pack's source, and read there by `cairn_config::library` (tenet 1434).
+//! Nothing is copied out into the workspace and nothing is owned by hash: a
+//! sync replaces the pack's staged tree with what its source holds, and a
+//! user's own definition is a different file in front of it. The lock records
+//! the source's hash and the staged tree's, which is how a startup sync skips
+//! a pack that has not moved and re-stages one whose tree was changed by
+//! anything else.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -13,34 +18,43 @@ use crate::mcp::McpVarSetup;
 use crate::server_config::McpServerConfig;
 use crate::{
     self as pack, lock as pack_lock, ContentHash, PackItemKind, PackLock, PackLockItem,
-    PackManifest, PackSource,
+    PackManifest, PackSource, PackSourceKind,
 };
 use cairn_platform::services::{guarded_copy_file, guarded_copy_tree, FileSystem, GitClient};
 
 const LEGACY_BUNDLE_SYNC_MARKER: &str = ".bundle-sync";
-const BUNDLE_COMMIT_SUBJECTS: &[&str] = &[
-    "Initialize Cairn workspace config",
-    "Add missing bundled workspace defaults",
-    "Sync bundled workspace defaults",
-];
-const PACK_COMMIT_PREFIX: &str = "Sync pack resources: ";
-/// The June bundle-branch sync committed shipped resources, and nothing else,
-/// in a scratch worktree of a dedicated `bundle` branch under this subject. A
-/// path whose last commit carries it holds exactly what that build shipped.
-///
-/// Its two siblings from the same era are deliberately NOT ownership evidence:
-/// `Merge branch 'bundle'` is only ever a path's last commit when the merge
-/// combined the user's side with the bundle's, and `Snapshot workspace config`
-/// committed the user's own pending edits before a sync.
-const BUNDLE_BRANCH_COMMIT_PREFIX: &str = "Update bundled defaults to ";
 
-fn is_pack_authored_subject(subject: &str) -> bool {
-    BUNDLE_COMMIT_SUBJECTS.contains(&subject)
-        || subject.starts_with(PACK_COMMIT_PREFIX)
-        || subject.starts_with(BUNDLE_BRANCH_COMMIT_PREFIX)
+/// The directories under `packs/<id>/` that hold items read in place. A
+/// machine service is not among them: it runs from the app bundle's own
+/// declaration, never from a copy.
+pub const STAGED_DIRS: [&str; 8] = [
+    "agents",
+    "credentials",
+    "providers",
+    "recipes",
+    "responses",
+    "routes",
+    "skills",
+    "workflows",
+];
+
+/// Where a sync assembles a pack's next tree before swapping it in.
+const INCOMING_DIR: &str = ".incoming";
+
+/// Whether items of this kind are staged under `packs/<id>/`.
+fn is_staged(kind: PackItemKind) -> bool {
+    !matches!(kind, PackItemKind::Mcp | PackItemKind::Service)
 }
 
-/// Sync an already resolved source through the canonical pack ownership machinery.
+/// Whether this kind installs as a whole directory rather than one file.
+fn is_tree_item(kind: PackItemKind) -> bool {
+    matches!(
+        kind,
+        PackItemKind::Service | PackItemKind::Skill | PackItemKind::Workflow
+    )
+}
+
+/// Sync an already resolved source: stage it in place and record the lock.
 pub fn sync_resolved_pack(
     git: &dyn GitClient,
     fs: &dyn FileSystem,
@@ -52,7 +66,6 @@ pub fn sync_resolved_pack(
     refuse_invalid_providers(&manifest)?;
     refuse_relay_collision(config_dir, &manifest)?;
     fs.create_dir_all(config_dir)?;
-    ensure_workspace_content_dirs(fs, config_dir)?;
     pack_lock::clear_uninstall(fs, config_dir, &manifest.id)?;
     let hash = pack::content_hash(&manifest.root)?;
     let lock = pack_lock::read_lock(config_dir, &manifest.id);
@@ -67,23 +80,51 @@ pub fn sync_resolved_pack(
             action: PackAction::Sync,
             source,
         }],
+        false,
     )
 }
 
-/// Refuse a non-bundled install whose pack id, destination path, or MCP server
-/// name already belongs to something else, naming both sides.
+/// A bare name that more than one installed pack defines. Resolving it is
+/// refused until something local defines it or a reference names one pack's
+/// address; installing such a pack is not, so this is a warning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackCollision {
+    pub kind: PackItemKind,
+    pub name: String,
+    /// Every installed pack that defines it, sorted.
+    pub packs: Vec<String>,
+}
+
+/// Whether a kind is addressed by a bare name across packs.
+fn has_bare_address(kind: PackItemKind) -> bool {
+    matches!(
+        kind,
+        PackItemKind::Agent
+            | PackItemKind::Recipe
+            | PackItemKind::Response
+            | PackItemKind::Route
+            | PackItemKind::Skill
+            | PackItemKind::Workflow
+    )
+}
+
+/// Refuse a non-bundled install whose pack id or MCP server name already
+/// belongs to something else, naming both sides, and report the bare names it
+/// shares with other installed packs.
 ///
-/// Packs do not namespace what they install, so two sources offering
-/// `skills/pdf` are a real conflict. The outcome is defined and never silent:
-/// no overwrite, no rename. Runs before anything is written. An update of the
-/// same pack from the same origin skips what that pack already holds.
-/// Bundled sync does not call this; it keeps its adopt-as-fork migration rule.
+/// A pack's items live in its own directory, so two packs never write the same
+/// file and a user's own definition simply shadows a pack's. A bare name two
+/// packs define is refused when it is resolved, not here. MCP server names are
+/// one registry, so a taken name is still refused. Runs before anything is
+/// written. An update of the same pack from the same origin skips what that
+/// pack already holds.
 pub fn check_install_collisions(
     config_dir: &Path,
     manifest: &PackManifest,
     incoming: &PackSource,
     shipped_ids: &[String],
-) -> Result<(), String> {
+) -> Result<Vec<PackCollision>, String> {
     let id = &manifest.id;
     let incoming_label = describe_source(incoming);
     let refuse = |reason: String| {
@@ -104,16 +145,6 @@ pub fn check_install_collisions(
         }
         _ => {}
     }
-    let own_items: BTreeSet<(PackItemKind, String)> = own
-        .iter()
-        .flat_map(|lock| {
-            lock.items
-                .iter()
-                .map(PackLockItem::manifest_item)
-                .chain(lock.removed.iter().cloned())
-        })
-        .map(|item| (item.kind, item.id))
-        .collect();
     let others: Vec<PackLock> = pack_lock::installed_packs(config_dir)
         .into_iter()
         .filter(|lock| lock.id != *id)
@@ -121,10 +152,8 @@ pub fn check_install_collisions(
     let pack_servers = pack::mcp::load_pack_mcp_servers(config_dir);
     let settings_servers = settings_mcp_server_names(config_dir);
 
+    let mut collisions = Vec::new();
     for item in manifest.items_from(incoming.kind) {
-        if own_items.contains(&(item.kind, item.id.clone())) || item.kind.in_pack_layer() {
-            continue;
-        }
         if item.kind == PackItemKind::Mcp {
             if let Some(owner) = pack_servers
                 .get(&item.id)
@@ -148,29 +177,54 @@ pub fn check_install_collisions(
             }
             continue;
         }
-        let Some(path) = &item.path else { continue };
-        if let Some(owner) = others.iter().find(|lock| {
-            lock.items
-                .iter()
-                .filter_map(|claimed| claimed.path.as_deref())
-                .chain(lock.removed.iter().filter_map(|gone| gone.path.as_deref()))
-                .any(|claimed| claimed == path)
-        }) {
-            return refuse(format!(
-                "`{path}` is installed from pack `{}` (from {})",
-                owner.id,
-                describe_source(&owner.source)
-            ));
+        if !has_bare_address(item.kind) {
+            continue;
         }
-        if config_dir.join(path).exists() {
-            return refuse(format!(
-                "you already have your own {} `{}` at `{path}`, which no pack installed",
-                item.kind.as_str(),
-                item.id
-            ));
+        let mut packs: Vec<String> = others
+            .iter()
+            .filter(|lock| lock.item(item.kind, &item.id).is_some())
+            .map(|lock| lock.id.clone())
+            .collect();
+        if !packs.is_empty() {
+            packs.push(id.clone());
+            packs.sort();
+            collisions.push(PackCollision {
+                kind: item.kind,
+                name: item.id,
+                packs,
+            });
         }
     }
-    Ok(())
+    Ok(collisions)
+}
+
+/// The bare names pack `pack_id` shares with other installed packs, as they
+/// stand now (after an install or update).
+pub fn installed_collisions(config_dir: &Path, pack_id: &str) -> Vec<PackCollision> {
+    let installed = pack_lock::installed_packs(config_dir);
+    let Some(lock) = installed.iter().find(|lock| lock.id == pack_id) else {
+        return Vec::new();
+    };
+    let mut collisions = Vec::new();
+    for item in &lock.items {
+        if !has_bare_address(item.kind) {
+            continue;
+        }
+        let mut packs: Vec<String> = installed
+            .iter()
+            .filter(|other| other.item(item.kind, &item.id).is_some())
+            .map(|other| other.id.clone())
+            .collect();
+        if packs.len() > 1 {
+            packs.sort();
+            collisions.push(PackCollision {
+                kind: item.kind,
+                name: item.id.clone(),
+                packs,
+            });
+        }
+    }
+    collisions
 }
 
 /// Where a pack came from, in the words a refusal uses.
@@ -221,11 +275,6 @@ fn settings_mcp_server_names(config_dir: &Path) -> BTreeSet<String> {
 
 /// Refuse a whole pack when any skill its source ships fails the skill-package
 /// rules, before anything is written.
-///
-/// The sync re-derives items from the source tree by convention at every step
-/// (lock, retirement, collisions), so a skill the plugin loader skipped would
-/// still be installed, and skipping it here alone would let a later
-/// re-derivation bring it back. Refusing keeps one item set throughout.
 fn refuse_invalid_skills(manifest: &PackManifest) -> Result<(), String> {
     let skills: Vec<_> = manifest
         .items()
@@ -313,72 +362,43 @@ fn refuse_relay_collision(config_dir: &Path, manifest: &PackManifest) -> Result<
     }
     Ok(())
 }
-
-/// Explicitly replace every currently shipped item in one bundled pack and
-/// establish fresh ownership baselines. Unlike ordinary sync, this deliberately
-/// overwrites forks and clears tombstones because the caller has confirmed the
-/// total restore scope.
-pub fn restore_one_bundled_pack(
-    fs: &dyn FileSystem,
-    resource_dir: &Path,
-    config_dir: &Path,
-    pack_id: &str,
-) -> Result<PackSyncResult, String> {
-    let manifest = pack::available_pack(resource_dir, pack_id)
-        .ok_or_else(|| format!("No pack `{pack_id}` is shipped in {resource_dir:?}"))?;
-    refuse_invalid_providers(&manifest)?;
-    refuse_relay_collision(config_dir, &manifest)?;
-    fs.create_dir_all(config_dir)?;
-    ensure_workspace_content_dirs(fs, config_dir)?;
-    pack::record_source_dir(fs, resource_dir, config_dir)?;
-    pack_lock::clear_uninstall(fs, config_dir, pack_id)?;
-
-    let source_mcp = source_mcp_servers(&manifest)?;
-    let mut lock = PackLock::new(
-        &manifest,
-        pack::content_hash(&manifest.root)?,
-        PackSource::bundled(manifest.format),
-        manifest.items(),
-    );
-    let mut outcome = SyncOutcome::default();
-    for item in &mut lock.items {
-        materialize_item(fs, config_dir, pack_id, &manifest, item, &source_mcp)?;
-        item.content_hash = source_item_hash(&manifest, item, &source_mcp)?;
-        item.forked = false;
-        if let Some(path) = &item.path {
-            outcome.changed(path.clone());
-        }
-    }
-
-    lock.cairn_version = 2;
-    lock.removed.clear();
-    lock.sort_items();
-    pack_lock::write_lock(fs, config_dir, &lock)?;
-    outcome.changed_paths.sort();
-    outcome.changed_paths.dedup();
-    Ok(PackSyncResult {
-        updated: outcome.changed,
-        changed_paths: outcome.changed_paths,
-    })
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PackSyncResult {
     pub updated: bool,
     pub changed_paths: Vec<String>,
+    /// What a migration from copied-out packs kept and the user should know.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Default)]
 struct SyncOutcome {
     changed: bool,
     changed_paths: Vec<String>,
+    notes: Vec<String>,
 }
 
 impl SyncOutcome {
     fn changed(&mut self, path: String) {
         self.changed = true;
         self.changed_paths.push(path);
+    }
+
+    fn absorb(&mut self, other: PackSyncResult) {
+        self.changed |= other.updated;
+        self.changed_paths.extend(other.changed_paths);
+        self.notes.extend(other.notes);
+    }
+
+    fn finish(mut self) -> PackSyncResult {
+        self.changed_paths.sort();
+        self.changed_paths.dedup();
+        PackSyncResult {
+            updated: self.changed,
+            changed_paths: self.changed_paths,
+            notes: self.notes,
+        }
     }
 }
 
@@ -402,6 +422,15 @@ impl PackPlan {
     }
 }
 
+/// The startup sync of every bundled pack, and the integrity check of every
+/// installed library or local pack.
+///
+/// A bundled pack whose source and staged tree both match its lock is left
+/// alone. A pack of any origin whose staged tree no longer hashes to its lock
+/// is staged again from the version the lock records: the app bundle's for a
+/// bundled pack whose bundle has not moved, or the verified snapshot for a
+/// library or local pack. A newer library version is never applied here; that
+/// is the operator's update.
 pub fn sync_workspace_packs(
     git: &dyn GitClient,
     fs: &dyn FileSystem,
@@ -413,21 +442,47 @@ pub fn sync_workspace_packs(
     ensure_workspace_content_dirs(fs, config_dir)?;
     pack::record_source_dir(fs, resource_dir, config_dir)?;
     let plans = plan_packs(fs, config_dir, pack::discover_available_packs(resource_dir))?;
-    let result = apply_plans(git, fs, config_dir, plans)?;
+    let mut outcome = SyncOutcome::default();
+    outcome.absorb(apply_plans(git, fs, config_dir, plans, true)?);
 
-    let all_migrated = pack_lock::installed_packs(config_dir)
-        .iter()
-        .all(PackLock::migration_complete);
+    for lock in pack_lock::installed_packs(config_dir) {
+        if lock.source.kind == PackSourceKind::Bundled
+            || pack_lock::is_uninstalled(config_dir, &lock.id)
+            || (lock.cairn_version >= pack_lock::LOCK_VERSION
+                && staged_is_current(config_dir, &lock))
+        {
+            continue;
+        }
+        let manifest = match snapshot_manifest(config_dir, &lock) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                log::warn!("Pack `{}` was not staged again: {error}", lock.id);
+                continue;
+            }
+        };
+        let plan = PackPlan {
+            hash: lock.content_hash.clone(),
+            source: lock.source.clone(),
+            manifest,
+            lock: Some(lock),
+            action: PackAction::Sync,
+        };
+        outcome.absorb(apply_plans(git, fs, config_dir, vec![plan], false)?);
+    }
+
     let marker = config_dir.join(LEGACY_BUNDLE_SYNC_MARKER);
-    if all_migrated && fs.exists(&marker) {
+    if fs.exists(&marker) {
         fs.remove_file(&marker)?;
     }
-    Ok(result)
+    Ok(outcome.finish())
 }
 
+/// The user's own definitions live in these workspace directories.
 fn ensure_workspace_content_dirs(fs: &dyn FileSystem, config_dir: &Path) -> Result<(), String> {
     for dir_name in pack::CONTENT_DIRS {
-        fs.create_dir_all(&config_dir.join(dir_name))?;
+        if dir_name != pack::manifest::SERVICES_DIR {
+            fs.create_dir_all(&config_dir.join(dir_name))?;
+        }
     }
     Ok(())
 }
@@ -460,72 +515,45 @@ pub fn sync_one_pack(
             hash,
             action: PackAction::Sync,
         }],
+        false,
     )
 }
 
+/// Uninstall a pack: its directory goes whole, and a record of the decision
+/// keeps a default pack from coming back. A user's own definitions are
+/// separate files, so nothing of theirs is touched.
 pub fn uninstall_pack(
     _git: &dyn GitClient,
     fs: &dyn FileSystem,
     config_dir: &Path,
     pack_id: &str,
 ) -> Result<PackUninstallResult, String> {
-    let mut lock = pack_lock::read_lock(config_dir, pack_id)
+    let lock = pack_lock::read_lock(config_dir, pack_id)
         .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
-    let mut result = PackUninstallResult::default();
-
-    let shown = |item: &PackLockItem| {
-        item.path
-            .as_deref()
-            .map(|path| pack::item_destination_rel(pack_id, item.kind, path))
-    };
-    for item in &mut lock.items {
-        if item.forked {
-            result.kept.extend(shown(item));
-            continue;
-        }
-        let current = current_item_hash(config_dir, pack_id, item)?;
-        if matches!(current, ContentHash::Missing) {
-            continue;
-        }
-        let owned = matches_baseline(config_dir, item, &current)?;
-        if !owned {
-            item.forked = true;
-            result.kept.extend(shown(item));
-            continue;
-        }
-        remove_item_content(fs, config_dir, pack_id, item)?;
-        result.removed.extend(shown(item));
-    }
-
-    // A kept provider or credential declaration lives inside the pack's own
-    // directory, so that directory survives with only the pack's records gone.
-    if lock
+    let mut removed: Vec<String> = lock
         .items
         .iter()
-        .any(|item| item.kind.in_pack_layer() && item.forked)
-    {
-        for owned in [
-            pack_lock::lock_path(config_dir, pack_id),
-            pack_lock::mcp_path(config_dir, pack_id),
-        ] {
-            if fs.exists(&owned) {
-                fs.remove_file(&owned)?;
-            }
-        }
-    } else {
-        pack_lock::remove_pack_dir(fs, config_dir, pack_id)?;
-    }
+        .map(|item| (item.kind, item.path.as_deref()))
+        .chain(
+            lock.removed
+                .iter()
+                .map(|item| (item.kind, item.path.as_deref())),
+        )
+        .filter(|(kind, _)| is_staged(*kind))
+        .filter_map(|(kind, path)| path.map(|path| pack::item_destination_rel(pack_id, kind, path)))
+        .filter(|rel| fs.exists(&config_dir.join(rel)))
+        .collect();
+    pack_lock::remove_pack_dir(fs, config_dir, pack_id)?;
     pack_lock::record_uninstall(fs, config_dir, pack_id)?;
-    result.removed.sort();
-    result.kept.sort();
-    Ok(result)
+    removed.sort();
+    removed.dedup();
+    Ok(PackUninstallResult { removed })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PackUninstallResult {
     pub removed: Vec<String>,
-    pub kept: Vec<String>,
 }
 
 fn apply_plans(
@@ -533,8 +561,10 @@ fn apply_plans(
     fs: &dyn FileSystem,
     config_dir: &Path,
     plans: Vec<PackPlan>,
+    startup: bool,
 ) -> Result<PackSyncResult, String> {
     let mut outcome = SyncOutcome::default();
+    let mut migrated: Vec<String> = Vec::new();
     for plan in plans.into_iter().filter(PackPlan::syncing) {
         let mut lock = plan.lock.unwrap_or_else(|| {
             PackLock::new(
@@ -545,10 +575,22 @@ fn apply_plans(
             )
         });
 
-        if !lock.migration_complete() {
-            migrate_legacy_lock(git, fs, config_dir, &plan.manifest, &mut lock)?;
-            // Migration is durable before normal sync can overwrite any item.
-            pack_lock::write_lock(fs, config_dir, &lock)?;
+        if lock.cairn_version < pack_lock::LOCK_VERSION {
+            let migration = crate::migrate_v3::migrate_pack(git, fs, config_dir, &plan.manifest)?;
+            for path in &migration.deleted {
+                outcome.changed(path.clone());
+            }
+            migrated.extend(migration.deleted);
+            migrated.push(format!(
+                "{}/{}/{}",
+                pack_lock::PACKS_DIR,
+                lock.id,
+                pack_lock::LOCK_FILE
+            ));
+            outcome.notes.extend(migration.notes);
+        } else if startup && lock.content_hash == plan.hash && staged_is_current(config_dir, &lock)
+        {
+            continue;
         }
 
         sync_pack(
@@ -561,12 +603,8 @@ fn apply_plans(
             &mut outcome,
         )?;
     }
-    outcome.changed_paths.sort();
-    outcome.changed_paths.dedup();
-    Ok(PackSyncResult {
-        updated: outcome.changed,
-        changed_paths: outcome.changed_paths,
-    })
+    crate::migrate_v3::commit_migration(git, config_dir, &migrated);
+    Ok(outcome.finish())
 }
 
 fn plan_packs(
@@ -580,15 +618,19 @@ fn plan_packs(
             let hash = pack::content_hash(&manifest.root)?;
             let mut lock = pack_lock::read_lock(config_dir, &manifest.id);
             let uninstalled = pack_lock::is_uninstalled(config_dir, &manifest.id);
+            // A workspace from before install locks holds a pack's items as
+            // flat copies and no lock; adopting it migrates those copies.
             let adopted =
-                lock.is_none() && !uninstalled && pack_is_materialized(fs, config_dir, &manifest);
+                lock.is_none() && !uninstalled && legacy_copies_exist(fs, config_dir, &manifest);
             if adopted {
-                lock = Some(PackLock::new(
+                let mut adopted_lock = PackLock::new(
                     &manifest,
                     hash.clone(),
                     PackSource::bundled(manifest.format),
                     manifest.items(),
-                ));
+                );
+                adopted_lock.cairn_version = 1;
+                lock = Some(adopted_lock);
             }
             let action = if uninstalled {
                 PackAction::Skip
@@ -609,83 +651,16 @@ fn plan_packs(
         .collect()
 }
 
-fn pack_is_materialized(fs: &dyn FileSystem, config_dir: &Path, manifest: &PackManifest) -> bool {
+/// Whether a pack's items sit as flat copies in the workspace, the way every
+/// sync before v3 left them.
+fn legacy_copies_exist(fs: &dyn FileSystem, config_dir: &Path, manifest: &PackManifest) -> bool {
     manifest.items().iter().any(|item| {
-        item.path.as_deref().is_some_and(|path| {
-            fs.exists(&pack::item_destination(
-                config_dir,
-                &manifest.id,
-                item.kind,
-                path,
-            ))
-        })
+        !item.kind.in_pack_layer()
+            && item
+                .path
+                .as_deref()
+                .is_some_and(|path| fs.exists(&config_dir.join(path)))
     })
-}
-
-fn migrate_legacy_lock(
-    git: &dyn GitClient,
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    manifest: &PackManifest,
-    lock: &mut PackLock,
-) -> Result<(), String> {
-    let pack_id = lock.id.clone();
-    let source_mcp = source_mcp_servers(manifest)?;
-    for item in &mut lock.items {
-        if item.content_hash.is_some() {
-            continue;
-        }
-        let current = current_item_hash_with_mcp(config_dir, &pack_id, item, None)?;
-        match current {
-            ContentHash::Missing => {
-                // Missing content is safe to restore. Seed the shipped hash so the
-                // lock is fully migrated before the copy happens.
-                item.content_hash = source_item_hash(manifest, item, &source_mcp)?;
-            }
-            ContentHash::Present(hash) => {
-                // Bytes identical to what this build ships cannot hold a user
-                // edit worth keeping, so they need no history to be owned.
-                let shipped = source_item_hash(manifest, item, &source_mcp)?;
-                let owned = shipped.as_deref() == Some(hash.as_str()) || {
-                    let history_path = item.path.clone().unwrap_or_else(|| {
-                        format!(
-                            "{}/{}/{}",
-                            pack_lock::PACKS_DIR,
-                            lock.id,
-                            pack::manifest::PACK_MCP_FILE
-                        )
-                    });
-                    legacy_path_is_pack_owned(git, config_dir, &history_path)
-                };
-                item.content_hash = Some(hash);
-                item.forked = !owned;
-            }
-        }
-    }
-    lock.sort_items();
-    // Validate serializability/readability through the same writer boundary.
-    let _ = fs;
-    Ok(())
-}
-
-fn legacy_path_is_pack_owned(git: &dyn GitClient, config_dir: &Path, rel_path: &str) -> bool {
-    let output = git.run(
-        config_dir,
-        vec![
-            "log".into(),
-            "-1".into(),
-            "--format=%s".into(),
-            "--".into(),
-            rel_path.into(),
-        ],
-    );
-    match output {
-        Ok(output) if output.success => {
-            let subject = output.stdout.trim();
-            !subject.is_empty() && is_pack_authored_subject(subject)
-        }
-        _ => false,
-    }
 }
 
 fn sync_pack(
@@ -699,92 +674,72 @@ fn sync_pack(
 ) -> Result<(), String> {
     let pack_id = lock.id.clone();
     let source_items = manifest.items_from(source.kind);
-    let source_mcp = source_mcp_servers(manifest)?;
-    let source_keys: BTreeSet<_> = source_items
+    let shipped: BTreeSet<(PackItemKind, String)> = source_items
         .iter()
         .map(|item| (item.kind, item.id.clone()))
         .collect();
+    // A removal of something no longer shipped has nothing left to record.
+    lock.removed
+        .retain(|item| shipped.contains(&(item.kind, item.id.clone())));
 
-    // Retire items no longer shipped. A fork survives without a pack claim;
-    // pack-owned content and its lock record disappear.
-    let mut retained = Vec::new();
-    for mut old in std::mem::take(&mut lock.items) {
-        if source_keys.contains(&(old.kind, old.id.clone())) {
-            retained.push(old);
-            continue;
-        }
-        let current = current_item_hash(config_dir, &pack_id, &old)?;
-        let owned = !old.forked && matches_baseline(config_dir, &old, &current)?;
-        if owned {
-            remove_item_content(fs, config_dir, &pack_id, &old)?;
-            if let Some(path) = &old.path {
-                outcome.changed(pack::item_destination_rel(&pack_id, old.kind, path));
-            }
-        } else if !matches!(current, ContentHash::Missing) {
-            // Retired forks remain as ordinary user content, no longer claimed.
-            old.forked = true;
-        }
-    }
-    lock.items = retained;
+    // Report what moved: every staged item whose bytes differ, retired ones
+    // included.
+    let tracked: BTreeMap<String, PackItemKind> = lock
+        .items
+        .iter()
+        .map(PackLockItem::manifest_item)
+        .chain(lock.removed.iter().cloned())
+        .chain(source_items.iter().cloned())
+        .filter(|item| is_staged(item.kind))
+        .filter_map(|item| {
+            let path = item.path.as_deref()?;
+            Some((
+                pack::item_destination_rel(&pack_id, item.kind, path),
+                item.kind,
+            ))
+        })
+        .collect();
+    let hash_of = |rel: &str, kind: PackItemKind| {
+        pack::hash_item_path(kind, config_dir, &config_dir.join(rel))
+            .unwrap_or(ContentHash::Missing)
+    };
+    let before: BTreeMap<&String, ContentHash> = tracked
+        .iter()
+        .map(|(rel, kind)| (rel, hash_of(rel, *kind)))
+        .collect();
 
-    for source_item in source_items {
-        if lock.is_removed(source_item.kind, &source_item.id) {
-            continue;
-        }
-        if lock.item(source_item.kind, &source_item.id).is_none() {
-            lock.items.push(PackLockItem::legacy(source_item.clone()));
-        }
-        let item = lock.item_mut(source_item.kind, &source_item.id).unwrap();
-        if item.forked {
-            continue;
-        }
-        let source_hash = source_item_hash(manifest, item, &source_mcp)?.ok_or_else(|| {
-            format!(
-                "Pack item {:?} `{}` has no shipped content",
-                item.kind, item.id
-            )
-        })?;
-        let current = current_item_hash_with_mcp(config_dir, &pack_id, item, None)?;
-        match current {
-            ContentHash::Missing => {
-                materialize_item(fs, config_dir, &pack_id, manifest, item, &source_mcp)?;
-                item.content_hash = Some(source_hash);
-                if let Some(path) = &item.path {
-                    outcome.changed(pack::item_destination_rel(&pack_id, item.kind, path));
-                }
-            }
-            ContentHash::Present(current_hash) => {
-                let Some(baseline) = item.content_hash.as_deref() else {
-                    // A fully migrated pack can gain a newly shipped item whose
-                    // destination already exists. With no positive ownership
-                    // evidence, the existing bytes belong to the user.
-                    item.content_hash = Some(current_hash);
-                    item.forked = true;
-                    continue;
-                };
-                if current_hash != baseline {
-                    if !matches_legacy_tree_baseline(config_dir, item, baseline)? {
-                        item.forked = true;
-                        continue;
-                    }
-                    // Same content under the pre-exclusion hash: re-record the
-                    // baseline in today's terms so the fallback is paid once.
-                    item.content_hash = Some(current_hash.clone());
-                }
-                if current_hash != source_hash {
-                    materialize_item(fs, config_dir, &pack_id, manifest, item, &source_mcp)?;
-                    item.content_hash = Some(source_hash);
-                    if let Some(path) = &item.path {
-                        outcome.changed(pack::item_destination_rel(&pack_id, item.kind, path));
-                    }
-                }
-            }
+    stage_items(fs, config_dir, &pack_id, manifest, &source_items)?;
+
+    for (rel, kind) in &tracked {
+        if before.get(rel) != Some(&hash_of(rel, *kind)) {
+            outcome.changed(rel.clone());
         }
     }
 
-    refresh_mcp_setup(fs, config_dir, &pack_id, manifest)?;
+    // The MCP layer: what the source defines, less what the user removed.
+    let mut servers = source_mcp_servers(manifest)?;
+    servers.retain(|name, _| !lock.is_removed(PackItemKind::Mcp, name));
+    if servers != installed_mcp_servers(config_dir, &pack_id)? {
+        outcome.changed(format!(
+            "{}/{pack_id}/{}",
+            pack_lock::PACKS_DIR,
+            pack::manifest::PACK_MCP_FILE
+        ));
+    }
+    write_mcp_layer(
+        fs,
+        config_dir,
+        &pack_id,
+        &servers,
+        source_mcp_setup(manifest)?,
+    )?;
 
-    lock.cairn_version = 2;
+    lock.items = source_items
+        .into_iter()
+        .filter(|item| !lock.is_removed(item.kind, &item.id))
+        .map(PackLockItem::from)
+        .collect();
+    lock.cairn_version = pack_lock::LOCK_VERSION;
     lock.name = manifest.name.clone();
     lock.version = manifest.version.clone();
     lock.description = manifest.description.clone();
@@ -793,106 +748,135 @@ fn sync_pack(
     lock.keywords = manifest.keywords.clone();
     lock.notes = manifest.notes_from(source.kind);
     lock.content_hash = pack_hash.to_string();
+    lock.staged_hash = Some(staged_hash(config_dir, &pack_id)?);
     lock.source = source.clone();
     lock.sort_items();
-    // Content always lands before the baseline that claims it.
+    // Content always lands before the lock that records it.
     pack_lock::write_lock(fs, config_dir, lock)?;
     Ok(())
 }
 
-/// Whether an item's current content is still the bytes Cairn last materialized.
-pub fn matches_baseline(
+/// Assemble the pack's next tree under `.incoming/` and swap each staged
+/// directory into place, so a directory is either the old version or the new
+/// one and a file the new version dropped does not linger. Removed items are
+/// staged too: resolution skips them, and restoring one only clears its record.
+fn stage_items(
+    fs: &dyn FileSystem,
     config_dir: &Path,
-    item: &PackLockItem,
-    current: &ContentHash,
-) -> Result<bool, String> {
-    let (ContentHash::Present(current), Some(baseline)) = (current, item.content_hash.as_deref())
-    else {
-        return Ok(false);
-    };
-    Ok(current == baseline || matches_legacy_tree_baseline(config_dir, item, baseline)?)
-}
-
-/// Whether this kind installs as a whole directory rather than one file.
-fn is_tree_item(kind: PackItemKind) -> bool {
-    matches!(
-        kind,
-        PackItemKind::Service | PackItemKind::Skill | PackItemKind::Workflow
-    )
-}
-
-/// A tree item's baseline recorded before OS metadata left the tree hash matches
-/// when the tree, metadata included, still hashes to it.
-fn matches_legacy_tree_baseline(
-    config_dir: &Path,
-    item: &PackLockItem,
-    baseline: &str,
-) -> Result<bool, String> {
-    if !is_tree_item(item.kind) {
-        return Ok(false);
-    }
-    let Some(path) = &item.path else {
-        return Ok(false);
-    };
-    Ok(
-        pack::hash_tree_including_os_metadata(&config_dir.join(path))?
-            == ContentHash::Present(baseline.to_string()),
-    )
-}
-
-fn source_item_hash(
+    pack_id: &str,
     manifest: &PackManifest,
+    items: &[pack::PackItem],
+) -> Result<(), String> {
+    let pack_dir = pack_lock::pack_dir(config_dir, pack_id);
+    let incoming = pack_dir.join(INCOMING_DIR);
+    if fs.exists(&incoming) {
+        fs.remove_dir_all(&incoming)?;
+    }
+    fs.create_dir_all(&incoming)?;
+    for item in items.iter().filter(|item| is_staged(item.kind)) {
+        let Some(path) = item.path.as_deref() else {
+            continue;
+        };
+        let source = manifest.root.join(path);
+        let destination = incoming.join(path);
+        if is_tree_item(item.kind) {
+            guarded_copy_tree(&source, &destination)?;
+        } else {
+            guarded_copy_file(&manifest.root, &source, &destination)?;
+        }
+    }
+    for dir in STAGED_DIRS {
+        let target = pack_dir.join(dir);
+        let staged = incoming.join(dir);
+        if fs.exists(&target) {
+            fs.remove_dir_all(&target)?;
+        }
+        if fs.exists(&staged) {
+            std::fs::rename(&staged, &target)
+                .map_err(|e| format!("Failed to stage {target:?}: {e}"))?;
+        }
+    }
+    fs.remove_dir_all(&incoming)
+}
+
+/// The hash of everything staged under `packs/<id>/`, OS metadata left out.
+pub fn staged_hash(config_dir: &Path, pack_id: &str) -> Result<String, String> {
+    let pack_dir = pack_lock::pack_dir(config_dir, pack_id);
+    let mut entries = Vec::new();
+    for dir in STAGED_DIRS {
+        entries.extend(pack::tree_entries(
+            &pack_dir.join(dir),
+            &format!("{dir}/"),
+            false,
+        )?);
+    }
+    Ok(pack::hash_entries(entries))
+}
+
+/// Whether a pack's staged tree is exactly what its last sync staged.
+fn staged_is_current(config_dir: &Path, lock: &PackLock) -> bool {
+    match (&lock.staged_hash, staged_hash(config_dir, &lock.id)) {
+        (Some(recorded), Ok(current)) => *recorded == current,
+        _ => false,
+    }
+}
+
+/// The hash of one installed item as it sits in its pack: the staged file or
+/// tree, or the definition in the pack's MCP layer. A source's per-item hashes
+/// are computed the same way, which is how an update is compared against what
+/// is installed.
+pub fn installed_item_hash(
+    config_dir: &Path,
+    pack_id: &str,
     item: &PackLockItem,
-    mcp: &BTreeMap<String, McpServerConfig>,
-) -> Result<Option<String>, String> {
+) -> Result<ContentHash, String> {
     if item.kind == PackItemKind::Mcp {
-        return mcp.get(&item.id).map(pack::hash_mcp_definition).transpose();
-    }
-    let Some(path) = &item.path else {
-        return Ok(None);
-    };
-    match pack::hash_item_path(item.kind, &manifest.root, &manifest.root.join(path))? {
-        ContentHash::Missing => Ok(None),
-        ContentHash::Present(hash) => Ok(Some(hash)),
-    }
-}
-
-fn current_item_hash(
-    config_dir: &Path,
-    pack_id: &str,
-    item: &PackLockItem,
-) -> Result<ContentHash, String> {
-    current_item_hash_with_mcp(config_dir, pack_id, item, None)
-}
-
-fn current_item_hash_with_mcp(
-    config_dir: &Path,
-    pack_id: &str,
-    item: &PackLockItem,
-    cached_mcp: Option<&BTreeMap<String, McpServerConfig>>,
-) -> Result<ContentHash, String> {
-    if item.kind != PackItemKind::Mcp {
-        let path = item
-            .path
-            .as_ref()
-            .ok_or_else(|| "File-backed pack item has no path".to_string())?;
-        return pack::hash_item_path(
-            item.kind,
-            config_dir,
-            &pack::item_destination(config_dir, pack_id, item.kind, path),
+        return Ok(
+            match installed_mcp_servers(config_dir, pack_id)?.get(&item.id) {
+                Some(config) => ContentHash::Present(pack::hash_mcp_definition(config)?),
+                None => ContentHash::Missing,
+            },
         );
     }
-    let owned;
-    let servers = if let Some(servers) = cached_mcp {
-        servers
-    } else {
-        owned = installed_mcp_servers(config_dir, pack_id)?;
-        &owned
+    let Some(path) = item.path.as_deref() else {
+        return Ok(ContentHash::Missing);
     };
-    match servers.get(&item.id) {
-        Some(config) => Ok(ContentHash::Present(pack::hash_mcp_definition(config)?)),
-        None => Ok(ContentHash::Missing),
+    let destination = pack::item_destination(config_dir, pack_id, item.kind, path);
+    pack::hash_item_path(item.kind, config_dir, &destination)
+}
+
+/// `<config>/packs/<id>/source/`: the verified copy of what a library or local
+/// pack shipped, which its staged tree is made from.
+pub fn snapshot_root(config_dir: &Path, pack_id: &str) -> std::path::PathBuf {
+    pack_lock::pack_dir(config_dir, pack_id).join("source")
+}
+
+/// The shipped copy of a local or library pack, refused when it is missing or
+/// no longer hashes to what the lock recorded.
+pub fn snapshot_manifest(config_dir: &Path, lock: &PackLock) -> Result<PackManifest, String> {
+    let root = snapshot_root(config_dir, &lock.id);
+    if !root.is_dir() {
+        return Err(format!(
+            "Pack `{}` has no fetched copy of its source on this machine yet; update it to fetch one",
+            lock.id
+        ));
     }
+    if pack::content_hash(&root)? != lock.content_hash {
+        return Err(format!(
+            "Pack `{}`'s snapshot was modified; update it to fetch it again",
+            lock.id
+        ));
+    }
+    let mut manifest = match lock.source.kind {
+        PackSourceKind::Local => pack::agent_plugin::load(&root)?.manifest,
+        _ => pack::manifest::load(&root)?,
+    };
+    // A manifest without an explicit id names itself after its directory,
+    // which here is `source`; the lock is the authority on what it is called.
+    manifest.id = lock.id.clone();
+    manifest.name = lock.name.clone();
+    manifest.root = root;
+    Ok(manifest)
 }
 
 fn source_mcp_servers(
@@ -921,113 +905,12 @@ fn installed_mcp_servers(
         .collect())
 }
 
-fn materialize_item(
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    pack_id: &str,
-    manifest: &PackManifest,
-    item: &PackLockItem,
-    source_mcp: &BTreeMap<String, McpServerConfig>,
-) -> Result<(), String> {
-    if item.kind == PackItemKind::Mcp {
-        let mut installed = installed_mcp_servers(config_dir, pack_id)?;
-        let config = source_mcp
-            .get(&item.id)
-            .ok_or_else(|| format!("Missing shipped MCP definition `{}`", item.id))?;
-        installed.insert(item.id.clone(), config.clone());
-        return write_mcp_layer(
-            fs,
-            config_dir,
-            pack_id,
-            &installed,
-            source_mcp_setup(manifest)?,
-        );
-    }
-    let path = item
-        .path
-        .as_ref()
-        .ok_or_else(|| "File-backed pack item has no path".to_string())?;
-    let source = manifest.root.join(path);
-    let destination = pack::item_destination(config_dir, pack_id, item.kind, path);
-    if is_tree_item(item.kind) {
-        if fs.exists(&destination) {
-            fs.remove_dir_all(&destination)?;
-        }
-        guarded_copy_tree(&source, &destination)
-    } else {
-        guarded_copy_file(&manifest.root, &source, &destination)
-    }
-}
-
-fn remove_item_content(
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    pack_id: &str,
-    item: &PackLockItem,
-) -> Result<(), String> {
-    if item.kind == PackItemKind::Mcp {
-        let mut installed = installed_mcp_servers(config_dir, pack_id)?;
-        installed.remove(&item.id);
-        let setup = installed_mcp_setup(config_dir, pack_id)?;
-        return write_mcp_layer(fs, config_dir, pack_id, &installed, setup);
-    }
-    let path = item
-        .path
-        .as_ref()
-        .ok_or_else(|| "File-backed pack item has no path".to_string())?;
-    let destination = pack::item_destination(config_dir, pack_id, item.kind, path);
-    if !fs.exists(&destination) {
-        return Ok(());
-    }
-    if is_tree_item(item.kind) {
-        fs.remove_dir_all(&destination)
-    } else {
-        fs.remove_file(&destination)
-    }
-}
-
 /// The `setup` copy a pack ships for its servers' `${VAR}`s.
 fn source_mcp_setup(manifest: &PackManifest) -> Result<BTreeMap<String, McpVarSetup>, String> {
     match manifest.mcp_source() {
         Some(path) => Ok(pack::mcp::parse_pack_mcp_file(&path)?.setup),
         None => Ok(BTreeMap::new()),
     }
-}
-
-fn installed_mcp_setup(
-    config_dir: &Path,
-    pack_id: &str,
-) -> Result<BTreeMap<String, McpVarSetup>, String> {
-    let path = pack_lock::mcp_path(config_dir, pack_id);
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    Ok(pack::mcp::parse_pack_mcp_file(&path)?.setup)
-}
-
-/// Carry the shipped `setup` copy into an installed layer that lacks it.
-///
-/// The copy is what turns "needs setup" into a labelled field a user can act
-/// on. Layers written before it was carried hold the servers alone, and the
-/// item sync rewrites a layer only when a server changes, so this is what
-/// brings an existing install up to date. Server definitions are rewritten
-/// exactly as installed.
-fn refresh_mcp_setup(
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    pack_id: &str,
-    manifest: &PackManifest,
-) -> Result<(), String> {
-    let path = pack_lock::mcp_path(config_dir, pack_id);
-    if !path.is_file() {
-        return Ok(());
-    }
-    let shipped = source_mcp_setup(manifest)?;
-    if installed_mcp_setup(config_dir, pack_id)? == shipped {
-        return Ok(());
-    }
-    let servers = installed_mcp_servers(config_dir, pack_id)?;
-    write_mcp_layer(fs, config_dir, pack_id, &servers, shipped)
 }
 
 fn write_mcp_layer(
@@ -1114,7 +997,7 @@ pub fn provision_workflow_runtime(
 mod tests {
     use super::*;
     use crate::manifest;
-    use cairn_platform::services::RealFileSystem;
+    use cairn_platform::services::{RealFileSystem, RealGitClient};
 
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1163,7 +1046,7 @@ mod tests {
         write(&dir.join("cairn-pack.yaml"), &format!("id: {id}\n"));
         write(
             &dir.join(format!("skills/{skill}/SKILL.md")),
-            "---\nname: x\n---\n",
+            &format!("---\nname: {skill}\ndescription: d\n---\n"),
         );
         write(
             &dir.join("mcp.yaml"),
@@ -1188,11 +1071,201 @@ mod tests {
         pack_lock::write_lock(&RealFileSystem, config, &lock).unwrap();
     }
 
+    /// A bundled resource tree with pack `core` at `version`, holding one agent
+    /// whose body names the version.
+    fn core_resources(root: &Path, version: &str) {
+        let core = root.join("packs/core");
+        let _ = std::fs::remove_dir_all(&core);
+        write(
+            &core.join("cairn-pack.yaml"),
+            &format!("id: core\nname: Core\nversion: {version}\ndefault: true\n"),
+        );
+        write(
+            &core.join("agents/build.md"),
+            &format!("---\nname: Build\ndescription: d\ntools: Read\n---\n\nBuild {version}.\n"),
+        );
+        write(
+            &core.join("skills/notes/SKILL.md"),
+            "---\nname: notes\ndescription: Notes.\n---\n",
+        );
+    }
+
+    fn sync(resources: &Path, config: &Path) -> PackSyncResult {
+        sync_workspace_packs(&RealGitClient, &RealFileSystem, resources, config, "1.0.0").unwrap()
+    }
+
+    /// A pack's items are staged where they are read, at their source paths,
+    /// and nothing is copied out into the workspace.
+    #[test]
+    fn a_pack_is_installed_in_place_and_nothing_is_copied_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+        core_resources(&resources, "1.0.0");
+        let result = sync(&resources, &config);
+        assert!(config.join("packs/core/agents/build.md").is_file());
+        assert!(config.join("packs/core/skills/notes/SKILL.md").is_file());
+        assert!(!config.join("agents/build.md").exists());
+        assert!(!config.join("skills/notes").exists());
+        assert!(result
+            .changed_paths
+            .contains(&"packs/core/agents/build.md".to_string()));
+        let lock = pack_lock::read_lock(&config, "core").unwrap();
+        assert_eq!(lock.cairn_version, pack_lock::LOCK_VERSION);
+        assert_eq!(
+            lock.staged_hash,
+            Some(staged_hash(&config, "core").unwrap())
+        );
+    }
+
+    /// An update applies in place; a workspace definition in front of the
+    /// pack's is a different file, and the update never touches it.
+    #[test]
+    fn a_pack_update_applies_in_place_under_a_workspace_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+        core_resources(&resources, "1.0.0");
+        sync(&resources, &config);
+        let mine = "---\nname: Build\ndescription: mine\ntools: Read\n---\n\nMine.\n";
+        write(&config.join("agents/build.md"), mine);
+
+        core_resources(&resources, "2.0.0");
+        let result = sync(&resources, &config);
+        assert!(
+            std::fs::read_to_string(config.join("packs/core/agents/build.md"))
+                .unwrap()
+                .contains("Build 2.0.0.")
+        );
+        assert_eq!(
+            std::fs::read_to_string(config.join("agents/build.md")).unwrap(),
+            mine
+        );
+        assert!(result
+            .changed_paths
+            .contains(&"packs/core/agents/build.md".to_string()));
+        assert!(!result
+            .changed_paths
+            .contains(&"agents/build.md".to_string()));
+    }
+
+    /// An unchanged pack is skipped at startup; a pack whose staged tree was
+    /// edited by something other than a sync gets the same version back.
+    #[test]
+    fn startup_skips_an_unchanged_pack_and_restages_a_tampered_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+        core_resources(&resources, "1.0.0");
+        sync(&resources, &config);
+        let again = sync(&resources, &config);
+        assert!(!again.updated, "{again:?}");
+
+        let staged = config.join("packs/core/agents/build.md");
+        let shipped = std::fs::read_to_string(&staged).unwrap();
+        std::fs::write(&staged, "sed was here\n").unwrap();
+        write(&config.join("packs/core/agents/stray.md"), "stray\n");
+        let restaged = sync(&resources, &config);
+        assert!(restaged.updated);
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), shipped);
+        assert!(!config.join("packs/core/agents/stray.md").exists());
+    }
+
+    /// A library pack's tampered tree is staged again from its verified
+    /// snapshot, the locked version, never from anything newer.
+    #[test]
+    fn a_library_pack_is_restaged_from_its_locked_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("home");
+        let manifest = incoming(temp.path(), "kit", "kit", "kit-server");
+        let snapshot = snapshot_root(&config, "kit");
+        guarded_copy_tree(&manifest.root, &snapshot).unwrap();
+        let mut at_snapshot = manifest.clone();
+        at_snapshot.root = snapshot.clone();
+        sync_resolved_pack(
+            &RealGitClient,
+            &RealFileSystem,
+            &config,
+            at_snapshot,
+            library_source(),
+        )
+        .unwrap();
+        let staged = config.join("packs/kit/skills/kit/SKILL.md");
+        let shipped = std::fs::read_to_string(&staged).unwrap();
+        std::fs::write(&staged, "tampered\n").unwrap();
+
+        // A newer version waiting in the source tree is not what comes back.
+        write(
+            &manifest.root.join("skills/kit/SKILL.md"),
+            "---\nname: kit\ndescription: d\n---\nnewer\n",
+        );
+        let resources = temp.path().join("no-bundle");
+        std::fs::create_dir_all(resources.join("packs")).unwrap();
+        sync(&resources, &config);
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), shipped);
+    }
+
+    /// A removed item stays staged, so restoring it only clears the record,
+    /// but it leaves the lock's items; a removed MCP server leaves the layer.
+    #[test]
+    fn a_removed_item_stays_staged_and_its_server_leaves_the_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("home");
+        let manifest = incoming(temp.path(), "kit", "kit", "kit-server");
+        sync_resolved_pack(
+            &RealGitClient,
+            &RealFileSystem,
+            &config,
+            manifest.clone(),
+            library_source(),
+        )
+        .unwrap();
+        for (kind, id) in [
+            (PackItemKind::Skill, "kit"),
+            (PackItemKind::Mcp, "kit-server"),
+        ] {
+            pack_lock::record_removal_from(&RealFileSystem, &config, "kit", kind, id).unwrap();
+        }
+        sync_resolved_pack(
+            &RealGitClient,
+            &RealFileSystem,
+            &config,
+            manifest,
+            library_source(),
+        )
+        .unwrap();
+        let lock = pack_lock::read_lock(&config, "kit").unwrap();
+        assert!(lock.item(PackItemKind::Skill, "kit").is_none());
+        assert!(lock.is_removed(PackItemKind::Skill, "kit"));
+        assert!(config.join("packs/kit/skills/kit/SKILL.md").is_file());
+        assert!(!pack_lock::mcp_path(&config, "kit").exists());
+    }
+
+    #[test]
+    fn uninstall_removes_the_pack_directory_and_records_the_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+        core_resources(&resources, "1.0.0");
+        sync(&resources, &config);
+        write(&config.join("agents/build.md"), "mine\n");
+        let result = uninstall_pack(&RealGitClient, &RealFileSystem, &config, "core").unwrap();
+        assert!(result
+            .removed
+            .contains(&"packs/core/agents/build.md".to_string()));
+        assert!(!config.join("packs/core/agents").exists());
+        assert!(pack_lock::is_uninstalled(&config, "core"));
+        assert_eq!(
+            std::fs::read_to_string(config.join("agents/build.md")).unwrap(),
+            "mine\n"
+        );
+        let again = sync(&resources, &config);
+        assert!(
+            !config.join("packs/core/agents/build.md").exists(),
+            "{again:?}"
+        );
+    }
+
     /// Every provider pack ships the same file names. Installed into their own
-    /// pack layers they never collide, and an uninstall takes only its own.
+    /// pack directories they never collide, and an uninstall takes only its own.
     #[test]
     fn two_provider_packs_install_side_by_side_in_their_own_layers() {
-        use cairn_platform::services::RealGitClient;
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("home");
         let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1232,71 +1305,12 @@ mod tests {
                 .contains(&"packs/tavily/providers/web-search.yaml".to_string()),
             "{result:?}"
         );
-        assert!(result.kept.is_empty());
         assert!(!config.join("packs/tavily/providers").exists());
         assert!(config.join("packs/exa/providers/web-search.yaml").is_file());
     }
 
-    /// An edited declaration is the user's copy, recorded or not, and an
-    /// uninstall keeps it while removing what the pack still owns.
-    #[test]
-    fn uninstall_keeps_edited_provider_and_credential_declarations() {
-        use cairn_platform::services::RealGitClient;
-        let temp = tempfile::tempdir().unwrap();
-        let config = temp.path().join("home");
-        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for id in ["tavily", "exa"] {
-            sync_one_pack(&RealGitClient, &RealFileSystem, &resources, &config, id).unwrap();
-        }
-
-        // An edit no sync has recorded yet.
-        let provider = config.join("packs/tavily/providers/web-search.yaml");
-        let mine = format!("{}# mine\n", std::fs::read_to_string(&provider).unwrap());
-        std::fs::write(&provider, &mine).unwrap();
-        let result = uninstall_pack(&RealGitClient, &RealFileSystem, &config, "tavily").unwrap();
-        assert_eq!(result.kept, vec!["packs/tavily/providers/web-search.yaml"]);
-        assert_eq!(
-            result.removed,
-            vec!["packs/tavily/credentials/api-key.yaml"]
-        );
-        assert_eq!(std::fs::read_to_string(&provider).unwrap(), mine);
-        assert!(!config
-            .join("packs/tavily/credentials/api-key.yaml")
-            .exists());
-        assert!(pack_lock::read_lock(&config, "tavily").is_none());
-        assert!(pack_lock::is_uninstalled(&config, "tavily"));
-
-        // A fork the lock already records.
-        let mut lock = pack_lock::read_lock(&config, "exa").unwrap();
-        assert!(lock.mark_forked(PackItemKind::Credential, "api-key"));
-        pack_lock::write_lock(&RealFileSystem, &config, &lock).unwrap();
-        let result = uninstall_pack(&RealGitClient, &RealFileSystem, &config, "exa").unwrap();
-        assert_eq!(result.kept, vec!["packs/exa/credentials/api-key.yaml"]);
-        assert!(config.join("packs/exa/credentials/api-key.yaml").is_file());
-        assert!(!config.join("packs/exa/providers/web-search.yaml").exists());
-
-        // Installing again keeps the user's copy rather than overwriting it.
-        sync_one_pack(
-            &RealGitClient,
-            &RealFileSystem,
-            &resources,
-            &config,
-            "tavily",
-        )
-        .unwrap();
-        assert_eq!(std::fs::read_to_string(&provider).unwrap(), mine);
-        assert!(
-            pack_lock::read_lock(&config, "tavily")
-                .unwrap()
-                .item(PackItemKind::Provider, "web-search")
-                .unwrap()
-                .forked
-        );
-    }
-
     #[test]
     fn a_provider_pack_that_would_leak_its_credential_is_refused_with_nothing_written() {
-        use cairn_platform::services::RealGitClient;
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("home");
         let dir = temp.path().join("src/leaky");
@@ -1327,24 +1341,37 @@ mod tests {
         assert!(!config.join("packs/leaky").exists());
     }
 
+    /// Your own definition at a pack item's name is no conflict: it shadows
+    /// the pack's. A name another installed pack defines is a warning naming
+    /// both, since resolving it is what is refused.
     #[test]
-    fn your_own_content_at_a_destination_is_refused_by_name() {
+    fn a_shared_name_is_a_warning_and_your_own_file_is_no_conflict() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("home");
         write(&config.join("skills/pdf/SKILL.md"), "mine\n");
         let manifest = incoming(temp.path(), "document-skills", "pdf", "docs");
-        let error =
-            check_install_collisions(&config, &manifest, &library_source(), &[]).unwrap_err();
+        assert!(
+            check_install_collisions(&config, &manifest, &library_source(), &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        let first = incoming(&temp.path().join("a"), "first", "pdf", "shared");
+        install(&config, &first, PackSource::local("/plugins/first".into()));
+        let collisions =
+            check_install_collisions(&config, &manifest, &library_source(), &[]).unwrap();
         assert_eq!(
-            error,
-            "you already have your own skill `pdf` at `skills/pdf`, which no pack installed; \
-             refusing to install pack `document-skills` from \
-             https://github.com/bleugreenlab/cairn-library"
+            collisions,
+            vec![PackCollision {
+                kind: PackItemKind::Skill,
+                name: "pdf".into(),
+                packs: vec!["document-skills".into(), "first".into()],
+            }]
         );
     }
 
     #[test]
-    fn a_path_or_server_another_pack_holds_is_refused_naming_that_pack() {
+    fn a_server_another_pack_holds_is_refused_naming_that_pack() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("home");
         let first = incoming(&temp.path().join("a"), "first", "pdf", "shared");
@@ -1353,17 +1380,6 @@ mod tests {
             &pack_lock::mcp_path(&config, "first"),
             "mcpServers:\n  shared:\n    type: http\n    url: https://x.test/mcp\n",
         );
-
-        let same_path = incoming(&temp.path().join("b"), "second", "pdf", "other");
-        let error =
-            check_install_collisions(&config, &same_path, &library_source(), &[]).unwrap_err();
-        assert!(
-            error.starts_with(
-                "`skills/pdf` is installed from pack `first` (from a local import of /plugins/first)"
-            ),
-            "{error}"
-        );
-
         let same_server = incoming(&temp.path().join("c"), "third", "other", "shared");
         let error =
             check_install_collisions(&config, &same_server, &library_source(), &[]).unwrap_err();
@@ -1423,10 +1439,9 @@ mod tests {
         );
 
         install(&config, &manifest, library_source());
-        write(&config.join("skills/linear/SKILL.md"), "materialized\n");
         assert!(
             check_install_collisions(&config, &manifest, &library_source(), &[]).is_ok(),
-            "an update of the same pack from the same source holds its own paths"
+            "an update of the same pack from the same source holds its own items"
         );
     }
 
@@ -1444,7 +1459,7 @@ mod tests {
         );
         let manifest = manifest::load(&source).unwrap();
         sync_resolved_pack(
-            &cairn_platform::services::RealGitClient,
+            &RealGitClient,
             &RealFileSystem,
             &config,
             manifest,
@@ -1457,49 +1472,10 @@ mod tests {
             installed.setup["TOOL_BIN"].label.as_deref(),
             Some("Tool executable")
         );
-
-        // A layer written before the copy was carried is brought up to date.
-        write(
-            &pack_lock::mcp_path(&config, "tool"),
-            "mcpServers:\n  tool:\n    command: ${TOOL_BIN}\n",
-        );
-        sync_resolved_pack(
-            &cairn_platform::services::RealGitClient,
-            &RealFileSystem,
-            &config,
-            manifest::load(&source).unwrap(),
-            PackSource::local("/src/tool".into()),
-        )
-        .unwrap();
-        let refreshed =
-            pack::mcp::parse_pack_mcp_file(&pack_lock::mcp_path(&config, "tool")).unwrap();
-        assert!(refreshed.setup.contains_key("TOOL_BIN"));
-        assert_eq!(refreshed.servers, installed.servers);
-    }
-
-    #[test]
-    fn legacy_and_pack_commit_subjects_are_both_sync_authored() {
-        // Retaining the pre-pack subjects verbatim is what keeps an existing
-        // user's files recognized as pack-owned after the upgrade. Dropping any
-        // of them would reclassify their whole workspace as user-edited and
-        // turn the next update into a wall of conflicts.
-        for subject in BUNDLE_COMMIT_SUBJECTS {
-            assert!(is_pack_authored_subject(subject));
-        }
-        assert!(is_pack_authored_subject("Sync pack resources: core"));
-        assert!(is_pack_authored_subject(
-            "Sync pack resources: some-third-party"
-        ));
-        assert!(is_pack_authored_subject("Update bundled defaults to 0.8.7"));
-        // Both carry the user's own content, so neither may prove ownership.
-        assert!(!is_pack_authored_subject("Snapshot workspace config"));
-        assert!(!is_pack_authored_subject("Merge branch 'bundle'"));
-        assert!(!is_pack_authored_subject("User edits explore"));
     }
 
     /// A remote or local source's service would be a catalog row with machines
-    /// that can never run it, so it never reaches the workspace, and a path
-    /// it never takes is no collision either.
+    /// that can never run it, so it never reaches the workspace.
     #[test]
     fn a_non_bundled_source_installs_around_its_service_and_notes_why() {
         for (name, source) in [
@@ -1515,18 +1491,10 @@ mod tests {
                 "---\nname: kit\ndescription: Useful.\n---\n",
             );
             write(&dir.join("services/probe/service.yaml"), "name: Probe\n");
-            write(&config.join("services/probe/mine.txt"), "mine\n");
             let manifest = pack::manifest::load(&dir).unwrap();
 
             check_install_collisions(&config, &manifest, &source, &[]).unwrap();
-            sync_resolved_pack(
-                &cairn_platform::services::RealGitClient,
-                &RealFileSystem,
-                &config,
-                manifest,
-                source,
-            )
-            .unwrap();
+            sync_resolved_pack(&RealGitClient, &RealFileSystem, &config, manifest, source).unwrap();
 
             let lock = pack_lock::read_lock(&config, "kit").unwrap();
             assert!(lock.item(PackItemKind::Skill, "kit").is_some(), "{name}");
@@ -1534,10 +1502,8 @@ mod tests {
                 lock.item(PackItemKind::Service, "probe").is_none(),
                 "{name}"
             );
-            assert!(
-                !config.join("services/probe/service.yaml").exists(),
-                "{name}"
-            );
+            assert!(!config.join("services/probe").exists(), "{name}");
+            assert!(!config.join("packs/kit/services").exists(), "{name}");
             assert!(
                 lock.notes
                     .iter()

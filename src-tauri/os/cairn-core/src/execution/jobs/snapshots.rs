@@ -1,4 +1,5 @@
 use super::*;
+use cairn_config::library::LibraryRoots;
 use cairn_session::agent_process::stream::TranscriptJson;
 
 pub(super) struct AgentSnapshotData {
@@ -405,9 +406,10 @@ fn resolve_host_agent(
     job_model: Option<&str>,
     project_path: Option<&Path>,
 ) -> Result<AgentSnapshot, String> {
-    let file_agent = config_agents::get_agent(config_dir, agent_config_id, project_path)
-        .map_err(|e| format!("Failed to load agent config '{agent_config_id}': {e}"))?
-        .ok_or_else(|| format!("Agent config '{agent_config_id}' not found"))?;
+    let file_agent =
+        config_agents::get_agent(&LibraryRoots::at(config_dir, project_path), agent_config_id)
+            .map_err(|e| format!("Failed to load agent config '{agent_config_id}': {e}"))?
+            .ok_or_else(|| format!("Agent config '{agent_config_id}' not found"))?;
     let mut snapshot = file_agent.snapshot();
     snapshot.selection = job_model.map(|model| {
         crate::models::ModelSelection::new(
@@ -435,7 +437,9 @@ fn host_skill_snapshots(
     let Some(skill_ids) = agent.skills.as_ref().filter(|ids| !ids.is_empty()) else {
         return out;
     };
-    let Ok(file_skills) = crate::config::skills::list_skills(config_dir, project_path) else {
+    let Ok(file_skills) =
+        crate::config::skills::list_skills(&LibraryRoots::at(config_dir, project_path))
+    else {
         return out;
     };
     for result in file_skills {

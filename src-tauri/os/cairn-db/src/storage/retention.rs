@@ -186,6 +186,10 @@ const TESTING: &str = "cairn://p/cairn/testing";
 /// Every table either lineage creates, with its rule. Proven exhaustive and
 /// free of stale entries by `every_table_has_a_retention_rule`.
 pub const TABLE_RETENTION: &[TableRetention] = &[
+    owned("main_incident_sources", "projects"),
+    owned("main_incident_budget", "projects"),
+    owned("main_incidents", "projects"),
+    owned("main_incident_evidence", "projects"),
     // Skeleton: small rows that make URIs resolve.
     keep("projects", SKELETON),
     keep("issues", SKELETON),
@@ -619,6 +623,9 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     // At most one row per job or thread, deleted with either by cascade.
     keep("placement_defaults", SMALL),
     keep("project_learned_requirements", SMALL),
+    // One row per trusted project, and one per confirmed definition in it.
+    keep("project_library_trust", SMALL),
+    keep("project_library_confirmations", SMALL),
     keep("purpose_debts", SMALL),
     keep("ref_store_maintenance", SMALL),
     keep("resource_surfacings", SMALL),

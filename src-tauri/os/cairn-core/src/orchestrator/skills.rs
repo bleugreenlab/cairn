@@ -2,6 +2,7 @@
 //!
 //! Mirrors the agent pattern for skills — workspace vs project scope resolution.
 
+use cairn_config::library::{LibraryRoots, Origin};
 use std::path::{Path, PathBuf};
 
 use crate::config::{skills as config_skills, slugify, ConfigResult};
@@ -47,7 +48,7 @@ impl ConfigResource for SkillResource {
         config_dir: &Path,
         project_path: Option<&Path>,
     ) -> Result<Vec<ConfigResult<Self::File>>, String> {
-        config_skills::list_skills(config_dir, project_path)
+        config_skills::list_skills(&LibraryRoots::at(config_dir, project_path))
     }
 
     fn get_file(
@@ -55,23 +56,37 @@ impl ConfigResource for SkillResource {
         id: &str,
         project_path: Option<&Path>,
     ) -> Result<Option<Self::File>, String> {
-        config_skills::get_skill(config_dir, id, project_path)
+        config_skills::get_skill(&LibraryRoots::at(config_dir, project_path), id)
     }
 
     fn save_file(
         config_dir: &Path,
         file: &Self::File,
         project_path: Option<&Path>,
+        layer: Option<&Origin>,
     ) -> Result<PathBuf, String> {
-        config_skills::save_skill(config_dir, file, project_path, None)
+        config_skills::save_skill(
+            &LibraryRoots::at(config_dir, project_path),
+            file,
+            layer,
+            None,
+        )
     }
 
-    fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String> {
-        config_skills::delete_skill(config_dir, id, project_path)
+    fn delete_file(
+        config_dir: &Path,
+        id: &str,
+        project_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>, String> {
+        config_skills::delete_skill(&LibraryRoots::at(config_dir, project_path), id, None)
+    }
+
+    fn file_origin(file: &Self::File) -> Origin {
+        file.origin.clone()
     }
 
     fn file_is_project_scoped(file: &Self::File) -> bool {
-        file.is_project_scoped
+        file.is_project_scoped()
     }
 
     fn file_bundles(file: &Self::File) -> &[String] {
@@ -110,7 +125,7 @@ impl ConfigResource for SkillResource {
     fn build_create_file(
         input: Self::CreateInput,
         id: String,
-        is_project_scoped: bool,
+        origin: Origin,
         _now: i64,
     ) -> Self::File {
         config_skills::FileSkill {
@@ -120,7 +135,7 @@ impl ConfigResource for SkillResource {
             prompt: input.prompt,
             allowed_tools: input.allowed_tools,
             bundles: Vec::new(),
-            is_project_scoped,
+            origin,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),
             meta: None,
@@ -138,7 +153,7 @@ impl ConfigResource for SkillResource {
         let is_project_scoped = match (&input.workspace_id, &input.project_id) {
             (Some(Some(_)), _) => false,
             (_, Some(Some(_))) => true,
-            _ => existing.is_project_scoped,
+            _ => existing.is_project_scoped(),
         };
         let project_id = match &input.project_id {
             Some(Some(pid)) => Some(pid.clone()),
@@ -151,7 +166,7 @@ impl ConfigResource for SkillResource {
         existing: &Self::File,
         input: Self::UpdateInput,
         id: &str,
-        new_is_project_scoped: bool,
+        new_origin: Origin,
         scope_changing: bool,
         _now: i64,
     ) -> Self::File {
@@ -164,7 +179,7 @@ impl ConfigResource for SkillResource {
             prompt: input.prompt.unwrap_or_else(|| existing.prompt.clone()),
             allowed_tools: merge_optional(&existing.allowed_tools, &input.allowed_tools),
             bundles: existing.bundles.clone(),
-            is_project_scoped: new_is_project_scoped,
+            origin: new_origin,
             file_path: if scope_changing {
                 PathBuf::new()
             } else {
@@ -211,7 +226,7 @@ impl ConfigResource for SkillResource {
     fn build_scoped_copy(
         source: &Self::File,
         id: &str,
-        is_project_scoped: bool,
+        origin: Origin,
         _workspace_id: Option<String>,
         _project_id: Option<String>,
         _now: i64,
@@ -223,7 +238,7 @@ impl ConfigResource for SkillResource {
             prompt: source.prompt.clone(),
             allowed_tools: source.allowed_tools.clone(),
             bundles: source.bundles.clone(),
-            is_project_scoped,
+            origin,
             file_path: PathBuf::new(),
             dir_path: PathBuf::new(),
             meta: None,
@@ -244,7 +259,7 @@ impl ConfigResource for SkillResource {
         file.file_path.clone()
     }
 
-    fn stage_paths(primary_path: &Path) -> Vec<PathBuf> {
+    fn stage_paths(_write_root: &Path, primary_path: &Path) -> Vec<PathBuf> {
         // primary_path is the skill's SKILL.md; stage the enclosing directory so
         // .meta.json and package subdirs (references/scripts/assets) commit too.
         vec![primary_path
@@ -286,12 +301,26 @@ impl Orchestrator {
         target_project_id: Option<&str>,
         workspace_id: Option<&str>,
     ) -> Result<SkillConfig, String> {
+        self.update_skill_config_in_layer(id, input, target_project_id, workspace_id, None)
+    }
+
+    /// Update a skill, saving an edit to a pack's skill as the user's own
+    /// definition in `target_layer` (`workspace` or `project`).
+    pub fn update_skill_config_in_layer(
+        &self,
+        id: &str,
+        input: UpdateSkillConfig,
+        target_project_id: Option<&str>,
+        workspace_id: Option<&str>,
+        target_layer: Option<&str>,
+    ) -> Result<SkillConfig, String> {
         config_resource::update_config::<SkillResource>(
             self,
             id,
             input,
             target_project_id,
             workspace_id,
+            target_layer,
         )
     }
 
@@ -351,8 +380,9 @@ impl Orchestrator {
             None => self.config_dir.clone(),
         };
         let project_path = project_id.map(|pid| self.project_path(pid)).transpose()?;
-        let skill = config_skills::get_skill(&config_root, id, project_path.as_deref())?
-            .ok_or_else(|| format!("Skill '{id}' was not found in the selected scope"))?;
+        let skill =
+            config_skills::get_skill(&LibraryRoots::at(&config_root, project_path.as_deref()), id)?
+                .ok_or_else(|| format!("Skill '{id}' was not found in the selected scope"))?;
         let bytes = crate::config::skill_archive::build_skill_archive(&skill.id, &skill.dir_path)?;
         std::fs::write(destination, bytes)
             .map_err(|e| format!("Failed to write .skill archive: {e}"))

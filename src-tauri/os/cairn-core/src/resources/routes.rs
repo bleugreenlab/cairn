@@ -8,6 +8,7 @@ use crate::{
     routes::{RouteDefinition, RouteNodeConfig, RouteSink},
 };
 use cairn_common::{query::QueryParam, uri::*};
+use cairn_config::library::LibraryRoots;
 use std::path::PathBuf;
 async fn scope(
     o: &Orchestrator,
@@ -73,10 +74,11 @@ pub(crate) async fn collection(
         Ok(x) => x,
         Err(e) => return e,
     };
-    let list = match if p.is_some() {
-        cfg::list_project_routes(path.as_deref().expect("explicit project has a path"))
+    let roots = LibraryRoots::at(&o.config_dir, path.as_deref());
+    let rows = match if p.is_some() {
+        cfg::list_project_routes(&roots)
     } else {
-        cfg::list_routes(&o.config_dir, path.as_deref())
+        cfg::list_route_rows(&roots)
     } {
         Ok(x) => x,
         Err(e) => return e,
@@ -85,16 +87,17 @@ pub(crate) async fn collection(
         .iter()
         .any(|q| q.key == "projection" && q.value == "graph")
     {
-        return graph(o, k.as_deref(), list).await;
+        return graph(o, k.as_deref(), cairn_config::library::active(rows)).await;
     }
     let mut out = format!(
         "# Routes — {} context\n\n",
         k.as_deref().unwrap_or("workspace")
     );
-    for x in list {
-        match x {
+    for row in rows {
+        let label = row.origin_label();
+        match row.entry {
             ConfigResult::Ok(v) => {
-                let project = if v.is_project_scoped {
+                let project = if v.is_project_scoped() {
                     k.as_deref()
                 } else {
                     None
@@ -109,11 +112,7 @@ pub(crate) async fn collection(
                     "- [{}]({}) [{}] — {} · {} · {} recent firing(s)\n",
                     v.id,
                     uri(project, &v.id),
-                    if v.is_project_scoped {
-                        "project"
-                    } else {
-                        "workspace"
-                    },
+                    label,
                     v.definition.description,
                     sink_kinds(&v.definition),
                     count
@@ -135,7 +134,7 @@ async fn graph(
     let mut edges = vec![];
     for x in list {
         let ConfigResult::Ok(v) = x else { continue };
-        let sk = scope_key(o, if v.is_project_scoped { project } else { None })
+        let sk = scope_key(o, if v.is_project_scoped() { project } else { None })
             .await
             .unwrap_or_else(|_| "workspace".into());
         let count = cairn_db::storage::count_route_firings(&o.db.local, &sk, &v.id)
@@ -211,14 +210,15 @@ pub(crate) async fn member(
         Ok(x) => x,
         Err(e) => return e,
     };
+    let roots = LibraryRoots::at(&o.config_dir, path.as_deref());
     let route = if p.is_some() {
-        cfg::get_project_route(path.as_deref().expect("explicit project has a path"), id)
+        cfg::get_project_route(&roots, id)
     } else {
-        cfg::get_route(&o.config_dir, id, path.as_deref())
+        cfg::get_route(&roots, id)
     };
     match route {
         Ok(Some(v)) => {
-            let h = if v.is_project_scoped {
+            let h = if v.is_project_scoped() {
                 build_project_route_history_uri(k.as_deref().unwrap(), id)
             } else {
                 build_route_history_uri(id)
@@ -235,7 +235,7 @@ pub(crate) async fn history(o: &Orchestrator, id: &str, p: Option<&str>) -> Stri
             Ok(path) => path,
             Err(error) => return error,
         };
-        match cfg::get_project_route(&path, id) {
+        match cfg::get_project_route(&LibraryRoots::at(&o.config_dir, Some(&path)), id) {
             Ok(Some(_)) => {}
             Ok(None) => return format!("Route not found: {id}"),
             Err(error) => return error,
@@ -268,7 +268,7 @@ pub(crate) async fn entry(o: &Orchestrator, id: &str, seq: i64, p: Option<&str>)
             Ok(path) => path,
             Err(error) => return error,
         };
-        match cfg::get_project_route(&path, id) {
+        match cfg::get_project_route(&LibraryRoots::at(&o.config_dir, Some(&path)), id) {
             Ok(Some(_)) => {}
             Ok(None) => return format!("Route not found: {id}"),
             Err(error) => return error,

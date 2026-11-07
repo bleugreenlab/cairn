@@ -6,6 +6,7 @@
 //! project collection is project-only. Read-only: workflows are invoked as a
 //! `run` target, not mutated through resource writes.
 
+use cairn_config::library::LibraryRoots;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -19,7 +20,7 @@ use crate::orchestrator::Orchestrator;
 use cairn_common::uri::{build_project_workflow_uri, build_workflow_uri};
 
 fn scope_label(workflow: &FileWorkflow) -> &'static str {
-    if workflow.is_project_scoped {
+    if workflow.is_project_scoped() {
         "project"
     } else {
         "workspace"
@@ -28,7 +29,7 @@ fn scope_label(workflow: &FileWorkflow) -> &'static str {
 
 /// Canonical URI for a workflow: project-scoped when it lives in a project.
 fn workflow_link(workflow: &FileWorkflow, project_key: Option<&str>) -> String {
-    if workflow.is_project_scoped {
+    if workflow.is_project_scoped() {
         match project_key {
             Some(project) => build_project_workflow_uri(project, &workflow.id),
             None => build_workflow_uri(&workflow.id),
@@ -69,11 +70,13 @@ pub(crate) async fn read_workflows_collection(
         Err(e) => return e,
     };
 
-    let workflows =
-        match config_workflows::list_workflows(&orch.config_dir, project_path.as_deref()) {
-            Ok(workflows) => workflows,
-            Err(e) => return format!("Error listing workflows: {e}"),
-        };
+    let workflows = match config_workflows::list_workflows(&LibraryRoots::at(
+        &orch.config_dir,
+        project_path.as_deref(),
+    )) {
+        Ok(workflows) => workflows,
+        Err(e) => return format!("Error listing workflows: {e}"),
+    };
 
     let mut by_id: BTreeMap<String, FileWorkflow> = BTreeMap::new();
     for result in workflows {
@@ -122,9 +125,8 @@ pub(crate) async fn read_workflow(
     };
 
     let workflow = match config_workflows::get_workflow(
-        &orch.config_dir,
+        &LibraryRoots::at(&orch.config_dir, project_path.as_deref()),
         workflow_id,
-        project_path.as_deref(),
     ) {
         Ok(Some(workflow)) => workflow,
         Ok(None) => return not_found(workflow_id, explicit_project),
@@ -133,7 +135,7 @@ pub(crate) async fn read_workflow(
 
     // Explicit project scope is project-only: never resolve a shared workspace
     // workflow behind an explicit project URI.
-    if explicit_project.is_some() && !workflow.is_project_scoped {
+    if explicit_project.is_some() && !workflow.is_project_scoped() {
         return not_found(workflow_id, explicit_project);
     }
 

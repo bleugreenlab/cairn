@@ -6,6 +6,7 @@
 //! holds and the credential store's recorded health, so a preview costs a
 //! settings read and a catalog build, not a network round trip.
 
+use cairn_config::library::LibraryRoots;
 use std::collections::BTreeMap;
 
 use cairn_config::allotment::{
@@ -558,11 +559,13 @@ impl Orchestrator {
             scopes.push((Some(project_id), Some(path)));
         }
         for (project_id, path) in scopes {
-            for listed in responses::list_responses(&self.config_dir, path.as_deref())? {
+            for listed in
+                responses::list_responses(&LibraryRoots::at(&self.config_dir, path.as_deref()))?
+            {
                 let ConfigResult::Ok(file) = listed else {
                     continue;
                 };
-                if file.is_project_scoped != project_id.is_some() {
+                if file.is_project_scoped() != project_id.is_some() {
                     continue;
                 }
                 if let Some(models) = file.definition.models.filter(|models| !models.is_empty()) {
@@ -904,9 +907,9 @@ mod tests {
             }
             let note = claude.identity_note("opus").unwrap();
             assert!(note.contains(expected), "{note}");
-            if report.is_some() {
+            if let Some(report) = report {
                 assert!(note.contains("alias-observing-session"), "{note}");
-                assert!(note.contains(report.unwrap()), "{note}");
+                assert!(note.contains(report), "{note}");
             }
             let view = ladder_view(&models, &catalog);
             let opus = view

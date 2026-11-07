@@ -148,6 +148,22 @@ const TOOL_ANALYTICS: &str = "upserts the invocation's hour bucket by its id and
 
 /// Every trigger in either lineage, private and team alike.
 pub const AUDITED_TRIGGERS: &[AuditedTrigger] = &[
+    trigger("main_incident_sources_immutable", "main_incident_sources", IMMUTABLE),
+    trigger("main_incident_source_retention_guard", "check_result_observations",
+        "probes pending sources by idx_main_incident_sources_observation_pending; ignores deletion until ack"),
+    trigger("main_incident_source_enqueue", "check_result_observations",
+        "enqueues one prospective main source by its (project_id,event_key) primary key; reads no table"),
+    trigger("main_incidents_immutable", "main_incidents", IMMUTABLE),
+    trigger(
+        "main_incident_evidence_immutable",
+        "main_incident_evidence",
+        IMMUTABLE,
+    ),
+    trigger(
+        "main_incident_evidence_filed_immutable",
+        "main_incident_evidence",
+        IMMUTABLE,
+    ),
     trigger("authorization_events_no_update", "authorization_events", IMMUTABLE),
     trigger("authorization_events_no_delete", "authorization_events", IMMUTABLE),
     trigger("request_attempt_members_no_update", "request_attempt_members", IMMUTABLE),

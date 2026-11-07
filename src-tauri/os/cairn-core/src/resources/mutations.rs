@@ -165,6 +165,35 @@ async fn scope_project_path(
     }
 }
 
+/// The layer a library write lands in: the project for a
+/// `cairn://p/<key>/...` target, else what `payload.layer` names
+/// (`workspace` or `project`), else `None` for "wherever it resolves".
+/// Naming a layer is how an agent puts its own definition in front of a pack's.
+fn write_layer(
+    payload: &serde_json::Value,
+    roots: &cairn_config::library::LibraryRoots,
+    explicit_project: Option<&str>,
+) -> Result<Option<cairn_config::library::Origin>, String> {
+    use cairn_config::library::Origin;
+    let project = || {
+        roots.project_origin().ok_or_else(|| {
+            "layer \"project\" needs a project: write from a run in one, or address cairn://p/<key>/..."
+                .to_string()
+        })
+    };
+    if explicit_project.is_some() {
+        return project().map(Some);
+    }
+    match payload_trimmed_non_empty_str(payload, "layer", &[]) {
+        None => Ok(None),
+        Some("workspace") => Ok(Some(Origin::Workspace)),
+        Some("project") => project().map(Some),
+        Some(other) => Err(format!(
+            "payload.layer must be \"workspace\" or \"project\", not \"{other}\""
+        )),
+    }
+}
+
 /// Whether a target is written using either run-relative shorthand.
 pub(crate) fn is_home_relative_target(target: &str) -> bool {
     super::common::home_relative_suffix(target).is_some()

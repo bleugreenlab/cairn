@@ -12,6 +12,7 @@ use crate::execution::model_selection::{
 };
 use crate::models::ModelSelection;
 use cairn_config::allotment::NodeConstraints;
+use cairn_config::library::LibraryRoots;
 use cairn_models::supply::CapacityRefusal;
 use cairn_models::types::catalog::VerbKind;
 
@@ -192,10 +193,13 @@ fn select_host_model(
     let models = match agent {
         Some(agent) => agent.models.clone(),
         None => {
-            crate::config::agents::get_agent(&orch.config_dir, agent_id, project_path)
-                .map_err(|e| format!("Failed to load agent config '{agent_id}': {e}"))?
-                .ok_or_else(|| format!("Agent config '{agent_id}' not found"))?
-                .models
+            crate::config::agents::get_agent(
+                &LibraryRoots::at(&orch.config_dir, project_path),
+                agent_id,
+            )
+            .map_err(|e| format!("Failed to load agent config '{agent_id}': {e}"))?
+            .ok_or_else(|| format!("Agent config '{agent_id}' not found"))?
+            .models
         }
     };
     let defaults = orch.effective_models(Some(&job.project_id))?.default_models;

@@ -393,7 +393,7 @@ pub async fn create(
 }
 
 /// Allocate and insert one issue, including provenance, parent edges and labels,
-/// in a single transaction. All issue creation paths terminate here.
+/// in a single transaction through the canonical transaction-level insert.
 pub async fn create_with_context(
     db: &LocalDb,
     clock: &dyn Clock,
@@ -401,91 +401,23 @@ pub async fn create_with_context(
     authorship: IssueAuthorship,
     context: IssueCreationContext,
 ) -> Result<(Issue, Vec<Label>), CairnError> {
-    let CreateIssue {
-        project_id,
-        title,
-        description,
-        backend_override,
-        label_ids,
-    } = input;
+    let project_id = input.project_id.clone();
     let id = ids::mint_child(&project_id);
     let now = clock.now();
-    let (author_json, appearance_json) = encode_issue_authorship(&authorship)?;
-
+    // Validate before opening the transaction, preserving the public boundary.
+    encode_issue_authorship(&authorship)?;
     db.write(|conn| {
         let id = id.clone();
-        let project_id = project_id.clone();
-        let title = title.clone();
-        let description = description.clone();
-        let backend_override = backend_override.clone();
-        let label_ids = label_ids.clone();
+        let input = CreateIssue {
+            project_id: input.project_id.clone(),
+            title: input.title.clone(),
+            description: input.description.clone(),
+            backend_override: input.backend_override.clone(),
+            label_ids: input.label_ids.clone(),
+        };
+        let authorship = authorship.clone();
         let context = context.clone();
-        let author_json = author_json.clone();
-        let appearance_json = appearance_json.clone();
-        Box::pin(async move {
-            let (parent_issue_id, parent_thread_id) = match context.parent_uri.as_deref() {
-                Some(parent_uri) => match resolve_parent_edge(conn, &project_id, parent_uri).await?
-                {
-                    ParentEdge::Issue(id) => (Some(id), None),
-                    ParentEdge::Thread(id) => (None, Some(id)),
-                },
-                None => (None, context.inferred_parent_thread_id),
-            };
-            let parent_job_id = if parent_issue_id.is_some() {
-                context.parent_job_id
-            } else {
-                None
-            };
-
-            let mut rows = conn
-                .query(
-                    "SELECT next_issue_number FROM projects WHERE id = ?1",
-                    params![project_id.as_str()],
-                )
-                .await?;
-            let row = rows.next().await?.ok_or_else(|| {
-                DbError::Row(format!("project not found: {}", project_id.as_str()))
-            })?;
-            let number = row.opt_i64(0)?.unwrap_or(1) as i32;
-            conn.execute(
-                "UPDATE projects SET next_issue_number = ?1, updated_at = ?2 WHERE id = ?3",
-                params![number + 1, now, project_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO issues (
-                    id, project_id, number, title, description, status, progress, attention,
-                    priority, created_at, updated_at, model, parent_issue_id, parent_job_id,
-                    parent_thread_id, author_principal_json, appearance_snapshot_json
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7,
-                    ?8, ?9, ?10, ?11, ?12
-                 )",
-                params![
-                    id.as_str(),
-                    project_id.as_str(),
-                    number,
-                    title.as_str(),
-                    description.as_deref(),
-                    now,
-                    backend_override.as_deref(),
-                    parent_issue_id.as_deref(),
-                    parent_job_id.as_deref(),
-                    parent_thread_id.as_deref(),
-                    author_json.as_str(),
-                    appearance_json.as_str()
-                ],
-            )
-            .await?;
-            let created_labels = match label_ids {
-                Some(labels) => attach::replace_issue_labels(conn, &id, &labels, now)
-                    .await
-                    .map_err(DbError::Row)?,
-                None => Vec::new(),
-            };
-            let issue = load_conn(conn, &id).await?;
-            Ok((issue, created_labels))
-        })
+        Box::pin(async move { create_conn(conn, &id, input, authorship, context, now).await })
     })
     .await
     .map_err(|error| match error {
@@ -497,6 +429,87 @@ pub async fn create_with_context(
         }
         error => CairnError::from(error),
     })
+}
+
+/// Canonical issue insert within an existing transaction; never starts execution.
+pub(crate) async fn create_conn(
+    conn: &crate::storage::TrackedConnection,
+    id: &str,
+    input: CreateIssue,
+    authorship: IssueAuthorship,
+    context: IssueCreationContext,
+    now: i64,
+) -> DbResult<(Issue, Vec<Label>)> {
+    let CreateIssue {
+        project_id,
+        title,
+        description,
+        backend_override,
+        label_ids,
+    } = input;
+    let (author_json, appearance_json) = encode_issue_authorship(&authorship)?;
+    let (parent_issue_id, parent_thread_id) = match context.parent_uri.as_deref() {
+        Some(parent_uri) => match resolve_parent_edge(conn, &project_id, parent_uri).await? {
+            ParentEdge::Issue(id) => (Some(id), None),
+            ParentEdge::Thread(id) => (None, Some(id)),
+        },
+        None => (None, context.inferred_parent_thread_id),
+    };
+    let parent_job_id = if parent_issue_id.is_some() {
+        context.parent_job_id
+    } else {
+        None
+    };
+
+    let mut rows = conn
+        .query(
+            "SELECT next_issue_number FROM projects WHERE id = ?1",
+            params![project_id.as_str()],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| DbError::Row(format!("project not found: {}", project_id.as_str())))?;
+    let number = row.opt_i64(0)?.unwrap_or(1) as i32;
+    conn.execute(
+        "UPDATE projects SET next_issue_number = ?1, updated_at = ?2 WHERE id = ?3",
+        params![number + 1, now, project_id.as_str()],
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO issues (
+            id, project_id, number, title, description, status, progress, attention,
+            priority, created_at, updated_at, model, parent_issue_id, parent_job_id,
+            parent_thread_id, author_principal_json, appearance_snapshot_json
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7,
+            ?8, ?9, ?10, ?11, ?12
+         )",
+        params![
+            id,
+            project_id,
+            number,
+            title.as_str(),
+            description.as_deref(),
+            now,
+            backend_override.as_deref(),
+            parent_issue_id.as_deref(),
+            parent_job_id.as_deref(),
+            parent_thread_id.as_deref(),
+            author_json.as_str(),
+            appearance_json.as_str()
+        ],
+    )
+    .await?;
+    let created_labels = match label_ids {
+        Some(labels) => attach::replace_issue_labels(conn, id, &labels, now)
+            .await
+            .map_err(DbError::Row)?,
+        None => Vec::new(),
+    };
+    let issue = load_conn(conn, id).await?;
+    Ok((issue, created_labels))
 }
 
 pub async fn get(db: &LocalDb, id: &str) -> Result<Option<Issue>, CairnError> {

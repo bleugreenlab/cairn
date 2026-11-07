@@ -378,6 +378,59 @@ pub async fn journal_operator_act(
     }
 }
 
+/// Journal a change to a project's library trust: the operator trusting the
+/// project, confirming a definition's authority, or revoking trust, or the
+/// runner clearing trust because the project's checkout moved.
+///
+/// `actor` is whoever caused the change. A clear the runner found on its own,
+/// with no request to attribute it to, is journaled with no actor rather than
+/// not at all. A failure is logged, never propagated.
+pub async fn journal_project_library_act(
+    db: &LocalDb,
+    project_id: &str,
+    mutation: AuthorityMutation,
+    summary: String,
+    actor: Option<cairn_common::identity::PrincipalRef>,
+) -> Option<String> {
+    let event = NewAuthorizationEvent {
+        scope: AuthorityScope::new(
+            AuthorityPlace::Project {
+                project_id: project_id.to_string(),
+            },
+            AuthorityAction::Write,
+        ),
+        mutation: mutation.as_str().to_string(),
+        summary: summary.clone(),
+        outcome: AuthorityDecision::Direct.as_str().to_string(),
+        reason: AuthorityReason::ProjectLibraryTrust.as_str().to_string(),
+        // The actor is the event's principal. The journal's decision-actor
+        // columns take an actor only with the appearance that proved it, which
+        // the trust acts do not carry.
+        principal: AuthorityPrincipal {
+            actor,
+            ..Default::default()
+        },
+        audience: AuthorityAudience {
+            project_id: Some(project_id.to_string()),
+            ..AuthorityAudience::workspace(WORKSPACE_ID)
+        },
+        run_id: None,
+        request_uri: None,
+        grant_id: None,
+        decision_actor: None,
+        appearance_snapshot: None,
+        request_acceptance: None,
+        decided_at: now(),
+    };
+    match store::append_event(db, event).await {
+        Ok(id) => Some(id),
+        Err(error) => {
+            log::warn!("failed to journal a project library trust change ({summary}): {error}");
+            None
+        }
+    }
+}
+
 /// One row an instrument-carried act wrote: what happened, to which table, and
 /// the row it names.
 #[derive(Debug, Clone)]

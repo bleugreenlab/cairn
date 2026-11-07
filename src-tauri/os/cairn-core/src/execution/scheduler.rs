@@ -17,6 +17,7 @@
 //!   (`MAX(started_at) WHERE recipe_id = ? AND triggered_by = 'schedule'`) —
 //!   no separate marker table or migration.
 
+use cairn_config::library::LibraryRoots;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Datelike, Days, Duration, LocalResult, NaiveDate, TimeZone, Timelike, Utc};
@@ -273,7 +274,7 @@ async fn load_scheduled_recipes(orch: &Orchestrator) -> Vec<ScheduledRecipe> {
     let config_dir = &orch.config_dir;
 
     // Workspace-scoped scheduled recipes have no project home — warn and skip.
-    if let Ok(ws_recipes) = config_recipes::list_recipes(config_dir, None) {
+    if let Ok(ws_recipes) = config_recipes::list_recipes(&LibraryRoots::workspace(config_dir)) {
         for recipe_result in ws_recipes {
             if let ConfigResult::Ok(fr) = recipe_result {
                 if fr.recipe.trigger == RecipeTrigger::Schedule
@@ -292,7 +293,9 @@ async fn load_scheduled_recipes(orch: &Orchestrator) -> Vec<ScheduledRecipe> {
     // Per-project scheduled recipes: one issue + execution per fire.
     for (project_id, project_key, repo_path) in load_projects(&orch.db.local).await {
         let project_path = PathBuf::from(&repo_path);
-        let Ok(proj_recipes) = config_recipes::list_recipes(config_dir, Some(&project_path)) else {
+        let Ok(proj_recipes) =
+            config_recipes::list_recipes(&LibraryRoots::at(config_dir, Some(&project_path)))
+        else {
             continue;
         };
         for recipe_result in proj_recipes {
@@ -301,7 +304,7 @@ async fn load_scheduled_recipes(orch: &Orchestrator) -> Vec<ScheduledRecipe> {
             };
             if fr.recipe.trigger != RecipeTrigger::Schedule
                 || fr.recipe.child_recipe_id.is_some()
-                || !fr.is_project_scoped
+                || !fr.is_project_scoped()
             {
                 continue;
             }
@@ -606,7 +609,10 @@ async fn fire_scheduled_recipe(
     // Re-verify the recipe still schedules — it may have been edited during the
     // bounded sleep. A recipe whose trigger changed (or which vanished) is
     // silently dropped this cycle; the next load reflects the edit.
-    match config_recipes::get_recipe(&orch.config_dir, &recipe.id, Some(&recipe.project_path)) {
+    match config_recipes::get_recipe(
+        &LibraryRoots::at(&orch.config_dir, Some(&recipe.project_path)),
+        &recipe.id,
+    ) {
         Ok(Some(fr)) if fr.recipe.trigger == RecipeTrigger::Schedule => {}
         Ok(_) => return Ok(()),
         Err(e) => return Err(format!("failed to reload recipe '{}': {e}", recipe.id)),

@@ -1,4 +1,5 @@
 use super::*;
+use cairn_config::library::LibraryRoots;
 
 /// Scan `message` for `/skill-id` tokens, prepend matched skill content,
 /// and pass through unknown slash commands unchanged.
@@ -18,7 +19,7 @@ pub fn resolve_skill_slash_command(
             continue;
         }
         if let Ok(Some(skill)) =
-            crate::config::skills::get_skill(&orch.config_dir, id, project_path)
+            crate::config::skills::get_skill(&LibraryRoots::at(&orch.config_dir, project_path), id)
         {
             skill_blocks.push(format!(
                 "<skill name=\"{}\">\n{}\n</skill>",

@@ -1394,6 +1394,11 @@ pub enum AuthorityReason {
     /// never replayed onto its base, and its landing is gated on the owner's
     /// review of declared paths. Only the operator may make that exception.
     BranchCatchUpMode,
+    /// Trusting a project's library definitions, confirming the authority one
+    /// of them carries, or withdrawing either. A trusted project's files grant
+    /// tools, hooks and scripts to every agent that resolves them, so only the
+    /// operator decides (cairn/6323).
+    ProjectLibraryTrust,
     /// Within the actor's established authority; no blast radius expansion.
     WithinExistingAuthority,
     /// Structurally invalid or an invariant violation. Approval cannot legalize
@@ -1415,6 +1420,7 @@ impl AuthorityReason {
             AuthorityReason::QueueStartNow => "queue_start_now",
             AuthorityReason::StoredContentRemoval => "stored_content_removal",
             AuthorityReason::BranchCatchUpMode => "branch_catch_up_mode",
+            AuthorityReason::ProjectLibraryTrust => "project_library_trust",
             AuthorityReason::WithinExistingAuthority => "within_existing_authority",
             AuthorityReason::StructurallyInvalid => "structurally_invalid",
         }

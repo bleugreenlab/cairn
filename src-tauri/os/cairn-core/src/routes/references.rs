@@ -15,6 +15,7 @@ use super::definition::Bindable;
 use super::{ArgumentBinding, RouteDefinition, RouteGraph, RouteNodeConfig, RouteSink};
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_config::library::LibraryRoots;
 use std::path::Path;
 
 pub async fn validate_references(
@@ -27,9 +28,8 @@ pub async fn validate_references(
         match &node.config {
             RouteNodeConfig::Response { response, args } => {
                 let file = crate::config::responses::get_response(
-                    &orch.config_dir,
+                    &LibraryRoots::at(&orch.config_dir, project_path),
                     response,
-                    project_path,
                 )?
                 .ok_or_else(|| format!("Unknown response '{response}'"))?;
                 let mut arguments = serde_json::Map::new();
@@ -75,7 +75,12 @@ async fn validate_sink_references(
     } = sink
     {
         // A recipe is addressed by its file id, not its display name.
-        if crate::config::recipes::get_recipe(&orch.config_dir, recipe, project_path)?.is_none() {
+        if crate::config::recipes::get_recipe(
+            &LibraryRoots::at(&orch.config_dir, project_path),
+            recipe,
+        )?
+        .is_none()
+        {
             return Err(format!("Unknown recipe '{recipe}'"));
         }
     }

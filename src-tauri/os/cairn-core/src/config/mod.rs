@@ -60,10 +60,9 @@ pub mod snapshot_migrate;
 pub mod workflows;
 pub mod yaml_edit;
 pub use cairn_config::files::*;
+pub use cairn_config::library;
 
-#[cfg(test)]
-use cairn_packs::restore::mirror_bundle_resources_with;
-pub use cairn_packs::{bundled_resource_ids, mirror_bundle_resources, RestoreResult};
+use cairn_config::library::LibraryRoots;
 use std::path::{Path, PathBuf};
 
 use crate::storage::{DbError, LocalDb, RowExt};
@@ -243,7 +242,7 @@ pub(crate) fn get_recipe_from_files(
         project_path
     );
 
-    let file_recipe = recipes::get_recipe(config_dir, recipe_id, project_path)?
+    let file_recipe = recipes::get_recipe(&LibraryRoots::at(config_dir, project_path), recipe_id)?
         .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
 
     log::info!(
@@ -254,7 +253,7 @@ pub(crate) fn get_recipe_from_files(
     );
 
     // Determine workspace_id and project_id based on scope
-    let (ws_id, proj_id) = if file_recipe.is_project_scoped {
+    let (ws_id, proj_id) = if file_recipe.is_project_scoped() {
         (None, None) // Project ID will be set by caller if needed
     } else {
         (Some("default".to_string()), None)
@@ -276,9 +275,10 @@ fn file_recipe_to_recipe(
     workspace_id: Option<String>,
     project_id: Option<String>,
 ) -> crate::models::Recipe {
+    let project_scoped = file_recipe.is_project_scoped();
     let mut recipe = file_recipe.recipe;
     // Set workspace_id to "default" for workspace-scoped recipes if not provided
-    recipe.workspace_id = if !file_recipe.is_project_scoped {
+    recipe.workspace_id = if !project_scoped {
         workspace_id.or_else(|| Some("default".to_string()))
     } else {
         None
@@ -342,8 +342,10 @@ pub async fn get_recipe_as_snapshot(
             continue;
         }
 
-        if let Ok(Some(file_agent)) = agents::get_agent(config_dir, &agent_id, Some(&project_path))
-        {
+        if let Ok(Some(file_agent)) = agents::get_agent(
+            &LibraryRoots::at(config_dir, Some(&project_path)),
+            &agent_id,
+        ) {
             agents.insert(agent_id.clone(), file_agent.snapshot());
         }
     }
@@ -353,213 +355,153 @@ pub async fn get_recipe_as_snapshot(
 
 pub(crate) use cairn_config::slugify_resource_segment;
 
+/// What every bare name of every library kind resolves to across `roots`:
+/// the origin in force, or the collision that refuses it. A project row that
+/// is skipped or unconfirmed is left out, since it is in force for nothing.
+pub(crate) fn library_index(
+    roots: &library::LibraryRoots,
+) -> std::collections::BTreeMap<
+    (library::LibraryKind, String),
+    (library::Origin, library::ListedStatus),
+> {
+    use library::{LibraryKind, ListedStatus};
+    fn rows<T>(
+        kind: LibraryKind,
+        listed: Result<Vec<library::Listed<T>>, String>,
+    ) -> Vec<((LibraryKind, String), (library::Origin, ListedStatus))> {
+        listed
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.status,
+                    ListedStatus::Active | ListedStatus::Collision { .. }
+                )
+            })
+            .map(|row| ((kind, row.name), (row.origin, row.status)))
+            .collect()
+    }
+    let mut index = std::collections::BTreeMap::new();
+    index.extend(rows(LibraryKind::Agent, agents::list_agent_rows(roots)));
+    index.extend(rows(LibraryKind::Recipe, recipes::list_recipe_rows(roots)));
+    index.extend(rows(LibraryKind::Skill, skills::list_skill_rows(roots)));
+    index.extend(rows(
+        LibraryKind::Response,
+        responses::list_response_rows(roots),
+    ));
+    index.extend(rows(LibraryKind::Route, routes::list_route_rows(roots)));
+    index.extend(rows(
+        LibraryKind::Workflow,
+        workflows::list_workflow_rows(roots),
+    ));
+    index
+}
+
+/// One definition in a project's `.cairn/`, as the operator reviews it before
+/// trusting the project or confirming the definition's authority.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDefinition {
+    pub kind: library::LibraryKind,
+    pub name: String,
+    /// The definition's authority projection as it stands, or `None` when the
+    /// file does not parse (and so cannot be confirmed).
+    pub authority: Option<serde_json::Map<String, serde_json::Value>>,
+    /// SHA-256 of `authority`'s canonical JSON: what a confirmation binds.
+    pub digest: Option<String>,
+    /// Why the file did not parse.
+    pub error: Option<String>,
+    /// Whether the definition is in force, skipped as untrusted, or waiting on
+    /// a confirmation of the named fields.
+    pub status: &'static str,
+    pub unconfirmed_fields: Vec<String>,
+}
+
+/// Every definition the project in `roots` holds, of every kind, whatever its
+/// trust: the list the operator reviews.
+pub fn project_definitions(roots: &library::LibraryRoots) -> Vec<ProjectDefinition> {
+    use library::{LibraryItem, LibraryKind, ListedStatus};
+    fn rows<T: LibraryItem>(
+        kind: LibraryKind,
+        listed: Result<Vec<library::Listed<T>>, String>,
+    ) -> Vec<ProjectDefinition> {
+        listed
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.origin.is_project())
+            .map(|row| {
+                let (authority, error) = match &row.entry {
+                    ConfigResult::Ok(item) => (Some(item.authority()), None),
+                    ConfigResult::Err { error, .. } => (None, Some(error.clone())),
+                };
+                ProjectDefinition {
+                    kind,
+                    name: row.name,
+                    digest: authority.as_ref().map(library::authority_digest),
+                    authority,
+                    error,
+                    status: row.status.as_str(),
+                    unconfirmed_fields: match row.status {
+                        ListedStatus::Unconfirmed { fields } => fields,
+                        _ => Vec::new(),
+                    },
+                }
+            })
+            .collect()
+    }
+    let mut all = Vec::new();
+    all.extend(rows(LibraryKind::Agent, agents::list_agent_rows(roots)));
+    all.extend(rows(LibraryKind::Recipe, recipes::list_recipe_rows(roots)));
+    all.extend(rows(LibraryKind::Skill, skills::list_skill_rows(roots)));
+    all.extend(rows(
+        LibraryKind::Response,
+        responses::list_response_rows(roots),
+    ));
+    all.extend(rows(LibraryKind::Route, routes::list_route_rows(roots)));
+    all.extend(rows(
+        LibraryKind::Workflow,
+        workflows::list_workflow_rows(roots),
+    ));
+    all
+}
+
+/// Roots for tests about layering rather than trust: the project trusted, and
+/// every definition it holds today confirmed exactly as it stands.
+#[cfg(test)]
+pub(crate) fn trusted_roots(config_dir: &Path, project: &Path) -> library::LibraryRoots {
+    use library::ProjectTrust;
+    let layer = library::test_support::project(project, "demo", ProjectTrust::Untrusted);
+    let roots = library::LibraryRoots::workspace(config_dir).with_project(layer);
+    let confirmed = project_definitions(&roots)
+        .into_iter()
+        .filter_map(|definition| Some(((definition.kind, definition.name), definition.authority?)))
+        .collect();
+    library::LibraryRoots::workspace(config_dir).with_project(library::test_support::project(
+        project,
+        "demo",
+        ProjectTrust::Trusted { confirmed },
+    ))
+}
+
+/// Record in the runner's trust registry that the project checked out at
+/// `project` is trusted with every definition it holds now confirmed, for tests
+/// that exercise layering through the orchestrator rather than trust itself.
+/// Call it after writing the definitions.
+#[cfg(test)]
+pub(crate) fn trust_for_test(config_dir: &Path, project: &Path, key: &str) {
+    if let Some(layer) = trusted_roots(config_dir, project).project {
+        library::trust::set(project, key, layer.trust);
+    }
+}
+
+#[cfg(test)]
+mod authority_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Total restore replaces shipped workflow packages while preserving
-    /// unrelated user-authored packages.
-    #[test]
-    fn restore_mirror_replaces_shipped_workflows_only() {
-        use crate::services::{RealFileSystem, RealGitClient};
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let resource_dir = temp.path().join("resources");
-        let home = temp.path().join("home");
-
-        // The default `core` pack ships an agent and a workflow.
-        let core = resource_dir.join("packs/core");
-        std::fs::create_dir_all(core.join("agents")).unwrap();
-        std::fs::write(
-            core.join("cairn-pack.yaml"),
-            "id: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
-        )
-        .unwrap();
-        std::fs::write(core.join("agents/explore.md"), "bundle\n").unwrap();
-        std::fs::create_dir_all(core.join("workflows/fan-out")).unwrap();
-        std::fs::write(
-            core.join("workflows/fan-out/workflow.yaml"),
-            "name: Fan Out\ndescription: d\n",
-        )
-        .unwrap();
-
-        // Workspace has a user-authored workflow and an edited fan-out copy.
-        std::fs::create_dir_all(home.join("workflows/my-flow")).unwrap();
-        std::fs::write(
-            home.join("workflows/my-flow/workflow.yaml"),
-            "name: Mine\ndescription: user\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(home.join("workflows/fan-out")).unwrap();
-        std::fs::write(home.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
-
-        mirror_bundle_resources_with(&RealGitClient, &RealFileSystem, &resource_dir, &home)
-            .unwrap();
-
-        // Agents were reset to the bundle…
-        assert_eq!(
-            std::fs::read_to_string(home.join("agents/explore.md")).unwrap(),
-            "bundle\n"
-        );
-        // The unrelated user-authored package remains, while the shipped package
-        // is deliberately reset as part of the confirmed total restore.
-        assert!(home.join("workflows/my-flow/workflow.yaml").exists());
-        assert_eq!(
-            std::fs::read_to_string(home.join("workflows/fan-out/workflow.yaml")).unwrap(),
-            "name: Fan Out\ndescription: d\n"
-        );
-        assert!(!home.join("workflows/fan-out/main.ts").exists());
-
-        assert_eq!(
-            bundled_resource_ids(&resource_dir, &home, "agents").unwrap(),
-            vec!["explore".to_string()]
-        );
-    }
-
-    /// A restore brings back what this workspace INSTALLED, not everything the
-    /// app ships. An optional pack the user never installed must not appear.
-    /// "Restore bundled defaults" is a deliberate click that supersedes an
-    /// earlier uninstall of a DEFAULT pack. What it must never do is put the
-    /// files back while leaving the pack uninstalled: those files would be
-    /// claimed by no pack, tracked by nothing, and skipped by every later sync.
-    #[test]
-    fn restore_after_uninstalling_everything_reinstalls_coherently() {
-        use crate::services::{RealFileSystem, RealGitClient};
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let resource_dir = temp.path().join("resources");
-        let home = temp.path().join("home");
-        let core = resource_dir.join("packs/core");
-        std::fs::create_dir_all(core.join("agents")).unwrap();
-        std::fs::write(
-            core.join("cairn-pack.yaml"),
-            "id: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
-        )
-        .unwrap();
-        std::fs::write(core.join("agents/explore.md"), "shipped\n").unwrap();
-
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
-            .unwrap();
-        crate::workspace::bundle::uninstall_pack(&git, &fs, &home, "core").unwrap();
-        assert!(!home.join("agents/explore.md").exists());
-
-        mirror_bundle_resources_with(&git, &fs, &resource_dir, &home).unwrap();
-
-        assert!(home.join("agents/explore.md").exists());
-        assert!(
-            pack::lock::read_lock(&home, "core").is_some(),
-            "restored files must be claimed by their pack"
-        );
-        assert!(
-            !pack::lock::is_uninstalled(&home, "core"),
-            "restoring supersedes the earlier uninstall rather than contradicting it"
-        );
-
-        // And the next ordinary sync keeps it, rather than skipping a pack it
-        // still considers removed.
-        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
-            .unwrap();
-        assert!(pack::lock::read_lock(&home, "core").is_some());
-        assert!(home.join("agents/explore.md").exists());
-
-        let lock = pack::lock::read_lock(&home, "core").unwrap();
-        assert!(lock
-            .item(pack::PackItemKind::Agent, "explore")
-            .is_some_and(|item| item.content_hash.is_some() && !item.forked));
-    }
-
-    /// A restore overrides every user decision within its scope, uniformly. An
-    /// item removal is not an exception: undoing one otherwise has no route a
-    /// user can reach without driving Cairn through an agent, and re-removing
-    /// it afterwards is a single click.
-    #[test]
-    fn restore_undoes_an_item_removal_too() {
-        use crate::services::{RealFileSystem, RealGitClient};
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let resource_dir = temp.path().join("resources");
-        let home = temp.path().join("home");
-        let core = resource_dir.join("packs/core");
-        std::fs::create_dir_all(core.join("agents")).unwrap();
-        std::fs::write(
-            core.join("cairn-pack.yaml"),
-            "id: core\nname: Core\nversion: 1.0.0\ndefault: true\n",
-        )
-        .unwrap();
-        std::fs::write(core.join("agents/explore.md"), "shipped\n").unwrap();
-        std::fs::write(core.join("agents/plan.md"), "shipped\n").unwrap();
-
-        let git = RealGitClient;
-        let fs = RealFileSystem;
-        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
-            .unwrap();
-
-        crate::config::agents::delete_agent(&home, "plan", None).unwrap();
-        assert!(!home.join("agents/plan.md").exists());
-        assert!(pack::lock::read_lock(&home, "core")
-            .unwrap()
-            .is_removed(pack::PackItemKind::Agent, "plan"));
-        mirror_bundle_resources_with(&git, &fs, &resource_dir, &home).unwrap();
-
-        assert!(home.join("agents/plan.md").exists());
-        assert!(
-            pack::lock::read_lock(&home, "core")
-                .unwrap()
-                .removed
-                .is_empty(),
-            "the removal record is cleared, so the next sync keeps the item"
-        );
-        crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
-            .unwrap();
-        assert!(home.join("agents/plan.md").exists());
-    }
-
-    #[test]
-    fn restore_mirror_only_reinstates_installed_packs() {
-        use crate::services::{RealFileSystem, RealGitClient};
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let resource_dir = temp.path().join("resources");
-        let home = temp.path().join("home");
-
-        for (id, default) in [("core", true), ("matlab", false)] {
-            let root = resource_dir.join("packs").join(id);
-            std::fs::create_dir_all(root.join("agents")).unwrap();
-            std::fs::write(
-                root.join("cairn-pack.yaml"),
-                format!("id: {id}\nname: {id}\nversion: 1.0.0\ndefault: {default}\n"),
-            )
-            .unwrap();
-            std::fs::write(root.join(format!("agents/{id}.md")), "shipped\n").unwrap();
-        }
-
-        // Only `core` is locked as installed.
-        std::fs::create_dir_all(home.join("packs/core")).unwrap();
-        std::fs::write(
-            home.join("packs/core/pack.yaml"),
-            "cairnVersion: 1\nid: core\nname: Core\nversion: 1.0.0\ninstalledAt: now\ncontentHash: h\nsource:\n  kind: bundled\n",
-        )
-        .unwrap();
-
-        mirror_bundle_resources_with(&RealGitClient, &RealFileSystem, &resource_dir, &home)
-            .unwrap();
-
-        assert!(home.join("agents/core.md").exists());
-        assert!(
-            !home.join("agents/matlab.md").exists(),
-            "a restore must not install a pack the user never chose"
-        );
-        assert_eq!(
-            bundled_resource_ids(&resource_dir, &home, "agents").unwrap(),
-            vec!["core".to_string()]
-        );
-    }
+    #[allow(unused_imports)]
+    use cairn_config::library::{LibraryRoots, Origin};
 
     #[test]
     fn test_slugify() {

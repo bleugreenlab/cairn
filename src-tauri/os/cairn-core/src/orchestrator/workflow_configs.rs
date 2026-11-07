@@ -13,6 +13,7 @@
 //! validated `save_workflow` for every write, so a save round-trips through the
 //! same load/validation path the loader uses.
 
+use cairn_config::library::LibraryRoots;
 use std::path::{Path, PathBuf};
 
 use crate::config::workflows::{self as config_workflows, FileWorkflow, WorkflowBranchMode};
@@ -80,9 +81,11 @@ impl Orchestrator {
         let mut out = Vec::new();
 
         if workspace_id.is_none() && project_id.is_none() {
-            for result in config_workflows::list_workflows(&self.config_dir, None)? {
+            for result in
+                config_workflows::list_workflows(&LibraryRoots::workspace(&self.config_dir))?
+            {
                 if let ConfigResult::Ok(w) = result {
-                    if !w.is_project_scoped {
+                    if !w.is_project_scoped() {
                         out.push(to_workflow_config(
                             w,
                             Some("default".to_string()),
@@ -93,11 +96,12 @@ impl Orchestrator {
                 }
             }
             for (pid, project_path) in self.all_project_paths()? {
-                for result in
-                    config_workflows::list_workflows(&self.config_dir, Some(&project_path))?
-                {
+                for result in config_workflows::list_workflows(&LibraryRoots::at(
+                    &self.config_dir,
+                    Some(&project_path),
+                ))? {
                     if let ConfigResult::Ok(w) = result {
-                        if w.is_project_scoped {
+                        if w.is_project_scoped() {
                             out.push(to_workflow_config(w, None, Some(pid.clone()), now));
                         }
                     }
@@ -106,17 +110,18 @@ impl Orchestrator {
         } else {
             let project_path: Option<PathBuf> =
                 project_id.map(|pid| self.project_path(pid)).transpose()?;
-            for result in
-                config_workflows::list_workflows(&self.config_dir, project_path.as_deref())?
-            {
+            for result in config_workflows::list_workflows(&LibraryRoots::at(
+                &self.config_dir,
+                project_path.as_deref(),
+            ))? {
                 if let ConfigResult::Ok(w) = result {
                     let include = match (workspace_id, project_id) {
-                        (Some(_), None) => !w.is_project_scoped,
-                        (None, Some(_)) => w.is_project_scoped,
+                        (Some(_), None) => !w.is_project_scoped(),
+                        (None, Some(_)) => w.is_project_scoped(),
                         _ => true,
                     };
                     if include {
-                        let (ws, pj) = if w.is_project_scoped {
+                        let (ws, pj) = if w.is_project_scoped() {
                             (None, project_id.map(str::to_string))
                         } else {
                             (workspace_id.map(str::to_string), None)
@@ -141,13 +146,15 @@ impl Orchestrator {
         let now = now_ts();
         let project_path: Option<PathBuf> =
             project_id.map(|pid| self.project_path(pid)).transpose()?;
-        let Some(w) =
-            config_workflows::get_workflow(&self.config_dir, id, project_path.as_deref())?
+        let Some(w) = config_workflows::get_workflow(
+            &LibraryRoots::at(&self.config_dir, project_path.as_deref()),
+            id,
+        )?
         else {
             return Ok(None);
         };
         let script_content = config_workflows::read_workflow_script(&w)?;
-        let (ws, pj) = if w.is_project_scoped {
+        let (ws, pj) = if w.is_project_scoped() {
             (None, project_id.map(str::to_string))
         } else {
             (Some("default".to_string()), None)
@@ -205,10 +212,12 @@ impl Orchestrator {
             args_schema: input.args_schema.as_ref(),
             output: input.output.as_ref(),
             script_content: &input.script_content,
-            is_project_scoped: is_project,
+            layer: &super::config_resource::scope_origin(project_path.as_deref()),
         };
-        let dest =
-            config_workflows::save_workflow(&self.config_dir, &spec, project_path.as_deref())?;
+        let dest = config_workflows::save_workflow(
+            &LibraryRoots::at(&self.config_dir, project_path.as_deref()),
+            &spec,
+        )?;
 
         let commit_root: &Path = match &project_path {
             Some(p) => p.as_path(),
@@ -252,16 +261,14 @@ impl Orchestrator {
     ) -> Result<(), String> {
         let project_path: Option<PathBuf> =
             project_id.map(|pid| self.project_path(pid)).transpose()?;
-        let existing =
-            config_workflows::get_workflow(&self.config_dir, id, project_path.as_deref())?;
-        config_workflows::delete_workflow(&self.config_dir, id, project_path.as_deref())?;
-        if let Some(w) = &existing {
+        let roots = LibraryRoots::at(&self.config_dir, project_path.as_deref());
+        if let Some(changed) = config_workflows::delete_workflow(&roots, id, None)? {
             let root: &Path = match &project_path {
                 Some(p) => p.as_path(),
                 None => self.config_dir.as_path(),
             };
             crate::config::commit_and_maybe_push(
-                std::slice::from_ref(&w.dir_path),
+                std::slice::from_ref(&changed),
                 &format!("cairn: delete workflow {id}"),
                 Some(root),
             );
@@ -295,9 +302,8 @@ impl Orchestrator {
             .map(|pid| self.project_path(pid))
             .transpose()?;
         let source = config_workflows::get_workflow(
-            &self.config_dir,
+            &LibraryRoots::at(&self.config_dir, source_project_path.as_deref()),
             source_id,
-            source_project_path.as_deref(),
         )?
         .ok_or_else(|| format!("Workflow not found: {source_id}"))?;
 
@@ -334,9 +340,8 @@ impl Orchestrator {
         self.emit_workflow_change("created", target_id);
 
         let copied = config_workflows::get_workflow(
-            &self.config_dir,
+            &LibraryRoots::at(&self.config_dir, target_project_path.as_deref()),
             target_id,
-            target_project_path.as_deref(),
         )?
         .ok_or_else(|| "Copied workflow failed to load".to_string())?;
         let now = now_ts();
@@ -370,15 +375,18 @@ impl Orchestrator {
         };
 
         if workspace_id.is_none() && project_id.is_none() {
-            for result in config_workflows::list_workflows(&self.config_dir, None)? {
+            for result in
+                config_workflows::list_workflows(&LibraryRoots::workspace(&self.config_dir))?
+            {
                 if let ConfigResult::Err { path, error } = result {
                     push(&path, error, None);
                 }
             }
             for (pid, project_path) in self.all_project_paths()? {
-                for result in
-                    config_workflows::list_workflows(&self.config_dir, Some(&project_path))?
-                {
+                for result in config_workflows::list_workflows(&LibraryRoots::at(
+                    &self.config_dir,
+                    Some(&project_path),
+                ))? {
                     if let ConfigResult::Err { path, error } = result {
                         if path.starts_with(&project_path) {
                             push(&path, error, Some(pid.clone()));
@@ -389,9 +397,10 @@ impl Orchestrator {
         } else {
             let project_path: Option<PathBuf> =
                 project_id.map(|pid| self.project_path(pid)).transpose()?;
-            for result in
-                config_workflows::list_workflows(&self.config_dir, project_path.as_deref())?
-            {
+            for result in config_workflows::list_workflows(&LibraryRoots::at(
+                &self.config_dir,
+                project_path.as_deref(),
+            ))? {
                 if let ConfigResult::Err { path, error } = result {
                     let is_project_err = project_path
                         .as_deref()
@@ -472,6 +481,7 @@ mod tests {
         );
 
         let orch = orch_with_project(&config_dir, &project_dir).await;
+        crate::config::trust_for_test(&config_dir, &project_dir, "PROJ");
 
         // Both scopes aggregate.
         let all = orch.list_workflow_configs(None, None).unwrap();

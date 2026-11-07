@@ -3,6 +3,7 @@ use crate::mcp::handlers::{run_context, skills_resources};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::{build_project_skill_uri, build_skill_uri};
+use cairn_config::library::{LibraryKind, LibraryRoots, Origin};
 
 fn payload_string_array(
     payload: &serde_json::Value,
@@ -99,22 +100,12 @@ pub(super) async fn apply_skill_create(
         Some(project) => Some(skills_resources::project_path_by_key(orch, project).await?),
         None => None,
     };
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let layer = super::write_layer(payload, &roots, explicit_project)?.unwrap_or(Origin::Workspace);
 
-    let conflict_exists = if is_project_scoped {
-        project_path.as_ref().is_some_and(|pp| {
-            pp.join(".cairn")
-                .join("skills")
-                .join(name)
-                .join("SKILL.md")
-                .exists()
-        })
-    } else {
-        orch.config_dir
-            .join("skills")
-            .join(name)
-            .join("SKILL.md")
-            .exists()
-    };
+    let conflict_exists = roots
+        .layer_dir(LibraryKind::Skill, &layer)
+        .is_some_and(|dir| dir.join(name).join("SKILL.md").exists());
     if conflict_exists {
         return Err(format!("Skill already exists: {name}"));
     }
@@ -126,7 +117,7 @@ pub(super) async fn apply_skill_create(
         prompt: prompt.to_string(),
         allowed_tools,
         bundles: Vec::new(),
-        is_project_scoped,
+        origin: layer,
         file_path: std::path::PathBuf::new(),
         dir_path: std::path::PathBuf::new(),
         meta: None,
@@ -142,12 +133,7 @@ pub(super) async fn apply_skill_create(
         source_run_id: request.run_id.clone(),
     };
 
-    let path = config_skills::save_skill(
-        &orch.config_dir,
-        &skill,
-        project_path.as_deref(),
-        Some(meta_update),
-    )?;
+    let path = config_skills::save_skill(&roots, &skill, None, Some(meta_update))?;
 
     // Commit the skill directory (SKILL.md + .meta.json) to the owning repo: the
     // project checkout for project scope, ~/.cairn for workspace scope.
@@ -200,7 +186,13 @@ pub(super) async fn apply_skill_patch(
         project_path.as_deref(),
     )?
     .ok_or_else(|| skill_not_found_message(skill_id, explicit_project))?;
-    reject_project_skill_write_from_agent(request, skill_id, skill.is_project_scoped)?;
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let layer = super::write_layer(payload, &roots, explicit_project)?
+        .filter(|layer| *layer != skill.origin);
+    let project_target = layer
+        .as_ref()
+        .map_or(skill.is_project_scoped(), Origin::is_project);
+    reject_project_skill_write_from_agent(request, skill_id, project_target)?;
 
     if let Some(description) = super::payload_str(payload, "description", &[]) {
         skill.description = description.to_string();
@@ -235,12 +227,7 @@ pub(super) async fn apply_skill_patch(
         source_run_id: request.run_id.clone(),
     };
 
-    let path = config_skills::save_skill(
-        &orch.config_dir,
-        &skill,
-        project_path.as_deref(),
-        Some(meta_update),
-    )?;
+    let path = config_skills::save_skill(&roots, &skill, layer.as_ref(), Some(meta_update))?;
     crate::config::commit_config_paths(
         &[skill_dir_for_commit(&path)],
         &format!("cairn: update skill {skill_id}"),
@@ -277,10 +264,12 @@ pub(super) async fn apply_skill_delete(
     else {
         return Err(skill_not_found_message(skill_id, explicit_project));
     };
-    reject_project_skill_write_from_agent(request, skill_id, skill.is_project_scoped)?;
-    config_skills::delete_skill(&orch.config_dir, skill_id, project_path.as_deref())?;
+    reject_project_skill_write_from_agent(request, skill_id, skill.is_project_scoped())?;
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let changed = config_skills::delete_skill(&roots, skill_id, Some(&skill.origin))?
+        .ok_or_else(|| skill_not_found_message(skill_id, explicit_project))?;
     crate::config::commit_config_paths(
-        std::slice::from_ref(&skill.dir_path),
+        std::slice::from_ref(&changed),
         &format!("cairn: delete skill {skill_id}"),
     );
 

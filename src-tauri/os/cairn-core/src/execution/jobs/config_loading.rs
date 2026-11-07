@@ -1,4 +1,5 @@
 use super::*;
+use cairn_config::library::LibraryRoots;
 
 /// Load agent config for a job — tries execution snapshot first, falls back to
 /// config files — with the model the job launched on.
@@ -101,7 +102,7 @@ fn load_agent_definition(
     // Fall back to config files.
     let project_id = &job.project_id;
     let agent = config::get_config_dir().ok().and_then(|cd| {
-        config_agents::get_agent(&cd, aid, project_path)
+        config_agents::get_agent(&LibraryRoots::at(&cd, project_path), aid)
             .ok()
             .flatten()
             .map(|fa| {
@@ -113,12 +114,12 @@ fn load_agent_definition(
                     prompt: snapshot.prompt,
                     tools: snapshot.tools,
                     models: snapshot_models.clone().unwrap_or(snapshot.models),
-                    workspace_id: if fa.is_project_scoped {
+                    workspace_id: if fa.is_project_scoped() {
                         None
                     } else {
                         Some("workspace".to_string())
                     },
-                    project_id: if fa.is_project_scoped {
+                    project_id: if fa.is_project_scoped() {
                         Some(project_id.clone())
                     } else {
                         None

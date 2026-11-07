@@ -3385,127 +3385,6 @@ async fn a_detach_and_a_reattach_are_announced_without_waiting_for_the_probe() {
     .await;
 }
 
-/// A real installed pack, so the lock decides: `beta` runs the pack's artifact
-/// and `alpha` an override. The next probe pass after an edit drains the
-/// artifact's resident and tells open windows it failed, with the sentence,
-/// while the override keeps running under the shipped declaration. Resetting
-/// brings the artifact's resident back. Those are the two ways out the sentence
-/// promises.
-#[tokio::test]
-async fn an_edited_copy_drains_at_the_next_pass_and_a_reset_brings_the_artifact_back() {
-    let h = harness().await;
-    let dir = tempfile::tempdir().unwrap();
-    let resources = dir.path().join("resources");
-    let root = resources.join("packs/kit");
-    std::fs::create_dir_all(root.join("services/probe")).unwrap();
-    std::fs::write(
-        root.join("cairn-pack.yaml"),
-        "id: kit\nname: Kit\nversion: 1.0.0\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("services/probe/service.yaml"),
-        native_manifest("none"),
-    )
-    .unwrap();
-    cairn_packs::sync_one_pack(
-        &crate::services::RealGitClient,
-        &crate::services::RealFileSystem,
-        &resources,
-        &h.orch.config_dir,
-        "kit",
-    )
-    .unwrap();
-    h.source.packs.lock().unwrap().push((
-        "kit".to_string(),
-        Arc::new(
-            crate::project_services::pack_source::PackServiceSource::open(
-                &h.orch.config_dir,
-                "kit",
-            ),
-        ),
-    ));
-    let mut beta = view("beta");
-    beta.installed
-        .push(cairn_common::executor_protocol::InstalledMachineService {
-            pack: "kit".to_string(),
-            service: "probe".to_string(),
-            sha256: PROBE_SHA.to_string(),
-            version: "1.0.0".to_string(),
-            outcome: cairn_common::executor_protocol::MachineServiceInstallOutcome::Installed,
-        });
-    *h.host.machines.lock().unwrap() = Some(vec![view("alpha"), beta]);
-    select(&h, "alpha");
-    crate::config::settings::mutate_fleet(
-        &h.orch.config_dir,
-        |config| {
-            config.machine_services.select(
-                probe_key(),
-                "beta",
-                cairn_config::fleet::MachineSelection { override_: None },
-            )
-        },
-        |_| {},
-    )
-    .unwrap();
-    machine::apply_machine_services(&h.orch, "test").await;
-    assert_eq!(launched_on(&h), ["alpha", "beta"]);
-    let drained = machine_cell(&h, "beta").unwrap();
-
-    std::fs::write(
-        h.orch.config_dir.join("services/probe/service.yaml"),
-        "name: Mine\n",
-    )
-    .unwrap();
-    // Stands in for `probe.every` elapsing. Nothing applies here: the pass has
-    // to notice the edit itself.
-    drained.machine.as_ref().unwrap().wake.notify_one();
-    eventually("the artifact's resident to end", || {
-        h.host
-            .native_ended
-            .lock()
-            .unwrap()
-            .contains(&"beta".to_string())
-    })
-    .await;
-    assert!(machine_cell(&h, "alpha").unwrap().serving().is_some());
-    assert_eq!(instance_state(&h, "alpha"), machine::InstanceState::Ready);
-    let machine::InstanceState::Failed { reason } = instance_state(&h, "beta") else {
-        panic!("{:?}", instance_state(&h, "beta"));
-    };
-    assert!(reason.contains("was edited"), "{reason}");
-    assert!(reason.contains("per-machine override"), "{reason}");
-    eventually("open windows to be told", || {
-        matches!(
-            *drained.machine.as_ref().unwrap().announced.lock().unwrap(),
-            Some(machine::InstanceState::Failed { .. })
-        )
-    })
-    .await;
-
-    crate::resources::mutations::packs::reset_pack_item(
-        &h.orch,
-        "kit",
-        cairn_packs::PackItemKind::Service,
-        "probe",
-        crate::library::PackAuthority::Operator,
-    )
-    .unwrap();
-    assert_eq!(
-        crate::project_services::pack_source::PackServiceSource::open(&h.orch.config_dir, "kit")
-            .refusal("probe"),
-        None
-    );
-    eventually("the artifact's resident to come back", || {
-        launched_on(&h) == ["alpha", "beta", "beta"]
-    })
-    .await;
-    eventually("the artifact's resident to read ready", || {
-        instance_state(&h, "beta") == machine::InstanceState::Ready
-    })
-    .await;
-}
-
 #[tokio::test]
 async fn a_declaration_without_a_size_fails_naming_it() {
     let m = machine_harness("none", &["alpha"]).await;
@@ -3657,7 +3536,7 @@ impl crate::mcp::gateway::McpGateway for PlacedCalls {
         tokio::time::sleep(delay).await;
         pending.1 = true;
         Ok(crate::mcp::gateway::McpCallOutcome::Complete(
-            crate::mcp::gateway::McpToolCallResult::from_text(&format!("{tool} answered on {key}")),
+            crate::mcp::gateway::McpToolCallResult::from_text(format!("{tool} answered on {key}")),
         ))
     }
     async fn list_tools(

@@ -2,19 +2,16 @@ use std::path::Path;
 
 use crate::services::{FileSystem, GitClient};
 
-/// Allowlist for the workspace config repo. Everything a pack can install must
-/// appear here: an untracked file has no commit history, so the ownership oracle
-/// (`workspace::bundle::pack_file_is_user_owned`) fails safe to "user-owned" and
-/// the file can never be updated by a later pack version.
+/// Allowlist for the workspace config repo: the user's own definitions and
+/// settings, and of each installed pack only the record of the decision.
 ///
-/// `packs/` holds each installed pack's lock and MCP definitions; `responses/`
-/// holds response templates, which the sync has always materialized but which
-/// were never tracked — leaving them permanently frozen on first install.
-/// `routes/` holds route definitions, the shipped ones included. `services/`
-/// mirrors the machine service declarations packs ship, so an edit is visible.
-/// `agent-pins.yaml` holds the backend/icon/tier choices layered over
-/// pack-owned agents (`cairn_config::agent_pins`).
-pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/responses/\n!/routes/\n!/services/\n!/workflows/\n!/packs/\n!/AGENTS.md\n!/settings.yaml\n!/agent-pins.yaml\n!/.gitignore\n.DS_Store\n";
+/// A pack's items are read where it installed them (`packs/<id>/...`) and can
+/// be staged again from the pack's source at any time, so only its lock
+/// (`pack.yaml`, which carries the user's removals) and an uninstall marker
+/// are tracked; a removal lands in the same commit as the deletion it records.
+/// `agent-pins.yaml` holds the icon and model choices layered over agents
+/// (`cairn_config::agent_pins`).
+pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/responses/\n!/routes/\n!/workflows/\n!/packs/\n/packs/*/*\n!/packs/*/pack.yaml\n!/packs/*/uninstalled\n!/AGENTS.md\n!/settings.yaml\n!/agent-pins.yaml\n!/.gitignore\n.DS_Store\n";
 
 pub(crate) fn ensure_workspace_repo(
     git: &dyn GitClient,

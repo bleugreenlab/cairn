@@ -786,6 +786,24 @@ impl OrchestratorBuilder {
         // Its debts reload before any purpose item is admitted, so nothing
         // dispatches beside one.
         fleet.attach_purpose_debt_journal(self.db.local.clone());
+        // Project library definitions resolve only for projects the operator
+        // trusted; until this load lands, every project reads as untrusted,
+        // which fails closed.
+        let trust_dbs = self.db.clone();
+        spawn_onto(
+            tokio::runtime::Handle::try_current().ok().as_ref(),
+            async move {
+                if let Err(error) = crate::projects::library_trust::refresh(&trust_dbs, None).await
+                {
+                    log::warn!("project library trust did not load: {error}");
+                }
+            },
+            || {
+                log::error!(
+                    "project library trust could not load; every project reads as untrusted"
+                )
+            },
+        );
         let managed_tools = self.managed_tools;
         let models_runtime = self.models_runtime.unwrap_or_else(|| {
             models::ModelRuntime::local(
@@ -3175,6 +3193,17 @@ impl Orchestrator {
             log::warn!("retention pass: {report}");
         } else {
             log::info!("retention pass: {report}");
+        }
+        match crate::execution::main_incidents_store::source_health(
+            &self.db.local,
+            None,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        {
+            Ok(health) if health.held_observations > 0 => log::warn!("retention hold: {health}"),
+            Err(error) => log::warn!("retention incident holds could not be read: {error}"),
+            _ => {}
         }
     }
 

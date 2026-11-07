@@ -10,6 +10,7 @@
 //! This module also exposes the small scope-resolution helpers used by the
 //! `write` tool to route skill mutations (create/patch/delete).
 
+use cairn_config::library::LibraryRoots;
 use std::path::{Path, PathBuf};
 
 use crate::config::skills::FileSkill;
@@ -86,12 +87,19 @@ pub(crate) fn resolve_skill_for_scope(
     explicit_project: bool,
     project_path: Option<&Path>,
 ) -> Result<Option<FileSkill>, String> {
-    let skill = config_skills::get_skill(config_dir, skill_id, project_path)?;
-    if explicit_project {
-        // Reject the workspace fallthrough: only a project-scoped match counts.
-        Ok(skill.filter(|skill| skill.is_project_scoped))
-    } else {
-        Ok(skill)
+    let roots = LibraryRoots::at(config_dir, project_path);
+    if !explicit_project {
+        return config_skills::get_skill(&roots, skill_id);
+    }
+    // Reject the workspace fallthrough: only the project's own definition
+    // counts, and it is behind the project's trust gate.
+    let Some(layer) = roots.project_origin() else {
+        return Ok(None);
+    };
+    match config_skills::resolve_skill_in(&roots, &layer, skill_id) {
+        Ok(resolved) => Ok(Some(resolved.item)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -165,7 +173,7 @@ pub(crate) async fn resolve_skill_script_path(
 }
 
 fn scope_label(skill: &FileSkill) -> &'static str {
-    if skill.is_project_scoped {
+    if skill.is_project_scoped() {
         "project"
     } else {
         "workspace"
@@ -173,7 +181,7 @@ fn scope_label(skill: &FileSkill) -> &'static str {
 }
 
 fn skill_link(skill: &FileSkill, project_key: Option<&str>, path: &[String]) -> String {
-    if skill.is_project_scoped {
+    if skill.is_project_scoped() {
         match project_key {
             Some(project) => build_project_skill_uri(project, &skill.id, path),
             None => build_skill_uri(&skill.id, path),
@@ -218,7 +226,10 @@ pub(crate) async fn read_skills_collection(
         }
     };
 
-    let skills = match config_skills::list_skills(&orch.config_dir, project_path.as_deref()) {
+    let skills = match config_skills::list_skills(&LibraryRoots::at(
+        &orch.config_dir,
+        project_path.as_deref(),
+    )) {
         Ok(skills) => skills,
         Err(e) => return format!("Error listing skills: {e}"),
     };
@@ -534,7 +545,7 @@ mod tests {
             format!("---\nname: {id}\ndescription: {description}\n---\n\nBody for {id}.\n"),
         )
         .unwrap();
-        match config_skills::get_skill(dir.parent().unwrap(), id, None) {
+        match config_skills::get_skill(&LibraryRoots::workspace(dir.parent().unwrap()), id) {
             Ok(Some(skill)) => skill,
             _ => panic!("failed to load fixture skill"),
         }
@@ -553,7 +564,8 @@ mod tests {
     /// Render the collection directly from loaded skills, bypassing run-context
     /// resolution (which needs a DB). Mirrors `read_skills_collection`'s body.
     fn render_collection(config_dir: &Path, project_path: Option<&Path>) -> String {
-        let skills = config_skills::list_skills(config_dir, project_path).unwrap();
+        let skills =
+            config_skills::list_skills(&LibraryRoots::at(config_dir, project_path)).unwrap();
         let mut by_id: std::collections::BTreeMap<String, FileSkill> =
             std::collections::BTreeMap::new();
         for result in skills {
@@ -583,6 +595,7 @@ mod tests {
         std::fs::create_dir_all(config_dir.join("skills")).unwrap();
         write_skill(&config_dir.join("skills"), "shared", "Workspace Version");
         write_project_skill(&project_dir, "shared", "Project Version");
+        crate::config::trust_for_test(&config_dir, &project_dir, "cairn");
 
         let rendered = render_collection(&config_dir, Some(&project_dir));
         // Project version wins and links project-scoped.

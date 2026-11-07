@@ -7,9 +7,10 @@
 //! informational note rather than a mutation, because recipes own no mutation and
 //! the collection is not tied to a specific issue.
 
-use std::collections::BTreeMap;
+use cairn_config::library::{self, LibraryKind, LibraryRoots, Listed};
 use std::path::PathBuf;
 
+use super::library_listing::{origin_lines, render_collection, Links};
 use crate::config::recipes::{self as config_recipes, FileRecipe};
 use crate::config::ConfigResult;
 use crate::mcp::handlers::skills_resources::{current_run_project, project_path_by_key};
@@ -17,24 +18,39 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::{build_project_recipe_uri, build_recipe_uri};
 
-fn scope_label(recipe: &FileRecipe) -> &'static str {
-    if recipe.is_project_scoped {
-        "project"
-    } else {
-        "workspace"
-    }
-}
+const LINKS: Links = Links {
+    bare: build_recipe_uri,
+    project: build_project_recipe_uri,
+};
 
-/// Canonical URI for a recipe: project-scoped when it lives in a project, else workspace.
-fn recipe_link(recipe: &FileRecipe, project_key: Option<&str>) -> String {
-    if recipe.is_project_scoped {
-        match project_key {
-            Some(project) => build_project_recipe_uri(project, &recipe.recipe.id),
-            None => build_recipe_uri(&recipe.recipe.id),
-        }
-    } else {
-        build_recipe_uri(&recipe.recipe.id)
-    }
+/// The rows a project's contextual-package policy selects, rendered.
+fn render_rows(
+    rows: Vec<Listed<FileRecipe>>,
+    project_key: Option<&str>,
+    project_only: bool,
+    policy: &crate::config::contextual_packages::ContextualPackagesConfig,
+) -> String {
+    let rows = rows
+        .into_iter()
+        .filter(|row| match &row.entry {
+            ConfigResult::Ok(recipe) => policy.is_selected(
+                crate::config::contextual_packages::ContextualPackageKind::Recipe,
+                &row.name,
+                &recipe.bundles,
+            ),
+            ConfigResult::Err { .. } => true,
+        })
+        .collect();
+    render_collection(
+        "Recipes",
+        "recipe",
+        LibraryKind::Recipe,
+        rows,
+        project_key,
+        project_only,
+        &LINKS,
+        |recipe: &FileRecipe| recipe.recipe.name.clone(),
+    )
 }
 
 /// Resolve the project key + repo path for the requested scope.
@@ -72,53 +88,21 @@ pub(crate) async fn read_recipes_collection(
         Err(e) => return e,
     };
 
-    let recipes = match config_recipes::list_recipes(&orch.config_dir, project_path.as_deref()) {
-        Ok(recipes) => recipes,
+    let rows = match config_recipes::list_recipe_rows(&LibraryRoots::at(
+        &orch.config_dir,
+        project_path.as_deref(),
+    )) {
+        Ok(rows) => rows,
         Err(e) => return format!("Error listing recipes: {e}"),
     };
-
-    // Project shadows workspace by id; sort by id for deterministic output.
-    let mut by_id: BTreeMap<String, FileRecipe> = BTreeMap::new();
-    for result in recipes {
-        if let ConfigResult::Ok(recipe) = result {
-            // config_root_subdirs yields project first, so keep the first
-            // occurrence: project shadows workspace by id.
-            by_id.entry(recipe.recipe.id.clone()).or_insert(recipe);
-        }
-    }
     let policy =
         crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
-    by_id.retain(|id, recipe| {
-        policy.is_selected(
-            crate::config::contextual_packages::ContextualPackageKind::Recipe,
-            id,
-            &recipe.bundles,
-        )
-    });
-
-    let header = match project_key.as_deref() {
-        Some(key) => format!("# Recipes — {key} context\n\n"),
-        None => "# Recipes — workspace\n\n".to_string(),
-    };
-    let mut out = header;
-    out.push_str(&format!("{} recipe(s)\n\n", by_id.len()));
-
-    if by_id.is_empty() {
-        out.push_str("No recipes found.\n\n");
-    } else {
-        for recipe in by_id.values() {
-            out.push_str(&format!(
-                "- [{}]({}) [{}] — {}\n",
-                recipe.recipe.id,
-                recipe_link(recipe, project_key.as_deref()),
-                scope_label(recipe),
-                recipe.recipe.name,
-            ));
-        }
-        out.push('\n');
-    }
-
-    out
+    render_rows(
+        rows,
+        project_key.as_deref(),
+        explicit_project.is_some(),
+        &policy,
+    )
 }
 
 /// Render a single recipe as its full editable YAML source.
@@ -137,18 +121,23 @@ pub(crate) async fn read_recipe(
         Err(e) => return e,
     };
 
-    let recipe =
-        match config_recipes::get_recipe(&orch.config_dir, recipe_id, project_path.as_deref()) {
-            Ok(Some(recipe)) => recipe,
-            Ok(None) => return not_found(recipe_id, explicit_project),
-            Err(e) => return format!("Error loading recipe: {e}"),
-        };
+    let resolved = match config_recipes::resolve_recipe(
+        &LibraryRoots::at(&orch.config_dir, project_path.as_deref()),
+        recipe_id,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) if error.is_not_found() => return not_found(recipe_id, explicit_project),
+        // Untrusted, unconfirmed, colliding or unreadable: the refusal names
+        // the definition and what the operator does about it.
+        Err(error) => return format!("{error}\n"),
+    };
 
     // Explicit project scope is project-only: never silently resolve a shared
     // workspace recipe behind an explicit project URI.
-    if explicit_project.is_some() && !recipe.is_project_scoped {
+    if explicit_project.is_some() && !resolved.origin.is_project() {
         return not_found(recipe_id, explicit_project);
     }
+    let recipe = &resolved.item;
     let policy =
         crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
     if !policy.is_selected(
@@ -177,7 +166,7 @@ pub(crate) async fn read_recipe(
         None => None,
     };
     let diagnostics = orch.decision_diagnostics(&recipe.recipe.nodes, project_id.as_deref());
-    render_recipe_full_source(&recipe, &source, &diagnostics)
+    render_recipe_full_source(&resolved, &source, &diagnostics)
 }
 
 /// Render the recipe header, what its decision nodes need, and its verbatim
@@ -186,15 +175,21 @@ pub(crate) async fn read_recipe(
 /// so a targeted `patch` (`old_string`/`new_string`) can match against what
 /// the reader sees.
 fn render_recipe_full_source(
-    recipe: &FileRecipe,
+    resolved: &library::Resolved<FileRecipe>,
     source: &str,
     diagnostics: &[crate::orchestrator::DecisionDiagnostic],
 ) -> String {
+    let recipe = &resolved.item;
     let mut out = format!(
-        "# Recipe `{}` — {}\n\n[{}]\n\n",
+        "# Recipe `{}` — {}\n\n{}\n",
         recipe.recipe.id,
         recipe.recipe.name,
-        scope_label(recipe),
+        origin_lines(
+            LibraryKind::Recipe,
+            &recipe.recipe.id,
+            &resolved.origin,
+            &resolved.shadows
+        ),
     );
     if !diagnostics.is_empty() {
         out.push_str("## decisions\n\n");
@@ -227,6 +222,8 @@ fn not_found(recipe_id: &str, explicit_project: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use cairn_config::library::{LibraryRoots, Origin};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -248,27 +245,15 @@ mod tests {
         std::fs::write(recipes_dir.join(format!("{id}.yaml")), content).unwrap();
     }
 
-    /// Render the collection directly from loaded recipes, bypassing run-context
+    /// Render the collection directly from listed rows, bypassing run-context
     /// resolution (which needs a DB). Mirrors `read_recipes_collection`'s body.
-    fn render_collection(config_dir: &Path, project_path: Option<&Path>) -> String {
-        let recipes = config_recipes::list_recipes(config_dir, project_path).unwrap();
-        let mut by_id: BTreeMap<String, FileRecipe> = BTreeMap::new();
-        for result in recipes {
-            if let ConfigResult::Ok(recipe) = result {
-                by_id.entry(recipe.recipe.id.clone()).or_insert(recipe);
-            }
-        }
-        let mut out = String::new();
-        for recipe in by_id.values() {
-            out.push_str(&format!(
-                "- [{}]({}) [{}] — {}\n",
-                recipe.recipe.id,
-                recipe_link(recipe, Some("cairn")),
-                scope_label(recipe),
-                recipe.recipe.name,
-            ));
-        }
-        out
+    fn render(roots: &LibraryRoots) -> String {
+        render_rows(
+            config_recipes::list_recipe_rows(roots).unwrap(),
+            Some("cairn"),
+            false,
+            &crate::config::contextual_packages::load_contextual_packages(None),
+        )
     }
 
     #[test]
@@ -277,13 +262,16 @@ mod tests {
         write_recipe(temp.path(), "build", "Build Flow");
         write_recipe(temp.path(), "planbuild", "Plan and Build");
 
-        let rendered = render_collection(temp.path(), None);
-        assert!(rendered.contains("- [build](cairn://recipes/build) [workspace] — Build Flow"));
+        let rendered = render(&LibraryRoots::workspace(temp.path()));
+        assert!(
+            rendered.contains("- [build](cairn://recipes/build) [~] — Build Flow"),
+            "{rendered}"
+        );
         assert!(rendered.contains("planbuild"));
     }
 
     #[test]
-    fn project_recipe_shadows_workspace_by_id() {
+    fn a_trusted_project_recipe_shadows_the_workspace_s_by_id() {
         let temp = tempdir().unwrap();
         let config_dir = temp.path().join("config");
         let project_dir = temp.path().join("project");
@@ -291,11 +279,17 @@ mod tests {
         write_recipe(&config_dir, "shared", "Workspace Version");
         write_project_recipe(&project_dir, "shared", "Project Version");
 
-        let rendered = render_collection(&config_dir, Some(&project_dir));
+        let rendered = render(&crate::config::trusted_roots(&config_dir, &project_dir));
         // Project version wins and links project-scoped.
-        assert!(rendered.contains("cairn://p/cairn/recipes/shared"));
-        assert!(rendered.contains("[project] — Project Version"));
-        assert!(!rendered.contains("Workspace Version"));
+        assert!(
+            rendered.contains("cairn://p/cairn/recipes/shared"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("[@, shadows ~] — Project Version"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Workspace Version"), "{rendered}");
     }
 
     #[test]
@@ -303,13 +297,13 @@ mod tests {
         let temp = tempdir().unwrap();
         write_recipe(temp.path(), "build", "Build Flow");
 
-        let recipe = config_recipes::get_recipe(temp.path(), "build", None)
+        let recipe = config_recipes::get_recipe(&LibraryRoots::workspace(temp.path()), "build")
             .unwrap()
             .unwrap();
         // Validate the fields the renderer reads; no default flag is surfaced.
         assert_eq!(recipe.recipe.name, "Build Flow");
         assert_eq!(recipe.recipe.trigger.to_string(), "manual");
-        assert!(!recipe.is_project_scoped);
+        assert!(!recipe.is_project_scoped());
     }
 
     #[test]
@@ -322,13 +316,16 @@ mod tests {
         // Only a workspace recipe exists; project scope must not resolve it.
         write_recipe(&config_dir, "ws-only", "Workspace Only");
 
-        let recipe = config_recipes::get_recipe(&config_dir, "ws-only", Some(&project_dir))
-            .unwrap()
-            .unwrap();
+        let recipe = config_recipes::get_recipe(
+            &LibraryRoots::at(&config_dir, Some(&project_dir)),
+            "ws-only",
+        )
+        .unwrap()
+        .unwrap();
         // The loader returns the workspace recipe (project-first then workspace),
         // but explicit project scope rejects a non-project-scoped match.
-        assert!(!recipe.is_project_scoped);
-        let rejected = recipe.is_project_scoped; // mirrors read_recipe's guard
+        assert!(!recipe.is_project_scoped());
+        let rejected = recipe.is_project_scoped(); // mirrors read_recipe's guard
         assert!(!rejected);
     }
 
@@ -337,10 +334,9 @@ mod tests {
         let temp = tempdir().unwrap();
         write_recipe(temp.path(), "build", "Build Flow");
 
-        let recipe = config_recipes::get_recipe(temp.path(), "build", None)
-            .unwrap()
-            .unwrap();
-        let source = std::fs::read_to_string(&recipe.file_path).unwrap();
+        let recipe =
+            config_recipes::resolve_recipe(&LibraryRoots::workspace(temp.path()), "build").unwrap();
+        let source = std::fs::read_to_string(&recipe.item.file_path).unwrap();
         let rendered = render_recipe_full_source(&recipe, &source, &[]);
         assert!(!rendered.contains("## decisions"));
 
@@ -359,9 +355,9 @@ mod tests {
         ));
         assert!(reported.find("## decisions") < reported.find("## source"));
 
-        // Header still names the recipe and scope.
+        // Header still names the recipe and where it resolves from.
         assert!(rendered.contains("# Recipe `build` — Build Flow"));
-        assert!(rendered.contains("[workspace]"));
+        assert!(rendered.contains("Origin: ~\n"), "{rendered}");
         // The full editable YAML document is present, not a metadata summary.
         assert!(rendered.contains("## source"));
         assert!(rendered.contains("cairnVersion: 1"));
@@ -373,7 +369,8 @@ mod tests {
     #[test]
     fn missing_recipe_id_not_found() {
         let temp = tempdir().unwrap();
-        let missing = config_recipes::get_recipe(temp.path(), "nope", None).unwrap();
+        let missing =
+            config_recipes::get_recipe(&LibraryRoots::workspace(temp.path()), "nope").unwrap();
         assert!(missing.is_none());
         assert_eq!(not_found("nope", None), "Recipe not found: nope");
         assert_eq!(

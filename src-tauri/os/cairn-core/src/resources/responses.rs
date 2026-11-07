@@ -7,6 +7,7 @@ use crate::{
     orchestrator::Orchestrator,
 };
 use cairn_common::uri::*;
+use cairn_config::library::LibraryRoots;
 use std::{collections::BTreeMap, path::PathBuf};
 async fn history_scope(o: &Orchestrator, project: Option<&str>) -> Result<String, String> {
     let Some(project) = project else {
@@ -49,7 +50,7 @@ pub(crate) async fn collection(
         Ok(x) => x,
         Err(e) => return e,
     };
-    let list = match cfg::list_responses(&o.config_dir, path.as_deref()) {
+    let list = match cfg::list_responses(&LibraryRoots::at(&o.config_dir, path.as_deref())) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -71,7 +72,7 @@ pub(crate) async fn collection(
     for x in map.values() {
         let scope_key = history_scope(
             o,
-            if x.is_project_scoped {
+            if x.is_project_scoped() {
                 k.as_deref()
             } else {
                 None
@@ -82,7 +83,7 @@ pub(crate) async fn collection(
         let n = cairn_db::storage::count_response_invocations(&o.db.local, &scope_key, &x.id)
             .await
             .unwrap_or(0);
-        let u = if x.is_project_scoped {
+        let u = if x.is_project_scoped() {
             k.as_deref()
                 .map(|k| build_project_response_uri(k, &x.id))
                 .unwrap_or_else(|| build_response_uri(&x.id))
@@ -104,7 +105,7 @@ pub(crate) async fn collection(
             "- [{}]({}) [{}] — {} · {} · {} · {} recent invocation(s)\n",
             x.id,
             u,
-            if x.is_project_scoped {
+            if x.is_project_scoped() {
                 "project"
             } else {
                 "workspace"
@@ -145,13 +146,13 @@ pub(crate) async fn member(
         Ok(x) => x,
         Err(e) => return e,
     };
-    let x = match cfg::get_response(&o.config_dir, id, path.as_deref()) {
-        Ok(Some(x)) if p.is_none() || x.is_project_scoped => x,
+    let x = match cfg::get_response(&LibraryRoots::at(&o.config_dir, path.as_deref()), id) {
+        Ok(Some(x)) if p.is_none() || x.is_project_scoped() => x,
         Ok(_) => return format!("Response not found: {id}"),
         Err(e) => return e,
     };
     let d = &x.definition;
-    let h = if x.is_project_scoped {
+    let h = if x.is_project_scoped() {
         k.as_deref()
             .map(|k| build_project_response_history_uri(k, id))
             .unwrap_or_else(|| build_response_history_uri(id))
@@ -175,10 +176,10 @@ pub(crate) async fn member(
     };
     let output = serde_json::to_string(&d.output).unwrap_or_else(|_| "text".into());
     let selection = format!("models: {}", allotment_text(d.models.as_deref()));
-    let mut out=format!("# Response {} — {}\n\n{}\n\n- {}\n- timeout: {}\n- variables: {}\n- output: `{}`\n- few-shot examples: {}\n- history: [{}]({})\n\n## prompt\n\n{}\n\n## recent history\n\n",id,d.name,d.description,selection,format!("{}s",d.timeout.as_secs()),variables,output,d.examples.len(),h,h,d.template);
+    let mut out=format!("# Response {} — {}\n\n{}\n\n- {}\n- timeout: {}s\n- variables: {}\n- output: `{}`\n- few-shot examples: {}\n- history: [{}]({})\n\n## prompt\n\n{}\n\n## recent history\n\n",id,d.name,d.description,selection,d.timeout.as_secs(),variables,output,d.examples.len(),h,h,d.template);
     let scope_key = history_scope(
         o,
-        if x.is_project_scoped {
+        if x.is_project_scoped() {
             k.as_deref()
         } else {
             None

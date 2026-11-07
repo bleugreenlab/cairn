@@ -21,7 +21,7 @@ use super::declaration::{
     ServicePackage, ServiceSource, MANIFEST_FILE, PACK_SERVICES_DIR,
 };
 use cairn_config::fleet::MachineServiceKey;
-use cairn_packs::{ContentHash, PackItemKind};
+use cairn_packs::PackItemKind;
 
 /// One installed pack's service declarations.
 pub(crate) struct PackServiceSource {
@@ -113,19 +113,6 @@ fn installed_lock(config_dir: &Path, pack: &str) -> Option<cairn_packs::PackLock
     cairn_packs::lock::read_lock(config_dir, pack)
 }
 
-/// Whether a service's materialized copy has moved from its baseline since the
-/// last sync, which is the same fact the catalog reports as the user's copy.
-fn copy_was_edited(config_dir: &Path, item: &cairn_packs::PackLockItem) -> bool {
-    let (Some(path), Some(_)) = (&item.path, &item.content_hash) else {
-        return false;
-    };
-    match cairn_packs::hash_item_path(item.kind, config_dir, &config_dir.join(path)) {
-        // A missing copy holds no edit; the next sync puts it back.
-        Ok(ContentHash::Missing) | Err(_) => false,
-        Ok(current) => !cairn_packs::matches_baseline(config_dir, item, &current).unwrap_or(false),
-    }
-}
-
 /// Where an installed pack's source tree is on this machine.
 fn source_root(config_dir: &Path, lock: &cairn_packs::PackLock) -> Option<PathBuf> {
     match lock.source.kind {
@@ -197,16 +184,10 @@ impl ServiceSource for PackServiceSource {
         .map(Some)
     }
 
-    fn refusal(&self, id: &str) -> Option<String> {
-        let (config_dir, lock) = self.installed.as_ref()?;
-        let item = lock.item(PackItemKind::Service, id)?;
-        (item.forked || copy_was_edited(config_dir, item)).then(|| {
-            format!(
-                "`{PACK_SERVICES_DIR}/{id}/{MANIFEST_FILE}` was edited; a machine service runs \
-                 only its shipped declaration. Reset it to the pack version, or set a per-machine \
-                 override."
-            )
-        })
+    /// A pack's service runs from the app bundle's own declaration, which
+    /// nothing in the workspace can edit, so its artifact is never refused.
+    fn refusal(&self, _id: &str) -> Option<String> {
+        None
     }
 }
 
@@ -380,38 +361,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (home, _) = installed_pack(dir.path(), AXON);
         assert!(declared_machine_service(&home, &key()).is_some());
+        assert!(
+            !home.join("services/probe").exists(),
+            "a service is never mirrored into the workspace"
+        );
 
-        std::fs::remove_dir_all(home.join("services/probe")).unwrap();
         cairn_packs::note_removed_item(&home, PackItemKind::Service, "probe");
         assert!(declared_machine_service(&home, &key()).is_none());
         let source = PackServiceSource::open(&home, "kit");
         assert!(source.list().unwrap().is_empty());
         assert!(source.package("probe").unwrap().is_none());
-    }
-
-    /// The copy is a tripwire, not what runs: the shipped declaration stays
-    /// readable, which is what an override runs, and the artifact is refused
-    /// from the moment of the edit rather than from the next sync.
-    #[test]
-    fn an_edited_copy_refuses_the_artifact_and_names_both_ways_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let (home, _) = installed_pack(dir.path(), AXON);
-        assert!(declared_machine_service(&home, &key())
-            .unwrap()
-            .refusal
-            .is_none());
-
-        std::fs::write(home.join("services/probe/service.yaml"), "name: Mine\n").unwrap();
-        let declared = declared_machine_service(&home, &key()).unwrap();
-        assert_eq!(
-            declared.refusal.as_deref(),
-            Some(
-                "`services/probe/service.yaml` was edited; a machine service runs only its shipped \
-                 declaration. Reset it to the pack version, or set a per-machine override."
-            )
-        );
-        let package = declared.package.expect("the shipped declaration is intact");
-        assert_eq!(package.declaration.native().unwrap().version, "0.3.6");
     }
 
     #[test]

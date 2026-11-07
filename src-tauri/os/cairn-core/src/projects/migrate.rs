@@ -114,6 +114,17 @@ pub(super) const CHANNEL_KEY_ADDRESSED: &[KeyAddressedSpec] = &[
         table: "discord_surface",
         sweep_where_sql: "project_key = ?1",
     },
+    // The operator's trust in the project's library definitions, confirmations
+    // first. Trust is per checkout on this install, so a deleted or moved
+    // project carries none of it along.
+    KeyAddressedSpec {
+        table: "project_library_confirmations",
+        sweep_where_sql: "project_id IN (SELECT project_id FROM project_library_trust WHERE lower(project_key) = ?1)",
+    },
+    KeyAddressedSpec {
+        table: "project_library_trust",
+        sweep_where_sql: "lower(project_key) = ?1",
+    },
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +140,12 @@ impl BlockingJob {
     /// A short, user-facing label for one blocking item, e.g. `issue #12 · builder`
     /// or `job 1a2b3c4d (advancing)` when no issue backs it.
     fn label(&self) -> String {
+        if self.status == INCIDENT_SOURCES_STATUS {
+            return self
+                .node_name
+                .clone()
+                .unwrap_or_else(|| "pending main incident sources".into());
+        }
         let mut label = match self.issue_number {
             Some(number) => format!("issue #{number}"),
             None => format!("job {}", &self.id[..self.id.len().min(8)]),
@@ -147,6 +164,7 @@ impl BlockingJob {
 /// Synthetic `BlockingJob::status` for an execution with undelivered DAG
 /// advancement (an outbox row, not a job). Distinguishes it in the surfaced list.
 const ADVANCING_STATUS: &str = "advancing";
+const INCIDENT_SOURCES_STATUS: &str = "incident-sources";
 
 impl std::fmt::Display for MoveProjectGateFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -347,6 +365,9 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     owned("wake_schedules", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     owned("wake_conditions", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     spec("issues", "project_id = ?1"),
+    spec("main_incident_budget", "project_id = ?1"),
+    spec("main_incidents", "project_id = ?1"),
+    spec("main_incident_evidence", "project_id = ?1"),
     spec("image_refs", "project_id = ?1"),
     delete_only("attachments", "project_id = ?1 OR thread_id IN (SELECT id FROM threads WHERE project_id = ?1)"),
     split_scope(
@@ -437,6 +458,8 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("memory_triage_issue_memories", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR memory_id IN (SELECT id FROM memories WHERE project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("search_outbox", "source_id = ?1 OR source_id IN (SELECT id FROM issues WHERE project_id = ?1) OR source_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR source_id IN (SELECT id FROM runs WHERE project_id = ?1) OR source_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
     delete_only("check_result_observations", "project_id = ?1"),
+    // Delete pending sources before observations so project removal bypasses their retention guard.
+    spec("main_incident_sources", "project_id = ?1"),
     delete_only("manual_check_handles", "project_id = ?1"),
     delete_only("check_test_results", "observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
     delete_only("check_observation_relabels", "project_id = ?1 OR observation_id IN (SELECT id FROM check_result_observations WHERE project_id = ?1)"),
@@ -702,7 +725,7 @@ async fn team_project_exists(db: &LocalDb, key: &str, expected_id: &str) -> Resu
 /// `docs/turn-process-recovery.md`). Gating on those rows made the feature
 /// unusable on any project that had ever done real work.
 ///
-/// Two populations are genuinely live and block:
+/// Three populations are genuinely live and block:
 ///
 /// 1. **Jobs with a live in-memory agent process.** `live_job_ids` is threaded
 ///    in from the caller's `Orchestrator::process_state`, because in-memory
@@ -724,6 +747,10 @@ async fn team_project_exists(db: &LocalDb, key: &str, expected_id: &str) -> Resu
 ///    advances an execution with no live process attached. A quiesced project
 ///    has none: the drain worker carries every advance to `done`, and startup
 ///    resets any `running` rows back to `pending` for replay.
+///
+/// 3. **Pending main incident sources** — replay still needs canonical check
+///    observations that do not copy into the destination. Drain source work
+///    before the move can sweep those observations away.
 async fn blocking_work(
     db: &LocalDb,
     project_id: &str,
@@ -736,6 +763,18 @@ async fn blocking_work(
         }
     }
     blocking.extend(advancing_executions(db, project_id).await?);
+    let source_count = db.query_one(
+        "SELECT COUNT(*) FROM main_incident_sources WHERE project_id=?1 AND processed_at IS NULL",
+        (project_id.to_string(),), |row| row.i64(0),
+    ).await?;
+    if source_count > 0 {
+        blocking.push(BlockingJob {
+            id: project_id.to_string(),
+            status: INCIDENT_SOURCES_STATUS.to_string(),
+            issue_number: None,
+            node_name: Some(format!("{source_count} pending main incident source(s)")),
+        });
+    }
     Ok(blocking)
 }
 
@@ -1841,6 +1880,7 @@ pub(super) mod tests {
                 "ambient_routing_feedback",
                 "channel_state_card",
                 "discord_surface",
+                "project_library_trust",
                 "project_routes"
             ]
         );
@@ -3438,6 +3478,38 @@ pub(super) mod tests {
             after.is_empty(),
             "a drained advance must not block, got {after:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn main_incident_sources_block_project_move_until_drained() {
+        let db = gate_db().await;
+        db.execute(
+            "INSERT INTO main_incident_sources(project_id,event_key,check_name,platform,created_at)
+             VALUES ('proj','source','rust','linux',1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let blocking = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].status, INCIDENT_SOURCES_STATUS);
+        assert!(blocking[0]
+            .label()
+            .contains("1 pending main incident source"));
+        assert!(blocking_work(&db, "unrelated", &HashSet::new())
+            .await
+            .unwrap()
+            .is_empty());
+        db.execute(
+            "UPDATE main_incident_sources SET processed_at=2 WHERE event_key='source'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(blocking_work(&db, "proj", &HashSet::new())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

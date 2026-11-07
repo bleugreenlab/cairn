@@ -10,8 +10,9 @@
 //!   main.ts           <- default script entry (overridable via `script:`)
 //! ```
 //!
-//! - Workspace-scoped: `~/.cairn/workflows/`
-//! - Project-scoped: `[project-dir]/.cairn/workflows/` (shadows workspace)
+//! One package per layer (`workflows/<id>/` in a project's `.cairn/`, the
+//! workspace, or an installed pack), resolved nearest-first through
+//! [`cairn_config::library`].
 //!
 //! This is the minimal package surface for the execution-side build: manifest +
 //! script entry, with the args JSON Schema validated at load. The fuller package
@@ -24,8 +25,13 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
+use cairn_config::library::{
+    self, LibraryItem, LibraryKind, LibraryRef, LibraryRoots, Listed, Origin, ResolveError,
+    Resolved,
+};
 use cairn_db::models::OutputSchema;
 
 use super::ConfigResult;
@@ -126,71 +132,153 @@ pub struct FileWorkflow {
     pub output: Option<OutputSchema>,
     /// Whether the workflow inherits the caller's branch (default `none`).
     pub branch: WorkflowBranchMode,
-    pub is_project_scoped: bool,
+    /// The layer this workflow was read from, or the layer a new one is for.
+    pub origin: Origin,
     /// Path to the package directory.
     pub dir_path: PathBuf,
     /// Absolute path to the resolved script entry (`dir_path/script`).
     pub script_path: PathBuf,
 }
 
-/// List all workflow packages from the workspace and project config dirs.
-///
-/// A directory qualifies as a workflow package if it contains a `workflow.yaml`.
-/// Project-scoped packages are listed before workspace ones (project shadows
-/// workspace, matching skills/agents/recipes).
-pub fn list_workflows(
-    config_dir: &Path,
-    project_path: Option<&Path>,
-) -> Result<Vec<ConfigResult<FileWorkflow>>, String> {
-    let mut results = vec![];
-    for (dir, is_project_scoped) in
-        super::config_root_subdirs(config_dir, project_path, "workflows")
-    {
-        if dir.exists() && dir.is_dir() {
-            scan_workflows_dir(&dir, is_project_scoped, &mut results)?;
-        }
+impl FileWorkflow {
+    pub fn is_project_scoped(&self) -> bool {
+        self.origin.is_project()
     }
-    Ok(results)
 }
 
-fn scan_workflows_dir(
+/// A workflow's authority is the code it runs on this machine and whether
+/// that code gets the caller's branch. The manifest's name, description and
+/// schemas are prose and shape, so the package is hashed without it.
+impl LibraryItem for FileWorkflow {
+    fn library_id(&self) -> &str {
+        &self.id
+    }
+
+    /// Every field is named below, so one added to `FileWorkflow` does not
+    /// compile until it is classified.
+    fn authority(&self) -> Map<String, Value> {
+        let FileWorkflow {
+            id: _,
+            // Prose.
+            name: _,
+            description: _,
+            script,
+            // The shape of what it is handed and what it returns.
+            args_schema: _,
+            output: _,
+            branch,
+            origin: _,
+            // The package whose code is hashed below.
+            dir_path,
+            // Derived from `dir_path` and `script`.
+            script_path: _,
+        } = self;
+        let mut fields = Map::new();
+        fields.insert("script".into(), json!(script));
+        fields.insert("code".into(), json!(package_code_hash(dir_path)));
+        fields.insert("branch".into(), json!(branch.as_str()));
+        fields
+    }
+}
+
+/// The hash of every file in a workflow package but its manifest.
+fn package_code_hash(dir: &Path) -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let files = match cairn_platform::services::guarded_tree_files(dir) {
+        Ok(files) => files,
+        // An unreadable package never matches a confirmation.
+        Err(error) => return format!("unreadable: {error}"),
+    };
+    for file in files {
+        let relative = file.relative_path.to_string_lossy().replace('\\', "/");
+        if relative == MANIFEST_FILE || cairn_packs::is_os_metadata_path(&file.relative_path) {
+            continue;
+        }
+        let hash = std::fs::read(&file.resolved_path)
+            .map(|bytes| cairn_packs::sha256_bytes(&bytes))
+            .unwrap_or_else(|error| format!("unreadable: {error}"));
+        entries.push((relative, hash));
+    }
+    entries.sort();
+    cairn_packs::sha256_bytes(
+        entries
+            .iter()
+            .map(|(path, hash)| format!("{path}\0{hash}\n"))
+            .collect::<String>()
+            .as_bytes(),
+    )
+}
+
+fn load_workflow_in(dir: &Path, id: &str, origin: &Origin) -> Option<ConfigResult<FileWorkflow>> {
+    let dir_path = dir.join(id);
+    dir_path
+        .join(MANIFEST_FILE)
+        .exists()
+        .then(|| load_workflow_dir(&dir_path, origin.clone()))
+}
+
+fn enumerate_workflows(
     dir: &Path,
-    is_project_scoped: bool,
-    results: &mut Vec<ConfigResult<FileWorkflow>>,
-) -> Result<(), String> {
+    origin: &Origin,
+) -> Result<Vec<(String, ConfigResult<FileWorkflow>)>, String> {
     let entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("Failed to read workflows directory: {}", e))?
         .filter_map(|e| e.ok())
         .collect();
-
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_dir() && path.join(MANIFEST_FILE).exists() {
-            results.push(load_workflow_dir(&path, is_project_scoped));
-        }
-    }
-    Ok(())
+    Ok(entries
+        .iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(MANIFEST_FILE).exists())
+        .filter_map(|path| {
+            let id = path.file_name()?.to_str()?.to_string();
+            Some((id, load_workflow_dir(&path, origin.clone())))
+        })
+        .collect())
 }
 
-/// Get a specific workflow package by id. Project scope shadows workspace: the
-/// first matching package (project, then workspace) wins.
-pub fn get_workflow(
-    config_dir: &Path,
-    id: &str,
-    project_path: Option<&Path>,
-) -> Result<Option<FileWorkflow>, String> {
-    for (workflows_dir, is_project_scoped) in
-        super::config_root_subdirs(config_dir, project_path, "workflows")
-    {
-        let dir_path = workflows_dir.join(id);
-        if dir_path.join(MANIFEST_FILE).exists() {
-            return match load_workflow_dir(&dir_path, is_project_scoped) {
-                ConfigResult::Ok(workflow) => Ok(Some(workflow)),
-                ConfigResult::Err { error, .. } => Err(error),
-            };
+/// Every workflow package across the layers, with its origin and what it
+/// shadows. A directory qualifies if it contains a `workflow.yaml`.
+pub fn list_workflow_rows(roots: &LibraryRoots) -> Result<Vec<Listed<FileWorkflow>>, String> {
+    roots.list(LibraryKind::Workflow, enumerate_workflows)
+}
+
+/// The workflows in force, one per name.
+pub fn list_workflows(roots: &LibraryRoots) -> Result<Vec<ConfigResult<FileWorkflow>>, String> {
+    Ok(library::active(list_workflow_rows(roots)?))
+}
+
+/// Resolve a workflow reference (an id or
+/// `cairn://packs/<pack>/workflows/<id>`) nearest-first.
+pub fn resolve_workflow(
+    roots: &LibraryRoots,
+    reference: &str,
+) -> Result<Resolved<FileWorkflow>, ResolveError> {
+    let parsed = LibraryRef::parse(LibraryKind::Workflow, reference).map_err(|error| {
+        ResolveError::Invalid {
+            path: PathBuf::new(),
+            error,
+            origin: None,
         }
+    })?;
+    roots.resolve(LibraryKind::Workflow, &parsed, load_workflow_in)
+}
+
+/// Resolve workflow `id` in one layer only (see [`LibraryRoots::resolve_in`]).
+pub fn resolve_workflow_in(
+    roots: &LibraryRoots,
+    layer: &Origin,
+    id: &str,
+) -> Result<Resolved<FileWorkflow>, ResolveError> {
+    roots.resolve_in(LibraryKind::Workflow, layer, id, load_workflow_in)
+}
+
+/// The workflow a reference resolves to, `None` when nothing defines it.
+pub fn get_workflow(roots: &LibraryRoots, id: &str) -> Result<Option<FileWorkflow>, String> {
+    match resolve_workflow(roots, id) {
+        Ok(resolved) => Ok(Some(resolved.item)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error.to_string()),
     }
-    Ok(None)
 }
 
 /// Parse and validate a `workflow.yaml` manifest string. This is the single
@@ -223,7 +311,8 @@ pub struct SaveWorkflowSpec<'a> {
     pub args_schema: Option<&'a serde_json::Value>,
     pub output: Option<&'a OutputSchema>,
     pub script_content: &'a str,
-    pub is_project_scoped: bool,
+    /// The layer to write the package into: the workspace or a project.
+    pub layer: &'a Origin,
 }
 
 /// Write a workflow package (`workflow.yaml` + the script entry) to the resolved
@@ -231,11 +320,7 @@ pub struct SaveWorkflowSpec<'a> {
 /// BEFORE anything is written, so an invalid args schema is a save error rather
 /// than a corrupt package on disk (a re-save of an existing package is never left
 /// half-written). Returns the package directory path.
-pub fn save_workflow(
-    config_dir: &Path,
-    spec: &SaveWorkflowSpec,
-    project_path: Option<&Path>,
-) -> Result<PathBuf, String> {
+pub fn save_workflow(roots: &LibraryRoots, spec: &SaveWorkflowSpec) -> Result<PathBuf, String> {
     if spec.id.trim().is_empty() {
         return Err("Workflow id must not be empty".to_string());
     }
@@ -250,12 +335,16 @@ pub fn save_workflow(
         return Err(format!("Script entry must be a plain filename: {script}"));
     }
 
-    let workflows_dir = if spec.is_project_scoped {
-        let proj = project_path.ok_or("Project path required for project-scoped workflow")?;
-        proj.join(".cairn").join("workflows")
-    } else {
-        config_dir.join("workflows")
-    };
+    if let Origin::Pack { id: pack } = spec.layer {
+        return Err(library::pack_edit_refusal(
+            LibraryKind::Workflow,
+            spec.id,
+            pack,
+        ));
+    }
+    let workflows_dir = roots
+        .layer_dir(LibraryKind::Workflow, spec.layer)
+        .ok_or("Project path required for project-scoped workflow")?;
     let dir = workflows_dir.join(spec.id);
 
     let manifest_out = WorkflowManifestOut {
@@ -292,29 +381,48 @@ pub fn read_workflow_script(workflow: &FileWorkflow) -> Result<String, String> {
     })
 }
 
-/// Delete a workflow package directory. Project scope is removed first when a
-/// project path is given (mirrors skills), else the workspace copy.
+/// Delete the workflow `id` resolves to, or the one in `layer` when named. A
+/// workspace or project package is deleted outright; a pack's own workflow is
+/// recorded as removed from its pack. Returns the path that changed (`None`
+/// when nothing defined it).
 pub fn delete_workflow(
-    config_dir: &Path,
+    roots: &LibraryRoots,
     id: &str,
-    project_path: Option<&Path>,
-) -> Result<(), String> {
-    if let Some(proj) = project_path {
-        let dir = proj.join(".cairn").join("workflows").join(id);
-        if dir.is_dir() {
-            return std::fs::remove_dir_all(&dir)
-                .map_err(|e| format!("Failed to delete workflow directory: {e}"));
+    layer: Option<&Origin>,
+) -> Result<Option<PathBuf>, String> {
+    let (origin, dir) = match layer {
+        Some(origin @ (Origin::Project { .. } | Origin::Workspace)) => {
+            let dir = roots
+                .layer_dir(LibraryKind::Workflow, origin)
+                .ok_or_else(|| format!("No {origin} layer to delete workflow `{id}` from"))?
+                .join(id);
+            if !dir.is_dir() {
+                return Ok(None);
+            }
+            (origin.clone(), dir)
         }
-    }
-    let dir = config_dir.join("workflows").join(id);
-    if dir.is_dir() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("Failed to delete workflow directory: {e}"))?;
-        // Pack sync restores missing owned content, so record the removal
-        // before the next startup can put the workflow straight back.
-        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Workflow, id);
-    }
-    Ok(())
+        Some(origin) => match resolve_workflow_in(roots, origin, id) {
+            Ok(resolved) => (resolved.origin, resolved.item.dir_path),
+            Err(ResolveError::Invalid {
+                path,
+                origin: Some(origin),
+                ..
+            }) => (origin, path.parent().map(Path::to_path_buf).unwrap_or(path)),
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        },
+        None => match resolve_workflow(roots, id) {
+            Ok(resolved) => (resolved.origin, resolved.item.dir_path),
+            Err(ResolveError::Invalid {
+                path,
+                origin: Some(origin),
+                ..
+            }) => (origin, path.parent().map(Path::to_path_buf).unwrap_or(path)),
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        },
+    };
+    library::remove_definition(roots, LibraryKind::Workflow, id, &origin, &dir).map(Some)
 }
 
 /// Recursively copy a workflow package directory (manifest, script, and any
@@ -340,7 +448,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn load_workflow_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<FileWorkflow> {
+fn load_workflow_dir(dir_path: &Path, origin: Origin) -> ConfigResult<FileWorkflow> {
     let id = match dir_path.file_name().and_then(|n| n.to_str()) {
         Some(name) => name.to_string(),
         None => {
@@ -376,7 +484,29 @@ fn load_workflow_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<F
         .script
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_SCRIPT.to_string());
+    // The entry must be a file of this package. The confirmed authority of a
+    // workflow is the hash of its package directory, and execution uploads the
+    // entry's directory, so an entry outside the package (an absolute path, a
+    // `..` escape, or a symlink out) would run bytes no confirmation covered.
+    if script.contains('/') || script.contains('\\') || script.contains("..") {
+        return ConfigResult::Err {
+            path: manifest_path,
+            error: format!("Script entry must be a plain filename inside the package: {script}"),
+        };
+    }
     let script_path = dir_path.join(&script);
+    if let (Ok(entry), Ok(package)) = (script_path.canonicalize(), dir_path.canonicalize()) {
+        if entry.parent() != Some(package.as_path()) {
+            return ConfigResult::Err {
+                path: manifest_path,
+                error: format!(
+                    "Script entry {} resolves outside the package to {}",
+                    script,
+                    entry.display()
+                ),
+            };
+        }
+    }
 
     // A manifest that names (or defaults to) a script entry that does not exist
     // lists as valid but dies at runtime with module-not-found, after a workflow
@@ -397,7 +527,7 @@ fn load_workflow_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<F
         args_schema: manifest.args,
         output: manifest.output,
         branch: manifest.branch,
-        is_project_scoped,
+        origin,
         dir_path: dir_path.to_path_buf(),
         script_path,
     })
@@ -406,7 +536,41 @@ fn load_workflow_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<F
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use cairn_config::library::{LibraryRoots, Origin};
     use tempfile::tempdir;
+
+    /// An entry outside the package would run bytes the confirmed package hash
+    /// never covered, so the loader refuses it however it is spelled.
+    #[test]
+    fn a_script_entry_outside_the_package_is_refused() {
+        let temp = tempdir().unwrap();
+        let outside = temp.path().join("outside.ts");
+        std::fs::write(&outside, "// elsewhere\n").unwrap();
+        for script in [
+            "../outside.ts".to_string(),
+            outside.to_string_lossy().to_string(),
+            "sub/main.ts".to_string(),
+        ] {
+            let dir = temp.path().join("workflows").join("w");
+            let _ = std::fs::remove_dir_all(&dir);
+            write_workflow(&dir, &format!("name: W\nscript: {script}\n"));
+            assert!(
+                matches!(load_workflow_dir(&dir, Origin::Workspace), ConfigResult::Err { .. }),
+                "{script} must be refused"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let dir = temp.path().join("workflows").join("linked");
+            write_workflow(&dir, "name: L\nscript: entry.ts\n");
+            std::os::unix::fs::symlink(&outside, dir.join("entry.ts")).unwrap();
+            assert!(matches!(
+                load_workflow_dir(&dir, Origin::Workspace),
+                ConfigResult::Err { .. }
+            ));
+        }
+    }
 
     fn write_workflow(dir: &Path, manifest: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -424,7 +588,7 @@ mod tests {
             &dir,
             "name: Deep Research\ndescription: A quorum of researchers.\n",
         );
-        match load_workflow_dir(&dir, false) {
+        match load_workflow_dir(&dir, Origin::Workspace) {
             ConfigResult::Ok(w) => {
                 assert_eq!(w.id, "deep-research");
                 assert_eq!(w.name, "Deep Research");
@@ -443,7 +607,7 @@ mod tests {
         // Default when omitted.
         let none_dir = temp.path().join("workflows").join("research");
         write_workflow(&none_dir, "name: Research\ndescription: d\n");
-        match load_workflow_dir(&none_dir, false) {
+        match load_workflow_dir(&none_dir, Origin::Workspace) {
             ConfigResult::Ok(w) => assert_eq!(w.branch, WorkflowBranchMode::None),
             ConfigResult::Err { error, .. } => panic!("{error}"),
         }
@@ -453,7 +617,7 @@ mod tests {
             &inherit_dir,
             "name: Repo Reader\ndescription: d\nbranch: inherit\n",
         );
-        match load_workflow_dir(&inherit_dir, false) {
+        match load_workflow_dir(&inherit_dir, Origin::Workspace) {
             ConfigResult::Ok(w) => assert_eq!(w.branch, WorkflowBranchMode::Inherit),
             ConfigResult::Err { error, .. } => panic!("{error}"),
         }
@@ -468,7 +632,7 @@ mod tests {
             "name: WF\ndescription: d\nscript: run.ts\nargs:\n  type: object\n  properties:\n    topic:\n      type: string\n  required: [topic]\noutput: review\n",
         );
         std::fs::write(dir.join("run.ts"), "// run\n").unwrap();
-        match load_workflow_dir(&dir, false) {
+        match load_workflow_dir(&dir, Origin::Workspace) {
             ConfigResult::Ok(w) => {
                 assert_eq!(w.script, "run.ts");
                 let schema = w.args_schema.unwrap();
@@ -488,7 +652,7 @@ mod tests {
             &dir,
             "name: WF\ndescription: d\noutput:\n  type: object\n  properties:\n    score:\n      type: number\n  required: [score]\n",
         );
-        match load_workflow_dir(&dir, false) {
+        match load_workflow_dir(&dir, Origin::Workspace) {
             ConfigResult::Ok(w) => match w.output {
                 Some(OutputSchema::Custom(v)) => assert_eq!(v["type"], "object"),
                 other => panic!("expected custom output schema, got {other:?}"),
@@ -507,7 +671,7 @@ mod tests {
             "name: WF\ndescription: d\nargs:\n  type: string\n  pattern: \"(\"\n",
         );
         assert!(matches!(
-            load_workflow_dir(&dir, false),
+            load_workflow_dir(&dir, Origin::Workspace),
             ConfigResult::Err { .. }
         ));
     }
@@ -519,7 +683,7 @@ mod tests {
         write_workflow(&wd.join("valid"), "name: Valid\ndescription: d\n");
         std::fs::create_dir_all(wd.join("empty-dir")).unwrap();
 
-        let results = list_workflows(temp.path(), None).unwrap();
+        let results = list_workflows(&LibraryRoots::workspace(temp.path())).unwrap();
         assert_eq!(results.len(), 1);
         match &results[0] {
             ConfigResult::Ok(w) => assert_eq!(w.id, "valid"),
@@ -541,15 +705,19 @@ mod tests {
             "name: WF\ndescription: Project version\n",
         );
 
-        let w = get_workflow(cfg, "wf", Some(&proj)).unwrap().unwrap();
+        let w = get_workflow(&crate::config::trusted_roots(cfg, &proj), "wf")
+            .unwrap()
+            .unwrap();
         assert_eq!(w.description, "Project version");
-        assert!(w.is_project_scoped);
+        assert!(w.is_project_scoped());
     }
 
     #[test]
     fn get_workflow_missing_is_none() {
         let temp = tempdir().unwrap();
-        assert!(get_workflow(temp.path(), "nope", None).unwrap().is_none());
+        assert!(get_workflow(&LibraryRoots::workspace(temp.path()), "nope")
+            .unwrap()
+            .is_none());
     }
     /// The built-in `fan-out` workflow shipped in-repo under the `core` pack is
     /// seeded into every workspace when that pack installs (which it does on
@@ -563,7 +731,7 @@ mod tests {
             .join("../../packs/core/workflows/fan-out")
             .canonicalize()
             .expect("fan-out workflow ships in the core pack");
-        match load_workflow_dir(&dir, false) {
+        match load_workflow_dir(&dir, Origin::Workspace) {
             ConfigResult::Ok(w) => {
                 assert_eq!(w.id, "fan-out");
                 assert!(!w.description.trim().is_empty());
@@ -587,7 +755,7 @@ mod tests {
             .join("../../packs/core/workflows/inference-generate")
             .canonicalize()
             .expect("inference-generate ships in the core pack");
-        match load_workflow_dir(&dir, false) {
+        match load_workflow_dir(&dir, Origin::Workspace) {
             ConfigResult::Ok(w) => {
                 assert_eq!(w.id, crate::orchestrator::inference_generate::WORKFLOW);
                 assert_eq!(
@@ -614,7 +782,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Manifest only, no main.ts — the loader must reject this on discovery.
         std::fs::write(dir.join(MANIFEST_FILE), "name: No Script\ndescription: d\n").unwrap();
-        match load_workflow_dir(&dir, false) {
+        match load_workflow_dir(&dir, Origin::Workspace) {
             ConfigResult::Err { error, .. } => {
                 assert!(error.contains("Script entry not found"), "{error}")
             }
@@ -640,13 +808,15 @@ mod tests {
             args_schema: Some(&args),
             output: None,
             script_content: "export {};\n// hello\n",
-            is_project_scoped: false,
+            layer: &Origin::Workspace,
         };
-        let dir = save_workflow(cfg, &spec, None).unwrap();
+        let dir = save_workflow(&LibraryRoots::workspace(cfg), &spec).unwrap();
         assert!(dir.join(MANIFEST_FILE).exists());
         assert!(dir.join(DEFAULT_SCRIPT).exists());
 
-        let loaded = get_workflow(cfg, "greet", None).unwrap().unwrap();
+        let loaded = get_workflow(&LibraryRoots::workspace(cfg), "greet")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.name, "Greeter");
         assert_eq!(loaded.description, "Says hi");
         assert_eq!(loaded.branch, WorkflowBranchMode::Inherit);
@@ -672,9 +842,9 @@ mod tests {
             args_schema: Some(&bad),
             output: None,
             script_content: "x",
-            is_project_scoped: false,
+            layer: &Origin::Workspace,
         };
-        assert!(save_workflow(cfg, &spec, None).is_err());
+        assert!(save_workflow(&LibraryRoots::workspace(cfg), &spec).is_err());
         // Validation runs before any write, so nothing lands on disk.
         assert!(!cfg.join("workflows").join("bad").exists());
     }
@@ -691,9 +861,9 @@ mod tests {
             args_schema: None,
             output: None,
             script_content: "x",
-            is_project_scoped: false,
+            layer: &Origin::Workspace,
         };
-        assert!(save_workflow(temp.path(), &spec, None).is_err());
+        assert!(save_workflow(&LibraryRoots::workspace(temp.path()), &spec).is_err());
     }
 
     #[test]
@@ -709,11 +879,11 @@ mod tests {
             args_schema: None,
             output: None,
             script_content: "x",
-            is_project_scoped: false,
+            layer: &Origin::Workspace,
         };
-        save_workflow(cfg, &spec, None).unwrap();
+        save_workflow(&LibraryRoots::workspace(cfg), &spec).unwrap();
         assert!(cfg.join("workflows").join("gone").exists());
-        delete_workflow(cfg, "gone", None).unwrap();
+        delete_workflow(&LibraryRoots::workspace(cfg), "gone", None).unwrap();
         assert!(!cfg.join("workflows").join("gone").exists());
     }
 

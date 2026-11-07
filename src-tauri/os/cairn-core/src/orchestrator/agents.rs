@@ -3,6 +3,7 @@
 //! Consolidates scope resolution logic for agent configs:
 //! workspace-scoped (`~/.cairn/agents/`) vs project-scoped (`[project]/.cairn/agents/`).
 
+use cairn_config::library::{LibraryRoots, Origin};
 use std::path::{Path, PathBuf};
 
 use crate::config::{agents as config_agents, ConfigResult};
@@ -56,7 +57,7 @@ impl ConfigResource for AgentResource {
         config_dir: &Path,
         project_path: Option<&Path>,
     ) -> Result<Vec<ConfigResult<Self::File>>, String> {
-        config_agents::list_agents(config_dir, project_path)
+        config_agents::list_agents(&LibraryRoots::at(config_dir, project_path))
     }
 
     fn get_file(
@@ -64,23 +65,32 @@ impl ConfigResource for AgentResource {
         id: &str,
         project_path: Option<&Path>,
     ) -> Result<Option<Self::File>, String> {
-        config_agents::get_agent(config_dir, id, project_path)
+        config_agents::get_agent(&LibraryRoots::at(config_dir, project_path), id)
     }
 
     fn save_file(
         config_dir: &Path,
         file: &Self::File,
         project_path: Option<&Path>,
+        layer: Option<&Origin>,
     ) -> Result<PathBuf, String> {
-        config_agents::save_agent(config_dir, file, project_path)
+        config_agents::save_agent(&LibraryRoots::at(config_dir, project_path), file, layer)
     }
 
-    fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String> {
-        config_agents::delete_agent(config_dir, id, project_path)
+    fn delete_file(
+        config_dir: &Path,
+        id: &str,
+        project_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>, String> {
+        config_agents::delete_agent(&LibraryRoots::at(config_dir, project_path), id, None)
+    }
+
+    fn file_origin(file: &Self::File) -> Origin {
+        file.origin.clone()
     }
 
     fn file_is_project_scoped(file: &Self::File) -> bool {
-        file.is_project_scoped
+        file.is_project_scoped()
     }
 
     fn file_bundles(file: &Self::File) -> &[String] {
@@ -119,7 +129,7 @@ impl ConfigResource for AgentResource {
     fn build_create_file(
         input: Self::CreateInput,
         id: String,
-        is_project_scoped: bool,
+        origin: Origin,
         _now: i64,
     ) -> Self::File {
         config_agents::FileAgent {
@@ -140,7 +150,7 @@ impl ConfigResource for AgentResource {
             hooks: None,
             icon: input.icon,
             bundles: Vec::new(),
-            is_project_scoped,
+            origin,
             file_path: PathBuf::new(),
             seed_budget_tokens: None,
             seed_eras: None,
@@ -155,7 +165,7 @@ impl ConfigResource for AgentResource {
         let is_project_scoped = match (&input.workspace_id, &input.project_id) {
             (Some(Some(_)), _) => false,
             (_, Some(Some(_))) => true,
-            _ => existing.is_project_scoped,
+            _ => existing.is_project_scoped(),
         };
         let project_id = match &input.project_id {
             Some(Some(pid)) => Some(pid.clone()),
@@ -168,7 +178,7 @@ impl ConfigResource for AgentResource {
         existing: &Self::File,
         input: Self::UpdateInput,
         id: &str,
-        new_is_project_scoped: bool,
+        new_origin: Origin,
         scope_changing: bool,
         _now: i64,
     ) -> Self::File {
@@ -187,7 +197,7 @@ impl ConfigResource for AgentResource {
             hooks: existing.hooks.clone(),
             icon: merge_optional(&existing.icon, &input.icon),
             bundles: existing.bundles.clone(),
-            is_project_scoped: new_is_project_scoped,
+            origin: new_origin,
             file_path: if scope_changing {
                 PathBuf::new()
             } else {
@@ -221,7 +231,7 @@ impl ConfigResource for AgentResource {
     fn build_scoped_copy(
         source: &Self::File,
         id: &str,
-        is_project_scoped: bool,
+        origin: Origin,
         _workspace_id: Option<String>,
         _project_id: Option<String>,
         _now: i64,
@@ -239,7 +249,7 @@ impl ConfigResource for AgentResource {
             hooks: source.hooks.clone(),
             icon: source.icon.clone(),
             bundles: source.bundles.clone(),
-            is_project_scoped,
+            origin,
             file_path: PathBuf::new(),
             seed_budget_tokens: None,
             seed_eras: None,
@@ -254,8 +264,8 @@ impl ConfigResource for AgentResource {
         file.file_path.clone()
     }
 
-    fn stage_paths(primary_path: &Path) -> Vec<PathBuf> {
-        config_agents::agent_stage_paths(primary_path)
+    fn stage_paths(write_root: &Path, primary_path: &Path) -> Vec<PathBuf> {
+        config_agents::agent_stage_paths(&LibraryRoots::workspace(write_root), primary_path)
     }
 }
 
@@ -295,12 +305,26 @@ impl Orchestrator {
         target_project_id: Option<&str>,
         workspace_id: Option<&str>,
     ) -> Result<AgentConfig, String> {
+        self.update_agent_config_in_layer(id, input, target_project_id, workspace_id, None)
+    }
+
+    /// Update an agent, saving an edit to a pack's agent as the user's own
+    /// definition in `target_layer` (`workspace` or `project`).
+    pub fn update_agent_config_in_layer(
+        &self,
+        id: &str,
+        input: UpdateAgentConfig,
+        target_project_id: Option<&str>,
+        workspace_id: Option<&str>,
+        target_layer: Option<&str>,
+    ) -> Result<AgentConfig, String> {
         config_resource::update_config::<AgentResource>(
             self,
             id,
             input,
             target_project_id,
             workspace_id,
+            target_layer,
         )
     }
 
@@ -456,14 +480,14 @@ mod tests {
         agent.models.iter().map(ToString::to_string).collect()
     }
 
-    /// Acceptance for cairn/4993: pinning `models: [claude/opus]` / `icon: hammer`
-    /// on the shipped Build agent through the editor leaves `agents/build.md`
-    /// byte-identical and pack-owned with the pin in effect, and the next pack
-    /// update advances the prompt while the pin holds. A real body edit still
-    /// forks, and resetting that fork keeps the pin.
+    /// Acceptance for cairn/4993, read in place: pinning `models: [claude/opus]`
+    /// / `icon: hammer` on the shipped Build agent through the editor leaves the
+    /// pack's `agents/build.md` byte-identical with the pin in effect, and the
+    /// next pack update advances the prompt while the pin holds. A body edit is
+    /// refused unless it names a layer to define the agent in front of the
+    /// pack's, and pins apply over that definition too.
     #[tokio::test]
-    async fn a_pinned_allotment_keeps_a_shipped_agent_pack_owned_and_updating() {
-        use crate::config::pack::{self, lock as pack_lock, PackItemKind};
+    async fn a_pinned_allotment_keeps_a_shipped_agent_updating_in_place() {
         use crate::services::{RealFileSystem, RealGitClient};
         use crate::workspace::bundle::sync_workspace_packs;
 
@@ -490,14 +514,7 @@ mod tests {
             sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &home, "1.0.0")
                 .unwrap()
         };
-        let forked = || {
-            pack_lock::read_lock(&home, "core")
-                .unwrap()
-                .item(PackItemKind::Agent, "build")
-                .unwrap()
-                .forked
-        };
-        let file = || std::fs::read_to_string(home.join("agents/build.md")).unwrap();
+        let file = || std::fs::read_to_string(home.join("packs/core/agents/build.md")).unwrap();
 
         ship("# Implementation Mode\n\nPrompt v1.");
         sync();
@@ -513,12 +530,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(file(), shipped_v1, "a pin must not touch the agent file");
+        assert_eq!(file(), shipped_v1, "a pin must not touch the pack's file");
+        assert!(
+            !home.join("agents/build.md").exists(),
+            "nor create a definition"
+        );
         let pinned = orch.get_agent_config("build", None).unwrap().unwrap();
         assert_eq!(named(&pinned), ["claude/opus"]);
         assert_eq!(pinned.icon.as_deref(), Some("hammer"));
-        sync();
-        assert!(!forked(), "the pinned agent stays pack-owned");
 
         ship("# Implementation Mode\n\nPrompt v2.");
         sync();
@@ -528,39 +547,20 @@ mod tests {
             "the pack update lands"
         );
         assert_eq!(named(&updated), ["claude/opus"]);
-        assert!(!forked());
 
-        // A body edit is a real fork; the pin stays in its own layer.
+        // A body edit of the pack's agent is refused without a layer.
         let mut edit = editor_pin_update(&updated, "claude/opus", Some("hammer"));
         edit.prompt = Some("My own prompt.".to_string());
-        orch.update_agent_config("build", edit, None, Some("default"))
-            .unwrap();
-        assert!(
-            !file().contains("claude/opus"),
-            "pins never land in the file"
-        );
-        sync();
-        assert!(forked());
-
-        // Resetting the fork restores the shipped body and keeps the pin.
-        let mut lock = pack_lock::read_lock(&home, "core").unwrap();
-        let pack::ContentHash::Present(current) =
-            pack::hash_file(&home.join("agents/build.md")).unwrap()
-        else {
-            panic!("agent exists")
-        };
-        lock.reset_item_baseline(PackItemKind::Agent, "build", current);
-        pack_lock::write_lock(&RealFileSystem, &home, &lock).unwrap();
-        sync();
-        let reset = orch.get_agent_config("build", None).unwrap().unwrap();
-        assert!(reset.prompt.contains("Prompt v2."));
-        assert_eq!(named(&reset), ["claude/opus"]);
-        assert_eq!(reset.icon.as_deref(), Some("hammer"));
+        let refusal = orch
+            .update_agent_config("build", edit, None, Some("default"))
+            .unwrap_err();
+        assert!(refusal.contains("pack items are never edited"), "{refusal}");
+        assert!(file().contains("Prompt v2."));
 
         // Choosing the file's own value again un-pins.
         orch.update_agent_config(
             "build",
-            editor_pin_update(&reset, "lg", None),
+            editor_pin_update(&updated, "lg", None),
             None,
             Some("default"),
         )
@@ -570,6 +570,36 @@ mod tests {
         assert!(cairn_config::agent_pins::load_pins(&home)
             .get("build")
             .is_none());
+
+        // Saving the edit as the workspace's own definition puts a file in
+        // front of the pack's, which stays as the pack shipped it.
+        let mut edit = editor_pin_update(&unpinned, "lg", None);
+        edit.prompt = Some("My own prompt.".to_string());
+        let mine = orch
+            .update_agent_config_in_layer("build", edit, None, Some("default"), Some("workspace"))
+            .unwrap();
+        assert!(mine.prompt.contains("My own prompt."));
+        assert!(std::fs::read_to_string(home.join("agents/build.md"))
+            .unwrap()
+            .contains("My own prompt."));
+        assert!(
+            file().contains("Prompt v2."),
+            "the pack's file is untouched"
+        );
+        let resolved = orch.get_agent_config("build", None).unwrap().unwrap();
+        assert!(resolved.prompt.contains("My own prompt."));
+
+        // A layer is chosen only over a pack's item.
+        let again = orch
+            .update_agent_config_in_layer(
+                "build",
+                editor_pin_update(&resolved, "lg", None),
+                None,
+                Some("default"),
+                Some("workspace"),
+            )
+            .unwrap_err();
+        assert!(again.contains("already your"), "{again}");
     }
 
     /// An inherited workspace agent disabled for one project drops out of that

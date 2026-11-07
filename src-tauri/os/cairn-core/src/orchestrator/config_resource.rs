@@ -3,10 +3,23 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use cairn_config::library::Origin;
+
 use crate::config::ConfigResult;
 use crate::storage::{run_db_blocking, RowExt};
 
 use super::Orchestrator;
+
+/// The layer a write scoped by `project_path` lands in: that project's, or
+/// the workspace's when there is none.
+pub(crate) fn scope_origin(project_path: Option<&Path>) -> Origin {
+    match project_path {
+        Some(path) => Origin::Project {
+            key: cairn_config::library::trust::project_layer(path).key,
+        },
+        None => Origin::Workspace,
+    }
+}
 
 async fn project_paths_from_db(
     db: std::sync::Arc<crate::storage::LocalDb>,
@@ -366,12 +379,23 @@ pub(crate) trait ConfigResource {
         id: &str,
         project_path: Option<&Path>,
     ) -> Result<Option<Self::File>, String>;
+    /// Write `file` into `layer`, or the layer its origin names when `layer`
+    /// is `None` (a pack's own item then accepts only what that kind allows
+    /// without a layer, such as an agent's pins). A pack item saved with a
+    /// layer becomes a definition in that layer, in front of the pack's.
     fn save_file(
         config_dir: &Path,
         file: &Self::File,
         project_path: Option<&Path>,
+        layer: Option<&Origin>,
     ) -> Result<PathBuf, String>;
-    fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String>;
+    /// Delete what `id` resolves to; returns the path that changed.
+    fn delete_file(
+        config_dir: &Path,
+        id: &str,
+        project_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>, String>;
+    fn file_origin(file: &Self::File) -> Origin;
 
     /// Refuse a file the workspace could not run, before it is written.
     /// Called by create and update with the scope the file is being saved
@@ -401,7 +425,7 @@ pub(crate) trait ConfigResource {
     fn build_create_file(
         input: Self::CreateInput,
         id: String,
-        is_project_scoped: bool,
+        origin: Origin,
         now: i64,
     ) -> Self::File;
 
@@ -414,7 +438,7 @@ pub(crate) trait ConfigResource {
         existing: &Self::File,
         input: Self::UpdateInput,
         id: &str,
-        new_is_project_scoped: bool,
+        new_origin: Origin,
         scope_changing: bool,
         now: i64,
     ) -> Self::File;
@@ -424,7 +448,7 @@ pub(crate) trait ConfigResource {
     fn build_scoped_copy(
         source: &Self::File,
         id: &str,
-        is_project_scoped: bool,
+        origin: Origin,
         workspace_id: Option<String>,
         project_id: Option<String>,
         now: i64,
@@ -436,10 +460,11 @@ pub(crate) trait ConfigResource {
     fn primary_path(file: &Self::File) -> PathBuf;
 
     /// Map a primary path (as returned by `save_file` or `primary_path`) to the
-    /// path(s) git should stage for this entity. Single-file resources stage the
-    /// file itself; directory-backed resources (skills) override to stage the
-    /// enclosing directory so sidecar files like `.meta.json` are captured.
-    fn stage_paths(primary_path: &Path) -> Vec<PathBuf> {
+    /// path(s) git should stage for this entity, given the workspace root the
+    /// write went through. Single-file resources stage the file itself;
+    /// directory-backed resources (skills) override to stage the enclosing
+    /// directory so sidecar files like `.meta.json` are captured.
+    fn stage_paths(_write_root: &Path, primary_path: &Path) -> Vec<PathBuf> {
         vec![primary_path.to_path_buf()]
     }
 }
@@ -693,16 +718,21 @@ pub(crate) fn create_config<R: ConfigResource>(
     };
     let id = R::create_id(&input);
     let now = now_timestamp();
-    let file = R::build_create_file(input, id.clone(), is_project_scoped, now);
+    let origin = if is_project_scoped {
+        scope_origin(project_path.as_deref())
+    } else {
+        Origin::Workspace
+    };
+    let file = R::build_create_file(input, id.clone(), origin, now);
     R::check_before_save(orch, &file, project_id.as_deref())?;
 
-    let dest_path = R::save_file(&write_root, &file, project_path.as_deref())?;
+    let dest_path = R::save_file(&write_root, &file, project_path.as_deref(), None)?;
     // Offer the resolved write root as the push target; commit_and_maybe_push
     // only pushes when that repo actually received one of these commits AND has a
     // remote, so a project-scoped create and a personal-workspace create stay
     // commit-only while a team-workspace create pushes the shared config repo.
     crate::config::commit_and_maybe_push(
-        &R::stage_paths(&dest_path),
+        &R::stage_paths(&write_root, &dest_path),
         &config_commit_message::<R>("create", &id),
         Some(write_root.as_path()),
     );
@@ -719,14 +749,26 @@ pub(crate) fn update_config<R: ConfigResource>(
     input: R::UpdateInput,
     target_project_id: Option<&str>,
     workspace_id: Option<&str>,
+    target_layer: Option<&str>,
 ) -> Result<R::Config, String> {
     let existing = find_for_update::<R>(orch, id, target_project_id, workspace_id)?;
+    if let Some(layer) = target_layer {
+        return save_pack_item_in_layer::<R>(
+            orch,
+            id,
+            existing,
+            input,
+            target_project_id,
+            workspace_id,
+            layer,
+        );
+    }
     let (new_is_project_scoped, new_project_id) =
         R::update_scope(&existing, &input, target_project_id);
     let scope_changing = new_is_project_scoped != R::file_is_project_scoped(&existing);
 
     let new_project_path: Option<PathBuf> = if new_is_project_scoped {
-        if let Some(ref pid) = new_project_id {
+        if let Some(pid) = new_project_id.as_deref().or(target_project_id) {
             Some(orch.project_path(pid)?)
         } else if scope_changing {
             return Err("Project ID required when changing to project scope".to_string());
@@ -750,23 +792,21 @@ pub(crate) fn update_config<R: ConfigResource>(
     };
 
     let now = now_timestamp();
-    let file = R::build_update_file(
-        &existing,
-        input,
-        id,
-        new_is_project_scoped,
-        scope_changing,
-        now,
-    );
+    let new_origin = if scope_changing {
+        scope_origin(new_project_path.as_deref())
+    } else {
+        R::file_origin(&existing)
+    };
+    let file = R::build_update_file(&existing, input, id, new_origin, scope_changing, now);
     R::check_before_save(orch, &file, new_project_id.as_deref())?;
-    let dest_path = R::save_file(&write_base, &file, new_project_path.as_deref())?;
+    let dest_path = R::save_file(&write_base, &file, new_project_path.as_deref(), None)?;
 
-    let mut commit_targets = R::stage_paths(&dest_path);
-    if scope_changing {
+    let mut commit_targets = R::stage_paths(&write_base, &dest_path);
+    if scope_changing && R::file_origin(&existing).pack_id().is_none() {
         R::cleanup_after_scope_change(&existing, &dest_path);
         // The old-scope file was just removed; stage that path too so its
         // deletion commits in whichever repo (workspace or project) held it.
-        commit_targets.extend(R::stage_paths(&R::primary_path(&existing)));
+        commit_targets.extend(R::stage_paths(&write_base, &R::primary_path(&existing)));
     }
     // Offer the resolved write root as the push target: a team-workspace update
     // pushes the shared config repo, while personal-workspace and project updates
@@ -787,6 +827,63 @@ pub(crate) fn update_config<R: ConfigResource>(
         Some(workspace_id.unwrap_or("default").to_string())
     };
     Ok(R::to_config(file, result_workspace_id, new_project_id, now))
+}
+
+/// Save an edit to a pack's item as the user's own definition in `layer`
+/// (`workspace` or `project`), in front of the pack's, which is left as the
+/// pack shipped it. The editor asks which layer when a save would change more
+/// than a pin.
+fn save_pack_item_in_layer<R: ConfigResource>(
+    orch: &Orchestrator,
+    id: &str,
+    existing: R::File,
+    input: R::UpdateInput,
+    target_project_id: Option<&str>,
+    workspace_id: Option<&str>,
+    layer: &str,
+) -> Result<R::Config, String> {
+    let existing_origin = R::file_origin(&existing);
+    if existing_origin.pack_id().is_none() {
+        return Err(format!(
+            "`{id}` is already your {} definition; a layer is chosen only when saving over a pack's item",
+            existing_origin.label()
+        ));
+    }
+    let (origin, project_path, project_id) = match layer {
+        "workspace" => (Origin::Workspace, None, None),
+        "project" => {
+            let pid =
+                target_project_id.ok_or("Saving as this project's definition needs the project")?;
+            let path = orch.project_path(pid)?;
+            (scope_origin(Some(&path)), Some(path), Some(pid.to_string()))
+        }
+        other => {
+            return Err(format!(
+                "unknown layer `{other}`: save as `workspace` or `project`"
+            ))
+        }
+    };
+    let write_base = match (&origin, workspace_id) {
+        (Origin::Workspace, Some(ws)) => orch.workspace_write_root(ws)?,
+        _ => orch.config_dir.clone(),
+    };
+    let now = now_timestamp();
+    let file = R::build_update_file(&existing, input, id, existing_origin, false, now);
+    R::check_before_save(orch, &file, project_id.as_deref())?;
+    let dest_path = R::save_file(&write_base, &file, project_path.as_deref(), Some(&origin))?;
+    crate::config::commit_and_maybe_push(
+        &R::stage_paths(&write_base, &dest_path),
+        &config_commit_message::<R>("update", id),
+        Some(write_base.as_path()),
+    );
+    emit_config_change::<R>(orch, "modified", id);
+    emit_db_change::<R>(orch, "update");
+    let saved = R::get_file(&orch.config_dir, id, project_path.as_deref())?
+        .ok_or_else(|| format!("`{id}` was saved but does not resolve"))?;
+    let workspace = project_id
+        .is_none()
+        .then(|| workspace_id.unwrap_or("default").to_string());
+    Ok(R::to_config(saved, workspace, project_id, now))
 }
 
 pub(crate) fn delete_config<R: ConfigResource>(
@@ -811,11 +908,9 @@ pub(crate) fn delete_config<R: ConfigResource>(
             (ws_root, None)
         }
     };
-    let existing = R::get_file(&delete_root, id, delete_project)?;
-    R::delete_file(&delete_root, id, delete_project)?;
-    if let Some(file) = &existing {
+    if let Some(changed) = R::delete_file(&delete_root, id, delete_project)? {
         crate::config::commit_and_maybe_push(
-            &R::stage_paths(&R::primary_path(file)),
+            &R::stage_paths(&delete_root, &changed),
             &config_commit_message::<R>("delete", id),
             Some(delete_root.as_path()),
         );
@@ -1028,18 +1123,23 @@ pub(crate) fn copy_config<R: ConfigResource>(
     }
 
     let now = now_timestamp();
+    let origin = if is_project_scoped {
+        scope_origin(target_project_path.as_deref())
+    } else {
+        Origin::Workspace
+    };
     let file = R::build_scoped_copy(
         &source,
         target_id,
-        is_project_scoped,
+        origin,
         workspace_id.clone(),
         project_id_string.clone(),
         now,
     );
-    let dest_path = R::save_file(&save_base, &file, target_project_path.as_deref())?;
+    let dest_path = R::save_file(&save_base, &file, target_project_path.as_deref(), None)?;
     R::post_save_copy(&source, &dest_path)?;
     crate::config::commit_and_maybe_push(
-        &R::stage_paths(&dest_path),
+        &R::stage_paths(&save_base, &dest_path),
         &config_commit_message::<R>("create", target_id),
         Some(save_base.as_path()),
     );
@@ -1377,6 +1477,7 @@ mod tests {
         dbs.insert_team_db_for_test(team_id, team.clone()).await;
         let services = Arc::new(TestServicesBuilder::new().build());
         let orch = OrchestratorBuilder::new(dbs, services, config_dir.clone()).build();
+        crate::config::trust_for_test(&config_dir, &project_dir, "TEAM");
 
         // The resolver finds the workspace clone for the team project.
         assert_eq!(
@@ -1601,11 +1702,19 @@ mod tests {
         // Materialize.
         let got = orch.ensure_team_workspace(&resource_dir, team_id).unwrap();
         assert_eq!(got, expected_ws);
-        // The bundle twin exists on disk as a config home carrying the seeded agent.
+        // The bundle twin exists on disk as a config home with the core pack
+        // installed in place: its agent is read from the pack, not copied out.
         assert!(expected_ws.is_dir(), "workspace config home initialized");
         assert!(
-            expected_ws.join("agents").join("example.md").exists(),
-            "bundled agent seeded into the team workspace clone"
+            crate::config::library::test_support::pack_root(&expected_ws, "core")
+                .join("agents")
+                .join("example.md")
+                .exists(),
+            "bundled agent installed in the team workspace's core pack"
+        );
+        assert!(
+            !expected_ws.join("agents").join("example.md").exists(),
+            "a pack item is never copied into the workspace layer"
         );
 
         // After materialization: the read path resolves the clone, and the

@@ -9,7 +9,7 @@
 //! they read the verified cache.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,7 @@ use crate::config::pack::library::git::GitPolicy;
 use crate::config::pack::library::source::{self as library_source, CAIRN_LIBRARY_ID};
 use crate::config::pack::library::{IndexEntry, LibrarySource, VerifiedIndex, MOVED_TO_LIBRARY};
 use crate::config::pack::server_config::McpServerConfig;
-use crate::config::pack::{self, ItemRuns, PackLock, PackManifest, PackSource, PackSourceKind};
+use crate::config::pack::{self, ItemRuns, PackLock, PackSource, PackSourceKind};
 use crate::orchestrator::Orchestrator;
 use crate::services::RealFileSystem;
 
@@ -123,8 +123,9 @@ pub fn pending_update(config_dir: &Path, lock: &PackLock, entry: &IndexEntry) ->
 }
 
 /// Every endpoint or run-here item the update from `lock` to `entry` would add,
-/// change, or remove. A user's fork and a removed item are untouched by any
-/// update, so they are not changes.
+/// change, or remove, judged by comparing each item the index lists with the
+/// item as installed in the pack. A removed item is untouched by any update,
+/// so it is not a change.
 pub fn runtime_changes(
     config_dir: &Path,
     lock: &PackLock,
@@ -137,9 +138,10 @@ pub fn runtime_changes(
             continue;
         }
         let change = match lock.item(item.kind, &item.id) {
-            Some(old) if old.forked => continue,
-            Some(old) if old.content_hash.as_deref() == Some(item.hash.as_str()) => continue,
-            Some(_) => "changed",
+            Some(old) => match pack::installed_item_hash(config_dir, &lock.id, old) {
+                Ok(pack::ContentHash::Present(hash)) if hash == item.hash => continue,
+                _ => "changed",
+            },
             None => "added",
         };
         changes.push(RuntimeChange {
@@ -155,7 +157,7 @@ pub fn runtime_changes(
         });
     }
     for old in &lock.items {
-        if old.forked || entry.item(old.kind, &old.id).is_some() {
+        if entry.item(old.kind, &old.id).is_some() {
             continue;
         }
         let before = installed.get(&old.id).cloned();
@@ -180,39 +182,7 @@ fn installed_definitions(config_dir: &Path, pack_id: &str) -> BTreeMap<String, M
         .unwrap_or_default()
 }
 
-/// `<config>/packs/<id>/source/`: the copy of what a non-bundled pack shipped,
-/// which reset, diff, and "behind shipped" compare against.
-pub fn snapshot_root(config_dir: &Path, pack_id: &str) -> PathBuf {
-    pack::lock::pack_dir(config_dir, pack_id).join("source")
-}
-
-/// The shipped copy of a local or library pack, refused when it is missing or
-/// no longer hashes to what the lock recorded.
-pub fn snapshot_manifest(config_dir: &Path, lock: &PackLock) -> Result<PackManifest, String> {
-    let root = snapshot_root(config_dir, &lock.id);
-    if !root.is_dir() {
-        return Err(format!(
-            "Pack `{}` has no fetched copy of its source on this machine yet; update it to fetch one",
-            lock.id
-        ));
-    }
-    if pack::content_hash(&root)? != lock.content_hash {
-        return Err(format!(
-            "Pack `{}`'s snapshot was modified; update it to fetch it again",
-            lock.id
-        ));
-    }
-    let mut manifest = match lock.source.kind {
-        PackSourceKind::Local => pack::agent_plugin::load(&root)?.manifest,
-        _ => pack::manifest::load(&root)?,
-    };
-    // A manifest without an explicit id names itself after its directory,
-    // which here is `source`; the lock is the authority on what it is called.
-    manifest.id = lock.id.clone();
-    manifest.name = lock.name.clone();
-    manifest.root = root;
-    Ok(manifest)
-}
+pub use cairn_packs::install::{snapshot_manifest, snapshot_root};
 
 /// Ids of every pack the app bundle ships, or `None` when this workspace has
 /// no recorded resource directory yet (so nothing can be known about it).
