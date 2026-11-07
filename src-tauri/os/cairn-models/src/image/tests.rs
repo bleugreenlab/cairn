@@ -812,6 +812,7 @@ fn provider(key: &str, models: Vec<DiscoveredModel>) -> CatalogProvider {
         }),
         serves: Vec::new(),
         unable: Vec::new(),
+        alias_resolutions: Vec::new(),
     }
 }
 

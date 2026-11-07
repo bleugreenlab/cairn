@@ -874,7 +874,10 @@ pub(super) mod tests {
         .unwrap();
         let pin = launch(&orch, &db, "builder-pinned").unwrap();
         assert_eq!(model_ref(&pin.chosen), "claude/opus");
-        assert_eq!(pin.provenance, "pinned to claude/opus");
+        assert_eq!(
+            pin.provenance,
+            "pinned to claude/opus; alias opus has no observed identity; awaiting a Claude session"
+        );
         assert_eq!(pin.band.as_deref(), Some("lg"));
         assert_eq!(pin.maker.as_deref(), Some("anthropic"));
         assert_eq!(job(&db, "builder-pinned").model.as_deref(), Some("opus"));

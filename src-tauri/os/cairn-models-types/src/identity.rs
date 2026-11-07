@@ -458,6 +458,41 @@ mod tests {
     }
 
     #[test]
+    fn claude_api_ids_resolve_only_through_listed_spellings_and_snapshots() {
+        for (native, expected) in [
+            ("claude-opus-4-6", "claude-opus-4.6"),
+            ("claude-opus-4-7", "claude-opus-4.7"),
+            ("claude-sonnet-4-6", "claude-sonnet-4.6"),
+            ("claude-fable-5-1", "claude-fable-5.1"),
+            ("claude-haiku-4-5-20251001", "claude-haiku-4.5"),
+            ("claude-opus-4-20250514", "claude-opus-4"),
+            ("claude-opus-4-1-20250805", "claude-opus-4.1"),
+            ("claude-opus-4-5-20251101", "claude-opus-4.5"),
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-4.5"),
+            ("claude-3-5-sonnet-20240620", "claude-sonnet-3.5-20240620"),
+            ("claude-3-5-sonnet-20241022", "claude-sonnet-3.5-v2"),
+        ] {
+            assert_eq!(
+                for_offer("claude", native, None),
+                Some(expected),
+                "{native}"
+            );
+        }
+        for native in [
+            "opus",
+            "sonnet",
+            "haiku",
+            "fable",
+            "claude-opus-99-7",
+            "claude-opus-4-6-20990101",
+            "claude-opus-4-7-20260416",
+            "claude-sonnet-4-5-20250514",
+        ] {
+            assert_eq!(for_offer("claude", native, None), None, "{native}");
+        }
+    }
+
+    #[test]
     fn offers_resolve_by_equality_with_the_makers_prefix_and_never_by_guess() {
         let offer = |provider, native, slug| for_offer(provider, native, slug);
         assert_eq!(

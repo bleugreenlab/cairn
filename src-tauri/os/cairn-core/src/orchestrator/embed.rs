@@ -267,6 +267,7 @@ fn cairn_gateway_provider() -> CatalogProvider {
         }),
         serves: Vec::new(),
         unable: Vec::new(),
+        alias_resolutions: Vec::new(),
     }
 }
 

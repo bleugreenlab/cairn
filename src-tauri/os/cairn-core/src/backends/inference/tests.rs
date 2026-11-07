@@ -110,6 +110,7 @@ fn provider_of(served: &[ServedModel]) -> CatalogProvider {
         }),
         serves: provider_serves(),
         unable: unable(served),
+        alias_resolutions: Vec::new(),
     }
 }
 

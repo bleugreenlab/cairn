@@ -43,6 +43,7 @@ fn provider(key: &str, models: Vec<DiscoveredModel>) -> CatalogProvider {
         }),
         serves: ServedVerb::conversation(Wire::OpenAiChatCompletions),
         unable: Vec::new(),
+        alias_resolutions: Vec::new(),
     }
 }
 
@@ -558,7 +559,7 @@ fn no_other_maker_or_an_unknown_maker_selects_as_if_unconstrained() {
     assert_eq!(chosen(&record), "claude/opus");
     assert_eq!(record.band.as_deref(), Some("lg"));
     assert!(
-        record.provenance.ends_with(
+        record.provenance.contains(
             "; no model from a maker other than anthropic in [claude/opus, claude/sonnet]; same maker as builder-1"
         ),
         "{}",
@@ -578,7 +579,7 @@ fn no_other_maker_or_an_unknown_maker_selects_as_if_unconstrained() {
     let record = run(&["claude/sonnet", "claude/opus"], &md, &no_windows).unwrap();
     assert_eq!(chosen(&record), "claude/sonnet");
     assert!(
-        record.provenance.ends_with("; same maker as builder-1"),
+        record.provenance.contains("; same maker as builder-1"),
         "{}",
         record.provenance
     );

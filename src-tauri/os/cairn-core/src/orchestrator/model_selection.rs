@@ -114,6 +114,11 @@ fn benchmark_hint(
         ),
         _ => placed.summary(),
     };
+    let identity_note = placer.identity_note(provider, model);
+    let summary = match &identity_note {
+        Some(note) => format!("{summary}; {note}"),
+        None => summary,
+    };
     let (measured, pooled_with, at_least) = match &placed.basis {
         Basis::Measured => (None, Vec::new(), None),
         Basis::Ordered {
@@ -126,7 +131,10 @@ fn benchmark_hint(
         measured,
         pooled_with,
         at_least,
-        from: placer.from_text(&placed),
+        from: placer.from_text(&placed).map(|from| match &identity_note {
+            Some(note) => format!("{from}; {note}"),
+            None => from,
+        }),
         summary,
         position,
         position_low,
@@ -168,6 +176,8 @@ pub struct UnrankedModel {
     pub model: String,
     /// Where the benchmarks place it, when they cover it.
     pub benchmark: Option<BenchmarkHint>,
+    /// Alias observation provenance, including when benchmarks cannot place it.
+    pub identity_note: Option<String>,
     /// The band the benchmark level falls in, which is where an allotment
     /// naming it selects it.
     pub band: Option<String>,
@@ -202,6 +212,8 @@ pub struct LadderRung {
     /// Where the benchmarks place this model, shown beside a stored level
     /// and never replacing it.
     pub benchmark: Option<BenchmarkHint>,
+    /// Alias observation provenance, including when benchmarks cannot place it.
+    pub identity_note: Option<String>,
     /// A newer release of this model's product line the same provider offers
     /// (`provider/model`, the newest), when there is one.
     pub superseded_by: Option<String>,
@@ -278,6 +290,7 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
                     .or(benchmark.as_ref().and_then(|hint| hint.position))
                     .and_then(|level| models.band_of(level))
                     .map(|band| band.id),
+                identity_note: on.and_then(|provider| provider.identity_note(model)),
                 benchmark,
                 superseded_by: on.and_then(|provider| superseded_by(provider, model)),
                 maker: on.and_then(|provider| provider.maker(model)),
@@ -357,6 +370,7 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
                         .and_then(|position| models.band_of(position))
                         .map(|band| band.id),
                     benchmark,
+                    identity_note: provider.identity_note(&model.model),
                     model: entry,
                 });
             }
@@ -844,6 +858,170 @@ mod tests {
     }
 
     #[test]
+    fn alias_provenance_survives_without_a_benchmark_and_never_changes_stored_levels() {
+        use cairn_models::interface::{AliasResolution, ALIAS_RESOLUTION_TTL_SECS};
+        let now = chrono::Utc::now().timestamp();
+        let mut models = models();
+        let mut calibration = models.ladder[0].clone();
+        calibration.model =
+            cairn_config::allotment::parse_model_ref("opencode-go/kimi-k2.5").unwrap();
+        models.ladder.push(calibration);
+        let original = models.clone();
+        for (report, age, version, expected) in [
+            (Some("claude-opus-4-6"), 0, None, "observed"),
+            (
+                Some("claude-opus-4-6"),
+                ALIAS_RESOLUTION_TTL_SECS + 1,
+                None,
+                "stale",
+            ),
+            (Some("claude-unrecognized"), 0, None, "unrecognized"),
+            (
+                Some("claude-opus-4-6"),
+                0,
+                Some("new-version"),
+                "CLI version changed",
+            ),
+            (None, 0, None, "no"),
+        ] {
+            let mut catalog = catalog();
+            let claude = catalog
+                .providers
+                .iter_mut()
+                .find(|on| on.descriptor.key == "claude")
+                .unwrap();
+            if let Some(report) = report {
+                claude.alias_resolutions.push(AliasResolution {
+                    alias: "opus".into(),
+                    reported: report.into(),
+                    canonical: cairn_models::types::identity::for_offer("claude", report, None)
+                        .map(str::to_string),
+                    observed_at: now - age,
+                    session_id: "alias-observing-session".into(),
+                    cli_version: Some("old-version".into()),
+                    current_cli_version: version.map(str::to_string),
+                });
+            }
+            let note = claude.identity_note("opus").unwrap();
+            assert!(note.contains(expected), "{note}");
+            if report.is_some() {
+                assert!(note.contains("alias-observing-session"), "{note}");
+                assert!(note.contains(report.unwrap()), "{note}");
+            }
+            let view = ladder_view(&models, &catalog);
+            let opus = view
+                .rungs
+                .iter()
+                .find(|r| r.model == "claude/opus")
+                .unwrap();
+            assert_eq!(opus.level, Some(0.83));
+            assert_eq!(opus.level_source, Some(LevelSource::Set));
+            assert_eq!(opus.identity_note.as_deref(), Some(note.as_str()));
+            let text = render_ladder(&[], || Ok(view.clone()));
+            assert!(text.contains(&note), "{text}");
+            if report == Some("claude-opus-4-6") && age == 0 && version.is_none() {
+                let hint = opus.benchmark.as_ref().expect("fresh alias benchmark");
+                assert!(hint.summary.contains(&note));
+                assert!(hint.from.as_ref().expect("calibrated").contains(&note));
+                let mut unplaced = models.clone();
+                unplaced
+                    .ladder
+                    .iter_mut()
+                    .find(|r| r.model.backend == "claude" && r.model.model.as_str() == "opus")
+                    .unwrap()
+                    .model =
+                    cairn_config::allotment::parse_model_ref("claude/claude-opus-4-6").unwrap();
+                let ctx = SelectionContext {
+                    models: &unplaced,
+                    catalog: &catalog,
+                    supply: SupplyInputs {
+                        store: None,
+                        project_id: None,
+                        assignments: &[],
+                        provider_windows: &|_| None,
+                        now,
+                    },
+                };
+                let record = select(
+                    &ctx,
+                    &parse_allotment(&["claude/opus"]).unwrap(),
+                    VerbKind::Session,
+                    &ResolvedConstraints::default(),
+                    &TopOfAllotment,
+                )
+                .unwrap();
+                assert_eq!(
+                    record.candidates[0].level_source,
+                    Some(LevelSource::Benchmarks)
+                );
+                assert_eq!(
+                    record.candidates[0].identity_note.as_deref(),
+                    Some(note.as_str())
+                );
+                assert_eq!(record.provenance.matches(&note).count(), 1);
+            } else {
+                assert!(opus.benchmark.is_none());
+            }
+            let unranked_models = ModelsConfig {
+                ladder: Vec::new(),
+                ..models.clone()
+            };
+            let unranked = ladder_view(&unranked_models, &catalog);
+            let alias = unranked
+                .unranked
+                .iter()
+                .find(|m| m.model == "claude/opus")
+                .unwrap();
+            assert_eq!(alias.identity_note.as_deref(), Some(note.as_str()));
+            assert!(render_ladder(&[], || Ok(unranked.clone())).contains(&note));
+
+            let ctx = SelectionContext {
+                models: &models,
+                catalog: &catalog,
+                supply: SupplyInputs {
+                    store: None,
+                    project_id: None,
+                    assignments: &[],
+                    provider_windows: &|_| None,
+                    now,
+                },
+            };
+            let record = select(
+                &ctx,
+                &parse_allotment(&["claude/opus", "claude/haiku"]).unwrap(),
+                VerbKind::Session,
+                &ResolvedConstraints::default(),
+                &TopOfAllotment,
+            )
+            .unwrap();
+            let candidate = record
+                .candidates
+                .iter()
+                .find(|c| c.model == "claude/opus")
+                .unwrap();
+            assert_eq!(candidate.level, Some(0.83));
+            assert_eq!(candidate.identity_note.as_deref(), Some(note.as_str()));
+            assert!(record
+                .candidates
+                .iter()
+                .find(|c| c.model == "claude/haiku")
+                .unwrap()
+                .identity_note
+                .is_some());
+            assert!(record.provenance.contains(&note));
+            assert!(render_selection(&[], |_, _| Ok(record.clone())).contains(&note));
+            let pinned =
+                crate::execution::model_selection::pinned(&models, &catalog, &record.chosen);
+            assert_eq!(
+                pinned.candidates[0].identity_note.as_deref(),
+                Some(note.as_str())
+            );
+            assert!(pinned.provenance.contains(&note));
+            assert_eq!(models, original);
+        }
+    }
+
+    #[test]
     fn the_ladder_view_places_rungs_in_bands_with_maker_and_effort() {
         let view = ladder_view(&models(), &catalog());
         let bands: Vec<&str> = view.bands.iter().map(|band| band.id.as_str()).collect();
@@ -907,6 +1085,7 @@ mod tests {
                 cairn_models::types::catalog::Wire::OpenAiChatCompletions,
             ),
             unable: Vec::new(),
+            alias_resolutions: Vec::new(),
         };
         catalog
             .providers

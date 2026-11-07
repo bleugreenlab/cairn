@@ -1115,6 +1115,7 @@ fn provider(account: &str, models: Vec<DiscoveredModel>) -> CatalogProvider {
         descriptor,
         serves: ServedVerb::conversation(Wire::OpenAiChatCompletions),
         unable: Vec::new(),
+        alias_resolutions: Vec::new(),
     }
 }
 

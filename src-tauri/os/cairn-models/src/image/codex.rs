@@ -824,6 +824,7 @@ mod tests {
                 }),
                 serves: Vec::new(),
                 unable: Vec::new(),
+                alias_resolutions: Vec::new(),
             }],
         };
         for verb in [VerbKind::Session, VerbKind::Complete] {

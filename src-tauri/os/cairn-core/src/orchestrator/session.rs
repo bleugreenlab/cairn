@@ -883,6 +883,7 @@ pub(crate) fn persist_system_prompt_event(
                     crate::transcripts::stream_store::insert_event_conn(
                         conn,
                         &crate::transcripts::stream_store::EventInsert {
+                            selected_model: None,
                             id: event_id.clone(),
                             run_id: run_id.clone(),
                             session_id: session_id.clone(),
@@ -2049,6 +2050,7 @@ pub fn insert_error_event(
                     crate::transcripts::stream_store::insert_event_conn(
                         conn,
                         &crate::transcripts::stream_store::EventInsert {
+                            selected_model: None,
                             id: event_id.clone(),
                             run_id: run_id.clone(),
                             session_id: session_id.clone(),
@@ -4641,6 +4643,7 @@ mod tests {
                 crate::transcripts::stream_store::insert_event_conn(
                     conn,
                     &crate::transcripts::stream_store::EventInsert {
+                        selected_model: None,
                         id: ids::mint_child(&run_id),
                         run_id: run_id.clone(),
                         session_id: session_id.clone(),

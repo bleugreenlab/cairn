@@ -42,6 +42,8 @@ pub struct EventInsert {
     pub run_id: String,
     pub session_id: Option<String>,
     pub timestamp: i32,
+    /// The actual selected model at this report, never read back from mutable job state.
+    pub selected_model: Option<String>,
     pub event_type: String,
     pub data: String,
     pub parent_tool_use_id: Option<String>,
@@ -178,11 +180,16 @@ async fn insert_event_at_conn(
     // The model the provider reported, stored beside the token columns so the
     // analytics rollup can still attribute the event after archival has
     // compressed its body.
-    let reported_model = cairn_analytics::queries::reported_model_column(
-        &event.event_type,
-        event.parent_tool_use_id.as_deref(),
-        &event.data,
-    );
+    let reported_model = if event.event_type == "system:init" && event.parent_tool_use_id.is_none()
+    {
+        cairn_db::storage::events::columns::reported_model(&event.data)
+    } else {
+        cairn_analytics::queries::reported_model_column(
+            &event.event_type,
+            event.parent_tool_use_id.as_deref(),
+            &event.data,
+        )
+    };
     // The account serving the run, frozen on the events the rollup reads; see
     // `event_account_sql`.
     let stamps_account =
@@ -194,9 +201,9 @@ async fn insert_event_at_conn(
                 id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd,
-                reported_model, account_id
+                reported_model, account_id, selected_model
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, {account})",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, {account}, ?19)",
                 account = cairn_analytics::queries::event_account_sql(2, 18)
             ),
             params![
@@ -217,7 +224,8 @@ async fn insert_event_at_conn(
                 event.turn_id.as_deref(),
                 event.cost_usd,
                 reported_model.as_deref(),
-                i64::from(stamps_account)
+                i64::from(stamps_account),
+                event.selected_model.as_deref()
             ],
         )
         .await?;
@@ -601,6 +609,7 @@ pub fn finalize_stream(
                                 run_id: stream.run_id.clone(),
                                 session_id: stream.session_id.clone(),
                                 timestamp: stream.created_at,
+                                selected_model: None,
                                 event_type: final_event.event_type.clone(),
                                 data: data_json.clone(),
                                 parent_tool_use_id: final_event.parent_tool_use_id.clone(),
@@ -1333,6 +1342,7 @@ pub mod testing {
             run_id: run_id.to_string(),
             session_id: Some("session-1".to_string()),
             timestamp: 0,
+            selected_model: None,
             event_type: "assistant".to_string(),
             data: "{}".to_string(),
             parent_tool_use_id: None,
@@ -1362,6 +1372,46 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    #[tokio::test]
+    async fn init_reports_are_durable_without_becoming_billing_events() {
+        let (_temp, db) = test_db().await;
+        insert_run(&db, "run-1").await;
+        let mut event = test_event("init", "run-1");
+        event.event_type = "system:init".into();
+        event.selected_model = Some("opus".into());
+        event.data =
+            r#"{"raw":{"model":"claude-opus-5-5","claude_code_version":"2.1.311"}}"#.into();
+        assert!(insert_event(db.clone(), event.clone()).unwrap());
+        let model = db
+            .query_opt(
+                "SELECT reported_model FROM events WHERE id = 'init'",
+                (),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+            .flatten();
+        assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
+        assert!(!cairn_analytics::queries::stamps_account(
+            "system:init",
+            None
+        ));
+
+        event.id = "child-init".into();
+        event.parent_tool_use_id = Some("child".into());
+        assert!(insert_event(db.clone(), event).unwrap());
+        let child = db
+            .query_opt(
+                "SELECT reported_model FROM events WHERE id = 'child-init'",
+                (),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+            .flatten();
+        assert_eq!(child, None);
+    }
 
     #[tokio::test]
     async fn max_sequence_sql_keeps_its_call_site() {

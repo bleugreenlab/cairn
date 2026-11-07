@@ -90,13 +90,15 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventExtras {
     pub reported_model: Option<String>,
+    pub selected_model: Option<String>,
     pub change_preview_status: Option<String>,
     pub change_applied_at: Option<i64>,
     pub account_id: Option<String>,
 }
 
-const EXTRA_COLUMNS: &str = "reported_model, change_preview_status, change_applied_at, account_id";
-const EXTRA_COLUMN_COUNT: usize = 4;
+const EXTRA_COLUMNS: &str =
+    "reported_model, change_preview_status, change_applied_at, account_id, selected_model";
+const EXTRA_COLUMN_COUNT: usize = 5;
 
 /// One event as a reader sees it.
 #[derive(Debug, Clone)]
@@ -1776,6 +1778,7 @@ impl HotRow {
                 change_preview_status: row.opt_text(offset + EVENT_COLUMN_COUNT + 1)?,
                 change_applied_at: row.opt_i64(offset + EVENT_COLUMN_COUNT + 2)?,
                 account_id: row.opt_text(offset + EVENT_COLUMN_COUNT + 3)?,
+                selected_model: row.opt_text(offset + EVENT_COLUMN_COUNT + 4)?,
             },
         })
     }
@@ -1816,6 +1819,7 @@ fn extras_from_row(row: &turso::Row) -> DbResult<EventExtras> {
         change_preview_status: row.opt_text(EVENT_COLUMN_COUNT + 1)?,
         change_applied_at: row.opt_i64(EVENT_COLUMN_COUNT + 2)?,
         account_id: row.opt_text(EVENT_COLUMN_COUNT + 3)?,
+        selected_model: row.opt_text(EVENT_COLUMN_COUNT + 4)?,
     })
 }
 

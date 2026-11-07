@@ -49,6 +49,7 @@ pub mod lifecycle;
 pub mod model_defaults;
 pub mod model_selection;
 pub mod models;
+mod models_aliases;
 pub mod object_plane;
 pub mod parent_wake;
 pub mod provider_pool;
@@ -872,6 +873,9 @@ impl OrchestratorBuilder {
             executor: Arc::new(OnceLock::new()),
             mcp_gateway: Arc::new(OnceLock::new()),
             model_catalog: self.model_catalog,
+            claude_alias_cache: Arc::new(generation_cache::GenerationCache::new(
+                "Claude alias observations",
+            )),
             catalog_rediscovery: self.catalog_rediscovery,
             host_memory: self.host_memory,
             provider_usage_snapshots: self.provider_usage_snapshots,
@@ -1848,6 +1852,9 @@ pub struct Orchestrator {
     /// clear error when unset. Wrapped like `executor` so it's Clone-compatible
     /// and settable after construction via `&self`.
     mcp_gateway: Arc<OnceLock<Arc<dyn McpGateway>>>,
+
+    claude_alias_cache:
+        Arc<generation_cache::GenerationCache<Vec<cairn_models::interface::AliasResolution>>>,
 
     /// Cached provider model catalog loaded at startup and refreshed on demand.
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,

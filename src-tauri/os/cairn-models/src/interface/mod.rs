@@ -19,6 +19,9 @@
 //! types defined here exist only where nothing did before: the composed
 //! catalog, its catalog-id view, the session view, and the requests refusal.
 
+mod alias;
+pub use alias::{AliasResolution, ALIAS_RESOLUTION_TTL_SECS};
+
 pub mod complete;
 pub mod decide;
 pub mod effort;
@@ -92,6 +95,9 @@ pub struct CatalogProvider {
     /// serve that verb.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unable: Vec<Unable>,
+    /// Session observations of the Claude CLI's moving aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alias_resolutions: Vec<AliasResolution>,
 }
 
 /// A model observed unable to serve a verb it declares.
@@ -313,6 +319,9 @@ pub struct CatalogOffer {
     /// guessing. Annotation only: offers still group by catalog id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical: Option<String>,
+    /// Session provenance for a moving alias, including missing or stale evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_note: Option<String>,
 }
 
 impl CatalogOffer {
@@ -657,12 +666,8 @@ impl Catalog {
                         pricing: model.pricing.clone(),
                         serves: provider.serves_declared(&model.model, model.serves.as_deref()),
                         serving_account_ids: model.serving_account_ids.clone(),
-                        canonical: cairn_models_types::identity::for_offer(
-                            key,
-                            &model.model,
-                            model.canonical_slug.as_deref(),
-                        )
-                        .map(str::to_string),
+                        canonical: provider.canonical(&model.model),
+                        identity_note: provider.identity_note(&model.model),
                     },
                     aliases,
                 );
@@ -1324,6 +1329,7 @@ mod tests {
             }),
             serves: Vec::new(),
             unable: Vec::new(),
+            alias_resolutions: Vec::new(),
         }
     }
 
@@ -1392,6 +1398,7 @@ mod tests {
             }),
             serves: Vec::new(),
             unable: Vec::new(),
+            alias_resolutions: Vec::new(),
         }
     }
 

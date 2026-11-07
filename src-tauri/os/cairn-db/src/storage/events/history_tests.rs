@@ -109,6 +109,9 @@ async fn run_events_keep_chat_order_with_same_second_ties() {
 #[tokio::test]
 async fn every_outcome_and_label_survives_the_pack() {
     let (db, events) = packed_db("seam-outcomes").await;
+    db.execute_script("UPDATE jobs SET model = 'sonnet' WHERE id = 'job-1';")
+        .await
+        .unwrap();
     let (hot, pack) = read_both(&db, || async {
         HistoryReader::new(&db)
             .run_events("run-1", EventFilter::default())
@@ -145,6 +148,7 @@ async fn every_outcome_and_label_survives_the_pack() {
             restored.extras,
             EventExtras {
                 reported_model: Some("claude-opus-5-5".to_string()),
+                selected_model: Some("opus".to_string()),
                 change_preview_status: Some("applied".to_string()),
                 change_applied_at: Some(99),
                 account_id: Some("acct-a".to_string()),

@@ -438,6 +438,7 @@ mod tests {
         // Same contract for a transcript event insert.
         let now = chrono::Utc::now().timestamp() as i32;
         let event = EventInsert {
+            selected_model: None,
             id: "evt-1".to_string(),
             run_id: run.to_string(),
             session_id: None,

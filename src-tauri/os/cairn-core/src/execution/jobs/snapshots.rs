@@ -589,6 +589,7 @@ fn store_transcript_event_with_turn(
     let turn_id = turn_id.map(str::to_string);
 
     let event = EventInsert {
+        selected_model: None,
         id: event_id.clone(),
         run_id: run_id.to_string(),
         session_id: Some(session_id.to_string()),

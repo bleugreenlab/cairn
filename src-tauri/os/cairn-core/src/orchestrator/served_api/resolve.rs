@@ -235,6 +235,7 @@ mod tests {
             }),
             serves: ServedVerb::conversation(Wire::OpenAiChatCompletions),
             unable: Vec::new(),
+            alias_resolutions: Vec::new(),
         }
     }
 

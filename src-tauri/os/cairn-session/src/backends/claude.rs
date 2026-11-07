@@ -1077,6 +1077,7 @@ pub fn flush_pending_assistant_before_suppress(
         run_id: run_id.to_string(),
         session_id: session_id.map(str::to_string),
         timestamp: now,
+        selected_model: None,
         event_type: pending.event_type.clone(),
         data,
         parent_tool_use_id: pending.parent_tool_use_id.clone(),
@@ -1109,6 +1110,7 @@ impl ClaudeRuntime {
         host: &ClaudeRuntime,
         run_id: &str,
         session_id: Option<String>,
+        selected_model: Option<String>,
         confirm_backend_id_after_init: bool,
         stdout: Box<dyn std::io::BufRead + Send>,
         mut stderr_watch: Option<StderrWatch>,
@@ -2129,6 +2131,11 @@ impl ClaudeRuntime {
                             run_id: run_id.to_string(),
                             session_id: session_id.clone(),
                             timestamp: now,
+                            selected_model: if event_type == "system:init" {
+                                selected_model.clone()
+                            } else {
+                                None
+                            },
                             event_type: event_type.clone(),
                             data: data.clone(),
                             parent_tool_use_id: transcript_event.parent_tool_use_id.clone(),
@@ -2627,6 +2634,7 @@ mod depletion_order_tests {
     struct RecordingHost {
         calls: Mutex<Vec<String>>,
         snapshots: Mutex<Vec<ContextTokenState>>,
+        events: Mutex<Vec<EventInsert>>,
     }
 
     impl RecordingHost {
@@ -2636,7 +2644,8 @@ mod depletion_order_tests {
     }
 
     impl TranscriptHost for RecordingHost {
-        fn insert_event(&self, _event: EventInsert) -> Result<bool, String> {
+        fn insert_event(&self, event: EventInsert) -> Result<bool, String> {
+            self.events.lock().unwrap().push(event);
             Ok(true)
         }
         fn finalize_stream(
@@ -2715,7 +2724,7 @@ mod depletion_order_tests {
         }
     }
 
-    async fn run_script(lines: &[&str]) -> Vec<String> {
+    async fn run_script_host(lines: &[&str], selected_model: Option<String>) -> Arc<RecordingHost> {
         let db = Arc::new(cairn_db::storage::migrated_test_db("claude-depletion-order.db").await);
         let host = Arc::new(RecordingHost::default());
         let runtime = ClaudeRuntime {
@@ -2730,6 +2739,7 @@ mod depletion_order_tests {
                 &runtime,
                 "run-depletion",
                 None,
+                selected_model,
                 false,
                 Box::new(std::io::Cursor::new(stdout.into_bytes())),
                 None,
@@ -2738,8 +2748,31 @@ mod depletion_order_tests {
         })
         .join()
         .expect("reader thread");
+        host
+    }
+
+    async fn run_script(lines: &[&str]) -> Vec<String> {
+        let host = run_script_host(lines, None).await;
         let calls = host.calls.lock().unwrap().clone();
         calls
+    }
+
+    #[tokio::test]
+    async fn init_carries_the_captured_launch_selection_without_a_mutable_process_lookup() {
+        let init = serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "s1",
+            "model": "claude-opus-4-7",
+            "tools": crate::agent_process::toolkits::CORE_VERBS,
+        })
+        .to_string();
+        let host = run_script_host(&[&init], Some("opus".into())).await;
+        let events = host.events.lock().unwrap();
+        let init = events
+            .iter()
+            .find(|event| event.event_type == "system:init")
+            .unwrap();
+        assert_eq!(init.selected_model.as_deref(), Some("opus"));
+        assert!(init.data.contains("claude-opus-4-7"));
     }
 
     // A job that selected no model still runs on one: the CLI names it in its
@@ -2786,6 +2819,7 @@ mod depletion_order_tests {
             ClaudeRuntime::reader_thread(
                 &runtime,
                 "run-reported",
+                None,
                 None,
                 false,
                 Box::new(std::io::Cursor::new(stdout.into_bytes())),
@@ -2859,6 +2893,7 @@ mod depletion_order_tests {
             ClaudeRuntime::reader_thread(
                 &runtime,
                 "run-window",
+                None,
                 None,
                 false,
                 Box::new(std::io::Cursor::new(stdout.into_bytes())),

@@ -430,6 +430,7 @@ fn insert_transcript_event(
         run_db.clone(),
         &orch.services.emitter,
         EventInsert {
+            selected_model: None,
             id: Uuid::new_v4().to_string(),
             run_id: run_id.to_string(),
             session_id: Some(session_id.to_string()),

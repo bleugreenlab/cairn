@@ -51,6 +51,9 @@ pub struct RankedCandidate {
     /// benchmark fit placed because the ladder holds no level for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level_source: Option<LevelSource>,
+    /// The observed identity of a floating alias, independent of its level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_note: Option<String>,
     pub band: Option<String>,
     pub maker: Option<String>,
     /// The supply class, absent when the candidate was set aside before
@@ -220,6 +223,14 @@ impl<'a> BenchmarkPlacer<'a> {
         self.catalog.benchmark(provider, model)
     }
 
+    pub fn identity_note(&self, provider: &str, model: &str) -> Option<String> {
+        self.catalog
+            .providers
+            .iter()
+            .find(|on| on.descriptor.key == provider)?
+            .identity_note(model)
+    }
+
     /// A solve rate as a position on this ladder, when it is calibrated.
     pub fn position(&self, solve_rate: f64) -> Option<f64> {
         self.map.as_ref().map(|map| map.position(solve_rate))
@@ -249,7 +260,12 @@ impl<'a> BenchmarkPlacer<'a> {
         Some(Level {
             value: self.position(placed.level)?,
             source: LevelSource::Benchmarks,
-            from: self.from_text(&placed),
+            from: self.from_text(&placed).map(|from| {
+                match self.identity_note(&model.backend, model.model.as_str()) {
+                    Some(note) => format!("{from}; {note}"),
+                    None => from,
+                }
+            }),
         })
     }
 }
@@ -535,6 +551,7 @@ pub fn select(
             model: model_ref(&l.candidate.model),
             level: l.candidate.level,
             level_source: l.candidate.level_source,
+            identity_note: l.provider.identity_note(l.candidate.model.model.as_str()),
             band: l.candidate.band.clone(),
             maker: l.maker.clone(),
             class: supply.as_ref().ok().map(|s| s.cost.class()),
@@ -545,6 +562,11 @@ pub fn select(
         })
         .collect();
     candidates.extend(set_aside);
+    for candidate in &mut candidates {
+        if let Some((provider, model)) = candidate.model.split_once('/') {
+            candidate.identity_note = placer.identity_note(provider, model);
+        }
+    }
 
     // 5. Effort and options.
     let chosen = first.candidate.model.clone();
@@ -607,6 +629,11 @@ pub fn select(
             notes.push(format!("level from {from}"));
         }
     }
+    if first.candidate.level_source != Some(LevelSource::Benchmarks) {
+        if let Some(note) = first.provider.identity_note(chosen.model.as_str()) {
+            notes.push(note);
+        }
+    }
     let provenance = supply::provenance_line(
         &requirement.note,
         &model_ref(&chosen),
@@ -661,6 +688,8 @@ pub fn pinned(models: &ModelsConfig, catalog: &Catalog, pin: &ModelSelection) ->
             model: reference.clone(),
             level,
             level_source,
+            identity_note: BenchmarkPlacer::new(models, catalog)
+                .identity_note(&pin.backend, pin.model.as_str()),
             band,
             maker: maker.clone(),
             class: None,
@@ -671,7 +700,12 @@ pub fn pinned(models: &ModelsConfig, catalog: &Catalog, pin: &ModelSelection) ->
         account: None,
         extras: RuntimeExtras::default(),
         relaxations: Vec::new(),
-        provenance: format!("pinned to {reference}"),
+        provenance: match BenchmarkPlacer::new(models, catalog)
+            .identity_note(&pin.backend, pin.model.as_str())
+        {
+            Some(note) => format!("pinned to {reference}; {note}"),
+            None => format!("pinned to {reference}"),
+        },
         subject: SelectionSubject::default(),
     }
 }
@@ -705,6 +739,7 @@ fn aside(candidate: &Candidate, maker: Option<String>, note: String) -> RankedCa
         model: model_ref(&candidate.model),
         level: candidate.level,
         level_source: candidate.level_source,
+        identity_note: None,
         band: candidate.band.clone(),
         maker,
         class: None,

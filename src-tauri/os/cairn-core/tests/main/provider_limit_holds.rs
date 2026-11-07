@@ -583,6 +583,7 @@ fn read_stream(orch: &Orchestrator, db: &Arc<LocalDb>, stdout: &'static str) {
             &runtime,
             "run",
             Some("session".into()),
+            None,
             false,
             Box::new(std::io::Cursor::new(stdout.as_bytes())),
             None,

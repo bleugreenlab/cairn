@@ -219,6 +219,7 @@ fn transcript_line(run_id: &str) -> EventInsert {
     .observed()
     .to_event_json();
     EventInsert {
+        selected_model: None,
         id: uuid::Uuid::new_v4().to_string(),
         run_id: run_id.to_string(),
         session_id: None,

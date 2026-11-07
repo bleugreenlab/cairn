@@ -416,6 +416,7 @@ async fn a_pack_states_every_section_and_counts_what_it_read() {
     let live: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
     for column in [
         "reported_model",
+        "selected_model",
         "change_preview_status",
         "change_applied_at",
         "account_id",
@@ -483,6 +484,15 @@ async fn a_pack_decodes_from_the_store_directory_alone() {
         restored.extras.reported_model.as_deref(),
         Some("claude-opus-5-5")
     );
+    assert_eq!(restored.extras.selected_model.as_deref(), Some("opus"));
+
+    let mut legacy = pack.rows(Section::Events, &run_id).next().unwrap().unwrap();
+    legacy.remove("selected_model");
+    assert!(decode_event_row(&legacy)
+        .unwrap()
+        .extras
+        .selected_model
+        .is_none());
 }
 
 #[tokio::test]

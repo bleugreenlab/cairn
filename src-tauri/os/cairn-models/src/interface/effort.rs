@@ -129,13 +129,20 @@ impl CatalogProvider {
 
     /// The provider-independent model `model` here is, when Cairn can tell
     /// without guessing ([`cairn_models_types::identity::for_offer`]). A
-    /// model discovery never listed resolves on its native id alone.
+    /// model discovery never listed resolves on its native id alone. Claude's
+    /// moving aliases can additionally resolve through a fresh session
+    /// observation, never by assuming which release an alias means.
     pub fn canonical(&self, model: &str) -> Option<String> {
         let slug = self
             .discovered(model)
             .and_then(|discovered| discovered.canonical_slug.as_deref());
         cairn_models_types::identity::for_offer(self.descriptor.key.as_ref(), model, slug)
             .map(str::to_string)
+            .or_else(|| {
+                self.alias_resolution(model)?
+                    .canonical()
+                    .map(str::to_string)
+            })
     }
 }
 
@@ -181,6 +188,7 @@ mod tests {
             }),
             serves: Vec::new(),
             unable: Vec::new(),
+            alias_resolutions: Vec::new(),
         }
     }
 

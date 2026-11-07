@@ -630,6 +630,7 @@ pub fn decode_event_row(object: &Map<String, Json>) -> Result<HistoryRow, PackEr
         reconstruction,
         extras: EventExtras {
             reported_model: opt_text("reported_model"),
+            selected_model: opt_text("selected_model"),
             change_preview_status: opt_text("change_preview_status"),
             change_applied_at: opt_int("change_applied_at"),
             account_id: opt_text("account_id"),

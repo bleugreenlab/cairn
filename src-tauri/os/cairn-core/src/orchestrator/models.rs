@@ -469,6 +469,11 @@ impl Orchestrator {
                 .unwrap_or_else(|| catalog::unknown_descriptor(key)),
             installed,
             models: self.provider_models(key),
+            alias_resolutions: if key == "claude" {
+                self.claude_alias_resolutions()
+            } else {
+                Vec::new()
+            },
             serves: self.provider_serves(key, project_id),
             unable: {
                 let mut unable = self.decision_observations.unable(key);
@@ -501,6 +506,7 @@ impl Models for Orchestrator {
                     models: None,
                     serves: Vec::new(),
                     unable: Vec::new(),
+                    alias_resolutions: Vec::new(),
                 }),
         );
         Ok(Catalog { providers })
@@ -699,6 +705,26 @@ pub(crate) mod tests {
     pub(crate) const OAUTH_SECRET: &str = "oauth-secret-token-value";
     pub(crate) const HEADER_SECRET: &str = "tenant-secret-header-value";
     pub(crate) const CUSTOM_KEY_SECRET: &str = "sk-custom-secret-value";
+
+    pub(crate) async fn seed_alias_session(
+        orch: &Orchestrator,
+        name: &str,
+        model: &str,
+        backend: &str,
+    ) {
+        orch.db.local.execute_script(format!(
+            "INSERT OR IGNORE INTO workspaces(id, name, created_at, updated_at)
+               VALUES ('alias-ws', 'Aliases', 1, 1);
+             INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('alias-project', 'alias-ws', 'Aliases', 'ALIAS', '/tmp/alias', 1, 1);
+             INSERT INTO jobs(id, project_id, status, model, created_at, updated_at)
+               VALUES ('{name}-job', 'alias-project', 'running', '{model}', 1, 1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('{name}-session', '{name}-job', '{backend}', 'open', 1, 1, 1);
+             INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+               VALUES ('{name}-run', 'alias-project', '{name}-job', 'live', '{name}-session', 1, 1);"
+        )).await.unwrap();
+    }
 
     pub(crate) async fn bare_orchestrator() -> Orchestrator {
         bare_orchestrator_with(Arc::new(cairn_models::subscription::Unsubscribed)).await

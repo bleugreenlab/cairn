@@ -152,6 +152,7 @@ mod tests {
         let emitter: Arc<dyn crate::services::EventEmitter> = capturing.clone();
 
         let event = EventInsert {
+            selected_model: None,
             id: "evt-1".to_string(),
             run_id: "run-1".to_string(),
             session_id: Some("session-1".to_string()),

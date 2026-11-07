@@ -479,6 +479,11 @@ pub(crate) fn render_ladder(
                 _ => hint.summary.clone(),
             });
         }
+        if rung.benchmark.is_none() {
+            if let Some(note) = &rung.identity_note {
+                facts.push(note.clone());
+            }
+        }
         let _ = write!(line, " — {}", facts.join(", "));
         line
     };
@@ -536,7 +541,16 @@ pub(crate) fn render_ladder(
                     let _ = writeln!(out, "- `{}` {} (not placed)", model.model, hint.summary);
                 }
                 (None, _) => {
-                    let _ = writeln!(out, "- `{}`", model.model);
+                    let _ = writeln!(
+                        out,
+                        "- `{}`{}",
+                        model.model,
+                        model
+                            .identity_note
+                            .as_ref()
+                            .map(|note| format!(" — {note}"))
+                            .unwrap_or_default()
+                    );
                 }
             }
         }
@@ -666,6 +680,9 @@ pub(crate) fn render_selection(
         } else {
             "set aside: "
         };
+        if let Some(note) = &candidate.identity_note {
+            let _ = write!(line, " · {note}");
+        }
         let _ = write!(line, " — {state}{}", candidate.note);
         let _ = writeln!(out, "{line}");
     }
@@ -1110,6 +1127,9 @@ fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind
         out.push('\n');
         for offer in &model.offers {
             let mut facts = Vec::new();
+            if let Some(note) = &offer.identity_note {
+                facts.push(note.clone());
+            }
             if let Some(canonical) = &offer.canonical {
                 facts.push(format!("canonical `{canonical}`"));
             }

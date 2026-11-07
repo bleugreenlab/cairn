@@ -630,6 +630,7 @@ pub(crate) fn settle_unanswered_calls(
         };
         let data = event.observed().to_event_json();
         let event_insert = EventInsert {
+            selected_model: None,
             id: event_id.clone(),
             run_id: run_id.to_string(),
             session_id: pending_result.session_id.clone(),

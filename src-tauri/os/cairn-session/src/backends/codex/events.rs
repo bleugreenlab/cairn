@@ -413,6 +413,7 @@ fn store_event_with_id_for_turn(
         .host
         .transcripts()
         .insert_event(EventInsert {
+            selected_model: None,
             id: event_id.to_string(),
             run_id: run_id.to_string(),
             session_id: session_id.map(str::to_string),
