@@ -463,10 +463,20 @@ mod tests {
         let mut process = MockProcessSpawner::new();
         process.expect_spawn().return_once(|config| {
             assert_eq!(config.program, "codex");
-            assert_eq!(
-                config.args,
-                vec!["app-server", "-c", "mcp_servers.cairn={url=\"u\"}"]
-            );
+            let args = &config.args;
+            assert_eq!(args[0], "app-server");
+            assert_eq!(args[1], "-c");
+            let (key, value) = args[2].split_once('=').unwrap();
+            assert_eq!(key, "projects");
+            let projects: toml::Value = format!("projects={value}").parse().unwrap();
+            for path in ["/tmp/worktree", "/tmp", "/"] {
+                assert_eq!(
+                    projects["projects"][path]["trust_level"].as_str(),
+                    Some("untrusted"),
+                    "project {path} must be untrusted"
+                );
+            }
+            assert_eq!(&args[3..], &["-c", "mcp_servers.cairn={url=\"u\"}"]);
             assert_eq!(config.cwd.as_deref(), Some("/tmp/worktree"));
             Ok(Box::new(MockChildProcess::with_stdout(42, vec![])))
         });
