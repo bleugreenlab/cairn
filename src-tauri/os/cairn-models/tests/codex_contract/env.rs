@@ -143,6 +143,8 @@ pub enum Surface {
     ConfigWarning,
     ThreadStartAwaitsServerRequest,
     RefreshNeverSent,
+    ProjectTrustRemoved,
+    ThreadProjectTrustRemoved,
 }
 
 impl Surface {
@@ -162,6 +164,8 @@ impl Surface {
             Self::ConfigWarning => "config-warning",
             Self::ThreadStartAwaitsServerRequest => "thread-start-awaits-server-request",
             Self::RefreshNeverSent => "refresh-never-sent",
+            Self::ProjectTrustRemoved => "project-trust-removed",
+            Self::ThreadProjectTrustRemoved => "thread-project-trust-removed",
         }
     }
 }
@@ -391,6 +395,8 @@ pub struct Open {
     pub goal: NativeGoal,
     pub effort: Option<String>,
     pub model: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub shared: bool,
 }
 
 impl Open {
@@ -404,6 +410,8 @@ impl Open {
             goal: NativeGoal::Leave,
             effort: None,
             model: Some(FAKE_MODEL.to_string()),
+            cwd: None,
+            shared: false,
         }
     }
 
@@ -792,13 +800,21 @@ impl ContractEnv {
             effort: open.effort,
             approval: ApprovalMode::Allow,
             output_schema: None,
-            cwd: self.work.to_string_lossy().into_owned(),
+            cwd: open
+                .cwd
+                .unwrap_or_else(|| self.work.clone())
+                .to_string_lossy()
+                .into_owned(),
             env: BTreeMap::new(),
             mcp: open.mcp,
             secrets: SecretEnv::new(),
             account_id: None,
             provider: ProviderSpec::Codex(CodexSpec {
-                server: CodexServer::Dedicated { router, events },
+                server: if open.shared {
+                    CodexServer::Shared(router)
+                } else {
+                    CodexServer::Dedicated { router, events }
+                },
                 base_instructions: "You are the codex-contract test agent.".to_string(),
                 developer_instructions: None,
                 service_tier: None,

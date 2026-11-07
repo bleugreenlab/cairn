@@ -541,13 +541,19 @@ mod tests {
 
         let spawned = host.spawned.lock().unwrap();
         assert_eq!(spawned[0].program, "/bin/codex");
+        let args = &spawned[0].args;
+        assert_eq!(args[0], "app-server");
+        assert_eq!(args[1], "-c");
+        let (key, value) = args[2].split_once('=').unwrap();
+        assert_eq!(key, "projects");
+        let projects: toml::Value = format!("projects={value}").parse().unwrap();
         assert_eq!(
-            spawned[0].args,
-            vec![
-                "app-server".to_string(),
-                "-c".to_string(),
-                mcp().codex_config_overrides().remove(0)
-            ]
+            projects["projects"]["/work"]["trust_level"].as_str(),
+            Some("untrusted")
+        );
+        assert_eq!(
+            &args[3..],
+            &["-c".to_string(), mcp().codex_config_overrides().remove(0)]
         );
         assert_eq!(spawned[0].cwd.as_deref(), Some("/work"));
         assert_eq!(spawned[0].env.get("CODEX_HOME").unwrap(), "/codex-home");
@@ -692,7 +698,10 @@ mod tests {
             json!({
                 "model": "gpt-test", "cwd": "/work", "approvalPolicy": "on-request",
                 "sandbox": "workspace-write", "serviceName": "cairn", "baseInstructions": "BASE",
-                "config": {"model_reasoning_effort": "high"},
+                "config": {
+                    "projects": super::super::home::project_config_overrides("/work")["projects"],
+                    "model_reasoning_effort": "high"
+                },
                 "serviceTier": "priority", "developerInstructions": "AGENT"
             })
         );

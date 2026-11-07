@@ -71,6 +71,10 @@ impl AppServerClient {
             .arg("app-server")
             .cwd(cwd)
             .stdin(true);
+        for (key, value) in crate::session::codex::home::project_config_overrides(cwd) {
+            let value = toml::Value::try_from(value).expect("project trust is TOML");
+            spawn_config = spawn_config.arg("-c").arg(&format!("{key}={value}"));
+        }
         for value in config_overrides {
             spawn_config = spawn_config.arg("-c").arg(value);
         }

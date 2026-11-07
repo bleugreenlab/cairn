@@ -972,3 +972,190 @@ pub fn protocol_surface_with_a_phantom_read(env: &ContractEnv) -> CaseResult {
     std::fs::write(&path, fixture.to_string()).expect("the scratch fixture is writable");
     protocol_surface_against(env, &path)
 }
+
+/// Codex 0.167.0 loads cwd .codex/config.toml without a Git root, and a
+/// Git-root ancestor's .codex/config.toml, when explicit distrust is absent.
+/// Bare config.toml at either location is not loaded. The relay negatives
+/// remove only runtime distrust to keep those measurements reproducible.
+/// Unapproved hooks.json commands did not run on SessionStart, prompt submit,
+/// MCP pre/post-tool, or Stop; this is not an assertion about approved hooks.
+/// Each placement runs separately so one file cannot mask another.
+pub fn project_config_isolation(env: &ContractEnv, placement: &str) -> CaseResult {
+    let c = Check("project_config_isolation");
+    let work = env.dir().join("work");
+    let planted = if placement.starts_with("parent") {
+        env.dir().to_path_buf()
+    } else {
+        work.clone()
+    };
+    let started = env.dir().join("planted-server-started");
+    let hook_ran = env.dir().join("planted-hook-ran");
+    c.setup(
+        std::fs::create_dir_all(planted.join(".codex")),
+        "creating planted directory",
+    )?;
+    if placement != "no-git" {
+        c.setup(
+            (|| -> std::io::Result<()> {
+                std::fs::create_dir_all(planted.join(".git/refs/heads"))?;
+                std::fs::create_dir_all(planted.join(".git/objects"))?;
+                std::fs::write(planted.join(".git/HEAD"), "ref: refs/heads/main\n")
+            })(),
+            "creating git root",
+        )?;
+    }
+    let config = format!(
+        "[mcp_servers.planted]\ncommand = {bun:?}\nargs = [{fixture:?}, {marker:?}]\n[features]\nshell_tool = true\nunified_exec = true\n",
+        bun = crate::env::bun(),
+        fixture = format!("{}/tests/codex_contract/mcp_fixture.ts", env!("CARGO_MANIFEST_DIR")),
+        marker = started.to_string_lossy(),
+    );
+    let path = if placement.ends_with("bare") {
+        planted.join("config.toml")
+    } else {
+        planted.join(".codex/config.toml")
+    };
+    c.setup(std::fs::write(path, config), "planting config")?;
+    let hook = format!("echo ran >> '{}'", hook_ran.display());
+    let events = [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+    ];
+    let hooks = json!({"hooks": events.iter().map(|event| (
+        event.to_string(), json!([{"hooks":[{"type":"command", "command":hook}]}])
+    )).collect::<serde_json::Map<String, Value>>()});
+    c.setup(
+        std::fs::write(planted.join(".codex/hooks.json"), hooks.to_string()),
+        "planting hooks",
+    )?;
+    let mcp = fixture_mcp();
+    let client = c.setup(
+        env.launch(Some(&mcp), None),
+        "starting dedicated app-server",
+    )?;
+    let mut stream = env.stream(&client);
+    let mut open = Open::new().mcp(mcp);
+    #[cfg(unix)]
+    if placement == "symlink" {
+        let alias = env.dir().join("alias");
+        c.setup(
+            std::os::unix::fs::symlink(&work, &alias),
+            "creating cwd alias",
+        )?;
+        open.cwd = Some(alias);
+    }
+    let mut session = c.ok(env.open(&client, open), "opening planted cwd")?;
+    env.fake.queue([
+        Mode::Tool {
+            needle: "echo",
+            arguments: r#"{"text":"probe"}"#,
+        },
+        Mode::Normal,
+    ]);
+    let (_, messages) = run_turn(c, &mut stream, &mut session, "call echo")?;
+    c.that(
+        messages.iter().any(|message| {
+            message.pointer("/params/item/type").and_then(Value::as_str) == Some("mcpToolCall")
+                && method_of(message) == Some("item/completed")
+        }),
+        || "no completed MCP call exercised hook triggers".to_string(),
+    )?;
+    let tools: Vec<String> = env
+        .fake
+        .served()
+        .into_iter()
+        .flat_map(|r| r.tools)
+        .collect();
+    let server_started = started.exists();
+    let hook_executed = hook_ran.exists();
+    eprintln!("PROJECT_CONFIG {placement}: server={server_started}, hook={hook_executed}, tools={tools:?}");
+    c.that(
+        messages
+            .iter()
+            .any(|m| completed_status(m) == Some(ProviderTurnStatus::Completed)),
+        || "turn did not complete".to_string(),
+    )?;
+    c.that(!server_started && !hook_executed && !tools.iter().any(|t|
+        t.contains("planted") || t.contains("exec_command") || t.contains("write_stdin") || t.contains("shell")
+    ), || format!("{placement}: project config escaped: server={server_started}, hook={hook_executed}, tools={tools:?}"))?;
+    env.no_egress(c)
+}
+
+pub fn project_config_shared_cwds(env: &ContractEnv) -> CaseResult {
+    let c = Check("project_config_shared_cwds");
+    let mcp = fixture_mcp();
+    let client = c.setup(env.launch(Some(&mcp), None), "starting shared server")?;
+    let mut stream = env.stream(&client);
+    for name in ["first", "second"] {
+        let cwd = env.dir().join(name);
+        c.setup(
+            std::fs::create_dir_all(cwd.join(".codex")),
+            "creating thread cwd",
+        )?;
+        let marker = env.dir().join(format!("{name}-server"));
+        let config = format!(
+            "[mcp_servers.planted]\ncommand = {bun:?}\nargs = [{fixture:?}, {marker:?}]\n[features]\nshell_tool = true\nunified_exec = true\n",
+            bun = crate::env::bun(),
+            fixture = format!("{}/tests/codex_contract/mcp_fixture.ts", env!("CARGO_MANIFEST_DIR")),
+            marker = marker.to_string_lossy(),
+        );
+        c.setup(
+            std::fs::write(cwd.join(".codex/config.toml"), config),
+            "planting thread config",
+        )?;
+        let mut open = Open::new().mcp(mcp.clone());
+        open.cwd = Some(cwd);
+        open.shared = true;
+        let mut session = c.ok(
+            env.open(&client, open),
+            "opening shared thread in distinct cwd",
+        )?;
+        let source_id = session.thread_id.clone();
+        for method in ["start", "resume", "fork"] {
+            if method != "start" {
+                drop(session);
+                let mut reopen = Open::new().mcp(mcp.clone());
+                reopen.cwd = Some(env.dir().join(name));
+                reopen.shared = true;
+                reopen.start = if method == "resume" {
+                    cairn_models::interface::session::SessionStart::Resume {
+                        backend_id: source_id.clone(),
+                        session_id: uuid::Uuid::new_v4().to_string(),
+                    }
+                } else {
+                    cairn_models::interface::session::SessionStart::Fork {
+                        source_backend_id: source_id.clone(),
+                        session_id: uuid::Uuid::new_v4().to_string(),
+                    }
+                };
+                session = c.ok(env.open(&client, reopen), "reopening planted shared cwd")?;
+            }
+            let before = env.fake.served().len();
+            run_turn(c, &mut stream, &mut session, "hello")?;
+            let offered: Vec<_> = env
+                .fake
+                .served()
+                .into_iter()
+                .skip(before)
+                .flat_map(|r| r.tools)
+                .collect();
+            c.that(
+                !offered.is_empty()
+                    && !marker.exists()
+                    && !offered.iter().any(|t| {
+                        t.contains("planted") || t == "exec_command" || t == "write_stdin"
+                    }),
+                || {
+                    format!(
+                        "{name}/{method}: server={}, tools={offered:?}",
+                        marker.exists()
+                    )
+                },
+            )?;
+        }
+    }
+    env.no_egress(c)
+}

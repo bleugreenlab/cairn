@@ -3,6 +3,8 @@
  * The codex-contract suite's MCP server: stdio, newline-delimited JSON-RPC,
  * one `echo` tool that answers its `text` argument back.
  */
+if (process.argv[2]) await Bun.write(process.argv[2], "started\n");
+
 const write = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
 const tools = [

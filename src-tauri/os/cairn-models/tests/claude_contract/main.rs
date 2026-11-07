@@ -124,3 +124,22 @@ fn negative_updater_enabled() {
         cases::update_is_refused_under_launch_env(&env().updater_enabled()),
     );
 }
+
+#[test]
+fn planted_cwd_settings() {
+    pass(cases::planted_cwd_config_isolation(
+        &env(),
+        ".claude/settings.json",
+    ));
+}
+#[test]
+fn planted_cwd_local_settings() {
+    pass(cases::planted_cwd_config_isolation(
+        &env(),
+        ".claude/settings.local.json",
+    ));
+}
+#[test]
+fn planted_cwd_mcp() {
+    pass(cases::planted_cwd_config_isolation(&env(), ".mcp.json"));
+}

@@ -12,7 +12,11 @@ import { connect } from "node:net";
 import { startRelay } from "../support/stdio_relay.ts";
 
 const [surface, codex, ...args] = process.argv.slice(2);
-const io = startRelay([codex, ...args]);
+// Strip only Cairn's explicit distrust, reproducing the pre-hardening launch.
+const forwarded = args.filter((arg, index) =>
+  !(surface === "project-trust-removed" &&
+    (arg.startsWith("projects=") || (arg === "-c" && args[index + 1]?.startsWith("projects=")))));
+const io = startRelay([codex, ...forwarded]);
 
 type Message = {
   id?: unknown;
@@ -114,6 +118,10 @@ function upstream(line: string): string[] {
     message = JSON.parse(line);
   } catch {
     return [line];
+  }
+  if (["project-trust-removed", "thread-project-trust-removed"].includes(surface) && message.params?.config) {
+    delete message.params.config.projects;
+    line = JSON.stringify(message);
   }
   if (message.method && message.id !== undefined) pending.set(message.id, message.method);
   if (!message.method && message.id !== undefined) {

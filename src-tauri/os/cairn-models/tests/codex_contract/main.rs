@@ -129,3 +129,80 @@ fn negative_protocol_surface() {
         cases::protocol_surface_with_a_phantom_read(&env()),
     );
 }
+
+#[test]
+fn project_config_dot_codex() {
+    pass(cases::project_config_isolation(&env(), "dot-codex"));
+}
+#[test]
+fn project_config_bare() {
+    pass(cases::project_config_isolation(&env(), "bare"));
+}
+#[test]
+fn project_config_without_git() {
+    pass(cases::project_config_isolation(&env(), "no-git"));
+}
+#[test]
+fn project_config_parent() {
+    pass(cases::project_config_isolation(&env(), "parent"));
+}
+
+#[test]
+fn project_config_shared_cwds() {
+    pass(cases::project_config_shared_cwds(&env()));
+}
+
+#[test]
+fn project_config_parent_bare() {
+    pass(cases::project_config_isolation(&env(), "parent-bare"));
+}
+
+// Removing only the runtime distrust reproduces the vulnerable production path.
+#[test]
+fn negative_project_config_dot_codex() {
+    red(
+        "project_config_isolation",
+        cases::project_config_isolation(&env().broken(Surface::ProjectTrustRemoved), "dot-codex"),
+    );
+}
+#[test]
+fn negative_project_config_without_git() {
+    red(
+        "project_config_isolation",
+        cases::project_config_isolation(&env().broken(Surface::ProjectTrustRemoved), "no-git"),
+    );
+}
+#[test]
+fn negative_project_config_parent() {
+    red(
+        "project_config_isolation",
+        cases::project_config_isolation(&env().broken(Surface::ProjectTrustRemoved), "parent"),
+    );
+}
+#[test]
+fn project_config_bare_without_hardening() {
+    pass(cases::project_config_isolation(
+        &env().broken(Surface::ProjectTrustRemoved),
+        "bare",
+    ));
+}
+#[test]
+fn project_config_parent_bare_without_hardening() {
+    pass(cases::project_config_isolation(
+        &env().broken(Surface::ProjectTrustRemoved),
+        "parent-bare",
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_config_symlink() {
+    pass(cases::project_config_isolation(&env(), "symlink"));
+}
+#[test]
+fn negative_project_config_shared_thread_trust() {
+    red(
+        "project_config_shared_cwds",
+        cases::project_config_shared_cwds(&env().broken(Surface::ThreadProjectTrustRemoved)),
+    );
+}

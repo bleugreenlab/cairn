@@ -18,6 +18,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Explicit distrust prevents app-server's writable-cwd implicit trust upgrade.
+/// Include ancestors: an existing saved trust entry must not enable a parent's
+/// project config. This is a runtime layer, never a scan of checkout contents.
+pub fn project_config_overrides(cwd: &str) -> serde_json::Map<String, Value> {
+    let path = std::path::PathBuf::from(cwd);
+    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let mut projects = serde_json::Map::new();
+    for path in [&path, &canonical] {
+        for ancestor in path.ancestors() {
+            projects.insert(
+                ancestor.to_string_lossy().into_owned(),
+                serde_json::json!({"trust_level": "untrusted"}),
+            );
+        }
+    }
+    serde_json::Map::from_iter([("projects".to_string(), Value::Object(projects))])
+}
+
 #[cfg(not(target_os = "windows"))]
 fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(source, destination)
@@ -260,6 +278,46 @@ fn harden_codex_model_catalog(catalog_json: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn project_distrust_covers_cwd_and_every_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("nested").join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let overrides = project_config_overrides(cwd.to_str().unwrap());
+        let projects = overrides["projects"].as_object().unwrap();
+        for path in [&cwd, &std::fs::canonicalize(&cwd).unwrap()] {
+            for ancestor in path.ancestors() {
+                assert_eq!(
+                    projects[ancestor.to_str().unwrap()]["trust_level"],
+                    "untrusted"
+                );
+            }
+        }
+        assert!(projects
+            .values()
+            .all(|entry| entry == &serde_json::json!({"trust_level": "untrusted"})));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_distrust_covers_both_symlink_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let overrides = project_config_overrides(alias.to_str().unwrap());
+        assert_eq!(
+            overrides["projects"][alias.to_str().unwrap()]["trust_level"],
+            "untrusted"
+        );
+        let canonical = std::fs::canonicalize(real).unwrap();
+        assert_eq!(
+            overrides["projects"][canonical.to_str().unwrap()]["trust_level"],
+            "untrusted"
+        );
+    }
 
     #[test]
     fn test_shared_codex_config_defines_no_mcp_server() {

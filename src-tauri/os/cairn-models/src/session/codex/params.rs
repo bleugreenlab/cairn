@@ -48,7 +48,7 @@ pub fn build_thread_start_params(
         "serviceName": "cairn",
         "baseInstructions": base_instructions,
     });
-    let mut config = serde_json::Map::new();
+    let mut config = super::home::project_config_overrides(cwd);
     if tool_free {
         // No rollout persisted, no shell or environment, nothing writable, and
         // every tool Codex would offer without one switched off for this
@@ -138,7 +138,7 @@ pub fn build_thread_resume_params(
         "sandbox": sandbox_mode,
         "baseInstructions": base_instructions,
     });
-    let mut config = serde_json::Map::new();
+    let mut config = super::home::project_config_overrides(cwd);
     insert_effort_override(&mut config, reasoning_effort);
     if !config.is_empty() {
         params["config"] = Value::Object(config);
@@ -395,11 +395,10 @@ mod tests {
         for key in ["ephemeral", "environments"] {
             assert!(params.get(key).is_none(), "{key} on a session with tools");
         }
-        // A session with tools carries no tool-free overrides, only its effort.
-        assert_eq!(
-            params["config"],
-            serde_json::json!({ "model_reasoning_effort": "medium" })
-        );
+        // A session with tools carries distrust and effort, not tool-free overrides.
+        let mut expected = super::super::home::project_config_overrides("/tmp/worktree");
+        expected.insert("model_reasoning_effort".into(), serde_json::json!("medium"));
+        assert_eq!(params["config"], Value::Object(expected));
     }
 
     /// A tool-free thread persists nothing, reaches no environment, can write
@@ -425,6 +424,7 @@ mod tests {
         assert_eq!(
             params["config"],
             serde_json::json!({
+                "projects": super::super::home::project_config_overrides("/tmp/scratch")["projects"],
                 "mcp_servers.cairn.enabled": false,
                 "web_search": "disabled",
                 "tools.update_plan.enabled": false,
@@ -615,10 +615,11 @@ mod tests {
                 "serviceTier",
             ]
         );
-        assert_eq!(
-            params["config"],
-            serde_json::json!({ "model_reasoning_effort": "high" })
-        );
+        assert_eq!(params["config"], {
+            let mut expected = super::super::home::project_config_overrides("/tmp/worktree");
+            expected.insert("model_reasoning_effort".into(), serde_json::json!("high"));
+            Value::Object(expected)
+        });
     }
 
     /// `thread/resume` has neither a reasoning-effort field nor `serviceName`
@@ -650,10 +651,11 @@ mod tests {
                 "threadId",
             ]
         );
-        assert_eq!(
-            params["config"],
-            serde_json::json!({ "model_reasoning_effort": "high" })
-        );
+        assert_eq!(params["config"], {
+            let mut expected = super::super::home::project_config_overrides("/tmp/worktree");
+            expected.insert("model_reasoning_effort".into(), serde_json::json!("high"));
+            Value::Object(expected)
+        });
     }
 
     /// `thread/fork` is resume's keys plus `deferGoalContinuation`, which
@@ -686,14 +688,15 @@ mod tests {
                 "threadId",
             ]
         );
-        assert_eq!(
-            params["config"],
-            serde_json::json!({ "model_reasoning_effort": "high" })
-        );
+        assert_eq!(params["config"], {
+            let mut expected = super::super::home::project_config_overrides("/tmp/worktree");
+            expected.insert("model_reasoning_effort".into(), serde_json::json!("high"));
+            Value::Object(expected)
+        });
     }
 
-    /// With no configured effort nothing is overridden: the thread keeps
-    /// the model's catalog default, and a resume sends no `config` at all.
+    /// With no configured effort the thread keeps the catalog default,
+    /// while project distrust is still sent on every open.
     #[test]
     fn no_configured_effort_sends_no_effort_override() {
         let resumed = build_thread_resume_params(
@@ -707,7 +710,12 @@ mod tests {
             "BASE",
             None,
         );
-        assert!(resumed.get("config").is_none());
+        assert_eq!(
+            resumed["config"],
+            Value::Object(super::super::home::project_config_overrides(
+                "/tmp/worktree"
+            ))
+        );
         let started = build_thread_start_params(
             "/tmp/worktree",
             "on-request",
@@ -721,7 +729,7 @@ mod tests {
             &[],
             CodexNativeTools::None,
         );
-        assert!(started.get("config").is_none());
+        assert_eq!(started["config"], resumed["config"]);
     }
 
     #[test]
