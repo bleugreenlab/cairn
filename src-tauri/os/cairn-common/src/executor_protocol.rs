@@ -5626,6 +5626,17 @@ pub struct LearnedResourceEstimate {
 /// older executor gets nothing wrong: a `Cancel` it does send is handled as
 /// always, and a request it no longer cancels runs to its ordinary result.
 ///
+/// cairn/5940 does not move the number. A pack service declared
+/// `placement: fleet` is served to every attached machine on the existing
+/// machine-service selection, as ordinary [`MachineServiceArtifact`]s, and
+/// reported back in the existing [`InstalledMachineService`]s; the runner
+/// launches it itself and never asks an executor to. `managed_program_path`
+/// moves into this crate so the runner and the executor resolve an install
+/// with one function, without changing what it resolves. No frame, variant or
+/// field changes, and a runner talking to an older executor gets nothing
+/// wrong: that executor installs the artifacts it is served, as it already did
+/// for a per-machine selection, and reports them as before.
+///
 /// cairn/6083 does not move the number. The runner submits independent
 /// pure-verdict placement groups concurrently and records each group's results
 /// when it returns. Each group is the same ordinary batch an older executor
@@ -7447,6 +7458,87 @@ impl ManagedProgram {
 
     pub fn install_dir_name(&self) -> String {
         machine_service_install_dir_name(&self.pack, &self.service, &self.sha256)
+    }
+}
+
+/// `<home>/<MACHINE_SERVICE_TOOLS_DIR>` holds machine-service installs, beside
+/// `bin`, one digest-addressed directory each.
+pub const MACHINE_SERVICE_TOOLS_DIR: &str = "tools";
+/// The full digest of the artifact an install directory was unpacked from,
+/// written last, so a directory without it is not an install.
+pub const MACHINE_SERVICE_MARKER: &str = ".cairn-artifact-sha256";
+
+/// Where an installed machine service's executable is under `home`, or why it
+/// is not there. The executor that installed it and a runner sharing its home
+/// both answer with this, so "installed" means one thing on both sides.
+pub fn managed_program_path(
+    home: &std::path::Path,
+    program: &ManagedProgram,
+) -> Result<std::path::PathBuf, String> {
+    let dir = home
+        .join(MACHINE_SERVICE_TOOLS_DIR)
+        .join(program.install_dir_name());
+    let marked = std::fs::read_to_string(dir.join(MACHINE_SERVICE_MARKER))
+        .map(|marker| marker.trim() == program.sha256)
+        .unwrap_or(false);
+    let executable = program
+        .executable
+        .split('/')
+        .fold(dir.clone(), |path, segment| path.join(segment));
+    if !marked || !executable.is_file() {
+        return Err(format!(
+            "not installed: {}/{} {} is not installed under {}",
+            program.pack,
+            program.service,
+            &program.sha256[..16.min(program.sha256.len())],
+            dir.display()
+        ));
+    }
+    Ok(executable)
+}
+
+#[cfg(test)]
+mod managed_program_tests {
+    use super::*;
+
+    #[test]
+    fn a_managed_program_resolves_only_to_a_marked_install() {
+        let home = tempfile::tempdir().unwrap();
+        let program = ManagedProgram {
+            pack: "axon".into(),
+            service: "axon".into(),
+            sha256: "5748ce7e08ee1e521fb4044ffa30577acf588a02d368a2f3d2bb459264d9c141".into(),
+            executable: "Axon.app/Contents/Resources/bin/axon".into(),
+        };
+        assert_eq!(
+            ManagedProgram::parse(&program.intent()),
+            Some(program.clone())
+        );
+        let missing = managed_program_path(home.path(), &program).unwrap_err();
+        assert!(
+            missing.starts_with("not installed: axon/axon 5748ce7e08ee1e52"),
+            "{missing}"
+        );
+
+        let dir = home.path().join("tools/axon-axon-5748ce7e08ee1e52");
+        std::fs::create_dir_all(dir.join("Axon.app/Contents/Resources/bin")).unwrap();
+        std::fs::write(dir.join("Axon.app/Contents/Resources/bin/axon"), b"x").unwrap();
+        assert!(
+            managed_program_path(home.path(), &program).is_err(),
+            "an unmarked directory is an interrupted install, not an install"
+        );
+        std::fs::write(dir.join(MACHINE_SERVICE_MARKER), &program.sha256).unwrap();
+        assert_eq!(
+            managed_program_path(home.path(), &program).unwrap(),
+            dir.join("Axon.app/Contents/Resources/bin/axon")
+        );
+        for bad in [
+            "cairn:managed-program:axon/axon@short:bin/axon",
+            "cairn:managed-program:axon/axon@5748ce7e08ee1e521fb4044ffa30577acf588a02d368a2f3d2bb459264d9c141:../axon",
+            "cairn:managed-program:axon@5748ce7e08ee1e521fb4044ffa30577acf588a02d368a2f3d2bb459264d9c141:axon",
+        ] {
+            assert_eq!(ManagedProgram::parse(bad), None, "{bad}");
+        }
     }
 }
 

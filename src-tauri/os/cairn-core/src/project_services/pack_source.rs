@@ -1,17 +1,15 @@
 //! Service declarations an installed pack ships: `services/<id>/service.yaml`
-//! in the pack's source. A pack-owned service is the one kind that may run one
-//! resident per machine (`placement: per-machine`); which machines is the
-//! operator's fleet row, `buildSlots.machineServices`.
+//! in the pack's source. A pack-owned service is the one kind that may be a
+//! machine service: one resident per machine (`placement: per-machine`), where
+//! which machines is the operator's fleet row, `buildSlots.machineServices`; or
+//! delivered to every machine and launched on demand (`placement: fleet`),
+//! where the row holds only per-machine overrides.
 //!
-//! Only the declaration is read here, and always from the app's own bundle. Pack
-//! sync also materializes a service into `~/.cairn/services/<id>/`, which gives
-//! it a hash in the lock, a catalog row, and removal and restore like every other
-//! kind; that copy is a mirror and an edit tripwire, never what runs, because the
-//! config directory is writable by agents and a declaration names artifact URLs,
-//! hashes and a command. So the lock decides what is declared: an item recorded
-//! as removed is not, and one whose copy was edited stays declared while its
-//! artifact is refused until it is reset; a per-machine override, which runs
-//! the shipped declaration with the operator's own binary, still may. A pack
+//! Only the declaration is read here, and always from the app's own bundle. A
+//! service is never mirrored into the config directory, which agents can write,
+//! because a declaration names artifact URLs, hashes and a command. The lock
+//! decides what is declared: an item recorded as removed is not. A per-machine
+//! override runs the shipped declaration with the operator's own binary. A pack
 //! installed from a URL or a local directory declares no services.
 
 use std::path::{Path, PathBuf};
@@ -201,7 +199,8 @@ pub(crate) struct DeclaredMachineService {
     pub refusal: Option<String>,
 }
 
-/// Every per-machine service the installed packs declare, in key order.
+/// Every machine service (per-machine or fleet) the installed packs declare, in
+/// key order.
 pub(crate) fn declared_machine_services(config_dir: &Path) -> Vec<DeclaredMachineService> {
     let mut declared = Vec::new();
     for source in PackServiceSource::installed(config_dir) {
@@ -224,7 +223,7 @@ fn machine_services_in(source: &PackServiceSource) -> Vec<DeclaredMachineService
         .filter_map(|listing| {
             let key = MachineServiceKey::new(source.pack(), &listing.id).ok()?;
             let package = match listing.declaration {
-                Ok(declaration) if declaration.placement == Placement::PerMachine => source
+                Ok(declaration) if declaration.placement != Placement::Single => source
                     .package(&listing.id)
                     .and_then(|package| package.ok_or_else(|| "its declaration vanished".into())),
                 // A single-instance pack service is not a machine service.
@@ -301,7 +300,10 @@ mod tests {
             native.targets["aarch64-apple-darwin"].executable,
             "Axon.app/Contents/Resources/bin/axon"
         );
-        assert_eq!(native.probe.every, std::time::Duration::from_secs(300));
+        assert_eq!(
+            native.resident_probe().unwrap().every,
+            std::time::Duration::from_secs(300)
+        );
         assert_eq!(package.source_hash, manifest_hash(AXON.as_bytes()));
     }
 
@@ -371,6 +373,41 @@ mod tests {
         let source = PackServiceSource::open(&home, "kit");
         assert!(source.list().unwrap().is_empty());
         assert!(source.package("probe").unwrap().is_none());
+    }
+
+    /// A workspace that installed the pack before it shipped this service has
+    /// a lock with no item for it. The service is declared all the same, from
+    /// the bundle and unrefused, so delivery does not wait for a sync; the next
+    /// sync records the item and still writes nothing into the workspace.
+    #[test]
+    fn a_lock_from_before_the_pack_shipped_the_service_still_declares_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, resources) = installed_pack(dir.path(), AXON);
+        let mut lock = cairn_packs::lock::read_lock(&home, "kit").unwrap();
+        lock.items.retain(|item| item.kind != PackItemKind::Service);
+        cairn_packs::lock::write_lock(&crate::services::RealFileSystem, &home, &lock).unwrap();
+
+        let declared = declared_machine_service(&home, &key()).expect("declared from the bundle");
+        assert!(declared.refusal.is_none());
+        assert!(declared.package.is_ok());
+
+        cairn_packs::sync_one_pack(
+            &crate::services::RealGitClient,
+            &crate::services::RealFileSystem,
+            &resources,
+            &home,
+            "kit",
+        )
+        .unwrap();
+        assert!(cairn_packs::lock::read_lock(&home, "kit")
+            .unwrap()
+            .item(PackItemKind::Service, "probe")
+            .is_some());
+        assert!(!home.join("services/probe").exists());
+        assert!(declared_machine_service(&home, &key())
+            .unwrap()
+            .refusal
+            .is_none());
     }
 
     #[test]

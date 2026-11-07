@@ -124,6 +124,20 @@ pub(crate) enum Placement {
     Single,
     /// One resident on each machine the fleet row selects it on.
     PerMachine,
+    /// Delivered to every attached machine whose target the declaration ships,
+    /// with no row selection. Never a resident: it holds no lease and has no
+    /// cell, and whatever consumes it launches it on demand.
+    Fleet,
+}
+
+impl Placement {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::PerMachine => "per-machine",
+            Self::Fleet => "fleet",
+        }
+    }
 }
 
 /// What a service's stdio carries.
@@ -258,7 +272,17 @@ pub(crate) struct NativeSpec {
     pub prove: Vec<String>,
     /// By the artifact plane's target triple.
     pub targets: BTreeMap<String, NativeArtifact>,
-    pub probe: ProbeSpec,
+    /// Present exactly for `placement: per-machine`: a fleet service has no
+    /// resident to probe. Read through [`NativeSpec::resident_probe`].
+    probe: Option<ProbeSpec>,
+}
+
+impl NativeSpec {
+    /// How a resident is asked its state: `Some` for a per-machine service,
+    /// `None` for a fleet service, which is never a resident.
+    pub(crate) fn resident_probe(&self) -> Option<&ProbeSpec> {
+        self.probe.as_ref()
+    }
 }
 
 /// What runs a validated service.
@@ -496,9 +520,10 @@ pub(crate) fn parse_service_manifest_in(
             "{manifest_place}: `name` must say what a person calls this service"
         ));
     }
-    if manifest.placement == Placement::PerMachine && !origin.pack_owned {
+    if manifest.placement != Placement::Single && !origin.pack_owned {
         return Err(format!(
-            "{manifest_place}: `placement: per-machine` is legal only for a service a pack ships; a project or thread service runs one instance"
+            "{manifest_place}: `placement: {}` is legal only for a service a pack ships; a project or thread service runs one instance",
+            manifest.placement.word()
         ));
     }
     if manifest.runtime == RuntimeKind::Native {
@@ -515,9 +540,10 @@ pub(crate) fn parse_service_manifest_in(
             ));
         }
     }
-    if manifest.placement == Placement::PerMachine {
+    if manifest.placement != Placement::Single {
         return Err(format!(
-            "{manifest_place}: `placement: per-machine` needs `runtime: native`; a bun service runs one instance"
+            "{manifest_place}: `placement: {}` needs `runtime: native`; a bun service runs one instance",
+            manifest.placement.word()
         ));
     }
     if manifest.callback == Some(Callback::None) {
@@ -594,9 +620,10 @@ fn transport_word(transport: Transport) -> &'static str {
     }
 }
 
-/// A `runtime: native` declaration: a pinned executable per target, one
-/// resident per selected machine, no Cairn callback, and a probe that says
-/// whether it is ready.
+/// A `runtime: native` declaration: a pinned executable per target and no
+/// Cairn callback. `per-machine` runs one resident per selected machine with a
+/// probe that says whether it is ready; `fleet` is delivered to every machine
+/// and launched by whatever consumes it, so it has no probe.
 fn parse_native(
     origin: &PackageOrigin,
     id: &str,
@@ -642,9 +669,10 @@ fn parse_native(
             ));
         }
     }
-    if manifest.placement != Placement::PerMachine {
+    let placement = manifest.placement;
+    if placement == Placement::Single {
         return Err(format!(
-            "{place}: `runtime: native` needs `placement: per-machine`: a native service runs one resident on each machine that selects it"
+            "{place}: `runtime: native` needs `placement: per-machine` (one resident on each machine that selects it) or `placement: fleet` (delivered to every machine, launched on demand)"
         ));
     }
     if manifest.callback == Some(Callback::Cairn) {
@@ -668,7 +696,20 @@ fn parse_native(
     let required = |key: &str| format!("{place}: `{key}` is required for `runtime: native`");
     let args = manifest.args.ok_or_else(|| required("args"))?;
     let artifacts = manifest.artifacts.ok_or_else(|| required("artifacts"))?;
-    let probe = manifest.probe.ok_or_else(|| required("probe"))?;
+    let probe = match (placement, manifest.probe) {
+        (Placement::Fleet, Some(_)) => {
+            return Err(format!(
+                "{place}: `probe` is refused for `placement: fleet`: a fleet service has no resident to probe; artifacts.prove proves the install"
+            ))
+        }
+        (Placement::Fleet, None) => None,
+        (_, Some(probe)) => Some(probe),
+        (_, None) => {
+            return Err(format!(
+                "{place}: `probe` is required for `placement: per-machine`"
+            ))
+        }
+    };
     if args.len() > MAX_ARGS {
         return Err(format!("{place}: `args` has more than {MAX_ARGS} entries"));
     }
@@ -682,7 +723,7 @@ fn parse_native(
         name: manifest.name.trim().to_string(),
         description: manifest.description.trim().to_string(),
         runtime: Runtime::Native(native),
-        placement: Placement::PerMachine,
+        placement,
         transport,
         callback: Callback::None,
         start: StartPolicy::Launch,
@@ -709,7 +750,7 @@ fn validate_args(args: &[String]) -> Result<(), String> {
 fn resolve_native(
     args: Vec<String>,
     artifacts: ArtifactsManifest,
-    probe: ProbeManifest,
+    probe: Option<ProbeManifest>,
 ) -> Result<NativeSpec, String> {
     let version = artifacts.version.trim();
     if version.is_empty() || version.chars().any(char::is_whitespace) {
@@ -767,6 +808,17 @@ fn resolve_native(
             },
         );
     }
+    let probe = probe.map(resolve_probe).transpose()?;
+    Ok(NativeSpec {
+        args,
+        version: version.to_string(),
+        prove: artifacts.prove,
+        targets,
+        probe,
+    })
+}
+
+fn resolve_probe(probe: ProbeManifest) -> Result<ProbeSpec, String> {
     if probe.args.is_empty() {
         return Err("probe.args must name the arguments of the status one-shot".into());
     }
@@ -797,18 +849,12 @@ fn resolve_native(
     {
         return Err("probe.waitingForOperator entries must be non-empty reasons".into());
     }
-    Ok(NativeSpec {
-        args,
-        version: version.to_string(),
-        prove: artifacts.prove,
-        targets,
-        probe: ProbeSpec {
-            args: probe.args,
-            every,
-            ready: probe.ready,
-            reason: probe.reason,
-            waiting_for_operator: probe.waiting_for_operator,
-        },
+    Ok(ProbeSpec {
+        args: probe.args,
+        every,
+        ready: probe.ready,
+        reason: probe.reason,
+        waiting_for_operator: probe.waiting_for_operator,
     })
 }
 
@@ -1276,7 +1322,10 @@ probe:
         assert_eq!(mac.archive, Some(cairn_common::archive::ArchiveKind::Zip));
         assert_eq!(mac.size, 10);
         assert_eq!(native.targets["x86_64-unknown-linux-gnu"].archive, None);
-        assert_eq!(native.probe.reason, vec!["/reason".to_string()]);
+        assert_eq!(
+            native.resident_probe().unwrap().reason,
+            vec!["/reason".to_string()]
+        );
         let package = package_from_files_in(
             &PackageOrigin::pack("probe", "probe"),
             "probe",
@@ -1352,6 +1401,83 @@ probe:
             let error = pack_manifest(&edit).unwrap_err();
             assert!(error.contains(says), "{says}: {error}");
         }
+    }
+
+    /// [`NATIVE`] as a fleet service: the same keys, and no probe.
+    fn fleet() -> String {
+        let probe_at = NATIVE.find("probe:\n").unwrap();
+        NATIVE[..probe_at].replace("placement: per-machine", "placement: fleet")
+    }
+
+    #[test]
+    fn a_fleet_service_parses_with_no_probe() {
+        let declaration = pack_manifest(&fleet()).unwrap();
+        assert_eq!(declaration.placement, Placement::Fleet);
+        assert_eq!(declaration.transport, Transport::McpStdio);
+        let native = declaration.native().unwrap();
+        assert_eq!(native.resident_probe(), None);
+        assert_eq!(native.prove, vec!["--version".to_string()]);
+        let none = fleet().replace("transport: mcp-stdio", "transport: none");
+        assert_eq!(pack_manifest(&none).unwrap().transport, Transport::None);
+    }
+
+    #[test]
+    fn the_probe_follows_the_placement() {
+        let probed = NATIVE.replace("placement: per-machine", "placement: fleet");
+        let error = pack_manifest(&probed).unwrap_err();
+        assert!(
+            error.contains("`probe` is refused for `placement: fleet`")
+                && error.contains("artifacts.prove proves the install"),
+            "{error}"
+        );
+        let unprobed = fleet().replace("placement: fleet", "placement: per-machine");
+        let error = pack_manifest(&unprobed).unwrap_err();
+        assert!(error.contains("`probe` is required"), "{error}");
+    }
+
+    #[test]
+    fn fleet_placement_is_a_packs_alone() {
+        let error = parse_service_manifest("probe", &fleet()).unwrap_err();
+        assert!(
+            error.contains("`placement: fleet` is legal only"),
+            "{error}"
+        );
+        let bun = pack_manifest("name: Echo\nplacement: fleet\n").unwrap_err();
+        assert!(bun.contains("needs `runtime: native`"), "{bun}");
+    }
+
+    #[test]
+    fn the_bundled_matlab_declaration_parses() {
+        let text = include_str!("../../../../packs/matlab/services/matlab-mcp-server/service.yaml");
+        let declaration = parse_service_manifest_in(
+            &PackageOrigin::pack("matlab", "matlab-mcp-server"),
+            "matlab-mcp-server",
+            text,
+        )
+        .unwrap();
+        assert_eq!(declaration.placement, Placement::Fleet);
+        assert_eq!(declaration.transport, Transport::McpStdio);
+        let native = declaration.native().unwrap();
+        assert_eq!(native.version, "0.16.0");
+        assert_eq!(
+            native.args,
+            [
+                "--matlab-session-mode=auto",
+                "--matlab-display-mode=nodesktop"
+            ]
+        );
+        assert_eq!(
+            native.targets.keys().collect::<Vec<_>>(),
+            [
+                "aarch64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+                "x86_64-unknown-linux-gnu"
+            ]
+        );
+        assert!(native
+            .targets
+            .values()
+            .all(|target| target.archive.is_none()));
     }
 
     #[test]

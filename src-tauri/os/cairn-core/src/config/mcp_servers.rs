@@ -237,7 +237,13 @@ pub(crate) fn resolve_mcp_servers(
 
 /// A connectable server and whose definition it is.
 pub(crate) struct ResolvedMcpServer {
+    /// What the gateway connects: the entry, or for a fleet service's
+    /// `machine-service` entry the stdio launch the host resolved.
     pub config: McpServerConfig,
+    /// The entry as written, which is what identifies the server. Catalog and
+    /// grant fingerprints read this, so a fleet service's pin bump (which moves
+    /// its managed path) does not change who the server is.
+    pub(crate) authored: McpServerConfig,
     pub(crate) pack_id: Option<String>,
     /// See [`AuthoredMcpServer::service_pack`].
     service_pack: Option<String>,
@@ -276,6 +282,7 @@ pub(crate) fn resolve_mcp_server_entries(
     authored_mcp_servers(config_dir, project_path)
         .into_iter()
         .filter_map(|(name, entry)| {
+            let mut config = entry.config.clone();
             if entry.config.transport == MACHINE_SERVICE_TRANSPORT {
                 if let Some(reason) = machine_service_verdict(
                     config_dir,
@@ -288,6 +295,12 @@ pub(crate) fn resolve_mcp_server_entries(
                         reason.summary()
                     );
                     return None;
+                }
+                if let Some(launch) = entry
+                    .service_key()
+                    .and_then(|key| machines.host_launch(&key))
+                {
+                    config = fleet_stdio(&entry.config, launch);
                 }
             } else if let Some(pack_id) = &entry.pack_id {
                 if let Some(reason) = entry
@@ -304,7 +317,8 @@ pub(crate) fn resolve_mcp_server_entries(
             Some((
                 name,
                 ResolvedMcpServer {
-                    config: entry.config,
+                    config,
+                    authored: entry.config,
                     pack_id: entry.pack_id,
                     service_pack: entry.service_pack,
                 },
@@ -313,10 +327,42 @@ pub(crate) fn resolve_mcp_server_entries(
         .collect()
 }
 
+/// The stdio launch the gateway connects for the fleet service entry `name`,
+/// when the host has it ready: what a connection test of that entry spawns.
+/// `None` for any other entry, and for a fleet entry its host cannot launch.
+pub fn fleet_launch_config(
+    config_dir: &Path,
+    project_path: Option<&Path>,
+    name: &str,
+    machines: &MachineServiceSnapshot,
+) -> Option<McpServerConfig> {
+    let entry = resolve_mcp_server_entries(config_dir, project_path, machines).remove(name)?;
+    (entry.authored.transport == MACHINE_SERVICE_TRANSPORT
+        && entry.config.transport != MACHINE_SERVICE_TRANSPORT)
+        .then_some(entry.config)
+}
+
+/// A fleet service's entry as the gateway connects it: an ordinary stdio
+/// launch of the absolute program the host resolved, which is never looked up
+/// on PATH.
+fn fleet_stdio(
+    authored: &McpServerConfig,
+    launch: &crate::project_services::declaration::NativeLaunch,
+) -> McpServerConfig {
+    let mut config = authored.clone();
+    config.transport = "stdio".to_string();
+    config.command = Some(launch.program.clone());
+    config.args = launch.args.clone();
+    config.service = None;
+    config
+}
+
 /// The machine service the enabled entry `name` reaches, whether or not any
 /// machine has it ready: `Some(Ok(key))` for a valid `machine-service` entry,
 /// `Some(Err(reason))` for one that cannot reach a service, and `None` when
-/// `name` is not a `machine-service` entry at all.
+/// `name` is not a `machine-service` entry at all. A fleet service also answers
+/// `None`: it has no resident to route to, because the host launches it as an
+/// ordinary stdio server that [`resolve_mcp_server_entries`] resolves.
 ///
 /// Readiness is deliberately not consulted. [`resolve_mcp_server_entries`]
 /// withholds a machine service no machine has ready, which is right for a
@@ -334,14 +380,18 @@ pub fn machine_service_entry_named(
     Some(match entry.service_pack.as_deref() {
         None => Err("no installed pack ships this entry, so `service` names nothing".to_string()),
         Some(pack) => {
-            super::machine_services::machine_service_entry(config_dir, pack, &entry.config)
+            match super::machine_services::machine_service_entry(config_dir, pack, &entry.config) {
+                Ok(key) if super::machine_services::is_fleet(config_dir, &key) => return None,
+                reached => reached,
+            }
         }
     })
 }
 
 /// Every enabled `machine-service` entry's name, keyed by the service it
 /// reaches, for a surface that starts from the service (an executor's page)
-/// and must name the address an agent calls.
+/// and must name the address an agent calls. A fleet service is left out: it is
+/// called at `cairn://mcp/<name>` with no machine to name.
 pub(crate) fn machine_service_server_names(
     config_dir: &Path,
     project_path: Option<&Path>,
@@ -351,7 +401,10 @@ pub(crate) fn machine_service_server_names(
         if entry.config.transport != MACHINE_SERVICE_TRANSPORT {
             continue;
         }
-        if let Some(key) = entry.service_key() {
+        if let Some(key) = entry
+            .service_key()
+            .filter(|key| !super::machine_services::is_fleet(config_dir, key))
+        {
             names.entry(key).or_default().push(name);
         }
     }
@@ -824,6 +877,8 @@ mod tests {
                     override_command: None,
                     provenance: "installed 1.0.0 (pack)".to_string(),
                     serves_mcp: true,
+                    fleet: false,
+                    launch: None,
                 })
                 .collect();
             MachineServiceSnapshot {
@@ -966,6 +1021,104 @@ mod tests {
             ]);
             assert!(prompt_mcp_servers(&home, None, &machines).contains_key("probe-mcp"));
             assert!(resolve_mcp_servers(&home, None, &machines).contains_key("probe-mcp"));
+            assert_eq!(verdict(&home, &machines), None);
+        }
+
+        fn fleet_manifest() -> String {
+            let probed = manifest("mcp-stdio");
+            probed[..probed.find("probe:\n").unwrap()]
+                .replace("placement: per-machine", "placement: fleet")
+        }
+
+        /// `kit/probe` as a fleet service: the host `local` in `host`, and
+        /// `fedora` ready. Only the host serves MCP, and only a ready host
+        /// carries a launch.
+        fn fleet_snapshot(host: InstanceState) -> MachineServiceSnapshot {
+            let launch = (host == InstanceState::Ready).then(|| {
+                crate::project_services::declaration::NativeLaunch {
+                    program: "/home/u/.cairn/tools/kit-probe-eb5765e715747cac/probe".to_string(),
+                    args: vec!["serve".to_string()],
+                }
+            });
+            let view = |machine: &str, state: InstanceState, launch| InstanceView {
+                machine: machine.to_string(),
+                state,
+                installed_version: Some("1.0.0".to_string()),
+                override_command: None,
+                provenance: "installed 1.0.0 (pack)".to_string(),
+                serves_mcp: machine == "local",
+                fleet: true,
+                launch,
+            };
+            MachineServiceSnapshot {
+                instances: BTreeMap::from([(
+                    key(),
+                    vec![
+                        view("fedora", InstanceState::Ready, None),
+                        view("local", host, launch),
+                    ],
+                )]),
+                machines: Vec::new(),
+            }
+        }
+
+        /// Only the host launches a fleet service, so another machine's
+        /// install admits nothing, and the reason names the host alone.
+        #[test]
+        fn a_fleet_entry_waits_for_the_host_whatever_else_is_installed() {
+            let (_dir, home) = installed(&[("probe", fleet_manifest())], ENTRY);
+            let machines = fleet_snapshot(InstanceState::NotInstalled {
+                reason: "the machine has not reported it yet".to_string(),
+            });
+            assert!(!prompt_mcp_servers(&home, None, &machines).contains_key("probe-mcp"));
+            assert!(!resolve_mcp_servers(&home, None, &machines).contains_key("probe-mcp"));
+            assert_eq!(
+                fleet_launch_config(&home, None, "probe-mcp", &machines),
+                None
+            );
+            assert_eq!(
+                verdict(&home, &machines),
+                Some(NotReady::MachineService {
+                    service: "probe".to_string(),
+                    machines: vec![MachineVerdict {
+                        machine: "local".to_string(),
+                        state: MachineStateTag::NotInstalled,
+                        reason: Some("the machine has not reported it yet".to_string()),
+                    }],
+                })
+            );
+        }
+
+        /// A ready host turns the entry into an ordinary stdio launch of what
+        /// it resolved, which the gateway spawns and never refuses; the entry
+        /// as written stays its identity.
+        #[test]
+        fn a_ready_host_resolves_a_fleet_entry_to_its_launch() {
+            let (_dir, home) = installed(&[("probe", fleet_manifest())], ENTRY);
+            let machines = fleet_snapshot(InstanceState::Ready);
+            assert!(prompt_mcp_servers(&home, None, &machines).contains_key("probe-mcp"));
+            let entries = resolve_mcp_server_entries(&home, None, &machines);
+            let entry = &entries["probe-mcp"];
+            assert_eq!(entry.config.transport, "stdio");
+            assert_eq!(
+                entry.config.command.as_deref(),
+                Some("/home/u/.cairn/tools/kit-probe-eb5765e715747cac/probe")
+            );
+            assert_eq!(entry.config.args, ["serve"]);
+            assert_eq!(entry.config.service, None);
+            assert_eq!(entry.authored.transport, MACHINE_SERVICE_TRANSPORT);
+            assert_eq!(entry.authored.service.as_deref(), Some("probe"));
+            assert_eq!(
+                entry.service_key(),
+                None,
+                "the gateway connects it by its launch"
+            );
+            assert_eq!(machine_service_entry_named(&home, None, "probe-mcp"), None);
+            assert!(machine_service_server_names(&home, None).is_empty());
+            assert_eq!(
+                fleet_launch_config(&home, None, "probe-mcp", &machines),
+                Some(entry.config.clone())
+            );
             assert_eq!(verdict(&home, &machines), None);
         }
 

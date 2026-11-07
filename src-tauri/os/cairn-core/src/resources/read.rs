@@ -3914,7 +3914,7 @@ fn machine_services_section(
         out.push_str(&format!(
             "- {}: {}\n  - Runs: {}\n",
             instance.key,
-            instance.state.sentence(),
+            instance.sentence(),
             instance.provenance
         ));
         if let Some(at) = instance.probed_at_ms {
@@ -3966,7 +3966,7 @@ fn machine_services_overview(
     for (key, instances) in lines {
         let machines: Vec<String> = instances
             .iter()
-            .map(|instance| format!("{} ({})", instance.machine, instance.state.sentence()))
+            .map(|instance| format!("{} ({})", instance.machine, instance.sentence()))
             .collect();
         out.push_str(&format!("- {key}: {}\n", machines.join(", ")));
     }
@@ -4032,7 +4032,29 @@ mod tests {
             probed_at_ms: None,
             serves_mcp: true,
             facade: None,
+            fleet: false,
+            launch: None,
         }
+    }
+
+    /// A fleet service's instance describes its artifact: ready reads
+    /// installed, never ready, and it advertises no verbs.
+    #[test]
+    fn a_ready_fleet_instance_reads_installed() {
+        use crate::project_services::supervisor::machine::InstanceState;
+        let mut fleet = instance("fedora", InstanceState::Ready, "installed 0.16.0 (pack)");
+        fleet.key = "matlab/matlab-mcp-server".parse().unwrap();
+        fleet.fleet = true;
+        fleet.serves_mcp = false;
+        fleet.catalog.clear();
+        let section = machine_services_section("fedora", &[fleet], &Default::default());
+        assert!(
+            section.contains(
+                "- matlab/matlab-mcp-server: installed\n  - Runs: installed 0.16.0 (pack)\n"
+            ),
+            "{section}"
+        );
+        assert!(!section.contains("ready"), "{section}");
     }
 
     /// The three ways a machine can come to run a service read as the three

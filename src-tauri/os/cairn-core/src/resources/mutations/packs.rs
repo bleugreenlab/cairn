@@ -1323,6 +1323,8 @@ mod tests {
                     override_command: Some("/opt/solo".to_string()),
                     provenance: "override /opt/solo (someone)".to_string(),
                     serves_mcp: true,
+                    fleet: false,
+                    launch: None,
                 }],
             )]),
             machines: vec![
@@ -1816,6 +1818,25 @@ mod tests {
         assert_eq!(pack_events(&ws), events);
         as_operator(&ws, "restore", "solo").unwrap();
         assert!(ships_solo(&ws));
+    }
+
+    /// The shipped MATLAB pack carries a fleet-placed service, so it is gated
+    /// exactly like Axon: a fleet service downloads and runs a binary on every
+    /// matching machine with no further click, which is more reach than a
+    /// per-machine one, not less.
+    #[test]
+    fn installing_the_shipped_matlab_pack_is_the_operators_act() {
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let matlab = pack::available_pack(&shipped, "matlab").expect("MATLAB ships bundled");
+        for action in ["install", "update", "restore"] {
+            let error =
+                require_operator_for_machine_services(&matlab, action, PackAuthority::Agent)
+                    .unwrap_err();
+            assert!(error.contains(OPERATOR_ONLY_PACK_ACT), "{error}");
+            assert!(error.contains("matlab/matlab-mcp-server"), "{error}");
+            require_operator_for_machine_services(&matlab, action, PackAuthority::Operator)
+                .unwrap();
+        }
     }
 
     /// A restore discards the removal records BEFORE the sync that materializes
@@ -2509,29 +2530,28 @@ mod tests {
     #[tokio::test]
     async fn a_bundled_connector_that_moved_to_the_library_keeps_working_under_its_new_provenance()
     {
+        const MANIFEST: &str = "id: linear\nname: Linear\nversion: 1.0.0\ndefault: false\n";
+        const MCP: &str = "mcpServers:\n  linear:\n    type: stdio\n    command: ${LINEAR_BIN}\n";
         let mut fixture = LibraryFixture::new();
         // Byte-identical to the bundled pack this workspace installs.
-        fixture.write(
-            "matlab",
-            "cairn-pack.yaml",
-            "id: matlab\nname: MATLAB\nversion: 1.0.0\ndefault: false\n",
-        );
-        fixture.write(
-            "matlab",
-            "mcp.yaml",
-            "mcpServers:\n  matlab:\n    type: stdio\n    command: ${MATLAB_BIN}\n",
-        );
+        fixture.write("linear", "cairn-pack.yaml", MANIFEST);
+        fixture.write("linear", "mcp.yaml", MCP);
         fixture.publish();
         let ws = library_workspace(&fixture).await;
-        apply_pack_action(&ws.orch, "install", "matlab").unwrap();
-        let layer = mcp_layer(&ws, "matlab");
-        let before = pack::lock::read_lock(&ws.home, "matlab").unwrap();
+        write(
+            &source_pack(&ws.resources, "linear").join("cairn-pack.yaml"),
+            MANIFEST,
+        );
+        write(&source_pack(&ws.resources, "linear").join("mcp.yaml"), MCP);
+        apply_pack_action(&ws.orch, "install", "linear").unwrap();
+        let layer = mcp_layer(&ws, "linear");
+        let before = pack::lock::read_lock(&ws.home, "linear").unwrap();
         assert_eq!(before.source.kind, pack::PackSourceKind::Bundled);
 
         // While this build still ships it, the bundled pack wins.
         refresh_library_sources(&ws.orch, true);
         assert_eq!(
-            pack::lock::read_lock(&ws.home, "matlab")
+            pack::lock::read_lock(&ws.home, "linear")
                 .unwrap()
                 .source
                 .kind,
@@ -2543,14 +2563,14 @@ mod tests {
             &crate::config::machine_services::MachineServiceSnapshot::empty(),
         );
         assert!(catalog.sources[0].refused_entries.iter().any(
-            |refusal| refusal.id == "matlab" && refusal.reason.contains("ships with this app")
+            |refusal| refusal.id == "linear" && refusal.reason.contains("ships with this app")
         ));
 
         // The next build no longer ships it.
-        std::fs::remove_dir_all(source_pack(&ws.resources, "matlab")).unwrap();
+        std::fs::remove_dir_all(source_pack(&ws.resources, "linear")).unwrap();
         let report = refresh_library_sources(&ws.orch, true);
-        assert_eq!(report.sources[0].migrated, vec!["matlab".to_string()]);
-        let after = pack::lock::read_lock(&ws.home, "matlab").unwrap();
+        assert_eq!(report.sources[0].migrated, vec!["linear".to_string()]);
+        let after = pack::lock::read_lock(&ws.home, "linear").unwrap();
         assert_eq!(after.source.kind, pack::PackSourceKind::Url);
         assert!(after.source.signer.is_some() && after.source.sha.is_some());
         assert_eq!(
@@ -2558,13 +2578,13 @@ mod tests {
             "items and baselines are untouched"
         );
         assert_eq!(after.content_hash, before.content_hash);
-        assert_eq!(mcp_layer(&ws, "matlab"), layer, "so readiness is unchanged");
+        assert_eq!(mcp_layer(&ws, "linear"), layer, "so readiness is unchanged");
         let entry = pack_catalog(
             &ws.home,
             &ws.orch.library,
             &crate::config::machine_services::MachineServiceSnapshot::empty(),
         )
-        .find("matlab")
+        .find("linear")
         .cloned()
         .unwrap();
         assert_eq!(entry.source.label, "Cairn library");

@@ -373,6 +373,8 @@ mod tests {
             probed_at_ms: None,
             serves_mcp: true,
             facade: None,
+            fleet: false,
+            launch: None,
         }
     }
 

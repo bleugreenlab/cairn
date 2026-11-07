@@ -25,8 +25,9 @@ use crate::config::pack::{
     self, ItemRuns, PackItem, PackItemKind, PackLock, PackManifest, PackSourceKind, UpstreamRef,
 };
 use crate::library::{LibraryContext, PendingUpdate, RuntimeChange};
-use crate::project_services::declaration::Transport;
+use crate::project_services::declaration::{Placement, Transport};
 use crate::project_services::pack_source::declared_machine_service;
+use crate::project_services::supervisor::machine::HOST_MACHINE;
 use cairn_config::fleet::MachineServiceKey;
 
 /// One entry a verified library index offers.
@@ -317,6 +318,9 @@ pub struct CredentialItem {
 pub struct MachineServiceItem {
     /// `<pack>/<service>`: the key a selection is written under.
     pub key: String,
+    /// How the service is placed: selected per machine, or delivered to the
+    /// whole fleet with only overrides in the row.
+    pub placement: MachineServicePlacement,
     /// The version the shipped declaration pins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_version: Option<String>,
@@ -330,6 +334,16 @@ pub struct MachineServiceItem {
     pub machines: Vec<MachineServiceMachine>,
 }
 
+/// `placement:` as the Library reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MachineServicePlacement {
+    /// One resident on each machine the fleet row selects it on.
+    PerMachine,
+    /// Delivered to every machine it ships for; launched on demand.
+    Fleet,
+}
+
 /// One machine's row: a machine the service ships an artifact for, or one that
 /// selected it whatever its platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,7 +353,11 @@ pub struct MachineServiceMachine {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     pub attached: bool,
-    /// Presence of this machine's key in the fleet row.
+    /// Whether this is the machine the runner runs on, whose files a native
+    /// picker here can browse.
+    pub this_machine: bool,
+    /// Whether the machine has an instance: its key is in the fleet row, or
+    /// the service is delivered to the whole fleet.
     pub selected: bool,
     /// The rest describe the instance, so only a selected machine has them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -873,6 +891,7 @@ fn machine_service_item(
                 name: candidate.name.clone(),
                 target: candidate.target.clone(),
                 attached: candidate.attached,
+                this_machine: candidate.name == HOST_MACHINE,
                 selected: view.is_some(),
                 state: verdict.as_ref().map(|verdict| verdict.state),
                 reason: verdict.and_then(|verdict| verdict.reason),
@@ -884,6 +903,10 @@ fn machine_service_item(
         .collect();
     Some(MachineServiceItem {
         key: key.to_string(),
+        placement: match package.map(|package| package.declaration.placement) {
+            Some(Placement::Fleet) => MachineServicePlacement::Fleet,
+            _ => MachineServicePlacement::PerMachine,
+        },
         pinned_version: native.map(|native| native.version.clone()),
         transport: package.map(|package| {
             match package.declaration.transport {
@@ -1291,10 +1314,20 @@ fn item_label(item: &PackCatalogItem) -> String {
             .machines
             .iter()
             .filter(|machine| machine.selected)
-            .map(|machine| format!("{}: {}", machine.name, machine_state_words(machine)))
+            .map(|machine| {
+                format!(
+                    "{}: {}",
+                    machine.name,
+                    machine_state_words(machine, service.placement)
+                )
+            })
             .collect();
         label.push_str(&if selected.is_empty() {
-            " (not selected on any machine)".to_string()
+            match service.placement {
+                MachineServicePlacement::PerMachine => " (not selected on any machine)",
+                MachineServicePlacement::Fleet => " (on no machine it ships for)",
+            }
+            .to_string()
         } else {
             format!(" ({})", selected.join(", "))
         });
@@ -1322,14 +1355,19 @@ fn item_label(item: &PackCatalogItem) -> String {
     label
 }
 
-/// One selected machine's state as a phrase.
-fn machine_state_words(machine: &MachineServiceMachine) -> String {
+/// One selected machine's state as a phrase. A fleet service's ready machine
+/// has the artifact installed; what it needs to work is the program's to say.
+fn machine_state_words(
+    machine: &MachineServiceMachine,
+    placement: MachineServicePlacement,
+) -> String {
     let word = match machine.state {
         Some(MachineStateTag::NotInstalled) | None => "not installed",
         Some(MachineStateTag::Installing) => "installing",
         Some(MachineStateTag::MachineAbsent) => "machine absent",
         Some(MachineStateTag::Starting) => "starting",
         Some(MachineStateTag::WaitingForOperator) => "waiting for the operator",
+        Some(MachineStateTag::Ready) if placement == MachineServicePlacement::Fleet => "installed",
         Some(MachineStateTag::Ready) => "ready",
         Some(MachineStateTag::Degraded) => "degraded",
         Some(MachineStateTag::Failed) => "failed",
@@ -1356,7 +1394,7 @@ fn render_machine_services(out: &mut String, entry: &PackCatalogEntry) {
         out.push('\n');
         for machine in &service.machines {
             let standing = if machine.selected {
-                machine_state_words(machine)
+                machine_state_words(machine, service.placement)
             } else {
                 "not selected".to_string()
             };
@@ -1370,12 +1408,22 @@ fn render_machine_services(out: &mut String, entry: &PackCatalogEntry) {
         if service.machines.is_empty() {
             out.push_str("- No machine this service ships an artifact for.\n");
         }
-        out.push_str(&format!(
-            "\nSelect it on a machine with `write cairn://executors/<name>` patch \
-             `{{machineServices: {{\"{key}\": {{}}}}}}`, which runs the service there; `null` \
-             removes it.\n\n",
-            key = service.key
-        ));
+        match service.placement {
+            MachineServicePlacement::PerMachine => out.push_str(&format!(
+                "\nSelect it on a machine with `write cairn://executors/<name>` patch \
+                 `{{machineServices: {{\"{key}\": {{}}}}}}`, which runs the service there; `null` \
+                 removes it.\n\n",
+                key = service.key
+            )),
+            MachineServicePlacement::Fleet => out.push_str(&format!(
+                "\nDelivered to every machine it ships for and started when a session uses it; \
+                 sessions start it on {HOST_MACHINE}. Run a build of your own on one machine with \
+                 `write cairn://executors/<name>` patch \
+                 `{{machineServices: {{\"{key}\": {{override: {{command: /abs/path}}}}}}}}`; `null` \
+                 clears the override.\n\n",
+                key = service.key
+            )),
+        }
     }
 }
 

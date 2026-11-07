@@ -3038,6 +3038,241 @@ fn probe_key() -> cairn_config::fleet::MachineServiceKey {
     "kit/probe".parse().unwrap()
 }
 
+const LINUX: &str = "x86_64-unknown-linux-gnu";
+
+/// [`native_manifest`] placed on the whole fleet: no probe.
+fn fleet_manifest() -> String {
+    let probed = native_manifest("mcp-stdio");
+    probed[..probed.find("probe:\n").unwrap()].replace("placement: per-machine", "placement: fleet")
+}
+
+/// A pack `kit` declaring the fleet service `probe`, and the fake host seeing
+/// `machines` attached.
+async fn fleet_harness(machines: Vec<machine::MachineView>) -> MachineHarness {
+    let h = harness().await;
+    let pack = tempfile::tempdir().unwrap();
+    let dir = pack.path().join("services/probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("service.yaml"), fleet_manifest()).unwrap();
+    h.source.packs.lock().unwrap().push((
+        "kit".to_string(),
+        Arc::new(
+            crate::project_services::pack_source::PackServiceSource::at_root(
+                "kit",
+                pack.path().to_path_buf(),
+            ),
+        ),
+    ));
+    *h.host.machines.lock().unwrap() = Some(machines);
+    MachineHarness { h, _pack: pack }
+}
+
+/// `name` on `target`, reporting `outcome` for kit/probe at the declared sha.
+fn reporting(
+    name: &str,
+    target: &str,
+    outcome: cairn_common::executor_protocol::MachineServiceInstallOutcome,
+) -> machine::MachineView {
+    machine::MachineView {
+        name: name.to_string(),
+        target: Some(target.to_string()),
+        installed: vec![cairn_common::executor_protocol::InstalledMachineService {
+            pack: "kit".to_string(),
+            service: "probe".to_string(),
+            sha256: PROBE_SHA.to_string(),
+            version: "1.0.0".to_string(),
+            outcome,
+        }],
+    }
+}
+
+/// Lay the declared artifact down under the runner's home as the colocated
+/// executor would, marker last, and return its executable.
+fn install_on_host(h: &Harness) -> std::path::PathBuf {
+    let program = cairn_common::executor_protocol::ManagedProgram {
+        pack: "kit".to_string(),
+        service: "probe".to_string(),
+        sha256: PROBE_SHA.to_string(),
+        executable: "probe".to_string(),
+    };
+    let dir = h
+        .orch
+        .config_dir
+        .join(cairn_common::executor_protocol::MACHINE_SERVICE_TOOLS_DIR)
+        .join(program.install_dir_name());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("probe"), b"#!/bin/sh\n").unwrap();
+    std::fs::write(
+        dir.join(cairn_common::executor_protocol::MACHINE_SERVICE_MARKER),
+        PROBE_SHA,
+    )
+    .unwrap();
+    dir.join("probe")
+}
+
+fn fleet_instance(h: &Harness, machine: &str) -> machine::MachineServiceInstance {
+    machine::instances(&h.orch, &probe_key())
+        .into_iter()
+        .find(|instance| instance.machine == machine)
+        .unwrap_or_else(|| panic!("{machine} has a fleet instance"))
+}
+
+/// A fleet service is never a resident: applying starts nothing, so it has no
+/// cell and no lease anywhere.
+#[tokio::test]
+async fn a_fleet_service_starts_no_resident() {
+    use cairn_common::executor_protocol::MachineServiceInstallOutcome::Installed;
+    let m = fleet_harness(vec![
+        reporting("local", LINUX, Installed),
+        reporting("fedora", LINUX, Installed),
+    ])
+    .await;
+    install_on_host(&m.h);
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    assert!(launched_on(&m.h).is_empty());
+    assert!(machine_cell(&m.h, "local").is_none());
+    assert!(machine_cell(&m.h, "fedora").is_none());
+}
+
+/// Each machine's state is its install report, with no cell; only the host
+/// serves MCP, and only a ready host carries what it launches.
+#[tokio::test]
+async fn a_fleet_services_state_on_each_machine_is_its_install_report() {
+    use cairn_common::executor_protocol::MachineServiceInstallOutcome as Outcome;
+    let m = fleet_harness(vec![
+        reporting("local", LINUX, Outcome::Installed),
+        reporting("fedora", LINUX, Outcome::Installing),
+        reporting(
+            "bgsrv-ub",
+            LINUX,
+            Outcome::NotInstalled {
+                reason: "artifact unavailable".to_string(),
+            },
+        ),
+        machine::MachineView {
+            name: "bginf-sp1".to_string(),
+            target: Some("aarch64-unknown-linux-gnu".to_string()),
+            installed: Vec::new(),
+        },
+        view("quiet"),
+    ])
+    .await;
+    let program = install_on_host(&m.h);
+
+    let local = fleet_instance(&m.h, "local");
+    assert_eq!(local.state, machine::InstanceState::Ready);
+    assert_eq!(local.sentence(), "installed");
+    assert_eq!(local.provenance, "installed 1.0.0 (pack)");
+    assert!(local.fleet && local.serves_mcp);
+    let launch = local.launch.expect("the host launches what it holds");
+    assert_eq!(launch.program, program.to_string_lossy());
+    assert_eq!(launch.args, ["serve"]);
+
+    let fedora = fleet_instance(&m.h, "fedora");
+    assert_eq!(fedora.state, machine::InstanceState::Installing);
+    assert!(!fedora.serves_mcp && fedora.launch.is_none());
+    assert_eq!(
+        fleet_instance(&m.h, "bgsrv-ub").state,
+        machine::InstanceState::NotInstalled {
+            reason: "artifact unavailable".to_string()
+        }
+    );
+    assert_eq!(
+        fleet_instance(&m.h, "bginf-sp1").state,
+        machine::InstanceState::NotInstalled {
+            reason: "the pack ships no artifact for this machine".to_string()
+        }
+    );
+    assert_eq!(
+        fleet_instance(&m.h, "quiet").state,
+        machine::InstanceState::NotInstalled {
+            reason: "the machine has not reported it yet".to_string()
+        }
+    );
+    assert!(machine::instances_on(&m.h.orch, "fedora")
+        .iter()
+        .any(|instance| instance.key == probe_key() && instance.fleet));
+    assert!(machine::selected_keys(&m.h.orch).contains(&probe_key()));
+
+    let snapshot = crate::config::machine_services::MachineServiceSnapshot::capture(&m.h.orch);
+    assert_eq!(snapshot.ready_on(&probe_key()), ["local"]);
+    assert_eq!(
+        snapshot
+            .host_launch(&probe_key())
+            .map(|launch| launch.program.clone()),
+        Some(program.to_string_lossy().into_owned())
+    );
+}
+
+/// The host is always in the set, and without an install it is not ready,
+/// whatever another machine holds: an absent executor, or a directory the
+/// marker does not vouch for.
+#[tokio::test]
+async fn the_host_is_ready_only_with_a_marked_install_or_an_override() {
+    use cairn_common::executor_protocol::MachineServiceInstallOutcome::Installed;
+    let m = fleet_harness(vec![reporting("fedora", LINUX, Installed)]).await;
+    assert_eq!(
+        fleet_instance(&m.h, "local").state,
+        machine::InstanceState::MachineAbsent
+    );
+
+    *m.h.host.machines.lock().unwrap() = Some(vec![
+        reporting("local", LINUX, Installed),
+        reporting("fedora", LINUX, Installed),
+    ]);
+    let unmarked = fleet_instance(&m.h, "local");
+    let machine::InstanceState::NotInstalled { reason } = &unmarked.state else {
+        panic!("an unmarked install is not one: {:?}", unmarked.state);
+    };
+    assert!(reason.contains("is not installed under"), "{reason}");
+    assert!(unmarked.launch.is_none());
+
+    select(&m.h, "local");
+    let overridden = fleet_instance(&m.h, "local");
+    assert_eq!(overridden.state, machine::InstanceState::Ready);
+    assert_eq!(
+        overridden.provenance,
+        "override /opt/probe/bin/probe (operator)"
+    );
+    assert_eq!(
+        overridden.launch.map(|launch| launch.program),
+        Some("/opt/probe/bin/probe".to_string()),
+        "the host's override wins over the managed path"
+    );
+}
+
+/// Every machine the declaration ships for is served the artifact, with no
+/// selection; a machine it does not ship for, or one with an override, is not.
+#[tokio::test]
+async fn a_fleet_service_is_served_to_every_machine_it_ships_for() {
+    let m = fleet_harness(vec![view("fedora")]).await;
+    let wanted = crate::fleet::machine_services::wanted_artifacts(&m.h.orch, "fedora", LINUX);
+    assert_eq!(wanted.len(), 1);
+    assert_eq!(
+        (wanted[0].pack.as_str(), wanted[0].service.as_str()),
+        ("kit", "probe")
+    );
+    assert_eq!(wanted[0].sha256, PROBE_SHA);
+    assert_eq!(wanted[0].archive, None);
+    assert_eq!(wanted[0].prove_args, ["--version"]);
+    assert!(crate::fleet::machine_services::wanted_artifacts(
+        &m.h.orch,
+        "bginf-sp1",
+        "aarch64-unknown-linux-gnu"
+    )
+    .is_empty());
+
+    select(&m.h, "fedora");
+    assert!(
+        crate::fleet::machine_services::wanted_artifacts(&m.h.orch, "fedora", LINUX).is_empty(),
+        "an overridden machine runs its own binary and is served nothing"
+    );
+    assert_eq!(
+        crate::fleet::machine_services::wanted_artifacts(&m.h.orch, "other", LINUX).len(),
+        1
+    );
+}
+
 /// Select `kit/probe` on `machine`, running the operator's binary there.
 fn select(h: &Harness, machine: &str) {
     crate::config::settings::mutate_fleet(

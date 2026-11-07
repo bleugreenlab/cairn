@@ -99,6 +99,9 @@ pub fn source_for_url<'a>(sources: &'a [LibrarySource], url: &str) -> Option<&'a
 /// Packs that used to ship in the app bundle and now live in the hosted
 /// library. A bundled lock for one of these flips to the library's provenance
 /// once the library's verified index carries it.
+///
+/// `matlab` is not among them: it ships a machine service, and a library
+/// source never carries one, so it stays bundled.
 pub const MOVED_TO_LIBRARY: &[&str] = &[
     "linear",
     "sentry",
@@ -109,7 +112,6 @@ pub const MOVED_TO_LIBRARY: &[&str] = &[
     "stripe",
     "deepwiki",
     "wolfram",
-    "matlab",
 ];
 
 /// Two repository URLs name the same repository, ignoring a trailing `/` or
@@ -162,8 +164,12 @@ mod tests {
     }
 
     #[test]
-    fn the_moved_packs_are_the_ten_bundled_non_core_packs() {
-        assert_eq!(MOVED_TO_LIBRARY.len(), 10);
+    fn the_moved_packs_are_the_nine_bundled_connector_packs() {
+        assert_eq!(MOVED_TO_LIBRARY.len(), 9);
         assert!(!MOVED_TO_LIBRARY.contains(&"core"));
+        assert!(
+            !MOVED_TO_LIBRARY.contains(&"matlab"),
+            "a pack shipping a machine service cannot move to a library source"
+        );
     }
 }

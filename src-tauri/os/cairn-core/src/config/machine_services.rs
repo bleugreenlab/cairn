@@ -13,7 +13,7 @@ use cairn_config::fleet::MachineServiceKey;
 use super::mcp_servers::{MachineVerdict, McpServerConfig, NotReady};
 use super::pack::{self, PackItemKind};
 use crate::orchestrator::Orchestrator;
-use crate::project_services::declaration::Transport;
+use crate::project_services::declaration::{NativeLaunch, Placement, Transport};
 use crate::project_services::pack_source::declared_machine_service;
 use crate::project_services::supervisor::machine::{self, InstanceState};
 
@@ -27,8 +27,12 @@ pub struct InstanceView {
     pub override_command: Option<String>,
     /// The instance's own sentence for what it runs and who chose it.
     pub provenance: String,
-    /// Whether the resident speaks MCP on its stdio.
+    /// Whether it serves MCP to this runner's gateway.
     pub serves_mcp: bool,
+    /// `placement: fleet`: delivered to the machine and launched on demand.
+    pub fleet: bool,
+    /// For a fleet service's ready host instance, what the host launches.
+    pub(crate) launch: Option<NativeLaunch>,
 }
 
 /// A machine a service could be selected on.
@@ -84,8 +88,8 @@ impl MachineServiceSnapshot {
             candidate.target.get_or_insert(target);
         }
         let mut instances = BTreeMap::new();
-        for key in fleet.machine_services.0.keys() {
-            let views: Vec<InstanceView> = machine::instances(orch, key)
+        for key in machine::selected_keys(orch) {
+            let views: Vec<InstanceView> = machine::instances(orch, &key)
                 .into_iter()
                 .map(|instance| InstanceView {
                     machine: instance.machine,
@@ -94,6 +98,8 @@ impl MachineServiceSnapshot {
                     override_command: instance.override_command,
                     provenance: instance.provenance,
                     serves_mcp: instance.serves_mcp,
+                    fleet: instance.fleet,
+                    launch: instance.launch,
                 })
                 .collect();
             for view in &views {
@@ -105,7 +111,7 @@ impl MachineServiceSnapshot {
                         attached: false,
                     });
             }
-            instances.insert(key.clone(), views);
+            instances.insert(key, views);
         }
         Self {
             instances,
@@ -129,7 +135,8 @@ impl MachineServiceSnapshot {
 
     /// Why `key` cannot be listed, or `None` when one machine has it ready. Only
     /// ready admits: a degraded instance is a crash backoff or a probe that says
-    /// no, and neither is a server worth advertising.
+    /// no, and neither is a server worth advertising. A fleet service is
+    /// launched only by the host, so only the host's state is a reason.
     pub fn not_ready(&self, key: &MachineServiceKey) -> Option<NotReady> {
         if !self.ready_on(key).is_empty() {
             return None;
@@ -139,9 +146,19 @@ impl MachineServiceSnapshot {
             machines: self
                 .views(key)
                 .iter()
+                .filter(|view| !view.fleet || view.machine == machine::HOST_MACHINE)
                 .map(|view| view.state.verdict(&view.machine))
                 .collect::<Vec<MachineVerdict>>(),
         })
+    }
+
+    /// What the host launches for the fleet service `key`, when it is ready
+    /// there. Read by MCP resolution, so it stays in memory and credential-free.
+    pub(crate) fn host_launch(&self, key: &MachineServiceKey) -> Option<&NativeLaunch> {
+        self.views(key)
+            .iter()
+            .filter(|view| view.state == InstanceState::Ready && view.serves_mcp)
+            .find_map(|view| view.launch.as_ref())
     }
 }
 
@@ -177,6 +194,14 @@ pub(crate) fn machine_service_entry(
              `transport: mcp-stdio`"
         )),
     }
+}
+
+/// Whether `key` is declared `placement: fleet`: a program the host launches on
+/// demand, not a resident that a call is routed to.
+pub(crate) fn is_fleet(config_dir: &Path, key: &MachineServiceKey) -> bool {
+    declared_machine_service(config_dir, key)
+        .and_then(|declared| declared.package.ok())
+        .is_some_and(|package| package.declaration.placement == Placement::Fleet)
 }
 
 /// Remove the service `id` from `pack_id`, leaving the pack installed.

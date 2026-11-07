@@ -1735,7 +1735,11 @@ pub fn set_machine_services(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let target = machine_target(orch, &executor_id, &machine);
+    let mut fleet_keys = std::collections::BTreeSet::new();
     for (key, selection) in &parsed {
+        if is_fleet_service(orch, key) {
+            fleet_keys.insert(key.clone());
+        }
         if let Some(selection) = selection {
             check_selectable(orch, key, &machine, target, selection)?;
         }
@@ -1743,6 +1747,26 @@ pub fn set_machine_services(
     let summaries = mutate_fleet(orch, |config| {
         let mut summaries = Vec::new();
         for (key, selection) in parsed {
+            if fleet_keys.contains(&key) {
+                let command = selection
+                    .as_ref()
+                    .and_then(|selection| selection.override_command().map(str::to_string));
+                summaries.push(match (command, selection) {
+                    (Some(command), Some(selection)) => {
+                        config
+                            .machine_services
+                            .select(key.clone(), &machine, selection)?;
+                        format!("{key} on {machine} runs override {command} (operator)")
+                    }
+                    _ if config.machine_services.unselect(&key, &machine) => {
+                        format!(
+                            "cleared {key}'s override on {machine}; it runs the pack's artifact"
+                        )
+                    }
+                    _ => format!("{key} had no override on {machine}"),
+                });
+                continue;
+            }
             match selection {
                 Some(selection) => {
                     let provenance = match selection.override_command() {
@@ -1800,9 +1824,20 @@ fn machine_target(orch: &Orchestrator, executor_id: &str, machine: &str) -> Opti
         .map(|platform| platform.target())
 }
 
+/// Whether `key` is a fleet service an installed pack declares: one whose row
+/// entry on a machine is only ever an override.
+fn is_fleet_service(orch: &Orchestrator, key: &cairn_config::fleet::MachineServiceKey) -> bool {
+    crate::project_services::pack_source::declared_machine_service(&orch.config_dir, key)
+        .and_then(|declared| declared.package.ok())
+        .is_some_and(|package| {
+            package.declaration.placement == crate::project_services::declaration::Placement::Fleet
+        })
+}
+
 /// Refuse a selection nothing could run: a service no installed pack
 /// declares, or a machine whose target the service ships no artifact for when
-/// the selection gives no binary of its own.
+/// the selection gives no binary of its own. A fleet service takes only an
+/// override: it is delivered everywhere, so there is nothing to select.
 fn check_selectable(
     orch: &Orchestrator,
     key: &cairn_config::fleet::MachineServiceKey,
@@ -1832,6 +1867,11 @@ fn check_selectable(
         .map_err(|error| format!("{key}'s declaration does not parse: {error}"))?;
     if selection.override_command().is_some() {
         return Ok(());
+    }
+    if package.declaration.placement == crate::project_services::declaration::Placement::Fleet {
+        return Err(format!(
+            "{key} is delivered to every machine it ships for; there is nothing to install. Set an override to run your own build."
+        ));
     }
     if let Some(refusal) = declared.refusal {
         return Err(format!("{key} cannot run its artifact: {refusal}"));
@@ -2108,6 +2148,89 @@ mod tests {
 
     /// A role patch reaches disk and the live entry together, and reads back
     /// the same through the config a restart would load.
+    const FLEET_PROBE: &str = "name: Probe\nruntime: native\nplacement: fleet\ntransport: mcp-stdio\nargs: [serve]\nartifacts:\n  version: 1.0.0\n  prove: [--version]\n  targets:\n    x86_64-unknown-linux-gnu:\n      url: https://example.invalid/probe\n      sha256: eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54\n      size: 10\n      executable: probe\n";
+
+    /// Install the bundled pack `kit`, shipping the fleet service `probe`, into
+    /// `config_dir`. Keep the returned directory: it is the pack's source.
+    fn install_fleet_pack(config_dir: &std::path::Path) -> tempfile::TempDir {
+        let resources = tempfile::tempdir().unwrap();
+        let root = resources.path().join("packs/kit");
+        std::fs::create_dir_all(root.join("services/probe")).unwrap();
+        std::fs::write(
+            root.join("cairn-pack.yaml"),
+            "id: kit\nname: Kit\nversion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("services/probe/service.yaml"), FLEET_PROBE).unwrap();
+        cairn_packs::sync_one_pack(
+            &crate::services::RealGitClient,
+            &crate::services::RealFileSystem,
+            resources.path(),
+            config_dir,
+            "kit",
+        )
+        .unwrap();
+        resources
+    }
+
+    /// A fleet service is delivered everywhere, so the one write path takes an
+    /// override or `null` for it and refuses `{}` by name; removing the item
+    /// clears every override it had.
+    #[tokio::test]
+    async fn a_fleet_service_takes_an_override_or_null_and_refuses_an_install() {
+        use cairn_config::fleet::{CommandOverride, MachineSelection};
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let _resources = install_fleet_pack(&orch.config_dir);
+        let key: cairn_config::fleet::MachineServiceKey = "kit/probe".parse().unwrap();
+        let change = |selection: Option<MachineSelection>| {
+            MachineServiceChanges::from([("kit/probe".to_string(), selection)])
+        };
+        let overriding = || {
+            Some(MachineSelection {
+                override_: Some(CommandOverride {
+                    command: "/opt/probe".into(),
+                }),
+            })
+        };
+        let row = || crate::config::settings::load_fleet(&orch.config_dir).machine_services;
+
+        let error =
+            set_machine_services(&orch, "local", &change(Some(MachineSelection::default())))
+                .unwrap_err();
+        assert_eq!(
+            error,
+            "kit/probe is delivered to every machine it ships for; there is nothing to install. Set an override to run your own build."
+        );
+        assert!(row().is_empty());
+
+        assert_eq!(
+            set_machine_services(&orch, "local", &change(overriding())).unwrap(),
+            ["kit/probe on local runs override /opt/probe (operator)"]
+        );
+        assert_eq!(
+            row()
+                .selection(&key, "local")
+                .and_then(MachineSelection::override_command),
+            Some("/opt/probe")
+        );
+        assert_eq!(
+            set_machine_services(&orch, "local", &change(None)).unwrap(),
+            ["cleared kit/probe's override on local; it runs the pack's artifact"]
+        );
+        assert!(row().is_empty());
+        assert_eq!(
+            set_machine_services(&orch, "local", &change(None)).unwrap(),
+            ["kit/probe had no override on local"]
+        );
+
+        set_machine_services(&orch, "local", &change(overriding())).unwrap();
+        crate::config::machine_services::delete_pack_service(&orch, "kit", "probe").unwrap();
+        assert!(row().is_empty(), "removing the item clears its overrides");
+    }
+
     #[tokio::test]
     async fn a_role_is_persisted_and_adopted_from_what_was_persisted() {
         let temp = tempfile::tempdir().unwrap();

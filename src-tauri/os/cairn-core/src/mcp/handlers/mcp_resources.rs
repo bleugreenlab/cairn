@@ -206,6 +206,7 @@ impl<'a> ReadContext<'a> {
         DiscoveryTarget {
             name,
             authored: &entry.config,
+            identity: &entry.authored,
             owner: entry.owner(),
             scope: project_scope
                 .map(ToolScope::Project)
@@ -219,7 +220,12 @@ impl<'a> ReadContext<'a> {
 /// One server, as an authorized read binds its catalog.
 struct DiscoveryTarget<'a> {
     name: &'a str,
+    /// What the gateway connects.
     authored: &'a McpServerConfig,
+    /// The entry as written: what a recorded catalog is bound to. It differs
+    /// from `authored` only for a fleet service, whose launch the host
+    /// resolves and whose managed path moves with every pin bump.
+    identity: &'a McpServerConfig,
     owner: String,
     scope: ToolScope<'a>,
     project_id: Option<&'a str>,
@@ -470,7 +476,7 @@ fn catalog_context(
             target.project_id,
             target.name,
             "catalog",
-            Some(target.authored),
+            Some(target.identity),
         ),
         credential_key: target.credential_key.clone(),
         credential_context: cairn_packs::server_config::CatalogCredentialContext {
@@ -553,8 +559,8 @@ fn publish(
                 server: target.name.to_string(),
                 ownership_scope: target.scope.identity(),
                 owner: target.owner.clone(),
-                transport: target.authored.transport.clone(),
-                endpoint: public_endpoint(target.authored),
+                transport: target.identity.transport.clone(),
+                endpoint: public_endpoint(target.identity),
                 protocol_version: protocol.to_string(),
             },
             fetched_at_ms,
@@ -1942,6 +1948,8 @@ mod tests {
             probed_at_ms: None,
             serves_mcp: true,
             facade: None,
+            fleet: false,
+            launch: None,
         }
     }
 

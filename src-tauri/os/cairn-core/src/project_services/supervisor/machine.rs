@@ -19,11 +19,13 @@
 //! - the instance set, which every surface reads state from. State is derived
 //!   here, live, and never stored.
 
+use super::super::declaration::{NativeSpec, Placement};
 use super::*;
 use crate::config::mcp_servers::{MachineStateTag, MachineVerdict};
 use crate::mcp::gateway::{DuplexIo, McpToolDef, PlacedFacade};
 use cairn_common::executor_protocol::{
-    InstalledMachineService, MachineServiceInstallOutcome, ManagedProgram, RemotePlatform,
+    managed_program_path, InstalledMachineService, MachineServiceInstallOutcome, ManagedProgram,
+    RemotePlatform, LOCAL_EXECUTOR_NAME,
 };
 use cairn_config::fleet::{MachineSelection, MachineServiceKey, MachineServicesConfig};
 use sha2::{Digest, Sha256};
@@ -538,7 +540,8 @@ async fn probe_loop(orch: Orchestrator, cell: Arc<Cell>) {
                 let every = incarnation
                     .declaration
                     .native()
-                    .map_or(NOT_READY_POLL, |native| native.probe.every);
+                    .and_then(|native| native.resident_probe())
+                    .map_or(NOT_READY_POLL, |probe| probe.every);
                 let report = probe_once(&orch, &cell, &incarnation).await;
                 let ready = report.outcome == ProbeOutcome::Ready;
                 *machine_cell.probe.lock().unwrap() = Some(report);
@@ -595,7 +598,12 @@ fn spec_for(cell: &Cell, incarnation: &Incarnation) -> LaunchSpec {
 
 /// Run the declaration's probe and read its answer.
 async fn probe_status(orch: &Orchestrator, spec: &LaunchSpec) -> ProbeOutcome {
-    let (Some(native), Some(launch)) = (spec.declaration.native(), spec.native.as_ref()) else {
+    let (Some(probe), Some(launch)) = (
+        spec.declaration
+            .native()
+            .and_then(|native| native.resident_probe()),
+        spec.native.as_ref(),
+    ) else {
         return ProbeOutcome::NoAnswer {
             reason: "the service declares no probe".to_string(),
         };
@@ -606,12 +614,12 @@ async fn probe_status(orch: &Orchestrator, spec: &LaunchSpec) -> ProbeOutcome {
             orch,
             spec,
             &launch.program,
-            native.probe.args.clone(),
+            probe.args.clone(),
             PROBE_TIMEOUT,
         )
         .await
     {
-        Ok(output) => interpret(&native.probe, &output),
+        Ok(output) => interpret(probe, &output),
         Err(error) => ProbeOutcome::NoAnswer { reason: error },
     }
 }
@@ -970,10 +978,28 @@ pub(crate) struct MachineServiceInstance {
     pub override_command: Option<String>,
     pub catalog: Vec<McpToolDef>,
     pub probed_at_ms: Option<i64>,
-    /// Whether the resident speaks MCP on its stdio (`transport: mcp-stdio`).
+    /// Whether it serves MCP to this runner's gateway: a per-machine resident
+    /// with `transport: mcp-stdio`, or a fleet service's host instance.
     pub serves_mcp: bool,
     /// The gateway's way in, while the cell exists.
     pub facade: Option<Arc<dyn PlacedFacade>>,
+    /// `placement: fleet`: delivered to the machine, never a resident.
+    pub fleet: bool,
+    /// For a fleet service's host instance that is ready, what the host
+    /// launches on demand.
+    pub launch: Option<NativeLaunch>,
+}
+
+impl MachineServiceInstance {
+    /// The state as a short phrase. A fleet instance that is ready describes
+    /// the artifact, not the capability: it is installed, and whether what it
+    /// needs is present is the program's to say when it is called.
+    pub(crate) fn sentence(&self) -> String {
+        match (&self.state, self.fleet) {
+            (InstanceState::Ready, true) => "installed".to_string(),
+            (state, _) => state.sentence(),
+        }
+    }
 }
 
 impl std::fmt::Debug for MachineServiceInstance {
@@ -988,42 +1014,334 @@ impl std::fmt::Debug for MachineServiceInstance {
     }
 }
 
-/// Every machine `key` is selected on, with its state.
+/// Every machine `key` has an instance on, with its state: the machines the row
+/// selects it on, or for a fleet service every machine it is delivered to.
 pub(crate) fn instances(
     orch: &Orchestrator,
     key: &MachineServiceKey,
 ) -> Vec<MachineServiceInstance> {
-    let row = crate::config::settings::load_fleet(&orch.config_dir).machine_services;
+    let fleet = crate::config::settings::load_fleet(&orch.config_dir);
+    let row = &fleet.machine_services;
     let declared = declared(orch, key);
     let views = supervisor(orch).host().machines(orch);
+    if declared.placement() == Some(Placement::Fleet) {
+        let enrolled = fleet
+            .remote_executors
+            .keys()
+            .map(|executor_id| crate::fleet::management::public_name(orch, executor_id));
+        return fleet_machines(key, row, &views, enrolled)
+            .into_iter()
+            .map(|machine| fleet_instance(orch, key, &machine, row, &declared, &views))
+            .collect();
+    }
     row.machines_for(key)
         .into_iter()
         .map(|(machine, selection)| instance(orch, key, machine, selection, &declared, &views))
         .collect()
 }
 
-/// Every machine service selected on `machine`, with its state.
+/// Every machine service on `machine`, with its state: the per-machine ones the
+/// row selects there, and every fleet service.
 pub(crate) fn instances_on(orch: &Orchestrator, machine: &str) -> Vec<MachineServiceInstance> {
     let row = crate::config::settings::load_fleet(&orch.config_dir).machine_services;
     let views = supervisor(orch).host().machines(orch);
-    row.selected_on(machine)
+    let name = cairn_common::executor_protocol::normalize_executor_name(machine)
+        .unwrap_or_else(|| machine.to_string());
+    let mut instances: Vec<MachineServiceInstance> = row
+        .selected_on(machine)
         .into_iter()
-        .map(|(key, selection)| {
+        .filter_map(|(key, selection)| {
             let declared = declared(orch, key);
-            let name = cairn_common::executor_protocol::normalize_executor_name(machine)
-                .unwrap_or_else(|| machine.to_string());
-            instance(orch, key, &name, selection, &declared, &views)
+            // A fleet key's row entry is an override, not a selection.
+            (declared.placement() != Some(Placement::Fleet))
+                .then(|| instance(orch, key, &name, selection, &declared, &views))
         })
-        .collect()
+        .collect();
+    for service in fleet_services(orch) {
+        let declared = declared(orch, &service.key);
+        instances.push(fleet_instance(
+            orch,
+            &service.key,
+            &name,
+            &row,
+            &declared,
+            &views,
+        ));
+    }
+    instances.sort_by(|a, b| a.key.cmp(&b.key));
+    instances
 }
 
-/// The keys of every machine service selected anywhere.
+/// The keys of every machine service with an instance anywhere: each one the
+/// row names, and every fleet service.
 pub(crate) fn selected_keys(orch: &Orchestrator) -> Vec<MachineServiceKey> {
-    crate::config::settings::load_fleet(&orch.config_dir)
+    let mut keys: Vec<MachineServiceKey> = crate::config::settings::load_fleet(&orch.config_dir)
         .machine_services
         .0
         .into_keys()
-        .collect()
+        .chain(fleet_services(orch).into_iter().map(|service| service.key))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The public name of the machine this runner runs on: its colocated executor,
+/// which shares the runner's home. Only it can launch a fleet service today.
+pub(crate) const HOST_MACHINE: &str = LOCAL_EXECUTOR_NAME;
+
+/// One fleet service an installed pack declares.
+pub(crate) struct FleetService {
+    pub key: MachineServiceKey,
+    pub package: ServicePackage,
+    /// Why the pack's own artifact may not run; see [`ServiceSource::refusal`].
+    pub refusal: Option<String>,
+}
+
+/// Every fleet service the installed packs declare, in key order: the one place
+/// that enumerates them, for delivery, instances, and readiness alike. A
+/// declaration that does not parse is not one, since nothing says it is fleet.
+pub(crate) fn fleet_services(orch: &Orchestrator) -> Vec<FleetService> {
+    let mut services = Vec::new();
+    for (pack, source) in supervisor(orch).sources().packs(orch) {
+        let listings = match source.list() {
+            Ok(listings) => listings,
+            Err(error) => {
+                tracing::warn!(%error, pack, "could not list a pack's services");
+                continue;
+            }
+        };
+        for listing in listings {
+            let fleet = listing
+                .declaration
+                .as_ref()
+                .is_ok_and(|declaration| declaration.placement == Placement::Fleet);
+            if !fleet {
+                continue;
+            }
+            let (Ok(key), Ok(Some(package))) = (
+                MachineServiceKey::new(&pack, &listing.id),
+                source.package(&listing.id),
+            ) else {
+                continue;
+            };
+            services.push(FleetService {
+                key,
+                package,
+                refusal: source.refusal(&listing.id),
+            });
+        }
+    }
+    services.sort_by(|a, b| a.key.cmp(&b.key));
+    services
+}
+
+/// The machines a fleet service has an instance on: the host, every attached or
+/// enrolled machine, and any the row overrides it on, by name.
+fn fleet_machines(
+    key: &MachineServiceKey,
+    row: &MachineServicesConfig,
+    views: &[MachineView],
+    enrolled: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut machines: std::collections::BTreeSet<String> = views
+        .iter()
+        .map(|view| view.name.clone())
+        .chain(std::iter::once(HOST_MACHINE.to_string()))
+        .collect();
+    machines.extend(enrolled);
+    machines.extend(
+        row.machines_for(key)
+            .into_iter()
+            .filter(|(_, selection)| selection.override_command().is_some())
+            .map(|(machine, _)| machine.to_string()),
+    );
+    machines.into_iter().collect()
+}
+
+/// A fleet service on one machine. There is no cell: the state is the
+/// machine's install report, or the operator's override.
+fn fleet_instance(
+    orch: &Orchestrator,
+    key: &MachineServiceKey,
+    machine: &str,
+    row: &MachineServicesConfig,
+    declared: &Declared,
+    views: &[MachineView],
+) -> MachineServiceInstance {
+    let view = views.iter().find(|view| view.name == machine);
+    let override_command = row
+        .selection(key, machine)
+        .and_then(MachineSelection::override_command);
+    let (artifact_sha, report) = holding(key, declared, view);
+    let installed_version = installed_version(report, artifact_sha);
+    let provenance = provenance(
+        key,
+        machine,
+        override_command,
+        installed_version.as_deref(),
+        report,
+        view,
+        artifact_sha,
+    );
+    let host = machine == HOST_MACHINE;
+    let mut state = fleet_state(
+        key,
+        machine,
+        override_command,
+        declared,
+        view,
+        artifact_sha,
+        report,
+    );
+    let native = declared.native();
+    let mut launch = None;
+    if host && state == InstanceState::Ready {
+        let target = view
+            .and_then(|view| view.target.clone())
+            .or_else(|| RemotePlatform::current().map(|platform| platform.target().to_string()));
+        match native
+            .ok_or_else(|| format!("no installed pack declares {key}"))
+            .and_then(|native| {
+                fleet_launch(
+                    &orch.config_dir,
+                    key,
+                    native,
+                    override_command,
+                    target.as_deref(),
+                )
+            }) {
+            Ok(resolved) => launch = Some(resolved),
+            Err(reason) => {
+                state = InstanceState::NotInstalled {
+                    reason: reason
+                        .strip_prefix("not installed: ")
+                        .unwrap_or(&reason)
+                        .to_string(),
+                }
+            }
+        }
+    }
+    MachineServiceInstance {
+        key: key.clone(),
+        machine: machine.to_string(),
+        state,
+        provenance,
+        installed_version,
+        override_command: override_command.map(str::to_string),
+        catalog: Vec::new(),
+        probed_at_ms: None,
+        serves_mcp: host && declared.transport() == Some(Transport::McpStdio),
+        facade: None,
+        fleet: true,
+        launch,
+    }
+}
+
+/// A fleet instance's state, from what its machine reports holding. Never
+/// `Starting`, `WaitingForOperator` or `Degraded`: nothing runs to be in them.
+fn fleet_state(
+    key: &MachineServiceKey,
+    machine: &str,
+    override_command: Option<&str>,
+    declared: &Declared,
+    view: Option<&MachineView>,
+    artifact_sha: Option<&str>,
+    report: Option<&InstalledMachineService>,
+) -> InstanceState {
+    match &declared.package {
+        None => {
+            return InstanceState::NotInstalled {
+                reason: format!("no installed pack declares {key}"),
+            }
+        }
+        Some(Err(error)) => {
+            return InstanceState::Failed {
+                reason: format!("its declaration does not parse: {error}"),
+            }
+        }
+        Some(Ok(_)) => {}
+    }
+    // The host launches an override itself; another machine's is only as
+    // present as the machine.
+    if override_command.is_some() {
+        return if view.is_some() || machine == HOST_MACHINE {
+            InstanceState::Ready
+        } else {
+            InstanceState::MachineAbsent
+        };
+    }
+    if let Some(refusal) = &declared.refusal {
+        return InstanceState::Failed {
+            reason: refusal.clone(),
+        };
+    }
+    if view.is_none() {
+        return InstanceState::MachineAbsent;
+    }
+    match report {
+        Some(report) => match &report.outcome {
+            MachineServiceInstallOutcome::Installed
+                if Some(report.sha256.as_str()) == artifact_sha =>
+            {
+                InstanceState::Ready
+            }
+            MachineServiceInstallOutcome::Installed => InstanceState::NotInstalled {
+                reason: format!(
+                    "{machine} holds {key} {}, not the version this pack declares",
+                    report.version
+                ),
+            },
+            MachineServiceInstallOutcome::Installing => InstanceState::Installing,
+            MachineServiceInstallOutcome::NotInstalled { reason } => InstanceState::NotInstalled {
+                reason: reason.clone(),
+            },
+        },
+        None if artifact_sha.is_none() => InstanceState::NotInstalled {
+            reason: "the pack ships no artifact for this machine".to_string(),
+        },
+        None => InstanceState::NotInstalled {
+            reason: "the machine has not reported it yet".to_string(),
+        },
+    }
+}
+
+/// What the host launches for a fleet service: the operator's override when
+/// one is set, else the pack's artifact as installed under `home`, marker
+/// checked, with the declaration's arguments. Never a PATH lookup. Not
+/// MCP-shaped: anything that launches a fleet service on demand reads this.
+pub(crate) fn fleet_launch(
+    home: &std::path::Path,
+    key: &MachineServiceKey,
+    native: &NativeSpec,
+    override_command: Option<&str>,
+    target: Option<&str>,
+) -> Result<NativeLaunch, String> {
+    let program = match override_command {
+        Some(command) => command.to_string(),
+        None => {
+            let target = target.ok_or_else(|| {
+                "not installed: this machine runs a platform no pack artifact targets".to_string()
+            })?;
+            let artifact = native
+                .targets
+                .get(target)
+                .ok_or_else(|| format!("not installed: {key} ships no artifact for {target}"))?;
+            let program = ManagedProgram {
+                pack: key.pack.clone(),
+                service: key.service.clone(),
+                sha256: artifact.sha256.clone(),
+                executable: artifact.executable.clone(),
+            };
+            managed_program_path(home, &program)?
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    Ok(NativeLaunch {
+        program,
+        args: native.args.clone(),
+    })
 }
 
 /// What the installed packs say about one key.
@@ -1033,6 +1351,27 @@ struct Declared {
     package: Option<Result<ServicePackage, String>>,
     /// Why the pack's own artifact may not run.
     refusal: Option<String>,
+}
+
+impl Declared {
+    fn shipped(&self) -> Option<&ServicePackage> {
+        self.package
+            .as_ref()
+            .and_then(|package| package.as_ref().ok())
+    }
+
+    fn placement(&self) -> Option<Placement> {
+        self.shipped().map(|package| package.declaration.placement)
+    }
+
+    fn transport(&self) -> Option<Transport> {
+        self.shipped().map(|package| package.declaration.transport)
+    }
+
+    fn native(&self) -> Option<&NativeSpec> {
+        self.shipped()
+            .and_then(|package| package.declaration.native())
+    }
 }
 
 fn declared(orch: &Orchestrator, key: &MachineServiceKey) -> Declared {
@@ -1061,31 +1400,16 @@ fn instance(
     let view = views.iter().find(|view| view.name == machine);
     let cell = supervisor(orch).existing("", &ServiceOwner::pack(&key.pack, machine), &key.service);
     let (artifact_sha, report) = holding(key, declared, view);
-    let installed_version = report
-        .filter(|report| report.outcome == MachineServiceInstallOutcome::Installed)
-        .filter(|report| Some(report.sha256.as_str()) == artifact_sha)
-        .map(|report| report.version.clone());
-    let provenance = match (selection.override_command(), &installed_version, report) {
-        (Some(command), _, _) => format!("override {command} (operator)"),
-        (None, Some(version), _) => format!("installed {version} (pack)"),
-        (None, None, Some(report)) => match &report.outcome {
-            MachineServiceInstallOutcome::NotInstalled { reason } => {
-                format!("not installed: {reason}")
-            }
-            MachineServiceInstallOutcome::Installing => "not installed: installing".to_string(),
-            MachineServiceInstallOutcome::Installed => format!(
-                "not installed: {machine} holds {} {}, not the version this pack declares",
-                key, report.version
-            ),
-        },
-        (None, None, None) => match (view, artifact_sha) {
-            (None, _) => format!("not installed: {MACHINE_ABSENT}"),
-            (Some(_), None) => {
-                "not installed: the pack ships no artifact for this machine".to_string()
-            }
-            (Some(_), Some(_)) => "not installed: the machine has not reported it yet".to_string(),
-        },
-    };
+    let installed_version = installed_version(report, artifact_sha);
+    let provenance = provenance(
+        key,
+        machine,
+        selection.override_command(),
+        installed_version.as_deref(),
+        report,
+        view,
+        artifact_sha,
+    );
     let machine_cell = cell.as_ref().and_then(|cell| cell.machine.as_ref());
     let probe = machine_cell.and_then(|machine_cell| machine_cell.probe.lock().unwrap().clone());
     let state = derive_state(
@@ -1109,12 +1433,54 @@ fn instance(
             .map(|probe| probe.catalog.clone())
             .unwrap_or_default(),
         probed_at_ms: probe.as_ref().map(|probe| probe.at_ms),
-        serves_mcp: declared
-            .package
-            .as_ref()
-            .and_then(|declared| declared.as_ref().ok())
-            .is_some_and(|package| package.declaration.transport == Transport::McpStdio),
+        serves_mcp: declared.transport() == Some(Transport::McpStdio),
         facade: cell.as_ref().and_then(|cell| facade_for(orch, cell)),
+        fleet: false,
+        launch: None,
+    }
+}
+
+/// The version a machine holds, when it holds the artifact the pack declares.
+fn installed_version(
+    report: Option<&InstalledMachineService>,
+    artifact_sha: Option<&str>,
+) -> Option<String> {
+    report
+        .filter(|report| report.outcome == MachineServiceInstallOutcome::Installed)
+        .filter(|report| Some(report.sha256.as_str()) == artifact_sha)
+        .map(|report| report.version.clone())
+}
+
+/// An instance's own sentence for what it runs and who chose it.
+fn provenance(
+    key: &MachineServiceKey,
+    machine: &str,
+    override_command: Option<&str>,
+    installed_version: Option<&str>,
+    report: Option<&InstalledMachineService>,
+    view: Option<&MachineView>,
+    artifact_sha: Option<&str>,
+) -> String {
+    match (override_command, installed_version, report) {
+        (Some(command), _, _) => format!("override {command} (operator)"),
+        (None, Some(version), _) => format!("installed {version} (pack)"),
+        (None, None, Some(report)) => match &report.outcome {
+            MachineServiceInstallOutcome::NotInstalled { reason } => {
+                format!("not installed: {reason}")
+            }
+            MachineServiceInstallOutcome::Installing => "not installed: installing".to_string(),
+            MachineServiceInstallOutcome::Installed => format!(
+                "not installed: {machine} holds {} {}, not the version this pack declares",
+                key, report.version
+            ),
+        },
+        (None, None, None) => match (view, artifact_sha) {
+            (None, _) => format!("not installed: {MACHINE_ABSENT}"),
+            (Some(_), None) => {
+                "not installed: the pack ships no artifact for this machine".to_string()
+            }
+            (Some(_), Some(_)) => "not installed: the machine has not reported it yet".to_string(),
+        },
     }
 }
 
