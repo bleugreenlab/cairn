@@ -900,6 +900,13 @@ const TS_GLOBALS: &[&str] = &[
 const TS_ROOT_MANIFEST: &str = "package.json";
 const TS_ROOT_TSCONFIG: &str = "tsconfig.json";
 
+// Relative imports from scripts cross into these workspaces without manifest
+// edges. A cross-language test pins this list to scripts/lib/ts-workspaces.ts.
+const SCRIPTS_IMPORTED_WORKSPACE_PATHS: &[&str] = &[
+    "packages/page-kit/build.ts",
+    "web/src/pages/docs/acknowledgments-credits.ts",
+];
+
 /// The TypeScript domain, or `None` if a manifest or tsconfig that defines it
 /// could not be read. Same rule as the Rust side: a workspace we cannot name or
 /// an alias we cannot see would narrow a closure without saying so.
@@ -996,6 +1003,20 @@ fn derive_ts_graph(sources: &BTreeMap<&str, &str>) -> Option<DomainGraph> {
         );
     }
 
+    let has_scripts = tsconfigs.contains_key("scripts/tsconfig.json");
+    if has_scripts {
+        // Scripts have their own compilation but no package manifest. Keep this
+        // synthetic workspace aligned with scripts/lib/ts-workspaces.ts.
+        graph.nodes.insert(
+            "scripts".to_string(),
+            DomainNode {
+                roots: vec!["scripts/".to_string()],
+                roots_unknown: false,
+                deps: BTreeSet::from([root_name.to_string()]),
+            },
+        );
+    }
+
     let package_names: BTreeSet<String> = graph.nodes.keys().cloned().collect();
     // Package directories, longest first, for resolving a tsconfig alias target
     // and a tsconfig's own owner onto a workspace.
@@ -1003,7 +1024,22 @@ fn derive_ts_graph(sources: &BTreeMap<&str, &str>) -> Option<DomainGraph> {
         .iter()
         .map(|(name, dir, _)| (format!("{dir}/"), name.clone()))
         .collect();
+    if has_scripts {
+        dirs.push(("scripts/".to_string(), "scripts".to_string()));
+    }
     dirs.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.len()));
+
+    if has_scripts {
+        // These relative imports cross workspace boundaries without manifest or
+        // alias edges. Resolve their owners by directory, not package name.
+        let deps: BTreeSet<String> = SCRIPTS_IMPORTED_WORKSPACE_PATHS
+            .iter()
+            .filter_map(|path| graph.owner(path).map(str::to_string))
+            .collect();
+        if let Some(node) = graph.nodes.get_mut("scripts") {
+            node.deps.extend(deps);
+        }
+    }
 
     // Declared dependency edges.
     for (name, doc) in std::iter::once((root_name.to_string(), &root))
@@ -1273,6 +1309,7 @@ pub(crate) mod fixtures {
             "package.json".to_string(),
             "tsconfig.json".to_string(),
             "tsconfig.node.json".to_string(),
+            "scripts/tsconfig.json".to_string(),
         ];
         let workspace: toml::Value = std::fs::read_to_string(root.join("src-tauri/Cargo.toml"))
             .expect("the workspace manifest is readable")
@@ -1517,17 +1554,95 @@ mod tests {
             "@cairn/sdk",
             "@cairn/harness",
             "cairn-web",
+            "scripts",
         ] {
             assert!(ts.nodes.contains_key(name), "{name} is a workspace");
         }
         assert!(ts.nodes["@cairn/harness"].deps.contains("@cairn/sdk"));
         assert!(ts.nodes["cairn-web"].deps.contains("@cairn/ui"));
         assert!(ts.nodes["cairn"].deps.contains("@cairn/ui"));
+        assert!(ts.nodes["scripts"].deps.contains("cairn"));
+        for path in SCRIPTS_IMPORTED_WORKSPACE_PATHS {
+            let owner = ts
+                .owner(path)
+                .expect("scripts import belongs to a workspace");
+            assert!(ts.nodes["scripts"].deps.contains(owner));
+        }
+        assert_eq!(ts.owner("scripts/tsconfig.json"), Some("scripts"));
         // The root package's directory is the repo root, so its roots come from
         // the root tsconfig's `include` instead.
         assert_eq!(ts.owner("src/App.tsx"), Some("cairn"));
         assert_eq!(ts.owner("packages/ui/src/Button.tsx"), Some("@cairn/ui"));
         assert_eq!(ts.owner("docs/checks.md"), None);
+    }
+
+    #[test]
+    fn scripts_scope_resolves_sources_configs_and_imported_workspaces() {
+        let fixture = TreeFixture::new()
+            .file(
+                "package.json",
+                r#"{"name":"app","workspaces":["packages/*","web"]}"#,
+            )
+            .file("tsconfig.json", r#"{"include":["src"]}"#)
+            .file("scripts/tsconfig.json", r#"{"include":["**/*.ts"]}"#)
+            .file(
+                "packages/page-kit/package.json",
+                r#"{"name":"renamed-pages"}"#,
+            )
+            .file("web/package.json", r#"{"name":"renamed-web"}"#)
+            .file("packages/unrelated/package.json", r#"{"name":"unrelated"}"#);
+        let selector = resolve(
+            &check("tsc --noEmit -p scripts", None, Some(&["ts:scripts"])),
+            &extra(&[("ts:scripts", &["api/**"])]),
+            &fixture,
+        );
+        assert!(selector.narrows(), "scripts is a known graph node");
+        for path in [
+            "scripts/typecheck.ts",
+            "scripts/lib/checks.test.ts",
+            "scripts/tsconfig.json",
+            "src/App.tsx",
+            "api/src/routes.ts",
+            "packages/page-kit/build.ts",
+            "web/src/pages/docs/acknowledgments-credits.ts",
+        ] {
+            assert!(selector.matches(path), "scripts closure includes {path}");
+        }
+        assert!(!selector.matches("docs/checks.md"));
+        assert!(!selector.matches("packages/unrelated/src/index.ts"));
+        let ts = domain_of(&fixture, Domain::Ts);
+        assert_eq!(ts.owner("scripts/tsconfig.json"), Some("scripts"));
+        assert_eq!(
+            ts.nodes["scripts"].deps,
+            BTreeSet::from([
+                "app".to_string(),
+                "renamed-pages".to_string(),
+                "renamed-web".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn scripts_tsconfig_aliases_belong_to_scripts_not_the_root() {
+        let fixture = TreeFixture::new()
+            .file(
+                "package.json",
+                r#"{"name":"app","workspaces":["scripts/tools"]}"#,
+            )
+            .file("tsconfig.json", r#"{"include":["src"]}"#)
+            .file(
+                "scripts/tsconfig.json",
+                r#"{"compilerOptions":{"paths":{"tools":["tools/src/index.ts"]}}}"#,
+            )
+            .file("scripts/tools/package.json", r#"{"name":"tools"}"#);
+        let ts = domain_of(&fixture, Domain::Ts);
+        assert!(ts.nodes["scripts"].deps.contains("tools"));
+        assert!(!ts.nodes["app"].deps.contains("tools"));
+
+        let absent = TreeFixture::new()
+            .file("package.json", r#"{"name":"app"}"#)
+            .file("tsconfig.json", r#"{"include":["src"]}"#);
+        assert!(!domain_of(&absent, Domain::Ts).nodes.contains_key("scripts"));
     }
 
     // --- graph derivation: generality and degradation ----------------------
