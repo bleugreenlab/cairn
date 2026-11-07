@@ -493,6 +493,79 @@ mod tests {
     }
 
     #[test]
+    fn batch_offers_share_base_identity_only_with_an_exact_slug_or_approved_mapping() {
+        for id in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-oss-20b",
+            "gpt-oss-120b",
+            "gpt-4-turbo",
+        ] {
+            let base = format!("openai/{id}");
+            let batch = format!("{base}:batch");
+            assert_eq!(for_offer("openrouter", &batch, Some(&base)), Some(id));
+            assert_eq!(for_offer("openrouter", &batch, None), None);
+        }
+        assert_eq!(
+            for_offer(
+                "openrouter",
+                "openai/o4-mini:batch",
+                Some("openai/o4-mini-2025-04-16")
+            ),
+            Some("o4-mini")
+        );
+        assert_eq!(
+            for_offer("openrouter", "openai/o4-mini:batch", None),
+            Some("o4-mini")
+        );
+        assert_eq!(
+            for_offer("openrouter", "openai/o4-mini:unknown", None),
+            None
+        );
+    }
+
+    #[test]
+    fn approved_openrouter_variants_resolve_to_the_benchmarked_weights() {
+        for (native, expected) in [
+            ("cohere/command-r7b-12-2024", "command-r7b"),
+            ("meta-llama/llama-3.1-70b-instruct", "llama-3.1-70b"),
+            ("meta-llama/llama-3.1-8b-instruct", "llama-3.1-8b"),
+            ("meta-llama/llama-3.2-1b-instruct", "llama-3.2-1b"),
+            ("meta-llama/llama-3.2-3b-instruct", "llama-3.2-3b"),
+            ("meta-llama/llama-3.3-70b-instruct", "llama-3.3-70b"),
+            ("nvidia/nemotron-3-super-120b-a12b", "nemotron-3-super"),
+            ("amazon/nova-pro-v1", "nova-pro"),
+            ("qwen/qwen-2.5-72b-instruct", "qwen2.5-72b"),
+        ] {
+            assert_eq!(
+                for_offer("openrouter", native, None),
+                Some(expected),
+                "{native}"
+            );
+            // An approved native-id mapping takes precedence over a dated discovery slug.
+            assert_eq!(
+                for_offer("openrouter", native, Some("unrecognized/snapshot")),
+                Some(expected),
+                "{native}"
+            );
+            assert!(
+                crate::benchmarks::shipped().model(expected).is_some(),
+                "{expected}"
+            );
+            assert_eq!(for_offer("other-provider", native, None), None, "{native}");
+        }
+        for native in [
+            "cohere/command-r7b-01-2025",
+            "meta-llama/llama-3.1-70b-instruct:free",
+            "nvidia/nemotron-3-super-49b-v1",
+            "amazon/nova-pro-v2",
+            "google/gemini-3-pro-image-preview",
+        ] {
+            assert_eq!(for_offer("openrouter", native, None), None, "{native}");
+        }
+    }
+
+    #[test]
     fn offers_resolve_by_equality_with_the_makers_prefix_and_never_by_guess() {
         let offer = |provider, native, slug| for_offer(provider, native, slug);
         assert_eq!(

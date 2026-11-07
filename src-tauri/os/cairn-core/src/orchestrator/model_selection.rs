@@ -1055,6 +1055,97 @@ mod tests {
         assert!(!view.benchmark_attribution.is_empty());
     }
 
+    #[test]
+    fn approved_openrouter_variants_show_benchmark_hints_in_a_ladder_read() {
+        let offers = [
+            ("cohere/command-r7b-12-2024", "command-r7b"),
+            ("meta-llama/llama-3.1-70b-instruct", "llama-3.1-70b"),
+            ("meta-llama/llama-3.1-8b-instruct", "llama-3.1-8b"),
+            ("meta-llama/llama-3.2-1b-instruct", "llama-3.2-1b"),
+            ("meta-llama/llama-3.2-3b-instruct", "llama-3.2-3b"),
+            ("meta-llama/llama-3.3-70b-instruct", "llama-3.3-70b"),
+            ("nvidia/nemotron-3-super-120b-a12b", "nemotron-3-super"),
+            ("amazon/nova-pro-v1", "nova-pro"),
+            ("qwen/qwen-2.5-72b-instruct", "qwen2.5-72b"),
+            ("openai/o4-mini:batch", "o4-mini"),
+        ];
+        let mut catalog = catalog();
+        let mut provider = catalog.providers[0].clone();
+        provider.descriptor = cairn_models::types::catalog::descriptor("openrouter")
+            .cloned()
+            .unwrap();
+        provider.alias_resolutions.clear();
+        let discovered = provider.models.as_mut().unwrap();
+        discovered.backend = "openrouter".into();
+        discovered.models = offers
+            .iter()
+            .map(|(native, _)| {
+                let mut model = cairn_models::types::catalog::claude_models().remove(0);
+                model.id = (*native).into();
+                model.model = (*native).into();
+                model.maker = cairn_models::types::catalog::openrouter_maker(native);
+                model.canonical_slug =
+                    (*native == "openai/o4-mini:batch").then(|| "openai/o4-mini-2025-04-16".into());
+                model
+            })
+            .collect();
+        catalog.providers.push(provider);
+
+        let mut models = models();
+        // Well-separated benchmarked releases calibrate solve rates onto this ladder.
+        for (native, level) in [
+            ("openrouter/meta-llama/llama-3.2-1b-instruct", 0.1),
+            ("openrouter/meta-llama/llama-3.3-70b-instruct", 0.7),
+        ] {
+            models.ladder.push(cairn_config::allotment::Rung {
+                model: cairn_config::allotment::parse_model_ref(native).unwrap(),
+                level: Some(cairn_config::allotment::Level::set(level)),
+                effort: None,
+                effort_level: None,
+                options: BTreeMap::new(),
+            });
+        }
+        let original = models.clone();
+        let view = ladder_view(&models, &catalog);
+        let text = render_ladder(&[], || Ok(view.clone()));
+        for (native, canonical) in offers {
+            let reference = format!("openrouter/{native}");
+            assert_eq!(
+                catalog.benchmark("openrouter", native).unwrap().canonical,
+                canonical
+            );
+            let hint = view
+                .rungs
+                .iter()
+                .find(|rung| rung.model == reference)
+                .and_then(|rung| rung.benchmark.as_ref())
+                .or_else(|| {
+                    view.unranked
+                        .iter()
+                        .find(|model| model.model == reference)
+                        .and_then(|model| model.benchmark.as_ref())
+                })
+                .expect(native);
+            let placement = cairn_models::types::benchmarks::shipped()
+                .model(canonical)
+                .unwrap();
+            assert_eq!(
+                (hint.level, hint.low, hint.high),
+                (placement.level, placement.low, placement.high),
+                "{native}"
+            );
+            assert!(hint.position.is_some(), "{native}");
+            let line = text
+                .lines()
+                .find(|line| line.contains(&format!("`{reference}`")))
+                .unwrap();
+            assert!(line.contains(&hint.summary), "{line}");
+            assert!(line.contains("on your ladder"), "{line}");
+        }
+        assert_eq!(models, original);
+        println!("{text}");
+    }
+
     /// A stored level stays the level, with the benchmark placement beside it
     /// as a hint; an unranked model the benchmarks cover shows its placement
     /// and band.
