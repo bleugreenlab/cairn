@@ -206,6 +206,26 @@ fn derive_entry(
     Ok(entry)
 }
 
+/// The MCP server a provider item binds, read from its validated declaration.
+fn bound_server(
+    root: &Path,
+    pack: &str,
+    item: &manifest::PackItem,
+) -> Result<Option<String>, String> {
+    let Some(slot) = (item.kind == PackItemKind::Provider)
+        .then(|| crate::provider::Slot::parse(&item.id))
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    Ok(
+        match crate::provider::load_pack_provider(root, pack, slot)?.map(|p| p.provider.adapter) {
+            Some(crate::provider::Adapter::Mcp(binding)) => Some(binding.server),
+            _ => None,
+        },
+    )
+}
+
 /// Read a staged pack root into an index entry, hashing every item exactly as
 /// the install lock does.
 pub fn entry_from_staged(
@@ -234,6 +254,12 @@ pub fn entry_from_staged(
         let definition = (item.kind == PackItemKind::Mcp)
             .then(|| mcp.get(&item.id).cloned())
             .flatten();
+        // A provider runs what the server it binds runs.
+        let bound = match bound_server(root, id, &item)? {
+            Some(server) => mcp.get(&server).cloned(),
+            None => None,
+        };
+        let runs = ItemRuns::classify(item.kind, definition.as_ref().or(bound.as_ref()));
         let hash = match (&item.path, &definition) {
             (_, Some(definition)) => crate::hash_mcp_definition(definition)?,
             (Some(path), None) => match crate::hash_item_path(item.kind, root, &root.join(path))? {
@@ -243,7 +269,7 @@ pub fn entry_from_staged(
             (None, None) => return Err(format!("MCP server `{}` has no definition", item.id)),
         };
         items.push(IndexItem {
-            runs: ItemRuns::classify(item.kind, definition.as_ref()),
+            runs,
             from: item
                 .path
                 .as_ref()
@@ -502,6 +528,45 @@ mod tests {
             error.contains("contains skill `extra`, which the signed index does not list"),
             "{error}"
         );
+    }
+
+    /// A provider is listed as running what its bound server runs: bmd's remote
+    /// server makes its provider an endpoint, a stdio server makes it run here.
+    #[test]
+    fn a_bound_provider_is_classified_by_its_server() {
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/bmd");
+        let runs_of = |root: &Path| {
+            let entry = entry_from_staged(
+                "bmd",
+                EntryOrigin::Source {
+                    path: String::new(),
+                },
+                root,
+                &BTreeMap::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            entry
+                .items
+                .iter()
+                .find(|item| item.kind == PackItemKind::Provider)
+                .unwrap()
+                .runs
+        };
+        assert_eq!(runs_of(&bundled), ItemRuns::Endpoint);
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("bmd");
+        std::fs::create_dir_all(local.join("providers")).unwrap();
+        for file in ["cairn-pack.yaml", "providers/web-fetch.yaml"] {
+            std::fs::copy(bundled.join(file), local.join(file)).unwrap();
+        }
+        std::fs::write(
+            local.join("mcp.yaml"),
+            "mcpServers:\n  bmd:\n    command: bmd-local\n",
+        )
+        .unwrap();
+        assert_eq!(runs_of(&local), ItemRuns::Here);
     }
 
     #[test]

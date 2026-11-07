@@ -1,0 +1,189 @@
+{
+  "about": "What the compiled web-fetch adapters (fetch_web.rs on main@e7a9e965) sent and what an agent read, for each captured case. A case's top-level fields are the compiled behaviour; `now` overrides the fields this issue changes on purpose, and `change` says why. The pack declarations must reproduce every case with its `now` applied.",
+  "target": "https://example.com/a?b=c",
+  "requests": [
+    {
+      "provider": "firecrawl",
+      "options": {},
+      "credential": "fc-Kp41Zx",
+      "method": "POST",
+      "url": "https://api.firecrawl.dev/v1/scrape",
+      "headers": [["Authorization", "Bearer fc-Kp41Zx"], ["Content-Type", "application/json"]],
+      "body": {"url": "https://example.com/a?b=c", "formats": ["markdown"], "onlyMainContent": true}
+    },
+    {
+      "provider": "firecrawl",
+      "options": {"onlyMainContent": false},
+      "credential": "fc-Kp41Zx",
+      "method": "POST",
+      "url": "https://api.firecrawl.dev/v1/scrape",
+      "headers": [["Authorization", "Bearer fc-Kp41Zx"], ["Content-Type", "application/json"]],
+      "body": {"url": "https://example.com/a?b=c", "formats": ["markdown"], "onlyMainContent": false}
+    },
+    {
+      "provider": "cloudflare",
+      "options": {"accountId": "account-123", "browser": "kitesurf", "waitUntil": "networkidle0"},
+      "credential": "cf-Tq83Lm",
+      "method": "POST",
+      "url": "https://api.cloudflare.com/client/v4/accounts/account-123/browser-rendering/markdown?browser=kitesurf",
+      "headers": [["Authorization", "Bearer cf-Tq83Lm"], ["Content-Type", "application/json"]],
+      "body": {"url": "https://example.com/a?b=c", "gotoOptions": {"waitUntil": "networkidle0"}}
+    },
+    {
+      "provider": "cloudflare",
+      "options": {"accountId": "account-123", "browser": "chromium", "waitUntil": "load"},
+      "credential": "cf-Tq83Lm",
+      "method": "POST",
+      "url": "https://api.cloudflare.com/client/v4/accounts/account-123/browser-rendering/markdown?browser=chromium",
+      "headers": [["Authorization", "Bearer cf-Tq83Lm"], ["Content-Type", "application/json"]],
+      "body": {"url": "https://example.com/a?b=c"},
+      "now": {"body": {"url": "https://example.com/a?b=c", "gotoOptions": {"waitUntil": "domcontentloaded"}}},
+      "change": "The declaration language has no conditionals, so gotoOptions is always sent. The compiled default sent nothing, which Cloudflare documents as domcontentloaded; a stored `load` is no longer a choice and falls back to that default, so the page-load semantics are unchanged and only the request bytes differ."
+    },
+    {
+      "provider": "jina",
+      "options": {},
+      "credential": "jn-Hc72Rb",
+      "method": "GET",
+      "url": "https://r.jina.ai/https://example.com/a?b=c",
+      "headers": [["Authorization", "Bearer jn-Hc72Rb"], ["X-Return-Format", "markdown"]],
+      "body": null,
+      "now": {"url": "https://r.jina.ai/https%3A%2F%2Fexample.com%2Fa%3Fb%3Dc"},
+      "change": "Jina percent-decodes its path once, so a raw target holding escapes or a fragment reached the origin altered. The target is now sent |query-encoded, which Jina returns exactly."
+    }
+  ],
+  "responses": [
+    {
+      "provider": "firecrawl",
+      "status": 200,
+      "body": "{\"success\":true,\"data\":{\"markdown\":\"# Example\\n\\nBody\"}}",
+      "ok": "# Example\n\nBody"
+    },
+    {
+      "provider": "firecrawl",
+      "status": 200,
+      "body": "{\"success\":true,\"data\":{}}",
+      "err": "Firecrawl returned no markdown for `https://example.com/a?b=c`."
+    },
+    {
+      "provider": "firecrawl",
+      "status": 200,
+      "body": "not json",
+      "err": "Firecrawl returned an unexpected response for `https://example.com/a?b=c`: expected ident at line 1 column 2"
+    },
+    {
+      "provider": "firecrawl",
+      "status": 200,
+      "body": "{\"success\":false,\"error\":\"Unsupported URL\"}",
+      "err": "Firecrawl returned no markdown for `https://example.com/a?b=c`.",
+      "now": {"err": "Firecrawl fetch of `https://example.com/a?b=c` failed: Unsupported URL"},
+      "change": "The success gate: Firecrawl's success:false is now a failed fetch carrying its error, not a missing-markdown error."
+    },
+    {
+      "provider": "firecrawl",
+      "status": 402,
+      "body": "{\"success\":false,\"error\":\"Payment required\"}",
+      "err": "Firecrawl fetch of `https://example.com/a?b=c` failed: HTTP 402 — {\"success\":false,\"error\":\"Payment required\"}",
+      "now": {"err": "Firecrawl fetch of `https://example.com/a?b=c` failed: HTTP 402 — Payment required."},
+      "change": "One fetch failure text for every provider (Cloudflare's): the gate's error path names the detail, and the sentence ends with a period."
+    },
+    {
+      "provider": "firecrawl",
+      "status": 500,
+      "body": "",
+      "err": "Firecrawl fetch of `https://example.com/a?b=c` failed: HTTP 500 — ",
+      "now": {"err": "Firecrawl fetch of `https://example.com/a?b=c` failed: HTTP 500."},
+      "change": "The shared failure text drops the dash when there is no detail."
+    },
+    {
+      "provider": "cloudflare",
+      "status": 200,
+      "body": "{\"success\":true,\"result\":\"# Rendered\",\"errors\":[]}",
+      "ok": "# Rendered"
+    },
+    {
+      "provider": "cloudflare",
+      "status": 200,
+      "body": "{\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}]}",
+      "err": "Cloudflare Browser Run fetch of `https://example.com/a?b=c` failed: Authentication error"
+    },
+    {
+      "provider": "cloudflare",
+      "status": 200,
+      "body": "{\"success\":false,\"errors\":[]}",
+      "err": "Cloudflare Browser Run fetch of `https://example.com/a?b=c` failed: the request was unsuccessful"
+    },
+    {
+      "provider": "cloudflare",
+      "status": 200,
+      "body": "{\"success\":true,\"errors\":[]}",
+      "err": "Cloudflare Browser Run returned no markdown for `https://example.com/a?b=c`."
+    },
+    {
+      "provider": "cloudflare",
+      "status": 200,
+      "body": "not json",
+      "err": "Cloudflare Browser Run returned an unexpected response for `https://example.com/a?b=c`: expected ident at line 1 column 2"
+    },
+    {
+      "provider": "cloudflare",
+      "status": 403,
+      "body": "{\"result\":null,\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\"}],\"messages\":[]}",
+      "err": "Cloudflare Browser Run fetch of `https://example.com/a?b=c` failed: HTTP 403 — Authentication error."
+    },
+    {
+      "provider": "cloudflare",
+      "status": 429,
+      "retryAfter": "30",
+      "body": "{\"success\":false,\"errors\":[{\"code\":2001,\"message\":\"Rate limit exceeded\"}]}",
+      "err": "Cloudflare Browser Run fetch of `https://example.com/a?b=c` failed: HTTP 429 — Rate limit exceeded. Retry-After: 30."
+    },
+    {
+      "provider": "cloudflare",
+      "status": 502,
+      "body": "<html>Bad gateway</html>",
+      "err": "Cloudflare Browser Run fetch of `https://example.com/a?b=c` failed: HTTP 502 — <html>Bad gateway</html>."
+    },
+    {
+      "provider": "jina",
+      "status": 200,
+      "contentType": "text/plain; charset=utf-8",
+      "body": "# Page\n\nWords",
+      "ok": "# Page\n\nWords"
+    },
+    {
+      "provider": "jina",
+      "status": 404,
+      "body": "Not found",
+      "err": "Fetch of `https://example.com/a?b=c` failed: HTTP 404 — Not found",
+      "now": {"err": "Jina fetch of `https://example.com/a?b=c` failed: HTTP 404 — Not found."},
+      "change": "The slot's one failure text names the provider; a pack provider used Regular's unlabelled text."
+    }
+  ],
+  "guidance": {
+    "firecrawl_no_key": {
+      "before": "No API key set for Firecrawl web fetch. Add it in Settings → Web Services.",
+      "now": "No API key set for Firecrawl web fetch. Add it in the Library."
+    },
+    "cloudflare_not_authorized": {
+      "before": "Cloudflare web fetch is not authorized. Connect it in Settings → Web Services.",
+      "now": "Cloudflare Browser Run web fetch is not authorized. Connect it in the Library."
+    },
+    "cloudflare_no_account": {
+      "before": "The Cloudflare Browser Run web-fetch provider is missing its account ID. Set your Cloudflare account ID in Settings → Web Services.",
+      "now": "Cloudflare Browser Run web fetch needs its Account ID. Set it in the Library."
+    },
+    "bmd_not_connected": {
+      "before": "The bmd web-fetch provider is not configured. Add and connect the bmd MCP server in Settings → Web Services, or switch providers.",
+      "now": "bmd web fetch needs its MCP server `bmd` connected. Connect it in the Library."
+    }
+  },
+  "bmd": {
+    "session": "cairn-web-fetch",
+    "server": "bmd",
+    "tool": "fetch",
+    "arguments": {"source": "https://example.com/a?b=c"},
+    "timeoutMs": 120000,
+    "result": "# bmd markdown"
+  }
+}

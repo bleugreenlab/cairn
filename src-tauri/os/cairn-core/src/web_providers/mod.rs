@@ -1,26 +1,38 @@
 //! The web-service slots, backed by providers that packs declare.
 //!
 //! The app compiles in the slot set and each slot's result contract
-//! ([`cairn_packs::provider::Slot`]), one declarative HTTP engine
-//! ([`cairn_packs::provider::http`]), and the zero-config defaults (`regular`
-//! fetch, `local` PDF). Everything about a particular provider — endpoint,
-//! headers, body, result paths, options, the hosts its key may reach — is data
-//! in an installed pack. Adding a provider is a change to a pack, never here.
+//! ([`cairn_packs::provider::Slot`]), the generic adapter engines (the
+//! declarative HTTP engine in [`cairn_packs::provider::http`] and the MCP-tool
+//! binding in [`cairn_packs::provider::binding`]), the generic OAuth flow for a
+//! declared client ([`oauth`]), and the zero-config defaults (`regular` fetch,
+//! `local` PDF). Everything about a particular provider — endpoint, headers,
+//! body, result paths, options, the hosts its credential may reach, the MCP
+//! tool it calls, the OAuth client it authorizes — is data in an installed
+//! pack. Adding a provider is a change to a pack, never here.
 //!
 //! Which provider fills a slot is workspace state: the slot's scalar in
 //! `settings.yaml` (`activeWebSearch`, `activeWebFetch`) names a pack id, and a
 //! pack provides at most one provider per slot (its `providers/<slot>.yaml`).
 //! Options live under the slot's map keyed by pack id (`webSearch.<pack>`).
 //! Installing a provider pack never activates it.
+//!
+//! A provider failure (a non-2xx response, a refused tool call) is an `Err` in
+//! every slot, so an agent reads it as a failed read. A configuration gap
+//! (nothing selected, not installed, no key, not authorized, needs setup) is
+//! `Ok` guidance naming where to fix it.
 
 mod migrate;
+pub mod oauth;
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use cairn_packs::provider::http::PreparedRequest;
-use cairn_packs::provider::{self, PackProvider, Slot};
+use cairn_packs::provider::binding::McpBinding;
+use cairn_packs::provider::http::{Inputs, PreparedRequest};
+use cairn_packs::provider::{self, Adapter, CredentialDecl, CredentialKind, PackProvider, Slot};
 use cairn_packs::server_config::NotReady;
+
+use crate::security::BrokeredSecret;
 
 pub use migrate::{migrate_workspace, MigrationReport};
 
@@ -28,6 +40,9 @@ pub use migrate::{migrate_workspace, MigrationReport};
 /// agent-facing message that says where to configure one uses this, so the
 /// install surface's final name is one edit.
 pub const LIBRARY_LOCATION: &str = "the Library";
+
+/// How long a slot waits on an MCP-bound provider's tool call.
+const MCP_SLOT_TIMEOUT_MS: u32 = 120_000;
 
 type Options = HashMap<String, serde_yaml::Value>;
 
@@ -56,6 +71,15 @@ pub fn builtin_default(slot: Slot) -> Option<&'static str> {
         Slot::WebSearch => None,
         Slot::WebFetch => Some("regular"),
         Slot::Pdf => Some("local"),
+    }
+}
+
+/// The built-in default's display label.
+fn builtin_label(slot: Slot) -> Option<&'static str> {
+    match slot {
+        Slot::WebSearch => None,
+        Slot::WebFetch => Some("Regular"),
+        Slot::Pdf => Some("Local"),
     }
 }
 
@@ -160,26 +184,75 @@ pub fn resolve(config_dir: &Path, slot: Slot) -> Resolved {
     }
 }
 
-/// Whether a pack credential holds a value. A keychain read failure is kept,
+/// Whether a pack credential holds a usable value: a stored secret, or an
+/// OAuth token that is not known to be dead. A store read failure is kept,
 /// because absence has not been established.
-pub fn credential_present(pack: &str, credential: &str, var: &str) -> Result<bool, String> {
-    crate::config::secrets::has_secret(
-        &crate::config::secrets::pack_credential_key(pack, credential),
-        var,
-    )
+pub fn credential_present(pack: &str, credential: &CredentialDecl) -> Result<bool, String> {
+    match &credential.kind {
+        CredentialKind::Secret { var } => crate::config::secrets::has_secret(
+            &crate::config::secrets::pack_credential_key(pack, &credential.name),
+            var,
+        ),
+        CredentialKind::OAuth { .. } => {
+            let status = oauth::status(pack, &credential.name);
+            match status.state.as_str() {
+                "authorized" => Ok(true),
+                "error" => Err(status
+                    .detail
+                    .unwrap_or_else(|| "OAuth credential store unavailable".to_string())),
+                _ => Ok(false),
+            }
+        }
+    }
 }
 
-/// Why a provider cannot run yet, in the readiness vocabulary pack MCP servers
-/// use: an unfilled credential is `MissingVars` ("needs key").
-pub fn readiness(provider: &PackProvider) -> Option<NotReady> {
-    let credential = &provider.credential;
-    match credential_present(&provider.pack, &credential.name, &credential.var) {
+/// Why a credential cannot be used yet: an unfilled secret is `MissingVars`
+/// ("needs key"), an unauthorized OAuth credential is `NeedsAuth`.
+pub fn credential_readiness(pack: &str, credential: &CredentialDecl) -> Option<NotReady> {
+    match credential_present(pack, credential) {
         Ok(true) => None,
-        Ok(false) => Some(NotReady::MissingVars {
-            vars: vec![credential.var.clone()],
+        Ok(false) => Some(match &credential.kind {
+            CredentialKind::Secret { var } => NotReady::MissingVars {
+                vars: vec![var.clone()],
+            },
+            CredentialKind::OAuth { .. } => NotReady::NeedsAuth,
         }),
         Err(error) => Some(NotReady::CredentialUnavailable { error }),
     }
+}
+
+/// Why the MCP server a binding names cannot be called yet, in the readiness
+/// vocabulary the MCP layer gates connections with. A server the user
+/// authored is not gated, as for any agent; it fails loudly at call time.
+fn binding_readiness(config_dir: &Path, binding: &McpBinding) -> Option<NotReady> {
+    let entries = crate::config::mcp_servers::workspace_mcp_entries(
+        config_dir,
+        &crate::config::machine_services::MachineServiceSnapshot::empty(),
+    );
+    match entries.get(&binding.server) {
+        Some(entry) => entry.not_ready.clone(),
+        None => Some(NotReady::NeedsSetup {
+            missing: vec![format!("MCP server `{}`", binding.server)],
+        }),
+    }
+}
+
+/// Why a provider cannot run yet: its credential, or the MCP server it binds,
+/// then any required option left blank.
+pub fn readiness(config_dir: &Path, provider: &PackProvider) -> Option<NotReady> {
+    let reach = match (&provider.provider.adapter, &provider.credential) {
+        (Adapter::Mcp(binding), _) => binding_readiness(config_dir, binding),
+        (Adapter::Http(_), Some(credential)) => credential_readiness(&provider.pack, credential),
+        (Adapter::Http(_), None) => None,
+    };
+    reach.or_else(|| {
+        let options = load_options(config_dir, provider.provider.slot, &provider.pack);
+        cairn_packs::provider_options::missing_required(&provider.provider.options, &options).map(
+            |option| NotReady::NeedsSetup {
+                missing: vec![option.label.clone()],
+            },
+        )
+    })
 }
 
 /// The credential `pack` declares under `credential`, read from its installed
@@ -188,7 +261,7 @@ fn installed_credential(
     config_dir: &Path,
     pack: &str,
     credential: &str,
-) -> Result<provider::CredentialDecl, String> {
+) -> Result<CredentialDecl, String> {
     if cairn_packs::lock::read_lock(config_dir, pack).is_none() {
         return Err(format!("Pack `{pack}` is not installed"));
     }
@@ -198,7 +271,7 @@ fn installed_credential(
         .ok_or_else(|| format!("Pack `{pack}` declares no credential `{credential}`"))
 }
 
-/// Store the operator's value for a pack credential in the keychain.
+/// Store the operator's value for a pack `secret` credential in the keychain.
 pub fn store_credential(
     config_dir: &Path,
     pack: &str,
@@ -206,27 +279,53 @@ pub fn store_credential(
     value: &str,
 ) -> Result<(), String> {
     let declared = installed_credential(config_dir, pack, credential)?;
+    let CredentialKind::Secret { var } = &declared.kind else {
+        return Err(format!(
+            "`{pack}/{credential}` is an OAuth credential: connect it instead of pasting a value"
+        ));
+    };
     let value = value.trim();
     if value.is_empty() {
         return Err(format!(
-            "An empty value cannot be stored for {}; clear it instead",
-            declared.var
+            "An empty value cannot be stored for {var}; clear it instead"
         ));
     }
     crate::config::secrets::set_secret(
         &crate::config::secrets::pack_credential_key(pack, credential),
-        &declared.var,
+        var,
         value,
     )
 }
 
-/// Remove a pack credential's stored value. Succeeds when none is stored.
+/// Remove a pack credential's stored value: a secret, or an OAuth token and
+/// any pending authorization. Succeeds when none is stored.
 pub fn delete_credential(config_dir: &Path, pack: &str, credential: &str) -> Result<(), String> {
     let declared = installed_credential(config_dir, pack, credential)?;
-    crate::config::secrets::delete_secret(
-        &crate::config::secrets::pack_credential_key(pack, credential),
-        &declared.var,
-    )
+    match &declared.kind {
+        CredentialKind::Secret { var } => crate::config::secrets::delete_secret(
+            &crate::config::secrets::pack_credential_key(pack, credential),
+            var,
+        ),
+        CredentialKind::OAuth { .. } => oauth::sign_out(pack, credential),
+    }
+}
+
+/// The value a provider's credential holds right now, brokered so it is a
+/// scrub target before it reaches a header: page content and error bodies flow
+/// straight to the agent. `None` when nothing usable is stored.
+pub(crate) async fn credential_value(
+    pack: &str,
+    credential: &CredentialDecl,
+    purpose: &str,
+) -> Result<Option<BrokeredSecret>, String> {
+    match &credential.kind {
+        CredentialKind::Secret { var } => {
+            crate::security::broker::pack_credential(pack, &credential.name, var, purpose)
+        }
+        CredentialKind::OAuth { .. } => {
+            crate::security::broker::pack_oauth_token(pack, &credential.name, purpose).await
+        }
+    }
 }
 
 /// Select (or clear) the provider for a slot. A name must be the built-in
@@ -234,28 +333,15 @@ pub fn delete_credential(config_dir: &Path, pack: &str, credential: &str) -> Res
 pub fn set_active(config_dir: &Path, slot: Slot, name: Option<&str>) -> Result<(), String> {
     let name = name.map(str::trim).filter(|name| !name.is_empty());
     if let Some(name) = name {
-        if builtin_default(slot) != Some(name) {
-            match installed_provider(config_dir, name, slot)? {
-                Some(_) => {}
-                None => {
-                    return Err(format!(
-                        "`{name}` is not an installed {} provider",
-                        slot.noun()
-                    ))
-                }
-            }
+        if builtin_default(slot) != Some(name)
+            && installed_provider(config_dir, name, slot)?.is_none()
+        {
+            return Err(format!(
+                "`{name}` is not an installed {} provider",
+                slot.noun()
+            ));
         }
     }
-    write_active(config_dir, slot, name)
-}
-
-/// Write the slot scalar without checking what it names. The compiled fetch
-/// selector, which accepts compiled ids, writes through this too.
-pub(crate) fn write_active(
-    config_dir: &Path,
-    slot: Slot,
-    name: Option<&str>,
-) -> Result<(), String> {
     crate::config::settings::mutate_workspace_settings(
         config_dir,
         "cairn: update settings",
@@ -315,9 +401,19 @@ pub fn upsert_options(
 pub struct SlotView {
     pub slot: Slot,
     pub active: Option<String>,
+    /// The compiled zero-config provider, selected when `active` is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<BuiltinView>,
     pub providers: Vec<ProviderView>,
     /// Installed packs whose declaration for this slot does not load.
     pub invalid: Vec<InvalidProviderView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinView {
+    pub id: &'static str,
+    pub label: &'static str,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -330,7 +426,13 @@ pub struct ProviderView {
     pub not_ready: Option<NotReady>,
     pub options: Vec<cairn_packs::provider_options::ProviderOption>,
     pub saved_options: Options,
-    pub credential: CredentialView,
+    /// The credential an `http` provider sends; absent for an MCP binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialView>,
+    /// The MCP server an `mcp` provider calls, which its own connection
+    /// authorizes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_server: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -338,11 +440,32 @@ pub struct ProviderView {
 pub struct CredentialView {
     pub name: String,
     pub label: String,
-    pub var: String,
+    /// `secret` or `oauth`.
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub var: Option<String>,
+    /// A secret is stored, or an OAuth token is authorized. Never the value.
     pub present: bool,
     pub hosts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup: Option<cairn_packs::mcp::McpVarSetup>,
+}
+
+impl CredentialView {
+    pub fn of(pack: &str, credential: &CredentialDecl, installed: bool) -> Self {
+        CredentialView {
+            name: credential.name.clone(),
+            label: credential.label.clone(),
+            kind: match credential.kind {
+                CredentialKind::Secret { .. } => "secret",
+                CredentialKind::OAuth { .. } => "oauth",
+            },
+            var: credential.var().map(str::to_string),
+            present: installed && credential_present(pack, credential).unwrap_or(false),
+            hosts: credential.hosts.clone(),
+            setup: credential.setup.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -354,23 +477,24 @@ pub struct InvalidProviderView {
 
 impl ProviderView {
     pub fn of(config_dir: &Path, provider: &PackProvider, active: bool) -> Self {
-        let not_ready = readiness(provider);
-        let credential = &provider.credential;
         ProviderView {
             pack: provider.pack.clone(),
             label: provider.provider.label.clone(),
             active,
             options: provider.provider.options.clone(),
-            saved_options: load_options(config_dir, provider.provider.slot, &provider.pack),
-            credential: CredentialView {
-                name: credential.name.clone(),
-                label: credential.label.clone(),
-                var: credential.var.clone(),
-                present: not_ready.is_none(),
-                hosts: credential.hosts.clone(),
-                setup: credential.setup.clone(),
+            saved_options: cairn_packs::provider_options::usable_options(
+                &provider.provider.options,
+                &load_options(config_dir, provider.provider.slot, &provider.pack),
+            ),
+            credential: provider
+                .credential
+                .as_ref()
+                .map(|credential| CredentialView::of(&provider.pack, credential, true)),
+            mcp_server: match &provider.provider.adapter {
+                Adapter::Mcp(binding) => Some(binding.server.clone()),
+                Adapter::Http(_) => None,
             },
-            not_ready,
+            not_ready: readiness(config_dir, provider),
         }
     }
 }
@@ -392,6 +516,9 @@ pub fn slot_view(config_dir: &Path, slot: Slot) -> SlotView {
     SlotView {
         slot,
         active,
+        builtin: builtin_default(slot)
+            .zip(builtin_label(slot))
+            .map(|(id, label)| BuiltinView { id, label }),
         providers,
         invalid,
     }
@@ -443,16 +570,16 @@ fn may_reach(hosts: &[String], url: &url::Url) -> bool {
 /// headers such as `x-api-key`, so following redirects freely would hand a
 /// key to whatever host a provider pointed at.
 pub(crate) async fn send(
-    provider: &PackProvider,
+    pack: &str,
+    credential: &CredentialDecl,
     prepared: &PreparedRequest,
 ) -> Result<reqwest::Response, String> {
-    let hosts = provider.credential.hosts.clone();
+    let hosts = credential.hosts.clone();
     let url = url::Url::parse(&prepared.url).map_err(|e| format!("invalid request URL: {e}"))?;
     if !may_reach(&hosts, &url) {
         return Err(format!(
-            "refusing to send credential `{}/{}` to `{}`, which is not in its hosts",
-            provider.pack,
-            provider.credential.name,
+            "refusing to send credential `{pack}/{}` to `{}`, which is not in its hosts",
+            credential.name,
             url.host_str().unwrap_or_default()
         ));
     }
@@ -482,6 +609,70 @@ pub(crate) async fn send(
         request = request.body(body.clone());
     }
     request.send().await.map_err(|e| e.to_string())
+}
+
+/// What an MCP-bound provider's call produced.
+pub(crate) enum McpOutcome {
+    /// The tool's text result.
+    Text(String),
+    /// The bound server cannot be connected: it is not ready, or is gone.
+    NotConnected,
+}
+
+/// Call an MCP-bound provider's tool. The server is resolved through the
+/// readiness-gated MCP layer, so a pack server that is not ready is never
+/// connected and a settings server of the same name shadows the pack's.
+pub(crate) async fn mcp_call(
+    orch: &crate::orchestrator::Orchestrator,
+    provider: &PackProvider,
+    binding: &McpBinding,
+    inputs: &Inputs<'_>,
+) -> Result<McpOutcome, String> {
+    use crate::config::mcp_servers::McpServerConfigExt;
+    let label = &provider.provider.label;
+    let noun = provider.provider.slot.noun();
+    let Some(gateway) = orch.mcp_gateway() else {
+        return Err(format!(
+            "The {label} {noun} provider needs the MCP gateway, which is not available in this host."
+        ));
+    };
+    let machines = crate::config::machine_services::MachineServiceSnapshot::capture(orch);
+    let entries =
+        crate::config::mcp_servers::resolve_mcp_server_entries(&orch.config_dir, None, &machines);
+    let Some(entry) = entries.get(&binding.server) else {
+        return Ok(McpOutcome::NotConnected);
+    };
+    let key = crate::config::secrets::credential_key(&binding.server, None);
+    let brokered = entry.config.brokered(&key, &format!("{label} {noun}"))?;
+    call_binding(gateway.as_ref(), &brokered, &key, provider, binding, inputs)
+        .await
+        .map(McpOutcome::Text)
+}
+
+/// The gateway call for a binding, split out so it is testable against a mock
+/// gateway.
+async fn call_binding(
+    gateway: &dyn crate::mcp::gateway::McpGateway,
+    config: &crate::security::BrokeredMcpConfig,
+    key: &str,
+    provider: &PackProvider,
+    binding: &McpBinding,
+    inputs: &Inputs<'_>,
+) -> Result<String, String> {
+    let arguments = cairn_packs::provider::binding::arguments(&provider.provider, binding, inputs);
+    gateway
+        .call_tool(
+            &format!("cairn-{}", provider.provider.slot.as_str()),
+            key,
+            config,
+            &binding.tool,
+            arguments,
+            Some(MCP_SLOT_TIMEOUT_MS),
+        )
+        .await
+        // `result: text`, the only form: a markdown slot has no place for an
+        // image block, so the composed text is the result.
+        .map(|result| result.text)
 }
 
 #[cfg(test)]

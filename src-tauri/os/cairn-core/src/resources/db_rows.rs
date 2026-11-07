@@ -1010,6 +1010,7 @@ pub(crate) async fn produce(
         more_records: false,
         affordance,
         images: Vec::new(),
+        failed: false,
     };
     if table == RESERVED_TABLE_SEGMENT {
         return line(reserved_table_segment_refusal(&store.root), affordance);
@@ -1172,6 +1173,7 @@ async fn read_collection(
         more_records: false,
         affordance: None,
         images: Vec::new(),
+        failed: false,
     })
 }
 

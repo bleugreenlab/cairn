@@ -107,13 +107,22 @@ pub fn rotation_hook(secret_id: &SecretId, category: Option<SecretCategory>) -> 
             revocation_suffices: false,
         };
     }
+    if id.starts_with("pack-oauth:") {
+        return RotationHook {
+            provider: "pack-oauth",
+            configured_at: "the Library, on the providing pack's credential",
+            guidance: "Sign the credential out and connect it again so the authorization \
+                 server issues a new grant, and revoke the old grant at that service. \
+                 Revoking Cairn's copy does not revoke the token there.",
+            revocation_suffices: false,
+        };
+    }
     if id.starts_with("web-provider:") {
         return RotationHook {
             provider: "web-provider",
-            configured_at: "Settings \u{2192} Web search and fetch",
-            guidance:
-                "Issue a new API key at the search or fetch provider, revoke the disclosed one \
-                 there, and store the replacement.",
+            configured_at: "Settings \u{2192} Channels",
+            guidance: "Issue a new token at the service, revoke the disclosed one there, and \
+                 store the replacement.",
             revocation_suffices: false,
         };
     }
@@ -227,13 +236,17 @@ mod tests {
                 credential_key: "linear".to_string(),
             },
             CredentialSource::WebProvider {
-                provider: "bmd".to_string(),
-                var: "BMD_KEY".to_string(),
+                provider: "discord".to_string(),
+                var: "DISCORD_BOT_TOKEN".to_string(),
             },
             CredentialSource::PackCredential {
                 pack: "tavily".to_string(),
                 credential: "api-key".to_string(),
                 var: "TAVILY_API_KEY".to_string(),
+            },
+            CredentialSource::PackOAuth {
+                pack: "example".to_string(),
+                credential: "login".to_string(),
             },
             CredentialSource::GitHubApp { app_id: 1 },
             CredentialSource::GitHubInstallation { installation_id: 2 },
@@ -263,6 +276,7 @@ mod tests {
                 | CredentialSource::McpOAuth { .. }
                 | CredentialSource::WebProvider { .. }
                 | CredentialSource::PackCredential { .. }
+                | CredentialSource::PackOAuth { .. }
                 | CredentialSource::GitHubApp { .. }
                 | CredentialSource::GitHubInstallation { .. }
                 | CredentialSource::ModelBackend { .. }
@@ -304,7 +318,8 @@ mod tests {
         for id in [
             "model-backend:anthropic:acct",
             "mcp-server:linear:LINEAR_API_KEY",
-            "web-provider:bmd:BMD_KEY",
+            "web-provider:discord:DISCORD_BOT_TOKEN",
+            "pack-oauth:example/login",
             "github-app:1",
             "account-device",
         ] {

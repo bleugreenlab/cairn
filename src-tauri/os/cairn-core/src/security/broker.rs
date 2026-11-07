@@ -119,7 +119,7 @@ pub enum CredentialSource {
     },
     /// The OAuth access token for a configured MCP server.
     McpOAuth { credential_key: String },
-    /// A compiled web fetch provider's API key, or a channel token.
+    /// A channel token (Discord, Telegram), stored at `{provider}/{var}`.
     WebProvider { provider: String, var: String },
     /// A credential a pack declares for its own providers, stored under
     /// [`crate::config::secrets::pack_credential_key`].
@@ -128,6 +128,9 @@ pub enum CredentialSource {
         credential: String,
         var: String,
     },
+    /// The access token of a pack's `oauth` credential, held in the OAuth
+    /// store at [`crate::web_providers::oauth::account`].
+    PackOAuth { pack: String, credential: String },
     /// The GitHub App's RSA private key. Cairn signs with it and never sends
     /// it: see [`github`].
     GitHubApp { app_id: i64 },
@@ -185,7 +188,8 @@ impl CredentialSource {
             },
             Self::PackCredential {
                 pack, credential, ..
-            } => AuthorityPlace::ExternalAccount {
+            }
+            | Self::PackOAuth { pack, credential } => AuthorityPlace::ExternalAccount {
                 provider: pack.clone(),
                 account_id: credential.clone(),
             },
@@ -241,6 +245,7 @@ impl CredentialSource {
                 credential,
                 var,
             } => format!("pack-credential:{pack}/{credential}:{var}"),
+            Self::PackOAuth { pack, credential } => format!("pack-oauth:{pack}/{credential}"),
             Self::GitHubApp { app_id } => format!("github-app:{app_id}"),
             Self::GitHubInstallation { installation_id } => {
                 format!("github-installation:{installation_id}")
@@ -263,7 +268,7 @@ impl CredentialSource {
     fn category(&self) -> SecretCategory {
         match self {
             Self::McpVar { .. } => SecretCategory::ConfiguredMcp,
-            Self::McpOAuth { .. } => SecretCategory::OAuthToken,
+            Self::McpOAuth { .. } | Self::PackOAuth { .. } => SecretCategory::OAuthToken,
             Self::WebProvider { .. } | Self::PackCredential { .. } => SecretCategory::ProviderKey,
             Self::GitHubApp { .. } => SecretCategory::ProviderSigningKey,
             Self::GitHubInstallation { .. } | Self::TeamSync { .. } => {
@@ -671,6 +676,30 @@ pub fn pack_credential(
     }))
 }
 
+/// The access token of a pack's `oauth` credential, refreshed when the store
+/// holds a refresh token. Registered before it is returned, so a provider that
+/// echoes its `Authorization` header in an error body cannot hand a live token
+/// to the agent reading the result. `None` when not authorized.
+pub async fn pack_oauth_token(
+    pack: &str,
+    credential: &str,
+    purpose: &str,
+) -> Result<Option<BrokeredSecret>, String> {
+    let account = crate::web_providers::oauth::account(pack, credential);
+    let Some(value) = crate::mcp::oauth::store::get_valid_access_token(&account).await? else {
+        return Ok(None);
+    };
+    let source = CredentialSource::PackOAuth {
+        pack: pack.to_string(),
+        credential: credential.to_string(),
+    };
+    register(&source, Declared::Secret, purpose, value.clone());
+    Ok(Some(BrokeredSecret {
+        value: Zeroizing::new(value),
+        id: source.secret_id(),
+    }))
+}
+
 /// What [`adopt_legacy_key`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyKeyAdoption {
@@ -711,11 +740,11 @@ pub(crate) fn adopt_legacy_key(
     Ok(outcome)
 }
 
-/// The stored API key for a compiled web fetch provider, or a channel token.
+/// A channel token (Discord, Telegram) stored at `{provider}/{var}`.
 ///
-/// Returns `None` when no key is stored or the stored value is blank, which is
-/// the "provider not configured" case rather than a failure. Pack-declared
-/// providers read [`pack_credential`] instead.
+/// Returns `None` when no token is stored or the stored value is blank, which
+/// is the "not configured" case rather than a failure. Web-service providers
+/// read [`pack_credential`] or [`pack_oauth_token`] instead.
 pub fn web_provider_key(
     provider: &str,
     var: &str,
@@ -1811,6 +1840,48 @@ mod tests {
         let mut sanitizer = Sanitizer::exact();
         let scrubbed = sanitizer.text(&echo);
         assert!(!scrubbed.contains(value), "{scrubbed}");
+    }
+
+    /// A pack OAuth token is registered for scrubbing the moment it is read,
+    /// before any provider can echo it back.
+    #[tokio::test]
+    async fn a_pack_oauth_token_is_scrubbed_before_use() {
+        use_mock_keychain();
+        let (pack, credential) = ("broker-oauth-pack", "login");
+        assert!(pack_oauth_token(pack, credential, "test")
+            .await
+            .unwrap()
+            .is_none());
+        let token = "oa-Ty62Nb17Kc";
+        crate::mcp::oauth::store::save(
+            &crate::web_providers::oauth::account(pack, credential),
+            &crate::mcp::oauth::store::StoredAuth {
+                issuer: None,
+                resource: String::new(),
+                authorization_endpoint: "https://login.test/a".into(),
+                token_endpoint: "https://login.test/t".into(),
+                registration_endpoint: None,
+                client_id: "c".into(),
+                client_secret: None,
+                access_token: token.into(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: Vec::new(),
+                needs_scopes: Vec::new(),
+                rejected_at: None,
+            },
+        )
+        .unwrap();
+        let resolved = pack_oauth_token(pack, credential, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.expose(), token);
+        assert!(is_registered("pack-oauth:broker-oauth-pack/login"));
+        let mut sanitizer = Sanitizer::exact();
+        let echo = format!("Authorization: Bearer {token}");
+        let scrubbed = sanitizer.text(&echo);
+        assert!(!scrubbed.contains(token), "{scrubbed}");
     }
 
     /// The legacy account is emptied once the pack account holds the value, and

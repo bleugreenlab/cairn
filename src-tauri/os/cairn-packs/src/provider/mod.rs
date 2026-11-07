@@ -13,15 +13,26 @@
 //! already is for `packs/<id>/mcp.yaml`. The installed layer has the same
 //! relative layout as the pack source, so [`load_pack_provider`] reads either.
 //!
+//! A provider has one of two adapter forms. An `http` adapter is a declared
+//! request and result mapping run by [`http`], sending the pack credential it
+//! names. An `mcp` adapter ([`binding`]) calls a tool on an MCP server the same
+//! pack declares; that server's own connection authenticates it, so it names no
+//! credential.
+//!
+//! A credential is a `secret` the operator pastes, or an `oauth` access token
+//! the operator obtains by authorizing a client the pack declares. Either way
+//! only the hosts it lists may receive it.
+//!
 //! Every declaration is validated when it is loaded, at install and at use:
 //! the slot must be known and match the file stem, the credential must exist
 //! and name the provider as an accessor, the request may only send the
-//! credential to a host the credential lists, and every interpolation must be
-//! one the slot defines. Forms that are reserved for later (`oauth`
-//! credentials, `run`/`tool:` accessors, `mcp`/`tool` adapters, the `pdf`
-//! slot) parse and are refused as not supported yet, so adopting them is not
-//! a schema change.
+//! credential to a host the credential lists, an MCP binding may only name a
+//! server in its own pack, and every interpolation must be one the slot
+//! defines. Forms that are reserved for later (`run`/`tool:` accessors, the
+//! `tool` adapter, the `pdf` slot) parse and are refused as not supported yet,
+//! so adopting them is not a schema change.
 
+pub mod binding;
 pub mod http;
 
 use std::collections::BTreeSet;
@@ -31,6 +42,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::mcp::{McpVarKind, McpVarSetup};
 use crate::provider_options::{Choice, OptionControl, ProviderOption};
+
+/// The app's OAuth relay. An authorization server redirects to
+/// `{OAUTH_RELAY_PREFIX}<relay>{OAUTH_RELAY_SUFFIX}`, and that page forwards the
+/// response to the desktop as `cairn://auth-callback?provider=<relay>&…`.
+pub const OAUTH_RELAY_PREFIX: &str = "https://cairn.computer/oauth/";
+pub const OAUTH_RELAY_SUFFIX: &str = "/callback";
 
 /// Pack-relative directory of provider declarations.
 pub const PROVIDERS_DIR: &str = "providers";
@@ -91,8 +108,8 @@ pub struct CredentialDecl {
     /// The file stem: `api-key`.
     pub name: String,
     pub label: String,
-    /// The env-style name the value is stored and, later, injected under.
-    pub var: String,
+    #[serde(flatten)]
+    pub kind: CredentialKind,
     /// The only hosts this value may be sent to.
     pub hosts: Vec<String>,
     /// The pack items that may use the value. Only providers in the same pack
@@ -102,15 +119,107 @@ pub struct CredentialDecl {
     pub setup: Option<McpVarSetup>,
 }
 
+/// How a credential's value comes to exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CredentialKind {
+    /// A value the operator pastes, stored under `var`: the env-style name it
+    /// is stored and, later, injected under.
+    Secret { var: String },
+    /// An access token the operator obtains by authorizing the declared client.
+    /// `var` is the name it would be injected under by a later `run` accessor.
+    #[serde(rename = "oauth")]
+    OAuth {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        var: Option<String>,
+        oauth: OAuthDecl,
+    },
+}
+
+/// A pre-registered OAuth client, its endpoints and the scopes it asks for.
+/// Run by the generic PKCE and token-store code; nothing here is discovered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthDecl {
+    pub authorize: String,
+    pub token: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    pub redirect: OAuthRedirect,
+}
+
+/// Where the authorization server sends the operator back to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OAuthRedirect {
+    /// The app relay page for this segment, which deep-links into the desktop.
+    Relay(String),
+    /// A one-shot listener on `127.0.0.1`.
+    Loopback,
+}
+
+impl OAuthRedirect {
+    /// The relay segment, for a relay redirect.
+    pub fn relay(&self) -> Option<&str> {
+        match self {
+            OAuthRedirect::Relay(relay) => Some(relay),
+            OAuthRedirect::Loopback => None,
+        }
+    }
+
+    /// The redirect URI a relay redirect sends to the authorization server.
+    pub fn relay_uri(&self) -> Option<String> {
+        self.relay()
+            .map(|relay| format!("{OAUTH_RELAY_PREFIX}{relay}{OAUTH_RELAY_SUFFIX}"))
+    }
+}
+
+impl CredentialDecl {
+    /// The env-style name the value is stored or injected under, if any.
+    pub fn var(&self) -> Option<&str> {
+        match &self.kind {
+            CredentialKind::Secret { var } => Some(var),
+            CredentialKind::OAuth { var, .. } => var.as_deref(),
+        }
+    }
+
+    /// The declared OAuth client, for an `oauth` credential.
+    pub fn oauth(&self) -> Option<&OAuthDecl> {
+        match &self.kind {
+            CredentialKind::Secret { .. } => None,
+            CredentialKind::OAuth { oauth, .. } => Some(oauth),
+        }
+    }
+}
+
 /// A provider bound to one slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderDecl {
     pub slot: Slot,
     pub label: String,
-    /// The credential's name in the same pack.
-    pub credential: String,
+    /// The credential's name in the same pack. An `mcp` adapter has none.
+    pub credential: Option<String>,
     pub options: Vec<ProviderOption>,
-    pub adapter: http::HttpAdapter,
+    pub adapter: Adapter,
+}
+
+/// How a provider reaches its service.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Adapter {
+    /// A declared HTTP request and result mapping.
+    Http(http::HttpAdapter),
+    /// A tool on an MCP server the same pack declares.
+    Mcp(binding::McpBinding),
+}
+
+impl ProviderDecl {
+    /// The HTTP adapter, for an `http` provider.
+    pub fn http(&self) -> Option<&http::HttpAdapter> {
+        match &self.adapter {
+            Adapter::Http(adapter) => Some(adapter),
+            Adapter::Mcp(_) => None,
+        }
+    }
 }
 
 /// One provider with the credential it reads, both from one pack.
@@ -118,7 +227,8 @@ pub struct ProviderDecl {
 pub struct PackProvider {
     pub pack: String,
     pub provider: ProviderDecl,
-    pub credential: CredentialDecl,
+    /// `None` for an `mcp` adapter, which authenticates through its server.
+    pub credential: Option<CredentialDecl>,
 }
 
 #[derive(Deserialize)]
@@ -126,11 +236,24 @@ pub struct PackProvider {
 struct CredentialFile {
     label: String,
     kind: String,
-    var: String,
+    #[serde(default)]
+    var: Option<String>,
     hosts: Vec<String>,
     accessors: Vec<String>,
     #[serde(default)]
     setup: Option<McpVarSetup>,
+    #[serde(default)]
+    oauth: Option<OAuthFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct OAuthFile {
+    authorize: String,
+    token: String,
+    client_id: String,
+    scopes: Vec<String>,
+    redirect: String,
 }
 
 #[derive(Deserialize)]
@@ -138,7 +261,8 @@ struct CredentialFile {
 struct ProviderFile {
     label: String,
     provides: String,
-    credential: String,
+    #[serde(default)]
+    credential: Option<String>,
     #[serde(default)]
     options: Vec<OptionFile>,
     adapter: serde_yaml::Mapping,
@@ -159,6 +283,8 @@ struct OptionFile {
     boolean: Option<serde_yaml::Value>,
     #[serde(default)]
     default: Option<serde_yaml::Value>,
+    #[serde(default)]
+    required: bool,
 }
 
 #[derive(Deserialize)]
@@ -203,20 +329,100 @@ fn is_host(host: &str) -> bool {
         && !host.ends_with('.')
 }
 
+/// An OAuth endpoint: `https://` with a literal lowercase host.
+fn oauth_endpoint(field: &str, url: &str) -> Result<String, String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("`oauth.{field}` must start with `https://`, not `{url}`"))?;
+    let host = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if url.contains("${") || !is_host(host) {
+        return Err(format!(
+            "`oauth.{field}` must name a literal lowercase host, not `{url}`"
+        ));
+    }
+    Ok(url.to_string())
+}
+
+fn parse_oauth(file: OAuthFile) -> Result<OAuthDecl, String> {
+    let authorize = oauth_endpoint("authorize", &file.authorize)?;
+    let token = oauth_endpoint("token", &file.token)?;
+    let client_id = file.client_id.trim();
+    if client_id.is_empty() || client_id.contains("${") {
+        return Err("`oauth.clientId` must be a literal, pre-registered client id".to_string());
+    }
+    if file.scopes.is_empty() {
+        return Err("`oauth.scopes` must name at least one scope".to_string());
+    }
+    if let Some(bad) = file
+        .scopes
+        .iter()
+        .find(|scope| scope.is_empty() || scope.contains(char::is_whitespace))
+    {
+        return Err(format!("`oauth.scopes` entry `{bad}` is not one scope"));
+    }
+    let redirect = if file.redirect == "loopback" {
+        OAuthRedirect::Loopback
+    } else {
+        let relay = file
+            .redirect
+            .strip_prefix(OAUTH_RELAY_PREFIX)
+            .and_then(|rest| rest.strip_suffix(OAUTH_RELAY_SUFFIX))
+            .filter(|relay| {
+                !relay.is_empty()
+                    && relay
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            })
+            .ok_or_else(|| {
+                format!(
+                    "`oauth.redirect` must be `loopback` or \
+                     `{OAUTH_RELAY_PREFIX}<relay>{OAUTH_RELAY_SUFFIX}`, not `{}`",
+                    file.redirect
+                )
+            })?;
+        OAuthRedirect::Relay(relay.to_string())
+    };
+    Ok(OAuthDecl {
+        authorize,
+        token,
+        client_id: client_id.to_string(),
+        scopes: file.scopes,
+        redirect,
+    })
+}
+
 /// Parse and validate one credential declaration. `name` is its file stem.
 pub fn parse_credential(name: &str, text: &str) -> Result<CredentialDecl, String> {
     let file: CredentialFile = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
-    match file.kind.as_str() {
-        "secret" => {}
-        "oauth" => return Err(format!("credential kind `oauth` is {NOT_SUPPORTED_YET}")),
-        other => return Err(format!("unknown credential kind `{other}` (secret)")),
-    }
-    if !is_env_name(&file.var) {
+    if let Some(var) = file.var.as_deref().filter(|var| !is_env_name(var)) {
         return Err(format!(
-            "`var` must be an env-style name such as `API_KEY`, not `{}`",
-            file.var
+            "`var` must be an env-style name such as `API_KEY`, not `{var}`"
         ));
     }
+    let kind = match file.kind.as_str() {
+        "secret" => {
+            if file.oauth.is_some() {
+                return Err("a `secret` credential takes no `oauth` block".to_string());
+            }
+            CredentialKind::Secret {
+                var: file
+                    .var
+                    .ok_or_else(|| "a `secret` credential needs `var`".to_string())?,
+            }
+        }
+        "oauth" => {
+            let oauth = file.oauth.ok_or_else(|| {
+                "an `oauth` credential needs an `oauth` block \
+                 (authorize, token, clientId, scopes, redirect)"
+                    .to_string()
+            })?;
+            CredentialKind::OAuth {
+                var: file.var,
+                oauth: parse_oauth(oauth)?,
+            }
+        }
+        other => return Err(format!("unknown credential kind `{other}` (secret, oauth)")),
+    };
     if file.hosts.is_empty() {
         return Err("`hosts` must name at least one host".to_string());
     }
@@ -252,7 +458,7 @@ pub fn parse_credential(name: &str, text: &str) -> Result<CredentialDecl, String
     Ok(CredentialDecl {
         name: name.to_string(),
         label: file.label,
-        var: file.var,
+        kind,
         hosts: file.hosts,
         accessors,
         setup: file.setup,
@@ -273,6 +479,11 @@ fn parse_option(option: OptionFile) -> Result<ProviderOption, String> {
     if forms.iter().filter(|form| **form).count() != 1 {
         return Err(format!(
             "option `{key}` must declare exactly one of `select`, `number`, `text`, `bool`"
+        ));
+    }
+    if option.required && option.text.is_none() {
+        return Err(format!(
+            "option `{key}`: only a `text` option can be `required`"
         ));
     }
     let default = option.default;
@@ -348,32 +559,85 @@ fn parse_option(option: OptionFile) -> Result<ProviderOption, String> {
         key,
         label: option.label,
         control,
+        required: option.required,
     })
+}
+
+/// The credential an `http` adapter names, which must exist in the pack and
+/// list the provider's slot as an accessor.
+fn named_credential<'a>(
+    slot: Slot,
+    name: Option<&str>,
+    credentials: &'a [CredentialDecl],
+) -> Result<&'a CredentialDecl, String> {
+    let name = name.ok_or_else(|| "an `http` adapter needs `credential:`".to_string())?;
+    let credential = credentials
+        .iter()
+        .find(|credential| credential.name == name)
+        .ok_or_else(|| {
+            format!("credential `{name}` is not declared in this pack's `credentials/`")
+        })?;
+    if !credential.accessors.contains(&slot) {
+        return Err(format!(
+            "credential `{}` does not list `provider:{}` in its `accessors`",
+            credential.name,
+            slot.as_str()
+        ));
+    }
+    Ok(credential)
 }
 
 fn parse_adapter(
     slot: Slot,
     options: &[ProviderOption],
-    credential: &CredentialDecl,
+    credential: Option<&str>,
+    credentials: &[CredentialDecl],
+    servers: &BTreeSet<String>,
     adapter: serde_yaml::Mapping,
-) -> Result<http::HttpAdapter, String> {
+) -> Result<Adapter, String> {
     if adapter.len() != 1 {
-        return Err("`adapter` must name exactly one form (http)".to_string());
+        return Err("`adapter` must name exactly one form (http, mcp)".to_string());
     }
     let (form, body) = adapter.into_iter().next().expect("one entry");
     match form.as_str() {
-        Some("http") => http::parse_adapter(slot, options, credential, body),
-        Some(form @ ("mcp" | "tool")) => Err(format!("adapter `{form}` is {NOT_SUPPORTED_YET}")),
-        _ => Err(format!("unknown adapter form {form:?} (http)")),
+        Some("http") => {
+            let credential = named_credential(slot, credential, credentials)?;
+            http::parse_adapter(slot, options, credential, body).map(Adapter::Http)
+        }
+        Some("mcp") => {
+            if credential.is_some() {
+                return Err(
+                    "an `mcp` adapter takes no `credential:`; its MCP server's own connection \
+                     authenticates it"
+                        .to_string(),
+                );
+            }
+            binding::parse(slot, options, servers, body).map(Adapter::Mcp)
+        }
+        Some(form @ "tool") => Err(format!("adapter `{form}` is {NOT_SUPPORTED_YET}")),
+        _ => Err(format!("unknown adapter form {form:?} (http, mcp)")),
     }
 }
 
-/// Parse and validate one provider declaration against its credential.
-/// `stem` is the file stem, which must equal the slot.
+/// The names of the MCP servers a pack root declares in its `mcp.yaml`.
+pub fn pack_mcp_server_names(root: &Path) -> Result<BTreeSet<String>, String> {
+    let path = root.join(crate::manifest::PACK_MCP_FILE);
+    if !path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(crate::mcp::parse_pack_mcp_file(&path)?
+        .servers
+        .into_keys()
+        .collect())
+}
+
+/// Parse and validate one provider declaration against its pack's credentials
+/// and MCP servers. `stem` is the file stem, which must equal the slot.
 pub fn parse_provider(
     stem: &str,
     text: &str,
     credentials: &[CredentialDecl],
+    servers: &BTreeSet<String>,
 ) -> Result<ProviderDecl, String> {
     let file: ProviderFile = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
     let slot = Slot::parse(&file.provides).ok_or_else(|| {
@@ -391,22 +655,6 @@ pub fn parse_provider(
     if slot == Slot::Pdf {
         return Err(format!("a `pdf` provider is {NOT_SUPPORTED_YET}"));
     }
-    let credential = credentials
-        .iter()
-        .find(|credential| credential.name == file.credential)
-        .ok_or_else(|| {
-            format!(
-                "credential `{}` is not declared in this pack's `credentials/`",
-                file.credential
-            )
-        })?;
-    if !credential.accessors.contains(&slot) {
-        return Err(format!(
-            "credential `{}` does not list `provider:{}` in its `accessors`",
-            credential.name,
-            slot.as_str()
-        ));
-    }
     let mut keys = BTreeSet::new();
     let mut options = Vec::new();
     for option in file.options {
@@ -416,11 +664,18 @@ pub fn parse_provider(
         }
         options.push(option);
     }
-    let adapter = parse_adapter(slot, &options, credential, file.adapter)?;
+    let adapter = parse_adapter(
+        slot,
+        &options,
+        file.credential.as_deref(),
+        credentials,
+        servers,
+        file.adapter,
+    )?;
     Ok(ProviderDecl {
         slot,
         label: file.label,
-        credential: credential.name.clone(),
+        credential: file.credential,
         options,
         adapter,
     })
@@ -445,6 +700,18 @@ pub fn load_pack_credentials(root: &Path, pack_id: &str) -> Result<Vec<Credentia
                 .map_err(|e| format!("credential `{pack_id}/{name}`: {e}"))?,
         );
     }
+    let mut relays = BTreeSet::new();
+    for credential in &credentials {
+        if let Some(relay) = credential.oauth().and_then(|oauth| oauth.redirect.relay()) {
+            if !relays.insert(relay) {
+                return Err(format!(
+                    "credential `{pack_id}/{}`: the OAuth relay `{relay}` is claimed by another \
+                     credential in this pack",
+                    credential.name
+                ));
+            }
+        }
+    }
     if !credentials.is_empty() && pack_id == RESERVED_CREDENTIAL_OWNER {
         return Err(format!(
             "pack id `{RESERVED_CREDENTIAL_OWNER}` is reserved for credentials that belong to no pack"
@@ -453,13 +720,33 @@ pub fn load_pack_credentials(root: &Path, pack_id: &str) -> Result<Vec<Credentia
     Ok(credentials)
 }
 
+/// Every installed pack credential that claims the OAuth relay `relay`, with
+/// its pack id. Read from each pack's installed layer.
+pub fn relay_holders(config_dir: &Path, relay: &str) -> Vec<(String, CredentialDecl)> {
+    crate::lock::installed_packs(config_dir)
+        .into_iter()
+        .flat_map(|lock| {
+            let root = crate::lock::pack_dir(config_dir, &lock.id);
+            load_pack_credentials(&root, &lock.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|credential| {
+                    credential.oauth().and_then(|oauth| oauth.redirect.relay()) == Some(relay)
+                })
+                .map(move |credential| (lock.id.clone(), credential))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Every provider a pack root declares, each with its credential, validated.
 /// `root` is a pack source or an installed `packs/<id>/` layer.
 pub fn load_pack_providers(root: &Path, pack_id: &str) -> Result<Vec<PackProvider>, String> {
     let credentials = load_pack_credentials(root, pack_id)?;
+    let servers = pack_mcp_server_names(root)?;
     let mut out = Vec::new();
     for slot in Slot::ALL {
-        if let Some(provider) = load_one(root, pack_id, slot, &credentials)? {
+        if let Some(provider) = load_one(root, pack_id, slot, &credentials, &servers)? {
             out.push(provider);
         }
     }
@@ -487,7 +774,13 @@ pub fn load_pack_provider(
     slot: Slot,
 ) -> Result<Option<PackProvider>, String> {
     let credentials = load_pack_credentials(root, pack_id)?;
-    load_one(root, pack_id, slot, &credentials)
+    load_one(
+        root,
+        pack_id,
+        slot,
+        &credentials,
+        &pack_mcp_server_names(root)?,
+    )
 }
 
 fn load_one(
@@ -495,6 +788,7 @@ fn load_one(
     pack_id: &str,
     slot: Slot,
     credentials: &[CredentialDecl],
+    servers: &BTreeSet<String>,
 ) -> Result<Option<PackProvider>, String> {
     let path = root
         .join(PROVIDERS_DIR)
@@ -505,13 +799,15 @@ fn load_one(
     let label = format!("provider `{pack_id}/{}`", slot.as_str());
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("{label}: cannot read {path:?}: {e}"))?;
-    let provider =
-        parse_provider(slot.as_str(), &text, credentials).map_err(|e| format!("{label}: {e}"))?;
-    let credential = credentials
-        .iter()
-        .find(|credential| credential.name == provider.credential)
-        .cloned()
-        .expect("parse_provider resolved the credential");
+    let provider = parse_provider(slot.as_str(), &text, credentials, servers)
+        .map_err(|e| format!("{label}: {e}"))?;
+    let credential = provider.credential.as_ref().map(|name| {
+        credentials
+            .iter()
+            .find(|credential| &credential.name == name)
+            .cloned()
+            .expect("parse_provider resolved the credential")
+    });
     Ok(Some(PackProvider {
         pack: pack_id.to_string(),
         provider,

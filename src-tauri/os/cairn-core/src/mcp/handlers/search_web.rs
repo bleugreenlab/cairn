@@ -7,8 +7,10 @@
 //! [`crate::web_providers`] and run by the declarative HTTP engine
 //! ([`cairn_packs::provider::http`]). There is no per-provider code here.
 //!
-//! Guidance (unconfigured, not installed, missing key, auth failure) is
-//! returned as `Ok` text so the read surfaces it as the body.
+//! Guidance for a configuration gap (unconfigured, not installed, no key) is
+//! `Ok` text the read surfaces as the body. A provider failure (a non-2xx
+//! response, a body of the wrong shape) is an `Err`, so the read renders as
+//! `[error]` and an agent reads it as the failed read it is.
 
 use cairn_packs::provider::http::{self, Inputs, ResponseMapping, SearchHit};
 use cairn_packs::provider::Slot;
@@ -32,25 +34,34 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
     };
     let provider = &active.provider;
     let label = provider.provider.label.as_str();
-    let ResponseMapping::Search(mapping) = &provider.provider.adapter.response else {
+    let (Some(adapter), Some(credential)) = (provider.provider.http(), &provider.credential) else {
+        return Err(format!(
+            "The {label} web-search provider is not an HTTP provider"
+        ));
+    };
+    let ResponseMapping::Search(mapping) = &adapter.response else {
         return Err(format!("The {label} web-search provider maps no results"));
     };
+    // Before the credential is read: a request with a blank required value
+    // would go out credentialed and fail at the provider.
+    if let Some(option) =
+        cairn_packs::provider_options::missing_required(&provider.provider.options, &active.options)
+    {
+        return Ok(needs_option_message(label, &option.label));
+    }
 
     // Through the broker, so the key is a scrub target before it is put in a
     // header or a request body: a provider that quotes a rejected key in its
     // error body would otherwise put it straight into the agent's result.
-    let Some(api_key) = crate::security::broker::pack_credential(
-        &provider.pack,
-        &provider.credential.name,
-        &provider.credential.var,
-        "web search request",
-    )?
+    let Some(api_key) =
+        web_providers::credential_value(&provider.pack, credential, "web search request").await?
     else {
         return Ok(missing_key_message(label));
     };
 
     let prepared = http::prepare(
         &provider.provider,
+        adapter,
         &Inputs {
             query: Some(query),
             target: None,
@@ -58,7 +69,7 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
             options: &active.options,
         },
     );
-    let resp = web_providers::send(provider, &prepared)
+    let resp = web_providers::send(&provider.pack, credential, &prepared)
         .await
         .map_err(|e| format!("Web search via {label} failed: {e}"))?;
     let status = resp.status();
@@ -67,7 +78,7 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
         .await
         .map_err(|e| format!("Web search via {label} failed to read response: {e}"))?;
     if !status.is_success() {
-        return Ok(http_error_message(label, status.as_u16(), &body));
+        return Err(http_error_message(label, status.as_u16(), &body));
     }
     let results = http::map_search(mapping, &body).map_err(|e| shape_error(label, &e, &body))?;
     Ok(render(label, query, &results))
@@ -126,6 +137,10 @@ fn no_provider_message(offered: &[String]) -> String {
     )
 }
 
+fn needs_option_message(label: &str, option: &str) -> String {
+    format!("{label} web search needs its {option}. Set it in {LIBRARY_LOCATION}, {READ_HINT}.")
+}
+
 fn not_installed_message(name: &str) -> String {
     format!(
         "The web-search provider `{name}` is selected but not installed. Install it from \
@@ -148,7 +163,7 @@ fn missing_key_message(label: &str) -> String {
     )
 }
 
-/// Map a non-2xx provider response to guidance text.
+/// The failure text for a non-2xx provider response.
 fn http_error_message(label: &str, status: u16, body: &str) -> String {
     if status == 401 || status == 403 {
         format!("The API key for {label} is missing or invalid — set it in {LIBRARY_LOCATION}.")
@@ -190,7 +205,8 @@ mod tests {
         for case in goldens()["renders"].as_array().unwrap() {
             let pack = case["provider"].as_str().unwrap();
             let provider = bundled(pack);
-            let ResponseMapping::Search(mapping) = &provider.provider.adapter.response else {
+            let ResponseMapping::Search(mapping) = &provider.provider.http().unwrap().response
+            else {
                 panic!("{pack} maps no results");
             };
             let hits = http::map_search(mapping, case["raw"].as_str().unwrap()).unwrap();
@@ -207,7 +223,7 @@ mod tests {
     fn error_texts_are_byte_identical() {
         let golden = &goldens()["errors"];
         let provider = bundled("tavily");
-        let ResponseMapping::Search(mapping) = &provider.provider.adapter.response else {
+        let ResponseMapping::Search(mapping) = &provider.provider.http().unwrap().response else {
             unreachable!()
         };
         let error = http::map_search(mapping, "not json").unwrap_err();

@@ -1,93 +1,224 @@
-//! Typed web-fetch adapters.
+//! Web fetch behind `read http(s)://`.
 //!
-//! The active provider (`config::web_fetch`) decides how an `http(s)://` target
-//! becomes markdown. Each provider is a real adapter that knows its own request
-//! and response shape:
+//! The `web-fetch` slot's contract lives here: the built-in **Regular** fetch
+//! (the zero-config default), guidance when the selected provider cannot run,
+//! the one failure text every provider shares, and the content-type-aware
+//! markdown conversion. Which provider answers, and how its request and
+//! response look, is a pack declaration resolved by [`crate::web_providers`]:
+//! an HTTP adapter run by [`cairn_packs::provider::http`], or an MCP-tool
+//! binding called through the readiness-gated MCP layer. There is no
+//! per-provider code here.
 //!
-//! - **A pack provider** (when `activeWebFetch` names an installed pack that
-//!   provides `web-fetch`): the pack's declaration run by the declarative HTTP
-//!   engine, its response handed to the same markdown conversion as Regular.
-//! - **Regular** (the default, depending on nothing): an async reqwest GET,
-//!   content-type aware — `text/html` is converted via `htmd`, while JSON / text
-//!   / markdown pass through unchanged.
-//! - **Firecrawl**: a provider API-key request normalized to markdown.
-//! - **Cloudflare**: Browser Run with a refreshed provider OAuth token.
-//! - **bmd**: calls bmd's `fetch` tool through the host MCP gateway, reusing the
-//!   OAuth connection the user established for the bmd MCP server. No pasteable
-//!   key — auth rides on the existing MCP connection.
+//! A provider failure (non-2xx, `success: false`, a refused tool call) is an
+//! `Err`, so the read renders as `[error]`. A configuration gap (not
+//! installed, no key, not authorized, needs setup, MCP server not connected)
+//! is `Ok` guidance naming the Library.
 //!
 //! PDF targets are handled by [`super::pdf`], not here.
 
-use crate::config::mcp_servers::McpServerConfigExt;
-use crate::config::web_fetch::{self, ActiveFetch, FetchProviderId};
-use crate::mcp::gateway::McpGateway;
+use cairn_packs::provider::http::{self, HttpAdapter, Inputs, MarkdownFailure, ResponseMapping};
+use cairn_packs::provider::{Adapter, CredentialKind, Slot};
+
 use crate::orchestrator::Orchestrator;
-use crate::web_providers::{self, Resolved, LIBRARY_LOCATION};
-use cairn_packs::provider::http::{self, Inputs};
-use cairn_packs::provider::Slot;
-use serde::Deserialize;
-use std::collections::HashMap;
+use crate::web_providers::{self, McpOutcome, Resolved, LIBRARY_LOCATION};
 
 /// Convert an `http(s)://` target to markdown via the active fetch provider.
-///
-/// An installed pack provider named by `activeWebFetch` answers first; any
-/// other name goes to the compiled providers, which fall back to Regular.
 pub(crate) async fn read_fetch_markdown(
     orch: &Orchestrator,
     target: &str,
 ) -> Result<String, String> {
     match web_providers::resolve(&orch.config_dir, Slot::WebFetch) {
-        Resolved::Provider(active) => return pack_fetch(&active, target).await,
-        Resolved::Invalid { name, error } => {
-            return Err(format!(
-                "The web-fetch provider `{name}` is installed, but its declaration does not \
-                 load: {error}. Update or reinstall it from {LIBRARY_LOCATION}."
-            ))
-        }
-        Resolved::Unconfigured | Resolved::NotInstalled { .. } => {}
-    }
-    match web_fetch::resolve_active_fetch(&orch.config_dir) {
-        ActiveFetch::Regular => regular_fetch(target).await,
-        ActiveFetch::Provider { id, options } => match id {
-            FetchProviderId::Firecrawl => firecrawl_fetch(target, &options).await,
-            FetchProviderId::Cloudflare => cloudflare_fetch(target, &options).await,
-            FetchProviderId::Bmd => bmd_fetch(orch, target).await,
-        },
+        Resolved::Unconfigured => regular_fetch(target).await,
+        Resolved::NotInstalled { name } => Ok(not_installed_message(&name)),
+        Resolved::Invalid { name, error } => Err(format!(
+            "The web-fetch provider `{name}` is installed, but its declaration does not \
+             load: {error}. Update or reinstall it from {LIBRARY_LOCATION}."
+        )),
+        Resolved::Provider(active) => pack_fetch(orch, &active, target).await,
     }
 }
 
-/// A pack's web-fetch provider: its declared request, the credential sent only
-/// to the hosts it lists, and the response read by the slot's markdown
-/// conversion.
-async fn pack_fetch(active: &web_providers::Active, target: &str) -> Result<String, String> {
+fn not_installed_message(name: &str) -> String {
+    format!(
+        "The web-fetch provider `{name}` is selected but not installed. Install it from \
+         {LIBRARY_LOCATION}, or select Regular there."
+    )
+}
+
+fn no_key_message(label: &str) -> String {
+    format!("No API key set for {label} web fetch. Add it in {LIBRARY_LOCATION}.")
+}
+
+fn not_authorized_message(label: &str) -> String {
+    format!("{label} web fetch is not authorized. Connect it in {LIBRARY_LOCATION}.")
+}
+
+fn needs_option_message(label: &str, option: &str) -> String {
+    format!("{label} web fetch needs its {option}. Set it in {LIBRARY_LOCATION}.")
+}
+
+fn not_connected_message(label: &str, server: &str) -> String {
+    format!(
+        "{label} web fetch needs its MCP server `{server}` connected. Connect it in \
+         {LIBRARY_LOCATION}."
+    )
+}
+
+/// A pack's web-fetch provider: a required option left blank is guidance, then
+/// the adapter runs.
+async fn pack_fetch(
+    orch: &Orchestrator,
+    active: &web_providers::Active,
+    target: &str,
+) -> Result<String, String> {
     let provider = &active.provider;
     let label = provider.provider.label.as_str();
-    // Brokered, so the key is a scrub target before it reaches a header: page
-    // content and error bodies flow straight to the agent.
-    let Some(key) = crate::security::broker::pack_credential(
-        &provider.pack,
-        &provider.credential.name,
-        &provider.credential.var,
-        "web fetch request",
-    )?
-    else {
-        return Ok(format!(
-            "No API key set for {label} web fetch. Add it in {LIBRARY_LOCATION}."
+    if let Some(option) =
+        cairn_packs::provider_options::missing_required(&provider.provider.options, &active.options)
+    {
+        return Ok(needs_option_message(label, &option.label));
+    }
+    match &provider.provider.adapter {
+        Adapter::Http(adapter) => http_fetch(active, adapter, target).await,
+        Adapter::Mcp(binding) => {
+            let inputs = Inputs {
+                query: None,
+                target: Some(target),
+                credential: "",
+                options: &active.options,
+            };
+            match web_providers::mcp_call(orch, provider, binding, &inputs).await? {
+                McpOutcome::Text(text) => Ok(text),
+                McpOutcome::NotConnected => Ok(not_connected_message(label, &binding.server)),
+            }
+        }
+    }
+}
+
+/// An HTTP provider: its declared request, the credential sent only to the
+/// hosts it lists, and the response read by the slot's contract.
+async fn http_fetch(
+    active: &web_providers::Active,
+    adapter: &HttpAdapter,
+    target: &str,
+) -> Result<String, String> {
+    let provider = &active.provider;
+    let label = provider.provider.label.as_str();
+    let Some(credential) = &provider.credential else {
+        return Err(format!(
+            "The {label} web-fetch provider names no credential"
         ));
+    };
+    let Some(token) =
+        web_providers::credential_value(&provider.pack, credential, "web fetch request").await?
+    else {
+        return Ok(match credential.kind {
+            CredentialKind::Secret { .. } => no_key_message(label),
+            CredentialKind::OAuth { .. } => not_authorized_message(label),
+        });
     };
     let prepared = http::prepare(
         &provider.provider,
+        adapter,
         &Inputs {
             query: None,
             target: Some(target),
-            credential: key.expose(),
+            credential: token.expose(),
             options: &active.options,
         },
     );
-    let resp = web_providers::send(provider, &prepared)
+    let resp = web_providers::send(&provider.pack, credential, &prepared)
         .await
         .map_err(|e| format!("Failed to fetch `{target}` via {label}: {e}"))?;
-    read_markdown_response(resp, target).await
+    let status = resp.status().as_u16();
+    let retry_after = header(&resp, reqwest::header::RETRY_AFTER);
+    let content_type = header(&resp, reqwest::header::CONTENT_TYPE).unwrap_or_default();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read the {label} response for `{target}`: {e}"))?;
+    provider_response(
+        label,
+        &adapter.response,
+        target,
+        &Response {
+            status,
+            retry_after: retry_after.as_deref(),
+            content_type: &content_type,
+            body: &body,
+        },
+    )
+}
+
+fn header(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// A provider's HTTP response, separated from the network so the slot's
+/// contract is testable.
+struct Response<'a> {
+    status: u16,
+    retry_after: Option<&'a str>,
+    content_type: &'a str,
+    body: &'a [u8],
+}
+
+/// The slot's contract for a provider response. Non-2xx is one failure text
+/// for every provider, carrying the declared error detail (else the start of
+/// the body) and, on a 429, the `Retry-After` the provider sent.
+fn provider_response(
+    label: &str,
+    mapping: &ResponseMapping,
+    target: &str,
+    response: &Response<'_>,
+) -> Result<String, String> {
+    let text = String::from_utf8_lossy(response.body);
+    if !(200..300).contains(&response.status) {
+        let detail = match mapping {
+            ResponseMapping::MarkdownJson(mapping) => http::error_detail(mapping, &text),
+            _ => None,
+        }
+        .or_else(|| {
+            let snippet: String = text.chars().take(200).collect();
+            let snippet = snippet.trim();
+            (!snippet.is_empty()).then(|| snippet.to_string())
+        })
+        .map(|detail| format!(" — {detail}"))
+        .unwrap_or_default();
+        let retry = match response.retry_after {
+            Some(value) if response.status == 429 => format!(" Retry-After: {value}."),
+            _ => String::new(),
+        };
+        return Err(format!(
+            "{label} fetch of `{target}` failed: HTTP {}{detail}.{retry}",
+            response.status
+        ));
+    }
+    match mapping {
+        ResponseMapping::MarkdownBody => {
+            body_to_markdown(response.content_type, response.body, target)
+        }
+        ResponseMapping::MarkdownJson(mapping) => {
+            http::map_markdown(mapping, &text).map_err(|failure| match failure {
+                MarkdownFailure::Unsuccessful(detail) => format!(
+                    "{label} fetch of `{target}` failed: {}",
+                    detail.as_deref().unwrap_or("the request was unsuccessful")
+                ),
+                MarkdownFailure::Missing => {
+                    format!("{label} returned no markdown for `{target}`.")
+                }
+                MarkdownFailure::Shape(error) => {
+                    format!("{label} returned an unexpected response for `{target}`: {error}")
+                }
+            })
+        }
+        ResponseMapping::Search(_) => Err(format!(
+            "The {label} web-fetch provider maps search results, not markdown"
+        )),
+    }
 }
 
 /// The built-in plain-HTTP fetch: an async reqwest GET with content-type-aware
@@ -99,277 +230,6 @@ async fn regular_fetch(target: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("Failed to fetch `{target}`: {e}"))?;
     read_markdown_response(resp, target).await
-}
-
-/// Firecrawl: POST to the scrape endpoint asking for markdown, then pull the
-/// `data.markdown` field out of the JSON response.
-async fn firecrawl_fetch(
-    target: &str,
-    options: &HashMap<String, serde_yaml::Value>,
-) -> Result<String, String> {
-    let key = match provider_key(FetchProviderId::Firecrawl)? {
-        Some(k) => k,
-        None => return Ok(missing_key_message(FetchProviderId::Firecrawl)),
-    };
-    let only_main = options
-        .get("onlyMainContent")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let body = serde_json::json!({
-        "url": target,
-        "formats": ["markdown"],
-        "onlyMainContent": only_main,
-    });
-    let resp = cairn_tls::client()
-        .post("https://api.firecrawl.dev/v1/scrape")
-        .header("Authorization", format!("Bearer {}", key.expose()))
-        .header("Content-Type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch `{target}` via Firecrawl: {e}"))?;
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Firecrawl response for `{target}`: {e}"))?;
-    if !status.is_success() {
-        let snippet: String = text.chars().take(200).collect();
-        return Err(format!(
-            "Firecrawl fetch of `{target}` failed: HTTP {} — {}",
-            status.as_u16(),
-            snippet.trim()
-        ));
-    }
-    let parsed: FirecrawlResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("Firecrawl returned an unexpected response for `{target}`: {e}"))?;
-    parsed
-        .data
-        .and_then(|d| d.markdown)
-        .ok_or_else(|| format!("Firecrawl returned no markdown for `{target}`."))
-}
-
-#[derive(Deserialize)]
-struct FirecrawlResponse {
-    data: Option<FirecrawlData>,
-}
-
-#[derive(Deserialize)]
-struct FirecrawlData {
-    markdown: Option<String>,
-}
-
-/// Cloudflare Browser Run: POST to the markdown Quick Action and select either
-/// the Kitesurf isolate browser or full Chromium through the query string.
-async fn cloudflare_fetch(
-    target: &str,
-    options: &HashMap<String, serde_yaml::Value>,
-) -> Result<String, String> {
-    // Brokered: the response body below is returned to the agent verbatim on
-    // failure, and Cloudflare's error envelope quotes the request it rejected.
-    let Some(token) =
-        crate::security::broker::mcp_oauth_token("web-fetch/cloudflare", "cloudflare web fetch")
-            .await?
-    else {
-        return Ok(
-            "Cloudflare web fetch is not authorized. Connect it in Settings → Web Services."
-                .to_string(),
-        );
-    };
-    let Some(request) = cloudflare_request(target, options) else {
-        return Ok(cloudflare_setup_message());
-    };
-    let response = cairn_tls::client()
-        .post(&request.url)
-        .bearer_auth(token.expose())
-        .json(&request.body)
-        .send()
-        .await
-        .map_err(|error| {
-            format!("Failed to fetch `{target}` via Cloudflare Browser Run: {error}")
-        })?;
-    let status = response.status();
-    let retry_after = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let text = response.text().await.map_err(|error| {
-        format!("Failed to read Cloudflare Browser Run response for `{target}`: {error}")
-    })?;
-
-    if !status.is_success() {
-        let detail = cloudflare_error_message(&text).unwrap_or_else(|| {
-            text.chars()
-                .take(200)
-                .collect::<String>()
-                .trim()
-                .to_string()
-        });
-        let retry = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            retry_after
-                .map(|value| format!(" Retry-After: {value}."))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let detail = if detail.is_empty() {
-            String::new()
-        } else {
-            format!(" — {detail}")
-        };
-        return Err(format!(
-            "Cloudflare Browser Run fetch of `{target}` failed: HTTP {}{detail}.{retry}",
-            status.as_u16()
-        ));
-    }
-
-    parse_cloudflare_response(&text, target)
-}
-
-struct CloudflareRequest {
-    url: String,
-    body: serde_json::Value,
-}
-
-fn cloudflare_request(
-    target: &str,
-    options: &HashMap<String, serde_yaml::Value>,
-) -> Option<CloudflareRequest> {
-    let account_id = options
-        .get("accountId")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let browser = options
-        .get("browser")
-        .and_then(|value| value.as_str())
-        .unwrap_or("kitesurf");
-    let wait_until = options
-        .get("waitUntil")
-        .and_then(|value| value.as_str())
-        .unwrap_or("load");
-    let mut body = serde_json::json!({ "url": target });
-    if wait_until == "networkidle0" {
-        body["gotoOptions"] = serde_json::json!({ "waitUntil": "networkidle0" });
-    }
-    Some(CloudflareRequest {
-        url: format!(
-            "https://api.cloudflare.com/client/v4/accounts/{account_id}/browser-rendering/markdown?browser={browser}"
-        ),
-        body,
-    })
-}
-
-#[derive(Deserialize)]
-struct CloudflareResponse {
-    success: bool,
-    result: Option<String>,
-    #[serde(default)]
-    errors: Vec<CloudflareError>,
-}
-
-#[derive(Deserialize)]
-struct CloudflareError {
-    message: Option<String>,
-}
-
-fn parse_cloudflare_response(text: &str, target: &str) -> Result<String, String> {
-    let response: CloudflareResponse = serde_json::from_str(text).map_err(|error| {
-        format!("Cloudflare Browser Run returned an unexpected response for `{target}`: {error}")
-    })?;
-    if !response.success {
-        let detail = response
-            .errors
-            .iter()
-            .find_map(|error| error.message.as_deref())
-            .unwrap_or("the request was unsuccessful");
-        return Err(format!(
-            "Cloudflare Browser Run fetch of `{target}` failed: {detail}"
-        ));
-    }
-    response
-        .result
-        .ok_or_else(|| format!("Cloudflare Browser Run returned no markdown for `{target}`."))
-}
-
-fn cloudflare_error_message(text: &str) -> Option<String> {
-    serde_json::from_str::<CloudflareResponse>(text)
-        .ok()?
-        .errors
-        .into_iter()
-        .find_map(|error| error.message)
-}
-
-fn cloudflare_setup_message() -> String {
-    "The Cloudflare Browser Run web-fetch provider is missing its account ID. Set your Cloudflare account ID in Settings → Web Services."
-        .to_string()
-}
-
-/// bmd: call bmd's `fetch` tool through the host MCP gateway, reusing the OAuth
-/// connection established for the configured bmd MCP server.
-pub(crate) async fn bmd_fetch(orch: &Orchestrator, source: &str) -> Result<String, String> {
-    let Some(gateway) = orch.mcp_gateway() else {
-        return Err(
-            "The bmd web-fetch provider needs the MCP gateway, which is not available in this host."
-                .to_string(),
-        );
-    };
-    let servers = crate::config::mcp_servers::load_workspace_mcp_servers(&orch.config_dir);
-    let Some(config) = servers.get("bmd") else {
-        return Ok(bmd_setup_message());
-    };
-    let credential_key = crate::config::secrets::credential_key("bmd", None);
-    let expanded = config.brokered(&credential_key, "bmd web fetch")?;
-    bmd_fetch_via(gateway.as_ref(), &expanded, &credential_key, source).await
-}
-
-/// The gateway call for bmd's `fetch` tool, split out so it is unit-testable
-/// against a mock gateway.
-async fn bmd_fetch_via(
-    gateway: &dyn McpGateway,
-    config: &crate::security::BrokeredMcpConfig,
-    credential_key: &str,
-    source: &str,
-) -> Result<String, String> {
-    gateway
-        .call_tool(
-            "cairn-web-fetch",
-            credential_key,
-            config,
-            "fetch",
-            serde_json::json!({ "source": source }),
-            Some(120_000),
-        )
-        .await
-        // Web fetch is text-only; an image block from a fetch tool has no place
-        // in markdown output, so collapse to the composed text.
-        .map(|result| result.text)
-}
-
-fn bmd_setup_message() -> String {
-    "The bmd web-fetch provider is not configured. Add and connect the bmd MCP server in Settings → Web Services, or switch providers."
-        .to_string()
-}
-
-/// The stored API key for an `ApiKey` provider, if set and non-empty.
-///
-/// Brokered, so the key is registered for scrubbing before it reaches an
-/// `Authorization` header. A fetch provider returns page content the agent
-/// reads directly; an error body that quotes the rejected key would otherwise
-/// surface it verbatim.
-fn provider_key(id: FetchProviderId) -> Result<Option<crate::security::BrokeredSecret>, String> {
-    let Some(var) = id.auth().secret_var() else {
-        return Ok(None);
-    };
-    crate::security::broker::web_provider_key(id.as_str(), var, "web fetch request")
-}
-
-fn missing_key_message(id: FetchProviderId) -> String {
-    format!(
-        "No API key set for {} web fetch. Add it in Settings → Web Services.",
-        id.label()
-    )
 }
 
 /// Read a reqwest response into markdown: non-2xx becomes a guidance error,
@@ -476,77 +336,98 @@ pub(crate) fn convert_body(content_type: &str, body: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::gateway::{McpResourceDef, McpToolCallResult, McpToolCatalog};
-    use async_trait::async_trait;
-    use std::sync::Mutex;
+    use cairn_packs::provider::{load_pack_provider, PackProvider};
+    use serde_json::Value;
+    use std::path::Path;
 
-    #[derive(Default)]
-    struct MockGateway {
-        last_tool: Mutex<Option<String>>,
-        last_args: Mutex<Option<serde_json::Value>>,
+    fn bundled(pack: &str) -> PackProvider {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packs")
+            .join(pack);
+        load_pack_provider(&root, pack, Slot::WebFetch)
+            .unwrap()
+            .unwrap()
     }
 
-    #[async_trait]
-    impl McpGateway for MockGateway {
-        async fn list_tools(
-            &self,
-            _: &str,
-            _: &str,
-            _: &crate::security::BrokeredMcpConfig,
-        ) -> Result<McpToolCatalog, String> {
-            Ok(McpToolCatalog::default())
-        }
-        async fn list_resources(
-            &self,
-            _: &str,
-            _: &str,
-            _: &crate::security::BrokeredMcpConfig,
-        ) -> Result<Vec<McpResourceDef>, String> {
-            Ok(vec![])
-        }
-        async fn read_resource(
-            &self,
-            _: &str,
-            _: &str,
-            _: &crate::security::BrokeredMcpConfig,
-            _: &str,
-        ) -> Result<String, String> {
-            Ok(String::new())
-        }
-        async fn call_tool(
-            &self,
-            _session: &str,
-            _server: &str,
-            _config: &crate::security::BrokeredMcpConfig,
-            tool: &str,
-            args: serde_json::Value,
-            _timeout: Option<u32>,
-        ) -> Result<McpToolCallResult, String> {
-            *self.last_tool.lock().unwrap() = Some(tool.to_string());
-            *self.last_args.lock().unwrap() = Some(args.clone());
-            Ok(McpToolCallResult::from_text("# bmd markdown"))
-        }
-        async fn close_session(&self, _: &str) {}
+    fn goldens() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../../cairn-packs/src/provider/testdata/fetch_goldens.json"
+        ))
+        .unwrap()
     }
 
-    fn bmd_config() -> crate::security::BrokeredMcpConfig {
-        let authored: crate::config::mcp_servers::McpServerConfig = serde_json::from_value(
-            serde_json::json!({"type": "http", "url": "https://bmd.example/mcp"}),
-        )
-        .unwrap();
-        authored.brokered("bmd", "test").unwrap()
+    fn now(case: &Value) -> Value {
+        let mut case = case.clone();
+        if let Some(Value::Object(changed)) = case.get("now").cloned() {
+            for (key, value) in changed {
+                case[key.as_str()] = value;
+            }
+        }
+        case
     }
 
-    #[tokio::test]
-    async fn bmd_fetch_via_calls_fetch_tool_with_source() {
-        let gw = MockGateway::default();
-        let out = bmd_fetch_via(&gw, &bmd_config(), "bmd", "https://example.com")
-            .await
-            .unwrap();
-        assert_eq!(out, "# bmd markdown");
-        assert_eq!(gw.last_tool.lock().unwrap().as_deref(), Some("fetch"));
-        let args = gw.last_args.lock().unwrap().clone().unwrap();
-        assert_eq!(args["source"], "https://example.com");
+    /// What an agent read from each captured response before the port is what
+    /// it reads after it, except where a case records a deliberate change.
+    #[test]
+    fn every_captured_response_reads_as_recorded() {
+        let goldens = goldens();
+        let target = goldens["target"].as_str().unwrap();
+        for case in goldens["responses"].as_array().unwrap() {
+            let case = now(case);
+            let pack = case["provider"].as_str().unwrap();
+            let provider = bundled(pack);
+            let got = provider_response(
+                &provider.provider.label,
+                &provider.provider.http().unwrap().response,
+                target,
+                &Response {
+                    status: case["status"].as_u64().unwrap() as u16,
+                    retry_after: case["retryAfter"].as_str(),
+                    content_type: case["contentType"].as_str().unwrap_or("application/json"),
+                    body: case["body"].as_str().unwrap().as_bytes(),
+                },
+            );
+            match (case.get("ok").and_then(Value::as_str), got) {
+                (Some(ok), Ok(text)) => assert_eq!(text, ok, "{pack}: {}", case["body"]),
+                (None, Err(error)) => assert_eq!(
+                    error,
+                    case["err"].as_str().unwrap(),
+                    "{pack}: {}",
+                    case["body"]
+                ),
+                (want, got) => panic!("{pack}: wanted {want:?}, got {got:?}"),
+            }
+        }
+    }
+
+    /// Guidance names the provider by its declared label and the Library.
+    #[test]
+    fn guidance_reads_as_recorded() {
+        let guidance = &goldens()["guidance"];
+        let now = |key: &str| guidance[key]["now"].as_str().unwrap().to_string();
+        assert_eq!(no_key_message("Firecrawl"), now("firecrawl_no_key"));
+        assert_eq!(
+            not_authorized_message("Cloudflare Browser Run"),
+            now("cloudflare_not_authorized")
+        );
+        assert_eq!(
+            needs_option_message("Cloudflare Browser Run", "Account ID"),
+            now("cloudflare_no_account")
+        );
+        assert_eq!(
+            not_connected_message("bmd", "bmd"),
+            now("bmd_not_connected")
+        );
+        for message in [
+            not_installed_message("ghost"),
+            no_key_message("X"),
+            not_authorized_message("X"),
+            needs_option_message("X", "Y"),
+            not_connected_message("X", "s"),
+        ] {
+            assert!(message.contains(LIBRARY_LOCATION), "{message}");
+            assert!(!message.contains("Settings"), "{message}");
+        }
     }
 
     #[test]
@@ -588,53 +469,5 @@ mod tests {
         assert_eq!(json, "{\"a\":1}");
         let text = convert_body("text/plain", "# already md".to_string());
         assert_eq!(text, "# already md");
-    }
-
-    #[test]
-    fn cloudflare_request_builds_kitesurf_and_chromium_variants() {
-        let kitesurf = HashMap::from([
-            ("accountId".to_string(), "account-123".into()),
-            ("browser".to_string(), "kitesurf".into()),
-            ("waitUntil".to_string(), "networkidle0".into()),
-        ]);
-        let request = cloudflare_request("https://example.com", &kitesurf).unwrap();
-        assert_eq!(
-            request.url,
-            "https://api.cloudflare.com/client/v4/accounts/account-123/browser-rendering/markdown?browser=kitesurf"
-        );
-        assert_eq!(request.body["url"], "https://example.com");
-        assert_eq!(request.body["gotoOptions"]["waitUntil"], "networkidle0");
-
-        let chromium = HashMap::from([
-            ("accountId".to_string(), "account-123".into()),
-            ("browser".to_string(), "chromium".into()),
-            ("waitUntil".to_string(), "load".into()),
-        ]);
-        let request = cloudflare_request("https://example.com", &chromium).unwrap();
-        assert!(request.url.ends_with("?browser=chromium"));
-        assert!(request.body.get("gotoOptions").is_none());
-    }
-
-    #[test]
-    fn cloudflare_response_parses_success_and_errors() {
-        assert_eq!(
-            parse_cloudflare_response(
-                r##"{"success":true,"result":"# Rendered","errors":[]}"##,
-                "https://example.com"
-            )
-            .unwrap(),
-            "# Rendered"
-        );
-        let error = parse_cloudflare_response(
-            r#"{"success":false,"errors":[{"code":10000,"message":"Authentication error"}]}"#,
-            "https://example.com",
-        )
-        .unwrap_err();
-        assert!(error.contains("Authentication error"), "{error}");
-
-        let error =
-            parse_cloudflare_response(r#"{"success":true,"errors":[]}"#, "https://example.com")
-                .unwrap_err();
-        assert!(error.contains("returned no markdown"), "{error}");
     }
 }

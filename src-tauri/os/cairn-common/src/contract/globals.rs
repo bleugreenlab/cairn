@@ -386,7 +386,7 @@ pub(crate) const WEB_SEARCH_CONTRACT: ResourceContract =
         kind: ResourceKind::WebSearch,
         uri_template: "cairn://websearch?q={query}",
         name: "Web search",
-        description: "Run a web search through the active typed web-search provider (Settings → Web Services) and get back a normalized ranked list of title · url · snippet results to read and then fetch. The query rides in ?q= as literal text — spaces are fine, no manual URL-encoding. Web search is opt-in: with no provider configured the read returns a clear setup message.",
+        description: "Run a web search through the active web-search provider (selected in the Library) and get back a normalized ranked list of title · url · snippet results to read and then fetch. The query rides in ?q= as literal text — spaces are fine, no manual URL-encoding. Web search is opt-in: with no provider configured the read returns a clear setup message.",
         read_projections: &[ProjectionSpec {
             key: "q",
             values: "the search query (literal text; spaces and punctuation need no encoding)",

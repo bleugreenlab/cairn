@@ -90,6 +90,9 @@ pub(crate) struct RenderedResource {
     /// Image blocks (e.g. a browser screenshot) lifted into the read envelope
     /// alongside the text body. Empty for ordinary text resources.
     pub images: Vec<ImageBlock>,
+    /// The read failed and `content` is its error: the read batch renders it
+    /// as an `[error]` segment rather than a body.
+    pub failed: bool,
 }
 
 /// How long one agent-written SQL read (`cairn://db?sql=`, a thread database's
@@ -162,6 +165,15 @@ impl RenderedResource {
             more_records: false,
             affordance,
             images: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// A read that failed, carrying its error.
+    fn failed(error: String) -> Self {
+        Self {
+            failed: true,
+            ..Self::line(error, None, None, None)
         }
     }
 
@@ -187,6 +199,7 @@ impl RenderedResource {
             more_records: false,
             affordance,
             images: Vec::new(),
+            failed: false,
         }
     }
 
@@ -207,6 +220,7 @@ impl RenderedResource {
             more_records: page.total.is_none() && page.more,
             affordance,
             images: Vec::new(),
+            failed: false,
         }
     }
 
@@ -233,6 +247,7 @@ impl RenderedResource {
             more_records: false,
             affordance,
             images: Vec::new(),
+            failed: false,
         }
     }
 }
@@ -431,6 +446,7 @@ async fn produce_schema_overview(
         more_records: false,
         affordance,
         images: Vec::new(),
+        failed: false,
     }
 }
 
@@ -467,6 +483,7 @@ async fn produce_sql_resource(
             more_records: false,
             affordance,
             images: Vec::new(),
+            failed: false,
         },
         Err(crate::storage::DbError::ReadBoundExceeded { bound, elapsed, .. }) => {
             RenderedResource::line(
@@ -1414,6 +1431,18 @@ pub(crate) async fn produce_cairn_resource(
         })
     };
 
+    // A web search runs once, before the grep and window projections split.
+    // A provider failure is a failed read under either, rendered `[error]` as a
+    // failed web fetch is; guidance and results are the body both project.
+    let web_search = if matches!(resource, CairnResource::WebSearch) {
+        match web_search_body(orch, &split.params).await {
+            Ok(body) => Some(body),
+            Err(error) => return RenderedResource::failed(error),
+        }
+    } else {
+        None
+    };
+
     // An image address is an immutable native block. It supports no text
     // projections, workspace paths, or leases.
     if let CairnResource::ProjectImage { project, reference } = &resource {
@@ -1545,6 +1574,8 @@ pub(crate) async fn produce_cairn_resource(
                     Ok(page) => page.body,
                     Err(error) => return RenderedResource::line(error, affordance, None, None),
                 }
+            } else if let Some(results) = &web_search {
+                results.clone()
             } else {
                 render_resource_body(orch, request, &resource, body_params).await
             };
@@ -1659,6 +1690,7 @@ pub(crate) async fn produce_cairn_resource(
                 more_records: false,
                 affordance,
                 images: Vec::new(),
+                failed: false,
             },
             Err(error) => RenderedResource::line(error, affordance, view_offset, view_limit),
         };
@@ -1692,6 +1724,7 @@ pub(crate) async fn produce_cairn_resource(
             more_records: false,
             affordance,
             images: Vec::new(),
+            failed: false,
         };
     }
 
@@ -1773,7 +1806,10 @@ pub(crate) async fn produce_cairn_resource(
     } else {
         strip_params(&split.params, &["offset", "limit"])
     };
-    let mut content = render_resource_body(orch, request, &resource, body_params).await;
+    let mut content = match web_search {
+        Some(results) => results,
+        None => render_resource_body(orch, request, &resource, body_params).await,
+    };
     if let Some(canonical) = migrated_annotation {
         content = with_migrated_annotation(&canonical, &content);
     }
@@ -3757,27 +3793,30 @@ async fn render_resource_body(
             super::self_rebuild::render_outcome(&orch.db.local, &id).await
         }
         CairnResource::Help => render_help(&params),
-        // Web search: the query rides in `?q=` as literal text (no URL-encoding).
-        // Results are normalized to a ranked title · url · snippet list by the
-        // active typed provider.
-        CairnResource::WebSearch => {
-            let query = find_query_value(&params, "q")
-                .map(str::trim)
-                .unwrap_or_default();
-            if query.is_empty() {
-                "Web search needs a query: read cairn://websearch?q=<your query> (the text after q= is the literal query; spaces are fine).".to_string()
-            } else {
-                match crate::mcp::handlers::search_web::search_web(orch, query).await {
-                    Ok(results) => results,
-                    Err(message) => message,
-                }
-            }
-        }
+        // `produce_cairn_resource` runs the search before dispatch so a failure
+        // stays a failure; this arm serves only a direct body render.
+        CairnResource::WebSearch => match web_search_body(orch, &params).await {
+            Ok(results) => results,
+            Err(message) => message,
+        },
         CairnResource::Mcp { server, resource } => {
             crate::mcp::handlers::mcp_resources::handle_mcp_read(orch, request, server, resource)
                 .await
         }
     }
+}
+
+/// `cairn://websearch?q=`: the query rides in `?q=` as literal text (no
+/// URL-encoding), and the selected provider's results come back as a ranked
+/// title · url · snippet list.
+async fn web_search_body(orch: &Orchestrator, params: &[QueryParam]) -> Result<String, String> {
+    let query = find_query_value(params, "q")
+        .map(str::trim)
+        .unwrap_or_default();
+    if query.is_empty() {
+        return Ok("Web search needs a query: read cairn://websearch?q=<your query> (the text after q= is the literal query; spaces are fine).".to_string());
+    }
+    crate::mcp::handlers::search_web::search_web(orch, query).await
 }
 
 /// Render the `cairn://help` resource. With no params, the whole read catalog +

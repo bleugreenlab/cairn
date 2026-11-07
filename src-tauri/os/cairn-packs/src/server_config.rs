@@ -637,6 +637,9 @@ pub enum NotReady {
     NeedsAuth,
     /// A credential store could not be read; absence has not been established.
     CredentialUnavailable { error: String },
+    /// Something the operator configures is missing: a required provider
+    /// option, or the MCP server a provider binds. Names each by its label.
+    NeedsSetup { missing: Vec<String> },
     /// No machine has this service's resident ready. `machines` lists every
     /// selected machine and its state; empty means it is selected on none.
     MachineService {
@@ -654,6 +657,7 @@ impl NotReady {
             NotReady::MissingVars { vars } => format!("missing_vars({})", vars.join(", ")),
             NotReady::NeedsAuth => "needs_auth".to_string(),
             NotReady::CredentialUnavailable { error } => format!("credential_unavailable({error})"),
+            NotReady::NeedsSetup { missing } => format!("needs_setup({})", missing.join(", ")),
             NotReady::MachineService { machines, .. } if machines.is_empty() => {
                 "machine_service(not installed on any machine)".to_string()
             }

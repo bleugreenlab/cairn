@@ -17,17 +17,32 @@
 //!    is installed. A pack that carries a machine service is never installed
 //!    here: installing one is the operator's act alone, and the slot scalars
 //!    are writable with the session token.
-//! 3. **Settings** need nothing: the scalars and `webSearch.<pack>` options
-//!    already have the right shape.
+//! 3. **OAuth records.** A compiled provider kept its OAuth record at
+//!    `{slot}/{pack}` in the OAuth store. For every bundled pack `oauth`
+//!    credential and each `provider:<slot>` accessor it lists, a record there
+//!    moves to the credential's account `pack:{pack}/{credential}` (never
+//!    overwriting one already there), and the old record and its `/pending`
+//!    entry are deleted. Derived from the declarations, so no provider is
+//!    named here.
+//! 4. **Settings** need nothing: the scalars and `webSearch.<pack>` /
+//!    `webFetch.<pack>` options already have the right shape. A stored select
+//!    value a declaration no longer offers falls back to its default at use.
+//!
+//! An installed bundled pack that gains a provider in a new app version needs
+//! no step here: the boot sync of bundled packs installs newly shipped items of
+//! an installed pack the way it updates changed ones.
 //!
 //! Each step is a no-op once done, so running it every boot is the idempotence.
 //! A keychain failure leaves the old entry in place for the next boot.
 //!
-//! The move is one-way: after it, an older build finds `{pack}/{VAR}` empty.
+//! The move is one-way: after it, an older build finds `{pack}/{VAR}` and
+//! `{slot}/{pack}` empty.
+
+use super::oauth::{adopt_legacy_record, LegacyRecordAdoption};
 
 use std::path::Path;
 
-use cairn_packs::provider::{self, Slot};
+use cairn_packs::provider::{self, CredentialKind, Slot};
 use cairn_packs::PackItemKind;
 use cairn_platform::services::{FileSystem, GitClient};
 
@@ -38,6 +53,8 @@ use crate::security::broker::{adopt_legacy_key, LegacyKeyAdoption};
 pub struct MigrationReport {
     /// `{pack}/{VAR}` accounts whose value now lives in the pack namespace.
     pub keys_moved: Vec<String>,
+    /// `{slot}/{pack}` OAuth records that now live at the pack credential.
+    pub oauth_moved: Vec<String>,
     /// Packs installed because a slot scalar named them.
     pub installed: Vec<String>,
     /// What was deliberately left alone, and why.
@@ -46,7 +63,7 @@ pub struct MigrationReport {
 
 impl MigrationReport {
     pub fn changed(&self) -> bool {
-        !self.keys_moved.is_empty() || !self.installed.is_empty()
+        !self.keys_moved.is_empty() || !self.oauth_moved.is_empty() || !self.installed.is_empty()
     }
 }
 
@@ -72,10 +89,26 @@ pub fn migrate_workspace(
             }
         };
         for credential in credentials {
-            let account = format!("{}/{}", manifest.id, credential.var);
+            let var = match &credential.kind {
+                CredentialKind::Secret { var } => var,
+                CredentialKind::OAuth { .. } => {
+                    for slot in &credential.accessors {
+                        let legacy = format!("{}/{}", slot.as_str(), manifest.id);
+                        match adopt_legacy_record(&legacy, &credential, &manifest.id) {
+                            Ok(LegacyRecordAdoption::Moved) => report.oauth_moved.push(legacy),
+                            Ok(LegacyRecordAdoption::Absent | LegacyRecordAdoption::Superseded) => {}
+                            Err(error) => log::warn!(
+                                "web providers: could not move the OAuth record at {legacy}: {error}"
+                            ),
+                        }
+                    }
+                    continue;
+                }
+            };
+            let account = format!("{}/{var}", manifest.id);
             if servers
                 .get(&manifest.id)
-                .is_some_and(|server| server.referenced_vars().contains(&credential.var))
+                .is_some_and(|server| server.referenced_vars().contains(var))
             {
                 report.skipped.push(format!(
                     "{account}: the MCP server `{}` uses it",
@@ -83,12 +116,7 @@ pub fn migrate_workspace(
                 ));
                 continue;
             }
-            match adopt_legacy_key(
-                &manifest.id,
-                &manifest.id,
-                &credential.name,
-                &credential.var,
-            ) {
+            match adopt_legacy_key(&manifest.id, &manifest.id, &credential.name, var) {
                 Ok(LegacyKeyAdoption::Moved) => report.keys_moved.push(account),
                 Ok(LegacyKeyAdoption::Absent | LegacyKeyAdoption::Superseded) => {}
                 Err(error) => {

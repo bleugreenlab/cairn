@@ -447,9 +447,10 @@ fn strip_query_keys(target: &str, keys: &[&str]) -> String {
     }
 }
 
-/// A web/PDF segment: fetch markdown via `bmd`, then either grep the markdown
-/// (universal grep over the materialized body) or window it client-side, wrapped
-/// as a `Grep`/`Web` segment. A bmd failure becomes an inline `Error` segment.
+/// A web/PDF segment: fetch markdown through the active web-fetch or PDF
+/// provider, then either grep the markdown (universal grep over the
+/// materialized body) or window it client-side, wrapped as a `Grep`/`Web`
+/// segment. A failed fetch becomes an inline `Error` segment.
 async fn produce_web_segment(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -465,7 +466,7 @@ async fn produce_web_segment(
     };
 
     let (clean, offset, limit) = split_line_scope(target, true);
-    // Peel grep-family params off the URL so they are never forwarded to bmd.
+    // Peel grep-family params off the URL so they never reach the provider.
     let clean = strip_query_keys(&clean, GREP_STRIP_KEYS);
     let web_request = McpCallbackRequest {
         answer_bound_ms: None,
@@ -555,6 +556,9 @@ async fn produce_resource_segment(
     }
 
     let rendered = crate::resources::produce_cairn_resource(orch, request, &resolved_target).await;
+    if rendered.failed {
+        return error_segment(target, rendered.content);
+    }
     let affordance = rendered.affordance;
     // Image blocks (e.g. a browser screenshot) ride alongside the text body into
     // the segment; `assemble` lifts them into the envelope and cairn-cmd emits

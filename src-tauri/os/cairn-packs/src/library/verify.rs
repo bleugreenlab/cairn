@@ -231,7 +231,17 @@ fn check_entry(entry: &IndexEntry) -> Result<(), String> {
             }
         }
         let derived = ItemRuns::classify(item.kind, item.definition.as_ref());
-        if item.runs != derived {
+        // The index carries no provider content, so which server a provider
+        // binds is not known here; it may run here only if its entry ships a
+        // server that does. Update review gates both classes alike.
+        let bound_here = item.kind == PackItemKind::Provider
+            && item.runs == ItemRuns::Here
+            && entry.items.iter().any(|other| {
+                other.kind == PackItemKind::Mcp
+                    && ItemRuns::classify(PackItemKind::Mcp, other.definition.as_ref())
+                        == ItemRuns::Here
+            });
+        if item.runs != derived && !bound_here {
             return Err(format!(
                 "{label} is listed as `{}`, but it is `{}`",
                 item.runs.as_str(),
@@ -305,6 +315,17 @@ pub fn verify_staged(
                 kind.as_str(),
                 found.hash,
                 item.hash
+            ));
+        }
+        // With the bytes in hand the class is exact, including the server a
+        // provider binds, which the index alone cannot show.
+        if found.runs != item.runs {
+            return Err(format!(
+                "{} `{id}` from {origin} runs as `{}`, but the signed index lists it as `{}`; \
+                 nothing was installed",
+                kind.as_str(),
+                found.runs.as_str(),
+                item.runs.as_str()
             ));
         }
     }
@@ -537,5 +558,91 @@ mod tests {
             reasons["server"].contains("listed as `content`, but it is `here`"),
             "{reasons:?}"
         );
+    }
+
+    /// An index that lists a stdio-bound provider as an endpoint passes the
+    /// index check, which cannot see the binding, and is refused once the
+    /// staged bytes show what the provider runs.
+    #[test]
+    fn staging_refuses_a_provider_listed_below_what_its_bound_server_runs() {
+        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/bmd");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bmd");
+        std::fs::create_dir_all(root.join("providers")).unwrap();
+        for file in ["cairn-pack.yaml", "providers/web-fetch.yaml"] {
+            std::fs::copy(bundled.join(file), root.join(file)).unwrap();
+        }
+        std::fs::write(
+            root.join("mcp.yaml"),
+            "mcpServers:\n  bmd:\n    command: bmd-local\n",
+        )
+        .unwrap();
+        let mut listed = super::super::derive::entry_from_staged(
+            "bmd",
+            EntryOrigin::Source {
+                path: String::new(),
+            },
+            &root,
+            &BTreeMap::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(verify_staged(&listed, &root, "the fixture").is_ok());
+        let provider = listed
+            .items
+            .iter_mut()
+            .find(|item| item.kind == PackItemKind::Provider)
+            .unwrap();
+        assert_eq!(provider.runs, ItemRuns::Here);
+        provider.runs = ItemRuns::Endpoint;
+        assert!(check_entry(&listed).is_ok(), "the index alone cannot tell");
+        let error = verify_staged(&listed, &root, "the fixture").unwrap_err();
+        assert!(
+            error.contains("runs as `here`, but the signed index lists it as `endpoint`"),
+            "{error}"
+        );
+    }
+
+    /// A provider listed as running here is accepted only beside a server that
+    /// does; anything else is listed as the endpoint it is.
+    #[test]
+    fn a_provider_runs_here_only_beside_a_server_that_does() {
+        let provider = |runs: ItemRuns| IndexItem {
+            kind: PackItemKind::Provider,
+            id: "web-fetch".into(),
+            path: Some("providers/web-fetch.yaml".into()),
+            from: None,
+            hash: hash("provider"),
+            runs,
+            definition: None,
+        };
+        let server = |text: &str| {
+            let definition: crate::server_config::McpServerConfig =
+                serde_yaml::from_str(text).unwrap();
+            IndexItem {
+                kind: PackItemKind::Mcp,
+                id: "reader".into(),
+                path: None,
+                from: None,
+                hash: crate::hash_mcp_definition(&definition).unwrap(),
+                runs: ItemRuns::classify(PackItemKind::Mcp, Some(&definition)),
+                definition: Some(definition),
+            }
+        };
+        let with = |items: Vec<IndexItem>| {
+            let mut entry = entry("reader-pack");
+            entry.items = items;
+            check_entry(&entry)
+        };
+        let stdio = "command: reader\n";
+        let remote = "type: http\nurl: https://reader.example.test/mcp\n";
+        assert!(with(vec![provider(ItemRuns::Here), server(stdio)]).is_ok());
+        assert!(with(vec![provider(ItemRuns::Endpoint), server(remote)]).is_ok());
+        let error = with(vec![provider(ItemRuns::Here), server(remote)]).unwrap_err();
+        assert!(
+            error.contains("listed as `here`, but it is `endpoint`"),
+            "{error}"
+        );
+        assert!(with(vec![provider(ItemRuns::Content)]).is_err());
     }
 }

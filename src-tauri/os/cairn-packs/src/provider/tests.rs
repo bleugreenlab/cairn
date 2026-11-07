@@ -56,9 +56,12 @@ fn a_well_formed_declaration_loads() {
     let providers = load_pack_providers(&root, "example").unwrap();
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0].provider.slot, Slot::WebSearch);
-    assert_eq!(providers[0].credential.var, "API_KEY");
     assert_eq!(
-        providers[0].provider.adapter.request.host,
+        providers[0].credential.as_ref().unwrap().var(),
+        Some("API_KEY")
+    );
+    assert_eq!(
+        providers[0].provider.http().unwrap().request.host,
         "api.example.test"
     );
 }
@@ -166,10 +169,6 @@ fn the_credential_must_exist_and_name_the_provider_as_an_accessor() {
 fn reserved_forms_parse_and_are_refused_as_not_supported_yet() {
     for (credential, provider) in [
         (
-            CREDENTIAL.replace("kind: secret", "kind: oauth"),
-            PROVIDER.to_string(),
-        ),
-        (
             CREDENTIAL.replace("[provider:web-search]", "[provider:web-search, run]"),
             PROVIDER.to_string(),
         ),
@@ -184,10 +183,6 @@ fn reserved_forms_parse_and_are_refused_as_not_supported_yet() {
             CREDENTIAL.to_string(),
             PROVIDER.replace("  http:\n", "  tool:\n"),
         ),
-        (
-            CREDENTIAL.to_string(),
-            PROVIDER.replace("  http:\n", "  mcp:\n"),
-        ),
     ] {
         let error = load_error(&credential, &provider);
         assert!(error.contains(NOT_SUPPORTED_YET), "{error}");
@@ -195,7 +190,7 @@ fn reserved_forms_parse_and_are_refused_as_not_supported_yet() {
 }
 
 #[test]
-fn a_pdf_provider_and_json_markdown_are_not_supported_yet() {
+fn a_pdf_provider_is_not_supported_yet() {
     let cred = "label: K\nkind: secret\nvar: API_KEY\nhosts: [api.example.test]\naccessors: [provider:web-fetch, provider:pdf]\n";
     let fetch = |markdown: &str| {
         format!(
@@ -211,17 +206,9 @@ fn a_pdf_provider_and_json_markdown_are_not_supported_yet() {
     std::fs::write(root.join("providers/web-fetch.yaml"), fetch("body")).unwrap();
     let providers = load_pack_providers(&root, "example").unwrap();
     assert_eq!(
-        providers[0].provider.adapter.response,
+        providers[0].provider.http().unwrap().response,
         ResponseMapping::MarkdownBody
     );
-
-    std::fs::write(
-        root.join("providers/web-fetch.yaml"),
-        fetch("{json: [data.markdown]}"),
-    )
-    .unwrap();
-    let error = load_pack_providers(&root, "example").unwrap_err();
-    assert!(error.contains(NOT_SUPPORTED_YET), "{error}");
 
     std::fs::remove_file(root.join("providers/web-fetch.yaml")).unwrap();
     std::fs::write(
@@ -261,7 +248,18 @@ fn every_bundled_pack_validates() {
         }
     }
     provider_packs.sort();
-    assert_eq!(provider_packs, ["brave", "exa", "jina", "tavily"]);
+    assert_eq!(
+        provider_packs,
+        [
+            "bmd",
+            "brave",
+            "cloudflare",
+            "exa",
+            "firecrawl",
+            "jina",
+            "tavily"
+        ]
+    );
 }
 
 fn yaml_options(value: &Value) -> HashMap<String, serde_yaml::Value> {
@@ -278,7 +276,7 @@ fn goldens() -> Value {
 }
 
 fn search_mapping(provider: &PackProvider) -> &http::SearchMapping {
-    match &provider.provider.adapter.response {
+    match &provider.provider.http().unwrap().response {
         ResponseMapping::Search(mapping) => mapping,
         other => panic!("not a search mapping: {other:?}"),
     }
@@ -294,6 +292,7 @@ fn the_bundled_declarations_reproduce_every_captured_request() {
         let options = yaml_options(&case["options"]);
         let prepared = http::prepare(
             &provider.provider,
+            provider.provider.http().unwrap(),
             &Inputs {
                 query: case["query"].as_str(),
                 target: None,
@@ -403,8 +402,10 @@ fn a_field_of_the_wrong_type_is_a_shape_error() {
     assert!(error.contains("is not a list"), "{error}");
 }
 
+/// Jina percent-decodes its path once, so the target is sent fully encoded:
+/// escapes, `?`, `&` and `#` in it reach the origin exactly.
 #[test]
-fn jina_fetch_sends_the_target_raw_with_the_shared_credential() {
+fn jina_fetch_sends_the_target_encoded_with_the_shared_credential() {
     let fetch = bundled("jina", Slot::WebFetch);
     let search = bundled("jina", Slot::WebSearch);
     assert_eq!(
@@ -412,20 +413,27 @@ fn jina_fetch_sends_the_target_raw_with_the_shared_credential() {
         "one credential, two readers"
     );
     assert_eq!(
-        fetch.provider.adapter.response,
+        fetch.provider.http().unwrap().response,
         ResponseMapping::MarkdownBody
     );
-    let prepared = http::prepare(
-        &fetch.provider,
-        &Inputs {
-            query: None,
-            target: Some("https://example.com/a?b=c"),
-            credential: "tok",
-            options: &HashMap::new(),
-        },
-    );
+    let prepare = |target: &str| {
+        http::prepare(
+            &fetch.provider,
+            fetch.provider.http().unwrap(),
+            &Inputs {
+                query: None,
+                target: Some(target),
+                credential: "tok",
+                options: &HashMap::new(),
+            },
+        )
+    };
+    let prepared = prepare("https://httpbingo.org/anything/a%20b?q=a%26b&z=%23x");
     assert_eq!(prepared.method, "GET");
-    assert_eq!(prepared.url, "https://r.jina.ai/https://example.com/a?b=c");
+    assert_eq!(
+        prepared.url,
+        "https://r.jina.ai/https%3A%2F%2Fhttpbingo.org%2Fanything%2Fa%2520b%3Fq%3Da%2526b%26z%3D%2523x"
+    );
     assert_eq!(
         prepared.headers,
         vec![
@@ -434,6 +442,399 @@ fn jina_fetch_sends_the_target_raw_with_the_shared_credential() {
         ]
     );
     assert_eq!(prepared.body, None);
+}
+
+fn fetch_goldens() -> Value {
+    serde_json::from_str(include_str!("testdata/fetch_goldens.json")).unwrap()
+}
+
+/// A golden case with its deliberate changes applied.
+fn now(case: &Value) -> Value {
+    let mut case = case.clone();
+    if let Some(Value::Object(changed)) = case.get("now").cloned() {
+        for (key, value) in changed {
+            case[key.as_str()] = value;
+        }
+    }
+    case
+}
+
+/// The requests the compiled fetch adapters built are reproduced by the
+/// bundled declarations, except where a case records a deliberate change.
+#[test]
+fn the_bundled_fetch_declarations_reproduce_every_captured_request() {
+    let goldens = fetch_goldens();
+    let target = goldens["target"].as_str().unwrap();
+    for case in goldens["requests"].as_array().unwrap() {
+        let case = now(case);
+        let pack_id = case["provider"].as_str().unwrap();
+        let provider = bundled(pack_id, Slot::WebFetch);
+        let options = yaml_options(&case["options"]);
+        let prepared = http::prepare(
+            &provider.provider,
+            provider.provider.http().unwrap(),
+            &Inputs {
+                query: None,
+                target: Some(target),
+                credential: case["credential"].as_str().unwrap(),
+                options: &options,
+            },
+        );
+        assert_eq!(prepared.method, case["method"], "{pack_id}");
+        assert_eq!(prepared.url, case["url"], "{pack_id}");
+        let headers: Vec<(String, String)> =
+            serde_json::from_value(case["headers"].clone()).unwrap();
+        assert_eq!(prepared.headers, headers, "{pack_id}");
+        let body = prepared
+            .body
+            .as_deref()
+            .map(|body| serde_json::from_str::<Value>(body).unwrap())
+            .unwrap_or(Value::Null);
+        assert_eq!(body, case["body"], "{pack_id}");
+    }
+}
+
+/// bmd binds its own pack's `bmd` server's `fetch` tool with `{source}`.
+#[test]
+fn the_bmd_binding_calls_fetch_with_the_target_as_source() {
+    let golden = &fetch_goldens()["bmd"];
+    let provider = bundled("bmd", Slot::WebFetch);
+    assert_eq!(provider.credential, None);
+    let Adapter::Mcp(binding) = &provider.provider.adapter else {
+        panic!("bmd is not an MCP binding");
+    };
+    assert_eq!(binding.server, golden["server"]);
+    assert_eq!(binding.tool, golden["tool"]);
+    assert_eq!(binding.result, binding::McpResult::Text);
+    let arguments = binding::arguments(
+        &provider.provider,
+        binding,
+        &Inputs {
+            query: None,
+            target: fetch_goldens()["target"].as_str(),
+            credential: "",
+            options: &HashMap::new(),
+        },
+    );
+    assert_eq!(arguments, golden["arguments"]);
+}
+
+const FETCH_CREDENTIAL: &str = "label: K\nkind: secret\nvar: API_KEY\nhosts: [api.example.test]\naccessors: [provider:web-fetch]\n";
+
+/// A pack root holding one fetch provider, a credential, and optionally an
+/// `mcp.yaml`.
+fn fetch_pack(credential: Option<&str>, provider: &str, mcp: Option<&str>) -> (TempDir, PathBuf) {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("example");
+    std::fs::create_dir_all(root.join(PROVIDERS_DIR)).unwrap();
+    if let Some(credential) = credential {
+        std::fs::create_dir_all(root.join(CREDENTIALS_DIR)).unwrap();
+        std::fs::write(root.join("credentials/api-key.yaml"), credential).unwrap();
+    }
+    if let Some(mcp) = mcp {
+        std::fs::write(root.join("mcp.yaml"), mcp).unwrap();
+    }
+    std::fs::write(root.join("providers/web-fetch.yaml"), provider).unwrap();
+    (temp, root)
+}
+
+fn json_fetch(response: &str) -> String {
+    format!(
+        "label: F\nprovides: web-fetch\ncredential: api-key\nadapter:\n  http:\n    request:\n      method: POST\n      url: https://api.example.test/scrape\n      json: {{ url: \"${{target}}\" }}\n    response:\n{response}"
+    )
+}
+
+fn json_mapping(response: &str) -> Result<http::JsonMarkdown, String> {
+    let (_temp, root) = fetch_pack(Some(FETCH_CREDENTIAL), &json_fetch(response), None);
+    let providers = load_pack_providers(&root, "example")?;
+    match providers[0].provider.http().unwrap().response.clone() {
+        ResponseMapping::MarkdownJson(mapping) => Ok(mapping),
+        other => panic!("not a JSON mapping: {other:?}"),
+    }
+}
+
+#[test]
+fn json_markdown_takes_the_first_text_path_behind_its_success_gate() {
+    use http::MarkdownFailure::*;
+    let gated = json_mapping(
+        "      success: { path: ok, error: [errors.0.message, error] }\n      markdown: { json: [data.markdown, result] }\n",
+    )
+    .unwrap();
+    let map = |body: &str| http::map_markdown(&gated, body);
+    assert_eq!(
+        map(r##"{"ok":true,"data":{"markdown":"# A"}}"##),
+        Ok("# A".into())
+    );
+    assert_eq!(
+        map(r##"{"ok":true,"data":{"markdown":"  "},"result":"# B"}"##),
+        Ok("# B".into()),
+        "a blank value is absent"
+    );
+    assert_eq!(map(r##"{"ok":true,"data":null}"##), Err(Missing));
+    assert_eq!(
+        map(r##"{"ok":false,"errors":[{"message":"denied"}]}"##),
+        Err(Unsuccessful(Some("denied".into())))
+    );
+    assert_eq!(
+        map(r##"{"ok":false,"error":"nope"}"##),
+        Err(Unsuccessful(Some("nope".into())))
+    );
+    assert_eq!(map(r##"{"ok":false}"##), Err(Unsuccessful(None)));
+    assert!(
+        matches!(map(r##"{"data":{"markdown":"# A"}}"##), Err(Shape(e)) if e.contains("`ok` is not a boolean"))
+    );
+    assert!(
+        matches!(map(r##"{"ok":true,"result":3}"##), Err(Shape(e)) if e.contains("`result` is not text"))
+    );
+    assert!(matches!(map("not json"), Err(Shape(_))));
+    assert_eq!(
+        http::error_detail(&gated, r##"{"errors":[{"message":"rate"}]}"##),
+        Some("rate".into())
+    );
+    assert_eq!(http::error_detail(&gated, "<html>"), None);
+
+    let ungated = json_mapping("      markdown: { json: [result] }\n").unwrap();
+    assert_eq!(
+        http::map_markdown(&ungated, r##"{"result":"# C"}"##),
+        Ok("# C".into())
+    );
+    assert_eq!(http::error_detail(&ungated, r##"{"error":"x"}"##), None);
+}
+
+#[test]
+fn a_success_gate_needs_a_json_body() {
+    let error = json_mapping("      success: { path: ok }\n      markdown: body\n").unwrap_err();
+    assert!(
+        error.contains("needs `markdown: {json: [paths]}`"),
+        "{error}"
+    );
+    let error = json_mapping("      markdown: { json: [] }\n").unwrap_err();
+    assert!(error.contains("at least one path"), "{error}");
+    let error = load_error(
+        CREDENTIAL,
+        &PROVIDER.replace(
+            "      results: results\n",
+            "      results: results\n      success: { path: ok }\n",
+        ),
+    );
+    assert!(
+        error.contains("`success` gate applies to a fetch"),
+        "{error}"
+    );
+}
+
+const MCP_YAML: &str = "mcpServers:\n  reader:\n    type: http\n    url: https://reader.example.test/mcp\n    oauth: {}\n";
+
+fn binding(adapter: &str) -> String {
+    format!(
+        "label: Reader\nprovides: web-fetch\noptions:\n  - {{ key: mode, label: Mode, select: [[a, A], [b, B]], default: a }}\nadapter:\n  mcp:\n{adapter}"
+    )
+}
+
+const BINDING: &str = "    server: reader\n    tool: fetch\n    arguments: { source: \"${target}\", mode: \"${options.mode}\" }\n    result: text\n";
+
+/// Search has no result contract for a tool's text, so a search provider may
+/// not bind one: it would install, show ready and be selectable, then fail.
+#[test]
+fn an_mcp_binding_is_refused_for_web_search() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("example");
+    std::fs::create_dir_all(root.join(PROVIDERS_DIR)).unwrap();
+    std::fs::write(root.join("mcp.yaml"), MCP_YAML).unwrap();
+    std::fs::write(
+        root.join("providers/web-search.yaml"),
+        "label: Reader\nprovides: web-search\nadapter:\n  mcp:\n    server: reader\n    tool: search\n    arguments: { query: \"${query}\" }\n    result: text\n",
+    )
+    .unwrap();
+    let error = load_pack_providers(&root, "example").unwrap_err();
+    assert!(
+        error.contains("adapter `mcp` for `web-search` is not supported yet"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_mcp_binding_names_a_server_in_its_own_pack() {
+    let (_temp, root) = fetch_pack(None, &binding(BINDING), Some(MCP_YAML));
+    let providers = load_pack_providers(&root, "example").unwrap();
+    let Adapter::Mcp(bound) = &providers[0].provider.adapter else {
+        panic!("not a binding");
+    };
+    assert_eq!(bound.server, "reader");
+    assert_eq!(providers[0].credential, None);
+    let stored = HashMap::from([("mode".to_string(), serde_yaml::Value::from("zz"))]);
+    let arguments = binding::arguments(
+        &providers[0].provider,
+        bound,
+        &Inputs {
+            query: None,
+            target: Some("https://t.test/"),
+            credential: "",
+            options: &stored,
+        },
+    );
+    assert_eq!(
+        arguments,
+        serde_json::json!({"source": "https://t.test/", "mode": "a"}),
+        "a stored select value outside the choices falls back to the default"
+    );
+
+    let refused = |provider: String, mcp: Option<&str>, credential: Option<&str>| {
+        let (_temp, root) = fetch_pack(credential, &provider, mcp);
+        load_pack_providers(&root, "example").unwrap_err()
+    };
+    let error = refused(binding(BINDING), None, None);
+    assert!(
+        error.contains("names server `reader`, which this pack's `mcp.yaml` does not declare"),
+        "{error}"
+    );
+    let error = refused(
+        binding(BINDING),
+        Some(&MCP_YAML.replace("reader:", "other:")),
+        None,
+    );
+    assert!(error.contains("does not declare"), "{error}");
+    let error = refused(
+        binding(BINDING).replace(
+            "provides: web-fetch\n",
+            "provides: web-fetch\ncredential: api-key\n",
+        ),
+        Some(MCP_YAML),
+        Some(FETCH_CREDENTIAL),
+    );
+    assert!(error.contains("takes no `credential:`"), "{error}");
+    let error = refused(
+        binding(&BINDING.replace("${options.mode}", "${credential}")),
+        Some(MCP_YAML),
+        None,
+    );
+    assert!(
+        error.contains("not available to an `mcp` adapter"),
+        "{error}"
+    );
+    let error = refused(
+        binding(&BINDING.replace("options.mode", "options.depth")),
+        Some(MCP_YAML),
+        None,
+    );
+    assert!(error.contains("undeclared option"), "{error}");
+    let error = refused(
+        binding(&BINDING.replace("tool: fetch", "tool: \" \"")),
+        Some(MCP_YAML),
+        None,
+    );
+    assert!(error.contains("needs a `tool`"), "{error}");
+    let error = refused(
+        binding(&BINDING.replace("result: text", "result: structured")),
+        Some(MCP_YAML),
+        None,
+    );
+    assert!(error.contains(NOT_SUPPORTED_YET), "{error}");
+    let error = refused(
+        binding(&BINDING.replace("result: text", "result: images")),
+        Some(MCP_YAML),
+        None,
+    );
+    assert!(error.contains("unknown `result"), "{error}");
+}
+
+const OAUTH_CREDENTIAL: &str = "label: Example login\nkind: oauth\nhosts: [api.example.test]\naccessors: [provider:web-fetch]\noauth:\n  authorize: https://login.example.test/oauth2/auth\n  token: https://login.example.test/oauth2/token\n  clientId: abc123\n  scopes: [read.write]\n  redirect: https://cairn.computer/oauth/example/callback\n";
+
+#[test]
+fn an_oauth_credential_declares_its_client_and_redirect() {
+    let credential = parse_credential("login", OAUTH_CREDENTIAL).unwrap();
+    assert_eq!(credential.var(), None);
+    let oauth = credential.oauth().unwrap();
+    assert_eq!(oauth.client_id, "abc123");
+    assert_eq!(oauth.redirect, OAuthRedirect::Relay("example".into()));
+    assert_eq!(
+        oauth.redirect.relay_uri().as_deref(),
+        Some("https://cairn.computer/oauth/example/callback")
+    );
+    let loopback = parse_credential(
+        "login",
+        &OAUTH_CREDENTIAL.replace("https://cairn.computer/oauth/example/callback", "loopback"),
+    )
+    .unwrap();
+    assert_eq!(loopback.oauth().unwrap().redirect, OAuthRedirect::Loopback);
+
+    for (from, to, expect) in [
+        (
+            "https://login.example.test/oauth2/auth",
+            "http://login.example.test/a",
+            "must start with `https://`",
+        ),
+        (
+            "https://login.example.test/oauth2/token",
+            "https://${options.host}/t",
+            "literal lowercase host",
+        ),
+        ("[read.write]", "[]", "at least one scope"),
+        ("[read.write]", "[\"a b\"]", "is not one scope"),
+        (
+            "clientId: abc123",
+            "clientId: \" \"",
+            "pre-registered client id",
+        ),
+        (
+            "https://cairn.computer/oauth/example/callback",
+            "https://evil.test/cb",
+            "must be `loopback` or",
+        ),
+        (
+            "https://cairn.computer/oauth/example/callback",
+            "https://cairn.computer/oauth/Ex/callback",
+            "must be `loopback` or",
+        ),
+    ] {
+        let error = parse_credential("login", &OAUTH_CREDENTIAL.replace(from, to)).unwrap_err();
+        assert!(error.contains(expect), "{to}: {error}");
+    }
+    let error = parse_credential(
+        "login",
+        &OAUTH_CREDENTIAL.replace("kind: oauth", "kind: secret"),
+    )
+    .unwrap_err();
+    assert!(error.contains("takes no `oauth` block"), "{error}");
+    let error = parse_credential("k", &CREDENTIAL.replace("var: API_KEY\n", "")).unwrap_err();
+    assert!(error.contains("needs `var`"), "{error}");
+}
+
+/// An access token is a credential like any other: it may only be sent to the
+/// hosts it lists.
+#[test]
+fn an_oauth_token_sent_to_an_undeclared_host_is_refused() {
+    let provider = json_fetch("      markdown: { json: [result] }\n")
+        .replace("https://api.example.test/", "https://api.evil.test/");
+    let (_temp, root) = fetch_pack(Some(OAUTH_CREDENTIAL), &provider, None);
+    let error = load_pack_providers(&root, "example").unwrap_err();
+    assert!(
+        error.contains("would send credential `api-key` (oauth) to `api.evil.test`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn two_credentials_in_one_pack_may_not_claim_one_relay() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("example");
+    std::fs::create_dir_all(root.join(CREDENTIALS_DIR)).unwrap();
+    std::fs::write(root.join("credentials/a.yaml"), OAUTH_CREDENTIAL).unwrap();
+    std::fs::write(root.join("credentials/b.yaml"), OAUTH_CREDENTIAL).unwrap();
+    let error = load_pack_credentials(&root, "example").unwrap_err();
+    assert!(error.contains("relay `example`"), "{error}");
+}
+
+#[test]
+fn only_a_text_option_can_be_required() {
+    let error = load_error(
+        CREDENTIAL,
+        &PROVIDER.replace("default: 5 }", "default: 5, required: true }"),
+    );
+    assert!(
+        error.contains("only a `text` option can be `required`"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -445,6 +846,7 @@ fn a_stored_non_integer_for_an_integer_option_falls_back_to_the_default() {
     ]);
     let prepared = http::prepare(
         &brave.provider,
+        brave.provider.http().unwrap(),
         &Inputs {
             query: Some("q"),
             target: None,

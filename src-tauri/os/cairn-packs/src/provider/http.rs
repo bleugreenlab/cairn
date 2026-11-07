@@ -21,6 +21,18 @@
 //! missing results array is an empty list. A blank title falls back to the url;
 //! that is the slot's rule, not something a provider declares.
 //!
+//! A fetch response is either `markdown: body`, the body itself handed to the
+//! slot's content-type-aware conversion, or `markdown: {json: [paths]}`, an
+//! ordered path list into a JSON body under the same first-present rule, whose
+//! value must be text and is returned as is. A JSON response may add a success
+//! gate, `success: {path, error: [paths]}`: on a 2xx response the value at
+//! `path` must be boolean `true`, and `false` is a failed fetch carrying the
+//! first `error` path's text. On a non-2xx response the same `error` paths name
+//! the failure's detail.
+//!
+//! A stored option value of the wrong type, or a select value that is no
+//! longer one of the declared choices, falls back to the declared default.
+//!
 //! # What it deliberately cannot do
 //!
 //! No conditionals, loops beyond the one results array, arithmetic, regex,
@@ -34,7 +46,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{CredentialDecl, ProviderDecl, Slot, NOT_SUPPORTED_YET};
+use super::{CredentialDecl, ProviderDecl, Slot};
 use crate::provider_options::{OptionControl, ProviderOption};
 
 /// A parsed, validated HTTP adapter.
@@ -63,6 +75,20 @@ pub enum ResponseMapping {
     /// The response body itself, handed to the fetch slot's markdown
     /// conversion (content-type aware, binary refused).
     MarkdownBody,
+    /// Markdown read out of a JSON body, optionally behind a success gate.
+    MarkdownJson(JsonMarkdown),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonMarkdown {
+    paths: Vec<Vec<String>>,
+    success: Option<SuccessGate>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SuccessGate {
+    path: Vec<String>,
+    error: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,7 +101,7 @@ pub struct SearchMapping {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Var {
+pub(crate) enum Var {
     Query,
     Target,
     Credential,
@@ -83,26 +109,34 @@ enum Var {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Filter {
+pub(crate) enum Filter {
     Query,
     Raw,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Piece {
+pub(crate) enum Piece {
     Lit(String),
     Var(Var, Option<Filter>),
 }
 
-type Template = Vec<Piece>;
+pub(crate) type Template = Vec<Piece>;
 
+/// A JSON value with interpolations: an HTTP body, or an MCP binding's tool
+/// arguments.
 #[derive(Debug, Clone, PartialEq)]
-enum JsonTemplate {
+pub(crate) enum JsonTemplate {
     Typed(Var),
     Text(Template),
     Literal(Value),
     Array(Vec<JsonTemplate>),
     Object(Vec<(String, JsonTemplate)>),
+}
+
+impl JsonTemplate {
+    pub(crate) fn empty_object() -> Self {
+        JsonTemplate::Object(Vec::new())
+    }
 }
 
 #[derive(Deserialize)]
@@ -132,6 +166,22 @@ struct ResponseFile {
     fields: Option<FieldsFile>,
     #[serde(default)]
     markdown: Option<serde_yaml::Value>,
+    #[serde(default)]
+    success: Option<SuccessFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuccessFile {
+    path: String,
+    #[serde(default)]
+    error: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkdownJsonFile {
+    json: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +206,9 @@ enum Place {
 struct Scope<'a> {
     slot: Slot,
     options: &'a [ProviderOption],
+    /// Whether `${credential}` is defined: an HTTP adapter sends its pack
+    /// credential, an MCP binding has none.
+    credential: bool,
 }
 
 impl Scope<'_> {
@@ -165,7 +218,12 @@ impl Scope<'_> {
             "query" => Err("`${query}` is defined only for a web-search provider".to_string()),
             "target" if self.slot != Slot::WebSearch => Ok(Var::Target),
             "target" => Err("`${target}` is not defined for a web-search provider".to_string()),
-            "credential" => Ok(Var::Credential),
+            "credential" if self.credential => Ok(Var::Credential),
+            "credential" => Err(
+                "`${credential}` is not available to an `mcp` adapter: its server's own \
+                 connection authenticates it"
+                    .to_string(),
+            ),
             other => match other.strip_prefix("options.") {
                 Some(key) if self.options.iter().any(|option| option.key == key) => {
                     Ok(Var::Option(key.to_string()))
@@ -300,10 +358,67 @@ fn url_host(url: &str, credential: &CredentialDecl) -> Result<String, String> {
     if !credential.hosts.contains(&host) {
         return Err(format!(
             "would send credential `{}` ({}) to `{host}`, which is not in its `hosts`",
-            credential.name, credential.var
+            credential.name,
+            credential.var().unwrap_or("oauth")
         ));
     }
     Ok(host)
+}
+
+/// Parse a JSON template with the slot's variables and the provider's options,
+/// and no credential: an MCP binding's tool arguments.
+pub(crate) fn json_template(
+    slot: Slot,
+    options: &[ProviderOption],
+    value: serde_yaml::Value,
+) -> Result<JsonTemplate, String> {
+    Scope {
+        slot,
+        options,
+        credential: false,
+    }
+    .json(value)
+}
+
+fn parse_markdown(response: ResponseFile) -> Result<ResponseMapping, String> {
+    if response.results.is_some() || response.fields.is_some() {
+        return Err("a fetch response maps `markdown`, not `results`".to_string());
+    }
+    let paths = match response.markdown {
+        Some(serde_yaml::Value::String(mode)) if mode == "body" => None,
+        Some(value @ serde_yaml::Value::Mapping(_)) => {
+            let file: MarkdownJsonFile =
+                serde_yaml::from_value(value).map_err(|e| format!("`markdown`: {e}"))?;
+            if file.json.is_empty() {
+                return Err("`markdown.json` must name at least one path".to_string());
+            }
+            Some(parse_paths(&file.json)?)
+        }
+        _ => {
+            return Err(
+                "a fetch response needs `markdown: body` or `markdown: {json: [paths]}`"
+                    .to_string(),
+            )
+        }
+    };
+    match (paths, response.success) {
+        (None, None) => Ok(ResponseMapping::MarkdownBody),
+        (None, Some(_)) => Err(
+            "a `success` gate reads a JSON body, so it needs `markdown: {json: [paths]}`"
+                .to_string(),
+        ),
+        (Some(paths), success) => Ok(ResponseMapping::MarkdownJson(JsonMarkdown {
+            paths,
+            success: success
+                .map(|gate| {
+                    Ok::<_, String>(SuccessGate {
+                        path: parse_path(&gate.path)?,
+                        error: parse_paths(&gate.error)?,
+                    })
+                })
+                .transpose()?,
+        })),
+    }
 }
 
 pub(super) fn parse_adapter(
@@ -314,7 +429,11 @@ pub(super) fn parse_adapter(
 ) -> Result<HttpAdapter, String> {
     let file: AdapterFile =
         serde_yaml::from_value(body).map_err(|e| format!("adapter `http`: {e}"))?;
-    let scope = Scope { slot, options };
+    let scope = Scope {
+        slot,
+        options,
+        credential: true,
+    };
 
     let method = file.request.method.to_ascii_uppercase();
     if !["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&method.as_str()) {
@@ -353,6 +472,11 @@ pub(super) fn parse_adapter(
             if response.markdown.is_some() {
                 return Err("a web-search response maps `results`, not `markdown`".to_string());
             }
+            if response.success.is_some() {
+                return Err(
+                    "a `success` gate applies to a fetch response's `markdown: {json}`".to_string(),
+                );
+            }
             let results = response
                 .results
                 .ok_or_else(|| "a web-search response needs `results`".to_string())?;
@@ -370,22 +494,7 @@ pub(super) fn parse_adapter(
                 score: parse_paths(&fields.score)?,
             })
         }
-        Slot::WebFetch | Slot::Pdf => {
-            if response.results.is_some() || response.fields.is_some() {
-                return Err("a fetch response maps `markdown`, not `results`".to_string());
-            }
-            match response.markdown {
-                Some(serde_yaml::Value::String(mode)) if mode == "body" => {
-                    ResponseMapping::MarkdownBody
-                }
-                Some(serde_yaml::Value::Mapping(map))
-                    if map.contains_key(serde_yaml::Value::from("json")) =>
-                {
-                    return Err(format!("`markdown: {{json: …}}` is {NOT_SUPPORTED_YET}"))
-                }
-                _ => return Err("a fetch response needs `markdown: body`".to_string()),
-            }
-        }
+        Slot::WebFetch | Slot::Pdf => parse_markdown(response)?,
     };
 
     Ok(HttpAdapter {
@@ -420,17 +529,23 @@ pub struct PreparedRequest {
 
 /// One option's effective value: the stored value when it has the right type,
 /// else the declared default. A stored non-integer for an integer option falls
-/// back to the default, as a negative one clamps to zero.
+/// back to the default, as a negative one clamps to zero, and a stored select
+/// value that is not one of the declared choices falls back to the default.
 fn option_value(option: &ProviderOption, stored: Option<&serde_yaml::Value>) -> Value {
     match &option.control {
-        OptionControl::Text { default, .. } | OptionControl::Select { default, .. } => {
-            Value::String(
-                stored
-                    .and_then(serde_yaml::Value::as_str)
-                    .unwrap_or(default)
-                    .to_string(),
-            )
-        }
+        OptionControl::Text { default, .. } => Value::String(
+            stored
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or(default)
+                .to_string(),
+        ),
+        OptionControl::Select { default, choices } => Value::String(
+            stored
+                .and_then(serde_yaml::Value::as_str)
+                .filter(|value| choices.iter().any(|choice| choice.value == *value))
+                .unwrap_or(default)
+                .to_string(),
+        ),
         OptionControl::Number {
             default, integer, ..
         } => {
@@ -480,7 +595,7 @@ fn encode_component(text: &str) -> String {
 }
 
 struct Resolver<'a> {
-    provider: &'a ProviderDecl,
+    options: &'a [ProviderOption],
     inputs: &'a Inputs<'a>,
 }
 
@@ -491,7 +606,6 @@ impl Resolver<'_> {
             Var::Target => Value::String(self.inputs.target.unwrap_or_default().to_string()),
             Var::Credential => Value::String(self.inputs.credential.to_string()),
             Var::Option(key) => self
-                .provider
                 .options
                 .iter()
                 .find(|option| &option.key == key)
@@ -535,11 +649,27 @@ impl Resolver<'_> {
     }
 }
 
+/// Resolve a JSON template against the provider's options and the inputs.
+pub(crate) fn resolve_json(
+    options: &[ProviderOption],
+    template: &JsonTemplate,
+    inputs: &Inputs<'_>,
+) -> Value {
+    Resolver { options, inputs }.json(template)
+}
+
 /// Build the provider's request. Pure: the credential is passed in, nothing is
 /// sent, and every variable was checked when the declaration loaded.
-pub fn prepare(provider: &ProviderDecl, inputs: &Inputs<'_>) -> PreparedRequest {
-    let request = &provider.adapter.request;
-    let resolver = Resolver { provider, inputs };
+pub fn prepare(
+    provider: &ProviderDecl,
+    adapter: &HttpAdapter,
+    inputs: &Inputs<'_>,
+) -> PreparedRequest {
+    let request = &adapter.request;
+    let resolver = Resolver {
+        options: &provider.options,
+        inputs,
+    };
     PreparedRequest {
         method: request.method.clone(),
         url: resolver.text(&request.url),
@@ -642,6 +772,67 @@ fn first_number(item: &Value, paths: &[Vec<String>], index: usize) -> Result<Opt
         }
     }
     Ok(None)
+}
+
+/// Why a JSON markdown response yielded no markdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownFailure {
+    /// The success gate read `false`; carries the declared error text, if any.
+    Unsuccessful(Option<String>),
+    /// No markdown path held text.
+    Missing,
+    /// The body did not have the declared shape.
+    Shape(String),
+}
+
+fn gate_error(value: &Value, gate: &SuccessGate) -> Option<String> {
+    gate.error
+        .iter()
+        .find_map(|path| match lookup(value, path) {
+            Ok(Some(Value::String(text))) if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// Read the markdown out of a 2xx JSON body, through the success gate.
+pub fn map_markdown(mapping: &JsonMarkdown, body: &str) -> Result<String, MarkdownFailure> {
+    let value: Value =
+        serde_json::from_str(body).map_err(|e| MarkdownFailure::Shape(e.to_string()))?;
+    if let Some(gate) = &mapping.success {
+        match lookup(&value, &gate.path).map_err(MarkdownFailure::Shape)? {
+            Some(Value::Bool(true)) => {}
+            Some(Value::Bool(false)) => {
+                return Err(MarkdownFailure::Unsuccessful(gate_error(&value, gate)))
+            }
+            _ => {
+                return Err(MarkdownFailure::Shape(format!(
+                    "{} is not a boolean",
+                    describe(&gate.path)
+                )))
+            }
+        }
+    }
+    for path in &mapping.paths {
+        match lookup(&value, path).map_err(MarkdownFailure::Shape)? {
+            None => continue,
+            Some(Value::String(text)) if text.trim().is_empty() => continue,
+            Some(Value::String(text)) => return Ok(text.clone()),
+            Some(_) => {
+                return Err(MarkdownFailure::Shape(format!(
+                    "{} is not text",
+                    describe(path)
+                )))
+            }
+        }
+    }
+    Err(MarkdownFailure::Missing)
+}
+
+/// The declared error text in a non-2xx JSON body, if the gate names one.
+pub fn error_detail(mapping: &JsonMarkdown, body: &str) -> Option<String> {
+    let gate = mapping.success.as_ref()?;
+    let value: Value = serde_json::from_str(body).ok()?;
+    gate_error(&value, gate)
 }
 
 /// Map a web-search response body into the slot's result list. The error is a

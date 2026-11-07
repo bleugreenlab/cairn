@@ -283,17 +283,26 @@ pub struct WebProviderItem {
     /// Whether the slot's scalar selects this pack. Always false for a pack
     /// that is not installed.
     pub active: bool,
-    pub credential: CredentialItem,
+    /// The credential an `http` provider sends; absent for an MCP binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialItem>,
+    /// The MCP server an `mcp` provider calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server: Option<String>,
 }
 
-/// A pack credential's declaration and presence.
+/// A pack credential's declaration and presence. Never its value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialItem {
     pub name: String,
     pub label: String,
-    pub var: String,
-    /// Whether a value is stored. False for a pack that is not installed.
+    /// `secret` or `oauth`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub var: Option<String>,
+    /// A secret is stored, or an OAuth token is authorized. False for a pack
+    /// that is not installed.
     pub present: bool,
     pub hosts: Vec<String>,
 }
@@ -736,7 +745,7 @@ fn project(
                     machine_service_item(config_dir, &view.id, &entry.id, machines);
             }
             if kind.in_pack_layer() {
-                describe_web_service_item(config_dir, view, &mut entry, kind);
+                describe_web_service_item(config_dir, view, &mut entry, kind, mcp_entries);
             }
             entry
         })
@@ -909,6 +918,7 @@ fn describe_web_service_item(
     view: &PackView,
     entry: &mut PackCatalogItem,
     kind: PackItemKind,
+    mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
 ) {
     let installed = view.installed.is_some();
     let root = if installed {
@@ -919,17 +929,16 @@ fn describe_web_service_item(
     let Some(root) = root else {
         return;
     };
-    let present = |credential: &pack::provider::CredentialDecl| {
-        installed
-            && crate::web_providers::credential_present(&view.id, &credential.name, &credential.var)
-                .unwrap_or(false)
-    };
-    let credential_item = |credential: &pack::provider::CredentialDecl| CredentialItem {
-        name: credential.name.clone(),
-        label: credential.label.clone(),
-        var: credential.var.clone(),
-        present: present(credential),
-        hosts: credential.hosts.clone(),
+    let credential_item = |credential: &pack::provider::CredentialDecl| {
+        let view = crate::web_providers::CredentialView::of(&view.id, credential, installed);
+        CredentialItem {
+            name: view.name,
+            label: view.label,
+            kind: view.kind.to_string(),
+            var: view.var,
+            present: view.present,
+            hosts: view.hosts,
+        }
     };
     match kind {
         PackItemKind::Provider => {
@@ -940,9 +949,24 @@ fn describe_web_service_item(
             else {
                 return;
             };
-            entry.connects_to = Some(provider.provider.adapter.request.host.clone());
+            // A bound provider runs what its server runs, and reaches the
+            // server's host; an HTTP provider reaches the host it names.
+            let bound = match &provider.provider.adapter {
+                pack::provider::Adapter::Mcp(binding) => {
+                    view.mcp_definition(&binding.server, mcp_entries)
+                }
+                pack::provider::Adapter::Http(_) => None,
+            };
+            entry.runs = ItemRuns::classify(PackItemKind::Provider, bound.as_ref());
+            entry.connects_to = match (&provider.provider.http(), &bound) {
+                (Some(adapter), _) => Some(adapter.request.host.clone()),
+                (None, Some(server)) if entry.runs == ItemRuns::Endpoint => {
+                    server.url.as_deref().and_then(host_of)
+                }
+                _ => None,
+            };
             if installed {
-                entry.not_ready = crate::web_providers::readiness(&provider);
+                entry.not_ready = crate::web_providers::readiness(config_dir, &provider);
             }
             entry.web_provider = Some(WebProviderItem {
                 slot: slot.as_str().to_string(),
@@ -950,7 +974,11 @@ fn describe_web_service_item(
                 active: installed
                     && crate::web_providers::active_name(config_dir, slot).as_deref()
                         == Some(view.id.as_str()),
-                credential: credential_item(&provider.credential),
+                credential: provider.credential.as_ref().map(credential_item),
+                mcp_server: match &provider.provider.adapter {
+                    pack::provider::Adapter::Mcp(binding) => Some(binding.server.clone()),
+                    pack::provider::Adapter::Http(_) => None,
+                },
             });
         }
         PackItemKind::Credential => {
@@ -961,13 +989,10 @@ fn describe_web_service_item(
                 return;
             };
             entry.connects_to = Some(credential.hosts.join(", "));
-            let item = credential_item(credential);
-            if installed && !item.present {
-                entry.not_ready = Some(NotReady::MissingVars {
-                    vars: vec![credential.var.clone()],
-                });
+            if installed {
+                entry.not_ready = crate::web_providers::credential_readiness(&view.id, credential);
             }
-            entry.credential = Some(item);
+            entry.credential = Some(credential_item(credential));
         }
         _ => {}
     }
@@ -1359,33 +1384,53 @@ fn render_machine_services(out: &mut String, entry: &PackCatalogEntry) {
 /// A pack's web-service providers and credentials: which slot each fills,
 /// whether it is selected, and whether its key is set. Presence only; the
 /// value is never read here.
+/// The readiness word a pack's web-service item shows.
+fn readiness_word(not_ready: Option<&NotReady>) -> String {
+    match not_ready {
+        None => "ready".to_string(),
+        Some(NotReady::MissingVars { vars }) => format!("needs key ({})", vars.join(", ")),
+        Some(NotReady::NeedsAuth) => "needs auth".to_string(),
+        Some(NotReady::NeedsSetup { missing }) => format!("needs setup ({})", missing.join(", ")),
+        Some(other) => other.summary(),
+    }
+}
+
 fn render_web_services(out: &mut String, entry: &PackCatalogEntry) {
     let installed = entry.state == PackState::Installed;
-    let providers: Vec<&WebProviderItem> = entry
+    let providers: Vec<(&WebProviderItem, Option<&NotReady>)> = entry
         .items
         .iter()
-        .filter_map(|item| item.web_provider.as_ref())
+        .filter_map(|item| {
+            item.web_provider
+                .as_ref()
+                .map(|provider| (provider, item.not_ready.as_ref()))
+        })
         .collect();
     if !providers.is_empty() {
         out.push_str("## Web services\n\n");
-        for provider in providers {
+        for (provider, not_ready) in providers {
             let selected = if provider.active {
                 format!(" · active for {}", provider.slot.replace('-', " "))
             } else {
                 String::new()
             };
-            let key = match (installed, provider.credential.present) {
-                (false, _) => "not installed".to_string(),
-                (true, true) => "ready".to_string(),
-                (true, false) => format!("needs key ({})", provider.credential.var),
+            let via = provider
+                .mcp_server
+                .as_ref()
+                .map(|server| format!(" · through MCP server `{server}`"))
+                .unwrap_or_default();
+            let state = if installed {
+                readiness_word(not_ready)
+            } else {
+                "not installed".to_string()
             };
             out.push_str(&format!(
-                "- `{}` — {}{selected} · {key}\n",
+                "- `{}` — {}{selected}{via} · {state}\n",
                 provider.slot, provider.label
             ));
         }
         out.push_str(&format!(
-            "\nSelecting a provider and setting its key are done in {}.\n\n",
+            "\nSelecting a provider and setting its key or connection are done in {}.\n\n",
             crate::web_providers::LIBRARY_LOCATION
         ));
     }
@@ -1397,15 +1442,22 @@ fn render_web_services(out: &mut String, entry: &PackCatalogEntry) {
     if !credentials.is_empty() {
         out.push_str("## Credentials\n\n");
         for credential in credentials {
-            let state = match (installed, credential.present) {
-                (false, _) => "not installed",
-                (true, true) => "set",
-                (true, false) => "not set",
+            let oauth = credential.kind == "oauth";
+            let state = match (installed, credential.present, oauth) {
+                (false, _, _) => "not installed",
+                (true, true, false) => "set",
+                (true, false, false) => "not set",
+                (true, true, true) => "connected",
+                (true, false, true) => "needs auth",
+            };
+            let what = match (&credential.var, oauth) {
+                (_, true) => "OAuth".to_string(),
+                (Some(var), false) => var.clone(),
+                (None, false) => credential.label.clone(),
             };
             out.push_str(&format!(
-                "- `{}` — {} · sent only to {} · {state}\n",
+                "- `{}` — {what} · sent only to {} · {state}\n",
                 credential.name,
-                credential.var,
                 credential.hosts.join(", ")
             ));
         }

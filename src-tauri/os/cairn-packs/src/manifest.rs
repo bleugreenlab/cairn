@@ -158,16 +158,26 @@ pub enum ItemRuns {
 }
 
 impl ItemRuns {
+    /// `mcp` is an MCP item's own definition, or the server a provider binds.
+    /// An HTTP provider binds none and sends its credential to the host it
+    /// names; a provider bound to a stdio server spawns that server.
     pub fn classify(
         kind: PackItemKind,
         mcp: Option<&crate::server_config::McpServerConfig>,
     ) -> Self {
+        let remote = |config: &crate::server_config::McpServerConfig| {
+            matches!(config.transport.as_str(), "http" | "sse")
+        };
         match kind {
             PackItemKind::Workflow | PackItemKind::Service => ItemRuns::Here,
-            PackItemKind::Credential | PackItemKind::Provider => ItemRuns::Endpoint,
-            PackItemKind::Mcp => match mcp.map(|config| config.transport.as_str()) {
-                Some("http" | "sse") => ItemRuns::Endpoint,
-                // An MCP item with no readable definition is assumed to spawn.
+            PackItemKind::Credential => ItemRuns::Endpoint,
+            PackItemKind::Provider => match mcp {
+                Some(server) if !remote(server) => ItemRuns::Here,
+                _ => ItemRuns::Endpoint,
+            },
+            // An MCP item with no readable definition is assumed to spawn.
+            PackItemKind::Mcp => match mcp {
+                Some(server) if remote(server) => ItemRuns::Endpoint,
                 _ => ItemRuns::Here,
             },
             PackItemKind::Agent
@@ -900,6 +910,16 @@ mod tests {
                 "{kind:?} sends a stored secret to an external host"
             );
         }
+        // A provider bound to an MCP server runs what that server runs.
+        assert_eq!(
+            ItemRuns::classify(PackItemKind::Provider, Some(&remote)),
+            ItemRuns::Endpoint
+        );
+        assert_eq!(
+            ItemRuns::classify(PackItemKind::Provider, Some(&stdio)),
+            ItemRuns::Here,
+            "a provider bound to a stdio server spawns it"
+        );
         assert_eq!(
             ItemRuns::classify(PackItemKind::Workflow, None),
             ItemRuns::Here

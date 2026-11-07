@@ -10,7 +10,7 @@
 //! - A **remote** `.pdf` URL routes here from [`super::web`], and the active
 //!   provider (`config::pdf`) decides how it becomes text. **Local** (the
 //!   default) downloads the bytes and extracts them in-process; **bmd** routes
-//!   the URL through bmd's `fetch` tool (the same MCP path as bmd web fetch).
+//!   the URL through bmd's `fetch` tool on the `bmd` MCP server.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -56,8 +56,42 @@ pub(crate) async fn read_pdf_url_markdown(
 ) -> Result<String, String> {
     match pdf::resolve_active_pdf(&orch.config_dir) {
         PdfProviderId::Local => download_and_extract(url).await,
-        PdfProviderId::Bmd => super::fetch_web::bmd_fetch(orch, url).await,
+        PdfProviderId::Bmd => bmd_pdf(orch, url).await,
     }
+}
+
+/// bmd's `fetch` tool through the host MCP gateway, reusing the OAuth
+/// connection of the `bmd` MCP server. Removed when the PDF slot moves to a
+/// pack provider, as web fetch did.
+async fn bmd_pdf(orch: &Orchestrator, source: &str) -> Result<String, String> {
+    use crate::config::mcp_servers::McpServerConfigExt;
+    let Some(gateway) = orch.mcp_gateway() else {
+        return Err(
+            "The bmd PDF provider needs the MCP gateway, which is not available in this host."
+                .to_string(),
+        );
+    };
+    let servers = crate::config::mcp_servers::load_workspace_mcp_servers(&orch.config_dir);
+    let Some(config) = servers.get("bmd") else {
+        return Ok(
+            "The bmd PDF provider is not configured. Install and connect bmd in the Library, \
+             or switch the PDF provider to Local."
+                .to_string(),
+        );
+    };
+    let credential_key = crate::config::secrets::credential_key("bmd", None);
+    let expanded = config.brokered(&credential_key, "bmd pdf")?;
+    gateway
+        .call_tool(
+            "cairn-pdf",
+            &credential_key,
+            &expanded,
+            "fetch",
+            serde_json::json!({ "source": source }),
+            Some(120_000),
+        )
+        .await
+        .map(|result| result.text)
 }
 
 /// Pure-Rust extraction of a remote PDF: download the bytes and pull out the text.

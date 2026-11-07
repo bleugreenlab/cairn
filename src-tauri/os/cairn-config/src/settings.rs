@@ -415,14 +415,13 @@ pub struct SettingsFile {
     /// written through `cairn://settings` and preserved across saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_api: Option<crate::served_api::ServedApiSettings>,
-    /// Web-fetch provider options, keyed by compiled provider id or provider
-    /// pack id, then option key. Config-only (YAML, not in the Settings DTO).
-    /// Validated against the compiled descriptor in core’s `config::web_fetch`
-    /// or the pack's declaration. See `docs/settings.md`.
+    /// Web-fetch provider options, keyed by the provider's pack id, then
+    /// option key. Config-only (YAML, not in the Settings DTO). Validated
+    /// against the options the pack declares. See `docs/settings.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_fetch: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
-    /// Which web-fetch provider backs fetch. Config-only (YAML, not in the
-    /// Settings DTO). Absent / `regular` = the built-in plain-HTTP fetch.
+    /// Which web-fetch provider backs fetch: a pack id. Config-only (YAML, not
+    /// in the Settings DTO). Absent / `regular` = the built-in plain-HTTP fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_web_fetch: Option<String>,
     /// Web-search provider options, keyed by the provider's pack id, then

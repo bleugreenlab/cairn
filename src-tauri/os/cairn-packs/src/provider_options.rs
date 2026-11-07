@@ -52,6 +52,10 @@ pub struct ProviderOption {
     pub key: String,
     pub label: String,
     pub control: OptionControl,
+    /// A text option the provider cannot run without: while it is blank the
+    /// provider needs setup rather than sending a request that cannot work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
 }
 
 impl ProviderOption {
@@ -64,6 +68,7 @@ impl ProviderOption {
                 default: default.to_string(),
                 placeholder: placeholder.to_string(),
             },
+            required: false,
         }
     }
 
@@ -82,6 +87,7 @@ impl ProviderOption {
                     .collect(),
                 default: default.to_string(),
             },
+            required: false,
         }
     }
 
@@ -96,6 +102,7 @@ impl ProviderOption {
                 default,
                 integer: false,
             },
+            required: false,
         }
     }
 
@@ -105,8 +112,51 @@ impl ProviderOption {
             key: key.to_string(),
             label: label.to_string(),
             control: OptionControl::Bool { default },
+            required: false,
         }
     }
+}
+
+/// The first required option whose effective value (the stored text, else the
+/// default) is blank.
+pub fn missing_required<'a>(
+    descriptors: &'a [ProviderOption],
+    options: &HashMap<String, serde_yaml::Value>,
+) -> Option<&'a ProviderOption> {
+    descriptors.iter().find(|option| {
+        let OptionControl::Text { default, .. } = &option.control else {
+            return false;
+        };
+        option.required
+            && options
+                .get(&option.key)
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or(default)
+                .trim()
+                .is_empty()
+    })
+}
+
+/// The stored options a settings form shows and resubmits. A select value that
+/// is no longer one of the declared choices is left out, so the form shows the
+/// default the request already falls back to, and resubmitting the form along
+/// with an unrelated edit does not send a value [`validate_options`] refuses.
+pub fn usable_options(
+    descriptors: &[ProviderOption],
+    options: &HashMap<String, serde_yaml::Value>,
+) -> HashMap<String, serde_yaml::Value> {
+    let retired = |key: &str, value: &serde_yaml::Value| {
+        descriptors.iter().any(|option| {
+            option.key == key
+                && matches!(&option.control, OptionControl::Select { choices, .. }
+                    if !value.as_str().is_some_and(|v| choices.iter().any(|c| c.value == v)))
+        })
+    };
+    options
+        .iter()
+        .filter(|(key, value)| !retired(key, value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 /// Validate submitted options against a provider's descriptor. Unknown keys and
@@ -219,10 +269,52 @@ mod tests {
                 default: 5.0,
                 integer: true,
             },
+            required: false,
         }];
         let error =
             validate_options(&descriptors, &opts(&[("count", 2.5.into())]), "x").unwrap_err();
         assert!(error.contains("whole number"), "{error}");
         assert!(validate_options(&descriptors, &opts(&[("count", 3.into())]), "x").is_ok());
+    }
+
+    /// A select value the declaration no longer offers is dropped from what a
+    /// form resubmits, and everything else, unknown keys included, is kept
+    /// for validation to judge.
+    #[test]
+    fn a_retired_select_value_is_left_out_of_what_a_form_resubmits() {
+        let descriptors = vec![
+            ProviderOption::select("waitUntil", "Wait until", &[("a", "A"), ("b", "B")], "a"),
+            ProviderOption::text("accountId", "Account ID", "", ""),
+        ];
+        let stored = opts(&[
+            ("waitUntil", serde_yaml::Value::from("load")),
+            ("accountId", serde_yaml::Value::from("acct")),
+        ]);
+        let usable = usable_options(&descriptors, &stored);
+        assert_eq!(
+            usable,
+            opts(&[("accountId", serde_yaml::Value::from("acct"))])
+        );
+        let mut resubmitted = usable.clone();
+        resubmitted.insert("waitUntil".into(), serde_yaml::Value::from("a"));
+        assert!(validate_options(&descriptors, &resubmitted, "t").is_ok());
+        let kept = opts(&[("waitUntil", serde_yaml::Value::from("b"))]);
+        assert_eq!(usable_options(&descriptors, &kept), kept);
+    }
+
+    #[test]
+    fn a_required_text_option_is_missing_while_blank() {
+        let mut account = ProviderOption::text("account", "Account ID", "", "id");
+        account.required = true;
+        let descriptors = vec![account, ProviderOption::text("note", "Note", "", "")];
+        let missing = |pairs: &[(&str, serde_yaml::Value)]| {
+            missing_required(&descriptors, &opts(pairs)).map(|option| option.label.clone())
+        };
+        assert_eq!(missing(&[]).as_deref(), Some("Account ID"));
+        assert_eq!(
+            missing(&[("account", "  ".into())]).as_deref(),
+            Some("Account ID")
+        );
+        assert_eq!(missing(&[("account", "acc-1".into())]), None);
     }
 }

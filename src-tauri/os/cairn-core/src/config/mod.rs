@@ -57,7 +57,6 @@ pub mod skill_archive;
 pub mod skill_package;
 pub mod skills;
 pub mod snapshot_migrate;
-pub mod web_fetch;
 pub mod workflows;
 pub mod yaml_edit;
 pub use cairn_config::files::*;

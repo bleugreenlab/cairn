@@ -50,6 +50,7 @@ pub fn sync_resolved_pack(
 ) -> Result<PackSyncResult, String> {
     refuse_invalid_skills(&manifest)?;
     refuse_invalid_providers(&manifest)?;
+    refuse_relay_collision(config_dir, &manifest)?;
     fs.create_dir_all(config_dir)?;
     ensure_workspace_content_dirs(fs, config_dir)?;
     pack_lock::clear_uninstall(fs, config_dir, &manifest.id)?;
@@ -287,6 +288,32 @@ fn refuse_invalid_providers(manifest: &PackManifest) -> Result<(), String> {
         })
 }
 
+/// Refuse a pack whose OAuth credential claims a relay segment a credential in
+/// another installed pack already holds. The relay is how an authorization
+/// response finds its credential, so two claims would make it ambiguous.
+fn refuse_relay_collision(config_dir: &Path, manifest: &PackManifest) -> Result<(), String> {
+    let Ok(credentials) = pack::provider::load_pack_credentials(&manifest.root, &manifest.id)
+    else {
+        return Ok(());
+    };
+    for credential in &credentials {
+        let Some(relay) = credential.oauth().and_then(|oauth| oauth.redirect.relay()) else {
+            continue;
+        };
+        if let Some((holder, held)) = pack::provider::relay_holders(config_dir, relay)
+            .into_iter()
+            .find(|(pack_id, _)| *pack_id != manifest.id)
+        {
+            return Err(format!(
+                "Pack `{}` was refused: its credential `{}` claims the OAuth relay `{relay}`, \
+                 which `{holder}/{}` already holds. Nothing was written.",
+                manifest.id, credential.name, held.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Explicitly replace every currently shipped item in one bundled pack and
 /// establish fresh ownership baselines. Unlike ordinary sync, this deliberately
 /// overwrites forks and clears tombstones because the caller has confirmed the
@@ -300,6 +327,7 @@ pub fn restore_one_bundled_pack(
     let manifest = pack::available_pack(resource_dir, pack_id)
         .ok_or_else(|| format!("No pack `{pack_id}` is shipped in {resource_dir:?}"))?;
     refuse_invalid_providers(&manifest)?;
+    refuse_relay_collision(config_dir, &manifest)?;
     fs.create_dir_all(config_dir)?;
     ensure_workspace_content_dirs(fs, config_dir)?;
     pack::record_source_dir(fs, resource_dir, config_dir)?;
@@ -414,6 +442,7 @@ pub fn sync_one_pack(
     let manifest = pack::available_pack(resource_dir, pack_id)
         .ok_or_else(|| format!("No pack `{pack_id}` is shipped in {resource_dir:?}"))?;
     refuse_invalid_providers(&manifest)?;
+    refuse_relay_collision(config_dir, &manifest)?;
     fs.create_dir_all(config_dir)?;
     ensure_workspace_content_dirs(fs, config_dir)?;
     pack::record_source_dir(fs, resource_dir, config_dir)?;
@@ -1092,6 +1121,42 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
+    /// A bundled pack holding one oauth credential on relay `relay`.
+    fn oauth_pack(resources: &Path, id: &str, relay: &str) {
+        let root = resources.join("packs").join(id);
+        write(
+            &root.join("cairn-pack.yaml"),
+            &format!("cairnVersion: 1\nid: {id}\nname: {id}\nversion: 1.0.0\ndescription: d\ndefault: false\n"),
+        );
+        write(
+            &root.join("credentials/login.yaml"),
+            &format!("label: Login\nkind: oauth\nhosts: [api.{id}.test]\naccessors: [provider:web-fetch]\noauth:\n  authorize: https://login.{id}.test/a\n  token: https://login.{id}.test/t\n  clientId: c\n  scopes: [s]\n  redirect: https://cairn.computer/oauth/{relay}/callback\n"),
+        );
+    }
+
+    /// One relay segment, one credential: a second pack claiming an installed
+    /// pack's relay is refused naming the holder, and nothing is written.
+    #[test]
+    fn a_second_claim_on_an_oauth_relay_is_refused_naming_the_holder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+        oauth_pack(&resources, "first", "shared");
+        oauth_pack(&resources, "second", "shared");
+        oauth_pack(&resources, "third", "own");
+        let git = cairn_platform::services::RealGitClient;
+        sync_one_pack(&git, &RealFileSystem, &resources, &config, "first").unwrap();
+        let error =
+            sync_one_pack(&git, &RealFileSystem, &resources, &config, "second").unwrap_err();
+        assert!(
+            error.contains("claims the OAuth relay `shared`, which `first/login` already holds"),
+            "{error}"
+        );
+        assert!(pack_lock::read_lock(&config, "second").is_none());
+        sync_one_pack(&git, &RealFileSystem, &resources, &config, "third").unwrap();
+        // Re-syncing the holder itself is not a second claim.
+        sync_one_pack(&git, &RealFileSystem, &resources, &config, "first").unwrap();
+    }
+
     /// A pack source with one skill and one MCP server.
     fn incoming(root: &Path, id: &str, skill: &str, server: &str) -> PackManifest {
         let dir = root.join(id);
@@ -1152,7 +1217,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(installed.credential.var, "EXA_API_KEY");
+        assert_eq!(
+            installed.credential.as_ref().and_then(|c| c.var()),
+            Some("EXA_API_KEY")
+        );
 
         let jina = pack::available_pack(&resources, "jina").unwrap();
         check_install_collisions(&config, &jina, &library_source(), &[]).unwrap();
