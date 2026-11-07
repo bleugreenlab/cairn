@@ -45,9 +45,9 @@
 //! Being a source store earns a record the *right* to be withheld rather than
 //! rewritten. It does not by itself make withholding happen. Withholding costs
 //! a durable read gate at a chokepoint every reader passes through, and only
-//! two stores have one: transcript events, served through event
-//! reconstruction, and archival segment blobs, served through a single
-//! hash-addressed load.
+//! three stores have one: transcript events, served through event
+//! reconstruction; history packs, served through the same history read seam;
+//! and archival segment blobs, served through a single hash-addressed load.
 //!
 //! The others — messages, artifacts, issue bodies, REPL exchanges, terminal
 //! tails, and the on-disk logs — are read from many call sites scattered across
@@ -201,6 +201,10 @@ pub enum SinkKind {
     /// in the content store, or (until the archive offload drains it) compressed
     /// in `archival_blobs`.
     ArchivalBlob,
+    /// The `events` rows of a history pack in the file archive, addressed by
+    /// event id. A second copy of the transcript while its hot rows remain,
+    /// and the only one once they are evicted.
+    HistoryPack,
     /// The Tantivy full-text index.
     SearchIndex,
     /// The event, turn, resource, and issue embedding tables.
@@ -227,6 +231,7 @@ pub const ALL_SINKS: &[SinkKind] = &[
     SinkKind::TerminalLog,
     SinkKind::StreamChunk,
     SinkKind::ArchivalBlob,
+    SinkKind::HistoryPack,
     SinkKind::SearchIndex,
     SinkKind::Embedding,
     SinkKind::CheckResultCache,
@@ -250,6 +255,7 @@ impl SinkKind {
             Self::TerminalLog => "terminal_log",
             Self::StreamChunk => "stream_chunk",
             Self::ArchivalBlob => cairn_db::storage::quarantine::ARCHIVAL_BLOB_SINK,
+            Self::HistoryPack => cairn_db::storage::quarantine::HISTORY_PACK_SINK,
             Self::SearchIndex => "search_index",
             Self::Embedding => "embedding",
             Self::CheckResultCache => "check_result_cache",
@@ -271,6 +277,7 @@ impl SinkKind {
             Self::TerminalLog => "terminal scrollback files",
             Self::StreamChunk => "streamed message chunks",
             Self::ArchivalBlob => "archival blobs",
+            Self::HistoryPack => "history packs",
             Self::SearchIndex => "full-text search index",
             Self::Embedding => "embeddings",
             Self::CheckResultCache => "check result cache",
@@ -287,8 +294,10 @@ impl SinkKind {
             // and the distinction is easy to get wrong: archival does not copy a
             // segment out of an event, it *moves* it. After teardown the blob is
             // the only place that text exists, so rebuilding it is not possible
-            // and purging it would delete history.
+            // and purging it would delete history. A history pack belongs here
+            // for the same reason: once eviction runs it is the transcript.
             Self::TranscriptEvent
+            | Self::HistoryPack
             | Self::Artifact
             | Self::Message
             | Self::IssueBody
@@ -323,6 +332,7 @@ impl SinkKind {
             | Self::TerminalLog
             | Self::StreamChunk
             | Self::ArchivalBlob
+            | Self::HistoryPack
             | Self::SearchIndex
             | Self::Embedding
             | Self::CheckResultCache => Reach::Automatic,
@@ -358,15 +368,17 @@ impl SinkKind {
 
     /// Whether quarantining a record of this store actually withholds it.
     ///
-    /// Only two stores have a real read gate today, and both earn it by having
-    /// a single chokepoint every reader passes through: transcript events are
-    /// served through event reconstruction, and archival segment blobs through
-    /// one hash-addressed load. Everything else is read from many call sites
+    /// Only three stores have a real read gate today, and each earns it by
+    /// having a single chokepoint every reader passes through: transcript
+    /// events are served through event reconstruction, packed events through
+    /// the history read seam (which gates them under both the transcript and
+    /// the pack key), and archival segment blobs through one hash-addressed
+    /// load. Everything else is read from many call sites
     /// scattered across the tree, and a gate on some of them is worse than
     /// none — it reports containment while the ungated paths keep serving.
     pub fn gate(self) -> Gate {
         match self {
-            Self::TranscriptEvent | Self::ArchivalBlob => Gate::Withholds,
+            Self::TranscriptEvent | Self::ArchivalBlob | Self::HistoryPack => Gate::Withholds,
 
             Self::Artifact | Self::Message | Self::IssueBody | Self::ReplExchange => Gate::Reports(
                 "This store is read from many call sites rather than one funnel, so there \
@@ -424,7 +436,7 @@ mod tests {
         // notice a variant that was added to the enum but not to `ALL_SINKS`.
         // Kept as an explicit number rather than derived, so adding a sink is a
         // deliberate edit here too.
-        assert_eq!(ALL_SINKS.len(), 15);
+        assert_eq!(ALL_SINKS.len(), 16);
     }
 
     #[test]
@@ -444,6 +456,7 @@ mod tests {
             vec![
                 cairn_db::storage::quarantine::TRANSCRIPT_EVENT_SINK,
                 cairn_db::storage::quarantine::ARCHIVAL_BLOB_SINK,
+                cairn_db::storage::quarantine::HISTORY_PACK_SINK,
             ],
             "a sink claims to withhold records without a read gate that honours it"
         );

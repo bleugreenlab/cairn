@@ -375,9 +375,9 @@ async fn offload(path: &str, archive: &str) -> Res<Json> {
         let report = run_offload_pass(&db, OffloadBudget::PRODUCTION).await;
         eprintln!("pass {}: {report}", passes.len() + 1);
         write_ms.extend(&report.write_ms);
-        log_peak = log_peak.max(report.log_peak_bytes);
-        folds += report.folds;
-        fold_max = fold_max.max(report.fold_max);
+        log_peak = log_peak.max(report.fold.log_peak_bytes);
+        folds += report.fold.folds;
+        fold_max = fold_max.max(report.fold.max);
         packs += report.packs_moved;
         pack_bytes += report.pack_bytes;
         blobs += report.blobs_moved;

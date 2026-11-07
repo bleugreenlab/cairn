@@ -43,33 +43,23 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use super::pacing::{acquire_gate, fold_if_due, FoldTally};
 use super::progress::{self, Progress};
-use super::rewrite::ARCHIVAL_GATE;
 use crate::orchestrator::object_plane::{
     publish_validated_reference, validate_pack_bytes, ValidatedObjectPack,
 };
 use crate::storage::content_store::{content_hash, ContentStore};
 use crate::storage::pack_catalog::{PackCatalogPublication, PackKind};
-use crate::storage::{decompress, DrainBudget, LocalDb, RowExt, CODEC_ZSTD_V1};
+use crate::storage::{decompress, LocalDb, RowExt, CODEC_ZSTD_V1, FOLD_AT_LOG_BYTES};
 
 /// How long after boot the first pass waits, so a backlog's first pass never
 /// lands in the boot convoy.
 pub const FIRST_PASS_DELAY: Duration = Duration::from_secs(15 * 60);
 
 /// The environment variable an operator sets to stop the offload without a
-/// rebuild. Read once, when the archival maintenance loop is spawned.
+/// rebuild. Read once, when the archival maintenance loop is spawned; see
+/// [`super::switch_enabled`] for the values that turn it off.
 pub const OFFLOAD_ENV: &str = "CAIRN_ARCHIVE_OFFLOAD";
-
-/// Whether the offload runs, given [`OFFLOAD_ENV`]'s value: unless explicitly
-/// turned off.
-pub fn offload_enabled(setting: Option<&str>) -> bool {
-    !matches!(
-        setting
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("off" | "0" | "false" | "no")
-    )
-}
 
 /// How large one page may grow, and when the log is folded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +74,7 @@ impl OffloadBudget {
     pub const PRODUCTION: Self = Self {
         blob_page_rows: 100,
         blob_page_bytes: 32 * 1024 * 1024,
-        fold_at_log_bytes: 64 * 1024 * 1024,
+        fold_at_log_bytes: FOLD_AT_LOG_BYTES,
     };
 }
 
@@ -110,12 +100,7 @@ pub struct OffloadReport {
     /// Each data write's duration (repoint or delete), in milliseconds.
     pub write_ms: Vec<u64>,
     pub gate_wait: Duration,
-    pub folds: usize,
-    /// Folds that were due while an earlier attempt was still in the engine.
-    pub folds_skipped: usize,
-    pub folds_failed: usize,
-    pub fold_max: Duration,
-    pub log_peak_bytes: u64,
+    pub fold: FoldTally,
     pub remaining_packs: Option<usize>,
     pub remaining_blobs: Option<usize>,
     /// Why the pass stopped early, if it did.
@@ -170,11 +155,11 @@ impl fmt::Display for OffloadReport {
             self.write_percentile(50),
             self.write_percentile(100),
             self.gate_wait.as_millis(),
-            self.folds,
-            self.fold_max.as_millis(),
-            self.folds_skipped,
-            self.folds_failed,
-            mib(self.log_peak_bytes),
+            self.fold.folds,
+            self.fold.max.as_millis(),
+            self.fold.skipped,
+            self.fold.failed,
+            mib(self.fold.log_peak_bytes),
             remaining(self.remaining_packs),
             remaining(self.remaining_blobs),
             self.duration.as_secs_f64(),
@@ -198,10 +183,8 @@ enum RowError {
 /// store or database fails.
 pub async fn run_offload_pass(db: &LocalDb, budget: OffloadBudget) -> OffloadReport {
     let started = Instant::now();
-    let mut report = OffloadReport {
-        log_peak_bytes: db.logical_log_bytes(),
-        ..OffloadReport::default()
-    };
+    let mut report = OffloadReport::default();
+    report.fold.observe(db);
     match (db.team_content_store(), db.content_store().cloned()) {
         (Some(_), _) => report.error = Some("a team replica holds nothing inline".into()),
         (None, None) => report.error = Some("this database has no content store".into()),
@@ -254,48 +237,6 @@ async fn load_cursor(db: &LocalDb, pass: &str) -> Result<String, String> {
         .unwrap_or_default())
 }
 
-async fn acquire_gate(
-    report: &mut OffloadReport,
-) -> Result<tokio::sync::SemaphorePermit<'static>, String> {
-    let waited = Instant::now();
-    let permit = ARCHIVAL_GATE
-        .acquire()
-        .await
-        .map_err(|error| format!("archival gate closed: {error}"))?;
-    report.gate_wait += waited.elapsed();
-    Ok(permit)
-}
-
-/// Fold the logical log if it is due and no earlier attempt is still running.
-async fn fold_if_due(db: &LocalDb, budget: OffloadBudget, report: &mut OffloadReport) {
-    let log_bytes = db.logical_log_bytes();
-    report.log_peak_bytes = report.log_peak_bytes.max(log_bytes);
-    if log_bytes < budget.fold_at_log_bytes {
-        return;
-    }
-    if db.checkpoint_in_engine() {
-        report.folds_skipped += 1;
-        return;
-    }
-    let started = Instant::now();
-    let outcome = db
-        .checkpoint(3, Duration::from_millis(50), DrainBudget::PRODUCTION)
-        .await;
-    report.folds += 1;
-    report.fold_max = report.fold_max.max(started.elapsed());
-    match outcome {
-        Ok(checkpoint) if checkpoint.succeeded() => {}
-        Ok(checkpoint) => {
-            report.folds_failed += 1;
-            log::debug!("archive offload: fold failed: {checkpoint}");
-        }
-        Err(error) => {
-            report.folds_failed += 1;
-            log::debug!("archive offload: fold failed: {error}");
-        }
-    }
-}
-
 /// One `execution_history` row still carrying its pack inline.
 struct InlinePack {
     execution_id: String,
@@ -344,7 +285,7 @@ async fn offload_packs(
 ) -> Result<(), String> {
     let mut cursor = load_cursor(db, progress::OFFLOAD_HISTORY).await?;
     loop {
-        let permit = acquire_gate(report).await?;
+        let permit = acquire_gate(&mut report.gate_wait).await?;
         let Some(row) = next_inline_pack(db, &cursor).await? else {
             drop(permit);
             // The end: start over next pass, so a skipped row is retried.
@@ -368,7 +309,13 @@ async fn offload_packs(
         save_cursor(db, progress::OFFLOAD_HISTORY, Some(cursor.clone())).await?;
         log::debug!("archive offload: pack page done through {cursor}");
         tokio::task::yield_now().await;
-        fold_if_due(db, budget, report).await;
+        fold_if_due(
+            db,
+            budget.fold_at_log_bytes,
+            &mut report.fold,
+            "archive offload",
+        )
+        .await;
     }
 }
 
@@ -500,7 +447,7 @@ async fn offload_blobs(
 ) -> Result<(), String> {
     let mut cursor = load_cursor(db, progress::OFFLOAD_BLOBS).await?;
     loop {
-        let permit = acquire_gate(report).await?;
+        let permit = acquire_gate(&mut report.gate_wait).await?;
         let page = next_blob_page(db, &cursor, budget).await?;
         let Some(last) = page.last().map(|(hash, _)| hash.clone()) else {
             drop(permit);
@@ -585,7 +532,13 @@ async fn offload_blobs(
         save_cursor(db, progress::OFFLOAD_BLOBS, Some(cursor.clone())).await?;
         log::debug!("archive offload: blob page done through {cursor}");
         tokio::task::yield_now().await;
-        fold_if_due(db, budget, report).await;
+        fold_if_due(
+            db,
+            budget.fold_at_log_bytes,
+            &mut report.fold,
+            "archive offload",
+        )
+        .await;
     }
 }
 

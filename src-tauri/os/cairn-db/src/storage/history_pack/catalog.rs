@@ -11,6 +11,7 @@
 //! store's collector (cairn/4648).
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use turso::Value;
 
@@ -47,6 +48,14 @@ pub struct PublishFacts {
     pub packed_at: i64,
 }
 
+/// What a publication cost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Published {
+    /// Each catalog statement's duration, run mappings first and the
+    /// `history_tier` row last.
+    pub catalog_writes: Vec<Duration>,
+}
+
 /// Why a pack was not catalogued. A failed attempt can leave an unreferenced
 /// object or run mappings, but cannot replace an evicted catalog.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +82,8 @@ pub enum PublishError {
 /// against their own manifest, and carry the manifest that was built, so a
 /// catalog row never names an unverified pack or bytes stored under a wrong key.
 /// An evicted execution's catalog is immutable, even if the same pack is offered.
+/// Verification decompresses and hashes every frame, so it runs on the blocking
+/// pool, inside an `archival/pack` runtime region.
 ///
 /// Callers must exclude eviction and other publishers for this execution from
 /// pack construction through publication. The SQL guards preserve an eviction
@@ -82,7 +93,7 @@ pub async fn publish(
     db: &LocalDb,
     built: &BuiltPack,
     facts: PublishFacts,
-) -> Result<(), PublishError> {
+) -> Result<Published, PublishError> {
     let store = db.content_store().ok_or(PublishError::NoStore)?;
     publish_to(db, store.as_ref(), built, facts).await
 }
@@ -93,7 +104,7 @@ pub async fn publish_to(
     store: &dyn ContentStore,
     built: &BuiltPack,
     facts: PublishFacts,
-) -> Result<(), PublishError> {
+) -> Result<Published, PublishError> {
     let execution_id = &built.manifest.execution_id;
     if tier_entry(db, execution_id)
         .await?
@@ -112,27 +123,49 @@ pub async fn publish_to(
         .await
         .map_err(PackError::from)?
         .ok_or(PublishError::ReadBackMissing)?;
+    let (expected_hash, expected_manifest) = (built.content_hash.clone(), built.manifest.clone());
+    tokio::task::spawn_blocking(move || verify_stored(stored, &expected_hash, &expected_manifest))
+        .await
+        .map_err(|error| {
+            PublishError::Mismatch(format!("the verification task failed: {error}"))
+        })??;
+    let catalog_writes = record(db, built, facts).await?;
+    Ok(Published { catalog_writes })
+}
+
+/// The stored bytes hash to their key, open, verify against their own
+/// manifest, and carry the manifest that was built.
+fn verify_stored(
+    stored: Vec<u8>,
+    expected_hash: &str,
+    expected_manifest: &super::Manifest,
+) -> Result<(), PublishError> {
+    let _region = cairn_platform::runtime_regions::enter("archival/pack");
     let stored_hash = content_hash(&stored);
-    if stored_hash != built.content_hash {
+    if stored_hash != expected_hash {
         return Err(PublishError::Mismatch(format!(
-            "the stored content hash {stored_hash} differs from the built one {}",
-            built.content_hash
+            "the stored content hash {stored_hash} differs from the built one {expected_hash}"
         )));
     }
     let pack = HistoryPack::open(stored)?;
     pack.verify()
         .map_err(|error| PublishError::Mismatch(error.to_string()))?;
-    if pack.manifest() != &built.manifest {
+    if pack.manifest() != expected_manifest {
         return Err(PublishError::Mismatch(
             "the stored manifest differs from the built one".to_string(),
         ));
     }
-    record(db, built, facts).await?;
     Ok(())
 }
 
-/// Write the catalog rows for a pack already verified in the store.
-async fn record(db: &LocalDb, built: &BuiltPack, facts: PublishFacts) -> Result<(), PublishError> {
+/// Write the catalog rows for a pack already verified in the store, timing
+/// each statement.
+async fn record(
+    db: &LocalDb,
+    built: &BuiltPack,
+    facts: PublishFacts,
+) -> Result<Vec<Duration>, PublishError> {
+    let mut writes = Vec::new();
     let execution_id = built.manifest.execution_id.clone();
     let run_ids: Vec<String> = built
         .manifest
@@ -154,12 +187,16 @@ async fn record(db: &LocalDb, built: &BuiltPack, facts: PublishFacts) -> Result<
         );
         let mut binds = vec![Value::Text(execution_id.clone())];
         binds.extend(chunk.iter().cloned().map(Value::Text));
-        if db.execute(sql, binds).await? == 0 {
+        let started = Instant::now();
+        let changed = db.execute(sql, binds).await?;
+        writes.push(started.elapsed());
+        if changed == 0 {
             return Err(PublishError::Evicted { execution_id });
         }
     }
     let row_counts = serde_json::to_string(&built.stats.rows)
         .map_err(|error| crate::storage::DbError::internal(error.to_string()))?;
+    let started = Instant::now();
     let changed = db
         .execute(
             "INSERT INTO history_tier
@@ -187,10 +224,48 @@ async fn record(db: &LocalDb, built: &BuiltPack, facts: PublishFacts) -> Result<
             ],
         )
         .await?;
+    writes.push(started.elapsed());
     if changed == 0 {
         return Err(PublishError::Evicted { execution_id });
     }
-    Ok(())
+    Ok(writes)
+}
+
+/// Drop the catalog row of the unevicted pack holding `event_id`, so the next
+/// pack pass packs its execution again. Returns the execution whose row went.
+///
+/// A pack is frozen as of its pass: an event withheld then is stored as its
+/// notice. When a quarantine is released, the hot row is the truth again and
+/// the pack must be rebuilt before eviction can rely on it. The object stays
+/// in the store for its collector (cairn/4648); its run mappings are orphans
+/// the read seam ignores and the next publication replaces. An evicted
+/// execution's catalog is never touched here: the hot row is gone, and
+/// repacking it is eviction's concern.
+pub async fn invalidate_for_event(db: &LocalDb, event_id: &str) -> DbResult<Option<String>> {
+    if !db.has_history_catalog() {
+        return Ok(None);
+    }
+    let Some(execution_id) = db
+        .query_opt(
+            "SELECT j.execution_id FROM events e
+             JOIN runs r ON r.id = e.run_id
+             JOIN jobs j ON j.id = r.job_id
+             WHERE e.id = ?1",
+            (event_id.to_string(),),
+            |row| row.opt_text(0),
+        )
+        .await?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let dropped = db
+        .execute(
+            "DELETE FROM history_tier WHERE execution_id = ?1 AND evicted_at IS NULL",
+            (execution_id.clone(),),
+        )
+        .await?;
+    Ok((dropped > 0).then_some(execution_id))
 }
 
 /// One execution's catalog row, if it has been packed.

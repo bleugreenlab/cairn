@@ -192,6 +192,7 @@ pub async fn take_inventory_in(
     let (transcripts, segments) = scan_transcript_events(db, snapshot, secret).await?;
     records.extend(transcripts);
     records.extend(scan_archival_segments(db, snapshot, secret, segments).await?);
+    records.extend(scan_history_packs(db, snapshot, secret).await?);
     for spec in SCANNED_TABLES {
         records.extend(scan_text_column(db, snapshot, secret, *spec).await?);
     }
@@ -476,6 +477,137 @@ async fn scan_archival_segments(
         }
     }
     Ok(out)
+}
+
+/// `history_tier` rows read per page while scanning history packs.
+const PACK_PAGE_ROWS: i64 = 100;
+
+/// Scan the `events` rows of every catalogued history pack.
+///
+/// A pack is a second copy of its execution's transcript, so a credential in a
+/// packed event is reported twice: once under [`SinkKind::TranscriptEvent`] for
+/// the hot row, once under [`SinkKind::HistoryPack`] for the packed one, both by
+/// event id. Packs are visited a catalog page at a time and decoded one frame
+/// at a time, on the blocking pool. A pack the store cannot produce because it
+/// is offline or failing fails the inventory rather than reading as clean; a
+/// catalogued object the store no longer has is logged and passed over, since
+/// no reader can serve it either.
+async fn scan_history_packs(
+    db: &LocalDb,
+    snapshot: &Arc<RegistrySnapshot>,
+    secret: &SecretId,
+) -> DbResult<Vec<AffectedRecord>> {
+    // A team replica has no catalog of its own.
+    if db.team_content_store().is_some() {
+        return Ok(Vec::new());
+    }
+    let Some(store) = db.content_store().cloned() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let mut after = String::new();
+    loop {
+        let page: Vec<(String, String)> = db
+            .query_all(
+                "SELECT execution_id, content_hash FROM history_tier WHERE execution_id > ?1
+                 ORDER BY execution_id LIMIT ?2",
+                (after.clone(), PACK_PAGE_ROWS),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await?;
+        let Some(last) = page.last().map(|(execution, _)| execution.clone()) else {
+            break;
+        };
+        for (execution_id, hash) in page {
+            let bytes = match store.get(&hash).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    log::warn!(
+                        "remediation: history pack {hash} of {execution_id} is catalogued but not in the archive"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(cairn_db::storage::DbError::internal(format!(
+                        "history pack {hash} of {execution_id} could not be scanned: {error}"
+                    )))
+                }
+            };
+            let (snapshot, secret) = (Arc::clone(snapshot), secret.clone());
+            let found = tokio::task::spawn_blocking(move || scan_pack(bytes, &snapshot, &secret))
+                .await
+                .map_err(|error| {
+                    cairn_db::storage::DbError::internal(format!(
+                        "scanning history pack {hash}: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    cairn_db::storage::DbError::internal(format!(
+                        "history pack {hash} of {execution_id} could not be scanned: {error}"
+                    ))
+                })?;
+            out.extend(found);
+        }
+        after = last;
+    }
+    Ok(out)
+}
+
+/// Every packed event carrying `secret`, counted over every string the row
+/// holds: the reconstructed `data`, and an unresolved row's stored form.
+fn scan_pack(
+    bytes: Vec<u8>,
+    snapshot: &Arc<RegistrySnapshot>,
+    secret: &SecretId,
+) -> Result<Vec<AffectedRecord>, cairn_db::storage::history_pack::PackError> {
+    use cairn_db::storage::history_pack::{HistoryPack, Section};
+    let pack = HistoryPack::open(bytes)?;
+    let runs: Vec<String> = pack
+        .manifest()
+        .runs
+        .iter()
+        .map(|run| run.id.clone())
+        .collect();
+    let mut out = Vec::new();
+    for run in runs {
+        for row in pack.rows(Section::Events, &run) {
+            let row = row?;
+            let occurrences: usize = row
+                .values()
+                .map(|value| count_in_json(snapshot, secret, value))
+                .sum();
+            if occurrences == 0 {
+                continue;
+            }
+            if let Some(id) = row.get("id").and_then(serde_json::Value::as_str) {
+                out.push(AffectedRecord {
+                    sink: SinkKind::HistoryPack,
+                    locator: id.to_string(),
+                    occurrences,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn count_in_json(
+    snapshot: &Arc<RegistrySnapshot>,
+    secret: &SecretId,
+    value: &serde_json::Value,
+) -> usize {
+    match value {
+        serde_json::Value::String(text) => count_occurrences(snapshot, secret, text),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| count_in_json(snapshot, secret, item))
+            .sum(),
+        serde_json::Value::Object(fields) => fields
+            .values()
+            .map(|item| count_in_json(snapshot, secret, item))
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// Scan the rotated JSONL logs and the runner's stderr file.
@@ -799,6 +931,125 @@ mod tests {
         assert!(!served[0].data.contains(VALUE), "withheld on read");
         assert!(served[0].data.contains("incident-store-segment"));
         quarantine().install_for(db.path(), QuarantineSet::from_entries(Vec::new()));
+    }
+
+    /// The fixture execution with `VALUE` written into one of its events, then
+    /// packed and catalogued. Returns that event's id.
+    async fn packed_leak(db: &LocalDb, prefix: &str) -> String {
+        use cairn_db::storage::history_pack::testing::{publish_for_test, seed_fixture_execution};
+        let names = seed_fixture_execution(db, prefix).await;
+        db.execute(
+            "UPDATE events SET data = ?1 WHERE id = ?2",
+            (
+                serde_json::json!({"eventType": "user", "content": format!("use {VALUE} now")})
+                    .to_string(),
+                names.plain.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        publish_for_test(db, "exec-1").await;
+        names.plain
+    }
+
+    fn empty_roots() -> InventoryRoots {
+        InventoryRoots {
+            log_dir: tempfile::tempdir().unwrap().keep(),
+            scratch_root: tempfile::tempdir().unwrap().keep(),
+        }
+    }
+
+    /// A packed copy of a leaked event is a second record, found by event id,
+    /// and a quarantine under the pack's key alone withholds it from a
+    /// pack-sourced read.
+    #[tokio::test]
+    async fn a_secret_in_a_history_pack_is_found_by_event_id_and_withheld() {
+        use cairn_db::storage::events::history::HistorySource;
+        use cairn_db::storage::quarantine::{quarantine, QuarantineSet, HISTORY_PACK_SINK};
+
+        let (registry, secret) = registry_with("pack-key", VALUE);
+        let snapshot = registry.snapshot();
+        let db = cairn_db::storage::migrated_test_db("remediation-history-pack.db").await;
+        let leaked = packed_leak(&db, "inv").await;
+
+        let found = take_inventory_in(&db, &snapshot, &secret, &empty_roots())
+            .await
+            .unwrap();
+        let by_sink = |sink: SinkKind| -> Vec<(String, usize)> {
+            found
+                .records
+                .iter()
+                .filter(|record| record.sink == sink)
+                .map(|record| (record.locator.clone(), record.occurrences))
+                .collect()
+        };
+        assert_eq!(by_sink(SinkKind::HistoryPack), [(leaked.clone(), 1)]);
+        assert_eq!(by_sink(SinkKind::TranscriptEvent), [(leaked.clone(), 1)]);
+
+        quarantine().install_for(
+            db.path(),
+            QuarantineSet::from_entries([(
+                HISTORY_PACK_SINK.to_string(),
+                leaked.clone(),
+                "incident-pack".to_string(),
+            )]),
+        );
+        db.set_history_source_override(Some(HistorySource::Pack));
+        let served = crate::resources::render_job_chat_raw_json(&db, "job-1").await;
+        db.set_history_source_override(None);
+        quarantine().install_for(db.path(), QuarantineSet::from_entries(Vec::new()));
+        assert!(!served.contains(VALUE), "withheld on a pack read");
+        assert!(served.contains("incident-pack"), "{served}");
+    }
+
+    #[tokio::test]
+    async fn releasing_a_quarantine_drops_the_unevicted_pack_for_a_repack() {
+        use crate::security::remediation::store::{open_incident, DiscoveredVia};
+        use cairn_db::storage::history_pack::catalog::tier_entry;
+        use cairn_db::storage::quarantine::{quarantine_record, HISTORY_PACK_SINK};
+
+        let db = cairn_db::storage::migrated_test_db("remediation-pack-release.db").await;
+        let leaked = packed_leak(&db, "rel").await;
+        let incident = open_incident(
+            &db,
+            "pack-key",
+            None,
+            DiscoveredVia::Declared,
+            None,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+
+        quarantine_record(&db, HISTORY_PACK_SINK, &leaked, &incident, 1)
+            .await
+            .unwrap();
+        assert!(
+            super::super::release(&db, &incident, SinkKind::HistoryPack, &leaked, "operator")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            tier_entry(&db, "exec-1").await.unwrap(),
+            None,
+            "the pack was made while the event was withheld, so it must be rebuilt"
+        );
+
+        // An evicted execution's catalog is never dropped: its hot row is gone.
+        cairn_db::storage::history_pack::testing::publish_for_test(&db, "exec-1").await;
+        db.execute("UPDATE history_tier SET evicted_at = 5", ())
+            .await
+            .unwrap();
+        quarantine_record(&db, HISTORY_PACK_SINK, &leaked, &incident, 2)
+            .await
+            .unwrap();
+        assert!(
+            super::super::release(&db, &incident, SinkKind::HistoryPack, &leaked, "operator")
+                .await
+                .unwrap()
+        );
+        assert!(tier_entry(&db, "exec-1").await.unwrap().is_some());
     }
 
     #[test]

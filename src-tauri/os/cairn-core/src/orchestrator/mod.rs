@@ -3170,6 +3170,27 @@ impl Orchestrator {
         }
     }
 
+    /// Run one history pack pass over the private database: write a verified
+    /// pack for each execution resolved longer ago than the hot window. Deletes
+    /// nothing.
+    pub async fn run_history_pack(&self) {
+        let settings = crate::config::settings::load_archive_settings(&self.config_dir);
+        let report = crate::archival::pack::run_pack_pass(
+            &self.db.local,
+            crate::archival::pack::PackPolicy {
+                window_secs: settings.hot_window_secs(),
+                bytes_per_row: settings.estimate_bytes_per_event_row,
+            },
+            crate::archival::pack::PackBudget::PRODUCTION,
+        )
+        .await;
+        if report.halted || !report.failed.is_empty() {
+            log::warn!("history pack: {report}");
+        } else {
+            log::info!("history pack: {report}");
+        }
+    }
+
     /// Run one retention evictor pass over the private database: delete what
     /// the `Evict` rules in `cairn_db::storage::retention` name, a page at a
     /// time, folding the logical log when the pass has grown it. Team replicas
@@ -3302,9 +3323,9 @@ impl Orchestrator {
         // The archive offload runs after each sweep, moving bytes still inline in
         // the private database into its file archive. The operator can stop it
         // without a rebuild, and the boot log says which way it went.
-        use crate::archival::offload::{offload_enabled, OFFLOAD_ENV};
+        use crate::archival::offload::OFFLOAD_ENV;
         let offload_setting = std::env::var(OFFLOAD_ENV).ok();
-        let offload = offload_enabled(offload_setting.as_deref());
+        let offload = crate::archival::switch_enabled(offload_setting.as_deref());
         let orch = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(crate::archival::sweep::SWEEP_INTERVAL);
@@ -3341,6 +3362,39 @@ impl Orchestrator {
         } else {
             log::warn!(
                 "archive offload: off ({OFFLOAD_ENV}={offload_setting:?}); inline archival bytes stay in the database"
+            );
+        }
+        // The history pack pass on the same cadence, first run after the
+        // offload's: it reads resolved executions a page at a time and writes
+        // their packs to the archive, deleting nothing. It serializes with the
+        // sweep, the offload and teardown on the archival permit, one execution
+        // at a time.
+        use crate::archival::pack::{PACK_ENV, PACK_FIRST_PASS_DELAY};
+        let pack_setting = std::env::var(PACK_ENV).ok();
+        if crate::archival::switch_enabled(pack_setting.as_deref()) {
+            let window_days =
+                crate::config::settings::load_archive_settings(&self.config_dir).hot_window_days();
+            log::info!(
+                "history pack: on ({PACK_ENV}={pack_setting:?}), hot window {window_days} d, first pass in {}s, then every {}s",
+                PACK_FIRST_PASS_DELAY.as_secs(),
+                crate::archival::sweep::SWEEP_INTERVAL.as_secs()
+            );
+            let orch = self.clone();
+            tokio::spawn(async move {
+                let period = crate::archival::sweep::SWEEP_INTERVAL;
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + PACK_FIRST_PASS_DELAY,
+                    period,
+                );
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    orch.run_history_pack().await;
+                }
+            });
+        } else {
+            log::warn!(
+                "history pack: off ({PACK_ENV}={pack_setting:?}); no history packs are written"
             );
         }
         // The retention evictor beside it, on its own shorter interval: its

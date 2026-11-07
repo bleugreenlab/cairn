@@ -358,15 +358,22 @@ pub async fn release(
     let at = now();
     let released = quarantine::release_record(db, sink.as_str(), locator, actor, at).await?;
     if released {
-        store::journal(
-            db,
-            incident_id,
-            "release",
-            actor,
-            Some(&format!("{sink} {locator}")),
-            at,
-        )
-        .await?;
+        // A pack written while the event was withheld holds its notice, not
+        // its content; drop the pack's catalog row so the next pack pass
+        // rebuilds it from the hot row.
+        let repack = match sink {
+            SinkKind::TranscriptEvent | SinkKind::HistoryPack => {
+                cairn_db::storage::history_pack::catalog::invalidate_for_event(db, locator).await?
+            }
+            _ => None,
+        };
+        let detail = match repack {
+            Some(execution) => {
+                format!("{sink} {locator}; history pack of {execution} to be rebuilt")
+            }
+            None => format!("{sink} {locator}"),
+        };
+        store::journal(db, incident_id, "release", actor, Some(&detail), at).await?;
     }
     Ok(released)
 }

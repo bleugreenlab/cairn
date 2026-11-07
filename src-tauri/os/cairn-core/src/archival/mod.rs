@@ -40,9 +40,12 @@
 //! map falls to zstd either way.
 
 pub mod offload;
+mod pacing;
+pub mod pack;
 pub(crate) mod progress;
 pub(crate) mod rewrite;
 pub mod sweep;
 
+pub use pacing::{switch_enabled, FoldTally};
 pub use rewrite::{archive_execution, ArchiveRange, ArchiveSummary, ArchiveTarget};
 pub use sweep::{run_archival_sweep, SweepSummary};

@@ -12,6 +12,9 @@ pub(crate) const SWEEP: &str = "sweep";
 pub(crate) const OFFLOAD_HISTORY: &str = "offload_history";
 /// The offload of `archival_blobs` rows: the last hash done.
 pub(crate) const OFFLOAD_BLOBS: &str = "offload_blobs";
+/// The history pack pass: the `(completed_at, execution_id)` of the last
+/// candidate visited, as `watermark` and `cursor`.
+pub(crate) const PACK: &str = "pack";
 /// The archive root this database's stored bytes live in, recorded when an
 /// archive is first opened (its `cursor`). Once set, boot never creates an
 /// archive in place of a missing one.

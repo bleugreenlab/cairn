@@ -489,9 +489,43 @@ pub struct ArchiveSettings {
     /// leading `~/` is the user's home directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// How many days after its issue resolves an execution's history stays
+    /// hot-only before the history pack pass packs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_window_days: Option<u32>,
+    /// The hot history, in GiB, the database should hold at most once eviction
+    /// exists; past it the oldest packed executions inside the window go too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_budget_gb: Option<u64>,
+    /// The estimated hot cost of one `events` row, in bytes. Absent means the
+    /// latest storage census's figure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_bytes_per_event_row: Option<u64>,
 }
 
+/// `archive.hotWindowDays` when unset.
+pub const DEFAULT_HOT_WINDOW_DAYS: u32 = 30;
+/// `archive.hotBudgetGb` when unset.
+pub const DEFAULT_HOT_BUDGET_GB: u64 = 10;
+
 impl ArchiveSettings {
+    /// The hot window, in days.
+    pub fn hot_window_days(&self) -> u32 {
+        self.hot_window_days.unwrap_or(DEFAULT_HOT_WINDOW_DAYS)
+    }
+
+    /// The hot window, in seconds.
+    pub fn hot_window_secs(&self) -> i64 {
+        i64::from(self.hot_window_days()) * 86_400
+    }
+
+    /// The hot budget, in bytes.
+    pub fn hot_budget_bytes(&self) -> u64 {
+        self.hot_budget_gb
+            .unwrap_or(DEFAULT_HOT_BUDGET_GB)
+            .saturating_mul(1024 * 1024 * 1024)
+    }
+
     /// The archive root these settings name, for a Cairn home at `home`.
     pub fn root(&self, home: &std::path::Path) -> std::path::PathBuf {
         match self
@@ -2950,8 +2984,31 @@ buildServices:
         );
         let home = ArchiveSettings {
             path: Some("~/cold".into()),
+            ..ArchiveSettings::default()
         };
         assert_eq!(home.root(dir), dirs::home_dir().unwrap().join("cold"));
+    }
+
+    #[test]
+    fn archive_tiering_settings_default_and_survive_a_save() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let unset = load_archive_settings(dir);
+        assert_eq!(unset.hot_window_days(), 30);
+        assert_eq!(unset.hot_window_secs(), 30 * 86_400);
+        assert_eq!(unset.hot_budget_bytes(), 10 * 1024 * 1024 * 1024);
+        assert_eq!(unset.estimate_bytes_per_event_row, None);
+
+        std::fs::write(
+            get_settings_path(dir),
+            "archive:\n  hotWindowDays: 7\n  hotBudgetGb: 2\n  estimateBytesPerEventRow: 1500\n",
+        )
+        .unwrap();
+        save_settings(dir, &load_settings(dir)).unwrap();
+        let loaded = load_archive_settings(dir);
+        assert_eq!(loaded.hot_window_days(), 7);
+        assert_eq!(loaded.hot_budget_bytes(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(loaded.estimate_bytes_per_event_row, Some(1500));
     }
 
     #[test]

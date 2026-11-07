@@ -360,13 +360,3 @@ async fn a_corrupt_blob_row_is_left_and_passed_over() {
     let saved = progress::load(&db, progress::OFFLOAD_BLOBS).await.unwrap();
     assert_eq!(saved.cursor, None);
 }
-
-#[test]
-fn the_kill_switch_turns_off_only_on_an_explicit_value() {
-    for off in ["off", "0", "false", "NO", " Off "] {
-        assert!(!offload_enabled(Some(off)), "{off}");
-    }
-    for on in [None, Some("on"), Some("1"), Some(""), Some("whatever")] {
-        assert!(offload_enabled(on), "{on:?}");
-    }
-}

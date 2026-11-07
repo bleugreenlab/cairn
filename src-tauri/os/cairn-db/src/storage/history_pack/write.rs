@@ -180,6 +180,18 @@ impl PackWriter {
         Ok(())
     }
 
+    /// The bytes the writer holds so far: compressed frames, plus the raw
+    /// rows of each section's open frame. What [`Self::finish`] assembles is
+    /// this, less the open frames' compression, plus the manifest and index.
+    pub fn held_bytes(&self) -> u64 {
+        self.sections
+            .values()
+            .map(|frames| {
+                (frames.bytes.len() + frames.open.as_ref().map_or(0, |open| open.raw.len())) as u64
+            })
+            .sum()
+    }
+
     /// Close every frame and assemble the object. The manifest's `sections`
     /// are filled here, from what was written.
     pub fn finish(mut self, mut manifest: Manifest) -> Result<(Vec<u8>, Manifest, u64), PackError> {
@@ -504,6 +516,18 @@ impl ExecutionPacker {
 
     pub fn stats(&self) -> &PackStats {
         &self.stats
+    }
+
+    /// The runs the manifest skeleton lists.
+    pub fn run_count(&self) -> usize {
+        self.skeleton.runs.len()
+    }
+
+    /// What the object holds so far; see [`PackWriter::held_bytes`]. A caller
+    /// bounding a pack's size checks this between pages, so an oversized
+    /// execution stops before it is assembled.
+    pub fn held_bytes(&self) -> u64 {
+        self.writer.held_bytes()
     }
 
     fn columns(&self, section: Section) -> Vec<ColumnDecl> {
