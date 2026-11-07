@@ -14,6 +14,7 @@ pub(crate) mod detached;
 mod embed;
 pub(crate) mod held;
 mod hygiene;
+mod machine_route;
 mod media;
 mod output;
 mod pace;
@@ -27,6 +28,10 @@ mod tip;
 mod types;
 
 pub(crate) use checks::{check_stream_id, run_item_stream_id, CheckExecResult};
+pub(crate) use machine_route::{
+    machine_os, serves as machine_service_serves,
+    takes_named_call as machine_service_takes_named_call,
+};
 pub(crate) use process::{cache_checkpoint_callback, MAX_BUFFER_SIZE};
 pub(crate) use redact::redact_command;
 pub(crate) use sandbox_policy::{resolve_run_confinement, RunCheckout};
@@ -3538,7 +3543,6 @@ pub(crate) fn build_slot_command_parts(
             ),
             Ok(
                 RunSpec::McpCall(_)
-                | RunSpec::ExecutorAction(_)
                 | RunSpec::ResponseCall { .. }
                 | RunSpec::ModelDoor { .. }
                 | RunSpec::ReplSend { .. },
@@ -3793,10 +3797,6 @@ fn apply_run_item_timeouts(resolved: &mut [(String, Result<RunSpec, String>)]) {
     for (_, spec) in resolved {
         if let Ok(RunSpec::Shell { timeout, .. } | RunSpec::Script { timeout, .. }) = spec {
             *timeout = Some(clamp_run_item_timeout_ms(*timeout));
-        } else if let Ok(RunSpec::ExecutorAction(action)) = spec {
-            action.timeout = Some(
-                clamp_host_item_timeout_ms(action.timeout).unwrap_or(MAX_HOST_ITEM_TIMEOUT_MS),
-            );
         }
     }
 }
@@ -4156,7 +4156,7 @@ impl BatchCoordinate {
     ///
     /// A branch the caller named is refused on a host batch, which holds no
     /// tree. A service's own default is not a request, so it applies only to a
-    /// tree-bound batch: an MCP tool, executor verb, or response from a service
+    /// tree-bound batch: an MCP tool or response from a service
     /// runs on the host like anyone's, and is verdict-only all the same.
     fn decide(
         explicit: Option<String>,
@@ -4164,7 +4164,7 @@ impl BatchCoordinate {
         tree_bound: bool,
     ) -> Result<Self, &'static str> {
         if explicit.is_some() && !tree_bound {
-            return Err("The branch option applies only to tree-bound shell or script batches; gateway, executor-action, and REPL batches run on the host.");
+            return Err("The branch option applies only to tree-bound shell or script batches; MCP-tool, response, model, and REPL batches run on the host.");
         }
         let service = service_branch.is_some();
         let branch = explicit.or(service_branch.filter(|_| tree_bound));
@@ -4252,7 +4252,7 @@ async fn prepare_and_run_batch(
         .any(|(_, spec)| matches!(spec, Ok(RunSpec::Shell { .. } | RunSpec::Script { .. })));
     let has_host_rpc = resolved
         .iter()
-        .any(|(_, spec)| matches!(spec, Ok(RunSpec::McpCall(_) | RunSpec::ExecutorAction(_))));
+        .any(|(_, spec)| matches!(spec, Ok(RunSpec::McpCall(_))));
     let has_response = resolved.iter().any(|(_, spec)| {
         matches!(
             spec,
@@ -4294,16 +4294,40 @@ async fn prepare_and_run_batch(
             Err(refusal) => return run_envelope(refusal.to_string(), Vec::new()),
         }
     };
-    if payload
+    // On a host batch, `executor` chooses which machine serves each
+    // machine-service MCP call and nothing else, so any other host item is
+    // refused by name. Routing settles every such call before anything runs.
+    let call_selector = payload
         .executor
         .as_ref()
-        .is_some_and(|selector| !selector.is_empty())
-        && !has_process
-    {
-        return run_envelope(
-            "The executor option applies only to tree-bound shell or script batches; gateway, executor-action, and REPL batches run on the host. An executor-action target already names its machine; split the host-bound item into a run call without executor.".to_string(),
-            Vec::new(),
-        );
+        .filter(|selector| !selector.is_empty());
+    if !has_process {
+        if call_selector.is_some() {
+            if let Some(refusal) = machine_route::host_selector_refusal(&resolved) {
+                return run_envelope(refusal, Vec::new());
+            }
+        }
+        let routes_machines = resolved.iter().any(|(_, spec)| {
+            matches!(spec, Ok(RunSpec::McpCall(call))
+                if matches!(call.route, types::McpRoute::MachineService { .. }))
+        });
+        if routes_machines {
+            let snapshot = crate::config::machine_services::MachineServiceSnapshot::capture(orch);
+            if let Err(refusals) = machine_route::route_batch(
+                &mut resolved,
+                call_selector,
+                |key| crate::project_services::supervisor::machine::instances(orch, key),
+                &snapshot.machines,
+            ) {
+                return run_envelope(
+                    RunFailure::NotExecuted(format!(
+                        "its machine-service calls could not be routed to a machine:\n{refusals}\n"
+                    ))
+                    .text(),
+                    Vec::new(),
+                );
+            }
+        }
     }
 
     let branch_target = if let Some(branch) = coordinate.branch.as_deref() {
@@ -4902,10 +4926,10 @@ struct HostBatch {
 impl HostBatch {
     /// Whether the batch holds an item allowed to run past the grace window. A
     /// response item is: it runs as long as its definition declares. So is an
-    /// MCP-tool item: it runs to its declared `timeout`, and a model door that
-    /// says it may ([`ModelDoor::outlives_grace`]). Decide, REPL, and
-    /// executor-action items are capped at the window and never need to
-    /// suspend.
+    /// MCP-tool item, whether it reaches a configured server or a machine
+    /// service's resident: it runs to its declared `timeout`. So does a model
+    /// door that says it may ([`ModelDoor::outlives_grace`]). Decide and REPL
+    /// items are capped at the window and never need to suspend.
     ///
     /// [`ModelDoor::outlives_grace`]: cairn_common::run_contract::ModelDoor::outlives_grace
     fn may_outlive_grace(&self) -> bool {
@@ -5048,9 +5072,9 @@ fn joined_host_outcomes(
 /// may park like a routed one ([`answer_call`] decides), marked as holding no
 /// tree. Its items are reachable through the batch control's interrupter:
 /// the call caps them at grace when it cannot park, a stop ends them while
-/// parked, and a dropped call cancels them. Decide, REPL, and executor-action
-/// items are capped at the window and never need to park (`suspendable` is
-/// false for a batch of only those).
+/// parked, and a dropped call cancels them. Decide and REPL items are capped
+/// at the window and never need to park (`suspendable` is false for a batch of
+/// only those).
 async fn run_host_batch(
     orch: &Orchestrator,
     settlement: RunBatchSettlement,
@@ -6403,8 +6427,7 @@ struct BatchFacts {
     /// The batch executes on the host and holds no working tree.
     host: bool,
     /// The batch may outlive grace and so may park. A host batch of only
-    /// decide, REPL, or executor-action items is capped at grace and never
-    /// parks.
+    /// decide or REPL items is capped at grace and never parks.
     may_park: bool,
     /// The batch runs against a pinned revision in a checkout of its own
     /// (`branch:`), so the branch moving never disturbs it.
@@ -8665,7 +8688,7 @@ mod tests {
 
     /// A service's default branch is not a `branch:` the service asked for: it
     /// places a tree-bound batch on the base tip and leaves a host batch (an
-    /// MCP tool, an executor verb) on the host, verdict-only either way. A
+    /// MCP tool, a machine service's included) on the host, verdict-only either way. A
     /// branch a caller names is still refused on a host batch.
     #[test]
     fn a_service_default_branch_applies_only_to_a_tree_bound_batch() {
@@ -9440,24 +9463,6 @@ mod tests {
         // `None` is preserved, not filled: "runs to completion" is a promise only
         // the suspendable path can keep, and these items have their own defaults.
         assert_eq!(clamp_host_item_timeout_ms(None), None);
-
-        let mut executor_action = vec![(
-            "executor action".into(),
-            Ok(RunSpec::ExecutorAction(Box::new(
-                super::types::ExecutorActionSpec {
-                    executor_name: "local".into(),
-                    action: "look".into(),
-                    args: serde_json::json!({}),
-                    timeout: Some(u32::MAX),
-                },
-            ))),
-        )];
-        apply_run_item_timeouts(&mut executor_action);
-        assert!(matches!(
-            &executor_action[0].1,
-            Ok(RunSpec::ExecutorAction(spec))
-                if spec.timeout == Some(MAX_HOST_ITEM_TIMEOUT_MS)
-        ));
 
         // A response or decide item keeps its ask through the seam, so its
         // timeout can name both the ask and the cap that overrode it.
@@ -10381,7 +10386,7 @@ mod decide_door_tests {
 /// batch takes, driven here directly with a short grace window and a stand-in
 /// provider, against a seeded run whose turn can park.
 #[cfg(test)]
-mod host_batch_tests {
+pub(crate) mod host_batch_tests {
     use super::types::RunSpec;
     use super::*;
     use crate::backends::{CompletionOutcome, CompletionRequest};
@@ -10400,9 +10405,32 @@ mod host_batch_tests {
         let local = LocalDb::open_migrated_for_test(root.join("test.db"))
             .await
             .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            root.join("config"),
+        )
+        .build();
+        seed_parkable_run(&orch).await;
+        let responses = orch.config_dir.join("responses");
+        std::fs::create_dir_all(&responses).unwrap();
+        std::fs::write(
+            responses.join("slow.md"),
+            "---\nname: Slow\ndescription: a reasoning call\nmodels: [openrouter/test-model]\ntimeout: 300s\n---\nLabel this.",
+        )
+        .unwrap();
+        orch
+    }
+
+    /// The live run `run-1` in a turn that can park, seeded into any test
+    /// orchestrator's database (its project `p` and workspace kept if present)
+    /// with its process registered, so a host batch for it can suspend.
+    pub(crate) async fn seed_parkable_run(orch: &Orchestrator) {
+        let local = &orch.db.local;
         for sql in [
-            "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
+            "INSERT OR IGNORE INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1)",
+            "INSERT OR IGNORE INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id,project_id,number,title,status,created_at,updated_at) VALUES ('i','p',1,'T','active',1,1)",
             "INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('job-1','e','i','p','Builder','running',1,1,'builder')",
@@ -10413,13 +10441,6 @@ mod host_batch_tests {
         ] {
             local.execute(sql, ()).await.unwrap();
         }
-        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
-        let orch = Orchestrator::builder(
-            Arc::new(DbState::new(Arc::new(local), search)),
-            Arc::new(TestServicesBuilder::new().build()),
-            root.join("config"),
-        )
-        .build();
         let mut handle = crate::agent_process::process::RunHandle::new(
             Arc::new(std::sync::Mutex::new(None)),
             Arc::new(std::sync::Mutex::new(None)),
@@ -10433,14 +10454,19 @@ mod host_batch_tests {
             .lock()
             .unwrap()
             .register("run-1".to_string(), handle);
-        let responses = orch.config_dir.join("responses");
-        std::fs::create_dir_all(&responses).unwrap();
-        std::fs::write(
-            responses.join("slow.md"),
-            "---\nname: Slow\ndescription: a reasoning call\nmodels: [openrouter/test-model]\ntimeout: 300s\n---\nLabel this.",
-        )
-        .unwrap();
-        orch
+    }
+
+    /// Run one host item for `run-1` as a parkable `run` call whose window
+    /// closes after `grace`: the composed answer, or the suspended marker when
+    /// it parked.
+    pub(crate) async fn run_parkable_item(
+        orch: &Orchestrator,
+        header: &str,
+        spec: RunSpec,
+        grace: Duration,
+    ) -> String {
+        let (settlement, batch) = batch_of(orch, (header.to_string(), spec), true).await;
+        run_suspendable_host_batch(orch, settlement, batch, grace).await
     }
 
     /// A provider that takes `delay` (or the request's own timeout, if that is
@@ -10638,11 +10664,13 @@ mod host_batch_tests {
             "cairn://mcp/fake/slow".to_string(),
             RunSpec::McpCall(Box::new(super::types::McpCallSpec {
                 server: "fake".into(),
-                credential_key: "fake".into(),
                 tool: "slow".into(),
                 args: json!({}),
-                config: serde_json::from_value(json!({})).unwrap(),
                 timeout,
+                route: super::types::McpRoute::Gateway {
+                    credential_key: "fake".into(),
+                    config: serde_json::from_value(json!({})).unwrap(),
+                },
             })),
         )
     }
@@ -10682,6 +10710,27 @@ mod host_batch_tests {
             "the gateway is held to the declared bound, not the host-item cap"
         );
         assert!(!was(&abandoned));
+    }
+
+    /// A machine-service call already routed to `machine`, for a test outside
+    /// this module (whose fields it cannot name) to run through a batch.
+    pub(crate) fn machine_service_spec(
+        server: &str,
+        tool: &str,
+        timeout: Option<u32>,
+        key: cairn_config::fleet::MachineServiceKey,
+        machine: &str,
+    ) -> RunSpec {
+        RunSpec::McpCall(Box::new(super::types::McpCallSpec {
+            server: server.into(),
+            tool: tool.into(),
+            args: json!({}),
+            timeout,
+            route: super::types::McpRoute::MachineService {
+                key,
+                machine: Some(machine.into()),
+            },
+        }))
     }
 
     /// An omitted `timeout` is not "run to completion": an external server is
@@ -10833,7 +10882,7 @@ mod host_batch_tests {
         }
     }
 
-    async fn wait_row(orch: &Orchestrator) -> (String, String) {
+    pub(crate) async fn wait_row(orch: &Orchestrator) -> (String, String) {
         orch.db
             .local
             .query_one(
@@ -10845,7 +10894,10 @@ mod host_batch_tests {
             .unwrap()
     }
 
-    async fn tool_result_containing(orch: &Orchestrator, needle: &str) -> Option<String> {
+    pub(crate) async fn tool_result_containing(
+        orch: &Orchestrator,
+        needle: &str,
+    ) -> Option<String> {
         let needle = format!("%{needle}%");
         orch.db
             .local

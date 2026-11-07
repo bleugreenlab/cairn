@@ -3,7 +3,9 @@
 
 use super::output::{strip_streamable_tail, OutputTail};
 use super::sandbox_policy::{resolve_run_confinement, RunConfinement};
-use super::types::{ItemOutcome, McpCallSpec, RunCompletePayload, RunOutputPayload, RunSpec};
+use super::types::{
+    ItemOutcome, McpCallSpec, McpRoute, RunCompletePayload, RunOutputPayload, RunSpec,
+};
 use crate::config::mcp_servers::McpServerConfigExt;
 use crate::mcp::gateway::{McpCallOutcome, McpResourceDef};
 use crate::mcp::handlers::shell_words::command_for_classification;
@@ -37,126 +39,6 @@ struct ExecOutput {
     /// Why the spawn's macOS profile refused it `ps` or `top`, appended after
     /// its output (see `sandbox::setuid_refusal_note`).
     setuid_refusal: Option<String>,
-}
-
-/// The verbs a probed catalog positively proves an instance has, if it proves
-/// any.
-///
-/// A failed probe and an instance nobody has probed yet both leave an empty
-/// catalog, and an empty catalog is not evidence of absence. Refusing a verb on
-/// it would tell an agent the machine cannot do something when the truth is that
-/// nobody could ask, which is exactly what a dropped link produces. Only a
-/// probe that came back with a real catalog can refute a verb.
-fn advertised_verbs(catalog: &[crate::mcp::gateway::McpToolDef]) -> Option<Vec<String>> {
-    if catalog.is_empty() {
-        return None;
-    }
-    Some(catalog.iter().map(|tool| tool.name.clone()).collect())
-}
-
-use crate::project_services::supervisor::machine::{InstanceState, MachineServiceInstance};
-
-/// Which of a machine's MCP-speaking machine services takes `action`: the one
-/// whose catalog advertises it, or the only one there is while nothing has
-/// refuted it. `Err` is the refusal.
-fn instance_for_verb<'a>(
-    machine: &str,
-    action: &str,
-    instances: &'a [MachineServiceInstance],
-) -> Result<&'a MachineServiceInstance, String> {
-    let mcp: Vec<&MachineServiceInstance> = instances
-        .iter()
-        .filter(|instance| instance.serves_mcp)
-        .collect();
-    if mcp.is_empty() {
-        return Err(format!(
-            "no machine service that serves MCP is selected on {machine}; select one on cairn://executors/{machine} with machineServices"
-        ));
-    }
-    if let Some(serving) = mcp
-        .iter()
-        .find(|instance| instance.catalog.iter().any(|tool| tool.name == action))
-    {
-        return Ok(serving);
-    }
-    let advertised: Vec<String> = mcp
-        .iter()
-        .filter_map(|instance| advertised_verbs(&instance.catalog))
-        .flatten()
-        .collect();
-    match mcp.as_slice() {
-        [only] if advertised.is_empty() => Ok(only),
-        _ if advertised.is_empty() => Err(format!(
-            "no machine service on {machine} has advertised its verbs yet; read cairn://executors/{machine}"
-        )),
-        _ => Err(format!(
-            "{machine} does not advertise `{action}`. Its verbs are: {}. Read cairn://executors/{machine}.",
-            advertised.join(", ")
-        )),
-    }
-}
-
-async fn run_executor_action(
-    orch: &Orchestrator,
-    header: String,
-    spec: super::types::ExecutorActionSpec,
-) -> ItemOutcome {
-    let Some(gateway) = orch.mcp_gateway() else {
-        return ItemOutcome::failed(header, "MCP gateway is not available in this host");
-    };
-    let instances =
-        crate::project_services::supervisor::machine::instances_on(orch, &spec.executor_name);
-    let instance = match instance_for_verb(&spec.executor_name, &spec.action, &instances) {
-        Ok(instance) => instance,
-        Err(refusal) => return ItemOutcome::failed(header, refusal),
-    };
-    // A state that cannot answer is said as itself rather than as a failed
-    // call: an agent can tell the operator what to do about it.
-    if matches!(
-        instance.state,
-        InstanceState::NotInstalled { .. }
-            | InstanceState::Installing
-            | InstanceState::MachineAbsent
-            | InstanceState::WaitingForOperator { .. }
-            | InstanceState::Failed { .. }
-    ) {
-        return ItemOutcome::failed(
-            header,
-            format!(
-                "{} on {} is {}",
-                instance.key,
-                spec.executor_name,
-                instance.state.sentence()
-            ),
-        );
-    }
-    let Some(facade) = instance.facade.clone() else {
-        return ItemOutcome::failed(
-            header,
-            format!("{} on {} is starting", instance.key, spec.executor_name),
-        );
-    };
-    let timeout = super::clamp_host_item_timeout_ms(spec.timeout);
-    let outcome = gateway
-        .call_placed_tool_once(facade, &spec.action, spec.args, timeout)
-        .await;
-    match outcome {
-        Ok(McpCallOutcome::Complete(result)) => ItemOutcome {
-            header,
-            body: result.text,
-            succeeded: true,
-            suspended: false,
-            images: result.images,
-            tracked_modifications: None,
-            data: None,
-            whole: false,
-        },
-        Ok(_) => ItemOutcome::failed(
-            header,
-            "Machine-service verbs cannot suspend for follow-up input",
-        ),
-        Err(error) => ItemOutcome::failed(header, format!("{}: {error}", spec.executor_name)),
-    }
 }
 
 /// Maximum output buffer size (64KB)
@@ -401,9 +283,6 @@ pub(crate) async fn run_one(
                 shell_args.extend(args);
             }
             (shell.to_string(), shell_args, timeout, Some(command), None)
-        }
-        RunSpec::ExecutorAction(spec) => {
-            return run_executor_action(orch, header, *spec).await;
         }
         RunSpec::ModelDoor {
             door,
@@ -743,14 +622,36 @@ async fn run_mcp_call(
 ) -> ItemOutcome {
     let McpCallSpec {
         server,
-        credential_key,
         tool,
         args,
-        config,
         timeout,
+        route,
     } = spec;
     let Some(gateway) = orch.mcp_gateway() else {
         return ItemOutcome::failed(header, "MCP gateway is not available in this host");
+    };
+    let (credential_key, config) = match route {
+        McpRoute::Gateway {
+            credential_key,
+            config,
+        } => (credential_key, config),
+        McpRoute::MachineService { key, machine } => {
+            return run_machine_service_call(
+                orch,
+                gateway.as_ref(),
+                header,
+                MachineServiceCall {
+                    server,
+                    tool,
+                    args,
+                    timeout,
+                    key,
+                    machine,
+                },
+                interrupt,
+            )
+            .await
+        }
     };
 
     // Per-session connection pooling keys on the run's job id, isolating
@@ -828,6 +729,177 @@ async fn run_mcp_call(
             .await
         }
         Err(e) => ItemOutcome::failed(header, e),
+    }
+}
+
+/// One placed call in flight on a machine, registered for as long as it runs.
+///
+/// The gateway holds one connection per machine and serializes calls on it, so
+/// a declared-long call (an `.axn` replay) holds the machine for its whole
+/// bound. A call queued behind it keeps its own timer running and would time
+/// out reading as a slow tool; this registry is what lets that timeout say it
+/// was waiting behind another call instead.
+struct InFlightPlacedCall {
+    key: String,
+    id: u64,
+}
+
+type InFlightCalls =
+    std::sync::Mutex<std::collections::HashMap<String, Vec<(u64, String, std::time::Instant)>>>;
+
+fn in_flight_calls() -> &'static InFlightCalls {
+    static CALLS: std::sync::OnceLock<InFlightCalls> = std::sync::OnceLock::new();
+    CALLS.get_or_init(Default::default)
+}
+
+impl InFlightPlacedCall {
+    fn enter(key: &str, tool: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        in_flight_calls()
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .push((id, tool.to_string(), std::time::Instant::now()));
+        Self {
+            key: key.to_string(),
+            id,
+        }
+    }
+
+    /// The earliest call on the same machine that started before this one and
+    /// is still running, with how long it has run: what holds the connection.
+    fn ahead(&self) -> Option<(String, Duration)> {
+        let calls = in_flight_calls().lock().unwrap();
+        calls
+            .get(&self.key)?
+            .iter()
+            .find(|(id, _, _)| *id < self.id)
+            .map(|(_, tool, started)| (tool.clone(), started.elapsed()))
+    }
+}
+
+impl Drop for InFlightPlacedCall {
+    fn drop(&mut self) {
+        let mut calls = in_flight_calls().lock().unwrap();
+        if let Some(list) = calls.get_mut(&self.key) {
+            list.retain(|(id, _, _)| *id != self.id);
+            if list.is_empty() {
+                calls.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// A machine-service call the batch has routed to one machine.
+struct MachineServiceCall {
+    server: String,
+    tool: String,
+    args: serde_json::Value,
+    timeout: Option<u32>,
+    key: cairn_config::fleet::MachineServiceKey,
+    machine: Option<String>,
+}
+
+/// Execute a machine-service MCP call through the resident on the machine the
+/// batch routed it to.
+///
+/// It is an MCP-tool item in every way a caller sees: the same bound
+/// ([`super::mcp_item_bound`]), the same interruption, and the same batch that
+/// parks past the window and delivers this result when it lands. What it
+/// cannot do is suspend for follow-up input: a durable continuation resumes on
+/// a pooled gateway session, and a placed facade has none.
+async fn run_machine_service_call(
+    orch: &Orchestrator,
+    gateway: &dyn crate::mcp::gateway::McpGateway,
+    header: String,
+    call: MachineServiceCall,
+    interrupt: Option<&crate::responses::InvocationInterrupt>,
+) -> ItemOutcome {
+    let MachineServiceCall {
+        server,
+        tool,
+        args,
+        timeout,
+        key,
+        machine,
+    } = call;
+    let Some(machine) = machine else {
+        return ItemOutcome::failed(
+            header,
+            format!("MCP call '{server}/{tool}' was not routed to a machine"),
+        );
+    };
+    // Re-read rather than trusting the route: a resident can stop between
+    // routing and the call, and its state then says why.
+    let instances = crate::project_services::supervisor::machine::instances(orch, &key);
+    let Some(instance) = instances
+        .iter()
+        .find(|instance| instance.machine == machine)
+    else {
+        return ItemOutcome::failed(
+            header,
+            format!("{key} is no longer selected on `{machine}`; read cairn://mcp/{server}"),
+        );
+    };
+    if !super::machine_route::takes_named_call(instance) {
+        return ItemOutcome::failed(
+            header,
+            format!("{key} on `{machine}` is {}", instance.state.sentence()),
+        );
+    }
+    let Some(facade) = instance.facade.clone() else {
+        return ItemOutcome::failed(header, format!("{key} on `{machine}` is starting"));
+    };
+    let bound = super::mcp_item_bound(timeout);
+    let limit_ms = u32::try_from(bound.limit.as_millis()).unwrap_or(u32::MAX);
+    let in_flight = InFlightPlacedCall::enter(facade.key(), &tool);
+    let call = gateway.call_placed_tool_once(facade, &tool, args, Some(limit_ms));
+    let mut interrupt = interrupt.cloned();
+    let outcome = tokio::select! {
+        biased;
+        interruption = async {
+            match interrupt.as_mut() {
+                Some(interrupt) => interrupt.wait().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            return ItemOutcome::failed(header, mcp_call_interrupted(&server, &tool, &bound, interruption));
+        }
+        () = tokio::time::sleep(bound.limit) => {
+            let queued = in_flight.ahead().map(|(other, running)| format!(
+                " It was queued behind `{other}` on {machine}, which had been running for {} s: a \
+                 machine takes one call at a time, so this call may never have reached it.",
+                running.as_secs()
+            )).unwrap_or_default();
+            return ItemOutcome::failed(
+                header,
+                format!("MCP call '{server}/{tool}' on {machine} {}{queued}", bound.describe(None)),
+            );
+        }
+        outcome = call => outcome,
+    };
+    drop(in_flight);
+    match outcome {
+        Ok(McpCallOutcome::Complete(result)) => ItemOutcome {
+            header,
+            body: append_link_affordance(result.text, &result.links, &server),
+            succeeded: true,
+            suspended: false,
+            images: result.images,
+            tracked_modifications: None,
+            data: None,
+            whole: false,
+        },
+        Ok(_) => ItemOutcome::failed(
+            header,
+            format!(
+                "MCP call '{server}/{tool}' asked for follow-up input, and a machine-service tool \
+                 cannot suspend for follow-up input"
+            ),
+        ),
+        Err(error) => ItemOutcome::failed(header, format!("{server} on {machine}: {error}")),
     }
 }
 
@@ -2206,79 +2278,6 @@ mod tests {
                 "{key} must be stripped so a worktree command builds into its own target dir"
             );
         }
-    }
-
-    fn instance(
-        state: crate::project_services::supervisor::machine::InstanceState,
-        verbs: &[&str],
-    ) -> MachineServiceInstance {
-        MachineServiceInstance {
-            key: "axon/axon".parse().unwrap(),
-            machine: "bgsrv-mac".into(),
-            state,
-            provenance: "installed 0.3.6 (pack)".into(),
-            installed_version: Some("0.3.6".into()),
-            override_command: None,
-            catalog: verbs
-                .iter()
-                .map(|name| crate::mcp::gateway::McpToolDef {
-                    name: name.to_string(),
-                    description: None,
-                    input_schema: serde_json::json!({}),
-                })
-                .collect(),
-            probed_at_ms: None,
-            serves_mcp: true,
-            facade: None,
-        }
-    }
-
-    /// A real catalog is the only thing that may refute a verb. An instance
-    /// whose probe failed or that nobody has probed has an empty one, and
-    /// treating that as "advertises nothing" is how a dropped link turns into
-    /// a refusal claiming the verb does not exist.
-    #[test]
-    fn only_a_probed_catalog_can_refute_a_verb() {
-        use crate::project_services::supervisor::machine::InstanceState;
-        let probed = [instance(InstanceState::Ready, &["look"])];
-        assert_eq!(
-            instance_for_verb("bgsrv-mac", "look", &probed)
-                .unwrap()
-                .key
-                .to_string(),
-            "axon/axon"
-        );
-        let refused = instance_for_verb("bgsrv-mac", "fly", &probed).unwrap_err();
-        assert!(refused.contains("does not advertise `fly`"), "{refused}");
-        assert!(refused.contains("look"), "{refused}");
-
-        let unprobed = [instance(InstanceState::Starting, &[])];
-        assert!(
-            instance_for_verb("bgsrv-mac", "look", &unprobed).is_ok(),
-            "an empty catalog is not evidence of absence"
-        );
-        let none = instance_for_verb("bgsrv-mac", "look", &[]).unwrap_err();
-        assert!(none.contains("no machine service"), "{none}");
-    }
-
-    /// An instance waiting on its operator is refused in those words, before
-    /// any call is tried.
-    #[test]
-    fn a_waiting_instance_is_refused_by_its_state() {
-        use crate::project_services::supervisor::machine::InstanceState;
-        let waiting = instance(
-            InstanceState::WaitingForOperator {
-                reason: "accessibility-permission-denied".into(),
-            },
-            &["look"],
-        );
-        let chosen =
-            instance_for_verb("bgsrv-mac", "look", std::slice::from_ref(&waiting)).unwrap();
-        let sentence = format!("{} on bgsrv-mac is {}", chosen.key, chosen.state.sentence());
-        assert_eq!(
-            sentence,
-            "axon/axon on bgsrv-mac is waiting for the operator: Accessibility is not granted to this copy (System Settings → Privacy & Security → Accessibility)"
-        );
     }
 
     #[test]

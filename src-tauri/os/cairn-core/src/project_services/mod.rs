@@ -261,9 +261,8 @@ pub(crate) async fn note_refusal(
     }
 }
 
-/// Record a tool target a call invoked (an MCP tool, a skill script, an
-/// executor verb) in the service's log: every one the owner scope admits is
-/// a row naming it.
+/// Record a tool target a call invoked (an MCP tool or a skill script) in the
+/// service's log: every one the owner scope admits is a row naming it.
 pub(crate) async fn note_target(orch: &Orchestrator, run: &authority::ServiceRun, target: &str) {
     let Ok(db) = crate::execution::routing::owning_db_for_project(&orch.db, &run.project_id).await
     else {

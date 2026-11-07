@@ -3,8 +3,7 @@
 
 use base64::Engine as _;
 
-use super::types::{McpCallSpec, RunItem, RunSpec};
-use crate::config::mcp_servers::McpServerConfig;
+use super::types::{McpCallSpec, McpRoute, RunItem, RunSpec};
 use crate::mcp::handlers::{skills_resources, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
@@ -106,10 +105,6 @@ pub(super) async fn resolve_run_item(
                     let spec = resolve_mcp_call(orch, run_context, server, resource, item).await;
                     (header, spec)
                 }
-                Some(CairnResource::ExecutorAction { name, action }) => (
-                    header,
-                    resolve_executor_action(name, action, item),
-                ),
                 Some(CairnResource::Response { response_id }) => (
                     header,
                     Ok(RunSpec::ResponseCall {
@@ -145,28 +140,6 @@ pub(super) async fn resolve_run_item(
         ["code"] => resolve_code_spec(item),
         _ => unreachable!("present holds only command/target/code"),
     }
-}
-
-fn resolve_executor_action(
-    executor_name: String,
-    action: String,
-    item: &RunItem,
-) -> Result<RunSpec, String> {
-    let args = match item.payload.as_ref().and_then(|payload| payload.args_json.clone()) {
-        None | Some(serde_json::Value::Null) => serde_json::json!({}),
-        Some(value @ serde_json::Value::Object(_)) => value,
-        Some(_) => return Err(format!(
-            "Executor action args (payload.args_json) for '{executor_name}/{action}' must be a JSON object of named arguments"
-        )),
-    };
-    Ok(RunSpec::ExecutorAction(Box::new(
-        super::types::ExecutorActionSpec {
-            executor_name,
-            action,
-            args,
-            timeout: item.timeout,
-        },
-    )))
 }
 
 fn resolve_matlab_spec(
@@ -454,7 +427,7 @@ async fn resolve_mcp_call(
     let tool = resource
         .ok_or_else(|| format!("MCP run target must name a tool: cairn://mcp/{server}/<tool>"))?;
 
-    let (config, credential_key) = resolve_mcp_server_config(orch, run_context, &server).await?;
+    let route = resolve_mcp_route(orch, run_context, &server).await?;
 
     // Named-argument object passed through to the server's tools/call. Default
     // to an empty object; reject non-object shapes with a clear message rather
@@ -471,26 +444,27 @@ async fn resolve_mcp_call(
 
     Ok(RunSpec::McpCall(Box::new(McpCallSpec {
         server,
-        credential_key,
         tool,
         args,
-        config,
         timeout: item.timeout,
+        route,
     })))
 }
 
-/// Resolve the authored config for a named MCP server from workspace + project
-/// settings (project overlays workspace), together with its scoped credential
-/// key.
+/// How a call reaches the named MCP server, resolved from workspace + project
+/// settings (project overlays workspace). A machine-service entry resolves
+/// whether or not a machine has it ready, and the batch routes it to one
+/// machine before anything runs ([`super::machine_route`]). Any other server
+/// resolves to its authored config and scoped credential key.
 ///
 /// Deliberately does *not* expand `${VAR}` references. The resolved spec is
 /// cloned, carried across a batch, and may be persisted on a suspend, so
 /// expansion happens through the broker at the gateway call instead.
-async fn resolve_mcp_server_config(
+async fn resolve_mcp_route(
     orch: &Orchestrator,
     run_context: Option<&RunContext>,
     server: &str,
-) -> Result<(McpServerConfig, String), String> {
+) -> Result<McpRoute, String> {
     // Resolve the run's project path for the project-level overlay; fall back to
     // workspace-only servers when there is no active run context.
     let project_path = match run_context {
@@ -499,6 +473,20 @@ async fn resolve_mcp_server_config(
             .ok(),
         None => None,
     };
+
+    match crate::config::mcp_servers::machine_service_entry_named(
+        &orch.config_dir,
+        project_path.as_deref(),
+        server,
+    ) {
+        Some(Ok(key)) => return Ok(McpRoute::MachineService { key, machine: None }),
+        Some(Err(reason)) => {
+            return Err(format!(
+                "MCP server '{server}' is a machine service that reaches no service: {reason}"
+            ))
+        }
+        None => {}
+    }
 
     let project_servers = project_path
         .as_deref()
@@ -513,28 +501,20 @@ async fn resolve_mcp_server_config(
 
     match servers.get(server) {
         Some(entry) => {
-            if let Some(refusal) = entry.machine_service_refusal(server, &machines) {
-                return Err(refusal);
-            }
             let project_scope = project_path
                 .as_deref()
                 .filter(|_| project_servers.contains_key(server));
             let credential_key = crate::config::secrets::credential_key(server, project_scope);
-            Ok((entry.config.clone(), credential_key))
+            Ok(McpRoute::Gateway {
+                credential_key,
+                config: entry.config.clone(),
+            })
         }
-        None => {
-            let mut names: Vec<&str> = servers.keys().map(|s| s.as_str()).collect();
-            names.sort_unstable();
-            let configured = if names.is_empty() {
-                "(none configured)".to_string()
-            } else {
-                names.join(", ")
-            };
-            Err(format!(
-                "Unknown MCP server '{server}'. Configured servers: {configured}. \
-                 Add it under `mcpServers` in ~/.cairn/settings.yaml or the project's .cairn/config.yaml."
-            ))
-        }
+        None => Err(crate::config::mcp_servers::unknown_server_refusal(
+            &orch.config_dir,
+            server,
+            servers.keys().map(String::as_str),
+        )),
     }
 }
 
@@ -545,8 +525,10 @@ async fn resolve_script_spec(
     target: &str,
     item: &RunItem,
 ) -> Result<RunSpec, String> {
-    let resource = cairn_common::uri::parse_uri(target)
-        .ok_or_else(|| format!("Invalid run target URI: {target}"))?;
+    let resource = cairn_common::uri::parse_uri(target).ok_or_else(|| {
+        cairn_common::uri::removed_executor_verb_refusal(target)
+            .unwrap_or_else(|| format!("Invalid run target URI: {target}"))
+    })?;
     let script_path = skills_resources::resolve_skill_script_path(orch, request, &resource).await?;
     let (program, mut args) = resolve_interpreter(&script_path)?;
     args.push(script_path.to_string_lossy().to_string());
@@ -611,45 +593,6 @@ fn resolve_interpreter(script_path: &std::path::Path) -> Result<(String, Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn executor_action_item(args_json: serde_json::Value) -> RunItem {
-        serde_json::from_value(serde_json::json!({
-            "target": "cairn://executors/bglab-ub/look",
-            "payload": { "args_json": args_json },
-            "timeout": 5000
-        }))
-        .expect("executor action run item")
-    }
-
-    #[test]
-    fn executor_action_resolution_preserves_address_args_and_timeout() {
-        let spec = resolve_executor_action(
-            "bglab-ub".into(),
-            "Look_Now".into(),
-            &executor_action_item(serde_json::json!({"app": "Finder"})),
-        )
-        .expect("valid action");
-        let RunSpec::ExecutorAction(spec) = spec else {
-            panic!("expected executor action spec")
-        };
-        assert_eq!(spec.executor_name, "bglab-ub");
-        assert_eq!(spec.action, "Look_Now");
-        assert_eq!(spec.args, serde_json::json!({"app": "Finder"}));
-        assert_eq!(spec.timeout, Some(5000));
-    }
-
-    #[test]
-    fn executor_action_resolution_rejects_positional_args() {
-        let error = resolve_executor_action(
-            "bglab-ub".into(),
-            "look".into(),
-            &executor_action_item(serde_json::json!(["Finder"])),
-        )
-        .err()
-        .expect("positional args must be rejected");
-        assert!(error.contains("payload.args_json"), "{error}");
-        assert!(error.contains("bglab-ub/look"), "{error}");
-    }
 
     #[test]
     fn resolve_interpreter_prefers_env_shebang() {

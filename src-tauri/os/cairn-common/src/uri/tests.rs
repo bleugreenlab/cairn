@@ -144,24 +144,44 @@ fn parses_symbol_resources_all_forms() {
     );
 }
 
+/// The executor verbs are gone, not aliased: their address is refused with the
+/// MCP server and selector that replace it, while the executor page still reads.
 #[test]
-fn an_executor_action_normalizes_only_the_machine_name() {
-    let expected = CairnResource::ExecutorAction {
-        name: "bglab-ub".to_string(),
-        action: "Look_Now".to_string(),
-    };
+fn an_executor_verb_address_is_refused_naming_its_replacement() {
     for uri in [
-        "cairn://executors/bglab-ub/Look_Now",
-        "cairn://executors/BGLab_UB/Look_Now",
+        "cairn://executors/local/look",
+        "cairn://executors/Local/look?x=1",
     ] {
-        assert_eq!(parse_uri(uri), Some(expected.clone()), "{uri}");
+        assert_eq!(parse_uri(uri), None, "{uri}");
+        let refusal = parse_resource_uri(uri).unwrap_err();
+        assert!(refusal.contains("cairn://mcp/axon/look"), "{refusal}");
+        assert!(refusal.contains("executor:{name:\"local\"}"), "{refusal}");
+        assert!(
+            refusal.starts_with("`cairn://executors/local/look` was removed"),
+            "{refusal}"
+        );
     }
-    assert_eq!(expected.to_uri(), "cairn://executors/bglab-ub/Look_Now");
-    assert_eq!(expected.kind(), ResourceKind::ExecutorAction);
-    assert_eq!(expected.project(), None);
-    assert_eq!(expected.to_route(), None);
-    assert_eq!(parse_uri("cairn://executors/bglab-ub/"), None);
-    assert_eq!(parse_uri("cairn://executors/---/look"), None);
+    assert!(
+        removed_executor_verb_refusal("cairn://executors/local/look/extra")
+            .unwrap()
+            .contains("cairn://mcp/axon/look\"")
+    );
+    assert_eq!(
+        removed_executor_verb_refusal("cairn://executors/local"),
+        None
+    );
+    assert_eq!(
+        removed_executor_verb_refusal("cairn://executors/local/"),
+        None
+    );
+    assert_eq!(
+        parse_resource_uri("cairn://executors/local")
+            .unwrap()
+            .map(|uri| uri.resource),
+        Some(CairnResource::Executor {
+            name: "local".to_string()
+        })
+    );
 }
 
 #[test]

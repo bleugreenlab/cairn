@@ -212,16 +212,13 @@ impl ModelDoor {
 }
 
 /// True for an item that runs on the host and cannot suspend past the grace
-/// window: a REPL send, an executor action, or a model door that keeps the
-/// host-item cap ([`ModelDoor::outlives_grace`]).
+/// window: a REPL send, or a model door that keeps the host-item cap
+/// ([`ModelDoor::outlives_grace`]).
 pub fn is_host_clamped_item(repl: bool, target: Option<&str>) -> bool {
-    repl || match target.and_then(parse_uri) {
-        Some(CairnResource::ExecutorAction { .. }) => true,
-        Some(resource) => {
-            ModelDoor::for_resource(&resource).is_some_and(|door| !door.outlives_grace())
-        }
-        None => false,
-    }
+    repl || target
+        .and_then(parse_uri)
+        .and_then(|resource| ModelDoor::for_resource(&resource))
+        .is_some_and(|door| !door.outlives_grace())
 }
 
 #[cfg(test)]

@@ -50,6 +50,9 @@ pub fn parse_resource_uri(uri: &str) -> Result<Option<CairnResourceUri>, String>
     if identity.starts_with("cairn://p/") && identity.split('/').nth(4) == Some("t") {
         return Err("thread /t/ aliases have been retired; use cairn://p/PROJECT/<name>".into());
     }
+    if let Some(refusal) = removed_executor_verb_refusal(identity) {
+        return Err(refusal);
+    }
     let Some(resource) = parse_uri(identity) else {
         return Ok(None);
     };
@@ -58,6 +61,26 @@ pub fn parse_resource_uri(uri: &str) -> Result<Option<CairnResourceUri>, String>
         .transpose()?
         .unwrap_or_default();
     Ok(Some(CairnResourceUri { resource, params }))
+}
+
+/// The refusal for a `cairn://executors/<name>/<verb>` address, which is gone:
+/// desktop automation is the MCP server `cairn://mcp/axon`, and the batch's
+/// `executor` selector chooses the machine. One capability keeps one address,
+/// so the old one is refused with the new one rather than aliased to it.
+pub fn removed_executor_verb_refusal(uri: &str) -> Option<String> {
+    let identity = uri.split_once('?').map_or(uri, |(identity, _)| identity);
+    let rest = identity.strip_prefix("cairn://executors/")?;
+    let (name, verb) = rest.split_once('/')?;
+    let verb = verb.split('/').next().unwrap_or_default();
+    if verb.is_empty() {
+        return None;
+    }
+    let name = cairn_executor_name(name).unwrap_or_else(|| name.to_string());
+    Some(format!(
+        "`cairn://executors/{name}/{verb}` was removed: desktop automation is the MCP server \
+         `cairn://mcp/axon`. Run {{executor:{{name:\"{name}\"}}, commands:[{{target:\"cairn://mcp/axon/{verb}\", \
+         payload:{{args_json:{{…}}}}}}]}}; read `cairn://mcp/axon` for each machine's tools."
+    ))
 }
 
 pub fn parse_uri(uri: &str) -> Option<CairnResource> {
@@ -183,12 +206,6 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         // machine.
         ["executors", name] => {
             cairn_executor_name(name).map(|name| CairnResource::Executor { name })
-        }
-        ["executors", name, action] => {
-            cairn_executor_name(name).map(|name| CairnResource::ExecutorAction {
-                name,
-                action: (*action).to_string(),
-            })
         }
         ["bug"] => Some(CairnResource::Bug),
         ["self-rebuild"] => Some(CairnResource::SelfRebuild),

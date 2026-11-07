@@ -2612,13 +2612,6 @@ async fn render_resource_body(
                 }
             }
         }
-        CairnResource::ExecutorAction { name, action } => {
-            if let Some(error) = reject_query_params("executor action", &params) {
-                error
-            } else {
-                render_executor_action_contract(orch, &name, &action).await
-            }
-        }
         CairnResource::Project { project } => {
             if find_query_value(&params, "search").is_some() {
                 read_project_search(orch, &project, &params).await
@@ -3837,12 +3830,16 @@ fn render_help(params: &[QueryParam]) -> String {
 /// from, and the state it is in, derived now.
 fn render_machine_services(orch: &Orchestrator, name: &str) -> String {
     let instances = crate::project_services::supervisor::machine::instances_on(orch, name);
-    machine_services_section(name, &instances)
+    let servers = crate::config::mcp_servers::machine_service_server_names(&orch.config_dir, None);
+    machine_services_section(name, &instances, &servers)
 }
 
+/// `servers` names the MCP server each service is reached at, so the page says
+/// the address an agent calls on this machine rather than the service key.
 fn machine_services_section(
     name: &str,
     instances: &[crate::project_services::supervisor::machine::MachineServiceInstance],
+    servers: &std::collections::BTreeMap<cairn_config::fleet::MachineServiceKey, Vec<String>>,
 ) -> String {
     if instances.is_empty() {
         return format!(
@@ -3860,10 +3857,16 @@ fn machine_services_section(
         if let Some(at) = instance.probed_at_ms {
             out.push_str(&format!("  - Probed: {}\n", crate::clock::age_millis(at)));
         }
-        if instance.serves_mcp && !instance.catalog.is_empty() {
-            out.push_str("  - Verbs:\n");
-            for tool in &instance.catalog {
-                out.push_str(&format!("    - cairn://executors/{name}/{}\n", tool.name));
+        if instance.serves_mcp {
+            let tools = match instance.catalog.len() {
+                0 => "tools appear after its next probe".to_string(),
+                1 => "1 tool".to_string(),
+                n => format!("{n} tools"),
+            };
+            for server in servers.get(&instance.key).into_iter().flatten() {
+                out.push_str(&format!(
+                    "  - MCP: cairn://mcp/{server} ({tools}) — run with executor:{{name:\"{name}\"}}\n"
+                ));
             }
         }
     }
@@ -3905,23 +3908,6 @@ fn machine_services_overview(
         out.push_str(&format!("- {key}: {}\n", machines.join(", ")));
     }
     out
-}
-
-async fn render_executor_action_contract(orch: &Orchestrator, name: &str, action: &str) -> String {
-    let instances = crate::project_services::supervisor::machine::instances_on(orch, name);
-    let Some(tool) = instances
-        .iter()
-        .flat_map(|instance| instance.catalog.iter())
-        .find(|tool| tool.name == action)
-        .cloned()
-    else {
-        return format!("`{name}` advertises no `{action}` yet. Read cairn://executors/{name} for its machine services and their verbs.");
-    };
-    let description = tool
-        .description
-        .unwrap_or_else(|| "No description provided.".into());
-    let schema = serde_json::to_string_pretty(&tool.input_schema).unwrap_or_else(|_| "{}".into());
-    format!("# cairn://executors/{name}/{action}\n\n{description}\n\n## Input schema\n\n```json\n{schema}\n```\n\nRun with `{{target:\"cairn://executors/{name}/{action}\", payload:{{args_json:{{...}}}}}}`.")
 }
 
 #[cfg(test)]
@@ -3991,6 +3977,10 @@ mod tests {
     #[test]
     fn the_executor_page_says_what_runs_where_it_came_from_and_its_state() {
         use crate::project_services::supervisor::machine::InstanceState;
+        let servers = std::collections::BTreeMap::from([(
+            "axon/axon".parse().unwrap(),
+            vec!["axon".to_string()],
+        )]);
         let page = machine_services_section(
             "local",
             &[
@@ -4008,6 +3998,7 @@ mod tests {
                     "not installed: artifact unavailable",
                 ),
             ],
+            &servers,
         );
         for line in [
             "- axon/axon: ready",
@@ -4015,11 +4006,12 @@ mod tests {
             "  - Runs: installed 0.3.6 (pack)",
             "- axon/axon: not installed: artifact unavailable",
             "  - Runs: not installed: artifact unavailable",
-            "    - cairn://executors/local/look",
+            "  - MCP: cairn://mcp/axon (1 tool) — run with executor:{name:\"local\"}",
         ] {
             assert!(page.contains(line), "{line}\n{page}");
         }
-        assert!(machine_services_section("local", &[]).contains("None selected"));
+        assert!(!page.contains("cairn://executors/local/"), "{page}");
+        assert!(machine_services_section("local", &[], &servers).contains("None selected"));
     }
 
     #[test]

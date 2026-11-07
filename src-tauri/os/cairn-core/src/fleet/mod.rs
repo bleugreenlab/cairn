@@ -20865,7 +20865,6 @@ fn serialize_process_batch(
                 stdin,
             } => (ProcessBatchExecution::Direct, program, args, stdin, timeout),
             RunSpec::McpCall(_)
-            | RunSpec::ExecutorAction(_)
             | RunSpec::ResponseCall { .. }
             | RunSpec::ModelDoor { .. }
             | RunSpec::ReplSend { .. } => {

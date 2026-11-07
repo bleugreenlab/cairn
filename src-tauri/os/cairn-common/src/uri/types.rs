@@ -1016,11 +1016,6 @@ pub enum CairnResource {
     Executor {
         name: String,
     },
-    /// One machine-local action exposed by an enrolled executor.
-    ExecutorAction {
-        name: String,
-        action: String,
-    },
     /// Every journaled authority grant in this workspace, plus the recent
     /// authorization decisions that cite them.
     Grants,
@@ -1267,7 +1262,6 @@ impl CairnResource {
             Self::ChannelsAmbientFeedback => ResourceKind::ChannelsAmbientFeedback,
             Self::Executors => ResourceKind::Executors,
             Self::Executor { .. } => ResourceKind::Executor,
-            Self::ExecutorAction { .. } => ResourceKind::ExecutorAction,
             Self::Grants => ResourceKind::Grants,
             Self::Grant { .. } => ResourceKind::Grant,
             Self::Models => ResourceKind::Models,

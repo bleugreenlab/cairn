@@ -244,30 +244,17 @@ pub(crate) struct ResolvedMcpServer {
 }
 
 impl ResolvedMcpServer {
-    /// Why the gateway cannot reach this entry: `cairn://mcp/<name>` does not
-    /// route to a machine service yet, so a read or a call is told which
-    /// machines serve it and today's working address. `None` for any other entry.
-    pub(crate) fn machine_service_refusal(
-        &self,
-        name: &str,
-        machines: &MachineServiceSnapshot,
-    ) -> Option<String> {
+    /// The instance set a `machine-service` entry reaches; `None` for any other
+    /// entry, which the gateway connects to by its config.
+    pub(crate) fn service_key(&self) -> Option<MachineServiceKey> {
         if self.config.transport != MACHINE_SERVICE_TRANSPORT {
             return None;
         }
-        let ready = MachineServiceKey::new(
+        MachineServiceKey::new(
             self.service_pack.as_deref()?,
             self.config.service.as_deref()?,
         )
         .ok()
-        .map(|key| machines.ready_on(&key).join(", "))
-        .unwrap_or_default();
-        Some(format!(
-            "MCP server '{name}' is a machine service, and `cairn://mcp/{name}` does not route to \
-             one yet. It is ready on {ready}. Reach it today at \
-             `cairn://executors/<machine>/<verb>`; read `cairn://executors/<machine>` for the \
-             verbs it serves."
-        ))
     }
 
     /// `user` for a definition the user authored, `pack:{id}` for one a pack
@@ -324,6 +311,101 @@ pub(crate) fn resolve_mcp_server_entries(
             ))
         })
         .collect()
+}
+
+/// The machine service the enabled entry `name` reaches, whether or not any
+/// machine has it ready: `Some(Ok(key))` for a valid `machine-service` entry,
+/// `Some(Err(reason))` for one that cannot reach a service, and `None` when
+/// `name` is not a `machine-service` entry at all.
+///
+/// Readiness is deliberately not consulted. [`resolve_mcp_server_entries`]
+/// withholds a machine service no machine has ready, which is right for a
+/// connection list and the prompt, but a call or a read naming it must still be
+/// told which machines it is selected on and what state each is in.
+pub(crate) fn machine_service_entry_named(
+    config_dir: &Path,
+    project_path: Option<&Path>,
+    name: &str,
+) -> Option<Result<MachineServiceKey, String>> {
+    let entry = authored_mcp_servers(config_dir, project_path).remove(name)?;
+    if entry.config.transport != MACHINE_SERVICE_TRANSPORT {
+        return None;
+    }
+    Some(match entry.service_pack.as_deref() {
+        None => Err("no installed pack ships this entry, so `service` names nothing".to_string()),
+        Some(pack) => {
+            super::machine_services::machine_service_entry(config_dir, pack, &entry.config)
+        }
+    })
+}
+
+/// Every enabled `machine-service` entry's name, keyed by the service it
+/// reaches, for a surface that starts from the service (an executor's page)
+/// and must name the address an agent calls.
+pub(crate) fn machine_service_server_names(
+    config_dir: &Path,
+    project_path: Option<&Path>,
+) -> BTreeMap<MachineServiceKey, Vec<String>> {
+    let mut names: BTreeMap<MachineServiceKey, Vec<String>> = BTreeMap::new();
+    for (name, entry) in authored_mcp_servers(config_dir, project_path) {
+        if entry.config.transport != MACHINE_SERVICE_TRANSPORT {
+            continue;
+        }
+        if let Some(key) = entry.service_key() {
+            names.entry(key).or_default().push(name);
+        }
+    }
+    for list in names.values_mut() {
+        list.sort();
+    }
+    names
+}
+
+/// The bundled pack that offers the MCP server `name` while it is not
+/// installed, as `(id, display name)`: what an unknown-server refusal points
+/// at instead of telling the agent to author the server itself.
+pub(crate) fn offering_pack(config_dir: &Path, name: &str) -> Option<(String, String)> {
+    let resource_dir = cairn_packs::source_dir(config_dir)?;
+    cairn_packs::discover_available_packs(&resource_dir)
+        .into_iter()
+        .filter(|manifest| {
+            cairn_packs::lock::read_lock(config_dir, &manifest.id).is_none()
+                || cairn_packs::lock::is_uninstalled(config_dir, &manifest.id)
+        })
+        .find(|manifest| {
+            manifest
+                .mcp_source()
+                .and_then(|path| cairn_packs::mcp::parse_pack_mcp_file(&path).ok())
+                .is_some_and(|file| file.servers.contains_key(name))
+        })
+        .map(|manifest| (manifest.id, manifest.name))
+}
+
+/// The refusal for a call or read naming a server nothing configures:
+/// `configured` lists what is, and a bundled pack that offers `server` is named
+/// with where the operator installs it.
+pub(crate) fn unknown_server_refusal<'a>(
+    config_dir: &Path,
+    server: &str,
+    configured: impl IntoIterator<Item = &'a str>,
+) -> String {
+    if let Some((id, pack)) = offering_pack(config_dir, server) {
+        return format!(
+            "MCP server '{server}' is provided by the {pack} pack, which is not installed. \
+             Install it from Settings → Library (`cairn://packs/{id}`)."
+        );
+    }
+    let mut names: Vec<&str> = configured.into_iter().collect();
+    names.sort_unstable();
+    let configured = if names.is_empty() {
+        "(none configured)".to_string()
+    } else {
+        names.join(", ")
+    };
+    format!(
+        "Unknown MCP server '{server}'. Configured servers: {configured}. \
+         Add it under `mcpServers` in ~/.cairn/settings.yaml or the project's .cairn/config.yaml."
+    )
 }
 
 /// The raw `mcpServers` block of `~/.cairn/settings.yaml` — the servers the user
@@ -887,18 +969,63 @@ mod tests {
             assert_eq!(verdict(&home, &machines), None);
         }
 
+        /// A call or read naming a machine service resolves it whatever its
+        /// machines' states, so it can be told about them; the connection list
+        /// still withholds it until one is ready.
         #[test]
-        fn a_refusal_names_the_ready_machines_and_todays_address() {
+        fn a_machine_service_entry_resolves_by_name_whether_or_not_it_is_ready() {
             let (_dir, home) = workspace();
-            let machines = snapshot(&[("m1", InstanceState::Ready)]);
-            let entries = resolve_mcp_server_entries(&home, None, &machines);
-            let refusal = entries["probe-mcp"]
-                .machine_service_refusal("probe-mcp", &machines)
-                .unwrap();
-            assert!(refusal.contains("ready on m1"), "{refusal}");
+            assert_eq!(
+                machine_service_entry_named(&home, None, "probe-mcp"),
+                Some(Ok(key()))
+            );
             assert!(
-                refusal.contains("cairn://executors/<machine>/<verb>"),
-                "{refusal}"
+                !resolve_mcp_servers(&home, None, &MachineServiceSnapshot::empty())
+                    .contains_key("probe-mcp")
+            );
+            assert_eq!(machine_service_entry_named(&home, None, "other"), None);
+            assert_eq!(
+                machine_service_server_names(&home, None),
+                BTreeMap::from([(key(), vec!["probe-mcp".to_string()])])
+            );
+
+            let (_dir, home) = installed(&[], ENTRY);
+            assert_eq!(
+                machine_service_entry_named(&home, None, "probe-mcp"),
+                Some(Err(
+                    "`service: probe` names no service this pack ships".to_string()
+                ))
+            );
+        }
+
+        /// A server only an uninstalled bundled pack offers is refused by
+        /// pointing at the pack, not at authoring the server by hand.
+        #[test]
+        fn an_unknown_server_a_bundled_pack_offers_points_at_installing_it() {
+            let dir = TempDir::new().unwrap();
+            let resources = dir.path().join("resources");
+            let root = resources.join("packs/kit");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("cairn-pack.yaml"),
+                "id: kit\nname: Kit\nversion: 1.0.0\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("mcp.yaml"), ENTRY).unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            cairn_packs::record_source_dir(&crate::services::RealFileSystem, &resources, &home)
+                .unwrap();
+
+            let refusal = unknown_server_refusal(&home, "probe-mcp", ["github"]);
+            assert_eq!(
+                refusal,
+                "MCP server 'probe-mcp' is provided by the Kit pack, which is not installed. \
+                 Install it from Settings → Library (`cairn://packs/kit`)."
+            );
+            let unknown = unknown_server_refusal(&home, "nothing", ["github"]);
+            assert!(
+                unknown.starts_with("Unknown MCP server 'nothing'. Configured servers: github.")
             );
         }
 

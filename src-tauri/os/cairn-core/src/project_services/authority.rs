@@ -65,7 +65,7 @@ pub(crate) enum DelegatedScope {
     /// A thread's service called by that thread itself: its schedule, its
     /// session, or one of its tasks. Everything [`DelegatedScope::ProjectAgent`]
     /// admits for the thread, plus the `target` items the thread can use from a
-    /// turn: MCP tools, skill scripts, and executor verbs, each under the
+    /// turn: MCP tools (a machine service's included) and skill scripts, each under the
     /// target's own gates and each logged. A service call has no turn to answer
     /// a prompt, so one that would prompt is refused instead (tenet 1313's
     /// ruling on cairn/5624).
@@ -779,7 +779,7 @@ fn writable(resource: &CairnResource, mode: &str) -> bool {
 }
 
 /// Whether `target` names something an owner-scoped call may invoke as a
-/// `run` item: an MCP tool, a skill script, or an executor verb.
+/// `run` item: an MCP tool or a skill script.
 fn is_owner_target(target: &str) -> bool {
     let target = without_query(target);
     let parts = |prefix: &str| -> Option<Vec<String>> {
@@ -788,14 +788,9 @@ fn is_owner_target(target: &str) -> bool {
             .map(|rest| rest.split('/').map(str::to_string).collect())
     };
     let named = |segments: &[String]| segments.iter().all(|segment| !segment.is_empty());
-    match (
-        parts("cairn://mcp/"),
-        parts("cairn://skills/"),
-        parts("cairn://executors/"),
-    ) {
-        (Some(mcp), _, _) => mcp.len() == 2 && named(&mcp),
-        (_, Some(skill), _) => skill.len() == 3 && skill[1] == "scripts" && named(&skill),
-        (_, _, Some(executor)) => executor.len() == 2 && named(&executor),
+    match (parts("cairn://mcp/"), parts("cairn://skills/")) {
+        (Some(mcp), _) => mcp.len() == 2 && named(&mcp),
+        (_, Some(skill)) => skill.len() == 3 && skill[1] == "scripts" && named(&skill),
         _ => false,
     }
 }
@@ -840,12 +835,13 @@ fn classify_delegated(
                 // A call reads the project's records and the public web; never
                 // files, which resolve against a cwd the caller supplies.
                 // The owning thread may also read what it may invoke: an MCP
-                // server's tools, an executor's verbs, a skill's scripts.
+                // server's tools (a machine service's per machine) and a
+                // skill's scripts.
                 let allowed = target.starts_with("https://")
                     || target.starts_with("http://")
                     || project_resource(run, target).is_some()
                     || (owner_targets
-                        && ["cairn://mcp", "cairn://executors", "cairn://skills"]
+                        && ["cairn://mcp", "cairn://skills"]
                             .iter()
                             .any(|root| is_at_or_under(target, root)));
                 if !allowed {
@@ -897,8 +893,7 @@ fn classify_delegated(
 enum RunCaller {
     /// Another agent's call: `command` and `code` items.
     Agent,
-    /// The owning thread's own call: also its MCP tools, skill scripts, and
-    /// executor verbs.
+    /// The owning thread's own call: also its MCP tools and skill scripts.
     Owner,
     /// A page's call: `command` and `code` items only, with nothing that
     /// chooses where or against what they run, since placement does that.
@@ -961,9 +956,9 @@ fn classify_run(
             if !is_owner_target(target) {
                 return Err(refused(format!(
                     "run `{target}`: a call may invoke an MCP tool \
-                     (cairn://mcp/<server>/<tool>), a skill script \
-                     (cairn://skills/<id>/scripts/<name>), or an executor verb \
-                     (cairn://executors/<name>/<verb>), and nothing else"
+                     (cairn://mcp/<server>/<tool>, a machine service's on the machine its \
+                     batch's executor names) or a skill script \
+                     (cairn://skills/<id>/scripts/<name>), and nothing else"
                 )));
             }
         }
@@ -1219,7 +1214,7 @@ mod tests {
         let target = |target: &str| json!({"commands": [{"target": target}]});
         for allowed in [
             "cairn://mcp/cairn-bugs/list_reports",
-            "cairn://executors/local/look",
+            "cairn://mcp/axon/look",
             "cairn://skills/testing/scripts/run-coverage",
         ] {
             assert!(
@@ -1240,6 +1235,7 @@ mod tests {
             "cairn://responses/summarize",
             "cairn://mcp/cairn-bugs",
             "cairn://executors/local",
+            "cairn://executors/local/look",
             "cairn://p/cairn/spanish/procedures/collect",
         ] {
             assert!(
@@ -1266,11 +1262,17 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            run_targets(
-                &json!({"commands": [{"code": "1"}, {"target": "cairn://executors/local/look"}]})
-            ),
-            vec!["cairn://executors/local/look".to_string()]
+            run_targets(&json!({"commands": [{"code": "1"}, {"target": "cairn://mcp/axon/look"}]})),
+            vec!["cairn://mcp/axon/look".to_string()]
         );
+        // The batch's executor chooses which machine serves a machine-service
+        // call, so an owner's call may carry one.
+        assert!(classify(
+            &owner,
+            "run",
+            &json!({"executor": {"name": "local"}, "commands": [{"target": "cairn://mcp/axon/look"}]})
+        )
+        .is_ok());
     }
 
     fn page_call() -> ServiceRun {
@@ -1429,7 +1431,7 @@ mod tests {
             json!({"commands": [{"command": "true"}], "executor": {"name": "local"}}),
             json!({"commands": [{"command": "true"}], "conflict_markers_reason": "x"}),
             json!({"commands": [{"target": "cairn://mcp/cairn-bugs/list_reports"}]}),
-            json!({"commands": [{"target": "cairn://executors/local/look"}]}),
+            json!({"commands": [{"target": "cairn://mcp/axon/look"}]}),
             json!({"commands": [{"target": "cairn://skills/testing/scripts/run-coverage"}]}),
             json!({"commands": [{"target": "cairn://workflows/release", "background": true}]}),
             json!({"commands": [{"code": "1", "interpreter": "python", "repl": "py"}]}),

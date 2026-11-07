@@ -1591,9 +1591,6 @@ impl CairnResource {
             Self::InferenceGenerations => "cairn://inference/generations".to_string(),
             Self::InferenceGeneration { id } => format!("cairn://inference/generations/{id}"),
             Self::Executor { name } => format!("cairn://executors/{name}"),
-            Self::ExecutorAction { name, action } => {
-                format!("cairn://executors/{name}/{action}")
-            }
             Self::Bug => "cairn://bug".to_string(),
             Self::SelfRebuild => build_self_rebuild_uri(),
             Self::SelfRebuildOutcome { id } => build_self_rebuild_outcome_uri(id),

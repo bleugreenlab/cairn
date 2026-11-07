@@ -102,17 +102,6 @@ pub(crate) const CHANNELS_AMBIENT_FEEDBACK_CONTRACT: ResourceContract = Resource
     }],
 };
 
-pub(crate) const EXECUTOR_ACTION_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ExecutorAction,
-    uri_template: "cairn://executors/{name}/{action}",
-    name: "Executor action",
-    description: "One machine-local action from an executor's cached tool catalog. Read the URI for its description and input schema; invoke it through run with payload.args_json containing an object of named arguments.",
-    read_projections: NO_PROJECTIONS,
-    related: NO_RELATED,
-    cross_actions: NO_CROSS_ACTIONS,
-    mutations: NO_MUTATIONS,
-};
-
 pub(crate) const DEV_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Dev,
@@ -313,7 +302,7 @@ pub(crate) const MCP_CONTRACT: ResourceContract =
         kind: ResourceKind::Mcp,
         uri_template: "cairn://mcp/{server}/{tool-or-resource}",
         name: "External MCP gateway",
-        description: "Configured external MCP servers reached through Cairn as a client. read cairn://mcp lists servers; read cairn://mcp/<server> shows the calling run's connection to it (connected, not connected, or closed, plus how its last server process ended and that process's last stderr lines), tool inputSchemas, and resources; read cairn://mcp/<server>/<resource-uri> proxies resources/read. Invoke a tool with run {target:\"cairn://mcp/<server>/<tool>\", payload:{args_json:{...}}} (every tools/call goes through run, never write). write cairn://mcp manages the server registry: create a new server, patch or delete one by name. A patch with action:restart instead drops the calling run's pooled connection to that server so its next call reconnects; a call already finds and replaces a closed connection on its own, so restart is for a server that is alive but wedged. A workspace-scope write edits ~/.cairn/settings.yaml and is gated by the same worktree fence as any out-of-worktree write; a project-scope write edits the run's .cairn/config.yaml in place.",
+        description: "Configured external MCP servers reached through Cairn as a client. read cairn://mcp lists servers; read cairn://mcp/<server> shows the calling run's connection to it (connected, not connected, or closed, plus how its last server process ended and that process's last stderr lines), tool inputSchemas, and resources; read cairn://mcp/<server>/<resource-uri> proxies resources/read. Invoke a tool with run {target:\"cairn://mcp/<server>/<tool>\", payload:{args_json:{...}}} (every tools/call goes through run, never write). A machine-service server (such as axon, desktop automation) runs on many machines, each with its own catalog: read cairn://mcp/<server> renders one section per machine and its state, never merged, and run's call-level executor:{name} or {os} chooses which machine serves the batch's calls (required when several serve it; the node default never chooses it). write cairn://mcp manages the server registry: create a new server, patch or delete one by name. A patch with action:restart instead drops the calling run's pooled connection to that server so its next call reconnects; a call already finds and replaces a closed connection on its own, so restart is for a server that is alive but wedged. A workspace-scope write edits ~/.cairn/settings.yaml and is gated by the same worktree fence as any out-of-worktree write; a project-scope write edits the run's .cairn/config.yaml in place.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,

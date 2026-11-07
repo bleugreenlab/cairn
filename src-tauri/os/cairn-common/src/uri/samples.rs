@@ -453,7 +453,6 @@ resource_samples! {
     ChannelsAmbientFeedback {} => Parser,
     Executors {} => Parser,
     Executor { name: "mac-mini".to_string() } => Parser,
-    ExecutorAction { name: "mac-mini".to_string(), action: "restart".to_string() } => Parser,
     Grants {} => Parser,
     Grant { id: "grant-1".to_string() } => Parser,
     Models {} => Parser,

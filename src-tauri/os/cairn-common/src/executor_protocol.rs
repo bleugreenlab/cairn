@@ -5609,6 +5609,16 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/5991 does not move the number. It removes the
+/// `cairn://executors/<name>/<verb>` address from the shared URI grammar and
+/// the run contract's host-clamped item list, and desktop automation becomes
+/// the MCP server `cairn://mcp/axon`. Both are runner-side decisions about
+/// which items a batch holds: an executor never received an executor-verb
+/// item, because a host item is never dispatched to a cell, and a machine
+/// service's resident is reached through the existing service-lease frames. No
+/// frame, variant or field changes, so a runner talking to an older executor
+/// gets nothing wrong.
+///
 /// cairn/6090 does not move the number. An operator Compact's job-wide cancel
 /// now spares the job's check requests, reading the `priority` field
 /// the runner already holds, so the runner sends `Cancel` for fewer requests

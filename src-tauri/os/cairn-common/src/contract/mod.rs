@@ -124,7 +124,6 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     inference::INFERENCE_TEMPLATE_CONTRACT,
     inference::INFERENCE_GENERATIONS_CONTRACT,
     inference::INFERENCE_GENERATION_CONTRACT,
-    globals::EXECUTOR_ACTION_CONTRACT,
     globals::MCP_CONTRACT,
     globals::HELP_CONTRACT,
     globals::WEB_SEARCH_CONTRACT,

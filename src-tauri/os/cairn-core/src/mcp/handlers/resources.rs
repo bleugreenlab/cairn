@@ -78,6 +78,7 @@ pub(crate) fn resource_uri_hint(uri: &str) -> Option<String> {
     thread_db_hint(uri)
         .or_else(|| task_terminal_hint(uri))
         .or_else(|| inference_recipes_hint(uri))
+        .or_else(|| cairn_common::uri::removed_executor_verb_refusal(uri))
 }
 
 /// Name the address inference recipes moved to when they became profiles, so

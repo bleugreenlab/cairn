@@ -1827,8 +1827,8 @@ async fn a_scheduled_method_runs_as_its_thread_with_no_turn() {
     );
     // A batch the method starts carries the call's run (`CAIRN_RUN_ID`), so the
     // SDK calls inside it are held to this same delegation. The owning thread's
-    // own call runs `code` items and its tool targets (an MCP tool, an
-    // executor verb), each logged; a workflow is still refused.
+    // own call runs `code` items and its tool targets (MCP tools, a machine
+    // service's included), each logged; a workflow is still refused.
     let run_of = |item: Value| McpCallbackRequest {
         tool: "run".into(),
         payload: json!({"commands": [item]}),
@@ -1842,7 +1842,7 @@ async fn a_scheduled_method_runs_as_its_thread_with_no_turn() {
     .await
     .is_none());
     for target in [
-        "cairn://executors/local/look",
+        "cairn://mcp/axon/look",
         "cairn://mcp/cairn-bugs/list_reports",
     ] {
         assert!(
@@ -1861,7 +1861,7 @@ async fn a_scheduled_method_runs_as_its_thread_with_no_turn() {
     assert!(workflow.contains("and nothing else"), "{workflow}");
     let log = tutor_log(&h).await;
     for target in [
-        "cairn://executors/local/look",
+        "cairn://mcp/axon/look",
         "cairn://mcp/cairn-bugs/list_reports",
     ] {
         assert!(
@@ -2841,8 +2841,9 @@ async fn a_page_of_the_thread_gets_no_tool_targets() {
 
 /// A service's tool targets are host batches. The branch a service's batch
 /// defaults to is the base tip of a tree it does not have here, so a run of
-/// an MCP tool or an executor verb reaches its dispatch instead of being
-/// refused for that branch; a branch the service names is still refused.
+/// an MCP tool reaches its dispatch instead of being refused for that branch;
+/// a branch the service names is still refused, and the removed executor-verb
+/// address is refused naming what replaced it.
 #[tokio::test]
 async fn a_service_tool_target_reaches_dispatch_without_a_branch() {
     let h = thread_harness().await;
@@ -2899,8 +2900,9 @@ async fn a_service_tool_target_reaches_dispatch_without_a_branch() {
     .await;
     assert!(!executor.contains("branch option"), "{executor}");
     assert!(
-        executor.contains(at_dispatch),
-        "the executor verb reached its dispatch: {executor}"
+        executor.contains("`cairn://executors/nowhere/look` was removed")
+            && executor.contains("cairn://mcp/axon/look"),
+        "the removed executor verb is refused naming its replacement: {executor}"
     );
 
     let explicit = crate::mcp::handlers::run::handle_run(
@@ -3587,5 +3589,482 @@ async fn an_instance_keeps_one_facade_and_each_connection_gets_a_fresh_process()
     assert!(
         alpha.state.lock().unwrap().crashes.is_empty(),
         "letting a resident go is not a crash"
+    );
+}
+
+// Machine services as MCP servers: `cairn://mcp/<server>/<tool>` routed to one
+// machine's resident by the batch's executor selector.
+
+/// A gateway that answers every placed call at once and records which
+/// machine's facade each one went to, with the bound it was handed.
+#[derive(Default)]
+struct PlacedCalls {
+    calls: StdMutex<Vec<(String, String, Option<u32>)>>,
+    /// How long each call takes. It holds `slot` meanwhile, as the real
+    /// gateway holds a machine's one connection for the whole call.
+    delay: StdMutex<std::time::Duration>,
+    slot: tokio::sync::Mutex<()>,
+    /// Answer with a request for follow-up input instead of a result.
+    asks_for_input: std::sync::atomic::AtomicBool,
+    /// A call whose future was dropped before it answered, which is what
+    /// cancels the request at a real resident.
+    abandoned: std::sync::atomic::AtomicBool,
+}
+
+impl PlacedCalls {
+    fn calls(&self) -> Vec<(String, String, Option<u32>)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+/// Marks its call abandoned when dropped before it is disarmed.
+struct Unanswered<'a>(&'a std::sync::atomic::AtomicBool, bool);
+
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        if !self.1 {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mcp::gateway::McpGateway for PlacedCalls {
+    async fn call_placed_tool_once(
+        &self,
+        facade: Arc<dyn crate::mcp::gateway::PlacedFacade>,
+        tool: &str,
+        _: Value,
+        timeout_ms: Option<u32>,
+    ) -> Result<crate::mcp::gateway::McpCallOutcome, String> {
+        let key = facade.key().to_string();
+        self.calls
+            .lock()
+            .unwrap()
+            .push((key.clone(), tool.to_string(), timeout_ms));
+        if self
+            .asks_for_input
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(crate::mcp::gateway::McpCallOutcome::InputRequired {
+                input_requests: json!({}),
+                request_state: None,
+            });
+        }
+        let mut pending = Unanswered(&self.abandoned, false);
+        let _held = self.slot.lock().await;
+        let delay = *self.delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
+        pending.1 = true;
+        Ok(crate::mcp::gateway::McpCallOutcome::Complete(
+            crate::mcp::gateway::McpToolCallResult::from_text(&format!("{tool} answered on {key}")),
+        ))
+    }
+    async fn list_tools(
+        &self,
+        _: &str,
+        _: &str,
+        _: &crate::security::BrokeredMcpConfig,
+    ) -> Result<crate::mcp::gateway::McpToolCatalog, String> {
+        Ok(Default::default())
+    }
+    async fn list_resources(
+        &self,
+        _: &str,
+        _: &str,
+        _: &crate::security::BrokeredMcpConfig,
+    ) -> Result<Vec<crate::mcp::gateway::McpResourceDef>, String> {
+        Ok(Vec::new())
+    }
+    async fn read_resource(
+        &self,
+        _: &str,
+        _: &str,
+        _: &crate::security::BrokeredMcpConfig,
+        _: &str,
+    ) -> Result<String, String> {
+        Ok(String::new())
+    }
+    async fn call_tool_once(
+        &self,
+        _: &str,
+        _: &str,
+        _: &crate::security::BrokeredMcpConfig,
+        _: &str,
+        _: Value,
+        _: Option<Value>,
+        _: Option<String>,
+        _: Option<u32>,
+        _: Option<&str>,
+    ) -> Result<crate::mcp::gateway::McpCallOutcome, String> {
+        Err("a machine-service call never reaches a configured server".to_string())
+    }
+    async fn close_session(&self, _: &str) {}
+}
+
+/// The pack `kit`, installed in the workspace from a bundle, shipping the
+/// MCP-speaking service `probe` and the machine-service entry `probe-mcp`
+/// that reaches it, selected and running on each of `serving`.
+async fn served_harness(
+    machines: &[&str],
+    serving: &[&str],
+) -> (MachineHarness, tempfile::TempDir, Arc<PlacedCalls>) {
+    let m = machine_harness("mcp-stdio", machines).await;
+    let resources = tempfile::tempdir().unwrap();
+    let root = resources.path().join("packs/kit");
+    std::fs::create_dir_all(root.join("services/probe")).unwrap();
+    std::fs::write(
+        root.join("cairn-pack.yaml"),
+        "id: kit\nname: Kit\nversion: 1.0.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("mcp.yaml"),
+        "mcpServers:\n  probe-mcp:\n    type: machine-service\n    service: probe\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("services/probe/service.yaml"),
+        native_manifest("mcp-stdio"),
+    )
+    .unwrap();
+    cairn_packs::sync_one_pack(
+        &crate::services::RealGitClient,
+        &crate::services::RealFileSystem,
+        resources.path(),
+        &m.h.orch.config_dir,
+        "kit",
+    )
+    .unwrap();
+    let gateway = Arc::new(PlacedCalls::default());
+    assert!(m.h.orch.set_mcp_gateway(gateway.clone()).is_ok());
+    for machine in serving {
+        select(&m.h, machine);
+    }
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    for machine in serving {
+        assert_eq!(instance_state(&m.h, machine), machine::InstanceState::Ready);
+    }
+    (m, resources, gateway)
+}
+
+/// The text of a `run` call's envelope.
+async fn run_batch(h: &Harness, payload: Value) -> String {
+    let envelope = crate::mcp::handlers::run::handle_run(
+        &h.orch,
+        &McpCallbackRequest {
+            tool: "run".into(),
+            payload,
+            ..Default::default()
+        },
+    )
+    .await;
+    serde_json::from_str::<Value>(&envelope)
+        .ok()
+        .and_then(|value| value["text"].as_str().map(str::to_string))
+        .unwrap_or(envelope)
+}
+
+#[tokio::test]
+async fn one_serving_machine_takes_a_call_with_no_selector() {
+    let (m, _resources, gateway) = served_harness(&["alpha", "beta"], &["alpha"]).await;
+    let out = run_batch(
+        &m.h,
+        json!({"commands": [{"target": "cairn://mcp/probe-mcp/look", "timeout": 600000}]}),
+    )
+    .await;
+    assert!(out.contains("look answered on kit/probe@alpha"), "{out}");
+    // The declared bound reaches the resident unclamped: a machine-service
+    // call runs to its own timeout like any MCP-tool item, past the window.
+    assert_eq!(
+        gateway.calls(),
+        [(
+            "kit/probe@alpha".to_string(),
+            "look".to_string(),
+            Some(600_000)
+        )]
+    );
+}
+
+/// Two serving machines and no selector: refused naming both, and nothing
+/// reaches either resident, not even the items the refusal would not need.
+#[tokio::test]
+async fn several_serving_machines_and_no_selector_run_nothing() {
+    let (m, _resources, gateway) = served_harness(&["alpha", "beta"], &["alpha", "beta"]).await;
+    let out = run_batch(
+        &m.h,
+        json!({"commands": [
+            {"target": "cairn://mcp/probe-mcp/look"},
+            {"target": "cairn://mcp/probe-mcp/click"},
+        ]}),
+    )
+    .await;
+    assert!(out.contains("No commands ran."), "{out}");
+    assert!(
+        out.contains("commands[0] (cairn://mcp/probe-mcp/look)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("commands[1] (cairn://mcp/probe-mcp/click)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("alpha (linux, ready), beta (linux, ready)"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "run({executor:{name:\"alpha\"}, commands:[{target:\"cairn://mcp/probe-mcp/look\""
+        ),
+        "{out}"
+    );
+    assert!(gateway.calls().is_empty(), "{:?}", gateway.calls());
+
+    let chosen = run_batch(
+        &m.h,
+        json!({
+            "executor": {"name": "beta"},
+            "commands": [
+                {"target": "cairn://mcp/probe-mcp/look"},
+                {"target": "cairn://mcp/probe-mcp/click"},
+            ],
+        }),
+    )
+    .await;
+    assert!(
+        chosen.contains("look answered on kit/probe@beta"),
+        "{chosen}"
+    );
+    assert!(
+        chosen.contains("cairn://mcp/probe-mcp/look on beta")
+            && chosen.contains("cairn://mcp/probe-mcp/click on beta"),
+        "each item names the machine that served it: {chosen}"
+    );
+    let machines: Vec<String> = gateway.calls().into_iter().map(|call| call.0).collect();
+    assert_eq!(machines, ["kit/probe@beta", "kit/probe@beta"]);
+}
+
+#[tokio::test]
+async fn a_selector_naming_a_machine_that_does_not_serve_is_refused_naming_those_that_do() {
+    let (m, _resources, gateway) = served_harness(&["alpha", "beta"], &["alpha"]).await;
+    let out = run_batch(
+        &m.h,
+        json!({
+            "executor": {"name": "beta"},
+            "commands": [{"target": "cairn://mcp/probe-mcp/look"}],
+        }),
+    )
+    .await;
+    assert!(
+        out.contains("`probe-mcp` is not served by `beta`; it serves on alpha (linux, ready)."),
+        "{out}"
+    );
+    assert!(gateway.calls().is_empty());
+
+    // The selector chooses a machine only for machine-service calls.
+    let mixed = run_batch(
+        &m.h,
+        json!({
+            "executor": {"name": "alpha"},
+            "commands": [
+                {"target": "cairn://mcp/probe-mcp/look"},
+                {"target": "cairn://models/decide"},
+            ],
+        }),
+    )
+    .await;
+    assert!(
+        mixed.contains("take no machine: commands[1] (cairn://models/decide)"),
+        "{mixed}"
+    );
+    assert!(gateway.calls().is_empty());
+}
+
+/// The read renders each machine with its own state, whether or not one is
+/// ready, and a call to a server no machine serves says so by machine.
+#[tokio::test]
+async fn a_machine_service_with_no_serving_machine_reads_and_refuses_by_machine() {
+    let (m, _resources, gateway) = served_harness(&["alpha"], &[]).await;
+    select(&m.h, "gamma");
+    let read = crate::mcp::handlers::mcp_resources::handle_mcp_read(
+        &m.h.orch,
+        &McpCallbackRequest::default(),
+        Some("probe-mcp".to_string()),
+        None,
+    )
+    .await;
+    assert!(
+        read.contains("# MCP server: probe-mcp (machine service kit/probe)"),
+        "{read}"
+    );
+    assert!(read.contains("No machine serves it now"), "{read}");
+    assert!(read.contains("## gamma"), "{read}");
+    assert!(
+        read.contains("- State: not running: machine absent"),
+        "{read}"
+    );
+
+    let out = run_batch(
+        &m.h,
+        json!({"commands": [{"target": "cairn://mcp/probe-mcp/look"}]}),
+    )
+    .await;
+    assert!(
+        out.contains(
+            "`probe-mcp` is served by no machine now: gamma (not running: machine absent)."
+        ),
+        "{out}"
+    );
+    assert!(gateway.calls().is_empty());
+}
+
+/// Option A of cairn/5991: a machine-service call declared longer than the
+/// synchronous window parks its batch, keeps running on the resident while the
+/// turn is parked, and the parked call resumes with its result. It is never
+/// cut at the window, and the resident is handed the declared bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_machine_service_call_parks_and_resumes_with_its_result() {
+    use crate::mcp::handlers::run::host_batch_tests as batches;
+    let (m, _resources, gateway) = served_harness(&["alpha"], &["alpha"]).await;
+    *gateway.delay.lock().unwrap() = std::time::Duration::from_millis(800);
+    batches::seed_parkable_run(&m.h.orch).await;
+
+    let text = batches::run_parkable_item(
+        &m.h.orch,
+        "cairn://mcp/probe-mcp/run on alpha",
+        batches::machine_service_spec("probe-mcp", "run", Some(5_000), probe_key(), "alpha"),
+        std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert!(
+        text.contains(crate::mcp::handlers::run::RUN_BATCH_SUSPENDED_MARKER),
+        "{text}"
+    );
+    let (state, condition) = batches::wait_row(&m.h.orch).await;
+    assert_eq!(state, "pending");
+    assert!(condition.contains("\"host\":true"), "{condition}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let result = loop {
+        if let Some(result) =
+            batches::tool_result_containing(&m.h.orch, "run answered on kit/probe@alpha").await
+        {
+            break result;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked call resumes with the resident's result"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let resumed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(resumed["toolUseId"], "tool-1");
+    assert_eq!(resumed["toolResult"], "run answered on kit/probe@alpha");
+    assert_eq!(resumed["isError"], false);
+    assert!(
+        !gateway.abandoned.load(std::sync::atomic::Ordering::SeqCst),
+        "parking did not cancel the call"
+    );
+    assert_eq!(
+        gateway.calls(),
+        [(
+            "kit/probe@alpha".to_string(),
+            "run".to_string(),
+            Some(5_000)
+        )]
+    );
+}
+
+/// A durable continuation resumes on a pooled gateway session, which a placed
+/// facade does not have, so a tool that asks for input fails saying so.
+#[tokio::test]
+async fn a_machine_service_tool_that_asks_for_input_fails_saying_it_cannot_suspend() {
+    let (m, _resources, gateway) = served_harness(&["alpha"], &["alpha"]).await;
+    gateway
+        .asks_for_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let out = run_batch(
+        &m.h,
+        json!({"commands": [{"target": "cairn://mcp/probe-mcp/look"}]}),
+    )
+    .await;
+    assert!(
+        out.contains(
+            "MCP call 'probe-mcp/look' asked for follow-up input, and a machine-service tool cannot suspend for follow-up input"
+        ),
+        "{out}"
+    );
+}
+
+/// One machine takes one call at a time. A call that times out queued behind
+/// a long one says so, rather than reading as a slow tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_queued_behind_a_long_one_says_so_when_it_times_out() {
+    let (m, _resources, gateway) = served_harness(&["alpha"], &["alpha"]).await;
+    *gateway.delay.lock().unwrap() = std::time::Duration::from_secs(3);
+    let long = run_batch(
+        &m.h,
+        json!({"commands": [{"target": "cairn://mcp/probe-mcp/run", "timeout": 10000}]}),
+    );
+    let queued = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        run_batch(
+            &m.h,
+            json!({"commands": [{"target": "cairn://mcp/probe-mcp/look", "timeout": 1000}]}),
+        )
+        .await
+    };
+    let (long, queued) = tokio::join!(long, queued);
+    assert!(long.contains("run answered on kit/probe@alpha"), "{long}");
+    assert!(
+        queued.contains("It was queued behind `run` on alpha")
+            && queued.contains("a machine takes one call at a time"),
+        "{queued}"
+    );
+}
+
+/// A machine waiting for its operator has its resident up, so a call that
+/// names it reaches it (Axon's `permit`, which asks for the grant). It never
+/// serves a call that does not name it.
+#[tokio::test]
+async fn a_machine_waiting_for_its_operator_takes_a_call_that_names_it() {
+    let (m, _resources, gateway) = served_harness(&["alpha"], &[]).await;
+    *m.h.host.probe_answer.lock().unwrap() = Some(Ok(
+        r#"{"ready":false,"reason":"permission-denied"}"#.to_string(),
+    ));
+    select(&m.h, "alpha");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    assert!(
+        matches!(
+            instance_state(&m.h, "alpha"),
+            machine::InstanceState::WaitingForOperator { .. }
+        ),
+        "{:?}",
+        instance_state(&m.h, "alpha")
+    );
+
+    let unnamed = run_batch(
+        &m.h,
+        json!({"commands": [{"target": "cairn://mcp/probe-mcp/look"}]}),
+    )
+    .await;
+    assert!(unnamed.contains("served by no machine now"), "{unnamed}");
+    assert!(
+        unnamed.contains("still takes a call that names it"),
+        "{unnamed}"
+    );
+    assert!(gateway.calls().is_empty());
+
+    let named = run_batch(
+        &m.h,
+        json!({
+            "executor": {"name": "alpha"},
+            "commands": [{"target": "cairn://mcp/probe-mcp/permit"}],
+        }),
+    )
+    .await;
+    assert!(
+        named.contains("permit answered on kit/probe@alpha"),
+        "{named}"
     );
 }

@@ -308,7 +308,10 @@ pub struct RunInput {
     /// available. Omit unless the batch must land somewhere specific. When the
     /// node declared a default (`write cairn:~ patch {executor:{...}}`), an
     /// omitted selector inherits it and the first line says `(node default)`;
-    /// this field overrides it for one call.
+    /// this field overrides it for one call. On a batch of machine-service MCP
+    /// calls (such as `cairn://mcp/axon/<tool>`) `{name}` or `{os}` chooses
+    /// which machine serves them: required when several machines serve the
+    /// server, optional when one does, and never taken from the node default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<RunExecutorSelectorInput>,
     /// A short written reason for committing files that contain literal Git
