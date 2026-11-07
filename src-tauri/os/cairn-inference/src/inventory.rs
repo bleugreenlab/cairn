@@ -57,6 +57,11 @@ pub enum ValidationError {
         index: usize,
         problem: &'static str,
     },
+    BadConfigFile {
+        profile: InferenceProfileId,
+        index: usize,
+        problem: &'static str,
+    },
     BadImageDigest {
         profile: InferenceProfileId,
         image: String,
@@ -147,6 +152,11 @@ impl fmt::Display for ValidationError {
                 index,
                 problem,
             } => write!(f, "profile {profile} weight file {index}: {problem}"),
+            Self::BadConfigFile {
+                profile,
+                index,
+                problem,
+            } => write!(f, "profile {profile} config file {index}: {problem}"),
             Self::BadImageDigest { profile, image } => write!(
                 f,
                 "profile {profile} image {image} is not pinned by digest (@sha256:<64 hex>)"

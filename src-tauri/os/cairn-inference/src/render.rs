@@ -83,16 +83,25 @@ pub fn container_name(deployment: &str, rank: usize) -> String {
 /// executor account's home.
 const SOURCES: &str = "$HOME/.cairn/inference/sources";
 
+/// A repository's directory within a Hugging Face cache: everything the hub
+/// library keeps of it (`blobs/`, `refs/`, `snapshots/`), and all a container
+/// is given of the cache.
+pub fn cache_dir(repo: &str) -> String {
+    format!("hub/models--{}", repo.replace('/', "--"))
+}
+
+fn cached_path(cache: &str, repo: &str, revision: &str, path: &str) -> String {
+    format!(
+        "{}/{}/snapshots/{revision}/{path}",
+        cache.trim_end_matches('/'),
+        cache_dir(repo)
+    )
+}
+
 /// The in-container path of a weight file, in a Hugging Face cache mounted at
 /// `cache`.
 pub fn cached_weight_path(cache: &str, weight: &WeightFile) -> String {
-    format!(
-        "{}/hub/models--{}/snapshots/{}/{}",
-        cache.trim_end_matches('/'),
-        weight.repo.replace('/', "--"),
-        weight.revision,
-        weight.path
-    )
+    cached_path(cache, &weight.repo, &weight.revision, &weight.path)
 }
 
 /// Render `profile` placed as `deployment`, its machines given in the
@@ -110,6 +119,14 @@ pub fn render(
             )));
         }
     }
+    for (index, file) in profile.model.config_files.iter().enumerate() {
+        if let Some(problem) = file.problem() {
+            return Err(Refusal(format!(
+                "profile {} config file {index}: {problem}",
+                profile.id
+            )));
+        }
+    }
     match &profile.engine {
         Engine::Command { start, stop, .. } => Ok(Rendered {
             start: start.clone(),
@@ -121,6 +138,15 @@ pub fn render(
             profile.id
         ))),
         Engine::Container(container) => {
+            if container.server == Server::Vllm
+                && mounts_cache(container)
+                && profile.model.config_files.is_empty()
+            {
+                return Err(Refusal(format!(
+                    "profile {} runs vLLM on the pinned weights alone: it pins none of its repository's configuration, tokenizer and chat-template files (model.configFiles), and its container reaches only the pinned files, read-only, so vLLM could not load it. Generate or import the profile again, which pins them",
+                    profile.id
+                )));
+            }
             let ranks = Ranks::of(profile, deployment, machines)?;
             let start = start_script(profile, container, deployment, &ranks)?;
             let stop = stop_script(&ranks, deployment);
@@ -267,6 +293,20 @@ fn no_newline(profile: &InferenceProfile, value: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
+fn mounts_cache(container: &Container) -> bool {
+    container
+        .mounts
+        .iter()
+        .any(|mount| mount.from == MountSource::HfCache)
+}
+
+/// `hf_get <url> <file>`: download from Hugging Face on the host, with the
+/// machine's token when it has one (`$HF_TOKEN`, else the cache's `token`
+/// file), so a gated repository's files arrive without the container ever
+/// seeing the token. The header travels through a file descriptor, never
+/// argv, and curl drops it on a redirect to another host.
+const HF_GET: &str = r#"hf_get() { if [ -z "${HF_TOKEN:-}" ] && [ -s "$hf/token" ]; then HF_TOKEN="$(cat "$hf/token")"; fi; if [ -n "${HF_TOKEN:-}" ]; then curl -fsSL --retry 3 -H @<(printf 'Authorization: Bearer %s\n' "$HF_TOKEN") -o "$2" "$1"; else curl -fsSL --retry 3 -o "$2" "$1"; fi; }"#;
+
 const RUNTIME: &str = r#"if command -v docker >/dev/null 2>&1; then rt=docker; elif command -v podman >/dev/null 2>&1; then rt=podman; else echo "neither docker nor podman is installed on $(hostname)" >&2; exit 1; fi"#;
 
 /// The script one rank runs on its own machine.
@@ -284,7 +324,12 @@ fn rank_script(
     out.push_str("set -euo pipefail\n");
     out.push_str(RUNTIME);
     out.push('\n');
-    out.push_str("hf=\"${HF_HOME:-$HOME/.cache/huggingface}\"\nmkdir -p \"$hf\"\n");
+    let cache = mounts_cache(container);
+    if cache {
+        out.push_str("hf=\"${HF_HOME:-$HOME/.cache/huggingface}\"\n");
+        out.push_str(HF_GET);
+        out.push('\n');
+    }
 
     if let Some(files) = &container.files {
         no_newline(profile, &files.url)?;
@@ -297,20 +342,47 @@ fn rank_script(
         );
     }
 
-    if container.server == Server::LlamaCpp {
-        for weight in &profile.model.weights {
-            let path = cached_weight_path("$hf", weight);
-            let url = format!(
-                "https://huggingface.co/{}/resolve/{}/{}",
-                weight.repo, weight.revision, weight.path
-            );
+    // Cairn fetches every pinned file before the container starts, since
+    // the container reaches the cache only read-only; each is verified
+    // against its pin and lands whole or not at all.
+    if cache {
+        let fetch = |out: &mut String, repo: &str, revision: &str, path: &str, verify: String| {
+            let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{path}");
             let _ = writeln!(
                 out,
-                "f=\"$hf\"{}\nif [ ! -f \"$f\" ]; then mkdir -p \"$(dirname \"$f\")\"; curl -fsSL --retry 3 -o \"$f.part\" {}; echo {}\"  $f.part\" | sha256sum -c --quiet -; mv \"$f.part\" \"$f\"; fi",
-                quote(path.trim_start_matches("$hf")),
+                "f=\"$hf\"/{}\nif [ ! -f \"$f\" ]; then mkdir -p \"$(dirname \"$f\")\"; hf_get {} \"$f.part\"; {verify}; mv \"$f.part\" \"$f\"; fi",
+                quote(cached_path("", repo, revision, path).trim_start_matches('/')),
                 quote(&url),
+            );
+        };
+        for file in &profile.model.config_files {
+            let verify = match (&file.sha256, &file.git_blob) {
+                (Some(sha256), _) => {
+                    format!("echo {}\"  $f.part\" | sha256sum -c --quiet -", quote(sha256))
+                }
+                (None, Some(blob)) => format!(
+                    "[ \"$({{ printf 'blob %d\\0' \"$(wc -c <\"$f.part\")\"; cat \"$f.part\"; }} | sha1sum | cut -d ' ' -f 1)\" = {} ] || {{ echo \"$f.part does not match its pinned git blob\" >&2; exit 1; }}",
+                    quote(blob)
+                ),
+                (None, None) => unreachable!("checked by ConfigFile::problem"),
+            };
+            fetch(&mut out, &file.repo, &file.revision, &file.path, verify);
+        }
+        for weight in &profile.model.weights {
+            let verify = format!(
+                "echo {}\"  $f.part\" | sha256sum -c --quiet -",
                 quote(&weight.sha256)
             );
+            fetch(
+                &mut out,
+                &weight.repo,
+                &weight.revision,
+                &weight.path,
+                verify,
+            );
+        }
+        for repo in profile.model.repos() {
+            let _ = writeln!(out, "mkdir -p \"$hf\"/{}", quote(&cache_dir(repo)));
         }
     }
 
@@ -401,9 +473,24 @@ fn rank_script(
     flags.push("\"${extra[@]}\"".into());
     for mount in &container.mounts {
         no_newline(profile, &mount.to)?;
-        let ro = if mount.read_only { ":ro" } else { "" };
         let host_side = match &mount.from {
-            MountSource::HfCache => "\"$hf\"".to_string(),
+            // Each pinned repository's own directory, read-only, at its
+            // place under `to`: never the cache itself, which holds the
+            // token and every other model's weights.
+            MountSource::HfCache => {
+                for repo in profile.model.repos() {
+                    let dir = cache_dir(repo);
+                    flags.extend([
+                        "-v".into(),
+                        format!(
+                            "\"$hf\"/{}:{}",
+                            quote(&dir),
+                            quote(&format!("{}/{dir}:ro", mount.to.trim_end_matches('/')))
+                        ),
+                    ]);
+                }
+                continue;
+            }
             MountSource::Source { path } => {
                 no_newline(profile, path)?;
                 let path = path.trim_start_matches("./");
@@ -414,6 +501,7 @@ fn rank_script(
                 }
             }
         };
+        let ro = if mount.read_only { ":ro" } else { "" };
         flags.extend([
             "-v".into(),
             format!("{host_side}:{}", quote(&format!("{}{ro}", mount.to))),
@@ -426,6 +514,12 @@ fn rank_script(
     for (key, value) in &env {
         no_newline(profile, key)?;
         flags.extend(["-e".into(), quote(&format!("{key}={}", fill(value)?))]);
+    }
+    if cache {
+        // Every file is already there and the mount is read-only: the
+        // server must not try to fetch or write anything into it. Last, so
+        // the profile's env cannot undo it.
+        flags.extend(["-e".into(), quote("HF_HUB_OFFLINE=1")]);
     }
     let mut command: Vec<String> = Vec::new();
     match &container.entrypoint {
@@ -538,7 +632,8 @@ fn stop_script(ranks: &Ranks<'_>, deployment: &Deployment) -> String {
 mod tests {
     use super::*;
     use crate::profile::{
-        Accelerator, HostOptions, ModelRef, Mount, ProfileOrigin, Requirements, SourcePin,
+        Accelerator, ConfigFile, HostOptions, ModelRef, Mount, ProfileOrigin, Requirements,
+        SourcePin,
     };
     use crate::record::RecordSource;
 
@@ -598,6 +693,24 @@ mod tests {
                     "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
                     "model-00001-of-00049.safetensors",
                 )],
+                config_files: vec![
+                    ConfigFile {
+                        repo: "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp".into(),
+                        revision: "6821d6ad3681a4b137b066b76094fa82ebd0a380".into(),
+                        path: "config.json".into(),
+                        sha256: None,
+                        git_blob: Some("8b4b87fc69023e7a224eb6563753aaf3223d8b98".into()),
+                        size: Some(727),
+                    },
+                    ConfigFile {
+                        repo: "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp".into(),
+                        revision: "6821d6ad3681a4b137b066b76094fa82ebd0a380".into(),
+                        path: "tokenizer.json".into(),
+                        sha256: Some(SHA.into()),
+                        git_blob: None,
+                        size: Some(11_422_947),
+                    },
+                ],
             },
             served_name: "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp".into(),
             upstream_id: None,
@@ -665,6 +778,7 @@ mod tests {
                 "Qwen/Qwen3-Embedding-4B-GGUF",
                 "Qwen3-Embedding-4B-Q8_0.gguf",
             )],
+            config_files: vec![],
         };
         profile.served_name = "Qwen/Qwen3-Embedding-4B".into();
         profile.requirements.machines = 1;
@@ -926,6 +1040,162 @@ mod tests {
         assert!(
             start.contains("-p 8090:8090"),
             "no host network: the port is published"
+        );
+    }
+
+    /// Every `-v` a script's container runs pass, as `(host side, container
+    /// side)`.
+    fn volumes(script: &str) -> Vec<(String, String)> {
+        script
+            .lines()
+            .filter(|line| line.starts_with("\"$rt\" run "))
+            .flat_map(|line| {
+                let words: Vec<&str> = line.split(' ').collect();
+                words
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-v")
+                    .map(|pair| {
+                        let (host, container) = pair[1].split_once(":'").unwrap();
+                        (
+                            host.to_string(),
+                            container.trim_end_matches('\'').to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn fedora() -> Vec<MachineAt> {
+        vec![MachineAt {
+            name: "fedora".into(),
+            address: None,
+            link: None,
+        }]
+    }
+
+    #[test]
+    fn a_container_reaches_only_its_pinned_repositories_read_only() {
+        let gang = render(
+            &dspark(),
+            &deployment("d", &["bginf-sp1", "bginf-sp2"], 8888),
+            &sparks(),
+        )
+        .unwrap()
+        .start;
+        let embed = render(
+            &embedder(),
+            &deployment("embed", &["fedora"], 8090),
+            &fedora(),
+        )
+        .unwrap()
+        .start;
+        for (script, repo, to) in [
+            (
+                &gang,
+                "deepseek-ai--DeepSeek-V4-Flash-Vision-Exp",
+                "/root/.cache/huggingface",
+            ),
+            (&embed, "Qwen--Qwen3-Embedding-4B-GGUF", "/models"),
+        ] {
+            let cache: Vec<(String, String)> = volumes(script)
+                .into_iter()
+                .filter(|(host, _)| host.starts_with("\"$hf\""))
+                .collect();
+            assert!(!cache.is_empty(), "{script}");
+            for (host, container) in &cache {
+                assert_eq!(host, &format!("\"$hf\"/'hub/models--{repo}'"), "{script}");
+                assert_eq!(container, &format!("{to}/hub/models--{repo}:ro"));
+            }
+            assert!(
+                !script.contains("-v \"$hf\":"),
+                "the cache itself, and its token, is never mounted"
+            );
+            assert!(
+                script.contains("'HF_HUB_OFFLINE=1' "),
+                "the server fetches nothing into a read-only mount"
+            );
+        }
+        assert!(
+            gang.contains("hf_get 'https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/config.json'"),
+            "vLLM's config files are fetched before it starts"
+        );
+        assert!(gang.contains("= '8b4b87fc69023e7a224eb6563753aaf3223d8b98' ]"));
+        assert!(
+            gang.contains("hf_get 'https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00001-of-00049.safetensors'"),
+            "and so are its weights"
+        );
+    }
+
+    #[test]
+    fn a_writable_cache_mount_reads_and_renders_read_only() {
+        let mount: Mount = serde_yaml::from_str(
+            "from: {kind: hfCache}\nto: /root/.cache/huggingface\nreadOnly: false\n",
+        )
+        .unwrap();
+        assert!(mount.read_only);
+        let source: Mount =
+            serde_yaml::from_str("from: {kind: source, path: ./patches}\nto: /opt/patches\n")
+                .unwrap();
+        assert!(!source.read_only, "a source mount keeps what it says");
+
+        let mut profile = embedder();
+        if let Engine::Container(container) = &mut profile.engine {
+            container.mounts[0].read_only = false;
+        }
+        let start = render(&profile, &deployment("embed", &["fedora"], 8090), &fedora())
+            .unwrap()
+            .start;
+        assert!(volumes(&start).iter().all(|(_, to)| to.ends_with(":ro")));
+    }
+
+    #[test]
+    fn a_projector_from_another_repository_is_mounted_beside_the_weights() {
+        let mut profile = embedder();
+        profile.model.weights.push(weight(
+            "ggml-org/Qwen3-Embedding-4B-mmproj",
+            "mmproj-f16.gguf",
+        ));
+        let start = render(&profile, &deployment("embed", &["fedora"], 8090), &fedora())
+            .unwrap()
+            .start;
+        let containers: Vec<String> = volumes(&start).into_iter().map(|(_, to)| to).collect();
+        assert_eq!(
+            containers,
+            vec![
+                "/models/hub/models--Qwen--Qwen3-Embedding-4B-GGUF:ro",
+                "/models/hub/models--ggml-org--Qwen3-Embedding-4B-mmproj:ro",
+            ]
+        );
+        assert!(
+            start.contains("mkdir -p \"$hf\"/'hub/models--ggml-org--Qwen3-Embedding-4B-mmproj'")
+        );
+    }
+
+    #[test]
+    fn vllm_without_its_config_files_is_refused() {
+        let mut profile = dspark();
+        profile.model.config_files.clear();
+        let refusal = render(
+            &profile,
+            &deployment("d", &["bginf-sp1", "bginf-sp2"], 8888),
+            &sparks(),
+        )
+        .unwrap_err();
+        assert!(refusal.0.contains("model.configFiles"), "{}", refusal.0);
+
+        profile = dspark();
+        profile.model.config_files[0].git_blob = Some("not-a-sha".into());
+        let refusal = render(
+            &profile,
+            &deployment("d", &["bginf-sp1", "bginf-sp2"], 8888),
+            &sparks(),
+        )
+        .unwrap_err();
+        assert!(
+            refusal.0.contains("config file 0: gitBlob"),
+            "{}",
+            refusal.0
         );
     }
 

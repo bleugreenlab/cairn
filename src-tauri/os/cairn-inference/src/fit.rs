@@ -524,6 +524,10 @@ pub fn starting_profile(
         model: ModelRef {
             name: model.name.clone(),
             weights,
+            config_files: match template.server {
+                Server::Vllm => source.config_files.clone(),
+                Server::LlamaCpp => Vec::new(),
+            },
         },
         served_name: model.name.clone(),
         upstream_id: None,
@@ -546,7 +550,7 @@ pub fn starting_profile(
             mounts: vec![Mount {
                 from: MountSource::HfCache,
                 to: mount_to.into(),
-                read_only: template.server == Server::LlamaCpp,
+                read_only: true,
             }],
             host: HostOptions {
                 ipc_host: true,

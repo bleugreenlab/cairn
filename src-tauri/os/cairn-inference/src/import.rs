@@ -772,10 +772,15 @@ pub fn compile(spec: &ImportSpec, files: &Files) -> Result<Compiled, ImportError
                 continue;
             }
             Some(HostPath::HfCache) => {
+                if !read_only {
+                    notes.push(format!(
+                        "the compose file mounts the Hugging Face cache at {target} writable; Cairn mounts only the pinned repositories' directories there, read-only, and fetches their files before the container starts"
+                    ));
+                }
                 mounts.push(Mount {
                     from: MountSource::HfCache,
                     to: target.to_string(),
-                    read_only,
+                    read_only: true,
                 });
                 continue;
             }
@@ -1130,7 +1135,17 @@ mod tests {
         assert!(container
             .mounts
             .iter()
-            .any(|m| m.from == MountSource::HfCache && m.to == "/cache/huggingface"));
+            .any(|m| m.from == MountSource::HfCache
+                && m.to == "/cache/huggingface"
+                && m.read_only));
+        assert!(
+            compiled
+                .notes
+                .iter()
+                .any(|note| note.contains("/cache/huggingface writable")),
+            "{:?}",
+            compiled.notes
+        );
         assert!(!container.mounts.iter().any(|m| m.to == "/tmp"));
         assert_eq!(container.files.as_ref().unwrap().commit, COMMIT);
         assert!(container.host.gpus && container.host.ipc_host && container.host.network_host);
@@ -1170,6 +1185,7 @@ mod tests {
                     sha256: "0".repeat(64),
                     size: None,
                 }],
+                config_files: vec![],
             },
             served_name: "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp".into(),
             upstream_id: None,

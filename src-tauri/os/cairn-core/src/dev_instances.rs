@@ -25,6 +25,8 @@ use crate::orchestrator::Orchestrator;
 use crate::services::GitClient;
 use crate::storage::RowExt;
 
+pub mod home_owner;
+
 const PROCESS_KEY: &str = "dev-instance";
 /// The entrypoint the executor runs inside the materialized checkout, relative
 /// to that checkout's root.
@@ -1105,17 +1107,66 @@ impl EventForwarder {
     }
 }
 
+/// Run one launch for `actor`, the requester the runner admitted. The instance
+/// home is claimed for `actor` before anything else happens (see
+/// [`home_owner`]): a home an agent's job did not create is refused there,
+/// before a lease is taken or the runtime is started, so none of the runtime's
+/// stop-runner, seeding, backup or migration paths is ever reached.
 pub async fn run_launch_session(
     orch: Orchestrator,
     request: DevInstanceLaunchRequest,
     events: mpsc::UnboundedSender<DevInstanceLaunchEvent>,
     resolution: DevInstanceResolution,
+    actor: home_owner::LaunchActor,
+    controls: mpsc::UnboundedReceiver<DevInstanceLaunchControl>,
+) {
+    // Instance homes live under the real OS home, as the runtime derives them,
+    // whatever CAIRN_HOME this runner itself runs with.
+    let home_root = cairn_common::paths::os_home_dir();
+    run_launch_session_from(
+        orch,
+        request,
+        events,
+        resolution,
+        actor,
+        home_root.as_deref(),
+        controls,
+    )
+    .await;
+}
+
+async fn run_launch_session_from(
+    orch: Orchestrator,
+    request: DevInstanceLaunchRequest,
+    events: mpsc::UnboundedSender<DevInstanceLaunchEvent>,
+    resolution: DevInstanceResolution,
+    actor: home_owner::LaunchActor,
+    home_root: Option<&Path>,
     mut controls: mpsc::UnboundedReceiver<DevInstanceLaunchControl>,
 ) {
     let _ = events.send(DevInstanceLaunchEvent::Resolved {
         selector: resolution.selector.clone(),
         commit_id: resolution.commit_id.clone(),
     });
+    let claimed = match home_root {
+        Some(root) => home_owner::claim_instance_home(
+            root,
+            &resolution.selector,
+            &resolution.commit_id,
+            &actor,
+        ),
+        None => Err(
+            "Refused: the OS home directory cannot be determined, so the instance home this launch would use cannot be checked. Nothing was changed."
+                .to_string(),
+        ),
+    };
+    if let Err(diagnostic) = claimed {
+        fail(
+            &events,
+            DevInstanceLaunchFailure::InstanceHomeRefused { diagnostic },
+        );
+        return;
+    }
     if orch.fleet.executor_generation().is_none() {
         let _ = events.send(DevInstanceLaunchEvent::Failed {
             failure: DevInstanceLaunchFailure::ColocatedExecutorUnavailable {

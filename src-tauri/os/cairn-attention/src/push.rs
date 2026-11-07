@@ -356,6 +356,7 @@ pub fn push_kind_headline(prefix: &str) -> (&str, &str) {
         "child-unresumed" => ("child", "A child's restart resume did not take"),
         "child-safety" => ("child", "A child node paused for safety"),
         "build-change" => ("system", "Cairn was rebuilt"),
+        "queue" => ("queue", "Held work started or moved by someone else"),
         other => (other, "Attention update"),
     }
 }

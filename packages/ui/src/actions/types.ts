@@ -136,13 +136,18 @@ function formatKey(key: string): string {
   return names[normalizeKey(key)] ?? key.toUpperCase();
 }
 
+/** A modifier's label as the platform writes it: `⌥` on macOS, `Alt` elsewhere. */
+export function formatModifier(modifier: Modifier, platform: Platform = detectPlatform()): string {
+  const labels: Record<Modifier, string> = platform === "macos"
+    ? { meta: "⌘", ctrl: "⌃", alt: "⌥", shift: "⇧" }
+    : { meta: platform === "windows" ? "Meta" : "Super", ctrl: "Ctrl", alt: "Alt", shift: "Shift" };
+  return labels[modifier];
+}
+
 export function formatStroke(stroke: KeyStroke, platform: Platform = detectPlatform()): string {
   const normalized = normalizeStroke(stroke);
   const mac = platform === "macos";
-  const labels: Record<Modifier, string> = mac
-    ? { meta: "⌘", ctrl: "⌃", alt: "⌥", shift: "⇧" }
-    : { meta: platform === "windows" ? "Meta" : "Super", ctrl: "Ctrl", alt: "Alt", shift: "Shift" };
-  const parts = normalized.modifiers.map((modifier) => labels[modifier]);
+  const parts = normalized.modifiers.map((modifier) => formatModifier(modifier, platform));
   parts.push(formatKey(normalized.key));
   return parts.join(mac ? "" : "+");
 }

@@ -6616,16 +6616,26 @@ fn classify_check_failure(
     // blanked rather than dropped so evidence indices still address `output`.
     // A row naming a FAILING test is the same positive evidence a parsed
     // failure is, for a run whose structured result never reached Cairn.
+    //
+    // A structured-result line is data for the same reason, read or not: its
+    // test identities are free text, and its real outcomes reach this
+    // function through `parsed`, never through a phrase scan. One the parser
+    // refused (truncated, an unknown schema) is still the envelope.
     let mut names_a_failing_test = false;
     let lines: Vec<&str> = output
         .lines()
-        .map(|line| match reported_test(line) {
-            Some(ReportedTest::Failed) => {
-                names_a_failing_test = true;
-                ""
+        .map(|line| {
+            if line.trim_start().starts_with(RESULT_ARTIFACT_JSON_MARKER) {
+                return "";
             }
-            Some(ReportedTest::NotFailed) => "",
-            None => line,
+            match reported_test(line) {
+                Some(ReportedTest::Failed) => {
+                    names_a_failing_test = true;
+                    ""
+                }
+                Some(ReportedTest::NotFailed) => "",
+                None => line,
+            }
         })
         .collect();
     if names_a_failing_test && !parsed.is_some_and(|result| result.parser == RUST_LINT_PARSER) {
@@ -6776,7 +6786,7 @@ fn classify_check_failure(
     // A compile the host ended exits as a build failure (cargo's 101), but the
     // host's signal or storage error is the cause, not the tree. Storing it as
     // infrastructure is what charges the death to the machine.
-    if let Some(ended) = host_ended_compile(output) {
+    if let Some(ended) = host_ended_compile(&lines.join("\n")) {
         return Some(FailureClassification {
             kind: CheckFailureKind::Infrastructure,
             reason: format!(
@@ -6849,6 +6859,9 @@ fn classify_check_failure(
                  without attributing it to any test",
             );
         }
+        if let Some(gap) = result.ingestion.as_ref().and_then(ingestion_gap) {
+            reason.push_str(&format!("; its result is incomplete: {gap}"));
+        }
         return Some(FailureClassification {
             kind: CheckFailureKind::RunnerError,
             reason,
@@ -6873,6 +6886,30 @@ fn classify_check_failure(
         });
     }
     None
+}
+
+/// The rows a structured result carried that its parse refused, in words, or
+/// `None` when it refused none.
+fn ingestion_gap(ingestion: &crate::execution::check_evidence::Ingestion) -> Option<String> {
+    let mut gaps = Vec::new();
+    if ingestion.duplicate_rows > 0 {
+        let first = ingestion
+            .duplicate_ids
+            .first()
+            .map(|id| format!(" (first: `{id}`)"))
+            .unwrap_or_default();
+        gaps.push(format!(
+            "{} row(s) repeat an earlier test identity{first}",
+            ingestion.duplicate_rows
+        ));
+    }
+    if ingestion.invalid_rows > 0 {
+        gaps.push(format!(
+            "{} row(s) have no identity or no terminal status",
+            ingestion.invalid_rows
+        ));
+    }
+    (!gaps.is_empty()).then(|| gaps.join("; "))
 }
 
 /// Why a credential-less dependency fetch is not a verdict on the tree, in
@@ -25473,6 +25510,181 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         .expect("a red with nothing named is not an ordinary failure");
         assert_eq!(classification.kind, CheckFailureKind::RunnerError);
         assert!(classification.kind.is_infrastructure());
+    }
+
+    /// Identities of `scripts/lib/rust-process-outcome.test.ts` as a structured
+    /// result carries them: each names a transport signature the classifier
+    /// matches in free text.
+    const SIGNATURE_IDS: [&str; 3] = [
+        "scripts/lib/rust-process-outcome.test.ts > Rust process outcomes > does not let Cargo's compile summary hide cache infrastructure failure: Failed to send data to or receive data from server: Connection reset by peer (os error 54)",
+        "scripts/lib/rust-process-outcome.test.ts > Rust process outcomes > does not let Cargo's compile summary hide cache infrastructure failure: failed client/server communication",
+        "scripts/lib/rust-process-outcome.test.ts > Rust process outcomes > does not let Cargo's compile summary hide cache infrastructure failure: failed to fill whole buffer",
+    ];
+
+    /// The duplicate identity cairn/6196 found in `src/lib/diffViewer.test.ts`.
+    const COLLIDING_ID: &str =
+        "src/lib/diffViewer.test.ts > diffViewer > preserves modified and zero-count hunk coordinates";
+
+    /// The executor's structured-result line for `rows` of `parser`.
+    fn result_envelope(parser: &str, rows: &[(&str, &str)], complete: bool) -> String {
+        let tests: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, status)| {
+                serde_json::json!({
+                    "id": id, "status": status, "attempts": 1, "retried": false, "flaky": false
+                })
+            })
+            .collect();
+        let result = serde_json::json!({
+            "schemaVersion": 1, "parser": parser, "complete": complete,
+            "selection": "full", "tests": tests, "undeclaredSkips": 0
+        });
+        format!("{RESULT_ARTIFACT_JSON_MARKER}{result}")
+    }
+
+    fn passing_signature_rows() -> Vec<(&'static str, &'static str)> {
+        SIGNATURE_IDS.iter().map(|id| (*id, "passed")).collect()
+    }
+
+    #[test]
+    fn a_structured_result_is_never_free_text_infrastructure_evidence() {
+        // Observation 820cbc1a's shape: every row passed, two rows share an
+        // identity so the result is incomplete, the run exited 1, and the
+        // passing identities quote all three transport signatures.
+        let mut rows = passing_signature_rows();
+        rows.extend([(COLLIDING_ID, "passed"), (COLLIDING_ID, "passed")]);
+        let envelope = result_envelope("vitest", &rows, true);
+        let tail = "error: script \"test:frontend:scoped\" exited with code 1\n\nExit code: 1";
+        let output =
+            format!(" JSON report written to /tmp/cairn-vitest-a/0.json\n{envelope}\n{tail}");
+        let parsed = parse_check_output(FRONTEND_COMMAND, &output).expect("the runner's result");
+        assert!(
+            !parsed.complete,
+            "a duplicate identity keeps the result incomplete"
+        );
+        assert_eq!(
+            (parsed.passed, parsed.failed, parsed.suite_failures),
+            (4, 0, 0)
+        );
+        let classification = classify_check_failure(
+            FRONTEND_COMMAND,
+            Some(1),
+            false,
+            false,
+            Some(&parsed),
+            &output,
+        )
+        .expect("a nonzero exit naming no failure is not an ordinary failure");
+        assert_eq!(classification.kind, CheckFailureKind::RunnerError);
+        assert_ne!(classification.evidence_line, Some(1));
+        assert!(
+            classification
+                .reason
+                .contains("repeat an earlier test identity")
+                && classification.reason.contains(COLLIDING_ID),
+            "the reason names why the result is incomplete: {}",
+            classification.reason
+        );
+
+        // An envelope the canonical parser cannot read is still the envelope,
+        // not a diagnostic the process printed.
+        let truncated = {
+            let end = envelope.find("failed to fill whole buffer").unwrap()
+                + "failed to fill whole buffer".len();
+            envelope[..end].to_string()
+        };
+        let unknown_schema = envelope.replace("\"schemaVersion\":1", "\"schemaVersion\":9");
+        assert_ne!(unknown_schema, envelope);
+        for envelope in [truncated, unknown_schema] {
+            let output = format!("vitest run\n{envelope}\n{tail}");
+            let parsed = parse_check_output(FRONTEND_COMMAND, &output);
+            assert!(parsed.is_none(), "{envelope}");
+            let classification =
+                classify_check_failure(FRONTEND_COMMAND, Some(1), false, false, None, &output);
+            assert!(
+                classification.as_ref().is_none_or(|classification| {
+                    classification.kind != CheckFailureKind::Infrastructure
+                        && classification.evidence_line != Some(1)
+                }),
+                "{classification:?}"
+            );
+        }
+
+        // Nor does a quoted signature sign a host-ended compile beside a
+        // cargo crate failure.
+        let command = "cargo test --workspace";
+        let envelope = result_envelope(
+            "nextest",
+            &[(
+                "cairn-core execution::tests::a_rustc_ended_by (signal: 9, SIGKILL: kill)",
+                "passed",
+            )],
+            false,
+        );
+        let output = format!("error: could not compile `cairn-core` (lib test)\n{envelope}");
+        let parsed = parse_check_output(command, &output);
+        assert_eq!(
+            classify_check_failure(command, Some(101), false, false, parsed.as_ref(), &output),
+            None
+        );
+    }
+
+    #[test]
+    fn evidence_beside_a_structured_result_still_classifies() {
+        let tail = "error: script \"test:frontend:scoped\" exited with code 1";
+
+        // An infrastructure diagnostic the process printed on its own line.
+        let envelope = result_envelope("vitest", &passing_signature_rows(), false);
+        let output = format!(
+            "{envelope}\nsccache: caused by: Failed to send data to or receive data from server\n{tail}"
+        );
+        let parsed = parse_check_output(FRONTEND_COMMAND, &output).expect("the runner's result");
+        let classification = classify_check_failure(
+            FRONTEND_COMMAND,
+            Some(1),
+            false,
+            false,
+            Some(&parsed),
+            &output,
+        )
+        .expect("a printed transport failure");
+        assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+        assert_eq!(classification.evidence_line, Some(1));
+
+        // A script's explicit marker keeps its exit-plus-start-of-line contract.
+        let output = format!("{envelope}\nCAIRN_INFRASTRUCTURE_EXIT: runner lost its cell\n{tail}");
+        let classification = classify_check_failure(
+            FRONTEND_COMMAND,
+            Some(75),
+            false,
+            false,
+            Some(&parsed),
+            &output,
+        )
+        .expect("the script's own marker");
+        assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+        assert_eq!(classification.evidence_line, Some(1));
+
+        // A named assertion failure stays an ordinary, visible failure even
+        // when its identity quotes a signature.
+        let mut rows = passing_signature_rows();
+        rows[2].1 = "failed";
+        let envelope = result_envelope("vitest", &rows, true);
+        let output = format!("{envelope}\n{tail}");
+        let parsed = parse_check_output(FRONTEND_COMMAND, &output).expect("the runner's result");
+        assert_eq!(parsed.failed, 1);
+        assert_eq!(parsed.failures[0].name, SIGNATURE_IDS[2]);
+        assert_eq!(
+            classify_check_failure(
+                FRONTEND_COMMAND,
+                Some(1),
+                false,
+                false,
+                Some(&parsed),
+                &output
+            ),
+            None
+        );
     }
 
     #[test]

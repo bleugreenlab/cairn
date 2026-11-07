@@ -32,31 +32,38 @@
  "siblings": [
   {
    "rfilename": ".gitattributes",
-   "size": 1570
+   "size": 1570,
+   "blobId": "52373fe24473b1aa44333d318f578ae6bf04b49b"
   },
   {
    "rfilename": "1_Pooling/config.json",
-   "size": 313
+   "size": 313,
+   "blobId": "81de5602eacbce382009c5af7a23085871801d8f"
   },
   {
    "rfilename": "README.md",
-   "size": 17276
+   "size": 17276,
+   "blobId": "81d922bc72353348a181473b9cc0ee53571ae13b"
   },
   {
    "rfilename": "config.json",
-   "size": 727
+   "size": 727,
+   "blobId": "8b4b87fc69023e7a224eb6563753aaf3223d8b98"
   },
   {
    "rfilename": "config_sentence_transformers.json",
-   "size": 215
+   "size": 215,
+   "blobId": "76aef3ade63553ebb698fe3c2a3264040ed093f8"
   },
   {
    "rfilename": "generation_config.json",
-   "size": 117
+   "size": 117,
+   "blobId": "d46f1983345269c582611bbedb3ca0a13f8e5f7b"
   },
   {
    "rfilename": "merges.txt",
-   "size": 1671853
+   "size": 1671853,
+   "blobId": "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7"
   },
   {
    "lfs": {
@@ -65,7 +72,8 @@
     "size": 4965826464
    },
    "rfilename": "model-00001-of-00002.safetensors",
-   "size": 4965826464
+   "size": 4965826464,
+   "blobId": "a8e10f7d684d392e8531cce8b5817518ffe9ebe9"
   },
   {
    "lfs": {
@@ -74,15 +82,18 @@
     "size": 3077765624
    },
    "rfilename": "model-00002-of-00002.safetensors",
-   "size": 3077765624
+   "size": 3077765624,
+   "blobId": "9db8ba5ef7e0afa2d94940c5472491e2d4f1dc9e"
   },
   {
    "rfilename": "model.safetensors.index.json",
-   "size": 30431
+   "size": 30431,
+   "blobId": "3d736ef26714eee0abde3e05104ee1b3ec26c974"
   },
   {
    "rfilename": "modules.json",
-   "size": 349
+   "size": 349,
+   "blobId": "952a9b81c0bfd99800fabf352f69c7ccd46c5e43"
   },
   {
    "lfs": {
@@ -91,15 +102,18 @@
     "size": 11422947
    },
    "rfilename": "tokenizer.json",
-   "size": 11422947
+   "size": 11422947,
+   "blobId": "982862dae5cfde7feac135a6367874a81a4a9fd5"
   },
   {
    "rfilename": "tokenizer_config.json",
-   "size": 7256
+   "size": 7256,
+   "blobId": "df3a9d96759529ca1006eb6db024bbb099a97578"
   },
   {
    "rfilename": "vocab.json",
-   "size": 2776833
+   "size": 2776833,
+   "blobId": "4783fe10ac3adce15ac8f358ef5462739852c569"
   }
  ],
  "tags": [

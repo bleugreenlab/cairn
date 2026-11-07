@@ -812,6 +812,16 @@ async fn release_in(
         .await
         .map_err(|busy| busy.to_string())?;
     let admission = admission_for(orch, db, execution_id).await?;
+    // A Start now is an act on the owning thread's record, which it is told
+    // about once the start commits; where the child stood is read now, under
+    // the lock, as the line it skips.
+    let start_subject = match &cause {
+        ReleaseCause::Override {
+            scope: OverrideScope::Everything { .. },
+            ..
+        } => super::queue_notice::place_before_start(orch, db, execution_id).await,
+        _ => None,
+    };
     let execution = execution_id.to_string();
     let outcome = db
         .write(|conn| {
@@ -829,6 +839,24 @@ async fn release_in(
         ConnRelease::Released(released) => {
             log::info!("released held execution {execution_id} ({cause:?})");
             announce_release(orch, db, execution_id, released).await;
+            if let (
+                Some(subject),
+                ReleaseCause::Override {
+                    scope: OverrideScope::Everything { by },
+                    ..
+                },
+            ) = (start_subject, &cause)
+            {
+                super::queue_notice::started(
+                    orch,
+                    db,
+                    execution_id,
+                    subject,
+                    by,
+                    &admission.blocks,
+                )
+                .await;
+            }
             Ok(ReleaseOutcome::Released)
         }
         ConnRelease::HeldByCap { blocks, moved } => {

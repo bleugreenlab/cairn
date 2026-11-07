@@ -181,6 +181,9 @@ impl ServiceHost for Arc<FakeHost> {
         let host = self.clone();
         tokio::spawn(async move {
             let mut slow: Vec<String> = Vec::new();
+            // Calls that answer only once they are cancelled, as a service
+            // that ignores cancellation and finishes anyway.
+            let mut lingering: Vec<Value> = Vec::new();
             let mut draining = false;
             let finish = |events: &mpsc::UnboundedSender<HostEvent>, code| {
                 let _ = events.send(HostEvent::Exited {
@@ -217,6 +220,7 @@ impl ServiceHost for Arc<FakeHost> {
                                     return;
                                 }
                                 "hang" => {}
+                                "linger" => lingering.push(id),
                                 // What a real lease delivers when the machine
                                 // is lost and the service is placed elsewhere.
                                 "lose" => {
@@ -238,6 +242,12 @@ impl ServiceHost for Arc<FakeHost> {
                                     out(&events, json!({"type": "drained"}));
                                     finish(&events, Some(0));
                                     return;
+                                }
+                            }
+                            "cancel" => {
+                                if let Some(at) = lingering.iter().position(|call| frame["id"] == *call) {
+                                    lingering.remove(at);
+                                    out(&events, json!({"type": "result", "id": id, "ok": true, "value": {"late": true}}));
                                 }
                             }
                             _ => {}
@@ -639,24 +649,232 @@ async fn a_dropped_caller_still_ends_its_call_and_revokes_its_bearer() {
     assert_eq!(status(&h, "echo").pending_calls, 0);
 }
 
+/// A call's deadline starts once the service is serving, so delegation and
+/// admission spend it too: a deadline can pass before the frame is sent
+/// (nothing reaches the service) or after (the service is told to cancel).
+/// Both answer `deadline`; only the message names the phase.
+const DEADLINE_BEFORE_SEND: &str = "the call's deadline passed before it was sent";
+const DEADLINE_AFTER_SEND: &str = "did not finish within";
+
+fn calls_of(h: &Harness, method: &str) -> Vec<Value> {
+    h.host
+        .frames_of("call")
+        .into_iter()
+        .filter(|frame| frame["method"] == method)
+        .collect()
+}
+
+/// The `method` call frame as the service received it. A call that ends
+/// before any such frame arrives never reached the service, and the panic
+/// says which phase its deadline passed in rather than leaving an empty
+/// frame list to index.
+async fn dispatched(
+    h: &Harness,
+    method: &str,
+    caller: &mut tokio::task::JoinHandle<Result<Value, CallError>>,
+) -> Value {
+    let began = Instant::now();
+    loop {
+        if let Some(frame) = calls_of(h, method).into_iter().next() {
+            return frame;
+        }
+        if caller.is_finished() {
+            // The host records frames on its own task: look once more.
+            tokio::task::yield_now().await;
+            if let Some(frame) = calls_of(h, method).into_iter().next() {
+                return frame;
+            }
+            let outcome = caller.await.unwrap();
+            panic!(
+                "the `{method}` call ended after {:?} without reaching the service \
+                 (phase: {}): {outcome:?}; frames seen: {:?}",
+                began.elapsed(),
+                match &outcome {
+                    Err(error) if error.message == DEADLINE_BEFORE_SEND =>
+                        "deadline before dispatch",
+                    Err(error) if error.message.contains(DEADLINE_AFTER_SEND) =>
+                        "deadline after dispatch",
+                    _ => "not a deadline",
+                },
+                h.host.frames.lock().unwrap(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Every frame sent to `service` before this returns has been recorded: the
+/// fake host reads its input in order, so an answered call comes after them.
+async fn flush(h: &Harness, service: &str) {
+    call(&h.orch, request(service, "echo", agent()))
+        .await
+        .unwrap();
+}
+
+/// A deadline that passes after the call frame was sent cancels the call in
+/// the service and revokes the bearer the frame carried. A service that
+/// answers anyway, or calls back with that bearer, is not heard.
 #[tokio::test]
-async fn a_deadline_cancels_the_call_and_revokes_its_bearer() {
+async fn a_deadline_after_dispatch_cancels_the_call_and_revokes_its_bearer() {
     let h = harness().await;
-    let mut hang = request("echo", "hang", agent());
-    hang.timeout = Some(Duration::from_millis(200));
-    let error = call(&h.orch, hang).await.unwrap_err();
-    assert_eq!(error.code, "deadline");
-    let call_frame = &h.host.frames_of("call")[0];
-    eventually("the cancel frame", || {
-        !h.host.frames_of("cancel").is_empty()
-    })
-    .await;
-    assert_eq!(h.host.frames_of("cancel")[0]["id"], call_frame["id"]);
-    let (_, token) = authority_of(call_frame);
+    h.source.put(
+        "patient",
+        "name: Patient\nlimits:\n  callTimeoutSeconds: 30\n",
+        "serve({})",
+    );
+    // Long enough that delegation and admission cannot plausibly spend it,
+    // so the frame is sent; `dispatched` fails by phase if it is not.
+    let mut linger = request("patient", "linger", agent());
+    linger.timeout = Some(Duration::from_secs(30));
+    let orch = h.orch.clone();
+    let mut caller = tokio::spawn(async move { call(&orch, linger).await });
+    let call_frame = dispatched(&h, "linger", &mut caller).await;
+    let (run_id, token) = authority_of(&call_frame);
+    assert!(
+        h.orch.run_bearers.verify(&token, &local()).is_ok(),
+        "the dispatched call's bearer is live while it runs"
+    );
+
+    // The frame was sent, so the call can only end by an answer (`linger`
+    // gives none until cancelled) or by its post-send timer. Paused, the clock jumps
+    // to that timer once the runtime idles, instead of 30 real seconds on.
+    tokio::time::pause();
+    let outcome = caller.await.unwrap();
+    tokio::time::resume();
+    let error = outcome.unwrap_err();
+    assert_eq!(error.code, "deadline", "{error:?}");
+    assert!(
+        error.message.contains(DEADLINE_AFTER_SEND),
+        "a dispatched call times out after sending: {error:?}"
+    );
+
+    flush(&h, "patient").await;
+    let cancels = h.host.frames_of("cancel");
+    assert_eq!(cancels.len(), 1, "{cancels:?}");
+    assert_eq!(cancels[0]["id"], call_frame["id"]);
+    assert_eq!(
+        calls_of(&h, "hang").len(),
+        1,
+        "a timed-out call is not resent"
+    );
     assert!(matches!(
         h.orch.run_bearers.verify(&token, &local()),
         Err(crate::mcp::run_bearer::BearerRefusal::Revoked { .. })
     ));
+    assert!(h.orch.project_services.runs.get(&run_id).is_none());
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM runs WHERE id = '{run_id}' AND status = 'exited'")
+        )
+        .await,
+        1
+    );
+}
+
+/// A deadline that passes while the call waits for a place in the service's
+/// concurrency gate sends nothing (no call, so nothing to cancel) and still
+/// ends the delegated run minted for it, bearer and all.
+#[tokio::test]
+async fn a_deadline_before_dispatch_sends_nothing_and_ends_its_delegation() {
+    let h = harness().await;
+    h.source.put(
+        "narrow",
+        "name: Narrow\nlimits:\n  concurrency: 1\n  callTimeoutSeconds: 5\n",
+        "serve({})",
+    );
+    let orch = h.orch.clone();
+    let holder = tokio::spawn(async move { call(&orch, request("narrow", "slow", agent())).await });
+    let holder_frame = eventually_frame(&h, "slow").await;
+    let (holder_run, _) = authority_of(&holder_frame);
+    let incarnation = h
+        .orch
+        .project_services
+        .supervisor
+        .cell("p", "cairn", &ServiceOwner::Project, "narrow")
+        .serving()
+        .unwrap();
+
+    let timeout = Duration::from_millis(200);
+    let mut hang = request("narrow", "hang", agent());
+    hang.timeout = Some(timeout);
+    let orch = h.orch.clone();
+    let caller = tokio::spawn(async move { call(&orch, hang).await });
+    eventually("the call to queue behind the held place", || {
+        incarnation.waiting.load(Ordering::Acquire) == 1
+    })
+    .await;
+    // The deadline was fixed before the call queued, so it has certainly
+    // passed once `timeout` has elapsed from here, however slow the host.
+    let queued = Instant::now();
+    while queued.elapsed() <= timeout {
+        tokio::time::sleep(timeout.saturating_sub(queued.elapsed()) + Duration::from_millis(1))
+            .await;
+    }
+    assert!(
+        !caller.is_finished(),
+        "the call is still queued for the gate"
+    );
+
+    // Delegation precedes admission: the queued call holds a live run.
+    let standing = status(&h, "narrow").run_id.unwrap();
+    let job = crate::project_services::rows::ensure_service_job(
+        &h.orch.db.local,
+        "p",
+        &ServiceOwner::Project,
+        "narrow",
+    )
+    .await
+    .unwrap();
+    let delegated_where = format!(
+        "FROM runs WHERE job_id = '{job}' AND status = 'live' AND id NOT IN ('{standing}', '{holder_run}')"
+    );
+    assert_eq!(
+        count(&h, &format!("SELECT COUNT(*) {delegated_where}")).await,
+        1
+    );
+    let delegated = h
+        .orch
+        .db
+        .local
+        .query_opt_text(format!("SELECT id {delegated_where}"), ())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h.orch.project_services.runs.get(&delegated).is_some());
+    assert!(!h.orch.run_bearers.run_is_revoked(&delegated));
+
+    h.host.release_slow.notify_waiters();
+    assert!(holder.await.unwrap().is_ok());
+    let error = caller.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "deadline", "{error:?}");
+    assert_eq!(
+        error.message, DEADLINE_BEFORE_SEND,
+        "a call admitted past its deadline is refused before sending"
+    );
+
+    flush(&h, "narrow").await;
+    assert!(
+        calls_of(&h, "hang").is_empty(),
+        "{:?}",
+        calls_of(&h, "hang")
+    );
+    assert!(h.host.frames_of("cancel").is_empty());
+    assert!(h.orch.run_bearers.run_is_revoked(&delegated));
+    assert!(h.orch.project_services.runs.get(&delegated).is_none());
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM runs WHERE id = '{delegated}' AND status = 'exited'")
+        )
+        .await,
+        1
+    );
+}
+
+async fn eventually_frame(h: &Harness, method: &str) -> Value {
+    eventually("the call frame", || !calls_of(h, method).is_empty()).await;
+    calls_of(h, method).remove(0)
 }
 
 #[tokio::test]

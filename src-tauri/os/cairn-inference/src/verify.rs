@@ -243,6 +243,7 @@ mod tests {
             model: ModelRef {
                 name: "m".into(),
                 weights: vec![],
+                config_files: vec![],
             },
             served_name: "m".into(),
             upstream_id: None,

@@ -699,6 +699,7 @@ pub fn runnable_surface(profile: &InferenceProfile) -> Option<Value> {
     };
     Some(serde_json::json!({
         "weights": profile.model.weights,
+        "configFiles": profile.model.config_files,
         "server": container.server,
         "accelerator": profile.requirements.accelerator,
         "image": container.image,
@@ -932,11 +933,18 @@ pub async fn write_generated(
     let write: GeneratedWrite = serde_json::from_value(payload.clone()).map_err(|error| {
         format!("generated is {{profile, sources?, answers?, startingTemplate?}}: {error}")
     })?;
-    let mut profile: InferenceProfile = match &write.profile {
+    let written: Value = match &write.profile {
         Value::String(yaml) => serde_yaml::from_str(yaml).map_err(|e| e.to_string()),
-        other => serde_json::from_value(other.clone()).map_err(|e| e.to_string()),
+        other => Ok(other.clone()),
     }
     .map_err(|error| format!("generated.profile is not a profile: {error}"))?;
+    if let Some(to) = writable_cache_mount(&written) {
+        return Err(format!(
+            "a generated profile mounts the Hugging Face cache read-only, and Cairn gives it only the pinned repositories' directories; drop readOnly: false from the mount at {to}"
+        ));
+    }
+    let mut profile: InferenceProfile = serde_json::from_value(written)
+        .map_err(|error| format!("generated.profile is not a profile: {error}"))?;
     if profile.model.name != generation.model {
         return Err(format!(
             "this generation is for {}; the profile serves {}",
@@ -960,6 +968,15 @@ pub async fn write_generated(
             "a generated profile checks out no source repository ({}); one that needs it is the operator's to write in its editor",
             files.url
         ));
+    }
+    if container.server == cairn_inference::Server::Vllm
+        && container
+            .mounts
+            .iter()
+            .any(|mount| mount.from == cairn_inference::MountSource::HfCache)
+        && profile.model.config_files.is_empty()
+    {
+        return Err("a generated vLLM profile pins its repository's configuration, tokenizer and chat-template files (model.configFiles), as its starting profile does: its container reaches only the pinned files, read-only".into());
     }
     let inventory = load_inventory(db).await?;
     let model = inventory
@@ -1021,6 +1038,27 @@ pub async fn write_generated(
             "surfaceDigest": digest,
         }),
     ))
+}
+
+/// Where `profile`, as written, mounts the Hugging Face cache with
+/// `readOnly: false`. A profile reads such a mount as read-only, so this asks
+/// what was written, to refuse it rather than quietly correct it.
+fn writable_cache_mount(profile: &Value) -> Option<String> {
+    profile
+        .pointer("/engine/mounts")?
+        .as_array()?
+        .iter()
+        .find(|mount| {
+            mount.pointer("/from/kind").and_then(Value::as_str) == Some("hfCache")
+                && mount.get("readOnly").and_then(Value::as_bool) == Some(false)
+        })
+        .map(|mount| {
+            mount
+                .get("to")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
 }
 
 /// The question a generation's workflow asked the operator, as stored.
@@ -2109,6 +2147,19 @@ requirements:
             refusal.contains("checks out no source repository"),
             "{refusal}"
         );
+        let writable = serde_json::json!({"profile": profile_yaml("w", "{kind: container, image: \"ghcr.io/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", server: llamaCpp, mounts: [{from: {kind: hfCache}, to: /models, readOnly: false}]}")});
+        let refusal = write_generated(&db, "h", "j-wf", &writable)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.contains("drop readOnly: false from the mount at /models"),
+            "{refusal}"
+        );
+        let unconfigured = serde_json::json!({"profile": profile_yaml("v", "{kind: container, image: \"ghcr.io/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", server: vllm, mounts: [{from: {kind: hfCache}, to: /root/.cache/huggingface}]}")});
+        let refusal = write_generated(&db, "h", "j-wf", &unconfigured)
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("model.configFiles"), "{refusal}");
     }
 
     fn asked(digest: &str, answer: Option<&str>) -> AskedQuestion {

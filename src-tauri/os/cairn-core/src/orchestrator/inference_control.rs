@@ -1440,6 +1440,7 @@ pub(crate) mod tests {
             model: ModelRef {
                 name: id.into(),
                 weights: Vec::new(),
+                config_files: Vec::new(),
             },
             served_name: id.into(),
             upstream_id: None,

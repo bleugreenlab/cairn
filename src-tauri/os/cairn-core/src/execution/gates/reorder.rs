@@ -967,12 +967,13 @@ pub async fn move_held_execution(
             .unwrap_or("nothing")
     );
     let mut touched: Vec<(Arc<LocalDb>, String)> = Vec::new();
+    let mut notices = Vec::new();
     let guard = orch
         .admission_lock
         .acquire(AdmissionSite::QueueMove, subject)
         .await
         .map_err(|busy| busy.to_string())?;
-    let moved = moves_under_lock(orch, moves, &mover, &mut touched).await;
+    let moved = moves_under_lock(orch, moves, &mover, &mut touched, &mut notices).await;
     drop(guard);
     // A database failing partway through still leaves rows that moved, so
     // their places and changes go out whatever the result.
@@ -985,27 +986,46 @@ pub async fn move_held_execution(
                 .await;
         let _ = orch.services.emitter.emit("db-change", change);
     }
+    let actor = match &mover {
+        QueueMover::Operator => None,
+        QueueMover::Thread { name } => Some(name.as_str()),
+    };
+    for notice in &notices {
+        super::queue_notice::moved(orch, notice, mover.name(), actor).await;
+    }
     moved
 }
 
 /// Every move's plan and writes, holding the admission lock. The plan is the
 /// authoritative check (the one a request ran before asking the operator saw
-/// the line without the lock).
+/// the line without the lock). Each move that changed a place leaves a
+/// [`super::queue_notice::MovedSubject`] in `notices`, naming where it stood
+/// before it.
 async fn moves_under_lock(
     orch: &Orchestrator,
     moves: &[(String, usize)],
     mover: &QueueMover,
     touched: &mut Vec<(Arc<LocalDb>, String)>,
+    notices: &mut Vec<super::queue_notice::MovedSubject>,
 ) -> Result<Vec<FleetMove>, String> {
     if moves.is_empty() {
         return Err("Nothing to move.".to_string());
     }
     let order = fleet_order(orch).await?;
     let holds = capacity_holds(&order).await?;
-    plan_on(&order, &holds, moves, mover).map_err(|refusals| refusals.join(" "))?;
+    let planned = plan_on(&order, &holds, moves, mover).map_err(|refusals| refusals.join(" "))?;
     let mut outcomes = Vec::new();
-    for (execution_id, position) in moves {
-        outcomes.push(move_under_lock(orch, execution_id, *position, mover, touched).await?);
+    for ((execution_id, position), plan) in moves.iter().zip(&planned) {
+        let outcome = move_under_lock(orch, execution_id, *position, mover, touched).await?;
+        if outcome.moved {
+            let entry = order
+                .iter()
+                .find(|entry| &entry.queued.execution_id == execution_id);
+            notices.extend(entry.and_then(|entry| {
+                super::queue_notice::MovedSubject::of(entry, plan.from, outcome.position)
+            }));
+        }
+        outcomes.push(outcome);
     }
     Ok(outcomes)
 }
@@ -2297,6 +2317,68 @@ pub(crate) mod tests {
         for number in [201, 202, 203, 301] {
             assert!(is_held(&w.env, number).await, "{number} is still held");
         }
+    }
+
+    /// A move of a thread's child by anyone but that thread leaves the thread
+    /// one passive line naming the mover, the new place, and the old one. The
+    /// thread's own move, its own `order`, and a move that changes nothing add
+    /// none.
+    #[tokio::test]
+    async fn a_move_by_someone_else_tells_the_owning_thread_once() {
+        use crate::execution::gates::queue_notice::tests::{notices, thread_session};
+
+        let w = world("move-notice.db", false).await;
+        thread_session(&w.env.db, "ta", "alpha-job", "alpha-run").await;
+        thread_session(&w.env.db, "tb", "beta-job", "beta-run").await;
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a1, &w.b1, &w.a2, &w.a3]));
+
+        operator_move(&w.env.orch, &w.a3, 1).await.unwrap();
+        assert!(!operator_move(&w.env.orch, &w.a3, 1).await.unwrap().moved);
+        move_held_execution(
+            &w.env.orch,
+            &[(w.a1.clone(), 2)],
+            QueueMover::Thread {
+                name: "alpha".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        order(&w.env, json!([202]), "alpha").await.unwrap();
+        let before = view_ids(&w.env).await;
+        let from = before.iter().position(|id| id == &w.a2).unwrap() + 1;
+        // Behind the two pins, to whichever of the last two places it is not in.
+        let to = if from == 3 { 4 } else { 3 };
+        move_held_execution(
+            &w.env.orch,
+            &[(w.a2.clone(), to)],
+            QueueMover::Thread {
+                name: "beta".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            notices(&w.env.db, "alpha-job").await,
+            vec![
+                (
+                    "passive".to_string(),
+                    "The operator moved prj/203 to 1st in the fleet's order (was 4th).".to_string()
+                ),
+                (
+                    "passive".to_string(),
+                    format!(
+                        "beta moved prj/202 to {} in the fleet's order (was {}).",
+                        crate::execution::gates::census::ordinal(to),
+                        crate::execution::gates::census::ordinal(from)
+                    )
+                ),
+            ]
+        );
+        assert!(
+            notices(&w.env.db, "beta-job").await.is_empty(),
+            "no child of beta's moved"
+        );
     }
 
     /// A granted thread's move releases next, exactly once under racing sweeps

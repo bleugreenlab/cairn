@@ -545,6 +545,7 @@ mod tests {
             "gate:g",
             "tenet-verdict:v",
             "tenet-contradiction:x",
+            "queue:q",
         ];
         db.write(move |conn| {
             Box::pin(async move {

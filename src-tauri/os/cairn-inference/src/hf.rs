@@ -27,7 +27,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::model::ModelFacts;
-use crate::profile::{is_commit_sha, is_sha256_hex};
+use crate::profile::{is_commit_sha, is_sha256_hex, ConfigFile};
 
 /// What a weight file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -150,6 +150,9 @@ pub struct WeightSource {
     pub format: WeightFormat,
     pub quantization: String,
     pub files: Vec<HfFile>,
+    /// The repository's configuration, tokenizer and chat-template files,
+    /// which a safetensors server reads beside the weights. None for GGUF.
+    pub config_files: Vec<ConfigFile>,
 }
 
 impl WeightSource {
@@ -243,6 +246,7 @@ pub fn classify(repos: &[HfRepo], model_dtype: Option<&str>) -> RepoFiles {
                 format: WeightFormat::Safetensors,
                 quantization,
                 files: safetensors,
+                config_files: repo.config_files.clone(),
             });
         }
         // GGUF weights, grouped by directory and stem without the shard
@@ -289,6 +293,7 @@ pub fn classify(repos: &[HfRepo], model_dtype: Option<&str>) -> RepoFiles {
                     .into_iter()
                     .map(|(_, _, file)| file.clone())
                     .collect(),
+                config_files: Vec::new(),
             });
         }
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
@@ -325,6 +330,8 @@ pub struct HfRepo {
     pub gated: bool,
     /// The checkpoint's weight files, safetensors and GGUF, with their hashes.
     pub weights: Vec<HfFile>,
+    /// The files a server reads beside the weights, by [`is_config_file`].
+    pub config_files: Vec<ConfigFile>,
     /// Set when this repository is a quantized derivative of another model:
     /// the models it may quantize, best guess first.
     pub base_candidates: Vec<String>,
@@ -341,6 +348,17 @@ impl HfRepo {
             .iter()
             .filter(move |file| file.format() == Some(format))
     }
+}
+
+/// Whether a server reads `path` beside a repository's weights: its JSON
+/// configuration (`config.json`, `tokenizer_config.json`, the safetensors
+/// index, a sentence-transformers `1_Pooling/config.json`), its tokenizer
+/// (`merges.txt`, a SentencePiece `.model`, a `.tiktoken`) and its chat
+/// template (`.jinja`). Never code: a repository's Python is not run.
+pub fn is_config_file(path: &str) -> bool {
+    [".json", ".txt", ".model", ".tiktoken", ".jinja"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
 }
 
 const QUANT_SUFFIXES: &[&str] = &[
@@ -396,6 +414,34 @@ pub fn parse(api: &str, config: Option<&str>) -> Result<HfRepo, String> {
             let size = lfs.get("size")?.as_u64()?;
             let file = HfFile { path, sha256, size };
             (file.format().is_some() && is_sha256_hex(&file.sha256)).then_some(file)
+        })
+        .collect();
+    let config_files: Vec<ConfigFile> = api
+        .get("siblings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|sibling| {
+            let path = sibling.get("rfilename")?.as_str()?;
+            if !is_config_file(path) {
+                return None;
+            }
+            let lfs = sibling.get("lfs");
+            let sha256 = lfs
+                .and_then(|lfs| lfs.get("sha256")?.as_str())
+                .map(str::to_string);
+            let file = ConfigFile {
+                repo: repo.clone(),
+                revision: revision.clone(),
+                path: path.to_string(),
+                git_blob: match sha256 {
+                    Some(_) => None,
+                    None => Some(sibling.get("blobId")?.as_str()?.to_string()),
+                },
+                sha256,
+                size: sibling.get("size").and_then(Value::as_u64),
+            };
+            file.problem().is_none().then_some(file)
         })
         .collect();
 
@@ -473,6 +519,7 @@ pub fn parse(api: &str, config: Option<&str>) -> Result<HfRepo, String> {
         facts,
         gated,
         weights,
+        config_files,
         base_candidates,
     })
 }
@@ -850,6 +897,51 @@ mod tests {
     }
 
     #[test]
+    fn a_safetensors_source_pins_its_config_files_by_lfs_hash_or_git_blob() {
+        let repo = read(
+            include_str!("../tests/fixtures/hf/Qwen--Qwen3-Embedding-4B.api.json"),
+            Some(include_str!(
+                "../tests/fixtures/hf/Qwen--Qwen3-Embedding-4B.config.json"
+            )),
+        );
+        let paths: Vec<&str> = repo.config_files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "1_Pooling/config.json",
+                "config.json",
+                "config_sentence_transformers.json",
+                "generation_config.json",
+                "merges.txt",
+                "model.safetensors.index.json",
+                "modules.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "vocab.json",
+            ],
+            "no README, .gitattributes or weights"
+        );
+        let by_path = |path: &str| repo.config_files.iter().find(|f| f.path == path).unwrap();
+        let config = by_path("config.json");
+        assert_eq!(
+            config.git_blob.as_deref(),
+            Some("8b4b87fc69023e7a224eb6563753aaf3223d8b98")
+        );
+        assert_eq!(config.sha256, None);
+        assert_eq!(config.revision, repo.revision);
+        let tokenizer = by_path("tokenizer.json");
+        assert_eq!(
+            tokenizer.sha256.as_deref(),
+            Some("83cdf8c3a34f68862319cb1810ee7b1e2c0a44e0864ae930194ddb76bb7feb8d")
+        );
+        assert_eq!(tokenizer.git_blob, None, "an LFS file is pinned by content");
+
+        let files = classify(&[repo], None);
+        let source = files.source("Qwen/Qwen3-Embedding-4B@bf16").unwrap();
+        assert_eq!(source.config_files.len(), 10);
+    }
+
+    #[test]
     fn an_incomplete_shard_set_is_not_a_source() {
         let file = |path: &str| HfFile {
             path: path.into(),
@@ -865,6 +957,7 @@ mod tests {
                 file("m-Q8_0-00001-of-00003.gguf"),
                 file("m-Q8_0-00002-of-00003.gguf"),
             ],
+            config_files: vec![],
             base_candidates: vec![],
         };
         let files = classify(&[repo], None);

@@ -445,7 +445,7 @@ fn summarize(
 }
 
 /// `, skipping the fleet and thread caps`: what a Start now skipped.
-fn skipped_phrase(skipped: &[String]) -> String {
+pub(crate) fn skipped_phrase(skipped: &[String]) -> String {
     match skipped {
         [] => String::new(),
         [one] => format!(", skipping the {one} cap"),

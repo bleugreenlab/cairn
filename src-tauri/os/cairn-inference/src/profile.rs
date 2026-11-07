@@ -135,9 +135,24 @@ pub struct ModelRef {
     /// than the model's own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<WeightFile>,
+    /// The other files of the weights' repository a server reads beside
+    /// them: vLLM's configuration, tokenizer and chat template. A GGUF file
+    /// holds all of that itself, so a llama.cpp profile pins none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_files: Vec<ConfigFile>,
 }
 
 impl ModelRef {
+    /// Every repository a pinned file comes from, once each: the cache
+    /// directories a container's Hugging Face cache mount reaches.
+    pub fn repos(&self) -> BTreeSet<&str> {
+        self.weights
+            .iter()
+            .map(|weight| weight.repo.as_str())
+            .chain(self.config_files.iter().map(|file| file.repo.as_str()))
+            .collect()
+    }
+
     /// The repository and revision the weights come from: the first weight
     /// file's, or the model's own name with no revision when none is pinned.
     pub fn weights_source(&self) -> (&str, Option<&str>) {
@@ -167,6 +182,54 @@ impl WeightFile {
     /// Validate the components used both in the Hub URL and the local cache.
     /// This is lexical: the cache itself is trusted, including its symlinks.
     pub(crate) fn problem(&self) -> Option<&'static str> {
+        if let Some(problem) = location_problem(&self.repo, &self.revision, &self.path) {
+            return Some(problem);
+        }
+        if !is_sha256_hex(&self.sha256) {
+            return Some("sha256 is not 64 lowercase hex digits");
+        }
+        None
+    }
+}
+
+/// One file of a weight repository a server reads beside the weights, pinned
+/// by repository, revision, path and hash. A file Hugging Face keeps in LFS
+/// (a large `tokenizer.json`) is pinned by its content's SHA-256; any other
+/// by its git blob id, the SHA-1 of `blob <size>\0` and its content, which is
+/// the only hash the Hub states for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigFile {
+    pub repo: String,
+    pub revision: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+impl ConfigFile {
+    pub(crate) fn problem(&self) -> Option<&'static str> {
+        if let Some(problem) = location_problem(&self.repo, &self.revision, &self.path) {
+            return Some(problem);
+        }
+        match (&self.sha256, &self.git_blob) {
+            (Some(sha256), None) if is_sha256_hex(sha256) => None,
+            (None, Some(blob)) if is_lower_hex(blob, 40) => None,
+            (Some(_), None) => Some("sha256 is not 64 lowercase hex digits"),
+            (None, Some(_)) => Some("gitBlob is not 40 lowercase hex digits"),
+            _ => Some("pin exactly one of sha256 (an LFS file) and gitBlob (any other)"),
+        }
+    }
+}
+
+/// Why a pinned file's repository, revision or path is unsafe to put in a
+/// Hub URL or a cache path.
+fn location_problem(repo: &str, revision: &str, path: &str) -> Option<&'static str> {
+    {
         let repo_component = |part: &str| {
             !part.is_empty()
                 && part.len() <= 96
@@ -178,42 +241,36 @@ impl WeightFile {
                 && !part.contains("..")
                 && !part.contains("--")
         };
-        let repo_ok = self.repo.split_once('/').is_some_and(|(owner, name)| {
+        let repo_ok = repo.split_once('/').is_some_and(|(owner, name)| {
             repo_component(owner) && repo_component(name) && !name.ends_with(".git")
         });
         if !repo_ok {
             return Some("repo must be a Hugging Face owner/name using letters, digits, _, - and . (no .. or --)");
         }
-        if self.revision.is_empty()
-            || !self
-                .revision
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-            || self.revision.starts_with(['.', '-'])
-            || self.revision.ends_with('.')
-            || self.revision.contains("..")
-            || self.revision.ends_with(".lock")
-        {
-            return Some("revision must be a plain ref or sha using letters, digits, _, - and . (no / or ..)");
-        }
-        if self.path.is_empty()
-            || self.path.starts_with('/')
-            || self
-                .path
-                .chars()
-                .any(|c| c.is_control() || matches!(c, '\\' | ':' | '?' | '#' | '%'))
-            || self
-                .path
-                .split('/')
-                .any(|part| matches!(part, "" | "." | ".."))
-        {
-            return Some("path must be relative with no empty, . or .. segment, backslash, control character or URL/drive delimiter (: ? # %)");
-        }
-        if !is_sha256_hex(&self.sha256) {
-            return Some("sha256 is not 64 lowercase hex digits");
-        }
-        None
     }
+    if revision.is_empty()
+        || !revision
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        || revision.starts_with(['.', '-'])
+        || revision.ends_with('.')
+        || revision.contains("..")
+        || revision.ends_with(".lock")
+    {
+        return Some(
+            "revision must be a plain ref or sha using letters, digits, _, - and . (no / or ..)",
+        );
+    }
+    if path.is_empty()
+        || path.starts_with('/')
+        || path
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\\' | ':' | '?' | '#' | '%'))
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Some("path must be relative with no empty, . or .. segment, backslash, control character or URL/drive delimiter (: ? # %)");
+    }
+    None
 }
 
 /// The engine that serves the model.
@@ -304,13 +361,36 @@ impl Server {
 
 /// One bind mount into the container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "MountRecord")]
 pub struct Mount {
     pub from: MountSource,
     /// The path inside the container.
     pub to: String,
+    /// Always true of a [`MountSource::HfCache`] mount: one written writable
+    /// reads as read-only.
     #[serde(default)]
     pub read_only: bool,
+}
+
+/// A mount as written, before a Hugging Face cache mount is made read-only.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MountRecord {
+    from: MountSource,
+    to: String,
+    #[serde(default)]
+    read_only: bool,
+}
+
+impl From<MountRecord> for Mount {
+    fn from(record: MountRecord) -> Self {
+        let read_only = record.read_only || record.from == MountSource::HfCache;
+        Self {
+            from: record.from,
+            to: record.to,
+            read_only,
+        }
+    }
 }
 
 /// Where a mount's host side is.
@@ -319,8 +399,13 @@ pub struct Mount {
 pub enum MountSource {
     /// A path within the profile's pinned [`Container::files`] checkout.
     Source { path: String },
-    /// The machine's Hugging Face cache (`$HF_HOME`, or
-    /// `~/.cache/huggingface`).
+    /// The pinned repositories' directories in the machine's Hugging Face
+    /// cache (`$HF_HOME`, or `~/.cache/huggingface`), read-only: for each
+    /// repository [`ModelRef::repos`] names, `hub/models--<owner>--<name>`,
+    /// at the same place under the mount's `to`. Nothing else of the cache is
+    /// mounted, so its token and every other model's weights stay out of the
+    /// container, and no engine can change weights another profile loads.
+    /// Cairn fetches every pinned file before the container starts.
     HfCache,
 }
 
@@ -570,6 +655,15 @@ impl InferenceProfile {
                 });
             }
         }
+        for (index, file) in self.model.config_files.iter().enumerate() {
+            if let Some(problem) = file.problem() {
+                problems.push(ValidationError::BadConfigFile {
+                    profile: profile(),
+                    index,
+                    problem,
+                });
+            }
+        }
         match &self.engine {
             Engine::Container(container) => {
                 problems.extend(self.container_problems(container));
@@ -666,6 +760,7 @@ mod tests {
             model: ModelRef {
                 name: "m".into(),
                 weights,
+                config_files: vec![],
             },
             served_name: "m".into(),
             upstream_id: None,
@@ -834,7 +929,7 @@ mod tests {
         engine.mounts.push(Mount {
             from: MountSource::HfCache,
             to: "/root/.cache/huggingface".into(),
-            read_only: false,
+            read_only: true,
         });
         engine.host.gpus = true;
         let mut generated = profile(Engine::Container(engine), vec![weight(SHA)]);

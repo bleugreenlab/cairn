@@ -2899,6 +2899,138 @@ pub(crate) mod tests {
         );
     }
 
+    /// The child's owner (here the parent issue's coordinator) is told once,
+    /// passively, naming the act and the place it skipped; the same start
+    /// told again, or attempted again, adds nothing.
+    #[tokio::test]
+    async fn start_now_leaves_the_owner_one_passive_line() {
+        use crate::execution::gates::queue_notice;
+
+        let env = env("cap-start-now-notice.db").await;
+        full_fleet(&env).await;
+        file(&env, 1, json!([])).await.unwrap();
+        sweep_at(&env.orch, now()).await.unwrap();
+        let (id, ..) = execution(&env, 1).await;
+        let start = || {
+            release(
+                &env.orch,
+                &id,
+                ReleaseCause::Override {
+                    principal: operator(),
+                    scope: OverrideScope::Everything {
+                        by: crate::execution::gates::sweep::CapSkipAuthority::Operator,
+                    },
+                },
+            )
+        };
+        assert_eq!(start().await.unwrap(), ReleaseOutcome::Released);
+        let line = (
+            "passive".to_string(),
+            "The operator started prj/1 now (was 1st in the fleet's order, skipping the fleet \
+             cap)."
+                .to_string(),
+        );
+        assert_eq!(
+            queue_notice::tests::notices(&env.db, "coord").await,
+            vec![line.clone()]
+        );
+
+        assert_eq!(start().await.unwrap(), ReleaseOutcome::NotHeld);
+        let subject = queue_notice::place_before_start(&env.orch, &env.db, &id)
+            .await
+            .unwrap();
+        queue_notice::started(
+            &env.orch,
+            &env.db,
+            &id,
+            subject,
+            &crate::execution::gates::sweep::CapSkipAuthority::Operator,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            queue_notice::tests::notices(&env.db, "coord").await,
+            vec![line],
+            "one start, one line"
+        );
+    }
+
+    /// A thread's child names its place in the thread's own queue, the number
+    /// `cairn:~/queue` printed. The thread's own granted start tells it
+    /// nothing; another thread's granted start names that thread.
+    #[tokio::test]
+    async fn start_now_on_a_threads_child_tells_the_thread_unless_it_acted() {
+        use crate::execution::gates::queue_notice::tests::{notices, thread_session};
+        use crate::execution::gates::sweep::CapSkipAuthority;
+
+        let env = env("cap-start-now-thread-notice.db").await;
+        full_fleet(&env).await;
+        add_thread(&env, "th", "harness").await;
+        thread_session(&env.db, "th", "harness-job", "harness-run").await;
+        for number in [105, 106, 107] {
+            add_issue(&env, number, Some("th")).await;
+            file(&env, number, json!([])).await.unwrap();
+            assert!(is_held(&env, number).await);
+        }
+        sweep_at(&env.orch, now()).await.unwrap();
+        let start = |number: i32, by: CapSkipAuthority| {
+            let env = &env;
+            async move {
+                let (id, ..) = execution(env, number).await;
+                release(
+                    &env.orch,
+                    &id,
+                    ReleaseCause::Override {
+                        principal: operator(),
+                        scope: OverrideScope::Everything { by },
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        assert!(start(106, CapSkipAuthority::Operator).await.released());
+        assert!(start(
+            105,
+            CapSkipAuthority::Granted {
+                thread: "harness".to_string(),
+                decision: None,
+            },
+        )
+        .await
+        .released());
+        assert!(start(
+            107,
+            CapSkipAuthority::Granted {
+                thread: "judgment".to_string(),
+                decision: None,
+            },
+        )
+        .await
+        .released());
+        let lines: Vec<String> = notices(&env.db, "harness-job")
+            .await
+            .into_iter()
+            .map(|(wake, line)| {
+                assert_eq!(wake, "passive");
+                line
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "The operator started prj/106 now (was 2nd in harness's queue, skipping the \
+                 fleet cap)."
+                    .to_string(),
+                "judgment started prj/107 now under the operator's grant (was 1st in \
+                 harness's queue, skipping the fleet cap)."
+                    .to_string(),
+            ],
+            "harness's own start of 105 adds nothing"
+        );
+    }
+
     #[tokio::test]
     async fn oldest_held_first() {
         let env = env("cap-oldest-first.db").await;

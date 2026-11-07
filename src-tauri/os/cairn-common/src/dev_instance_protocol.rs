@@ -189,6 +189,12 @@ pub enum DevInstanceLaunchFailure {
     ConflictingLaunch {
         diagnostic: String,
     },
+    /// The instance home this launch names was created by another actor, and
+    /// an agent's launch never uses a home its own job did not create. Refused
+    /// before any lease, runner, database or file is touched.
+    InstanceHomeRefused {
+        diagnostic: String,
+    },
     ProcessStart {
         diagnostic: String,
     },
@@ -296,6 +302,7 @@ mod tests {
             DevInstanceLaunchFailure::MaterializationCleanup { diagnostic: d() },
             DevInstanceLaunchFailure::MaterializationPersistence { diagnostic: d() },
             DevInstanceLaunchFailure::ConflictingLaunch { diagnostic: d() },
+            DevInstanceLaunchFailure::InstanceHomeRefused { diagnostic: d() },
             DevInstanceLaunchFailure::ProcessStart { diagnostic: d() },
             DevInstanceLaunchFailure::LeaseUnavailable { diagnostic: d() },
             DevInstanceLaunchFailure::LeaseLost { diagnostic: d() },

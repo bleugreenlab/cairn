@@ -282,6 +282,11 @@ pub async fn import(
         model: ModelRef {
             name: model.name.clone(),
             weights,
+            // vLLM reads these beside the weights; a GGUF file holds them.
+            config_files: match server {
+                Server::Vllm => read.config_files.clone(),
+                Server::LlamaCpp => Vec::new(),
+            },
         },
         served_name: model.name.clone(),
         upstream_id: None,

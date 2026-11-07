@@ -224,7 +224,9 @@ fn container_lines(out: &mut String, container: &cairn_inference::Container) {
     }
     for mount in &container.mounts {
         let from = match &mount.from {
-            cairn_inference::MountSource::HfCache => "the Hugging Face cache".to_string(),
+            cairn_inference::MountSource::HfCache => {
+                "the pinned repositories' directories of the Hugging Face cache".to_string()
+            }
             cairn_inference::MountSource::Source { path } => format!("source {path}"),
         };
         let _ = writeln!(
@@ -317,6 +319,21 @@ fn profile_section(out: &mut String, profile: &InferenceProfile) {
                 out,
                 "  - {}@{} {} (sha256 {})",
                 weight.repo, weight.revision, weight.path, weight.sha256
+            );
+        }
+    }
+    if !profile.model.config_files.is_empty() {
+        out.push_str("- config files:\n");
+        for file in &profile.model.config_files {
+            let pin = match (&file.sha256, &file.git_blob) {
+                (Some(sha256), _) => format!("sha256 {sha256}"),
+                (None, Some(blob)) => format!("git blob {blob}"),
+                (None, None) => "unpinned".into(),
+            };
+            let _ = writeln!(
+                out,
+                "  - {}@{} {} ({pin})",
+                file.repo, file.revision, file.path
             );
         }
     }

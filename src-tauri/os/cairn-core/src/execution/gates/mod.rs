@@ -13,6 +13,7 @@ pub mod census;
 #[cfg(test)]
 mod held_reads_tests;
 pub mod pulse;
+pub(crate) mod queue_notice;
 pub mod reorder;
 pub mod rotation;
 #[cfg(test)]

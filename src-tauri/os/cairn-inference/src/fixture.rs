@@ -17,6 +17,7 @@ pub(crate) fn command_profile(id: &str, machines: u32) -> InferenceProfile {
         model: ModelRef {
             name: id.into(),
             weights: Vec::new(),
+            config_files: Vec::new(),
         },
         served_name: id.into(),
         upstream_id: None,
