@@ -365,12 +365,6 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("check_result_commit_aliases", "check_result_observations"),
     owned("check_observation_relabels", "check_result_observations"),
     undecided(
-        "pr_resolution_attributions",
-        TESTING,
-        "trim lane_snapshot (~215 KB a row) once the merge resolves, or cap per merge request",
-    )
-    .budget(640),
-    undecided(
         "runtime_admission_requests",
         "cairn://p/cairn/execution",
         "delete settled requests 30 days after they settle; prepared launches and calls cascade",
@@ -448,6 +442,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("pack_catalog_backfill_attempts", "execution_history"),
     owned("pack_catalog_references", "pack_catalog"),
     owned("merge_attempt_events", "merge_requests"),
+    // One row per resolution, a few kilobytes since lane_snapshot stopped
+    // copying the execution snapshot (cairn/6257); the merge-time lane record
+    // is provenance and lives as long as its merge request.
+    owned("pr_resolution_attributions", "merge_requests").budget(32),
     owned("human_base_merge_policy_events", "projects"),
     owned("doc_references", "issues"),
     owned("issue_labels", "issues"),

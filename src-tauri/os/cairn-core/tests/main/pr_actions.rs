@@ -986,6 +986,35 @@ async fn a_merge_made_on_github_resolves_on_refresh_exactly_once() {
         section.contains("Merged by someone outside Cairn (observed on GitHub)"),
         "{section}"
     );
+    // The provenance is a short summary that links to the execution, never the
+    // execution's snapshot pasted in as JSON.
+    let provenance = section
+        .split("<details><summary>Resolution provenance</summary>")
+        .nth(1)
+        .and_then(|rest| rest.split("</details>").next())
+        .expect("the resolution renders its provenance");
+    assert!(provenance.len() < 2_048, "{provenance}");
+    assert!(
+        provenance.contains("Surface: `github-refresh-observation`"),
+        "{provenance}"
+    );
+    assert!(
+        provenance.contains("execution: cairn://p/gh/1/1"),
+        "{provenance}"
+    );
+    assert!(!provenance.contains("Lane snapshot"), "{provenance}");
+    assert!(!provenance.contains('{'), "{provenance}");
+    let stored = text_column(
+        db,
+        "SELECT lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1",
+        &mr,
+    )
+    .await
+    .expect("the observation journals a lane snapshot");
+    assert!(
+        !stored.contains("executionSnapshot") && !stored.contains("PR test"),
+        "the execution's snapshot is not copied: {stored}"
+    );
 
     assert_eq!(mr_status(db, &mr).await, "merged");
     assert_eq!(

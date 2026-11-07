@@ -665,6 +665,7 @@ fn lane(
     verified_on: Option<&str>,
 ) -> NodeCheckStatus {
     NodeCheckStatus {
+        observation_id: None,
         job_id: "job".into(),
         request_id: None,
         name: name.into(),

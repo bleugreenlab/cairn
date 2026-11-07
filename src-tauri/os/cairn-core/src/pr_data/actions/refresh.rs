@@ -29,7 +29,9 @@ use super::context::{
     db_error, load_mr_branches, load_mr_issue_id, resolve_mr_context_for_job,
     try_resolve_mr_context_for_job, MrContext, PrNodeResolution,
 };
-use super::resolution::{resolution_actor_label, resolve_observed_pr_node, resolve_pr_node};
+use super::resolution::{
+    provenance_links, render_resolution_provenance, resolve_observed_pr_node, resolve_pr_node,
+};
 
 /// The mergeability an artifact may publish for a live pull request.
 ///
@@ -1308,17 +1310,8 @@ pub async fn render_live_pr_section(
     if let Some(attribution) =
         attribution.filter(|event| expected_action.is_some_and(|expected| event.action == expected))
     {
-        let actor = resolution_actor_label(
-            Some(attribution.actor_kind.as_str()),
-            attribution.actor_identity.as_deref(),
-            Some(attribution.surface.as_str()),
-        );
-        let verb = if attribution.action == "close" {
-            "Closed"
-        } else {
-            "Merged"
-        };
-        out.push_str(&format!("{verb} by {actor} at {}\n\n<details><summary>Resolution provenance</summary>\n\nSurface: `{}`\n\nLane snapshot: `{}`\n\n</details>\n", chrono::DateTime::from_timestamp(attribution.created_at, 0).map(|v| v.to_rfc3339()).unwrap_or_else(|| attribution.created_at.to_string()), attribution.surface, attribution.lane_snapshot));
+        let links = provenance_links(&db, &mr_context.job_id, &attribution.lane_snapshot).await;
+        out.push_str(&render_resolution_provenance(&attribution, &links));
         // A landing that recorded more than an ordinary one (a pin bump's
         // evidence, a config notice) says so.
         if attribution.action == "merge" {

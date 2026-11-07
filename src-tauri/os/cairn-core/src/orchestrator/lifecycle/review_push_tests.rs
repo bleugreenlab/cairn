@@ -97,6 +97,7 @@ fn waited_on_lanes(
         .iter()
         .map(
             |(name, state, when)| crate::execution::checks_status::NodeCheckStatus {
+                observation_id: None,
                 job_id: "j-prod".to_string(),
                 request_id: None,
                 name: name.to_string(),

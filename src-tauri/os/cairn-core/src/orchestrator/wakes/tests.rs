@@ -820,6 +820,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
     .unwrap();
 
     let statuses = vec![NodeCheckStatus {
+        observation_id: None,
         job_id: "job".to_string(),
         request_id: None,
         name: "rust-tests".to_string(),
@@ -903,6 +904,7 @@ fn a_verdictless_subscribe_time_reading_is_confirmed_rather_than_fired_on() {
     use crate::messages::delivery::HeadTurn;
 
     let lane = |name: &str, state: NodeCheckState| NodeCheckStatus {
+        observation_id: None,
         job_id: "job".to_string(),
         request_id: None,
         name: name.to_string(),
@@ -967,6 +969,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
     use crate::messages::delivery::HeadTurn;
 
     let lane = |name: &str, state: NodeCheckState| NodeCheckStatus {
+        observation_id: None,
         job_id: "job".to_string(),
         request_id: None,
         name: name.to_string(),

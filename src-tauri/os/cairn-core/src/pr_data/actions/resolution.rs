@@ -23,7 +23,447 @@ pub struct StoredPrResolutionAttribution {
     pub actor_identity: Option<String>,
     pub surface: String,
     pub created_at: i64,
-    pub lane_snapshot: String,
+    pub lane_snapshot: LaneSnapshot,
+}
+
+/// The state of the work a pull request's resolution was made against: each
+/// check lane's verdict, the producing execution's jobs, and the head the pull
+/// request stood at. It is what shows, afterwards, that a merge landed with
+/// lanes still waiting for a verdict.
+///
+/// The execution is named, never copied. Its snapshot (every agent's prompt,
+/// the recipe graph, every skill) runs to hundreds of kilobytes and lives on
+/// the execution's own resource.
+///
+/// Rows journaled before this shape also carry `execution.executionSnapshot`
+/// and each lane's full status (output tails, failure names). [`Self::parse`]
+/// reads both shapes and keeps only these fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneSnapshot {
+    pub execution: Option<ExecutionAtResolution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub systematic_checks: Vec<LaneAtResolution>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionAtResolution {
+    pub id: Option<String>,
+    pub execution_status: Option<String>,
+    pub jobs: Vec<JobAtResolution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobAtResolution {
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// One check lane as it stood at the resolution. `state` is the lane's
+/// [`NodeCheckState`](crate::execution::checks_status::NodeCheckState) word;
+/// `pending` and `running` mean the lane had no verdict yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneAtResolution {
+    pub name: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passed: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ran_at: Option<i64>,
+    /// The earlier head of the branch the verdict was recorded against, when
+    /// it is not the head the pull request stood at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_on: Option<LaneHead>,
+    /// Where the lane's evidence lives. `None` only on rows journaled before
+    /// lanes cited their observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<LaneObservation>,
+}
+
+/// The evidence behind a lane's state at resolution. A cited observation
+/// holds what the lane record leaves out (output tail, per-test results), so a
+/// reader can recover why a lane was red; an absent one says why there is
+/// nothing to cite rather than leaving the pointer null.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LaneObservation {
+    Cited {
+        id: String,
+        /// The observation's resolvable address, when it has a public handle;
+        /// observations recorded before handles existed are cited by id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+    Absent {
+        reason: String,
+    },
+}
+
+impl LaneObservation {
+    fn cell(observation: Option<&Self>) -> String {
+        match observation {
+            Some(Self::Cited { uri: Some(uri), .. }) => uri.clone(),
+            Some(Self::Cited { id, uri: None }) => format!("observation `{id}`"),
+            Some(Self::Absent { reason }) => format!("none: {reason}"),
+            None => "not recorded".to_string(),
+        }
+    }
+}
+
+/// Why a lane whose status names no observation has none to cite.
+fn absent_observation_reason(state: &str) -> &'static str {
+    match state {
+        "pending" | "running" => "no verdict at resolution",
+        "notApplicable" => "the check does not apply",
+        "unsupported" => "this build cannot run the check",
+        _ => "its verdict row cites no observation",
+    }
+}
+
+async fn lane_observation(
+    db: &LocalDb,
+    observation_id: Option<&str>,
+    state: &str,
+) -> LaneObservation {
+    let Some(id) = observation_id else {
+        return LaneObservation::Absent {
+            reason: absent_observation_reason(state).to_string(),
+        };
+    };
+    let uri = db
+        .query_opt(
+            "SELECT p.key, o.public_handle
+               FROM check_result_observations o
+               JOIN projects p ON p.id = o.project_id
+              WHERE o.id = ?1",
+            (id.to_string(),),
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|(key, handle)| {
+            handle.map(|handle| format!("cairn://p/{key}/check-observations/{handle}"))
+        });
+    LaneObservation::Cited {
+        id: id.to_string(),
+        uri,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaneHead {
+    pub head: String,
+}
+
+impl LaneAtResolution {
+    fn from_status(status: &crate::execution::checks_status::NodeCheckStatus) -> Option<Self> {
+        // The lane's public projection is the one serialization of its state,
+        // so the stored words are the ones every other surface shows.
+        serde_json::to_value(status)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    /// Whether the lane held a verdict when the pull request resolved.
+    fn has_verdict(&self) -> bool {
+        !matches!(self.state.as_str(), "pending" | "running")
+    }
+
+    fn verdict(&self) -> String {
+        let state = match self.state.as_str() {
+            "pending" | "running" => format!("{}, no verdict", self.state),
+            "notApplicable" => "not applicable".to_string(),
+            state => state.to_string(),
+        };
+        let counts = [
+            (self.passed, "passed"),
+            (self.failed, "failed"),
+            (self.skipped, "skipped"),
+        ]
+        .into_iter()
+        .filter_map(|(count, label)| count.filter(|n| *n > 0).map(|n| format!("{n} {label}")))
+        .collect::<Vec<_>>();
+        if counts.is_empty() {
+            state
+        } else {
+            format!("{state} ({})", counts.join(", "))
+        }
+    }
+}
+
+fn json_part<T: serde::de::DeserializeOwned>(value: &serde_json::Value, key: &str) -> Option<T> {
+    value
+        .get(key)
+        .cloned()
+        .and_then(|part| serde_json::from_value(part).ok())
+}
+
+fn json_list<T: serde::de::DeserializeOwned>(value: &serde_json::Value, key: &str) -> Vec<T> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl LaneSnapshot {
+    /// Read a stored `lane_snapshot`, of either shape, field by field: a part
+    /// that does not parse is absent rather than costing the rest.
+    pub fn parse(stored: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(stored) else {
+            return Self::default();
+        };
+        let execution = value
+            .get("execution")
+            .filter(|execution| execution.is_object())
+            .map(|execution| ExecutionAtResolution {
+                id: json_part(execution, "id"),
+                execution_status: json_part(execution, "executionStatus"),
+                jobs: json_list(execution, "jobs"),
+            })
+            .filter(|execution| {
+                execution.id.is_some()
+                    || execution.execution_status.is_some()
+                    || !execution.jobs.is_empty()
+            });
+        Self {
+            execution,
+            head: json_part(&value, "head"),
+            systematic_checks: json_list(&value, "systematicChecks"),
+        }
+    }
+}
+
+/// Where the rest of a resolution's provenance is read.
+#[derive(Debug, Clone, Default)]
+pub struct ProvenanceLinks {
+    /// The producing node's `/checks`, which holds each lane's full detail.
+    pub checks: Option<String>,
+    /// The producing execution, which holds its snapshot.
+    pub execution: Option<String>,
+}
+
+/// Lanes the provenance table lists before deferring to the checks link, so
+/// the block stays a summary however many checks a project configures.
+const PROVENANCE_LANE_ROWS: usize = 64;
+
+/// Names a summary line lists before counting the rest. The lane table and
+/// the linked resources carry every name; the cap keeps each line short
+/// enough that a grep of the artifact returns readable lines.
+const PROVENANCE_LINE_NAMES: usize = 5;
+
+fn bounded_list(items: &[String]) -> String {
+    let mut listed = items
+        .iter()
+        .take(PROVENANCE_LINE_NAMES)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > PROVENANCE_LINE_NAMES {
+        listed.push_str(&format!(
+            " and {} more",
+            items.len() - PROVENANCE_LINE_NAMES
+        ));
+    }
+    listed
+}
+
+fn short_head(head: &str) -> &str {
+    head.get(..12).unwrap_or(head)
+}
+
+fn table_cell(text: &str) -> String {
+    text.replace('|', "\\|").replace('\n', " ")
+}
+
+/// The resolution line and its provenance block, as a PR artifact renders it:
+/// who resolved it, on which surface, when, and a table of the check lanes as
+/// they stood, with links to the detail.
+pub fn render_resolution_provenance(
+    attribution: &StoredPrResolutionAttribution,
+    links: &ProvenanceLinks,
+) -> String {
+    let actor = resolution_actor_label(
+        Some(attribution.actor_kind.as_str()),
+        attribution.actor_identity.as_deref(),
+        Some(attribution.surface.as_str()),
+    );
+    let verb = if attribution.action == "close" {
+        "Closed"
+    } else {
+        "Merged"
+    };
+    let at = chrono::DateTime::from_timestamp(attribution.created_at, 0)
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| attribution.created_at.to_string());
+    let snapshot = &attribution.lane_snapshot;
+    let mut out = format!(
+        "{verb} by {actor} at {at}\n\n<details><summary>Resolution provenance</summary>\n\nSurface: `{}`\n",
+        attribution.surface
+    );
+    if let Some(head) = snapshot.head.as_deref() {
+        out.push_str(&format!("Head: `{}`\n", short_head(head)));
+    }
+    if let Some(execution) = &snapshot.execution {
+        let mut line = format!(
+            "Execution: {}",
+            execution.execution_status.as_deref().unwrap_or("unknown")
+        );
+        let jobs = execution
+            .jobs
+            .iter()
+            .map(|job| {
+                format!(
+                    "{} {}",
+                    job.node.as_deref().unwrap_or("(unnamed)"),
+                    job.status.as_deref().unwrap_or("unknown")
+                )
+            })
+            .collect::<Vec<_>>();
+        if !jobs.is_empty() {
+            line.push_str(&format!("; jobs: {}", bounded_list(&jobs)));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    let lanes = &snapshot.systematic_checks;
+    if lanes.is_empty() {
+        out.push_str("\nNo check lanes were recorded at resolution.\n");
+    } else {
+        let waiting = lanes
+            .iter()
+            .filter(|lane| !lane.has_verdict())
+            .map(|lane| lane.name.clone())
+            .collect::<Vec<_>>();
+        if waiting.is_empty() {
+            out.push_str(&format!(
+                "\nEvery check lane ({}) had a verdict at resolution.\n",
+                lanes.len()
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n{} of {} check lanes had no verdict at resolution: {}.\n",
+                waiting.len(),
+                lanes.len(),
+                bounded_list(&waiting)
+            ));
+        }
+        out.push_str("\n| Lane | Verdict | Head | Observation |\n|---|---|---|---|\n");
+        for lane in lanes.iter().take(PROVENANCE_LANE_ROWS) {
+            let head = lane
+                .verified_on
+                .as_ref()
+                .map(|verified| verified.head.as_str())
+                .or(snapshot.head.as_deref())
+                .map(|head| format!("`{}`", short_head(head)))
+                .unwrap_or_else(|| "—".to_string());
+            out.push_str(&format!(
+                "| {} | {} | {head} | {} |\n",
+                table_cell(&lane.name),
+                table_cell(&lane.verdict()),
+                table_cell(&LaneObservation::cell(lane.observation.as_ref()))
+            ));
+        }
+        if lanes.len() > PROVENANCE_LANE_ROWS {
+            out.push_str(&format!(
+                "\n{} more lanes are not listed.\n",
+                lanes.len() - PROVENANCE_LANE_ROWS
+            ));
+        }
+    }
+
+    let mut rest = Vec::new();
+    if let Some(checks) = &links.checks {
+        rest.push(format!("lane detail: {checks}"));
+    }
+    if let Some(execution) = &links.execution {
+        rest.push(format!("execution: {execution}"));
+    }
+    if !rest.is_empty() {
+        out.push_str(&format!("\nThe rest: {}.\n", rest.join("; ")));
+    }
+    out.push_str("\n</details>\n");
+    out
+}
+
+/// The execution that produced a pull request's owner: a producing job, or a
+/// `pr` action run (CAIRN-1220).
+async fn execution_id_for_owner(db: &LocalDb, owner_id: &str) -> Option<String> {
+    db.query_opt(
+        "SELECT COALESCE((SELECT execution_id FROM jobs WHERE id = ?1),
+                         (SELECT execution_id FROM action_runs WHERE id = ?1))",
+        (owner_id.to_string(),),
+        |row| row.opt_text(0),
+    )
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+/// The links a rendered provenance block offers for what it summarizes.
+pub async fn provenance_links(
+    db: &LocalDb,
+    owner_id: &str,
+    snapshot: &LaneSnapshot,
+) -> ProvenanceLinks {
+    let checks = crate::jobs::queries::home_uri_for_job(db, owner_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|node| format!("{node}/checks"));
+    let execution_id = match snapshot
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.id.clone())
+    {
+        Some(id) => Some(id),
+        None => execution_id_for_owner(db, owner_id).await,
+    };
+    let execution = match execution_id {
+        Some(id) => db
+            .query_opt(
+                "SELECT p.key, i.number, COALESCE(e.seq, 1)
+                   FROM executions e
+                   JOIN issues i ON i.id = e.issue_id
+                   JOIN projects p ON p.id = i.project_id
+                  WHERE e.id = ?1",
+                (id,),
+                |row| {
+                    Ok(format!(
+                        "cairn://p/{}/{}/{}",
+                        row.text(0)?,
+                        row.i64(1)?,
+                        row.i64(2)?
+                    ))
+                },
+            )
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    ProvenanceLinks { checks, execution }
 }
 
 impl PrResolutionAttribution {
@@ -91,18 +531,71 @@ pub fn resolution_actor_label(
     }
 }
 
-async fn lane_snapshot_for_job(orch: &Orchestrator, db: &LocalDb, job_id: &str) -> String {
-    let job_id = job_id.to_string();
-    let execution = db.query_opt(
-        "SELECT json_object('executionStatus', e.status, 'executionSnapshot', json(e.snapshot), 'jobs', COALESCE((SELECT json_group_array(json_object('node', j2.uri_segment, 'status', j2.status)) FROM jobs j2 WHERE j2.execution_id = e.id), '[]')) FROM jobs j LEFT JOIN executions e ON e.id = j.execution_id WHERE j.id = ?1",
-        (job_id.clone(),),
-        |row| row.text(0),
-    ).await.ok().flatten().and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()).unwrap_or_else(|| serde_json::json!({"state":"unavailable"}));
-    let checks = crate::execution::checks_status::node_check_statuses(orch, &job_id)
+async fn execution_at_resolution(db: &LocalDb, owner_id: &str) -> Option<ExecutionAtResolution> {
+    let id = execution_id_for_owner(db, owner_id).await?;
+    let execution_status = db
+        .query_opt(
+            "SELECT status FROM executions WHERE id = ?1",
+            (id.clone(),),
+            |row| row.opt_text(0),
+        )
         .await
-        .and_then(|statuses| serde_json::to_value(statuses).ok())
-        .unwrap_or_else(|| serde_json::json!([]));
-    serde_json::json!({ "execution": execution, "systematicChecks": checks }).to_string()
+        .ok()
+        .flatten()
+        .flatten();
+    let jobs = db
+        .query_all(
+            "SELECT uri_segment, status FROM jobs WHERE execution_id = ?1 ORDER BY created_at, id",
+            (id.clone(),),
+            |row| {
+                Ok(JobAtResolution {
+                    node: row.opt_text(0)?,
+                    status: row.opt_text(1)?,
+                })
+            },
+        )
+        .await
+        .unwrap_or_default();
+    Some(ExecutionAtResolution {
+        id: Some(id),
+        execution_status,
+        jobs,
+    })
+}
+
+async fn lane_snapshot_for_job(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    mr_id: &str,
+) -> LaneSnapshot {
+    let head = db
+        .query_opt(
+            "SELECT head_sha FROM merge_requests WHERE id = ?1",
+            (mr_id.to_string(),),
+            |row| row.opt_text(0),
+        )
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id)
+        .await
+        .unwrap_or_default();
+    let mut systematic_checks = Vec::with_capacity(statuses.len());
+    for status in &statuses {
+        let Some(mut lane) = LaneAtResolution::from_status(status) else {
+            continue;
+        };
+        lane.observation =
+            Some(lane_observation(db, status.observation_id.as_deref(), &lane.state).await);
+        systematic_checks.push(lane);
+    }
+    LaneSnapshot {
+        execution: execution_at_resolution(db, job_id).await,
+        head,
+        systematic_checks,
+    }
 }
 
 pub async fn latest_resolution_attribution(
@@ -113,7 +606,7 @@ pub async fn latest_resolution_attribution(
     // A Cairn merge can land on GitHub and be observed by a refresh before its
     // own resolution journals, inside the same second. The principal that acted
     // outranks the observation of its act.
-    db.query_opt("SELECT action, actor_kind, actor_identity, surface, created_at, lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1 ORDER BY created_at DESC, CASE WHEN actor_kind = 'unjournaled' THEN 1 ELSE 0 END LIMIT 1", (mr_id,), |row| Ok(StoredPrResolutionAttribution { action: row.text(0)?, actor_kind: row.text(1)?, actor_identity: row.opt_text(2)?, surface: row.text(3)?, created_at: row.i64(4)?, lane_snapshot: row.text(5)? })).await.ok().flatten()
+    db.query_opt("SELECT action, actor_kind, actor_identity, surface, created_at, lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1 ORDER BY created_at DESC, CASE WHEN actor_kind = 'unjournaled' THEN 1 ELSE 0 END LIMIT 1", (mr_id,), |row| Ok(StoredPrResolutionAttribution { action: row.text(0)?, actor_kind: row.text(1)?, actor_identity: row.opt_text(2)?, surface: row.text(3)?, created_at: row.i64(4)?, lane_snapshot: LaneSnapshot::parse(&row.text(5)?) })).await.ok().flatten()
 }
 
 /// Move a `merge_requests` row to its terminal status, returning whether this
@@ -293,7 +786,9 @@ async fn resolve_pr_node_as(
     let merge_context = resolve_merge_mr_context_for_job(&db, owner_id).await?;
     let mr_id = merge_context.mr.mr_id.clone();
     let now = chrono::Utc::now().timestamp();
-    let lane_snapshot = lane_snapshot_for_job(orch, &db, owner_id).await;
+    let lane_snapshot =
+        serde_json::to_string(&lane_snapshot_for_job(orch, &db, owner_id, &mr_id).await)
+            .map_err(|e| format!("Failed to record the lane snapshot: {e}"))?;
     let performed = matches!(resolver, Resolver::Performed(_));
     let claimed =
         claim_merge_request_resolution(&db, &mr_id, resolution, merged_commit, now).await?;
@@ -920,7 +1415,14 @@ mod tests {
             attribution.actor_identity.as_deref(),
             Some("cairn://p/prj/1/1/thread")
         );
-        assert!(attribution.lane_snapshot.contains("executionStatus"));
+        assert_eq!(
+            attribution
+                .lane_snapshot
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.id.as_deref()),
+            Some("exec-pr-node")
+        );
 
         assert_eq!(
             scalar(
@@ -1468,5 +1970,499 @@ mod tests {
             private_status.is_none(),
             "the private DB must never receive the team PR's row"
         );
+    }
+
+    /// A resolution names the execution it resolved and records what its jobs
+    /// were doing, but copies none of the execution's snapshot: the recipe
+    /// graph, prompts and skills stay on the execution.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolution_names_its_execution_and_copies_no_snapshot() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        db.execute(
+            "UPDATE merge_requests SET head_sha = 'feedfacecafe0123' WHERE id = 'mr-pr-node'",
+            (),
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = &orch.db.local;
+
+        resolve_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Merge,
+            Some(PrResolutionAttribution::operator_ui()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = scalar(
+            db,
+            "SELECT lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1",
+            "mr-pr-node",
+        )
+        .await
+        .expect("the resolution journals its lane snapshot");
+        for snapshot_field in ["executionSnapshot", "recipe", "triggerContext", "edges"] {
+            assert!(
+                !stored.contains(snapshot_field),
+                "{snapshot_field} copied into {stored}"
+            );
+        }
+        let snapshot = LaneSnapshot::parse(&stored);
+        let execution = snapshot.execution.expect("the execution is named");
+        assert_eq!(execution.id.as_deref(), Some("exec-pr-node"));
+        assert!(execution.execution_status.is_some());
+        assert!(
+            execution
+                .jobs
+                .iter()
+                .any(|job| job.status.as_deref() == Some("complete")),
+            "{:?}",
+            execution.jobs
+        );
+        assert_eq!(snapshot.head.as_deref(), Some("feedfacecafe0123"));
+    }
+
+    fn lanes_at_resolution() -> Vec<crate::execution::checks_status::NodeCheckStatus> {
+        use crate::execution::checks_status::{test_status, NodeCheckState, VerifiedHead};
+        let mut failed = test_status("rust-tests", "advisory", "review", NodeCheckState::Failed);
+        failed.passed = Some(120);
+        failed.failed = Some(3);
+        failed.ran_at = Some(1_700_000_000);
+        failed.output_tail = Some("x".repeat(50_000));
+        failed.failure_names = vec!["crate::module::a_failing_test".to_string()];
+        let mut replayed = test_status("lint", "advisory", "review", NodeCheckState::Passed);
+        replayed.verified_on = Some(VerifiedHead {
+            head: "0123456789abcdef".to_string(),
+            base: "basebasebase".to_string(),
+        });
+        vec![
+            failed,
+            replayed,
+            test_status("api", "gate", "write", NodeCheckState::Passed),
+            test_status("rust-lint", "advisory", "review", NodeCheckState::Pending),
+            test_status("typecheck", "advisory", "review", NodeCheckState::Running),
+        ]
+    }
+
+    fn attribution_with(lane_snapshot: LaneSnapshot) -> StoredPrResolutionAttribution {
+        StoredPrResolutionAttribution {
+            action: "merge".to_string(),
+            actor_kind: "operator-ui".to_string(),
+            actor_identity: None,
+            surface: "operator-ui".to_string(),
+            created_at: 1_700_000_000,
+            lane_snapshot,
+        }
+    }
+
+    /// The stored record keeps each lane's state, policy, cadence, counts and
+    /// verified head, and drops the detail a lane carries for live surfaces.
+    #[test]
+    fn the_lane_record_keeps_each_lanes_state_and_drops_its_detail() {
+        let snapshot = LaneSnapshot {
+            execution: Some(ExecutionAtResolution {
+                id: Some("exec-1".to_string()),
+                execution_status: Some("running".to_string()),
+                jobs: vec![JobAtResolution {
+                    node: Some("builder".to_string()),
+                    status: Some("complete".to_string()),
+                }],
+            }),
+            head: Some("feedfacecafe0123".to_string()),
+            systematic_checks: lanes_at_resolution()
+                .iter()
+                .filter_map(LaneAtResolution::from_status)
+                .collect(),
+        };
+        let stored = serde_json::to_string(&snapshot).unwrap();
+
+        assert!(stored.len() < 2_048, "{} bytes: {stored}", stored.len());
+        assert!(!stored.contains("xxxx"), "the output tail is not stored");
+        assert!(!stored.contains("a_failing_test"));
+        assert_eq!(LaneSnapshot::parse(&stored), snapshot);
+        let states = snapshot
+            .systematic_checks
+            .iter()
+            .map(|lane| (lane.name.as_str(), lane.state.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            [
+                ("rust-tests", "failed"),
+                ("lint", "passed"),
+                ("api", "passed"),
+                ("rust-lint", "pending"),
+                ("typecheck", "running"),
+            ]
+        );
+        let failed = &snapshot.systematic_checks[0];
+        assert_eq!((failed.passed, failed.failed), (Some(120), Some(3)));
+        assert_eq!(failed.policy.as_deref(), Some("advisory"));
+        assert_eq!(failed.when.as_deref(), Some("review"));
+        assert_eq!(
+            snapshot.systematic_checks[1]
+                .verified_on
+                .as_ref()
+                .map(|verified| verified.head.as_str()),
+            Some("0123456789abcdef")
+        );
+    }
+
+    /// The provenance block is a lane table that says which lanes had no
+    /// verdict, with links for the rest, never a raw JSON line.
+    #[test]
+    fn provenance_renders_the_lanes_as_a_table_with_links() {
+        let attribution = attribution_with(LaneSnapshot {
+            execution: Some(ExecutionAtResolution {
+                id: Some("exec-1".to_string()),
+                execution_status: Some("running".to_string()),
+                jobs: vec![JobAtResolution {
+                    node: Some("builder".to_string()),
+                    status: Some("complete".to_string()),
+                }],
+            }),
+            head: Some("feedfacecafe0123".to_string()),
+            systematic_checks: lanes_at_resolution()
+                .iter()
+                .filter_map(LaneAtResolution::from_status)
+                .collect(),
+        });
+        let rendered = render_resolution_provenance(
+            &attribution,
+            &ProvenanceLinks {
+                checks: Some("cairn://p/proj/3/1/builder/checks".to_string()),
+                execution: Some("cairn://p/proj/3/1".to_string()),
+            },
+        );
+
+        assert!(
+            rendered.starts_with("Merged by operator (UI) at "),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Surface: `operator-ui`"), "{rendered}");
+        assert!(rendered.contains("Head: `feedfacecafe`"), "{rendered}");
+        assert!(
+            rendered.contains("Execution: running; jobs: builder complete"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("2 of 5 check lanes had no verdict at resolution: rust-lint, typecheck."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("| Lane | Verdict | Head | Observation |\n|---|---|---|---|\n"));
+        assert!(
+            rendered.contains("| rust-tests | failed (120 passed, 3 failed) | `feedfacecafe` |"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| lint | passed | `0123456789ab` |"),
+            "a replayed verdict shows the head it was recorded at: {rendered}"
+        );
+        assert!(rendered.contains("| rust-lint | pending, no verdict | `feedfacecafe` |"));
+        assert!(rendered.contains(
+            "The rest: lane detail: cairn://p/proj/3/1/builder/checks; execution: cairn://p/proj/3/1."
+        ));
+        assert!(!rendered.contains('{'), "no JSON in the block: {rendered}");
+        assert!(rendered.ends_with("</details>\n"));
+    }
+
+    /// However many lanes a project configures, the block stays a summary.
+    #[test]
+    fn provenance_stays_under_its_size_bound() {
+        use crate::execution::checks_status::{test_status, NodeCheckState};
+        let lanes = (0..200)
+            .map(|n| {
+                let mut lane = test_status(
+                    &format!("a-fairly-long-check-lane-name-{n:03}"),
+                    "advisory",
+                    "review",
+                    if n % 2 == 0 {
+                        NodeCheckState::Failed
+                    } else {
+                        NodeCheckState::Pending
+                    },
+                );
+                lane.passed = Some(10_000);
+                lane.failed = Some(1_000);
+                lane.skipped = Some(100);
+                lane.output_tail = Some("y".repeat(10_000));
+                lane
+            })
+            .collect::<Vec<_>>();
+        let attribution = attribution_with(LaneSnapshot {
+            execution: Some(ExecutionAtResolution {
+                id: Some("exec".to_string()),
+                execution_status: Some("running".to_string()),
+                jobs: (0..100)
+                    .map(|n| JobAtResolution {
+                        node: Some(format!("a-fairly-long-node-name-{n:03}")),
+                        status: Some("complete".to_string()),
+                    })
+                    .collect(),
+            }),
+            head: Some("feedfacecafe0123".to_string()),
+            systematic_checks: lanes
+                .iter()
+                .filter_map(LaneAtResolution::from_status)
+                .collect(),
+        });
+        let rendered = render_resolution_provenance(&attribution, &ProvenanceLinks::default());
+        assert!(
+            rendered.len() < 8_192,
+            "{} bytes rendered for 200 lanes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("136 more lanes are not listed."),
+            "{rendered}"
+        );
+        // A reader greps the artifact for a lane: every line stays short, and
+        // the lane's own row is what the grep returns.
+        let longest = rendered.lines().map(str::len).max().unwrap_or(0);
+        assert!(longest < 300, "a {longest}-byte line:\n{rendered}");
+        let hits = rendered
+            .lines()
+            .filter(|line| line.contains("a-fairly-long-check-lane-name-041"))
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].starts_with("| a-fairly-long-check-lane-name-041 |"),
+            "{hits:?}"
+        );
+        assert!(rendered.contains("and 95 more"), "{rendered}");
+    }
+
+    /// A row journaled before the lane record existed still renders as a lane
+    /// table: the copied execution snapshot and each lane's detail are skipped.
+    #[test]
+    fn a_legacy_lane_snapshot_renders_as_a_table() {
+        let legacy = serde_json::json!({
+            "execution": {
+                "executionStatus": "complete",
+                "executionSnapshot": {"recipe": {"name": "A recipe"}, "agents": {"builder": {"prompt": "p".repeat(40_000)}}},
+                "jobs": [{"node": "builder", "status": "complete"}, {"node": null, "status": "blocked"}]
+            },
+            "systematicChecks": [
+                {"jobId": "j", "requestId": null, "name": "rust-tests", "state": "pending", "policy": "advisory", "when": "review", "cached": null, "failureNames": [], "outputTail": null},
+                {"jobId": "j", "name": "api", "state": "passed", "policy": "gate", "when": "write", "passed": 47, "failureNames": [], "outputTail": "ok"}
+            ]
+        })
+        .to_string();
+        let snapshot = LaneSnapshot::parse(&legacy);
+        assert_eq!(snapshot.systematic_checks.len(), 2);
+        let rendered =
+            render_resolution_provenance(&attribution_with(snapshot), &ProvenanceLinks::default());
+        assert!(!rendered.contains("executionSnapshot"), "{rendered}");
+        assert!(!rendered.contains("ppppp"), "{rendered}");
+        assert!(rendered.contains("Execution: complete; jobs: builder complete, (unnamed) blocked"));
+        assert!(
+            rendered.contains("| rust-tests | pending, no verdict | — |"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| api | passed (47 passed) | — |"),
+            "{rendered}"
+        );
+        assert!(rendered.len() < 1_024, "{rendered}");
+
+        // The unreadable shapes an earlier build could journal read as empty.
+        assert_eq!(LaneSnapshot::parse("not json"), LaneSnapshot::default());
+        assert_eq!(
+            LaneSnapshot::parse(r#"{"execution":{"state":"unavailable"},"systematicChecks":[]}"#),
+            LaneSnapshot::default()
+        );
+    }
+
+    /// A lane cites the observation its verdict came from: by address when the
+    /// observation has a public handle, by id when it predates handles. A lane
+    /// with no observation says why instead of leaving the pointer empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_lane_cites_its_observation_or_says_why_it_has_none() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('p-obs', 'default', 'Project', 'proj', '/repo', 'main', 1, 1);
+             INSERT INTO check_result_observations
+               (id, project_id, commit_sha, tree_hash, check_name, input_hash, environment_fingerprint,
+                exit_code, verdict, complete, reusable, parser_version, result_schema_version,
+                ran_at, duration_ms, cadence, output_tail, public_handle)
+             VALUES ('obs-red', 'p-obs', 'c', 't', 'rust-tests', 'i', 'env', 1, 'failed', 1, 0, 1, 1,
+                     1, 1, 'review', 'the tail', 'e884003b'),
+                    ('obs-old', 'p-obs', 'c', 't', 'lint', 'i', 'env', 0, 'passed', 1, 1, 1, 1,
+                     1, 1, 'write', 'ok', NULL);",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lane_observation(&db, Some("obs-red"), "failed").await,
+            LaneObservation::Cited {
+                id: "obs-red".to_string(),
+                uri: Some("cairn://p/proj/check-observations/e884003b".to_string()),
+            }
+        );
+        assert_eq!(
+            lane_observation(&db, Some("obs-old"), "passed").await,
+            LaneObservation::Cited {
+                id: "obs-old".to_string(),
+                uri: None,
+            }
+        );
+        assert_eq!(
+            lane_observation(&db, None, "pending").await,
+            LaneObservation::Absent {
+                reason: "no verdict at resolution".to_string(),
+            }
+        );
+        assert_eq!(
+            lane_observation(&db, None, "notApplicable").await,
+            LaneObservation::Absent {
+                reason: "the check does not apply".to_string(),
+            }
+        );
+
+        let mut lanes = lanes_at_resolution()
+            .iter()
+            .filter_map(LaneAtResolution::from_status)
+            .collect::<Vec<_>>();
+        lanes[0].observation = Some(lane_observation(&db, Some("obs-red"), "failed").await);
+        lanes[3].observation = Some(lane_observation(&db, None, "pending").await);
+        let snapshot = LaneSnapshot {
+            execution: None,
+            head: Some("feedfacecafe0123".to_string()),
+            systematic_checks: lanes,
+        };
+        let stored = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            stored.contains(r#""observation":{"kind":"cited","id":"obs-red""#),
+            "{stored}"
+        );
+        assert!(
+            stored
+                .contains(r#""observation":{"kind":"absent","reason":"no verdict at resolution"}"#),
+            "{stored}"
+        );
+        assert_eq!(LaneSnapshot::parse(&stored), snapshot);
+
+        let rendered =
+            render_resolution_provenance(&attribution_with(snapshot), &ProvenanceLinks::default());
+        assert!(
+            rendered.contains(
+                "| rust-tests | failed (120 passed, 3 failed) | `feedfacecafe` | cairn://p/proj/check-observations/e884003b |"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "| rust-lint | pending, no verdict | `feedfacecafe` | none: no verdict at resolution |"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// The migration strips the copied execution snapshot and each lane's
+    /// detail from rows journaled before, and keeps every lane's state.
+    #[tokio::test]
+    async fn the_migration_shrinks_journaled_lane_snapshots() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("lane-snapshots.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "trim_pr_resolution_lane_snapshot")
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            before.len() < TURSO_MIGRATIONS.len(),
+            "the migration must be in the lineage"
+        );
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'P', 'p', '/tmp/p', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('i', 'p', 1, 'I', 'merged', 'merged', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+             VALUES('j', 'p', 'i', 'complete', 1, 1);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr', 'j', 'p', 'i', 'PR', 'feature', 'main', 'merged', 1, 2);
+            ",
+        )
+        .await
+        .unwrap();
+        let legacy = serde_json::json!({
+            "execution": {
+                "executionStatus": "complete",
+                "executionSnapshot": {"recipe": {"name": "A recipe"}, "agents": {"builder": {"prompt": "p".repeat(40_000)}}},
+                "jobs": [{"node": "builder", "status": "complete"}]
+            },
+            "systematicChecks": [
+                {"jobId": "j", "requestId": "r", "name": "rust-tests", "state": "failed", "policy": "advisory", "when": "review", "passed": 120, "failed": 3, "failureNames": ["a::b"], "outputTail": "t".repeat(5_000), "verifiedOn": {"head": "0123456789abcdef", "base": "basebase"}},
+                {"jobId": "j", "name": "rust-lint", "state": "pending", "policy": "advisory", "when": "review", "failureNames": []}
+            ]
+        })
+        .to_string();
+        let unavailable = r#"{"execution":{"state":"unavailable"},"systematicChecks":[]}"#;
+        for (id, lane_snapshot) in [
+            ("legacy", legacy.as_str()),
+            ("unavailable", unavailable),
+            ("unreadable", "not json"),
+        ] {
+            db.execute(
+                "INSERT INTO pr_resolution_attributions
+                   (id, merge_request_id, action, actor_kind, surface, lane_snapshot, created_at)
+                 VALUES (?1, 'mr', 'merge', 'operator-ui', 'operator-ui', ?2, 2)",
+                params![id, lane_snapshot],
+            )
+            .await
+            .unwrap();
+        }
+        let expected_lanes = LaneSnapshot::parse(&legacy).systematic_checks;
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        let stored = |id: &'static str| {
+            let db = &db;
+            async move {
+                db.query_opt_text(
+                    "SELECT lane_snapshot FROM pr_resolution_attributions WHERE id = ?1",
+                    params![id],
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+        let shrunk = stored("legacy").await;
+        assert!(shrunk.len() < 1_024, "{} bytes: {shrunk}", shrunk.len());
+        for dropped in [
+            "executionSnapshot",
+            "outputTail",
+            "failureNames",
+            "jobId",
+            "basebase",
+        ] {
+            assert!(!shrunk.contains(dropped), "{dropped} kept in {shrunk}");
+        }
+        let snapshot = LaneSnapshot::parse(&shrunk);
+        assert_eq!(snapshot.systematic_checks, expected_lanes);
+        assert_eq!(snapshot.systematic_checks.len(), 2);
+        let execution = snapshot.execution.expect("the execution's state is kept");
+        assert_eq!(execution.execution_status.as_deref(), Some("complete"));
+        assert_eq!(execution.jobs.len(), 1);
+        assert_eq!(stored("unavailable").await, unavailable);
+        assert_eq!(stored("unreadable").await, "not json");
     }
 }

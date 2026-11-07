@@ -1142,6 +1142,7 @@ mod tests {
         use crate::messages::delivery::HeadTurn;
 
         let lane = |name: &str, state: NodeCheckState| NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: name.to_string(),

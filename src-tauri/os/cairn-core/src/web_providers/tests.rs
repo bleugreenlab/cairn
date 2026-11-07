@@ -806,8 +806,7 @@ async fn a_web_search_read_windows_its_body_and_a_failure_stays_failed_under_gre
     std::fs::create_dir_all(&config).unwrap();
     let orch = orchestrator(&config).await;
     let request = read_request();
-    let read =
-        |uri: &'static str| crate::resources::produce_cairn_resource(&orch, &request, uri);
+    let read = |uri: &'static str| crate::resources::produce_cairn_resource(&orch, &request, uri);
 
     let windowed = read("cairn://websearch?q=rust&offset=10&limit=5").await;
     assert!(!windowed.failed, "{}", windowed.content);

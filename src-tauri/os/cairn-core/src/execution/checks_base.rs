@@ -954,6 +954,7 @@ pub(crate) mod tests {
     #[test]
     fn only_a_test_runners_complete_red_is_attributed() {
         let row = |parser: &str, passed: bool, kind: Option<&str>| CheckResultCacheEntry {
+            source_observation_id: None,
             project_id: "p".to_string(),
             tree_hash: "t".to_string(),
             input_hash: "i".to_string(),

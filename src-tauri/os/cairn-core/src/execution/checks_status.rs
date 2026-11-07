@@ -639,6 +639,7 @@ pub(crate) fn test_status(
     state: NodeCheckState,
 ) -> NodeCheckStatus {
     NodeCheckStatus {
+        observation_id: None,
         job_id: "job".to_string(),
         request_id: None,
         name: name.to_string(),
@@ -731,6 +732,10 @@ pub struct NodeCheckStatus {
     pub(crate) job_id: String,
     /// The live fabric request for this lane, while one has been submitted.
     pub(crate) request_id: Option<String>,
+    /// The immutable observation the lane's verdict row projects, when it has
+    /// one: the evidence a citation of this lane names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) observation_id: Option<String>,
     pub(crate) name: String,
     pub(crate) state: NodeCheckState,
     pub(crate) policy: String,
@@ -1017,6 +1022,7 @@ fn unsupported_lanes<'a>(
                 .to_string()
         };
         NodeCheckStatus {
+            observation_id: None,
             job_id: job_id.clone(),
             request_id: None,
             name: name.clone(),
@@ -1763,6 +1769,7 @@ fn assemble_statuses(
 
             let executor = wave_board.and_then(|board| board.lane_phase(&name).executor);
             NodeCheckStatus {
+                observation_id: None,
                 job_id: job_id.to_string(),
                 request_id: request_ids.get(&name).cloned(),
                 name,
@@ -1969,6 +1976,7 @@ fn status_from_row(
     // as unverified rather than as a red, and it has no run to time.
     let attempted_nothing = failure_kind.is_some_and(CheckFailureKind::attempted_nothing);
     NodeCheckStatus {
+        observation_id: row.source_observation_id.clone(),
         job_id: job_id.to_string(),
         request_id,
         name: name.to_string(),
@@ -3134,8 +3142,44 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 
+    /// A lane shown by a verdict row names the observation that row projects,
+    /// so a record of the lane can cite its evidence; an infrastructure row
+    /// names none.
+    #[test]
+    fn a_lane_names_the_observation_its_verdict_row_projects() {
+        let mut row = verdict_row("rust-tests", false);
+        row.source_observation_id = Some("obs-1".to_string());
+        let status = status_from_row(
+            "job",
+            None,
+            "rust-tests",
+            CheckPolicy::Advisory,
+            CheckWhen::Review,
+            &row,
+            None,
+        );
+        assert_eq!(status.observation_id.as_deref(), Some("obs-1"));
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["observationId"],
+            "obs-1"
+        );
+
+        let infra = verdict_row("rust-tests", false);
+        let status = status_from_row(
+            "job",
+            None,
+            "rust-tests",
+            CheckPolicy::Advisory,
+            CheckWhen::Review,
+            &infra,
+            None,
+        );
+        assert_eq!(status.observation_id, None);
+    }
+
     fn verdict_row(name: &str, passed: bool) -> CheckResultCacheEntry {
         CheckResultCacheEntry {
+            source_observation_id: None,
             project_id: "project-a".to_string(),
             tree_hash: "tree".to_string(),
             input_hash: format!("ih-{name}"),
@@ -3178,6 +3222,7 @@ mod tests {
     #[test]
     fn a_verdict_carries_forward_only_from_a_head_with_the_same_patch() {
         let row = |name: &str, tree: &str| CheckResultCacheEntry {
+            source_observation_id: None,
             tree_hash: tree.to_string(),
             ..verdict_row(name, name != "red")
         };
@@ -3385,6 +3430,7 @@ mod tests {
     /// A row that ended without a verdict, recorded `ran_at` after the epoch.
     fn died_row(name: &str, kind: CheckFailureKind, ran_at: i64) -> CheckResultCacheEntry {
         CheckResultCacheEntry {
+            source_observation_id: None,
             exit_code: 143,
             failure_kind: Some(kind.as_str().to_string()),
             output_tail: "Cairn: check process was terminated by SIGTERM (exit 143)".to_string(),
@@ -3398,6 +3444,7 @@ mod tests {
         let mut parsed: ParsedCheckResult = serde_json::from_str(&parsed_json(0, &[])).unwrap();
         parsed.selection = "empty".to_string();
         CheckResultCacheEntry {
+            source_observation_id: None,
             target_results_json: Some(serde_json::to_string(&parsed).unwrap()),
             ..verdict_row(name, true)
         }
@@ -3409,6 +3456,7 @@ mod tests {
     #[test]
     fn a_verdict_outranks_a_newer_attempt_without_one_in_either_order() {
         let pass = CheckResultCacheEntry {
+            source_observation_id: None,
             ran_at: 100,
             ..verdict_row("frontend-tests", true)
         };
@@ -3426,6 +3474,7 @@ mod tests {
         );
 
         let earlier_attempt = CheckResultCacheEntry {
+            source_observation_id: None,
             ran_at: 50,
             ..attempt.clone()
         };
@@ -3434,6 +3483,7 @@ mod tests {
         assert_eq!(lane.newer_attempt, None, "an older attempt is not news");
 
         let red = CheckResultCacheEntry {
+            source_observation_id: None,
             ran_at: 100,
             ..verdict_row("frontend-tests", false)
         };
@@ -3448,6 +3498,7 @@ mod tests {
         assert_eq!(lane.newer_attempt, None);
 
         let newer_pass = CheckResultCacheEntry {
+            source_observation_id: None,
             ran_at: 300,
             ..verdict_row("frontend-tests", true)
         };
@@ -3527,6 +3578,7 @@ mod tests {
     #[test]
     fn a_wake_notes_a_newer_attempt_beside_the_verdict_it_kept() {
         let pass = CheckResultCacheEntry {
+            source_observation_id: None,
             ran_at: 100,
             ..verdict_row("frontend-tests", true)
         };
@@ -4168,6 +4220,7 @@ mod tests {
     #[test]
     fn status_annotation_renders_counts_duration_and_cached() {
         let mut status = NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: "rust".to_string(),
@@ -4238,6 +4291,7 @@ mod tests {
     #[test]
     fn a_fast_tier_lane_renders_its_population_green_or_red() {
         let mut status = NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: "rust-tests".to_string(),
@@ -4336,6 +4390,7 @@ mod tests {
     #[test]
     fn status_annotation_separates_a_self_skipped_suite_from_a_zero_selection() {
         let mut status = NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: "rust-full".to_string(),
@@ -4383,6 +4438,7 @@ mod tests {
     #[test]
     fn status_annotation_names_a_cached_suite_collection_failure() {
         let mut status = NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: "frontend-partial".to_string(),
@@ -4439,6 +4495,7 @@ mod tests {
     #[test]
     fn failed_annotation_renders_timeout_with_still_running_tests() {
         let status = NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: "rust-full".to_string(),
@@ -4526,6 +4583,7 @@ mod tests {
     #[test]
     fn suppressed_annotation_says_not_run_rather_than_naming_a_verdict() {
         let mut status = NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: "rust-full".to_string(),
@@ -4574,6 +4632,7 @@ mod tests {
     #[test]
     fn a_row_becomes_suppressed_only_at_the_bound() {
         let mut row = CheckResultCacheEntry {
+            source_observation_id: None,
             project_id: "project-a".to_string(),
             tree_hash: "tree".to_string(),
             input_hash: "ih".to_string(),
@@ -4631,6 +4690,7 @@ mod tests {
     #[test]
     fn failed_annotation_renders_spawn_error() {
         let status = NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: "rust-lint".to_string(),
@@ -4718,6 +4778,7 @@ mod tests {
                 .unwrap(),
             );
             CheckResultCacheEntry {
+                source_observation_id: None,
                 target_results_json: Some(serde_json::to_string(&parsed).unwrap()),
                 ..verdict_row("rust-tests", true)
             }

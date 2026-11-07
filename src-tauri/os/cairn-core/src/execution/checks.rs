@@ -16695,6 +16695,7 @@ cairn-common = { path = "../cairn-common" }
 
     fn cache_entry(check_name: &str, tree_hash: &str, passed: bool) -> CheckResultCacheEntry {
         CheckResultCacheEntry {
+            source_observation_id: None,
             project_id: "project-a".to_string(),
             tree_hash: tree_hash.to_string(),
             input_hash: format!("input-{tree_hash}"),

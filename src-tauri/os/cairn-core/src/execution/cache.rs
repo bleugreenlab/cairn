@@ -148,7 +148,7 @@ fn passing_row_sql() -> String {
                 executor_connection_generation, executor_slot_id, executor_lease_epoch,
                 executor_started_at_unix_ms, executor_finished_at_unix_ms,
                 toolchain_fingerprint, infra_failure_streak,
-                defined_by_commit_sha
+                defined_by_commit_sha, source_observation_id
            FROM check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
           WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
             AND {} AND passed = 1 AND failure_kind IS NULL",
@@ -219,7 +219,7 @@ fn infra_rows_sql(scopes: usize) -> String {
                 executor_connection_generation, executor_slot_id, executor_lease_epoch,
                 executor_started_at_unix_ms, executor_finished_at_unix_ms,
                 toolchain_fingerprint, infra_failure_streak, defined_by_commit_sha,
-                environment_fingerprint
+                source_observation_id, environment_fingerprint
            FROM check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
           WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
             AND {} AND environment_fingerprint IN ({})",
@@ -277,7 +277,7 @@ fn head_rows_sql() -> String {
                 r.job_id, r.cached, r.failure_kind, r.executor_id, r.executor_device_id,
                 r.executor_connection_generation, r.executor_slot_id, r.executor_lease_epoch,
                 r.executor_started_at_unix_ms, r.executor_finished_at_unix_ms,
-                r.toolchain_fingerprint, r.infra_failure_streak, r.defined_by_commit_sha
+                r.toolchain_fingerprint, r.infra_failure_streak, r.defined_by_commit_sha, r.source_observation_id
            FROM check_result_cache r INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
           WHERE r.project_id = ?1 AND r.check_name = ?2 AND r.input_hash = ?3
             AND (({} AND r.tree_hash = ?4)
@@ -406,6 +406,7 @@ fn row_to_check_result(
         executor_started_at_unix_ms: row.opt_i64(18)?,
         executor_finished_at_unix_ms: row.opt_i64(19)?,
         toolchain_fingerprint: row.opt_text(20)?,
+        source_observation_id: row.opt_text(23)?,
     })
 }
 
@@ -1009,7 +1010,7 @@ async fn read_infra_scope_rows(
     let mut rows = conn.query(&sql, values).await?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
-        out.push((row.text(23)?, row_to_check_result(&row)?));
+        out.push((row.text(24)?, row_to_check_result(&row)?));
     }
     Ok(out)
 }
@@ -1596,7 +1597,7 @@ pub(crate) fn list_check_results(
                                executor_connection_generation, executor_slot_id, executor_lease_epoch,
                                executor_started_at_unix_ms, executor_finished_at_unix_ms,
                                toolchain_fingerprint, infra_failure_streak,
-                               defined_by_commit_sha
+                               defined_by_commit_sha, source_observation_id
                         FROM check_result_cache
                         WHERE project_id = ?1 AND tree_hash = ?2
                         ORDER BY check_name ASC
@@ -1661,7 +1662,7 @@ pub fn list_latest_check_results_for_project(
                                c.executor_slot_id, c.executor_lease_epoch,
                                c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
                                c.toolchain_fingerprint, c.infra_failure_streak,
-                               c.defined_by_commit_sha
+                               c.defined_by_commit_sha, c.source_observation_id
                         FROM (
                             SELECT r.*,
                                    ROW_NUMBER() OVER (
@@ -1730,7 +1731,7 @@ pub(crate) fn list_latest_passing_check_results_for_job(
                                c.executor_slot_id, c.executor_lease_epoch,
                                c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
                                c.toolchain_fingerprint, c.infra_failure_streak,
-                               c.defined_by_commit_sha
+                               c.defined_by_commit_sha, c.source_observation_id
                         FROM (
                             SELECT r.*,
                                    ROW_NUMBER() OVER (
@@ -1846,7 +1847,7 @@ pub(crate) async fn latest_check_results_for_job(
                            c.executor_slot_id, c.executor_lease_epoch,
                            c.executor_started_at_unix_ms, c.executor_finished_at_unix_ms,
                            c.toolchain_fingerprint, c.infra_failure_streak,
-                           c.defined_by_commit_sha
+                           c.defined_by_commit_sha, c.source_observation_id
                     FROM check_result_cache l
                     JOIN check_result_cache c
                       ON c.job_id = l.job_id
@@ -1914,7 +1915,7 @@ pub fn list_check_results_for_executor_generation(
                                 executor_connection_generation, executor_slot_id, executor_lease_epoch,
                                 executor_started_at_unix_ms, executor_finished_at_unix_ms,
                                 toolchain_fingerprint, infra_failure_streak,
-                                defined_by_commit_sha
+                                defined_by_commit_sha, source_observation_id
                          FROM check_result_cache
                          WHERE project_id = ?1 AND executor_id = ?2
                            AND executor_connection_generation = ?3
@@ -1974,6 +1975,9 @@ pub struct CheckResultCacheEntry {
     /// recorded; such a row is diagnostic only and is never an exact reusable
     /// hit, because nothing proves which definition produced it.
     pub(crate) defined_by_commit_sha: Option<String>,
+    /// The immutable observation a verdict row projects. `None` for an
+    /// infrastructure row and for rows written before observations existed.
+    pub(crate) source_observation_id: Option<String>,
 }
 
 /// A reusable hot-cache result and the immutable observation that produced it.

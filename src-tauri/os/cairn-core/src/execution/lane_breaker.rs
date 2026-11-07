@@ -243,6 +243,7 @@ pub(crate) async fn lane_trip_conn(
     // The newest failure of the tripped group stands for it everywhere a
     // suppression is rendered or re-stamped, and its streak is the group's size.
     let entry = CheckResultCacheEntry {
+        source_observation_id: None,
         project_id: row.text(0)?,
         tree_hash: row.text(1)?,
         input_hash: row.text(2)?,

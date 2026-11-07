@@ -597,6 +597,7 @@ mod tests {
 
     fn lane(name: &str, state: NodeCheckState) -> NodeCheckStatus {
         NodeCheckStatus {
+            observation_id: None,
             job_id: "job".to_string(),
             request_id: None,
             name: name.to_string(),
