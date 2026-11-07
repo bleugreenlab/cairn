@@ -289,6 +289,15 @@ async fn github_without_prospect(
         merge_context.source_branch.as_str(),
         merge_context.target_branch.as_str(),
     );
+    let held_db = crate::projects::crud::owning_db(&orch.db, &merge_context.project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if crate::orchestrator::base_advance::held_replay_source(&held_db, &store.path, source)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
     let (Some(source_tip), Some(target_tip)) = (
         crate::jj::bookmark_commit(&store.jj, &store.path, source),
         crate::jj::bookmark_commit(&store.jj, &store.path, target),
@@ -327,6 +336,11 @@ async fn github_without_prospect(
     }))
 }
 
+struct ReplayedLanding {
+    bound: bind::BoundLanding,
+    held_descendants: std::collections::BTreeMap<String, crate::jj::ConflictDiagnostic>,
+}
+
 /// Bring `source` onto `target_tip` unless it already descends from it, then
 /// bind it there: by ONE merge commit for a branch in merge catch-up mode,
 /// otherwise by a replay. The merge is deterministic for fixed parents, so
@@ -338,7 +352,10 @@ fn replay_and_bind(
     target_tip: &str,
     rules: &[(String, IdentifierRule)],
     merge_mode: bool,
-) -> Result<bind::BoundLanding, String> {
+    source_cut: Option<&str>,
+    preserve_bookmarks: &std::collections::BTreeSet<String>,
+) -> Result<ReplayedLanding, String> {
+    let mut held_descendants = std::collections::BTreeMap::new();
     let source = merge_context.source_branch.as_str();
     let descends = crate::jj::revset_commit(
         &store.jj,
@@ -379,12 +396,14 @@ fn replay_and_bind(
             }
         }
     } else if !descends {
-        crate::orchestrator::base_advance::replay_for_landing(
+        held_descendants = crate::orchestrator::base_advance::replay_for_landing(
             &store.jj,
             &store.path,
             source,
             target_tip,
             &merge_context.target_branch,
+            source_cut,
+            preserve_bookmarks,
         )?;
     }
     bind::bind_onto(
@@ -395,6 +414,10 @@ fn replay_and_bind(
         &merge_context.target_branch,
         rules,
     )
+    .map(|bound| ReplayedLanding {
+        bound,
+        held_descendants,
+    })
 }
 
 /// The merge result as it would land now, built in the store and undone. The
@@ -407,6 +430,9 @@ async fn build_prospect(
     mode: Option<&crate::orchestrator::catch_up::CatchUpMode>,
 ) -> Result<Prospect, String> {
     let (source_tip, target_tip) = live_default_landing_tips(orch, merge_context).await?;
+    let held_db = crate::projects::crud::owning_db(&orch.db, &merge_context.project_id)
+        .await
+        .map_err(|error| error.to_string())?;
     if let Some(mode) = mode {
         crate::orchestrator::catch_up::landing_review_gate(
             orch,
@@ -426,6 +452,13 @@ async fn build_prospect(
     // With no identifier rule touched, `bind_onto` returns the merged head
     // unchanged and the parse gate still judges it.
     let binds = mode.is_some()
+        || crate::orchestrator::base_advance::held_replay_source(
+            &held_db,
+            &store.path,
+            &merge_context.source_branch,
+        )
+        .await?
+        .is_some()
         || bind::touches_identifiers(&store.jj, &store.path, &source_tip, &target_tip, &rules)?;
     if !binds {
         return Ok(Prospect {
@@ -438,8 +471,31 @@ async fn build_prospect(
     }
 
     let operation = crate::jj::operation_id(&store.jj, &store.path)?;
+    let preserve_bookmarks =
+        crate::orchestrator::base_advance::held_replay_bookmarks_for_repository(
+            &orch.db,
+            &store.path,
+        )
+        .await?;
+    let source_cut = crate::orchestrator::base_advance::held_replay_source_cut(
+        orch,
+        &held_db,
+        &store.jj,
+        &store.path,
+        &merge_context.source_branch,
+        &merge_context.target_branch,
+    )
+    .await?;
     let built = (|| -> Result<Prospect, String> {
-        let bound = replay_and_bind(store, merge_context, &target_tip, &rules, mode.is_some())?;
+        let ReplayedLanding { bound, .. } = replay_and_bind(
+            store,
+            merge_context,
+            &target_tip,
+            &rules,
+            mode.is_some(),
+            source_cut.as_deref(),
+            &preserve_bookmarks,
+        )?;
         let tree_hash = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head)?;
         let patch = store.jj.run(
             &store.path,
@@ -510,13 +566,43 @@ async fn land_if_unchanged(
             Err(restore) => format!("{error} (also failed to roll the landing back: {restore})"),
         }
     };
+    let held_db = crate::projects::crud::owning_db(&orch.db, &merge_context.project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let expected_held_source = crate::orchestrator::base_advance::held_replay_source(
+        &held_db,
+        &store.path,
+        &merge_context.source_branch,
+    )
+    .await?;
+    let preserve_bookmarks =
+        crate::orchestrator::base_advance::held_replay_bookmarks_for_repository(
+            &orch.db,
+            &store.path,
+        )
+        .await?;
+    let source_cut = crate::orchestrator::base_advance::held_replay_source_cut(
+        orch,
+        &held_db,
+        &store.jj,
+        &store.path,
+        &merge_context.source_branch,
+        &merge_context.target_branch,
+    )
+    .await?;
+    let mut held_descendants = std::collections::BTreeMap::new();
     let head = if prospect.binds {
-        let bound = replay_and_bind(
+        let ReplayedLanding {
+            bound,
+            held_descendants: held,
+        } = replay_and_bind(
             store,
             merge_context,
             &prospect.merge.target_tip,
             &prospect.rules,
             merge_mode,
+            source_cut.as_deref(),
+            &preserve_bookmarks,
         )
         .map_err(&rollback)?;
         let tree = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head)
@@ -532,6 +618,7 @@ async fn land_if_unchanged(
             })?;
             return Ok(None);
         }
+        held_descendants = held;
         bound.head
     } else {
         prospect.merge.source_tip.clone()
@@ -541,6 +628,14 @@ async fn land_if_unchanged(
         let commit = land_validated_default(orch, merge_context, method, &prospect.merge.tree_hash)
             .await
             .map_err(&rollback)?;
+        crate::orchestrator::base_advance::persist_held_descendant_sessions(
+            orch,
+            &orch.db.local,
+            &merge_context.project_id,
+            &store.path,
+            &held_descendants,
+        )
+        .await?;
         return Ok(Some(Landed {
             commit: Some(commit),
             dropped: Vec::new(),
@@ -572,6 +667,24 @@ async fn land_if_unchanged(
     // From here origin holds the bound head. A refused GitHub merge leaves the
     // branch bound, and the next landing binds it again against the tip it
     // then finds: a no-op when nothing landed in between.
+    crate::orchestrator::base_advance::persist_held_descendant_sessions(
+        orch,
+        &orch.db.local,
+        &merge_context.project_id,
+        &store.path,
+        &held_descendants,
+    )
+    .await?;
+    crate::orchestrator::base_advance::clear_held_replay_source(
+        &held_db,
+        &store.jj,
+        &store.path,
+        &merge_context.source_branch,
+        &prospect.merge.target_tip,
+        &head,
+        expected_held_source.as_ref(),
+    )
+    .await?;
     let commit = github_merge(orch, merge_context, method, &head).await?;
     Ok(Some(Landed { commit, dropped }))
 }
@@ -928,6 +1041,7 @@ impl LandingWorld for GatedLanding<'_> {
             self.merge_context.target_branch.as_str(),
         );
         let store = &self.store;
+        let mut held_descendants = std::collections::BTreeMap::new();
         // ── The final comparison, local only, under the store lock ──
         let head = {
             let guard = self
@@ -957,13 +1071,60 @@ impl LandingWorld for GatedLanding<'_> {
                 Err(error) => return Execution::Refused(error),
             };
             let restore = || crate::jj::restore_operation(&store.jj, &store.path, &operation);
+            let held_db = match crate::projects::crud::owning_db(
+                &self.orch.db,
+                &self.merge_context.project_id,
+            )
+            .await
+            {
+                Ok(db) => db,
+                Err(error) => return Execution::Refused(error.to_string()),
+            };
+            let expected_held_source = match crate::orchestrator::base_advance::held_replay_source(
+                &held_db,
+                &store.path,
+                source,
+            )
+            .await
+            {
+                Ok(source) => source,
+                Err(error) => return Execution::Refused(error),
+            };
+            let preserve_bookmarks =
+                match crate::orchestrator::base_advance::held_replay_bookmarks_for_repository(
+                    &self.orch.db,
+                    &store.path,
+                )
+                .await
+                {
+                    Ok(names) => names,
+                    Err(error) => return Execution::Refused(error),
+                };
+            let source_cut = match crate::orchestrator::base_advance::held_replay_source_cut(
+                self.orch,
+                &held_db,
+                &store.jj,
+                &store.path,
+                source,
+                target,
+            )
+            .await
+            {
+                Ok(cut) => cut,
+                Err(error) => return Execution::Refused(error),
+            };
             let head = if prospect.binds {
-                let bound = match replay_and_bind(
+                let ReplayedLanding {
+                    bound,
+                    held_descendants: held,
+                } = match replay_and_bind(
                     store,
                     self.merge_context,
                     &approved.target_oid,
                     &prospect.rules,
                     prospect.merge_mode,
+                    source_cut.as_deref(),
+                    &preserve_bookmarks,
                 ) {
                     Ok(bound) => bound,
                     Err(error) => {
@@ -978,6 +1139,7 @@ impl LandingWorld for GatedLanding<'_> {
                         observed: serde_json::json!({ "resultTreeOid": tree.ok() }),
                     };
                 }
+                held_descendants = held;
                 bound.head
             } else {
                 approved.source_oid.clone()
@@ -993,15 +1155,32 @@ impl LandingWorld for GatedLanding<'_> {
                 )
                 .await
                 {
-                    Ok(commit) => Execution::Landed {
-                        commit: commit.clone(),
-                        approved_head: head,
-                        landing: DefaultLanding {
-                            landed_commit: Some(commit),
-                            plan: prospect.plan,
-                            dropped: Vec::new(),
-                        },
-                    },
+                    Ok(commit) => {
+                        if let Err(error) =
+                            crate::orchestrator::base_advance::persist_held_descendant_sessions(
+                                self.orch,
+                                &self.orch.db.local,
+                                &self.merge_context.project_id,
+                                &store.path,
+                                &held_descendants,
+                            )
+                            .await
+                        {
+                            return Execution::Unknown {
+                                reason: error,
+                                approved_head: Some(head),
+                            };
+                        }
+                        Execution::Landed {
+                            commit: commit.clone(),
+                            approved_head: head,
+                            landing: DefaultLanding {
+                                landed_commit: Some(commit),
+                                plan: prospect.plan,
+                                dropped: Vec::new(),
+                            },
+                        }
+                    }
                     Err(error) => {
                         let _ = restore();
                         let unchanged = crate::jj::revset_commit(
@@ -1024,6 +1203,30 @@ impl LandingWorld for GatedLanding<'_> {
                         }
                     }
                 };
+            }
+            if let Err(error) = crate::orchestrator::base_advance::persist_held_descendant_sessions(
+                self.orch,
+                &self.orch.db.local,
+                &self.merge_context.project_id,
+                &store.path,
+                &held_descendants,
+            )
+            .await
+            {
+                return Execution::Refused(error);
+            }
+            if let Err(error) = crate::orchestrator::base_advance::clear_held_replay_source(
+                &held_db,
+                &store.jj,
+                &store.path,
+                source,
+                &approved.target_oid,
+                &head,
+                expected_held_source.as_ref(),
+            )
+            .await
+            {
+                return Execution::Refused(error);
             }
             head
         };

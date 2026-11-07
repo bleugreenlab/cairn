@@ -251,7 +251,7 @@ async fn recovery_fence_section(
     rows: &NodeRebaseRows,
     branch: &str,
 ) -> String {
-    let Ok(store) = rows.store_path(orch) else {
+    let Ok(store) = rows.store_path(orch).await else {
         return String::new();
     };
     match crate::orchestrator::branch_recovery::fences_for_branch(db, &store, branch).await {
@@ -445,13 +445,12 @@ async fn load_base_standing(
     rows: &NodeRebaseRows,
     branch: &str,
 ) -> Result<BaseStanding, String> {
-    let repo_path = rows.repo_path.clone()?;
+    let store = rows.store_path(orch).await?;
     let candidates = rows
         .candidates
         .as_ref()
         .map_err(|error| format!("This node's base branch could not be read: {error}"))?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path));
     let resolved =
         resolve_base(&jj, &store, branch, candidates).map_err(|error| error.to_string())?;
     let carries_base = crate::jj::branch_carries_commit(&jj, &store, branch, &resolved.commit);
@@ -499,7 +498,6 @@ pub(crate) struct NodeRebaseRows {
     pub(crate) job_id: String,
     /// The node's bookmark, or `None` when it has no branch yet.
     pub(crate) branch: Option<String>,
-    repo_path: Result<String, String>,
     candidates: Result<BaseCandidates, String>,
     project_id: Option<String>,
 }
@@ -510,14 +508,29 @@ impl NodeRebaseRows {
         self.project_id.as_deref()
     }
 
-    /// The project's branch store, where this node's bookmark lives.
-    pub(crate) fn store_path(&self, orch: &Orchestrator) -> Result<std::path::PathBuf, String> {
-        self.repo_path
-            .as_ref()
-            .map_err(Clone::clone)
-            .map(|repo_path| {
-                crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path))
-            })
+    /// Resolve after the row read releases its connection. Team repositories
+    /// belong to this machine's private overlay, not the synced creator path.
+    pub(crate) async fn store_path(
+        &self,
+        orch: &Orchestrator,
+    ) -> Result<std::path::PathBuf, String> {
+        let project_id = self
+            .project_id
+            .as_deref()
+            .ok_or_else(|| "This node's project identity could not be read".to_string())?;
+        let (repo_path, key) =
+            crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, project_id)
+                .await
+                .map_err(|error| {
+                    format!("This node's local repository path could not be read: {error}")
+                })?;
+        let repo_path = repo_path.filter(|path| !path.trim().is_empty()).ok_or_else(|| {
+            format!("Project `{key}` has no local repository path on this machine, so its branch store cannot be accessed. Register its local repository before requesting a replay or rebuild.")
+        })?;
+        Ok(crate::jj::project_store_dir(
+            &orch.config_dir,
+            std::path::Path::new(&repo_path),
+        ))
     }
 
     #[track_caller]
@@ -535,7 +548,6 @@ impl NodeRebaseRows {
                 let branch = node_branch(conn, &job.id).await?;
                 Ok(Self {
                     branch,
-                    repo_path: load_repo_path(conn, &job.id).await,
                     candidates: load_base_candidates(conn, &job.id)
                         .await
                         .map_err(|error| error.to_string()),
@@ -582,7 +594,7 @@ async fn catch_up_section(
     rows: &NodeRebaseRows,
     branch: &str,
 ) -> String {
-    let (Some(project_id), Ok(store)) = (rows.project_id(), rows.store_path(orch)) else {
+    let (Some(project_id), Ok(store)) = (rows.project_id(), rows.store_path(orch).await) else {
         return String::new();
     };
     let mode = match crate::orchestrator::catch_up::mode_for(db, project_id, &store, branch).await {
@@ -689,11 +701,9 @@ async fn catch_up_section(
 /// origin, or nothing. Most often the parent of an issue whose child's pull
 /// request was merged into the parent's branch in GitHub's UI.
 async fn own_origin_section(orch: &Orchestrator, rows: &NodeRebaseRows, branch: &str) -> String {
-    let (Some(project_id), Ok(repo_path)) = (rows.project_id.as_deref(), rows.repo_path.as_ref())
-    else {
+    let (Some(project_id), Ok(store)) = (rows.project_id(), rows.store_path(orch).await) else {
         return String::new();
     };
-    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path));
     let Some(drift) =
         crate::orchestrator::base_branch_sync::known_drift(orch, project_id, &store, branch).await
     else {
@@ -823,11 +833,10 @@ async fn conflicted_name_section(
     rows: &NodeRebaseRows,
     branch: &str,
 ) -> String {
-    let Ok(repo_path) = rows.repo_path.as_ref() else {
+    let Ok(store) = rows.store_path(orch).await else {
         return String::new();
     };
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path));
     if !crate::jj::is_jj_dir(&store) {
         return String::new();
     }
@@ -923,31 +932,6 @@ fn render_conflicted_name(assessment: &crate::jj::ConflictedNameAssessment) -> S
         )),
     }
     out
-}
-
-async fn load_repo_path(
-    conn: &cairn_db::storage::TrackedConnection,
-    job_id: &str,
-) -> Result<String, String> {
-    let mut rows = conn
-        .query(
-            "SELECT p.repo_path
-             FROM jobs j JOIN projects p ON j.project_id = p.id
-             WHERE j.id = ?1 LIMIT 1",
-            (job_id,),
-        )
-        .await
-        .map_err(|error| format!("This node's project row could not be read: {error}"))?;
-    rows.next()
-        .await
-        .map_err(|error| format!("This node's project row could not be read: {error}"))?
-        .and_then(|row| row.opt_text(0).ok().flatten())
-        .filter(|repo_path| !repo_path.is_empty())
-        .ok_or_else(|| {
-            "Cairn holds no repository path for this node's project, so the branch store could \
-             not be asked anything about it."
-                .to_string()
-        })
 }
 
 /// Where a branch with an open session stands NOW, read live from the store.

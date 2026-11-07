@@ -244,7 +244,7 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::NodeRebase,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/rebase",
     name: "Node rebase",
-    description: "The active conflict resolution session for this node's branch: what advanced the base, the immutable three-way coordinates, the incoming change's complete file list flagged conflicting or clean-on-retry, whether conflict markers are present in the checkout, and the sanctioned next action. Both sides of the merge are recomputed from immutable commits and paged independently — view=base-ours is what your branch did, view=base-theirs is what arrived. A patch with action:replay asks the store to replay the branch onto the base; slot refs are exports of the runner's jj store, so this is the only way ancestry moves.",
+    description: "The active conflict resolution session for this node's branch: what advanced the base, the immutable three-way coordinates, the incoming change's complete file list flagged conflicting or clean-on-retry, whether conflict markers are present in the checkout, and the sanctioned next action. Both sides of the merge are recomputed from immutable commits and paged independently — view=base-ours is what your branch did, view=base-theirs is what arrived. A patch with action:rebuild recovers a flagged branch from explicit source_commit, owner-attested source_base with source_base_reason, and expected_tip coordinates, preserving the flagged tip in a recovery ref and refusing unprovable later edits. A patch with action:replay asks the store to replay the branch onto the base; slot refs are exports of the runner's jj store, so this is the only way ancestry moves.",
     read_projections: &[
         ProjectionSpec {
             key: "view",
@@ -277,6 +277,10 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
             REBASE_REVIEW_PATHS,
             REBASE_REVIEWED_THROUGH,
             REBASE_THROUGH,
+            REBASE_SOURCE_COMMIT,
+            REBASE_SOURCE_BASE,
+            REBASE_SOURCE_BASE_REASON,
+            REBASE_EXPECTED_TIP,
         ],
         label: "replay this branch, take origin's fast-forward of it or its base, set its catch-up mode, or mark its review",
         example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]})",

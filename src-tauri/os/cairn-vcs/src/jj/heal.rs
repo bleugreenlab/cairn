@@ -158,6 +158,20 @@ pub(super) fn same_tree(jj: &JjEnv, store: &Path, from: &str, to: &str) -> Resul
     .map(|out| out.trim().is_empty())
 }
 
+fn unique_commit_for_change(commits: &[ScopeCommit], change: &str) -> Result<String, String> {
+    let matches: Vec<&ScopeCommit> = commits
+        .iter()
+        .filter(|commit| commit.change_id == change)
+        .collect();
+    match matches.as_slice() {
+        [commit] => Ok(commit.commit_id.clone()),
+        _ => Err(format!(
+            "{ANCESTRY_HEAL_GUARD} expected one incarnation of change {change} on the healed branch, found {}; refusing to choose across lineages",
+            matches.len()
+        )),
+    }
+}
+
 fn full_description(jj: &JjEnv, store: &Path, rev: &str) -> Result<String, String> {
     jj.run(
         store,
@@ -253,6 +267,50 @@ pub fn heal_conflicted_ancestry(
     branch: &str,
     dest_commit: &str,
 ) -> Result<AncestryHeal, String> {
+    heal_conflicted_ancestry_preserving(jj, store, branch, dest_commit, &BTreeSet::new())
+}
+
+/// Use the same pre-proof descendant hold as rebase: an outstanding ownership
+/// cut is not consumed by another branch's history repair.
+pub fn heal_conflicted_ancestry_preserving(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest_commit: &str,
+    preserve: &BTreeSet<String>,
+) -> Result<AncestryHeal, String> {
+    let before = crate::read_local_bookmark_view(store)?;
+    heal_with_final_check(
+        jj,
+        store,
+        branch,
+        dest_commit,
+        &mut || super::merge::hold_preserved_descendants(jj, store, branch, &before, preserve),
+        true,
+    )
+}
+
+/// The enclosing rebase owns rollback and export. Its descendant hold runs
+/// after the canonical heal has restored paths and notes, before any proof or
+/// publication, so folded landmarks are not mistaken for independent branches.
+pub(super) fn heal_before_rebase_export(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest_commit: &str,
+    check_descendants: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<AncestryHeal, String> {
+    heal_with_final_check(jj, store, branch, dest_commit, check_descendants, false)
+}
+
+fn heal_with_final_check(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest_commit: &str,
+    final_check: &mut dyn FnMut() -> Result<(), String>,
+    publish: bool,
+) -> Result<AncestryHeal, String> {
     let branch_revset = format!("bookmarks(exact:{branch:?})");
     if !revset_descends_from(jj, store, &branch_revset, dest_commit) {
         return Err(format!(
@@ -290,8 +348,13 @@ pub fn heal_conflicted_ancestry(
         before: &before,
         conflicts_before: &conflicts_before,
     };
-    plan.run(jj, store)
-        .map_err(|reason| undo_branch_rewrite(jj, store, branch, &pre_op, "ancestry heal", reason))
+    plan.run(jj, store, final_check, publish).map_err(|reason| {
+        if publish {
+            undo_branch_rewrite(jj, store, branch, &pre_op, "ancestry heal", reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Everything the heal pinned before its first rewrite.
@@ -309,18 +372,31 @@ struct HealPlan<'a> {
 }
 
 impl HealPlan<'_> {
-    fn run(&self, jj: &JjEnv, store: &Path) -> Result<AncestryHeal, String> {
+    fn run(
+        &self,
+        jj: &JjEnv,
+        store: &Path,
+        final_check: &mut dyn FnMut() -> Result<(), String>,
+        publish: bool,
+    ) -> Result<AncestryHeal, String> {
         let branch = self.branch;
         let on_branch: BTreeSet<&str> = self
             .branch_commits
             .iter()
             .map(|commit| commit.change_id.as_str())
             .collect();
-        let pre_commit_of: BTreeMap<&str, &str> = self
-            .before
-            .iter()
-            .map(|commit| (commit.change_id.as_str(), commit.commit_id.as_str()))
-            .collect();
+        let mut pre_commit_of: BTreeMap<&str, &str> = BTreeMap::new();
+        for commit in self.before {
+            if pre_commit_of
+                .insert(&commit.change_id, &commit.commit_id)
+                .is_some()
+            {
+                return Err(format!(
+                    "{ANCESTRY_HEAL_GUARD} multiple pre-heal incarnations of change {} lie in the heal scope; no unique original content",
+                    commit.change_id
+                ));
+            }
+        }
         let pre_conflicted: BTreeSet<&str> = self
             .before
             .iter()
@@ -413,7 +489,12 @@ impl HealPlan<'_> {
 
         let dropped = self.drop_emptied(jj, store, &pre_commit_of, &mut healed)?;
         for (index, entry) in healed.iter().enumerate() {
-            let original = full_description(jj, store, &entry.change_id)?;
+            // Held descendants can keep the old incarnation visible. Resolve
+            // against the live branch range after each preceding describe,
+            // which itself rewrites descendant commits.
+            let commits = scope_commits(jj, store, self.range)?;
+            let current = unique_commit_for_change(&commits, &entry.change_id)?;
+            let original = full_description(jj, store, &current)?;
             let note = heal_note(
                 self.dest,
                 self.pre_tip,
@@ -430,7 +511,7 @@ impl HealPlan<'_> {
                 store,
                 &[
                     "describe",
-                    entry.change_id.as_str(),
+                    current.as_str(),
                     "-m",
                     &message,
                     "--ignore-working-copy",
@@ -439,11 +520,15 @@ impl HealPlan<'_> {
             )?;
         }
 
+        reached_step("ancestry heal: before final proof");
+        final_check()?;
         self.prove(jj, store)?;
         let tip = bookmark_commit(jj, store, branch).ok_or_else(|| {
             format!("ancestry heal: branch `{branch}` did not resolve after the heal")
         })?;
-        export_bookmark_advance(jj, store, true, branch, "jj git export (ancestry heal)")?;
+        if publish {
+            export_bookmark_advance(jj, store, true, branch, "jj git export (ancestry heal)")?;
+        }
         log::info!(
             "ancestry heal: resolved {} conflict-flagged commit(s) of `{branch}` in place on {}, \
              dropped {} emptied commit(s)",
@@ -615,5 +700,44 @@ pub(super) fn undo_branch_rewrite(
                 ))
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    fn commit(id: &str, change: &str) -> ScopeCommit {
+        ScopeCommit {
+            commit_id: id.to_string(),
+            change_id: change.to_string(),
+            empty: false,
+            conflict: false,
+            merge: false,
+            subject: String::new(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_healed_change_resolves_only_to_its_unique_scoped_immutable_commit() {
+        let scope = vec![
+            commit("other", "another"),
+            commit("current-incarnation", "healed"),
+        ];
+        assert_eq!(
+            unique_commit_for_change(&scope, "healed").unwrap(),
+            "current-incarnation"
+        );
+        assert!(unique_commit_for_change(&scope, "absent")
+            .unwrap_err()
+            .contains("found 0"));
+        let split = vec![
+            commit("held-incarnation", "healed"),
+            commit("current-incarnation", "healed"),
+        ];
+        assert!(unique_commit_for_change(&split, "healed")
+            .unwrap_err()
+            .contains("found 2"));
     }
 }

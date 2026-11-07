@@ -183,12 +183,13 @@ pub(crate) struct BaseCandidates {
 }
 
 impl BaseCandidates {
-    /// Override the recorded base with the one an open conflict session named.
-    /// A session's base is the more specific fact: it is the branch the rolled
-    /// back rebase was actually aimed at.
-    pub(crate) fn recorded_from_session(mut self, session_base: Option<&str>) -> Self {
-        if let Some(base) = session_base.filter(|base| !base.is_empty()) {
-            self.recorded = Some(base.to_string());
+    /// A historical session can fill a missing coordinate, but cannot undo a
+    /// current recorded destination after sanctioned retargeting or acceptance.
+    pub(crate) fn with_session_fallback(mut self, session_base: Option<&str>) -> Self {
+        if self.recorded.is_none() {
+            self.recorded = session_base
+                .filter(|base| !base.is_empty())
+                .map(str::to_string);
         }
         self
     }
@@ -479,10 +480,10 @@ mod tests {
         assert_eq!(candidates.recorded, None);
     }
 
-    /// An open session names the base the rolled-back rebase was aimed at, which
-    /// outranks the job's own column.
+    /// Closing a session or consuming a receipt must not make an older
+    /// captured session authoritative over the current job destination again.
     #[test]
-    fn a_session_base_overrides_the_recorded_one() {
+    fn a_historical_session_only_fills_a_missing_recorded_destination() {
         let candidates = BaseCandidates {
             recorded: Some("agent/parent".into()),
             ..BaseCandidates::default()
@@ -490,7 +491,14 @@ mod tests {
         assert_eq!(
             candidates
                 .clone()
-                .recorded_from_session(Some("integration"))
+                .with_session_fallback(Some("integration"))
+                .recorded
+                .as_deref(),
+            Some("agent/parent")
+        );
+        assert_eq!(
+            BaseCandidates::default()
+                .with_session_fallback(Some("integration"))
                 .recorded
                 .as_deref(),
             Some("integration")
@@ -498,11 +506,11 @@ mod tests {
         // An absent or empty session base leaves the record standing rather
         // than blanking it.
         assert_eq!(
-            candidates.clone().recorded_from_session(None).recorded,
+            candidates.clone().with_session_fallback(None).recorded,
             candidates.recorded
         );
         assert_eq!(
-            candidates.clone().recorded_from_session(Some("")).recorded,
+            candidates.clone().with_session_fallback(Some("")).recorded,
             candidates.recorded
         );
     }

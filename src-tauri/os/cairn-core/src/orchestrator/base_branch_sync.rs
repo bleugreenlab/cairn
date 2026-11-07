@@ -1269,10 +1269,7 @@ async fn poll_project_within(
 }
 
 async fn project_repo_path(orch: &Orchestrator, project_id: &str) -> Option<PathBuf> {
-    let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
-        .await
-        .ok()?;
-    crate::orchestrator::base_advance::load_project_repo_path(&db, project_id)
+    crate::orchestrator::base_advance::load_project_repo_path(&orch.db, project_id)
         .await
         .ok()
         .flatten()

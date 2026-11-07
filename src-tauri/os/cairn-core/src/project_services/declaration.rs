@@ -1083,10 +1083,11 @@ impl BaseTipSource {
         let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
             .await
             .map_err(|error| error.to_string())?;
-        let repo_path = crate::orchestrator::base_advance::load_project_repo_path(&db, project_id)
-            .await?
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| format!("project {project_id} has no repository"))?;
+        let repo_path =
+            crate::orchestrator::base_advance::load_project_repo_path(&orch.db, project_id)
+                .await?
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| format!("project {project_id} has no repository"))?;
         let branch =
             crate::orchestrator::base_advance::load_project_default_branch(&db, project_id)
                 .await?

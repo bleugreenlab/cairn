@@ -1136,6 +1136,7 @@ where
         let parent = load_parent(parent_job_id)?;
         let Some(branch) = parent.branch else {
             let base = crate::jj::resolve_base_rev(jj, store, request.base_ref, git_rev_parse);
+            crate::jj::require_clean_tree(jj, store, &base, "Starting an inherited job")?;
             return Ok((None, Some(base)));
         };
         if behavior.requires_parent_head {
@@ -1147,6 +1148,7 @@ where
                      its parent has already moved past."
                 )
             })?;
+            crate::jj::require_clean_tree(jj, store, &branch, "Starting an inherited job")?;
             return Ok((Some(branch), Some(head)));
         }
         let head = inherited_head(
@@ -1157,11 +1159,18 @@ where
             request.base_ref,
             git_rev_parse,
         );
+        crate::jj::require_clean_tree(
+            jj,
+            store,
+            &head,
+            &format!("Starting a job on inherited branch `{branch}`"),
+        )?;
         return Ok((Some(branch), Some(head)));
     }
 
     let base = crate::jj::resolve_base_rev(jj, store, request.base_ref, git_rev_parse);
     if !behavior.mints_branch {
+        crate::jj::require_clean_tree(jj, store, &base, "Starting a branchless job")?;
         return Ok((None, Some(base)));
     }
 
@@ -1175,6 +1184,7 @@ where
                  same name."
             ));
         }
+        crate::jj::require_clean_tree(jj, store, branch, "Restarting a job")?;
         return Ok((Some(branch.to_string()), Some(recorded_base.to_string())));
     }
 
@@ -1187,6 +1197,12 @@ where
     // below is for a name this preparation is about to create: one already in
     // the store at another commit belongs to something else.
     let mint_point = request.adopt_head.unwrap_or(base.as_str());
+    crate::jj::require_clean_tree(
+        jj,
+        store,
+        mint_point,
+        &format!("Starting new branch `{branch}`"),
+    )?;
     match crate::jj::bookmark_commit(jj, store, &branch) {
         Some(existing) if existing != mint_point => {
             return Err(format!(
@@ -1360,6 +1376,15 @@ where
         return Err(refusal);
     }
 
+    if let Some(adopt_head) = continuation.adopt_head() {
+        run_db_borrowed(async {
+            let db = crate::execution::routing::owning_db_for_job(&orch.db, &job.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            crate::orchestrator::base_advance::refuse_held_continuity(&db, jj, store, adopt_head)
+                .await
+        })?;
+    }
     let (branch, base_commit) = select_job_coordinate(
         behavior,
         CoordinateRequest {
@@ -10097,6 +10122,98 @@ mod tests {
             recorded_base: None,
             base_ref: "main",
         }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn startup_refuses_scaffolded_continuity_inheritance_and_restart() {
+        let fx = inherit_fixture().expect("real jj required for startup conflict regression");
+        std::fs::write(
+            fx._project.path().join("JJ-CONFLICT-README"),
+            "legacy scaffolding\n",
+        )
+        .unwrap();
+        git(fx._project.path(), &["add", "-A"]);
+        git(
+            fx._project.path(),
+            &["commit", "-q", "-m", "legacy scaffolded tip"],
+        );
+        let flagged = git_stdout(fx._project.path(), &["rev-parse", "HEAD"]);
+        ensure_project_store(&fx.jj, &fx.store, fx._project.path()).unwrap();
+        create_bookmark_at(&fx.jj, &fx.store, "agent/broken", &flagged).unwrap();
+        assert!(
+            !crate::jj::branch_has_conflict(&fx.jj, &fx.store, "agent/broken").unwrap(),
+            "the tree check must catch scaffolding even without a native conflict flag"
+        );
+
+        let minted = "agent/successor";
+        let error = select_job_coordinate(
+            &mints(),
+            CoordinateRequest {
+                job_id: "successor",
+                parent_job_id: None,
+                existing_branch: None,
+                recorded_base: None,
+                base_ref: "main",
+                adopt_head: Some(&flagged),
+            },
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!(),
+            || Ok(minted.to_string()),
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(&flagged) && error.contains("scaffolding"),
+            "{error}"
+        );
+        assert!(crate::jj::bookmark_commit(&fx.jj, &fx.store, minted).is_none());
+
+        for strict in [false, true] {
+            let mut behavior = inherits();
+            behavior.requires_parent_head = strict;
+            let error = select_job_coordinate(
+                &behavior,
+                child_request(Some("parent")),
+                &fx.jj,
+                &fx.store,
+                |_| {
+                    Ok(ParentCoordinate {
+                        branch: Some("agent/broken".to_string()),
+                        recorded_base: Some(fx.first.clone()),
+                    })
+                },
+                || unreachable!(),
+                |_| None,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains(&flagged) && error.contains("agent/broken"),
+                "{error}"
+            );
+        }
+        let error = select_job_coordinate(
+            &mints(),
+            CoordinateRequest {
+                job_id: "restart",
+                parent_job_id: None,
+                existing_branch: Some("agent/broken"),
+                recorded_base: Some(&fx.first),
+                base_ref: "main",
+                adopt_head: None,
+            },
+            &fx.jj,
+            &fx.store,
+            |_| unreachable!(),
+            || unreachable!(),
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(&flagged) && error.contains("Restarting"),
+            "{error}"
+        );
     }
 
     /// A branchless mode is not "no opinion": it puts the job on its base

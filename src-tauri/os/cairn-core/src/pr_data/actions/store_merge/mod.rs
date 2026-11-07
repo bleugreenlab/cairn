@@ -87,7 +87,9 @@ pub(super) async fn prospective_store_merge_child(
         })?;
     let mut local = merge_context.clone();
     local.mr.is_local = true;
-    let transformed = store_merge_child_inner(orch, &local, method, false, None).await;
+    let transformed = store_merge_child_mutation(orch, &local, method, false, None)
+        .await
+        .map(|fold| fold.commit);
     let result = transformed.and_then(|commit_id| {
         let tree_hash = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit_id)?;
         let tree_entries = crate::jj::tree_entries(&jj, &store, &commit_id)?;
@@ -168,7 +170,9 @@ pub(super) async fn prospective_default_landing(
     } else {
         None
     };
-    let transformed = store_merge_child_inner(orch, merge_context, method, false, None).await;
+    let transformed = store_merge_child_mutation(orch, merge_context, method, false, None)
+        .await
+        .map(|fold| fold.commit);
     let result = transformed.and_then(|commit_id| {
         // A remote fold fetched and built onto `main@origin`, which a
         // prospective fold never moves because nothing is pushed.
@@ -287,10 +291,11 @@ pub(super) async fn land_verified_store_merge_child(
     let mut local = merge_context.clone();
     local.mr.is_local = true;
     let folding = trace.phase("fold");
-    let commit = match store_merge_child_inner(orch, &local, method, false, None).await {
-        Ok(commit) => commit,
+    let fold = match store_merge_child_mutation(orch, &local, method, false, None).await {
+        Ok(fold) => fold,
         Err(error) => return Err(error),
     };
+    let commit = fold.commit;
     drop(folding);
     let verifying = trace.phase("verify landed tree");
     let actual_tree = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit)?;
@@ -322,6 +327,24 @@ pub(super) async fn land_verified_store_merge_child(
             .await);
         }
     }
+    crate::orchestrator::base_advance::persist_held_descendant_sessions(
+        orch,
+        &orch.db.local,
+        &merge_context.project_id,
+        &store,
+        &fold.held_descendants,
+    )
+    .await?;
+    crate::orchestrator::base_advance::clear_held_replay_source(
+        &fold.held_db,
+        &jj,
+        &store,
+        &merge_context.source_branch,
+        &commit,
+        &commit,
+        fold.held_source.as_ref(),
+    )
+    .await?;
     Ok(VerifiedLanding::Landed(commit))
 }
 
@@ -380,6 +403,47 @@ async fn store_merge_child_inner(
     publish: bool,
     validated_tree: Option<&str>,
 ) -> Result<String, String> {
+    let fold =
+        store_merge_child_mutation(orch, merge_context, method, publish, validated_tree).await?;
+    let store =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    crate::orchestrator::base_advance::persist_held_descendant_sessions(
+        orch,
+        &orch.db.local,
+        &merge_context.project_id,
+        &store,
+        &fold.held_descendants,
+    )
+    .await?;
+    crate::orchestrator::base_advance::clear_held_replay_source(
+        &fold.held_db,
+        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        &store,
+        &merge_context.source_branch,
+        &fold.commit,
+        &fold.commit,
+        fold.held_source.as_ref(),
+    )
+    .await?;
+    Ok(fold.commit)
+}
+
+struct StoreFold {
+    commit: String,
+    held_source: Option<crate::orchestrator::base_advance::HeldReplaySource>,
+    held_db: std::sync::Arc<crate::storage::LocalDb>,
+    held_descendants: std::collections::BTreeMap<String, crate::jj::ConflictDiagnostic>,
+}
+
+/// A speculative fold returns its held diagnostics as data: only a caller that
+/// accepts the mutation may persist sessions or project markers into checkouts.
+async fn store_merge_child_mutation(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+    method: &str,
+    publish: bool,
+    validated_tree: Option<&str>,
+) -> Result<StoreFold, String> {
     // A default-branch fold either parse-gates what it folds, or, when the
     // landing already validated a tree off the lock, proves it is that tree.
     let fold_onto_default =
@@ -403,6 +467,40 @@ async fn store_merge_child_inner(
             .await?
             .is_some();
 
+    let held_db = crate::projects::crud::owning_db(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let held_source =
+        crate::orchestrator::base_advance::held_replay_source(&held_db, &store, source_branch)
+            .await?;
+    let source_cut = crate::orchestrator::base_advance::held_replay_source_cut(
+        orch,
+        &held_db,
+        &jj,
+        &store,
+        source_branch,
+        target_branch,
+    )
+    .await?;
+    let preserve_bookmarks =
+        crate::orchestrator::base_advance::held_replay_bookmarks_for_repository(&orch.db, &store)
+            .await?;
+    let replay = |dest: &str| {
+        crate::jj::rebase_branch_onto_with_options(
+            &jj,
+            &store,
+            source_branch,
+            dest,
+            &crate::jj::RebaseOptions {
+                source_cut: source_cut
+                    .as_ref()
+                    .filter(|_| !crate::jj::revset_descends_from(&jj, &store, source_branch, dest))
+                    .cloned(),
+                preserve_bookmarks: preserve_bookmarks.clone(),
+            },
+        )
+    };
+    let mut held_descendants = std::collections::BTreeMap::new();
     if target_branch == default_branch {
         // The default branch advances out of band. Bring its live tip into the
         // store (it may have moved via another Cairn merge OR externally — a
@@ -450,7 +548,7 @@ async fn store_merge_child_inner(
             if merge_mode {
                 require_merged_with(&jj, &store, target_branch, source_branch, &dest)?;
             } else {
-                match crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)? {
+                match replay(&dest)? {
                     crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
                         return Err(crate::jj::base_conflict_refusal(
                             target_branch,
@@ -462,8 +560,13 @@ async fn store_merge_child_inner(
                     // this path lands exactly one commit whose tree equals the source
                     // tip, so `flatten_branch_recovery` below discards the conflicted
                     // ancestry rather than folding it onto the default branch.
-                    crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { .. }
-                    | crate::jj::RebaseOutcome::Rebased => {}
+                    crate::jj::RebaseOutcome::RebasedOverConflictedAncestry {
+                        held_descendants: held,
+                        ..
+                    }
+                    | crate::jj::RebaseOutcome::Rebased {
+                        held_descendants: held,
+                    } => held_descendants.extend(held),
                 }
             }
             // Idempotence guard (mirrors the old real-fold path's no-op on a
@@ -541,8 +644,10 @@ async fn store_merge_child_inner(
             if merge_mode {
                 require_merged_with(&jj, &store, target_branch, source_branch, &dest)?;
             } else {
-                match crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)? {
-                    crate::jj::RebaseOutcome::Rebased => {}
+                match replay(&dest)? {
+                    crate::jj::RebaseOutcome::Rebased {
+                        held_descendants: held,
+                    } => held_descendants.extend(held),
                     crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
                         return Err(crate::jj::base_conflict_refusal(
                             target_branch,
@@ -550,7 +655,7 @@ async fn store_merge_child_inner(
                             &diagnostic.conflicting_paths(),
                         ))
                     }
-                    crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { paths } => {
+                    crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { paths, .. } => {
                         return Err(crate::jj::conflicted_ancestry_refusal(
                             target_branch,
                             source_branch,
@@ -796,11 +901,12 @@ async fn store_merge_child_inner(
                     // Healed in place, never collapsed: the integration branch's
                     // history is published and carries every child PR folded
                     // into it so far.
-                    if let Err(e) = crate::jj::heal_conflicted_ancestry(
+                    if let Err(e) = crate::jj::heal_conflicted_ancestry_preserving(
                         &jj,
                         &store,
                         target_branch,
                         &dest_commit,
+                        &preserve_bookmarks,
                     ) {
                         return Err(rollback_merge(
                             orch,
@@ -859,7 +965,7 @@ async fn store_merge_child_inner(
         if merge_mode {
             require_merged_with(&jj, &store, target_branch, source_branch, target_branch)?;
         } else {
-            match crate::jj::rebase_branch_onto(&jj, &store, source_branch, target_branch)? {
+            match replay(target_branch)? {
                 crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
                     return Err(crate::jj::base_conflict_refusal(
                         target_branch,
@@ -870,8 +976,13 @@ async fn store_merge_child_inner(
                 // Handled below: the child's conflicted ancestry is healed in place
                 // before the fold, so no conflict-flagged commit is folded into the
                 // integration branch.
-                crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { .. }
-                | crate::jj::RebaseOutcome::Rebased => {}
+                crate::jj::RebaseOutcome::RebasedOverConflictedAncestry {
+                    held_descendants: held,
+                    ..
+                }
+                | crate::jj::RebaseOutcome::Rebased {
+                    held_descendants: held,
+                } => held_descendants.extend(held),
             }
         }
 
@@ -889,7 +1000,7 @@ async fn store_merge_child_inner(
                         format!("integration bookmark `{target_branch}` did not resolve for the heal")
                     })?;
                 if let Err(e) =
-                    crate::jj::heal_conflicted_ancestry(&jj, &store, source_branch, &dest_commit)
+                    crate::jj::heal_conflicted_ancestry_preserving(&jj, &store, source_branch, &dest_commit, &preserve_bookmarks)
                 {
                     let base_err = format!(
                         "Refusing to merge: could not heal `{source_branch}`'s conflict-flagged history on the integration branch `{target_branch}` ({e}).{detail}",
@@ -1012,8 +1123,15 @@ async fn store_merge_child_inner(
         }
     }
 
-    crate::jj::bookmark_commit(&jj, &store, target_branch)
-        .ok_or_else(|| format!("target bookmark `{target_branch}` did not resolve after the fold"))
+    let commit = crate::jj::bookmark_commit(&jj, &store, target_branch).ok_or_else(|| {
+        format!("target bookmark `{target_branch}` did not resolve after the fold")
+    })?;
+    Ok(StoreFold {
+        commit,
+        held_source,
+        held_db,
+        held_descendants,
+    })
 }
 
 /// The store route's guard for a branch that catches up by merge: it is never

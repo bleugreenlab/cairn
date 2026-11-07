@@ -145,6 +145,7 @@ pub struct JjBackend {
     /// around), and to turn a legitimate rollback OFF by deleting it. Neither
     /// direction is the batch's to decide, so the decision predates it.
     owned_branch: Option<String>,
+    recovery_db: Option<std::sync::Arc<crate::db::DbState>>,
 }
 
 impl JjBackend {
@@ -152,6 +153,7 @@ impl JjBackend {
     pub(crate) fn new(jj: crate::jj::JjEnv, worktree: &Path) -> Self {
         Self {
             owned_branch: crate::jj::read_branch_marker(worktree),
+            recovery_db: None,
             jj,
         }
     }
@@ -211,7 +213,22 @@ impl JjBackend {
         ) {
             return;
         }
-        match crate::jj::heal_conflicted_ancestry(&self.jj, worktree, branch, &base_commit) {
+        let preserve = match self.recovery_db.as_ref() {
+            Some(dbs) => match crate::storage::run_db_blocking(|| async {
+                crate::orchestrator::base_advance::held_replay_bookmarks_for_repository(
+                    dbs, worktree,
+                )
+                .await
+            }) {
+                Ok(held) => held,
+                Err(error) => {
+                    log::warn!("reseal heal: cannot load held ownership boundaries ({error}); leaving the accepted seal for orchestrator recovery");
+                    return;
+                }
+            },
+            None => std::collections::BTreeSet::new(),
+        };
+        match crate::jj::heal_conflicted_ancestry_preserving(&self.jj, worktree, branch, &base_commit, &preserve) {
             Ok(heal) => {
                 log::info!(
                     "reseal heal: healed {branch} in place ({} conflict-flagged commit(s) resolved, {} emptied commit(s) dropped)",
@@ -439,7 +456,9 @@ pub(crate) fn resolve_worktree_vcs(
 ) -> Box<dyn WorktreeVcs> {
     if crate::jj::is_jj_dir(worktree) {
         let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-        Box::new(JjBackend::new(jj, worktree))
+        let mut backend = JjBackend::new(jj, worktree);
+        backend.recovery_db = Some(orch.db.clone());
+        Box::new(backend)
     } else {
         Box::new(NonWorktreeVcs)
     }

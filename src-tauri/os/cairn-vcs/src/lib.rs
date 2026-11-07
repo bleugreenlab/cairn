@@ -237,6 +237,40 @@ pub fn publish_logical_head(
         ))
 }
 
+async fn require_clean_logical_tree(
+    tree: &jj_lib::merged_tree::MergedTree,
+    context: &str,
+) -> Result<(), String> {
+    if tree.has_conflict() {
+        return Err(format!(
+            "logical-head publication refused: {context} carries native tree conflicts. \
+             Resolve every conflicting path with explicit file mutations or rebuild through cairn:~/rebase; \
+             a build or automatic check fix cannot extend a conflict-bearing parent."
+        ));
+    }
+    let roots = tree
+        .trees()
+        .await
+        .map_err(|error| format!("inspect {context}: {error}"))?;
+    let root = roots
+        .as_resolved()
+        .ok_or_else(|| format!("inspect {context}: unresolved tree"))?;
+    let scaffolding: Vec<String> = root
+        .entries_non_recursive()
+        .map(|entry| entry.name().as_internal_str())
+        .filter(|name| cairn_common::conflict_scaffolding::is_conflict_scaffolding_entry(name))
+        .map(str::to_string)
+        .collect();
+    if !scaffolding.is_empty() {
+        return Err(format!(
+            "logical-head publication refused: {context} carries jj conflict scaffolding ({}). \
+             No branch was advanced; use cairn:~/rebase to rebuild from clean content.",
+            scaffolding.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 async fn publish_logical_head_inner(
     repository_path: &Path,
     bookmark: &str,
@@ -287,6 +321,11 @@ async fn publish_logical_head_inner(
         .map_err(|error| format!("read expected logical head: {error}"))?;
     let (tree, affected_paths) = match proposed_tree {
         ProposedTree::DeltaCommit(delta_commit) => {
+            require_clean_logical_tree(
+                &head.tree(),
+                &format!("parent of `{bookmark}` at {expected_head}"),
+            )
+            .await?;
             let delta_id = CommitId::try_from_hex(&delta_commit)
                 .ok_or_else(|| "proposed delta is not a full hexadecimal object ID".to_string())?;
             let delta = repo
@@ -446,6 +485,7 @@ async fn publish_logical_head_inner(
         }
     };
 
+    require_clean_logical_tree(&tree, &format!("proposed head of `{bookmark}`")).await?;
     let mut amend_note = None;
     let mut tx = repo.start_transaction();
     let published = match mode {
@@ -1535,6 +1575,94 @@ mod tests {
         assert!(retried.contains("delta parent mismatch"), "{retried}");
 
         assert_eq!(bookmark_commit(dir.path()), advanced.head);
+    }
+
+    #[test]
+    fn automatic_delta_refuses_a_conflicted_parent_but_explicit_resolution_can_publish() {
+        let (dir, expected, _, _) = fixture();
+        let ours = delta_commit(dir.path(), &expected, "ours\n");
+        let theirs = delta_commit(dir.path(), &expected, "theirs\n");
+        let flagged = runtime().block_on(async {
+            let repo = load_repo_at_head(dir.path()).await.unwrap();
+            let tree_id = |id: &str| {
+                repo.store()
+                    .get_commit(&CommitId::try_from_hex(id).unwrap())
+                    .unwrap()
+                    .tree()
+                    .tree_ids()
+                    .as_resolved()
+                    .unwrap()
+                    .clone()
+            };
+            let tree = jj_lib::merged_tree::MergedTree::new(
+                repo.store().clone(),
+                Merge::from_removes_adds([tree_id(&expected)], [tree_id(&ours), tree_id(&theirs)]),
+                jj_lib::conflict_labels::ConflictLabels::unlabeled(),
+            );
+            let mut tx = repo.start_transaction();
+            let commit = tx
+                .repo_mut()
+                .new_commit(vec![CommitId::try_from_hex(&expected).unwrap()], tree)
+                .set_description("conflicted parent fixture")
+                .write()
+                .await
+                .unwrap();
+            let id = commit.id().clone();
+            tx.repo_mut()
+                .set_local_bookmark_target(RefName::new("feature"), RefTarget::normal(id.clone()));
+            tx.commit("conflicted parent fixture").await.unwrap();
+            id.hex()
+        });
+        let delta = delta_commit(dir.path(), &flagged, "automatic fix\n");
+        let error = publish_logical_head(
+            dir.path(),
+            "feature",
+            &flagged,
+            &delta,
+            None,
+            PublicationMode::Child {
+                description: "automatic fix".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("native tree conflicts"), "{error}");
+        assert_eq!(bookmark_commit(dir.path()), flagged);
+        let resolved = publish_logical_mutations(
+            dir.path(),
+            "feature",
+            &flagged,
+            vec![LogicalTreeMutation {
+                path: "value".into(),
+                content: Some(b"resolved\n".to_vec()),
+            }],
+            None,
+            PublicationMode::Child {
+                description: "explicit resolution".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(bookmark_commit(dir.path()), resolved.head);
+    }
+
+    #[test]
+    fn logical_publication_refuses_proposed_root_scaffolding_before_moving_a_bookmark() {
+        let (dir, expected, _, _) = fixture();
+        let error = publish_logical_mutations(
+            dir.path(),
+            "feature",
+            &expected,
+            vec![LogicalTreeMutation {
+                path: "JJ-CONFLICT-README".into(),
+                content: Some(b"not resolved\n".to_vec()),
+            }],
+            None,
+            PublicationMode::Child {
+                description: "bad tree".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("jj conflict scaffolding"), "{error}");
+        assert_eq!(bookmark_commit(dir.path()), expected);
     }
 
     #[test]

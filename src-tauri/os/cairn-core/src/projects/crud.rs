@@ -627,15 +627,21 @@ pub async fn resolve_local_repo_path_and_key(
     project_id: &str,
 ) -> Result<(Option<String>, String), CairnError> {
     let db = owning_db(dbs, project_id).await?;
-    let project = get_db(&db, project_id)
+    // These coordinates are shared by both schemas. Decoding an entire
+    // DbProject would couple path resolution to unrelated schema-root columns.
+    let (id, key, repo_path) = db
+        .query_opt(
+            "SELECT id, key, repo_path FROM projects WHERE id = ?1",
+            (project_id.to_string(),),
+            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+        )
         .await?
         .ok_or_else(|| CairnError::NotFound {
             entity: "project",
             id: project_id.to_string(),
         })?;
-    let local_path =
-        resolve_local_repo_path(dbs, &project.id, &project.key, &project.repo_path).await?;
-    Ok((local_path, project.key))
+    let local_path = resolve_local_repo_path(dbs, &id, &key, &repo_path).await?;
+    Ok((local_path, key))
 }
 
 async fn local_repo_path(

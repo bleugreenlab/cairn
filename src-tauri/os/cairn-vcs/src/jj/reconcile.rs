@@ -659,9 +659,10 @@ pub(crate) fn publish_reconciled_bookmark(
 }
 
 #[derive(Clone, Copy)]
-struct ReconcilePublication {
+struct ReconcilePublication<'a> {
     clean: bool,
     healed: bool,
+    preserve_bookmarks: &'a std::collections::BTreeSet<String>,
 }
 
 /// Where a branch this pass rebased stood immediately before the rebase, so a
@@ -836,7 +837,7 @@ fn classify_reconciled_sibling(
     store: &Path,
     branch: &str,
     dest_commit: Option<&str>,
-    publication: ReconcilePublication,
+    publication: ReconcilePublication<'_>,
     rollback: Option<&RebaseRollback>,
     report: &mut ReconcileReport,
 ) {
@@ -891,7 +892,13 @@ fn classify_reconciled_sibling(
         // carries, child-PR landings included.
         Some(FlattenState::IntermediateOnly) => {
             let dest = dest_commit.expect("IntermediateOnly implies a concrete dest");
-            match heal_conflicted_ancestry(jj, store, branch, dest) {
+            match heal_conflicted_ancestry_preserving(
+                jj,
+                store,
+                branch,
+                dest,
+                publication.preserve_bookmarks,
+            ) {
                 Ok(heal) => {
                     // The heal rewrote commit ids, so the PR head must move even
                     // when a plain clean rebase would have been skipped.
@@ -1070,8 +1077,12 @@ fn rebase_sibling(
     branch: &str,
     integration_branch: &str,
     resolution: Option<&ResolutionCarry>,
+    replay_options: &super::merge::RebaseOptions,
     report: &mut ReconcileReport,
-) -> Option<RebaseRollback> {
+) -> Option<(
+    RebaseRollback,
+    std::collections::BTreeMap<String, ConflictDiagnostic>,
+)> {
     // Captured before the rebase so a classification that cannot keep the
     // result can return the store to exactly here. Exact under the per-store
     // lock every caller holds.
@@ -1085,12 +1096,25 @@ fn rebase_sibling(
             return None;
         }
     };
-    let proceed =
-        match rebase_branch_onto_with_resolution(jj, store, branch, integration_branch, resolution)
-        {
-            Ok(RebaseOutcome::Rebased) => true,
-            Ok(RebaseOutcome::RebasedOverConflictedAncestry { paths }) => {
-                log::info!(
+    let mut descendant_conflicts = std::collections::BTreeMap::new();
+    let proceed = match rebase_branch_onto_with_resolution(
+        jj,
+        store,
+        branch,
+        integration_branch,
+        resolution,
+        replay_options,
+    ) {
+        Ok(RebaseOutcome::Rebased { held_descendants }) => {
+            descendant_conflicts = held_descendants;
+            true
+        }
+        Ok(RebaseOutcome::RebasedOverConflictedAncestry {
+            paths,
+            held_descendants,
+        }) => {
+            descendant_conflicts = held_descendants;
+            log::info!(
                 "jj reconcile: {branch} rebased clean-tip over conflicted history ({}); handing it \
                  to flatten recovery",
                 if paths.is_empty() {
@@ -1099,21 +1123,19 @@ fn rebase_sibling(
                     paths.join(", ")
                 }
             );
-                true
-            }
-            Ok(RebaseOutcome::Conflicted { diagnostic }) => {
-                record_conflict(report, branch, diagnostic);
-                false
-            }
-            Err(error) => {
-                log::warn!(
-                    "jj reconcile: rebase {branch} onto {integration_branch} failed: {error}"
-                );
-                record_failure(report, branch, error);
-                false
-            }
-        };
-    proceed.then_some(rollback)
+            true
+        }
+        Ok(RebaseOutcome::Conflicted { diagnostic }) => {
+            record_conflict(report, branch, diagnostic);
+            false
+        }
+        Err(error) => {
+            log::warn!("jj reconcile: rebase {branch} onto {integration_branch} failed: {error}");
+            record_failure(report, branch, error);
+            false
+        }
+    };
+    proceed.then_some((rollback, descendant_conflicts))
 }
 
 /// Reconcile runner-owned sibling bookmarks onto the locally advanced integration
@@ -1174,6 +1196,9 @@ pub fn reconcile_resolved_sibling_without_publication(
 /// How one reconcile pass treats its siblings.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileOptions {
+    /// Exact original ownership cut for one held sibling.
+    pub source_cut: Option<(String, String)>,
+    pub preserve_bookmarks: std::collections::BTreeSet<String>,
     /// Publish each moved sibling to origin as part of the pass.
     pub publish: bool,
     /// An explicitly requested committed resolution for one named sibling.
@@ -1273,6 +1298,14 @@ pub fn reconcile_siblings_with_options(
                 dest_commit.as_deref(),
                 publish,
                 resolution,
+                &super::merge::RebaseOptions {
+                    source_cut: options
+                        .source_cut
+                        .as_ref()
+                        .filter(|(name, _)| name == branch)
+                        .map(|(_, cut)| cut.clone()),
+                    preserve_bookmarks: options.preserve_bookmarks.clone(),
+                },
                 &mut report,
             );
         }
@@ -1399,6 +1432,7 @@ fn reconcile_one_sibling(
     dest_commit: Option<&str>,
     publish: bool,
     resolution: Option<(&str, &ResolutionCarry)>,
+    replay_options: &super::merge::RebaseOptions,
     report: &mut ReconcileReport,
 ) {
     let already_on_dest = dest_commit
@@ -1407,6 +1441,7 @@ fn reconcile_one_sibling(
     let mut push_clean = !already_on_dest;
     let mut trivial_fast_forward = false;
     let mut rollback = None;
+    let mut descendant_conflicts = std::collections::BTreeMap::new();
     let carry = resolution
         .filter(|(resolved, _)| *resolved == branch)
         .map(|(_, carry)| carry);
@@ -1423,8 +1458,19 @@ fn reconcile_one_sibling(
             push_clean = false;
             trivial_fast_forward = true;
         } else {
-            match rebase_sibling(jj, store, branch, integration_branch, carry, report) {
-                Some(before) => rollback = Some(before),
+            match rebase_sibling(
+                jj,
+                store,
+                branch,
+                integration_branch,
+                carry,
+                replay_options,
+                report,
+            ) {
+                Some((before, held)) => {
+                    rollback = Some(before);
+                    descendant_conflicts = held;
+                }
                 None => return,
             }
         }
@@ -1445,6 +1491,7 @@ fn reconcile_one_sibling(
         ReconcilePublication {
             clean: push_clean && publish,
             healed: publish,
+            preserve_bookmarks: &replay_options.preserve_bookmarks,
         },
         rollback.as_ref(),
         report,
@@ -1466,6 +1513,11 @@ fn reconcile_one_sibling(
                 branch,
                 super::merge::roll_back_rebase(jj, store, branch, &rollback.pre_op, error),
             );
+        }
+    }
+    if report.rebased_clean.iter().any(|name| name == branch) {
+        for (descendant, diagnostic) in descendant_conflicts {
+            record_conflict(report, &descendant, diagnostic);
         }
     }
 }

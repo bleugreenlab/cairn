@@ -149,7 +149,7 @@ async fn writer(
         crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
     if context.job_id != owning_job {
         return Err(
-            "Refused: only this branch's owning node or the operator may mark its review. \
+            "Refused: only this branch's owning node or the operator may change its rebase state. \
              Nothing changed."
                 .to_string(),
         );
@@ -214,7 +214,7 @@ async fn set_catch_up_mode(
         .project_id()
         .ok_or_else(|| "this node's project could not be read".to_string())?
         .to_string();
-    let store = rows.store_path(orch)?;
+    let store = rows.store_path(orch).await?;
     let default_branch = project_default_branch(db, &project_id).await?;
     if branch == default_branch {
         return Err(format!(
@@ -360,7 +360,7 @@ async fn mark_reviewed(
         .project_id()
         .ok_or_else(|| "this node's project could not be read".to_string())?
         .to_string();
-    let store = rows.store_path(orch)?;
+    let store = rows.store_path(orch).await?;
     let mode = crate::orchestrator::catch_up::mode_for(db, &project_id, &store, branch)
         .await?
         .ok_or_else(|| {
@@ -396,6 +396,193 @@ async fn mark_reviewed(
     ))
 }
 
+mod acceptance;
+
+async fn require_rebuild_branch_owner(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    branch: &str,
+) -> Result<(), String> {
+    match rebuild_branch_owner_refusal(db, job_id, branch).await? {
+        Some(reason) => Err(reason.to_string()),
+        None => Ok(()),
+    }
+}
+
+async fn rebuild_branch_owner_refusal(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    branch: &str,
+) -> Result<Option<&'static str>, String> {
+    let job = job_id.to_string();
+    let default = db.query_opt_text(
+        "SELECT p.default_branch FROM projects p JOIN jobs j ON j.project_id = p.id WHERE j.id = ?1",
+        (job.clone(),),
+    ).await.map_err(|e| e.to_string())?.ok_or_else(|| "rebuild project is missing".to_string())?;
+    if branch == default {
+        return Ok(Some(
+            "rebuild refuses to replace the project's default branch",
+        ));
+    }
+    let parent_branch = db
+        .query_opt_text(
+            "SELECT p.branch FROM jobs j JOIN jobs p ON p.id = j.parent_job_id WHERE j.id = ?1",
+            (job.clone(),),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    if parent_branch.as_deref() == Some(branch) {
+        return Ok(Some("rebuild refused: this node inherits the upstream branch; address its owning node instead"));
+    }
+    let execution = db
+        .query_opt_text(
+            "SELECT execution_id FROM jobs WHERE id = ?1",
+            (job.clone(),),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "rebuild owner has no execution".to_string())?;
+    let node = db
+        .query_opt_text("SELECT recipe_node_id FROM jobs WHERE id = ?1", (job,))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "rebuild owner has no recipe node".to_string())?;
+    let snapshot = crate::jobs::queries::load_execution_snapshot(db, &execution)
+        .await
+        .map_err(|e| e.to_string())?;
+    let node = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .find(|candidate| candidate.id == node)
+        .ok_or_else(|| "rebuild owning recipe node is absent from its execution".to_string())?;
+    let db_node = crate::execution::dag::recipe_node_to_db(node, &snapshot.recipe.id);
+    if !crate::execution::step_behavior::resolve_node_behavior(&db_node).mints_branch {
+        return Ok(Some("rebuild refused: this node did not mint an isolated branch; address its owning node instead"));
+    }
+    Ok(None)
+}
+
+fn rebuild_coordinates(payload: &serde_json::Value) -> Result<(&str, &str, &str, &str), String> {
+    let source = payload_non_empty_str(payload, "source_commit", &[]).ok_or_else(|| {
+        "rebuild requires source_commit: the full last clean branch commit ID".to_string()
+    })?;
+    let expected = payload_non_empty_str(payload, "expected_tip", &[]).ok_or_else(|| {
+        "rebuild requires expected_tip: the full flagged branch tip ID".to_string()
+    })?;
+    for key in [
+        "branch",
+        "resolution",
+        "fingerprint",
+        "drop_incoming_reason",
+        "mode",
+        "through",
+        "review_paths",
+        "reviewed_through",
+    ] {
+        if payload.get(key).is_some() {
+            return Err(format!("payload.{key} does not apply to rebuild"));
+        }
+    }
+    let source_base = payload_non_empty_str(payload, "source_base", &[])
+        .ok_or_else(|| "rebuild requires source_base: owner-attested full original branch cut ID, excluding inherited parent changes".to_string())?;
+    let reason = payload_non_empty_str(payload, "source_base_reason", &[])
+        .ok_or_else(|| "rebuild requires source_base_reason explaining why this is the original cut, excluding inherited parent changes".to_string())?;
+    Ok((source, source_base, reason, expected))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rebuild(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    payload: &serde_json::Value,
+    dry_run: bool,
+) -> Result<String, String> {
+    let (source, source_base, reason, expected) = rebuild_coordinates(payload)?;
+    let (source, source_base, reason, expected) = (
+        source.to_string(),
+        source_base.to_string(),
+        reason.to_string(),
+        expected.to_string(),
+    );
+    let db = orch.db.for_project(project).await;
+    let rows =
+        crate::resources::NodeRebaseRows::read(&db, project, number, exec_seq, node_id).await?;
+    writer(orch, request, &rows.job_id).await?;
+    let branch = rows
+        .branch
+        .clone()
+        .ok_or_else(|| "This node has no branch to rebuild".to_string())?;
+    require_rebuild_branch_owner(&db, &rows.job_id, &branch).await?;
+    let base = crate::resources::node_base_branch(orch, &rows, &branch).await?;
+    let store = rows.store_path(orch).await?;
+    let _guard = orch
+        .acquire_jj_store_lock(
+            &store,
+            crate::orchestrator::StoreLockClass::Background,
+            format!("explicit rebuild: {branch}"),
+        )
+        .await;
+    crate::orchestrator::branch_recovery::refuse_if_fenced(
+        &db,
+        &store,
+        &[&branch, &base],
+        "rebuild flagged branch",
+    )
+    .await?;
+    if let Some(batch) =
+        crate::orchestrator::base_advance::inflight_run_batch_on_branch(&db, &rows.job_id, &branch)
+            .await?
+    {
+        return Err(format!("Rebuild refused while {} can still publish to this branch; finish or stop that batch and retry.", batch.describe()));
+    }
+    let snapshot = acceptance::Snapshot::capture(&db, &store, &branch, &rows.job_id).await?;
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let (worker_jj, worker_store, worker_branch, worker_base) =
+        (jj.clone(), store.clone(), branch.clone(), base.clone());
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::jj::rebuild_flagged_branch(
+            &worker_jj,
+            &worker_store,
+            &worker_branch,
+            &worker_base,
+            &source,
+            &source_base,
+            &reason,
+            &expected,
+            dry_run,
+        )
+    })
+    .await
+    .map_err(|error| format!("rebuild worker failed: {error}"))??;
+    match outcome {
+        crate::jj::RebuildOutcome::Preview { summary } => Ok(summary),
+        crate::jj::RebuildOutcome::Accepted {
+            previous_tip,
+            rebuilt_tip,
+            base_commit,
+            summary,
+            export_error,
+        } => {
+            let retained = snapshot.accept(&db, &jj, &store, &branch, &base, &previous_tip, &rebuilt_tip, &base_commit).await
+                .map_err(|error| format!("Rebuild remains committed at {rebuilt_tip}, but metadata acceptance failed: {error}. Retry this same rebuild request; it will not create another native head."))?;
+            let summary = if retained == 0 {
+                summary
+            } else {
+                format!("{summary} Retained {retained} newer or unproven replay generations; those obligations were not superseded.")
+            };
+            match export_error {
+                Some(error) => Err(format!("{summary} Metadata accepted, but Git export failed: {error}. Retry this same rebuild request to retry export only.")),
+                None => Ok(summary),
+            }
+        }
+    }
+}
+
 pub(super) async fn dispatch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -425,6 +612,7 @@ pub(super) async fn dispatch(
                 "replay"
                     | "fast-forward-from-origin"
                     | "repair"
+                    | "rebuild"
                     | "catch-up-mode"
                     | "mark-reviewed"
             ) {
@@ -432,8 +620,32 @@ pub(super) async fn dispatch(
                     index,
                     item,
                     format!(
-                        "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'catch-up-mode' or 'mark-reviewed', got '{action}'"
+                        "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'rebuild', 'catch-up-mode' or 'mark-reviewed', got '{action}'"
                     ),
+                ));
+            }
+            if action == "rebuild" {
+                let outcome = rebuild(
+                    orch, request, project, *number, *exec_seq, node_id, payload, dry_run,
+                )
+                .await;
+                return outcome
+                    .map(Some)
+                    .map_err(|error| build_failure(index, item, error));
+            }
+            if [
+                "source_commit",
+                "source_base",
+                "source_base_reason",
+                "expected_tip",
+            ]
+            .iter()
+            .any(|key| payload.get(*key).is_some())
+            {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "source_commit, source_base, source_base_reason and expected_tip apply only to rebuild",
                 ));
             }
             if matches!(action, "catch-up-mode" | "mark-reviewed") {
@@ -528,6 +740,7 @@ pub(super) async fn dispatch(
                 } else {
                     let store = rows
                         .store_path(orch)
+                        .await
                         .map_err(|error| build_failure(index, item, error))?;
                     crate::orchestrator::branch_recovery::repair_now(orch, &db, &store, &branch)
                         .await
@@ -587,6 +800,371 @@ mod tests {
     use crate::storage::SearchIndex;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn rebuild_payload_requires_explicit_coordinates_and_rejects_replay_overrides() {
+        use serde_json::json;
+        assert!(rebuild_coordinates(&json!({}))
+            .unwrap_err()
+            .contains("source_commit"));
+        assert!(rebuild_coordinates(&json!({"source_commit":"source"}))
+            .unwrap_err()
+            .contains("expected_tip"));
+        assert!(
+            rebuild_coordinates(&json!({"source_commit":"source", "expected_tip":"tip"}))
+                .unwrap_err()
+                .contains("source_base")
+        );
+        assert!(rebuild_coordinates(
+            &json!({"source_commit":"source", "source_base":"cut", "expected_tip":"tip"})
+        )
+        .unwrap_err()
+        .contains("source_base_reason"));
+        for key in [
+            "branch",
+            "resolution",
+            "fingerprint",
+            "drop_incoming_reason",
+            "mode",
+            "through",
+            "review_paths",
+            "reviewed_through",
+        ] {
+            let mut payload = json!({"source_commit":"source", "source_base":"cut", "source_base_reason":"original cut", "expected_tip":"tip"});
+            payload[key] = json!("override");
+            assert!(rebuild_coordinates(&payload).unwrap_err().contains(key));
+        }
+        assert_eq!(
+            rebuild_coordinates(&json!({"source_commit":"source", "source_base":"cut", "source_base_reason":"original cut", "expected_tip":"tip"})).unwrap(),
+            ("source", "cut", "original cut", "tip")
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_dispatch_denies_inherited_and_default_branches_before_store_access() {
+        let db = Arc::new(crate::storage::migrated_test_db("rebuild-inherited.db").await);
+        // Child workflows have node addresses despite their delegation parent;
+        // ordinary child jobs resolve only through task addresses.
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-1','default','Project','proj','/repo','main',1,1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1','proj-1',1,'Issue','active',1,1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('exec-1','recipe-default','issue-1','proj-1','running',1,1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+               VALUES ('parent','exec-1','builder','issue-1','proj-1','running','agent/parent','main','builder',1,1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, parent_job_id, agent_config_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+               VALUES ('child','exec-1','reviewer','issue-1','proj-1','parent','workflow','running','agent/parent','main','reviewer',1,1);"
+        ).await.unwrap();
+        let mut snapshot: crate::models::ExecutionSnapshot = serde_json::from_str(
+            &crate::test_support::shipping_execution_snapshot_json("issue-1", "proj-1"),
+        )
+        .unwrap();
+        snapshot.recipe.id = "recipe-default".into();
+        let node = &mut snapshot.recipe.nodes[0];
+        node.id = "reviewer".into();
+        node.agent_config.as_mut().unwrap().git_config = Some(crate::models::AgentGitConfig {
+            branch_mode: crate::models::BranchMode::Inherit,
+            ..Default::default()
+        });
+        db.execute(
+            "UPDATE executions SET snapshot=?1 WHERE id='exec-1'",
+            (serde_json::to_string(&snapshot).unwrap(),),
+        )
+        .await
+        .unwrap();
+        let rows = crate::resources::NodeRebaseRows::read(&db, "proj", 1, 1, "reviewer")
+            .await
+            .unwrap();
+        assert_eq!(rows.job_id, "child");
+        assert_eq!(rows.branch.as_deref(), Some("agent/parent"));
+        let root = tempfile::tempdir().unwrap();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.path().join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        let item = ChangeItem {
+            target: "cairn://p/proj/1/1/reviewer/rebase".into(),
+            mode: ChangeMode::Patch,
+            payload: Some(serde_json::json!({
+                "action":"rebuild",
+                "source_base_reason":"original cut",
+                "source_base":"123456789abcdef0123456789abcdef012345678",
+                "source_commit":"0123456789abcdef0123456789abcdef01234567",
+                "expected_tip":"abcdef0123456789abcdef0123456789abcdef01"
+            })),
+        };
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "write".into(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+            answer_bound_ms: None,
+            origin: None,
+        };
+        let resource = CairnResource::NodeRebase {
+            project: "proj".into(),
+            number: 1,
+            exec_seq: 1,
+            node_id: "reviewer".into(),
+        };
+        let error = dispatch(&orch, &request, 0, &item, false, &resource)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("inherits the upstream branch"),
+            "{error:?}"
+        );
+        db.execute_script(
+            "UPDATE jobs SET branch='main', base_branch='agent/parent' WHERE id='child';",
+        )
+        .await
+        .unwrap();
+        let error = dispatch(&orch, &request, 0, &item, false, &resource)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("default branch"), "{error:?}");
+
+        // A recipe inherit node has no delegation parent to trigger the earlier
+        // shortcut; its frozen branch policy must independently deny rebuild.
+        db.execute_script(
+            "UPDATE jobs SET parent_job_id=NULL, branch='agent/parent', base_branch='main' WHERE id='child';",
+        )
+        .await
+        .unwrap();
+        let error = dispatch(&orch, &request, 0, &item, false, &resource)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("did not mint an isolated branch"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn rebuild_team_overlay_routes_standing_preview_and_acceptance_to_the_local_store() {
+        use crate::jj::tests::{git, git_stdout, init_project, rebase_recording_conflict};
+        use crate::storage::{LocalDb, MigrationRunner, TEAM_MIGRATIONS};
+
+        let bin = crate::jj::tests::resolve_jj().expect("provisioned real jj required");
+        let root = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path();
+        init_project(path);
+        let cut = git_stdout(path, &["rev-parse", "HEAD"]);
+        let branch = "agent/team-rebuild";
+        git(path, &["checkout", "-q", "-b", branch]);
+        std::fs::write(path.join("shared.rs"), "team branch work\n").unwrap();
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-q", "-m", "team branch delta"]);
+        let source = git_stdout(path, &["rev-parse", "HEAD"]);
+        git(path, &["checkout", "-q", "-b", "bad", &cut]);
+        std::fs::write(path.join("shared.rs"), "obsolete parent\n").unwrap();
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-q", "-m", "obsolete parent"]);
+        git(path, &["checkout", "-q", "main"]);
+        std::fs::write(path.join("incoming.txt"), "current base\n").unwrap();
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-q", "-m", "current base"]);
+        let base = git_stdout(path, &["rev-parse", "HEAD"]);
+        let jj = crate::jj::environment(&bin, root.path());
+        let store = crate::jj::project_store_dir(root.path(), path);
+        crate::jj::ensure_project_store(&jj, &store, path).unwrap();
+        rebase_recording_conflict(&jj, &store, branch, "bad");
+        let flagged = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+
+        let private =
+            Arc::new(crate::storage::migrated_test_db("rebuild-overlay-private.db").await);
+        let team = Arc::new(LocalDb::open(root.path().join("team.db")).await.unwrap());
+        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&team)
+            .await
+            .unwrap();
+        let project_id = "teamrepair~00000000-0000-4000-8000-000000000001";
+        let issue_id = "teamrepair~00000000-0000-4000-8000-000000000002";
+        let execution_id = "teamrepair~00000000-0000-4000-8000-000000000003";
+        let job_id = "teamrepair~00000000-0000-4000-8000-000000000004";
+        let creator = root.path().join("creator-machine-repository");
+        let creator_store = crate::jj::project_store_dir(root.path(), &creator);
+        let creator_sql = creator.to_string_lossy().replace('\'', "''");
+        team.execute_script(format!(
+            "INSERT INTO teams(id,name,created_at,updated_at) VALUES ('teamrepair','Repair team',1,1);
+             INSERT INTO projects(id,team_id,name,key,repo_path,default_branch,created_at,updated_at)
+             VALUES ('{project_id}','teamrepair','Team repair','team-repair','{creator_sql}','main',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+             VALUES ('{issue_id}','{project_id}',1,'Team repair','active',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+             VALUES ('{execution_id}','recipe','{issue_id}','{project_id}','running',1,1);
+             INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,branch,base_branch,uri_segment,created_at,updated_at)
+             VALUES ('{job_id}','{execution_id}','builder','{issue_id}','{project_id}','running','{branch}','main','builder',1,1);"
+        )).await.unwrap();
+        team.execute(
+            "UPDATE executions SET snapshot=?1 WHERE id=?2",
+            (
+                crate::test_support::shipping_execution_snapshot_json(issue_id, project_id),
+                execution_id,
+            ),
+        )
+        .await
+        .unwrap();
+        private
+            .execute_script(
+                "INSERT INTO teams(id,name,sync_url,replica_path,created_at)
+             VALUES ('teamrepair','Repair team','http://sync.invalid','/unused-replica',1);
+             INSERT INTO project_routes(project_key,team_id,created_at)
+             VALUES ('team-repair','teamrepair',1);",
+            )
+            .await
+            .unwrap();
+        crate::projects::crud::set_local_repo_path(&private, "team-repair", path)
+            .await
+            .unwrap();
+        let dbs = Arc::new(DbState::new(
+            private.clone(),
+            Arc::new(SearchIndex::open_or_create(root.path().join("overlay-search")).unwrap()),
+        ));
+        dbs.register_team_db_for_test("teamrepair".into(), team.clone())
+            .await;
+        dbs.set_route("team-repair", Some("teamrepair".into()))
+            .await;
+        let orch = Orchestrator::builder(
+            dbs,
+            Arc::new(TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .jj_binary_path(&bin)
+        .build();
+        let routed = orch.db.for_project("team-repair").await;
+        assert!(Arc::ptr_eq(&routed, &team));
+        assert!(private
+            .query_opt_text("SELECT id FROM projects WHERE id=?1", (project_id,))
+            .await
+            .unwrap()
+            .is_none());
+        let rows = crate::resources::NodeRebaseRows::read(&routed, "team-repair", 1, 1, "builder")
+            .await
+            .unwrap();
+        assert_eq!(rows.project_id(), Some(project_id));
+        assert_eq!(rows.store_path(&orch).await.unwrap(), store);
+        assert_ne!(store, creator_store);
+        assert_eq!(
+            crate::resources::node_base_branch(&orch, &rows, branch)
+                .await
+                .unwrap(),
+            "main"
+        );
+
+        let item = ChangeItem {
+            target: "cairn://p/team-repair/1/1/builder/rebase".into(),
+            mode: ChangeMode::Patch,
+            payload: Some(serde_json::json!({"action":"rebuild",
+                "source_commit":source, "source_base":cut, "source_base_reason":"original team mint",
+                "expected_tip":flagged})),
+        };
+        let request = McpCallbackRequest {
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "write".into(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+            answer_bound_ms: None,
+            origin: None,
+        };
+        let resource = CairnResource::NodeRebase {
+            project: "team-repair".into(),
+            number: 1,
+            exec_seq: 1,
+            node_id: "builder".into(),
+        };
+        let preview = dispatch(&orch, &request, 0, &item, true, &resource)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(preview.contains(&base), "{preview}");
+        assert_eq!(
+            crate::jj::bookmark_commit(&jj, &store, branch).as_deref(),
+            Some(flagged.as_str())
+        );
+        let accepted = dispatch(&orch, &request, 0, &item, false, &resource)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(accepted.contains("Rebuilt"), "{accepted}");
+        let rebuilt = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+        assert_ne!(rebuilt, flagged);
+        crate::jj::require_clean_tree(&jj, &store, &rebuilt, "team overlay rebuild").unwrap();
+        assert_eq!(
+            git_stdout(path, &["show", &format!("{rebuilt}:incoming.txt")]),
+            "current base"
+        );
+        assert_eq!(
+            git_stdout(path, &["show", &format!("{rebuilt}:shared.rs")]),
+            "team branch work"
+        );
+        assert!(
+            !creator_store.exists(),
+            "the synced creator path must never select or initialize a store"
+        );
+
+        private
+            .execute(
+                "UPDATE project_routes SET local_repo_path=NULL WHERE project_key='team-repair'",
+                (),
+            )
+            .await
+            .unwrap();
+        let error = rows.store_path(&orch).await.unwrap_err();
+        assert!(
+            error.contains("no local repository path on this machine"),
+            "{error}"
+        );
+        assert!(crate::resources::node_base_branch(&orch, &rows, branch)
+            .await
+            .unwrap_err()
+            .contains("no local repository path"));
+        let error = dispatch(&orch, &request, 0, &item, false, &resource)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("no local repository path"),
+            "{error:?}"
+        );
+        assert_eq!(
+            crate::jj::bookmark_commit(&jj, &store, branch).as_deref(),
+            Some(rebuilt.as_str())
+        );
+        assert!(!creator_store.exists());
+
+        // Local projects retain their own repo path without a private overlay.
+        private.execute_script(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES ('local-project','default','Local','local-repair','/local/repository',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+             VALUES ('local-issue','local-project',1,'Local','active',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+             VALUES ('local-exec','recipe','local-issue','local-project','running',1,1);
+             INSERT INTO jobs(id,execution_id,issue_id,project_id,status,branch,base_branch,uri_segment,created_at,updated_at)
+             VALUES ('local-job','local-exec','local-issue','local-project','running','agent/local','main','builder',1,1);"
+        ).await.unwrap();
+        let local =
+            crate::resources::NodeRebaseRows::read(&private, "local-repair", 1, 1, "builder")
+                .await
+                .unwrap();
+        assert_eq!(
+            local.store_path(&orch).await.unwrap(),
+            crate::jj::project_store_dir(root.path(), std::path::Path::new("/local/repository"))
+        );
+    }
 
     /// The 10-29 holder (cairn/5502): a replay request whose store lock is
     /// already held, as it is when the same write batch carries file items.

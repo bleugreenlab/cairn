@@ -331,10 +331,26 @@ pub(crate) const REMOVAL_INCLUDE_SHARED: KeySpec = KeySpec::new(
     "also remove every other live reference to the same bytes; without it, shared bytes are refused and the other references listed",
 );
 
+pub(crate) const REBASE_SOURCE_COMMIT: KeySpec = KeySpec::new(
+    "source_commit", KeyType::Str,
+    "rebuild only: full immutable ID of the branch's last clean source commit; its conflicted rewrite and all later deltas must be provable",
+);
+pub(crate) const REBASE_SOURCE_BASE: KeySpec = KeySpec::new(
+    "source_base", KeyType::Str,
+    "rebuild only: owner-attested full immutable original branch cut; source_base..source_commit is deliberately declared to be this branch's own delta, excluding inherited parent changes (never inferred from today's merge base)",
+);
+pub(crate) const REBASE_SOURCE_BASE_REASON: KeySpec = KeySpec::new(
+    "source_base_reason", KeyType::Str,
+    "rebuild only: required provenance explaining why source_base is the original own-delta boundary rather than inherited parent work; recorded with the recovery",
+);
+pub(crate) const REBASE_EXPECTED_TIP: KeySpec = KeySpec::new(
+    "expected_tip", KeyType::Str,
+    "rebuild only: full immutable flagged tip ID observed by the owner; a moved or ambiguous bookmark is refused",
+);
 pub(crate) const REBASE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "replay — replay onto the base (a branch in merge catch-up mode merges the base in instead); fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward; repair — retry now the targeted repair of a recovery fence on this branch (only the recorded bookmarks and Git heads move); catch-up-mode — set (mode:\"merge\") or end (mode:\"replay\") this branch's merge catch-up mode, on the operator's approval; mark-reviewed — record that the owner reviewed the base's incoming changes through `through`",
+    "replay — replay onto the base (a branch in merge catch-up mode merges the base in instead); fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward; rebuild — rebuild a flagged branch onto its current base using explicit source_commit, owner-attested source_base, source_base_reason and expected_tip, pinning the flagged tip in a recovery ref and refusing unprovable later edits; repair — retry now the targeted repair of a recovery fence on this branch (only the recorded bookmarks and Git heads move); catch-up-mode — set (mode:\"merge\") or end (mode:\"replay\") this branch's merge catch-up mode, on the operator's approval; mark-reviewed — record that the owner reviewed the base's incoming changes through `through`",
 );
 pub(crate) const REBASE_CATCH_UP_MODE: KeySpec = KeySpec::new(
     "mode",

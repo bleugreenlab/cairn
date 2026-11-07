@@ -25,6 +25,7 @@ mod maintenance;
 mod merge;
 mod packed_refs;
 mod publish;
+mod rebuild;
 mod reconcile;
 mod recovery;
 mod seal;
@@ -55,6 +56,7 @@ pub use packed_refs::{
     take_packed_refs_waited, with_packed_refs_patience, with_packed_refs_patience_async, PackedRefs,
 };
 pub use publish::*;
+pub use rebuild::{rebuild_flagged_branch, RebuildOutcome};
 pub use reconcile::*;
 pub use recovery::{
     bookmarks_an_import_would_move, interrupted_repair_coordinates, repair_branch_recovery,

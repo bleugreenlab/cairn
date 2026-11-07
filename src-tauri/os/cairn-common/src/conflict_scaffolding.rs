@@ -67,11 +67,10 @@ pub fn conflict_scaffolding_in_root_listing(listing: &str) -> Vec<String> {
         .collect()
 }
 
-/// The operator-facing refusal for a commit whose tree carries scaffolding.
+/// The refusal for a commit whose tree carries scaffolding.
 ///
-/// This is a diagnostic, not an agent instruction: the repair is store-side
-/// (the branch must be rebuilt on clean content), and nothing an agent can do
-/// inside a materialized checkout addresses it.
+/// Repair is store-side, through the owning branch's rebase resource; deleting
+/// sidecars in a materialized checkout does not recover the branch's content.
 pub fn conflict_scaffolding_refusal(what: &str, commit: &str, entries: &[String]) -> String {
     format!(
         "this branch cannot be built on any machine: refusing to {what} commit {commit}: its tree carries jj conflict scaffolding ({}). \
@@ -79,8 +78,10 @@ pub fn conflict_scaffolding_refusal(what: &str, commit: &str, entries: &[String]
          file into the top-level tree with no markers, so this tree is not a resolved merge. \
          Commit a real resolution, then use `cairn:~/rebase` with `action:\"replay\"`; \
          `take-committed-tip` preserves the conflict flag and cannot clear this condition. \
-         If a clean resolution commit cannot be authored, no agent-side action can repair the \
-         branch; an operator must repair it in the store.",
+         If a clean resolution commit cannot be authored, read `cairn:~/rebase` and preview \
+         `action:\"rebuild\"` with the last clean source commit, its owner-attested original cut, \
+         and the expected flagged tip. Only the owning isolated node may rebuild; source provenance \
+         and the complete recovered delta must pass its loss checks. Otherwise an operator must recover the branch.",
         entries.join(", ")
     )
 }
@@ -233,8 +234,8 @@ impl MarkerSource {
 /// The refusal for a commit whose resulting content still carries conflict
 /// markers.
 ///
-/// Unlike [`conflict_scaffolding_refusal`] — a diagnostic about a store-side
-/// repair no agent can perform — this one is an agent instruction, so it states
+/// Unlike [`conflict_scaffolding_refusal`], which requires a guarded store-side
+/// rebuild, this refusal can be resolved by editing content, so it states
 /// exactly what the refusal left behind (see [`MarkerSource`]) before asking for
 /// anything.
 ///
@@ -326,6 +327,17 @@ mod tests {
         assert!(!is_conflict_scaffolding_entry(".jjconflict"));
         assert!(!is_conflict_scaffolding_entry("docs/JJ-CONFLICT-README"));
         assert!(!is_conflict_scaffolding_entry("JJ-CONFLICT-README.md"));
+    }
+
+    #[test]
+    fn scaffolding_refusal_names_the_guarded_owner_rebuild_route() {
+        let message =
+            conflict_scaffolding_refusal("build", "abc123", &["JJ-CONFLICT-README".into()]);
+        assert!(message.contains("abc123"));
+        assert!(message.contains("action:\"rebuild\""));
+        assert!(message.contains("owner-attested original cut"));
+        assert!(message.contains("owning isolated node"));
+        assert!(!message.contains("no agent-side action"));
     }
 
     /// A real `git merge` conflict, diff3 style (jj's default materialization),

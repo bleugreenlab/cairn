@@ -31,6 +31,31 @@ pub fn branch_has_conflict(jj: &JjEnv, store: &Path, branch: &str) -> Result<boo
     revset_has_conflict(jj, store, &format!("bookmarks(exact:{:?})", branch))
 }
 
+/// Refuse a coordinate before admitting work against an unmaterializable tree.
+/// Both jj's conflict flag and Git's root scaffolding are authoritative: legacy
+/// trees can carry the latter without the former.
+pub fn require_clean_tree(
+    jj: &JjEnv,
+    store: &Path,
+    revision: &str,
+    action: &str,
+) -> Result<(), String> {
+    let commit = revset_commit_checked(jj, store, revision)?
+        .ok_or_else(|| format!("{action} refused: coordinate `{revision}` does not resolve"))?;
+    let checkout = resolve_backing_checkout(store)
+        .ok_or_else(|| format!("{action} refused: no backing Git repository for `{revision}`"))?;
+    let entries = root_conflict_scaffolding(Some(jj), &checkout, &commit)?;
+    if !entries.is_empty() || revset_has_conflict(jj, store, &commit)? {
+        return Err(format!(
+            "{action} refused: `{revision}` at {commit} carries tree conflicts or jj conflict scaffolding ({}). \
+             No work was started on this tree. Read cairn:~/rebase and resolve or rebuild the branch; \
+             starting a new execution does not repair its inherited tree.",
+            entries.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// A commit carrying a recorded conflict, with the paths whose merge did not
 /// resolve. Store-side detail for *reporting* which commits and files block a
 /// merge — advisory enumeration only; the boolean [`branch_has_conflict`] stays

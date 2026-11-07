@@ -289,6 +289,25 @@ mod tests {
     use super::specs::SUBAGENT_TYPE;
     use super::*;
 
+    #[test]
+    fn rebase_advertises_rebuild_with_explicit_clean_source_and_expected_tip() {
+        let mutation = mutation_spec(ResourceKind::NodeRebase, ChangeMode::Patch).unwrap();
+        let action = mutation
+            .required
+            .iter()
+            .find(|key| key.key == "action")
+            .unwrap();
+        assert!(action.note().contains("rebuild"));
+        for name in [
+            "source_commit",
+            "source_base",
+            "source_base_reason",
+            "expected_tip",
+        ] {
+            assert!(mutation.optional.iter().any(|key| key.key == name));
+        }
+    }
+
     /// The fleet's management surface IS the resource graph: enrollment and
     /// listener-certificate rotation on the collection, configuration and
     /// removal on the machine. Exactly these four, because what is absent is

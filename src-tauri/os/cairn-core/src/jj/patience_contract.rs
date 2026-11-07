@@ -20,6 +20,11 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         "fn run_export(",
     ),
     (
+        "selected logical-head export",
+        include_str!("../../../cairn-vcs/src/jj/export.rs"),
+        "pub(crate) async fn export_selected_bookmarks_inner(",
+    ),
+    (
         "sealed check refs",
         include_str!("../execution/checks.rs"),
         "fn git_check_ref_write(",
@@ -27,7 +32,7 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
     (
         "stranded delta ref",
         include_str!("../mcp/handlers/run/mod.rs"),
-        "fn strand_conflicted_delta(",
+        "fn keep_stranded_delta(",
     ),
     (
         "logical-head commit write",

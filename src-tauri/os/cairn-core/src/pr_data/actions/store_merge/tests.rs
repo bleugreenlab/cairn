@@ -687,3 +687,250 @@ async fn publication_refuses_an_undescribed_commit_made_outside_cairn() {
         "nothing was pushed"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn direct_store_landing_persists_held_child_destination() {
+    let bin = jj_bin().expect("real jj required for direct held-child landing");
+    let mut fx = setup_clean_merge(&bin).await;
+    fx.ctx.mr.is_local = true;
+    let child = "agent/held-child";
+    let child_ws = fx._wts.path().join("held-child");
+    crate::jj::add_workspace(
+        &fx.jj,
+        &fx.store,
+        &child_ws,
+        child,
+        &fx.ctx.source_branch,
+        None,
+    )
+    .unwrap();
+    std::fs::write(child_ws.join("conflict.txt"), "child\n").unwrap();
+    crate::jj::seal(&fx.jj, &child_ws, "child changes conflict path", None).unwrap();
+    let before = crate::jj::bookmark_commit(&fx.jj, &fx.store, child).unwrap();
+    crate::jj::forget_workspace(&fx.jj, &fx.store, child).unwrap();
+    let coord = fx._wts.path().join("coord");
+    std::fs::write(coord.join("conflict.txt"), "incoming\n").unwrap();
+    crate::jj::seal(&fx.jj, &coord, "integration advances child path", None).unwrap();
+    fx.orch
+        .db
+        .local
+        .execute(
+            "INSERT INTO jobs (id, project_id, status, branch, base_branch, created_at, updated_at)
+         VALUES ('held-child', 'proj-1', 'running', ?1, ?2, 1, 1)",
+            params![child, fx.ctx.source_branch.as_str()],
+        )
+        .await
+        .unwrap();
+    let parent_before =
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch).unwrap();
+    let counts = || async {
+        fx.orch
+            .db
+            .local
+            .query_text(
+                "SELECT json_array(
+              (SELECT COUNT(*) FROM jj_reconcile_intents),
+              (SELECT json_group_array(json_array(intent_id,bookmark,held_replay_source_cut,held_replay_source_tip)) FROM jj_reconcile_items),
+              (SELECT COUNT(*) FROM messages),
+              (SELECT COUNT(*) FROM attention_pushes))",
+                (),
+            )
+            .await
+            .unwrap()
+    };
+    let before_counts = counts().await;
+    prospective_store_merge_child(&fx.orch, &fx.ctx, "squash")
+        .await
+        .unwrap();
+    assert_eq!(
+        counts().await,
+        before_counts,
+        "a prospect has no durable session or delivery side effects"
+    );
+    assert!(
+        crate::orchestrator::conflict_session::load_active_session(&fx.orch.db.local, child)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch).as_deref(),
+        Some(parent_before.as_str())
+    );
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, child).as_deref(),
+        Some(before.as_str())
+    );
+    assert_eq!(
+        std::fs::read_to_string(child_ws.join("conflict.txt")).unwrap(),
+        "child\n"
+    );
+    store_merge_child_inner(&fx.orch, &fx.ctx, "squash", false, None)
+        .await
+        .unwrap();
+    let parent_after =
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch).unwrap();
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, child).as_deref(),
+        Some(before.as_str())
+    );
+    let session =
+        crate::orchestrator::conflict_session::load_active_session(&fx.orch.db.local, child)
+            .await
+            .unwrap()
+            .expect("direct landing records its held child's session");
+    assert_eq!(session.ours.as_deref(), Some(before.as_str()));
+    assert_eq!(session.theirs.as_deref(), Some(parent_after.as_str()));
+    assert_eq!(session.target_branch, fx.ctx.source_branch);
+    assert_eq!(session.incoming.base_branch, fx.ctx.source_branch);
+    assert_eq!(session.destination_commit, parent_after);
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn published_held_source_survives_github_failure_and_retry() {
+    published_held_source_retry(false).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn published_team_held_source_uses_only_its_owning_database() {
+    published_held_source_retry(true).await;
+}
+
+async fn published_held_source_retry(team_project: bool) {
+    let bin = jj_bin().expect("real jj required for published held receipt regression");
+    let mut fx = setup_clean_merge(&bin).await;
+    fx.ctx.default_branch = fx.ctx.target_branch.clone();
+    let held_db = if team_project {
+        let db = Arc::new(
+            LocalDb::open(fx._home.path().join("team-landing.db"))
+                .await
+                .unwrap(),
+        );
+        crate::storage::MigrationRunner::new(crate::storage::TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        let project = "teamlanding~00000000-0000-4000-8000-000000000001";
+        let job = "teamlanding~00000000-0000-4000-8000-000000000004";
+        fx.orch
+            .db
+            .register_team_db_for_test("teamlanding".to_string(), db.clone())
+            .await;
+        fx.orch
+            .db
+            .set_route("team-landing", Some("teamlanding".into()))
+            .await;
+        fx.orch.db.local.execute("INSERT INTO teams (id,name,sync_url,replica_path,created_at) VALUES ('teamlanding','Landing team','http://sync','/tmp/team-landing.db',1)",()).await.unwrap();
+        fx.orch.db.local.execute("INSERT INTO project_routes (project_key,team_id,local_repo_path,created_at) VALUES ('team-landing','teamlanding',?1,1)",params![fx.ctx.mr.repo_path.as_str()]).await.unwrap();
+        db.execute("INSERT INTO teams (id,name,created_at,updated_at) VALUES ('teamlanding','Landing team',1,1)",()).await.unwrap();
+        db.execute("INSERT INTO projects (id,team_id,name,key,repo_path,default_branch,created_at,updated_at) VALUES (?1,'teamlanding','Team landing','team-landing','/creator/machine/repository',?2,1,1)",params![project,fx.ctx.target_branch.as_str()]).await.unwrap();
+        let original =
+            crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.source_branch).unwrap();
+        let source = "agent/team-landing-builder";
+        crate::jj::create_bookmark_at(&fx.jj, &fx.store, source, &original).unwrap();
+        let cut = crate::jj::bookmark_commit(&fx.jj, &fx.store, "main").unwrap();
+        db.execute("INSERT INTO jobs (id,project_id,status,branch,base_branch,base_commit,created_at,updated_at) VALUES (?1,?2,'running',?3,?4,?5,1,1)",params![job,project,source,fx.ctx.target_branch.as_str(),cut.as_str()]).await.unwrap();
+        fx.ctx.project_id = project.to_string();
+        fx.ctx.mr.project_id = project.to_string();
+        fx.ctx.mr.job_id = job.to_string();
+        fx.ctx.source_branch = source.to_string();
+        db
+    } else {
+        fx.orch.db.local.clone()
+    };
+    let source = fx.ctx.source_branch.as_str();
+    let cut = crate::jj::bookmark_commit(&fx.jj, &fx.store, "main").unwrap();
+    let before = crate::jj::bookmark_commit(&fx.jj, &fx.store, source).unwrap();
+    let coord = fx._wts.path().join("coord");
+    std::fs::write(coord.join("later.txt"), "advanced parent\n").unwrap();
+    crate::jj::seal(&fx.jj, &coord, "advance parent after hold", None).unwrap();
+    crate::jj::push_store_bookmark(&fx.jj, &fx.store, &fx.ctx.target_branch).unwrap();
+    let destination = crate::jj::bookmark_commit(&fx.jj, &fx.store, &fx.ctx.target_branch).unwrap();
+    held_db.execute("INSERT INTO jj_reconcile_intents (id,project_id,store_path,target_branch,destination_commit,status,created_at,updated_at) VALUES ('held-published',?4,?1,?2,?3,'completed',1,1)",
+        params![fx.store.to_string_lossy().as_ref(),fx.ctx.target_branch.as_str(),destination.as_str(),fx.ctx.project_id.as_str()]).await.unwrap();
+    held_db.execute("INSERT INTO jj_reconcile_items (intent_id,bookmark,status,updated_at,held_replay_source_cut,held_replay_source_tip) VALUES ('held-published',?1,'completed',1,?2,?3)",
+        params![source,cut.as_str(),before.as_str()]).await.unwrap();
+    let receipt =
+        crate::orchestrator::base_advance::held_replay_source(&held_db, &fx.store, source)
+            .await
+            .unwrap();
+    if team_project {
+        assert!(crate::orchestrator::base_advance::held_replay_source(
+            &fx.orch.db.local,
+            &fx.store,
+            source
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+    prospective_default_landing(&fx.orch, &fx.ctx, "squash")
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::orchestrator::base_advance::held_replay_source(&held_db, &fx.store, source)
+            .await
+            .unwrap(),
+        receipt,
+        "prospective landing preserves exact receipt values"
+    );
+    let failure = super::super::default_landing::land_on_default(
+        &fx.orch,
+        &fx.ctx.mr.job_id,
+        &fx.ctx,
+        "squash",
+        true,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        failure.contains("GitHub merge requires a PR number"),
+        "{failure}"
+    );
+    let published = git_stdout(&fx.origin_path, &["rev-parse", source]);
+    assert_ne!(
+        published, before,
+        "the bound rewrite was actually published before GitHub refused"
+    );
+    assert!(crate::jj::revset_descends_from(
+        &fx.jj,
+        &fx.store,
+        &published,
+        &destination
+    ));
+    assert!(
+        crate::orchestrator::base_advance::held_replay_source(&held_db, &fx.store, source)
+            .await
+            .unwrap()
+            .is_none(),
+        "publication consumes the owning database's exact generation before the fallible request"
+    );
+    if team_project {
+        assert!(crate::orchestrator::base_advance::held_replay_source(
+            &fx.orch.db.local,
+            &fx.store,
+            source
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+    let retry = super::super::default_landing::land_on_default(
+        &fx.orch,
+        &fx.ctx.mr.job_id,
+        &fx.ctx,
+        "squash",
+        true,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        retry.contains("GitHub merge requires a PR number"),
+        "retry reaches GitHub rather than stale held ancestry: {retry}"
+    );
+}

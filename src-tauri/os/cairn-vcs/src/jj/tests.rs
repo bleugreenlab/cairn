@@ -156,6 +156,19 @@ fn logical_tree_hash_uses_jj_backend_for_agent_only_revision() {
     );
 }
 
+#[test]
+#[serial_test::serial(jj)]
+fn clean_tree_admission_refuses_native_conflicts_before_work_starts() {
+    let bin = jj_bin().expect("real jj required for clean tree admission regression");
+    let fx = setup_conflicting_advance(&bin);
+    require_clean_tree(&fx.jj, &fx.store, fx.branch, "Starting work").unwrap();
+    rebase_recording_conflict(&fx.jj, &fx.store, fx.branch, "main");
+    assert!(branch_has_conflict(&fx.jj, &fx.store, fx.branch).unwrap());
+    let tip = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
+    let error = require_clean_tree(&fx.jj, &fx.store, fx.branch, "Starting work").unwrap_err();
+    assert!(error.contains(&tip) && error.contains(fx.branch), "{error}");
+}
+
 /// A sanctioned replay must distinguish the original same-hunk conflict from a
 /// later tip commit that deliberately resolves it. The replay reapplies the
 /// lineage, restores the committed resolution only for the session's conflicting
@@ -393,6 +406,7 @@ fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
             branch,
             "main",
             Some(&ResolutionCarry::from_tip(&tip, &paths)),
+            &RebaseOptions::default(),
         )
         .unwrap(),
         RebaseOutcome::RebasedOverConflictedAncestry { .. }
@@ -460,13 +474,30 @@ fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
 /// cairn/5326's integration-branch shape: a coordinator branch with a child PR
 /// folded into it and a later commit of its own. A take-committed-tip replay of
 /// the coordinator leaves the hub's first commit, the child's landing, and the
-/// later commit conflict-flagged. The reconcile heals them in place: the
+/// later commit conflict-flagged during replay. The replay heals them atomically
+/// before exporting folded landmarks: the
 /// child's landing is still a commit of its own, still the child bookmark's
 /// target, and still changes only the child's file. The coordinator is never
 /// collapsed.
 #[test]
 #[serial_test::serial(jj)]
 fn a_coordinator_with_a_folded_child_is_healed_without_collapsing_it() {
+    folded_coordinator_replay(false, false);
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn folded_landmark_heal_holds_only_the_child_with_its_own_conflict() {
+    folded_coordinator_replay(true, false);
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn refused_folded_landmark_heal_restores_the_entire_replay() {
+    folded_coordinator_replay(true, true);
+}
+
+fn folded_coordinator_replay(with_conflicting_child: bool, refuse_heal: bool) {
     let Some(bin) = jj_bin() else {
         eprintln!("skipping a_coordinator_with_a_folded_child_is_healed_without_collapsing_it: jj not resolvable");
         return;
@@ -501,6 +532,17 @@ fn a_coordinator_with_a_folded_child_is_healed_without_collapsing_it() {
     std::fs::write(ws_pending.join("pending.rs"), "pending work\n").unwrap();
     seal(&jj, &ws_pending, "pending child work", None).unwrap();
     forget_workspace(&jj, &store, pending).unwrap();
+    let independent = "agent/independent-conflict";
+    let independent_before = if with_conflicting_child {
+        let workspace = wts.path().join("independent");
+        add_workspace(&jj, &store, &workspace, independent, int, None).unwrap();
+        std::fs::write(workspace.join("shared.rs"), "INDEPENDENT-SIDE\n").unwrap();
+        seal(&jj, &workspace, "independent child edits shared", None).unwrap();
+        forget_workspace(&jj, &store, independent).unwrap();
+        Some(bookmark_commit(&jj, &store, independent).unwrap())
+    } else {
+        None
+    };
     store_commit_on(
         &jj,
         &store,
@@ -526,22 +568,109 @@ fn a_coordinator_with_a_folded_child_is_healed_without_collapsing_it() {
         "coordinator takes main's wording",
     );
     let tip = bookmark_commit(&jj, &store, int).unwrap();
-    assert!(matches!(
-        rebase_branch_onto_with_resolution(
-            &jj,
-            &store,
-            int,
-            "main",
-            Some(&ResolutionCarry::from_tip(&tip, &paths)),
-        )
-        .unwrap(),
-        RebaseOutcome::RebasedOverConflictedAncestry { .. }
-    ));
+    // store_commit_on models a native-only edit; synchronize this fixture's
+    // starting export before demanding bit-identical Git refs after rollback.
+    export_selected_bookmarks(&jj, &store, &[(int, tip.as_str())]).unwrap();
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{int}")]),
+        tip
+    );
+    let before = crate::read_local_bookmark_view(&store).unwrap();
+    let git_before = git_stdout(
+        proj.path(),
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+        ],
+    );
+    if refuse_heal {
+        let (fault_jj, fault_store) = (jj.clone(), store.clone());
+        at_step("ancestry heal: before final proof", move || {
+            store_commit_on(
+                &fault_jj,
+                &fault_store,
+                int,
+                "proof-fault.txt",
+                "unexpected content\n",
+                "inject non-exact heal",
+            );
+        });
+    }
+    let result = rebase_branch_onto_with_resolution(
+        &jj,
+        &store,
+        int,
+        "main",
+        Some(&ResolutionCarry::from_tip(&tip, &paths)),
+        &RebaseOptions::default(),
+    );
+    if refuse_heal {
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("does not hold the tree of its pre-heal tip"),
+            "{error}"
+        );
+        assert!(error.contains("rolled back to operation"), "{error}");
+        assert_eq!(
+            crate::read_local_bookmark_view(&store).unwrap().bookmarks,
+            before.bookmarks
+        );
+        assert_eq!(
+            git_stdout(
+                proj.path(),
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads"
+                ]
+            ),
+            git_before
+        );
+        for name in [int, child, pending, independent] {
+            require_clean_tree(&jj, &store, name, "refused folded-heal rollback").unwrap();
+        }
+        return;
+    }
+    let RebaseOutcome::Rebased { held_descendants } = result.unwrap() else {
+        panic!("folded landmarks must heal before export")
+    };
+    if let Some(original) = independent_before.as_ref() {
+        assert_eq!(
+            held_descendants
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![independent]
+        );
+        assert_eq!(held_descendants[independent].ours.as_ref(), Some(original));
+        assert_eq!(
+            bookmark_commit(&jj, &store, independent).as_ref(),
+            Some(original)
+        );
+        assert!(!branch_has_conflict(&jj, &store, independent).unwrap());
+        assert_eq!(
+            git_stdout(
+                proj.path(),
+                &["rev-parse", &format!("refs/heads/{independent}")]
+            ),
+            *original
+        );
+        let change = change_id_of(&jj, &store, independent);
+        assert_eq!(
+            visible_commit_ids_for_change(&jj, &store, &change),
+            vec![original.clone()]
+        );
+    } else {
+        assert!(held_descendants.is_empty());
+    }
+    assert!(!branch_has_conflict(&jj, &store, child).unwrap());
+    assert!(!branch_has_conflict(&jj, &store, pending).unwrap());
     let dest = bookmark_commit(&jj, &store, "main").unwrap();
     let range = format!("{dest}..bookmarks(exact:{int:?})");
     assert!(
-        conflicted_commits(&jj, &store, &range).len() >= 3,
-        "precondition: the hub, the child's landing, and the later commit are all flagged"
+        conflicted_commits(&jj, &store, &range).is_empty(),
+        "folded landmarks heal atomically before any rewritten bookmark is exported"
     );
 
     let report =
@@ -595,16 +724,228 @@ fn a_coordinator_with_a_folded_child_is_healed_without_collapsing_it() {
     assert_eq!(commit_summary(&jj, &store, &pending_tip), "A pending.rs");
 }
 
-/// A descendant whose conflict is its OWN — a child that edited the very path
-/// the coordinator's replay conflicts on — cannot be cleared by healing the
-/// coordinator. Publishing would export that child as conflict scaffolding, so
-/// the heal refuses and the whole replay rolls back: the coordinator returns to
-/// the resolution its agent committed, and the child to where it was.
+/// A clean coordinator replay can still conflict on a child's own edits.
 #[test]
 #[serial_test::serial(jj)]
-fn a_heal_that_would_leave_a_child_bookmark_conflicted_rolls_the_replay_back() {
+fn clean_parent_replay_keeps_conflicting_child_at_its_clean_tip() {
+    let bin = jj_bin().expect("real jj required for descendant replay regression");
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let parent = "agent/parent";
+    let parent_ws = wts.path().join("parent");
+    add_workspace(&jj, &store, &parent_ws, parent, "main", None).unwrap();
+    std::fs::write(parent_ws.join("parent.txt"), "parent work\n").unwrap();
+    seal(&jj, &parent_ws, "parent work", None).unwrap();
+    forget_workspace(&jj, &store, parent).unwrap();
+    let parent_before = bookmark_commit(&jj, &store, parent).unwrap();
+
+    let child = "agent/child";
+    let child_ws = wts.path().join("child");
+    add_workspace(&jj, &store, &child_ws, child, parent, None).unwrap();
+    std::fs::write(child_ws.join("shared.rs"), "CHILD-SIDE\n").unwrap();
+    seal(&jj, &child_ws, "child changes shared", None).unwrap();
+    forget_workspace(&jj, &store, child).unwrap();
+    let child_before = bookmark_commit(&jj, &store, child).unwrap();
+    let grandchild = "agent/grandchild";
+    let grandchild_ws = wts.path().join("grandchild");
+    add_workspace(&jj, &store, &grandchild_ws, grandchild, child, None).unwrap();
+    std::fs::write(grandchild_ws.join("grandchild.txt"), "grandchild work\n").unwrap();
+    seal(&jj, &grandchild_ws, "grandchild work", None).unwrap();
+    forget_workspace(&jj, &store, grandchild).unwrap();
+    let grandchild_before = bookmark_commit(&jj, &store, grandchild).unwrap();
+
+    let clean = "agent/clean-child";
+    let clean_ws = wts.path().join("clean-child");
+    add_workspace(&jj, &store, &clean_ws, clean, parent, None).unwrap();
+    std::fs::write(clean_ws.join("clean.txt"), "clean child work\n").unwrap();
+    seal(&jj, &clean_ws, "clean child work", None).unwrap();
+    forget_workspace(&jj, &store, clean).unwrap();
+    let clean_before = bookmark_commit(&jj, &store, clean).unwrap();
+
+    let unrelated = "agent/unrelated";
+    let unrelated_ws = wts.path().join("unrelated");
+    add_workspace(&jj, &store, &unrelated_ws, unrelated, "main", None).unwrap();
+    std::fs::write(unrelated_ws.join("shared.rs"), "UNRELATED-SIDE\n").unwrap();
+    seal(&jj, &unrelated_ws, "unrelated work", None).unwrap();
+    forget_workspace(&jj, &store, unrelated).unwrap();
+    let unrelated_git_before = git_stdout(
+        proj.path(),
+        &["rev-parse", &format!("refs/heads/{unrelated}")],
+    );
+
+    advance_main_shared(&jj, &store, wts.path(), "MAIN-SIDE\n");
+    rebase_recording_conflict(&jj, &store, unrelated, "main");
+    let unrelated_flagged = bookmark_commit(&jj, &store, unrelated).unwrap();
+    assert!(branch_has_conflict(&jj, &store, unrelated).unwrap());
+    let outcome = rebase_branch_onto(&jj, &store, parent, "main").unwrap();
+    assert!(
+        !matches!(outcome, RebaseOutcome::Conflicted { .. }),
+        "{outcome:?}"
+    );
+    assert_ne!(bookmark_commit(&jj, &store, parent).unwrap(), parent_before);
+    assert_eq!(
+        bookmark_commit(&jj, &store, child).as_deref(),
+        Some(child_before.as_str()),
+        "a child's own conflict must not block its clean parent or move the child onto scaffolding"
+    );
+    assert!(!branch_has_conflict(&jj, &store, child).unwrap());
+    assert_eq!(
+        bookmark_commit(&jj, &store, grandchild).as_deref(),
+        Some(grandchild_before.as_str())
+    );
+    let parent_after = bookmark_commit(&jj, &store, parent).unwrap();
+    assert_ne!(bookmark_commit(&jj, &store, clean).unwrap(), clean_before);
+    assert!(branch_descends_from(&jj, &store, clean, &parent_after));
+    assert_eq!(
+        bookmark_commit(&jj, &store, unrelated).as_deref(),
+        Some(unrelated_flagged.as_str())
+    );
+    assert_eq!(
+        git_stdout(
+            proj.path(),
+            &["rev-parse", &format!("refs/heads/{unrelated}")]
+        ),
+        unrelated_git_before,
+        "a parent replay must not export an unrelated legacy flagged bookmark"
+    );
+    let RebaseOutcome::Rebased { held_descendants } = outcome else {
+        panic!("the parent itself must be entirely clean");
+    };
+    assert_eq!(held_descendants.len(), 2);
+    for (name, original) in [(child, &child_before), (grandchild, &grandchild_before)] {
+        let diagnostic = &held_descendants[name];
+        assert_eq!(diagnostic.ours.as_deref(), Some(original.as_str()));
+        assert_eq!(diagnostic.theirs.as_deref(), Some(parent_after.as_str()));
+        assert_eq!(diagnostic.conflicting_paths(), vec!["shared.rs"]);
+        assert!(root_conflict_scaffolding(Some(&jj), proj.path(), original)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{name}")]),
+            *original,
+            "the backing Git ref also stays at the original clean commit"
+        );
+    }
+    for (name, original) in [(child, &child_before), (grandchild, &grandchild_before)] {
+        let change = change_id_of(&jj, &store, name);
+        assert_eq!(
+            visible_commit_ids_for_change(&jj, &store, &change),
+            vec![original.clone()]
+        );
+        let rejected = held_descendants[name].conflicted_tip.as_ref().unwrap();
+        let before_cleanup = operation_id(&jj, &store).unwrap();
+        assert_eq!(
+            super::merge::hide_superseded_history(&jj, &store, rejected, &parent_after).unwrap(),
+            0
+        );
+        assert_eq!(
+            operation_id(&jj, &store).unwrap(),
+            before_cleanup,
+            "already-hidden diagnostics need no abandon operation"
+        );
+        assert!(
+            revset_has_conflict(&jj, &store, rejected).unwrap(),
+            "hidden diagnostic objects remain readable"
+        );
+        assert!(jj
+            .run(
+                &store,
+                &[
+                    "log",
+                    "-r",
+                    &format!("{rejected} & ::visible_heads()"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "--ignore-working-copy"
+                ],
+                "verify diagnostic is hidden from actual heads",
+            )
+            .unwrap()
+            .trim()
+            .is_empty());
+    }
+    for round in 0..2 {
+        store_commit_on(
+            &jj,
+            &store,
+            "main",
+            &format!("advance-{round}.txt"),
+            "advance\n",
+            "advance base again",
+        );
+        let RebaseOutcome::Rebased {
+            held_descendants: again,
+        } = rebase_branch_onto(&jj, &store, parent, "main").unwrap()
+        else {
+            panic!("a repeated clean parent advance must still proceed");
+        };
+        assert!(
+            again.is_empty(),
+            "held branches stay on their original lineage until their own replay"
+        );
+        for (name, original) in [(child, &child_before), (grandchild, &grandchild_before)] {
+            assert_eq!(bookmark_commit(&jj, &store, name).as_ref(), Some(original));
+            let change = change_id_of(&jj, &store, name);
+            assert_eq!(
+                visible_commit_ids_for_change(&jj, &store, &change),
+                vec![original.clone()],
+                "rejected versions must not accumulate"
+            );
+        }
+    }
+    let report =
+        reconcile_siblings_without_publication(&jj, &store, parent, &[child.to_string()]).unwrap();
+    assert_eq!(report.conflicted, vec![child.to_string()]);
+    assert!(report.conflict_diagnostics.contains_key(child));
+
+    let rejected = held_descendants[child].conflicted_tip.as_ref().unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            "agent/diagnostic-anchor",
+            "-r",
+            rejected,
+            "--ignore-working-copy",
+        ],
+        "anchor rejected diagnostic",
+    )
+    .unwrap();
+    let error = super::merge::retire_rejected_replays(
+        &jj,
+        &store,
+        std::slice::from_ref(rejected),
+        &parent_after,
+    )
+    .unwrap_err();
+    assert!(error.contains("remain anchored"), "{error}");
+    assert_eq!(
+        bookmark_commit(&jj, &store, "agent/diagnostic-anchor").as_ref(),
+        Some(rejected)
+    );
+    assert!(revset_has_conflict(&jj, &store, rejected).unwrap());
+    assert_eq!(
+        bookmark_commit(&jj, &store, child).as_ref(),
+        Some(&child_before)
+    );
+}
+
+/// A child's own conflict is not the coordinator's to heal. Holding that child
+/// at its exact clean tip lets the coordinator carry its resolution onto the
+/// advanced base and heal its own ancestry without publishing child scaffolding.
+#[test]
+#[serial_test::serial(jj)]
+fn resolved_parent_heal_keeps_conflicting_child_at_its_clean_tip() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping a_heal_that_would_leave_a_child_bookmark_conflicted_rolls_the_replay_back: jj not resolvable");
+        eprintln!("skipping resolved_parent_heal_keeps_conflicting_child_at_its_clean_tip: jj not resolvable");
         return;
     };
     let home = TempDir::new().unwrap();
@@ -655,19 +996,58 @@ fn a_heal_that_would_leave_a_child_bookmark_conflicted_rolls_the_replay_back() {
         &ResolutionCarry::from_tip(&tip, &paths),
     )
     .unwrap();
-    assert_eq!(report.conflicted, vec![int.to_string()], "{report:?}");
-    assert!(report.rebased_clean.is_empty(), "{report:?}");
+    assert_eq!(report.conflicted, vec![child.to_string()], "{report:?}");
+    assert_eq!(report.rebased_clean, vec![int.to_string()], "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    let parent_after = bookmark_commit(&jj, &store, int).unwrap();
+    assert_ne!(
+        parent_after, tip,
+        "the coordinator advances onto the new base"
+    );
+    assert!(
+        super::heal::same_tree(&jj, &store, &tip, &parent_after).unwrap(),
+        "healing preserves the coordinator's complete committed resolution"
+    );
+    let main_tip = bookmark_commit(&jj, &store, "main").unwrap();
+    assert!(revset_descends_from(&jj, &store, &parent_after, &main_tip));
+    assert!(
+        !revset_has_conflict(&jj, &store, &format!("{main_tip}..{parent_after}")).unwrap(),
+        "the parent has no conflict-bearing owned ancestry"
+    );
+    require_clean_tree(&jj, &store, &parent_after, "healed parent").unwrap();
     assert_eq!(
-        bookmark_commit(&jj, &store, int).as_deref(),
-        Some(tip.as_str()),
-        "the coordinator is back on the resolution its agent committed"
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{int}")]),
+        parent_after
     );
     assert_eq!(
         bookmark_commit(&jj, &store, child).as_deref(),
         Some(child_before.as_str()),
-        "and the child is back where it was, not published conflicted"
+        "the child is back where it was, not published conflicted"
     );
     assert!(!branch_has_conflict(&jj, &store, child).unwrap());
+    require_clean_tree(&jj, &store, &child_before, "held child").unwrap();
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{child}")]),
+        child_before
+    );
+    let diagnostic = &report.conflict_diagnostics[child];
+    assert_eq!(diagnostic.ours.as_deref(), Some(child_before.as_str()));
+    assert!(
+        super::heal::same_tree(
+            &jj,
+            &store,
+            diagnostic.theirs.as_deref().unwrap(),
+            &parent_after
+        )
+        .unwrap(),
+        "the child's immutable incoming side holds the healed parent's content"
+    );
+    let child_change = change_id_of(&jj, &store, child);
+    assert_eq!(
+        visible_commit_ids_for_change(&jj, &store, &child_change),
+        vec![child_before],
+        "the held child's conflicting rewrite is not left as a competing version"
+    );
 }
 
 /// A child built on a hub's conflict-flagged commit that carries its OWN
@@ -796,10 +1176,21 @@ fn a_replay_carrying_a_text_resolution_leaves_no_twin_of_the_superseded_branch()
             CarriedContent::Text("RESOLVED\n".to_string()),
         )],
     };
-    let outcome =
-        rebase_branch_onto_with_resolution(&fx.jj, &fx.store, fx.branch, "main", Some(&carry))
-            .unwrap();
-    assert_eq!(outcome, RebaseOutcome::Rebased);
+    let outcome = rebase_branch_onto_with_resolution(
+        &fx.jj,
+        &fx.store,
+        fx.branch,
+        "main",
+        Some(&carry),
+        &RebaseOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        RebaseOutcome::Rebased {
+            held_descendants: Default::default()
+        }
+    );
     assert_eq!(
         String::from_utf8_lossy(&file_show(&fx.jj, &fx.store, fx.branch, "shared.rs").unwrap()),
         "RESOLVED\n"
@@ -4979,6 +5370,16 @@ fn lost_packed_refs_locks_classify_as_infrastructure_never_permanent() {
 #[test]
 #[serial_test::serial(jj)]
 fn reconcile_siblings_heals_intermediate_only_sibling() {
+    reconcile_intermediate_with_held_child(false);
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn already_current_ancestry_heal_preserves_a_held_clean_childs_exact_cut() {
+    reconcile_intermediate_with_held_child(true);
+}
+
+fn reconcile_intermediate_with_held_child(preserve_child: bool) {
     let Some(bin) = jj_bin() else {
         eprintln!("skipping reconcile_siblings_heals_intermediate_only_sibling: jj not resolvable");
         return;
@@ -5042,9 +5443,37 @@ fn reconcile_siblings_heals_intermediate_only_sibling() {
         FlattenState::IntermediateOnly
     );
 
-    // The reconcile heals the sibling (already-on-dest path), classifies it
-    // clean, and pushes the healed tip to origin.
-    let report = reconcile_siblings(&jj, &store, int, &[sibling.to_string()]).unwrap();
+    let held_cut = bookmark_commit(&jj, &store, sibling).unwrap();
+    let held_branch = "agent/held-behind-heal";
+    let held_before = if preserve_child {
+        let held_ws = wts.path().join("held-behind-heal");
+        add_workspace(&jj, &store, &held_ws, held_branch, sibling, None).unwrap();
+        std::fs::write(held_ws.join("own.txt"), "held own work\n").unwrap();
+        seal(&jj, &held_ws, "held own work", None).unwrap();
+        let tip = bookmark_commit(&jj, &store, held_branch).unwrap();
+        forget_workspace(&jj, &store, held_branch).unwrap();
+        Some(tip)
+    } else {
+        None
+    };
+    // The branch already carries the destination: this exercises direct heal,
+    // not the rebase wrapper's preservation stage.
+    let report = reconcile_siblings_with_options(
+        &jj,
+        &store,
+        int,
+        &[sibling.to_string()],
+        &ReconcileOptions {
+            publish: true,
+            preserve_bookmarks: if preserve_child {
+                [held_branch.to_string()].into_iter().collect()
+            } else {
+                Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(report.rebased_clean, vec![sibling.to_string()]);
     assert!(report.conflicted.is_empty());
 
@@ -5077,6 +5506,23 @@ fn reconcile_siblings_heals_intermediate_only_sibling() {
         .is_ok(),
         "the healed sibling is pushable"
     );
+    if let Some(held_before) = held_before {
+        assert_eq!(
+            bookmark_commit(&jj, &store, held_branch).as_deref(),
+            Some(held_before.as_str()),
+            "direct heal cannot consume the child's durable source boundary"
+        );
+        rebase_branch_onto_from_cut(&jj, &store, held_branch, sibling, &held_cut).unwrap();
+        assert!(revset_descends_from(&jj, &store, held_branch, sibling));
+        assert_eq!(
+            file_show(&jj, &store, held_branch, "own.txt").unwrap(),
+            b"held own work\n"
+        );
+        assert_eq!(
+            file_show(&jj, &store, held_branch, "shared.rs").unwrap(),
+            b"resolved\n"
+        );
+    }
 }
 
 /// Component C: a sibling bookmark riding a conflicted INTERMEDIATE commit
@@ -9778,7 +10224,9 @@ fn a_clean_rebase_names_the_files_both_sides_changed() {
 
     assert_eq!(
         rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased,
+        RebaseOutcome::Rebased {
+            held_descendants: Default::default()
+        },
         "edits at opposite ends of one file merge with no conflict recorded"
     );
     let post_tip = bookmark_commit(&jj, &store, branch).unwrap();
@@ -10550,7 +10998,7 @@ fn a_clean_tip_over_conflicted_history_is_never_folded() {
 
     let outcome = rebase_branch_onto(&jj, &store, branch, "main").unwrap();
     match &outcome {
-        RebaseOutcome::RebasedOverConflictedAncestry { paths } => {
+        RebaseOutcome::RebasedOverConflictedAncestry { paths, .. } => {
             assert!(
                 paths.contains(&"shared.rs".to_string()),
                 "the conflicted ancestry names its file: {paths:?}"
@@ -10585,7 +11033,9 @@ fn a_clean_tip_over_conflicted_history_is_never_folded() {
     heal_conflicted_ancestry(&jj, &store, branch, &dest).unwrap();
     assert_eq!(
         rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased,
+        RebaseOutcome::Rebased {
+            held_descendants: Default::default()
+        },
         "the healed branch is genuinely clean"
     );
     rebase_then_fold_into(&jj, &store, "main", branch, "main").unwrap();
@@ -11530,7 +11980,12 @@ fn a_base_advance_rebases_a_branch_whose_origin_copy_was_untracked() {
     let new_base = advance_store_main(&jj, &store);
 
     let outcome = rebase_branch_onto(&jj, &store, branch, "main").unwrap();
-    assert_eq!(outcome, RebaseOutcome::Rebased);
+    assert_eq!(
+        outcome,
+        RebaseOutcome::Rebased {
+            held_descendants: Default::default()
+        }
+    );
     assert!(branch_descends_from(&jj, &store, branch, &new_base));
     assert_eq!(origin_tracking(&jj, &store, branch), Some(true));
 
@@ -12372,7 +12827,7 @@ fn rewrite_published_branch(jj: &JjEnv, store: &Path, workspaces: &Path, branch:
     );
     assert!(matches!(
         rebase_branch_onto(jj, store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased
+        RebaseOutcome::Rebased { .. }
     ));
     bookmark_commit(jj, store, branch).unwrap()
 }
@@ -12547,7 +13002,9 @@ fn a_base_advance_drops_the_formatting_commit_it_empties() {
 
     assert_eq!(
         rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased
+        RebaseOutcome::Rebased {
+            held_descendants: Default::default()
+        }
     );
     let main_tip = bookmark_commit(&jj, &store, "main").unwrap();
     let own = commits_oldest_first(
@@ -13750,4 +14207,122 @@ fn operation_budget_subminimum_classification_restores_successful_rebase() {
         "{summary}"
     );
     assert!(summary.contains("[cleanup; spawn attempted]"), "{summary}");
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn held_cut_replays_owned_range_and_moves_empty_alias() {
+    let bin = jj_bin().expect("real jj required for exact held-cut replay");
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("store");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let old = wts.path().join("old-parent");
+    add_workspace(&jj, &store, &old, "agent/old-parent", "main", None).unwrap();
+    std::fs::write(old.join("parent.txt"), "obsolete parent\n").unwrap();
+    seal(&jj, &old, "old parent work", None).unwrap();
+    let cut = bookmark_commit(&jj, &store, "agent/old-parent").unwrap();
+    forget_workspace(&jj, &store, "agent/old-parent").unwrap();
+    let child = wts.path().join("owned");
+    add_workspace(&jj, &store, &child, "agent/owned", &cut, None).unwrap();
+    std::fs::write(child.join("owned.txt"), "owned work\n").unwrap();
+    seal(&jj, &child, "owned work", None).unwrap();
+    let before = bookmark_commit(&jj, &store, "agent/owned").unwrap();
+    forget_workspace(&jj, &store, "agent/owned").unwrap();
+    create_bookmark_at(&jj, &store, "agent/alias", &cut).unwrap();
+    let held_ws = wts.path().join("held-owned-descendant");
+    add_workspace(&jj, &store, &held_ws, "agent/held-owned", &before, None).unwrap();
+    std::fs::write(held_ws.join("nested.txt"), "nested own work\n").unwrap();
+    seal(&jj, &held_ws, "nested own work", None).unwrap();
+    let held_before = bookmark_commit(&jj, &store, "agent/held-owned").unwrap();
+    forget_workspace(&jj, &store, "agent/held-owned").unwrap();
+    let new = wts.path().join("new-parent");
+    add_workspace(&jj, &store, &new, "agent/new-parent", "main", None).unwrap();
+    std::fs::write(new.join("parent.txt"), "resolved parent\n").unwrap();
+    std::fs::write(new.join("later.txt"), "later parent work\n").unwrap();
+    seal(&jj, &new, "resolved and later parent work", None).unwrap();
+    let destination = bookmark_commit(&jj, &store, "agent/new-parent").unwrap();
+    forget_workspace(&jj, &store, "agent/new-parent").unwrap();
+
+    let invalid =
+        rebase_branch_onto_from_cut(&jj, &store, "agent/owned", &destination, &destination)
+            .unwrap_err();
+    assert!(invalid.contains("not an ancestor"), "{invalid}");
+    assert_eq!(
+        bookmark_commit(&jj, &store, "agent/owned").as_deref(),
+        Some(before.as_str())
+    );
+    let outcome = rebase_branch_onto_with_options(
+        &jj,
+        &store,
+        "agent/owned",
+        &destination,
+        &RebaseOptions {
+            source_cut: Some(cut.clone()),
+            preserve_bookmarks: ["agent/held-owned".to_string()].into_iter().collect(),
+        },
+    )
+    .unwrap();
+    let RebaseOutcome::Rebased { held_descendants } = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(held_descendants["agent/held-owned"]
+        .conflicting_paths()
+        .is_empty());
+    assert_eq!(
+        bookmark_commit(&jj, &store, "agent/held-owned").as_deref(),
+        Some(held_before.as_str()),
+        "a clean implicit rewrite cannot invalidate an outstanding held source cut"
+    );
+    rebase_branch_onto_from_cut(&jj, &store, "agent/held-owned", "agent/owned", &before).unwrap();
+    assert!(revset_descends_from(
+        &jj,
+        &store,
+        "agent/held-owned",
+        "agent/owned"
+    ));
+    assert_eq!(
+        file_show(&jj, &store, "agent/held-owned", "nested.txt").unwrap(),
+        b"nested own work\n"
+    );
+    assert!(
+        matches!(outcome, RebaseOutcome::Rebased { .. }),
+        "{outcome:?}"
+    );
+    assert!(revset_descends_from(
+        &jj,
+        &store,
+        "agent/owned",
+        &destination
+    ));
+    assert_eq!(
+        file_show(&jj, &store, "agent/owned", "parent.txt").unwrap(),
+        b"resolved parent\n"
+    );
+    assert_eq!(
+        file_show(&jj, &store, "agent/owned", "later.txt").unwrap(),
+        b"later parent work\n"
+    );
+    assert_eq!(
+        file_show(&jj, &store, "agent/owned", "owned.txt").unwrap(),
+        b"owned work\n"
+    );
+    let outcome =
+        rebase_branch_onto_from_cut(&jj, &store, "agent/alias", &destination, &cut).unwrap();
+    assert!(
+        matches!(outcome, RebaseOutcome::Rebased { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, "agent/alias").as_deref(),
+        Some(destination.as_str())
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, "agent/old-parent").as_deref(),
+        Some(cut.as_str()),
+        "other anchors are untouched"
+    );
 }

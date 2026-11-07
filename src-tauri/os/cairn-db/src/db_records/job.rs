@@ -329,12 +329,27 @@ mod jobs_base_commit_sql_reach {
     /// - `storage/migrations.rs` — schema lineage and its fixtures.
     /// - `diff.rs` — a test fixture that seeds a deliberately stale record to
     ///   prove the live derivation ignores it.
+    /// - `resources/mutations/dispatch/rebase/acceptance.rs` — compares the
+    ///   captured archival anchor before recording the accepted native rebuild's
+    ///   base; the store, not this column, proves the accepted head and base.
+    ///   Its test module seeds and checks those archival records and observers.
+    /// - `pr_data/actions/store_merge/tests.rs` — team landing fixtures seed
+    ///   the original recorded cut to prove routed receipt consumption.
+    /// - `execution/jobs/lifecycle.rs` — restart fixtures check that a refused
+    ///   resume preserves the previously recorded anchor.
+    /// - `mcp/handlers/run/held.rs` — fixtures seed jobs and held-publication
+    ///   archival bases in one SQL batch; the latter is not a live job coordinate.
     const SANCTIONED_SQL_SITES: &[&str] = &[
         "os/cairn-core/src/diff.rs",
         "os/cairn-core/src/effects/dag/delegation.rs",
         "os/cairn-workflow/src/advancement/job_creation.rs",
         "os/cairn-workflow/src/effects/dag/delegation.rs",
         "os/cairn-core/src/execution/jobs/persistence.rs",
+        "os/cairn-core/src/execution/jobs/lifecycle.rs",
+        "os/cairn-core/src/mcp/handlers/run/held.rs",
+        "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance.rs",
+        "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance/tests.rs",
+        "os/cairn-core/src/pr_data/actions/store_merge/tests.rs",
         "os/cairn-core/src/orchestrator/base_advance.rs",
         "os/cairn-db/src/storage/migrations.rs",
     ];

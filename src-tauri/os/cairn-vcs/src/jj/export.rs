@@ -805,8 +805,8 @@ pub(crate) fn confirm_origin_tip(
 /// The store's git backend records the project's `.git` in `store/git_target`,
 /// and Cairn always inits the store against the project's MAIN checkout, so the
 /// checkout is the worktree that owns that `.git` — its parent directory.
-pub(crate) fn resolve_backing_checkout(export_cwd: &Path) -> Option<PathBuf> {
-    let repo_pointer = export_cwd.join(".jj").join("repo");
+pub fn repository_directory(cwd: &Path) -> Option<PathBuf> {
+    let repo_pointer = cwd.join(".jj").join("repo");
     let store_repo = if repo_pointer.is_dir() {
         repo_pointer
     } else {
@@ -819,6 +819,11 @@ pub(crate) fn resolve_backing_checkout(export_cwd: &Path) -> Option<PathBuf> {
         }
     };
 
+    std::fs::canonicalize(store_repo).ok()
+}
+
+pub(crate) fn resolve_backing_checkout(export_cwd: &Path) -> Option<PathBuf> {
+    let store_repo = repository_directory(export_cwd)?;
     let git_target_file = store_repo.join("store").join("git_target");
     let raw = std::fs::read_to_string(&git_target_file).ok()?;
     let git_dir = PathBuf::from(raw.trim());
@@ -1173,3 +1178,121 @@ mod operation_budget_tests {
         }
     }
 }
+
+fn export_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
+}
+
+/// Export exactly the clean bookmarks whose immutable tips the caller observed.
+/// The caller holds the store lock and commits native authority before calling;
+/// this never moves native bookmarks or rewinds a historical operation.
+pub fn export_selected_bookmarks(
+    jj: &JjEnv,
+    store: &Path,
+    expectations: &[(&str, &str)],
+) -> Result<(), String> {
+    futures::executor::block_on(export_selected_bookmarks_inner(jj, store, expectations))
+}
+
+pub(crate) async fn export_selected_bookmarks_inner(
+    jj: &JjEnv,
+    store: &Path,
+    expectations: &[(&str, &str)],
+) -> Result<(), String> {
+    use jj_lib::backend::CommitId;
+    use jj_lib::object_id::ObjectId as _;
+    use jj_lib::ref_name::RefName;
+    use jj_lib::repo::Repo as _;
+    let repo = crate::load_repo_at_head(store)
+        .await
+        .map_err(|e| e.to_string())?;
+    for (name, tip) in expectations {
+        let id = CommitId::try_from_hex(tip)
+            .filter(|id| id.hex() == *tip)
+            .ok_or_else(|| format!("invalid immutable export tip: {tip}"))?;
+        if repo
+            .view()
+            .get_local_bookmark(RefName::new(name))
+            .as_normal()
+            != Some(&id)
+        {
+            return Err(format!(
+                "scoped export refused: native bookmark `{name}` no longer names {tip}"
+            ));
+        }
+        let commit = repo.store().get_commit(&id).map_err(|e| e.to_string())?;
+        crate::require_clean_logical_tree(&commit.tree(), &format!("export target `{name}`"))
+            .await?;
+    }
+    let git_repo = jj_lib::git::get_git_repo(repo.store()).map_err(|e| e.to_string())?;
+    let checkout = resolve_backing_checkout(store);
+    let git = ScopedGit(jj);
+    let before = checkout
+        .as_deref()
+        .and_then(|path| snapshot_checkout_head(&git, path));
+    let mut tx = repo.start_transaction();
+    let export = super::packed_refs::with_packed_refs_patience_for(
+        jj,
+        PackedRefs::JjStore(store),
+        "scoped git export",
+        || {
+            let stats = jj_lib::git::export_some_refs(tx.repo_mut(), |kind, symbol| {
+                matches!(kind, jj_lib::git::GitRefKind::Bookmark)
+                    && symbol.remote == jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                    && expectations
+                        .iter()
+                        .any(|(name, _)| *name == symbol.name.as_str())
+            })
+            .map_err(|error| export_error_chain(&error))?;
+            if stats.failed_bookmarks.is_empty() {
+                Ok(())
+            } else {
+                // FailedToSet/FailedToDelete retain the typed source chain.
+                // Debug output loses the displayed packed-ref lock diagnosis
+                // that the canonical retry policy and classifier both consume.
+                Err(stats
+                    .failed_bookmarks
+                    .iter()
+                    .map(|(symbol, reason)| {
+                        format!("{}: {}", symbol.name.as_str(), export_error_chain(reason))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+        },
+    );
+    if let (Some(path), Some(before)) = (checkout.as_deref(), before.as_ref()) {
+        repair_export_detach(&git, path, before, jj.checkout_repair_policy);
+    }
+    // Even a partial export records exactly the refs it did move.
+    tx.commit("export selected clean bookmarks".to_string())
+        .await
+        .map_err(|e| format!("scoped export bookkeeping failed: {e}"))?;
+    export?;
+    for (name, tip) in expectations {
+        let read = jj.command_output(
+            cairn_platform::env::git()
+                .arg("--git-dir")
+                .arg(git_repo.path())
+                .args(["rev-parse", "--verify", &format!("refs/heads/{name}")]),
+            std::time::Duration::from_secs(30),
+            "verify scoped export",
+        )?;
+        if !read.status.success() || String::from_utf8_lossy(&read.stdout).trim() != *tip {
+            return Err(format!(
+                "scoped export verification failed: refs/heads/{name} is not {tip}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod scoped_export_error_tests;

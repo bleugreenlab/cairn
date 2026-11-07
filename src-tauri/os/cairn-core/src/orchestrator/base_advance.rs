@@ -247,6 +247,8 @@ fn structural_prepared_test_hook(store: &Path) {
 }
 
 struct StructuralMergePlan {
+    source_cut: Option<String>,
+    preserve_bookmarks: BTreeSet<String>,
     tip: String,
     destination: String,
     paths: Vec<String>,
@@ -302,6 +304,8 @@ fn prepare_structural_merge(
         }
     }
     Ok(Some(StructuralMergePlan {
+        source_cut: None,
+        preserve_bookmarks: BTreeSet::new(),
         tip: ours.to_string(),
         destination: theirs.to_string(),
         paths,
@@ -353,12 +357,23 @@ fn apply_structural_merge(
                 ));
             }
         }
-        let report = crate::jj::reconcile_resolved_sibling_without_publication(
+        let report = crate::jj::reconcile_siblings_with_options(
             jj,
             store,
             &plan.destination,
-            branch,
-            &crate::jj::ResolutionCarry::from_tip(&committed, &plan.paths),
+            &[branch.to_string()],
+            &crate::jj::ReconcileOptions {
+                resolution: Some((
+                    branch.to_string(),
+                    crate::jj::ResolutionCarry::from_tip(&committed, &plan.paths),
+                )),
+                preserve_bookmarks: plan.preserve_bookmarks.clone(),
+                source_cut: plan
+                    .source_cut
+                    .as_ref()
+                    .map(|cut| (branch.to_string(), cut.clone())),
+                ..Default::default()
+            },
         )?;
         if let Some(failure) = report
             .failed
@@ -409,6 +424,7 @@ fn apply_structural_merge(
     })
 }
 
+#[cfg(test)]
 fn try_structural_merge(
     jj: &crate::jj::JjEnv,
     store: &Path,
@@ -435,16 +451,45 @@ pub(crate) fn replay_for_landing(
     branch: &str,
     target: &str,
     target_name: &str,
-) -> Result<(), String> {
-    let diagnostic = match crate::jj::rebase_branch_onto(jj, store, branch, target)? {
-        crate::jj::RebaseOutcome::Rebased
-        | crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { .. } => return Ok(()),
+    source_cut: Option<&str>,
+    preserve_bookmarks: &BTreeSet<String>,
+) -> Result<BTreeMap<String, crate::jj::ConflictDiagnostic>, String> {
+    let outcome = crate::jj::rebase_branch_onto_with_options(
+        jj,
+        store,
+        branch,
+        target,
+        &crate::jj::RebaseOptions {
+            source_cut: source_cut
+                .filter(|_| !crate::jj::revset_descends_from(jj, store, branch, target))
+                .map(str::to_string),
+            preserve_bookmarks: preserve_bookmarks.clone(),
+        },
+    )?;
+    let diagnostic = match outcome {
+        crate::jj::RebaseOutcome::Rebased { held_descendants }
+        | crate::jj::RebaseOutcome::RebasedOverConflictedAncestry {
+            held_descendants, ..
+        } => return Ok(held_descendants),
         crate::jj::RebaseOutcome::Conflicted { diagnostic } => diagnostic,
     };
     let rules = crate::orchestrator::landing::merge_rules_at(jj, store, target);
     let baseline = ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default());
-    match try_structural_merge(jj, store, branch, target, &diagnostic, &baseline, &rules) {
-        Ok(Some(report)) if report.rebased_clean.iter().any(|clean| clean == branch) => Ok(()),
+    let result = match prepare_structural_merge(jj, store, &diagnostic, &baseline, &rules) {
+        Ok(Some(mut plan)) => {
+            plan.source_cut = source_cut.map(str::to_string);
+            plan.preserve_bookmarks = preserve_bookmarks.clone();
+            apply_structural_merge(jj, store, branch, target, &plan)
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(Some(report)) if report.rebased_clean.iter().any(|clean| clean == branch) => Ok(report
+            .conflict_diagnostics
+            .into_iter()
+            .filter(|(name, _)| name != branch)
+            .collect()),
         Ok(_) => Err(crate::jj::base_conflict_refusal(
             target_name,
             branch,
@@ -889,10 +934,8 @@ async fn release_reminted_claim_after_failure(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn refresh_stale_durable_intent(
     db: &LocalDb,
-    repo_path: &str,
     store: &Path,
     target_branch: &str,
     stored_destination: &str,
@@ -935,7 +978,7 @@ async fn refresh_stale_durable_intent(
 
     let reminted = claim_reconcile_intent(
         db,
-        repo_path,
+        &claim.project_id,
         store,
         target_branch,
         current_destination,
@@ -1682,7 +1725,7 @@ pub(crate) async fn notify_downstream_of_base_advance(
     // auto-rebase of in-flight siblings over the shared store. The advance
     // propagates through the commit graph itself; conflicts are recorded (not
     // blocking) and no sibling rebase/force-push is required.
-    let Some(repo_path) = load_project_repo_path(&db, &merged_job.project_id).await? else {
+    let Some(repo_path) = load_project_repo_path(&orch.db, &merged_job.project_id).await? else {
         log::debug!(
             "Skipping base advance reconcile for job {}: no project repo_path",
             merged_job.id
@@ -2063,14 +2106,33 @@ async fn reconcile_jj_downstream(
         .as_deref()
         .filter(|branch| !branch.is_empty() && *branch != base_branch)
     {
-        if let Err(error) = repoint_children_of_merged_branch(
-            db,
-            &merged_job.project_id,
-            merged_branch,
-            base_branch,
-        )
-        .await
-        {
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let _guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "retarget held children after parent landing",
+            )
+            .await;
+        let retarget = match crate::jj::bookmark_commit_checked(&jj, &store, base_branch) {
+            Ok(Some(destination)) => {
+                repoint_children_of_merged_branch(
+                    db,
+                    &merged_job.project_id,
+                    merged_branch,
+                    base_branch,
+                    &store,
+                    &destination,
+                )
+                .await
+            }
+            Ok(None) => Err(format!(
+                "retarget destination `{base_branch}` did not resolve"
+            )),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = retarget {
             log::warn!(
                 "merged job {}: could not re-point work cut from `{merged_branch}` onto \
                  `{base_branch}`: {error}",
@@ -2233,7 +2295,7 @@ pub(crate) async fn reconcile_default_advance(
             );
             error.to_string()
         })?;
-    let Some(repo_path) = load_project_repo_path(&db, project_id).await? else {
+    let Some(repo_path) = load_project_repo_path(&orch.db, project_id).await? else {
         log::debug!("Skipping external advance reconcile: no repo_path for project {project_id}");
         return Ok(());
     };
@@ -2363,7 +2425,7 @@ pub(crate) async fn reconcile_base_branch_advance(
     let db = owning_db_for_project(&orch.db, project_id)
         .await
         .map_err(|error| error.to_string())?;
-    let Some(repo_path) = load_project_repo_path(&db, project_id).await? else {
+    let Some(repo_path) = load_project_repo_path(&orch.db, project_id).await? else {
         return Ok(());
     };
     let repo = Path::new(&repo_path);
@@ -2806,9 +2868,21 @@ async fn execute_durable_reconcile_work(
 ) -> Result<(), String> {
     let project_id = work.claim.project_id.clone();
     let original_intent_id = work.claim.id.clone();
-    let repo_path = load_project_repo_path(db, &project_id)
-        .await?
-        .ok_or_else(|| format!("project {project_id} has no repository path"))?;
+    let (repo_path, _) =
+        crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, &project_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    let repo_path =
+        repo_path.ok_or_else(|| format!("project {project_id} has no local repository path"))?;
+    let effective_store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+    let repository = crate::jj::repository_directory(&effective_store)
+        .ok_or_else(|| format!("project {project_id} local repository did not resolve"))?;
+    if crate::jj::repository_directory(&work.store).as_ref() != Some(&repository) {
+        return Err(format!(
+            "durable reconcile intent {} no longer matches project {project_id}'s local repository",
+            work.claim.id
+        ));
+    }
     let siblings = load_sibling_jobs(db, &project_id, &work.target_branch, EXCLUDE_NONE).await?;
     let specs = siblings
         .iter()
@@ -2869,15 +2943,21 @@ async fn execute_durable_reconcile_work(
         .await?
         .is_some()
         {
-            reopen_reconcile_intent(db, &work.store, &work.target_branch, &pinned_dest, branch)
-                .await?;
+            reopen_reconcile_intent(
+                db,
+                &project_id,
+                &work.store,
+                &work.target_branch,
+                &pinned_dest,
+                branch,
+            )
+            .await?;
         }
     }
     // This is database bookkeeping, not a local-view mutation. The worker
     // revalidates the destination under its mutation guard before acting.
     let Some(claim) = refresh_stale_durable_intent(
         db,
-        &repo_path,
         &work.store,
         &work.target_branch,
         &work.destination_commit,
@@ -3161,34 +3241,24 @@ async fn load_pending_materializations(db: &LocalDb) -> Result<Vec<(String, Stri
 
 async fn claim_reconcile_intent(
     db: &LocalDb,
-    repo_path: &str,
+    project_id: &str,
     store: &Path,
     target_branch: &str,
     destination: &str,
     source: &str,
 ) -> Result<Option<ReconcileClaim>, String> {
-    let repo_path = repo_path.to_string();
+    let project_id = project_id.to_string();
     let store = store.to_string_lossy().into_owned();
     let target_branch = target_branch.to_string();
     let destination = destination.to_string();
     let source = source.to_string();
     db.write(|conn| {
-        let repo_path = repo_path.clone();
+        let project_id = project_id.clone();
         let store = store.clone();
         let target_branch = target_branch.clone();
         let destination = destination.clone();
         let source = source.clone();
         Box::pin(async move {
-            let mut project_rows = conn
-                .query(
-                    "SELECT id FROM projects WHERE repo_path = ?1 LIMIT 1",
-                    (repo_path.as_str(),),
-                )
-                .await?;
-            let Some(project) = project_rows.next().await? else {
-                return Ok(None);
-            };
-            let project_id = project.text(0)?;
             let mut rows = conn
                 .query(
                     "SELECT id, trigger_sources_json, status, lease_expires_at
@@ -3272,6 +3342,586 @@ async fn claim_reconcile_intent(
     })
     .await
     .map_err(|error| format!("claim reconcile intent: {error}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldReplaySource {
+    pub(crate) intent_id: String,
+    pub(crate) destination: String,
+    pub(crate) base_branch: String,
+    pub(crate) cut: Option<String>,
+    pub(crate) tip: String,
+}
+
+/// The outstanding receipt is independent of the session's open/resolved state.
+/// A NULL cut with a recorded tip means held-but-unsafe, never ordinary replay.
+pub(crate) async fn held_replay_source(
+    db: &LocalDb,
+    store: &Path,
+    branch: &str,
+) -> Result<Option<HeldReplaySource>, String> {
+    let path = store.to_string_lossy().into_owned();
+    let branch = branch.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT n.target_branch, i.held_replay_source_cut, i.held_replay_source_tip, n.id, n.destination_commit
+             FROM jj_reconcile_items i JOIN jj_reconcile_intents n ON n.id = i.intent_id
+             WHERE n.store_path = ?1 AND i.bookmark = ?2 AND i.held_replay_source_tip IS NOT NULL",
+                    params![path, branch],
+                )
+                .await?;
+            let mut sources = BTreeSet::new();
+            while let Some(row) = rows.next().await? {
+                sources.insert((row.text(0)?, row.opt_text(1)?, row.text(2)?, row.text(3)?, row.text(4)?));
+            }
+            if sources.len() > 1 {
+                return Err(DbError::Row(
+                    "held replay has competing source receipts".to_string(),
+                ));
+            }
+            Ok(sources
+                .into_iter()
+                .next()
+                .map(|(base_branch, cut, tip, intent_id, destination)| HeldReplaySource {
+                    intent_id,
+                    destination,
+                    base_branch,
+                    cut,
+                    tip,
+                }))
+        })
+    })
+    .await
+    .map_err(|error| format!("read held replay source: {error}"))
+}
+
+/// Snapshot all outstanding branch obligations while holding the writer guard.
+/// Implicit descendant rewrites cannot consume another branch's original cut.
+pub(crate) async fn held_replay_bookmarks(
+    db: &LocalDb,
+    store: &Path,
+) -> Result<BTreeSet<String>, String> {
+    let store = store.to_string_lossy().into_owned();
+    db.read(move |conn| {
+        let store = store.clone();
+        Box::pin(async move {
+            let mut rows = conn.query("SELECT DISTINCT i.bookmark FROM jj_reconcile_items i JOIN jj_reconcile_intents n ON n.id=i.intent_id WHERE n.store_path=?1 AND i.held_replay_source_tip IS NOT NULL", params![store]).await?;
+            let mut names = BTreeSet::new();
+            while let Some(row) = rows.next().await? { names.insert(row.text(0)?); }
+            Ok(names)
+        })
+    }).await.map_err(|error| format!("read outstanding held bookmarks: {error}"))
+}
+
+/// Physical workspace barriers carry a database facade rather than a logical
+/// branch coordinate. Match canonical repository identity, not mutable markers
+/// or a project name guessed from the workspace path.
+pub(crate) async fn held_replay_bookmarks_for_repository(
+    dbs: &crate::db::DbState,
+    worktree: &Path,
+) -> Result<BTreeSet<String>, String> {
+    let repository = crate::jj::repository_directory(worktree)
+        .ok_or_else(|| "cannot identify ancestry-heal repository".to_string())?;
+    let mut held = BTreeSet::new();
+    for db in dbs.all_dbs().await {
+        let stores = db.read(|conn| Box::pin(async move {
+            let mut rows = conn.query("SELECT DISTINCT n.store_path FROM jj_reconcile_intents n JOIN jj_reconcile_items i ON i.intent_id=n.id WHERE i.held_replay_source_tip IS NOT NULL", ()).await?;
+            let mut stores = Vec::new();
+            while let Some(row) = rows.next().await? { stores.push(row.text(0)?); }
+            Ok(stores)
+        })).await.map_err(|error| error.to_string())?;
+        for store in stores {
+            let store = Path::new(&store);
+            if crate::jj::repository_directory(store).as_ref() == Some(&repository) {
+                held.extend(held_replay_bookmarks(&db, store).await?);
+            }
+        }
+    }
+    Ok(held)
+}
+
+pub(crate) async fn held_replay_source_cut(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+    base_branch: &str,
+) -> Result<Option<String>, String> {
+    let Some(source) = held_replay_source(db, store, branch).await? else {
+        return Ok(None);
+    };
+    if source.base_branch != base_branch {
+        return Err(format!("held replay of `{branch}` records immediate parent `{}`, not `{base_branch}`; no replay was attempted", source.base_branch));
+    }
+    let repository = crate::jj::repository_directory(store)
+        .ok_or_else(|| "held replay repository did not resolve".to_string())?;
+    let dbs = orch.db.all_dbs().await;
+    let mut databases = vec![db];
+    databases.extend(
+        dbs.iter()
+            .map(AsRef::as_ref)
+            .filter(|candidate| !std::ptr::eq(*candidate, db)),
+    );
+    for owner_db in databases {
+        if let Some(parent) =
+            crate::orchestrator::conflict_session::load_active_session(owner_db, base_branch)
+                .await?
+        {
+            if crate::jj::repository_directory(Path::new(&parent.store_path)).as_ref()
+                == Some(&repository)
+            {
+                return Err(format!("held replay of `{branch}` waits for immediate parent `{base_branch}` to resolve its session"));
+            }
+        }
+    }
+    let cut = source.cut.ok_or_else(|| format!("held replay of `{branch}` has no proven original source cut; repair its ownership coordinates before replaying"))?;
+    // A bound landing may already have replayed inside its still-speculative
+    // transaction. No further replay is needed, but only its accepting caller
+    // may consume the durable receipt.
+    if crate::jj::revset_descends_from(jj, store, branch, base_branch) {
+        return Ok(Some(cut));
+    }
+    if !crate::jj::revset_descends_from(jj, store, branch, &source.tip)
+        || !crate::jj::revset_descends_from(jj, store, &source.tip, &cut)
+    {
+        return Err(format!("held replay of `{branch}` no longer descends from its recorded tip and source cut; no replay was attempted"));
+    }
+    Ok(Some(cut))
+}
+
+/// Successful accepted replay is the only consumer. Preview rollback and a
+/// no-op on the unchanged original parent leave the receipt outstanding.
+pub(crate) async fn clear_held_replay_source(
+    db: &LocalDb,
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+    destination: &str,
+    accepted_head: &str,
+    expected: Option<&HeldReplaySource>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let Some(cut) = expected.cut.as_deref() else {
+        return Ok(());
+    };
+    if cut == destination {
+        return Ok(());
+    }
+    if !crate::jj::revset_descends_from(jj, store, accepted_head, destination) {
+        return Err(format!("cannot consume held replay of `{branch}`: accepted head does not carry its destination"));
+    }
+    // The caller retains the writer guard from capture through acceptance. The
+    // immutable tuple is also a compare-and-swap fence against another receipt
+    // generation; installing an obligation never makes an older one consumable.
+    let (store, branch, expected) = (store.to_path_buf(), branch.to_string(), expected.clone());
+    db.write(|conn| {
+        let (store, branch, expected) = (store.clone(), branch.clone(), expected.clone());
+        Box::pin(
+            async move { consume_held_replay_source_conn(conn, &store, &branch, &expected).await },
+        )
+    })
+    .await
+    .map_err(|error| format!("consume held replay source: {error}"))?;
+    Ok(())
+}
+
+/// Compare-and-swap only this captured receipt inside an accepting transaction.
+/// Callers prove acceptance authority before entering the database transaction:
+/// destination coverage for replay, or original immutable-tip binding for rebuild.
+/// Explicit rebuild may also retire a held-but-unsafe receipt with no source cut.
+pub(crate) async fn consume_held_replay_source_conn(
+    conn: &crate::storage::TrackedConnection,
+    store: &Path,
+    branch: &str,
+    expected: &HeldReplaySource,
+) -> DbResult<u64> {
+    Ok(conn.execute(
+        "UPDATE jj_reconcile_items SET held_replay_source_cut = NULL, held_replay_source_tip = NULL
+         WHERE bookmark = ?1 AND held_replay_source_cut IS ?3 AND held_replay_source_tip = ?4
+           AND intent_id = ?6 AND intent_id IN (SELECT id FROM jj_reconcile_intents WHERE store_path = ?2 AND target_branch = ?5 AND destination_commit = ?7)",
+        params![branch, store.to_string_lossy().as_ref(), expected.cut.as_deref(), expected.tip.as_str(), expected.base_branch.as_str(), expected.intent_id.as_str(), expected.destination.as_str()],
+    ).await?)
+}
+
+/// A new bookmark must not erase an outstanding held-lineage obligation.
+/// Existing-branch restart keeps the receipt; a successor waits for recovery on
+/// the original branch instead of inventing a cut from today's parent tip.
+pub(crate) async fn refuse_held_continuity(
+    db: &LocalDb,
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    adopt_head: &str,
+) -> Result<(), String> {
+    let path = store.to_string_lossy().into_owned();
+    let rows = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(
+            "SELECT DISTINCT i.bookmark, i.held_replay_source_tip FROM jj_reconcile_items i
+             JOIN jj_reconcile_intents n ON n.id=i.intent_id
+             WHERE n.store_path=?1 AND i.held_replay_source_tip IS NOT NULL",
+            params![path],
+        ).await?;
+                let mut tips = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    tips.push((row.text(0)?, row.text(1)?));
+                }
+                Ok(tips)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    for (branch, tip) in rows {
+        if crate::jj::revset_descends_from(jj, store, adopt_head, &tip) {
+            return Err(format!("continuity from held branch `{branch}` is refused: recover its exact source-cut replay before minting a successor bookmark"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BranchOwnerKind {
+    Mint,
+    Observer,
+    Unknown,
+}
+
+/// Mint authority and cut consensus use the same frozen behavior. Missing
+/// standalone workflow metadata is not evidence of either ownership or inherit.
+async fn branch_owner_kind(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    owner: &SiblingJob,
+    branch: &str,
+) -> Result<BranchOwnerKind, String> {
+    let metadata = db.query_one(
+        "SELECT p.branch,j.execution_id,j.recipe_node_id,j.project_id FROM jobs j LEFT JOIN jobs p ON p.id=j.parent_job_id WHERE j.id=?1",
+        params![owner.id.as_str()],
+        |row| Ok((row.opt_text(0)?,row.opt_text(1)?,row.opt_text(2)?,row.text(3)?)),
+    ).await.map_err(|error| error.to_string())?;
+    if metadata.0.as_deref() == Some(branch) {
+        return Ok(BranchOwnerKind::Observer);
+    }
+    if let (Some(execution), Some(node_id)) = (metadata.1.as_ref(), metadata.2.as_ref()) {
+        let snapshot = match crate::jobs::queries::load_execution_snapshot(db, execution).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(BranchOwnerKind::Unknown),
+        };
+        let Some(node) = snapshot
+            .recipe
+            .nodes
+            .iter()
+            .find(|node| &node.id == node_id)
+        else {
+            return Ok(BranchOwnerKind::Unknown);
+        };
+        let node = crate::execution::dag::recipe_node_to_db(node, &snapshot.recipe.id);
+        return Ok(
+            if crate::execution::step_behavior::resolve_node_behavior(&node).mints_branch {
+                BranchOwnerKind::Mint
+            } else {
+                BranchOwnerKind::Observer
+            },
+        );
+    }
+    if metadata.2.is_none() && orch.db.local.query_opt_i64(
+        "SELECT 1 FROM workflow_run WHERE job_id=?1 AND project_id=?2 AND anchor_branch=?3 AND branch_mode='inherit' AND execution_id IS ?4 LIMIT 1",
+        params![owner.id.as_str(),metadata.3.as_str(),branch,metadata.1.as_deref()],
+    ).await.map_err(|error| error.to_string())?.is_some() {
+        return Ok(BranchOwnerKind::Observer);
+    }
+    Ok(BranchOwnerKind::Unknown)
+}
+
+async fn original_held_source_cut(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    store: &Path,
+    branch: &str,
+    base_branch: &str,
+    tip: &str,
+    owners: &[SiblingJob],
+) -> Result<Option<String>, String> {
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    if let Some(source) = held_replay_source(db, store, branch).await? {
+        return Ok(
+            if source.base_branch == base_branch
+                && crate::jj::revset_descends_from(&jj, store, tip, &source.tip)
+            {
+                source.cut
+            } else {
+                None
+            },
+        );
+    }
+    let mut cuts = BTreeSet::new();
+    let mut uncertain = false;
+    for owner in owners {
+        match branch_owner_kind(orch, db, owner, branch).await? {
+            BranchOwnerKind::Observer => continue,
+            BranchOwnerKind::Unknown => {
+                uncertain = true;
+                continue;
+            }
+            BranchOwnerKind::Mint => {}
+        }
+        match owner.base_commit.as_ref() {
+            Some(cut) if crate::jj::revset_descends_from(&jj, store, tip, cut) => {
+                cuts.insert(cut.clone());
+            }
+            _ => uncertain = true,
+        }
+    }
+    Ok(if !uncertain && cuts.len() == 1 {
+        cuts.into_iter().next()
+    } else {
+        None
+    })
+}
+
+/// Record held bookmarks against their own immediate destination. The VCS
+/// operation knows graph descendants, not job ownership: a failed replay of a
+/// parent also flags its descendants, which must wait rather than resolve onto
+/// the selected ancestor independently. Caller holds the replay's store writer
+/// guard through installation, marker projection, and notification: otherwise a
+/// queued writer could install a newer conflict before this one. Database and
+/// executor work here extends the guard beyond the jj-only replay budget.
+pub(crate) async fn persist_held_descendant_sessions(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    held: &BTreeMap<String, crate::jj::ConflictDiagnostic>,
+) -> Result<(), String> {
+    let repository = crate::jj::repository_directory(store)
+        .ok_or_else(|| "held descendant repository did not resolve".to_string())?;
+    let dbs = orch.db.all_dbs().await;
+    let mut databases = vec![db];
+    databases.extend(
+        dbs.iter()
+            .map(AsRef::as_ref)
+            .filter(|candidate| !std::ptr::eq(*candidate, db)),
+    );
+    for branch in held.keys() {
+        let mut routes = Vec::new();
+        for owning_db in &databases {
+            let query_branch = branch.clone();
+            let candidates = owning_db.read(move |conn| {
+                let branch = query_branch.clone();
+                Box::pin(async move {
+                    let mut rows = conn.query(&format!("SELECT DISTINCT j.project_id,p.repo_path,p.key FROM jobs j JOIN projects p ON p.id=j.project_id WHERE j.branch=?1 AND {LIVE_JOB_PREDICATE}"), params![branch]).await?;
+                    let mut candidates = Vec::new();
+                    while let Some(row) = rows.next().await? { candidates.push((row.text(0)?,row.text(1)?,row.text(2)?)); }
+                    Ok(candidates)
+                })
+            }).await.map_err(|error| error.to_string())?;
+            for (project, synced_repo, key) in candidates {
+                let Some(repo) = crate::projects::crud::resolve_local_repo_path(
+                    &orch.db,
+                    &project,
+                    &key,
+                    &synced_repo,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                else {
+                    continue;
+                };
+                let owner_store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo));
+                if crate::jj::repository_directory(&owner_store).as_ref() == Some(&repository) {
+                    let owners = load_jobs_on_branch(owning_db, &project, branch).await?;
+                    let mut possible_mint = false;
+                    for owner in owners {
+                        if branch_owner_kind(orch, owning_db, &owner, branch).await?
+                            != BranchOwnerKind::Observer
+                        {
+                            possible_mint = true;
+                        }
+                    }
+                    if possible_mint {
+                        routes.push((*owning_db, project));
+                    }
+                }
+            }
+        }
+        if routes.len() > 1 {
+            return Err(format!("held descendant `{branch}` has ambiguous project/database ownership in its physical repository"));
+        }
+        if let Some((owner_db, owner_project)) = routes.pop() {
+            persist_held_descendant_sessions_for_owner(
+                orch,
+                owner_db,
+                &owner_project,
+                store,
+                held,
+                branch,
+            )
+            .await?;
+        } else {
+            log::warn!("held descendant `{branch}` from project {project_id} has no live owner in its physical repository");
+        }
+    }
+    Ok(())
+}
+
+async fn persist_held_descendant_sessions_for_owner(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    held: &BTreeMap<String, crate::jj::ConflictDiagnostic>,
+    selected_branch: &str,
+) -> Result<(), String> {
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    for (branch, raw) in held
+        .iter()
+        .filter(|(name, _)| name.as_str() == selected_branch)
+    {
+        let owners = load_jobs_on_branch(db, project_id, branch).await?;
+        let mut bases = BTreeSet::new();
+        for owner in &owners {
+            if let Some(base) =
+                crate::orchestrator::replay_base::load_base_candidates_for_job(db, &owner.id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .recorded
+            {
+                bases.insert(base);
+            }
+        }
+        if owners.is_empty() {
+            continue;
+        }
+        if bases.len() != 1 {
+            return Err(format!(
+                "held descendant `{branch}` has no unambiguous recorded immediate base"
+            ));
+        }
+        let base = bases.into_iter().next().unwrap();
+        let blocked = held.contains_key(&base);
+        let held_tip = raw
+            .ours
+            .as_deref()
+            .ok_or_else(|| format!("held branch `{branch}` has no original tip"))?;
+        let source_cut =
+            original_held_source_cut(orch, db, store, branch, &base, held_tip, &owners).await?;
+        let destination = crate::jj::bookmark_commit(&jj, store, &base)
+            .ok_or_else(|| format!("held descendant `{branch}` base `{base}` did not resolve"))?;
+        let mut diagnostic = crate::jj::capture_conflict_diagnostic(
+            &jj,
+            store,
+            branch,
+            &destination,
+            raw.ours.as_deref(),
+            raw.conflicting_paths(),
+        );
+        diagnostic.conflicted_tip = raw.conflicted_tip.clone();
+        diagnostic.scaffolding = raw.scaffolding.clone();
+        diagnostic.validation = raw.validation.clone();
+        let now = chrono::Utc::now().timestamp();
+        let candidate = uuid::Uuid::new_v4().to_string();
+        let store_path = store.to_string_lossy();
+        db.execute(
+            "INSERT INTO jj_reconcile_intents
+             (id, project_id, store_path, target_branch, destination_commit,
+              trigger_sources_json, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, '[\"held_descendant\"]', 'pending', ?6, ?6)
+             ON CONFLICT(project_id, store_path, target_branch, destination_commit) DO NOTHING",
+            params![
+                candidate.as_str(),
+                project_id,
+                store_path.as_ref(),
+                base.as_str(),
+                destination.as_str(),
+                now
+            ],
+        )
+        .await
+        .map_err(|error| format!("record held descendant intent: {error}"))?;
+        let intent_id = reconcile_intent_id(db, project_id, store, &base, &destination)
+            .await
+            .ok_or_else(|| format!("held descendant `{branch}` intent was not persisted"))?;
+        persist_reconcile_item(db, ReconcileItemUpdate {
+            intent_id: &intent_id, bookmark: branch, observed_tip: Some(held_tip),
+            status: "completed", failure_kind: None, outcome_kind: Some("held_parent"),
+            fingerprint: None, diagnostic: Some("Held for immediate-parent recovery; original ownership cut is recorded separately from conflict coordinates."),
+        }).await?;
+        let path = store.to_string_lossy().into_owned();
+        let bookmark = branch.clone();
+        let intent = intent_id.clone();
+        let tip = held_tip.to_string();
+        db.write(move |conn| {
+            let (path, bookmark, intent, tip, cut) = (path.clone(), bookmark.clone(), intent.clone(), tip.clone(), source_cut.clone());
+            Box::pin(async move {
+                conn.execute("UPDATE jj_reconcile_items SET held_replay_source_cut = NULL, held_replay_source_tip = NULL
+                    WHERE bookmark = ?1 AND intent_id IN (SELECT id FROM jj_reconcile_intents WHERE store_path = ?2)",
+                    params![bookmark.as_str(), path.as_str()]).await?;
+                conn.execute("UPDATE jj_reconcile_items SET held_replay_source_cut = ?3, held_replay_source_tip = ?4
+                    WHERE intent_id = ?1 AND bookmark = ?2",
+                    params![intent.as_str(), bookmark.as_str(), cut.as_deref(), tip.as_str()]).await?;
+                Ok(())
+            })
+        }).await.map_err(|error| format!("freeze held replay source: {error}"))?;
+        if blocked
+            || (raw.conflicting_paths().is_empty()
+                && raw.scaffolding.is_none()
+                && raw.validation.is_none())
+        {
+            continue;
+        }
+        let previous =
+            crate::orchestrator::conflict_session::load_active_session(db, branch).await?;
+        let basis = crate::orchestrator::conflict_session::inherited_basis(
+            &jj,
+            store,
+            previous.as_ref(),
+            diagnostic.ours.as_deref(),
+        );
+        let incoming = IncomingIdentity {
+            base_branch: base,
+            ..IncomingIdentity::default()
+        };
+        persist_reconcile_item(db, ReconcileItemUpdate {
+            intent_id: &intent_id,
+            bookmark: branch,
+            observed_tip: diagnostic.ours.as_deref(),
+            status: "completed",
+            failure_kind: Some(ROLLED_BACK_CONFLICT),
+            outcome_kind: Some("conflicted"),
+            fingerprint: None,
+            diagnostic: Some("The immediate parent advanced; this branch remains at its pre-replay commit because its own edits conflict."),
+        }).await?;
+        record_conflict_session(db, &intent_id, branch, &diagnostic, &incoming, &basis).await?;
+        supersede_stale_sessions(db, branch, &intent_id).await?;
+        withdraw_pending_clean_notes(db, branch).await?;
+        let (state, marker_diagnostic, dispositions) =
+            materialize_markers_for_branch(orch, db, project_id, branch, &diagnostic).await;
+        record_marker_state(
+            db,
+            &intent_id,
+            branch,
+            state,
+            marker_diagnostic.as_deref(),
+            &dispositions,
+        )
+        .await?;
+        let evidence = ConflictEvidence {
+            diagnostics: HashMap::from([(branch.clone(), diagnostic)]),
+            marker_states: HashMap::from([(branch.clone(), state)]),
+            carry_notes: HashMap::new(),
+        };
+        notify_conflicted_siblings(
+            orch, db, &owners, std::slice::from_ref(branch),
+            "Your immediate parent branch advanced, but replaying your own edits conflicted. Your branch remains at its previous clean commit; resolve your rebase session.",
+            &evidence, &intent_id,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3370,9 +4020,14 @@ async fn finish_reconcile_intent(
         "completed"
     };
     db.execute(
-        "UPDATE jj_reconcile_intents
-         SET status = ?3, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?4
-         WHERE id = ?1 AND lease_owner = ?2",
+        format!("UPDATE jj_reconcile_intents
+         SET status = CASE WHEN ?3='completed' AND EXISTS (
+             SELECT 1 FROM jj_reconcile_items item JOIN jj_reconcile_intents n ON n.id=item.intent_id
+             JOIN jobs j ON j.project_id=n.project_id AND j.branch=item.bookmark AND j.base_branch=n.target_branch
+             WHERE item.intent_id=?1 AND item.status='pending' AND item.outcome_kind='held_retarget' AND {LIVE_JOB_PREDICATE}
+         ) THEN 'pending' ELSE ?3 END,
+         lease_owner = NULL, lease_expires_at = NULL, updated_at = ?4
+         WHERE id = ?1 AND lease_owner = ?2"),
         params![intent_id, owner, status, chrono::Utc::now().timestamp()],
     )
     .await
@@ -3384,6 +4039,7 @@ async fn finish_reconcile_intent(
 /// Best effort: a read failure costs the name, never the request.
 async fn reconcile_intent_id(
     db: &LocalDb,
+    project_id: &str,
     store: &Path,
     target_branch: &str,
     destination: &str,
@@ -3391,8 +4047,8 @@ async fn reconcile_intent_id(
     let store = store.to_string_lossy().into_owned();
     db.query_text(
         "SELECT id FROM jj_reconcile_intents
-         WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3",
-        params![store.as_str(), target_branch, destination],
+         WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3 AND project_id = ?4",
+        params![store.as_str(), target_branch, destination, project_id],
     )
     .await
     .ok()
@@ -3401,6 +4057,7 @@ async fn reconcile_intent_id(
 
 async fn wait_for_reconcile_slot(
     db: &LocalDb,
+    project_id: &str,
     store: &Path,
     target_branch: &str,
     destination: &str,
@@ -3411,8 +4068,8 @@ async fn wait_for_reconcile_slot(
         let running = db
             .query_text(
                 "SELECT status FROM jj_reconcile_intents
-                 WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3",
-                params![store.as_str(), target_branch, destination],
+                 WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3 AND project_id = ?4",
+                params![store.as_str(), target_branch, destination, project_id],
             )
             .await
             .map_err(|error| format!("inspect reconcile intent: {error}"))?
@@ -3478,7 +4135,7 @@ async fn reconcile_base_advance(
 
     let Some(claim) = claim_reconcile_intent(
         db,
-        repo_path,
+        project_id,
         &store,
         sibling_base_branch,
         &pinned_dest,
@@ -3486,7 +4143,8 @@ async fn reconcile_base_advance(
     )
     .await?
     else {
-        let intent = reconcile_intent_id(db, &store, sibling_base_branch, &pinned_dest).await;
+        let intent =
+            reconcile_intent_id(db, project_id, &store, sibling_base_branch, &pinned_dest).await;
         log::debug!(
             "jj base advance ({label}): coalesced with existing intent {} for {pinned_dest}",
             intent.as_deref().unwrap_or("(unread)")
@@ -3709,7 +4367,14 @@ pub(crate) async fn request_branch_replay(
         }
     }
 
-    let project = load_replay_project(db, job_id).await?;
+    let mut project = load_replay_project(db, job_id).await?;
+    let (local_repo, _) =
+        crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, &project.id)
+            .await
+            .map_err(|error| error.to_string())?;
+    project.repo_path = local_repo.ok_or_else(|| {
+        "Clone this team project's repository before requesting replay".to_string()
+    })?;
     // An explicit replay is not repair. A fenced branch is refused here with the
     // recovery's coordinates and route, and again at the locked boundary.
     crate::orchestrator::branch_recovery::refuse_if_fenced(
@@ -3737,12 +4402,9 @@ pub(crate) async fn request_branch_replay(
             session.incoming.base_branch.as_str()
         }
     });
-    let candidates = crate::orchestrator::replay_base::load_base_candidates_for_job(db, job_id)
-        .await?
-        .recorded_from_session(session_base);
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&project.repo_path));
-    let resolved = {
+    let (resolved, retargeted_held_session) = {
         let guard = orch
             .acquire_jj_store_lock(
                 &store,
@@ -3752,8 +4414,38 @@ pub(crate) async fn request_branch_replay(
             .await;
         let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = guard.phase(format!("resolve replay destination branch={branch}"));
-        crate::orchestrator::replay_base::resolve_base(&jj, &store, branch, &candidates)
-            .map_err(|error| error.to_string())?
+        let candidates =
+            crate::orchestrator::replay_base::load_base_candidates_for_job(db, job_id).await?;
+        let held = held_replay_source(db, &store, branch).await?;
+        if let Some(held) = held.as_ref() {
+            if candidates.recorded.as_deref() != Some(held.base_branch.as_str()) {
+                return Err(format!("held replay of `{branch}` has no matching recorded destination authority; no replay was queued"));
+            }
+        }
+        // A sanctioned retarget moves the receipt and job together. A historical
+        // session still supplies resolution evidence, never authority to undo
+        // that transition by routing the request back to its old parent.
+        let current_session =
+            crate::orchestrator::conflict_session::load_active_session(db, branch).await?;
+        let current_session_base = current_session.as_ref().map(|session| {
+            if session.incoming.base_branch.is_empty() {
+                session.target_branch.as_str()
+            } else {
+                session.incoming.base_branch.as_str()
+            }
+        });
+        let candidates = candidates.with_session_fallback(current_session_base);
+        let resolved =
+            crate::orchestrator::replay_base::resolve_base(&jj, &store, branch, &candidates)
+                .map_err(|error| error.to_string())?;
+        if held
+            .as_ref()
+            .is_some_and(|held| held.base_branch != resolved.branch)
+        {
+            return Err(format!("held replay of `{branch}` requires its sanctioned destination transition before falling back from a missing parent"));
+        }
+        let retargeted = session_base.is_some_and(|historical| historical != resolved.branch);
+        (resolved, retargeted)
     };
     let base_branch = resolved.branch.clone();
     let destination = resolved.commit.clone();
@@ -3790,11 +4482,11 @@ pub(crate) async fn request_branch_replay(
     }
 
     let incoming = match session.as_ref() {
-        Some(session) => session.incoming.clone(),
+        Some(session) if !retargeted_held_session => session.incoming.clone(),
         // A bare request vouches for the base it is landing on and nothing else:
         // no PR and no issue carried the advance, because as far as this branch
         // is concerned no advance was ever announced.
-        None => IncomingIdentity {
+        _ => IncomingIdentity {
             base_branch: base_branch.clone(),
             ..IncomingIdentity::default()
         },
@@ -3916,7 +4608,15 @@ pub(crate) async fn request_branch_replay(
             // already correct.
             retargets.push((attempted_destination, reopen_destination.clone()));
         }
-        wait_for_reconcile_slot(db, &store, &base_branch, &reopen_destination, deadline).await?;
+        wait_for_reconcile_slot(
+            db,
+            &project.id,
+            &store,
+            &base_branch,
+            &reopen_destination,
+            deadline,
+        )
+        .await?;
     };
 
     // Re-aimed at a newer base while queued: the page names where it went.
@@ -4133,6 +4833,7 @@ async fn load_replay_project(db: &LocalDb, job_id: &str) -> Result<ReplayProject
 /// same destination is exactly the point.
 async fn reopen_reconcile_intent(
     db: &LocalDb,
+    project_id: &str,
     store: &Path,
     target_branch: &str,
     destination: &str,
@@ -4142,9 +4843,9 @@ async fn reopen_reconcile_intent(
     db.execute(
         "UPDATE jj_reconcile_intents
          SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL
-         WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3
+         WHERE store_path = ?1 AND target_branch = ?2 AND destination_commit = ?3 AND project_id = ?4
            AND status = 'completed'",
-        params![store.as_str(), target_branch, destination],
+        params![store.as_str(), target_branch, destination, project_id],
     )
     .await
     .map_err(|error| format!("reopen reconcile intent: {error}"))?;
@@ -4152,9 +4853,9 @@ async fn reopen_reconcile_intent(
         "UPDATE jj_reconcile_items SET status = 'pending', notification_sent = 0
          WHERE bookmark = ?1 AND intent_id IN (
              SELECT id FROM jj_reconcile_intents
-             WHERE store_path = ?2 AND target_branch = ?3 AND destination_commit = ?4
+             WHERE store_path = ?2 AND target_branch = ?3 AND destination_commit = ?4 AND project_id = ?5
          )",
-        params![bookmark, store.as_str(), target_branch, destination],
+        params![bookmark, store.as_str(), target_branch, destination, project_id],
     )
     .await
     .map_err(|error| format!("reopen reconcile item: {error}"))?;
@@ -4508,7 +5209,15 @@ async fn execute_reconcile_claim_body(
             crate::orchestrator::conflict_session::load_pending_replay_request(db, &store, branch)
                 .await?;
         let progress = reconcile_item_status(db, intent_id, branch).await?;
+        // Recording an implicit hold completed its bookkeeping, not the owed
+        // replay. The same destination can later be retried automatically once
+        // the immediate parent has recovered.
+        let owes_held_replay = progress
+            .as_ref()
+            .is_some_and(|progress| progress.outcome_kind.as_deref() == Some("held_parent"))
+            && held_replay_source(db, &store, branch).await?.is_some();
         if pending_request.is_none()
+            && !owes_held_replay
             && progress.as_ref().is_some_and(|progress| {
                 progress.status == "completed"
                     || (progress.status == "graph_moved" && progress.notification_sent)
@@ -4764,7 +5473,7 @@ async fn execute_reconcile_claim_body(
         // What a structural merge measures each path from if this replay
         // conflicts: the live fork, or the side the open session's resolution
         // was made against.
-        let replay_baseline = current_tip.as_deref().and_then(|pre_tip| {
+        let mut replay_baseline = current_tip.as_deref().and_then(|pre_tip| {
             let fork = branch_fork_point(jj, &store, pre_tip, &pinned_dest)?;
             Some(
                 ReplayBaseline {
@@ -4800,6 +5509,8 @@ async fn execute_reconcile_claim_body(
         let mut resolution_basis_for_conflict = None;
         let mut ambiguous_item = None;
         let mut divergence_resolved = false;
+        let mut held_cut = None;
+        let mut expected_held_source = None;
         let mut item_report = if let Some(progress) = progress
             .as_ref()
             .filter(|p| resumes_past_mutation(p) && pending_request.is_none())
@@ -5147,7 +5858,18 @@ async fn execute_reconcile_claim_body(
             } else {
                 None
             };
-            let mut item_report = if ambiguous_item.is_some() {
+            let preserve_bookmarks = held_replay_bookmarks_for_repository(&orch.db, &store).await?;
+            expected_held_source = held_replay_source(db, &store, branch).await?;
+            let source =
+                held_replay_source_cut(orch, db, &jj, &store, branch, &notes.incoming.base_branch)
+                    .await;
+            held_cut = source.as_ref().ok().cloned().flatten();
+            if let (Some(cut), Some(baseline)) = (held_cut.as_ref(), replay_baseline.as_mut()) {
+                baseline.fork = cut.clone();
+            }
+            let mut item_report = if let Err(error) = source {
+                failed_reconcile_report(branch, error)
+            } else if ambiguous_item.is_some() {
                 crate::jj::ReconcileReport::default()
             } else if let Some(error) = name_refusal {
                 let mut refused = crate::jj::ReconcileReport::default();
@@ -5209,12 +5931,19 @@ async fn execute_reconcile_claim_body(
                         }
                         guard
                             .blocking_phase("rebase and export", || {
-                                crate::jj::reconcile_resolved_sibling_without_publication(
+                                crate::jj::reconcile_siblings_with_options(
                                     &jj,
                                     &store,
                                     &pinned_dest,
-                                    branch,
-                                    &plan.carry,
+                                    std::slice::from_ref(branch),
+                                    &crate::jj::ReconcileOptions {
+                                        resolution: Some((branch.clone(), plan.carry.clone())),
+                                        preserve_bookmarks: preserve_bookmarks.clone(),
+                                        source_cut: held_cut
+                                            .as_ref()
+                                            .map(|cut| (branch.clone(), cut.clone())),
+                                        ..Default::default()
+                                    },
                                 )
                             })
                             .unwrap_or_else(|error| failed_reconcile_report(branch, error))
@@ -5235,11 +5964,18 @@ async fn execute_reconcile_claim_body(
                 let item = vec![branch.clone()];
                 guard
                     .blocking_phase("rebase and export", || {
-                        crate::jj::reconcile_siblings_without_publication(
+                        crate::jj::reconcile_siblings_with_options(
                             &jj,
                             &store,
                             &pinned_dest,
                             &item,
+                            &crate::jj::ReconcileOptions {
+                                preserve_bookmarks: preserve_bookmarks.clone(),
+                                source_cut: held_cut
+                                    .as_ref()
+                                    .map(|cut| (branch.clone(), cut.clone())),
+                                ..Default::default()
+                            },
                         )
                     })
                     .unwrap_or_else(|error| failed_reconcile_report(branch, error))
@@ -5250,6 +5986,18 @@ async fn execute_reconcile_claim_body(
                 }) {
                     after.insert(branch.clone(), commit);
                 }
+            }
+            if item_report.rebased_clean.contains(branch) {
+                clear_held_replay_source(
+                    db,
+                    &jj,
+                    &store,
+                    branch,
+                    &pinned_dest,
+                    branch,
+                    expected_held_source.as_ref(),
+                )
+                .await?;
             }
             // The recovery fence first, and before releasing this guard: no
             // queued writer may act on a store whose rollback is unverified.
@@ -5295,6 +6043,13 @@ async fn execute_reconcile_claim_body(
                 );
             }
             drop(timeout_persistence);
+            let held = item_report
+                .conflict_diagnostics
+                .iter()
+                .filter(|(name, _)| *name != branch)
+                .map(|(name, diagnostic)| (name.clone(), diagnostic.clone()))
+                .collect();
+            persist_held_descendant_sessions(orch, db, project_id, &store, &held).await?;
             if explicit {
                 replay_phases.push(guard.phase_summary());
             }
@@ -5482,7 +6237,10 @@ async fn execute_reconcile_claim_body(
                         continue;
                     }
                     let result = match prepared {
-                        Ok(Some(plan)) => {
+                        Ok(Some(mut plan)) => {
+                            plan.source_cut = held_cut.clone();
+                            plan.preserve_bookmarks =
+                                held_replay_bookmarks_for_repository(&orch.db, &store).await?;
                             let _phase = guard.phase(format!(
                                 "apply pre-proven structural replay branch={branch}"
                             ));
@@ -5504,6 +6262,25 @@ async fn execute_reconcile_claim_body(
                             item_report = failed_reconcile_report(branch, error);
                         }
                     }
+                    if item_report.rebased_clean.contains(branch) {
+                        clear_held_replay_source(
+                            db,
+                            &jj,
+                            &store,
+                            branch,
+                            &pinned_dest,
+                            branch,
+                            expected_held_source.as_ref(),
+                        )
+                        .await?;
+                    }
+                    let held = item_report
+                        .conflict_diagnostics
+                        .iter()
+                        .filter(|(name, _)| *name != branch)
+                        .map(|(name, diagnostic)| (name.clone(), diagnostic.clone()))
+                        .collect();
+                    persist_held_descendant_sessions(orch, db, project_id, &store, &held).await?;
                     {
                         let _phase = guard.phase("structural recovery fence persistence");
                         if persist_transaction_recoveries(
@@ -6584,8 +7361,8 @@ fn content_conflict_guidance() -> String {
     )
 }
 
-/// The guidance for a replay refused at export because the rebased tree carried
-/// jj conflict scaffolding, though jj recorded no conflict.
+/// Guidance for a replay withheld because its attempted tree carried conflict
+/// scaffolding, whether or not jj also recorded a native conflict.
 ///
 /// It must not read as "nothing to resolve": the branch did NOT take the new
 /// base, and a replay requested without new work meets the same tree. It names
@@ -6594,12 +7371,11 @@ fn content_conflict_guidance() -> String {
 fn scaffolding_guidance(refusal: &crate::jj::ScaffoldingRefusal, ours: Option<&str>) -> String {
     let tip = ours.map(|ours| format!(" {ours}")).unwrap_or_default();
     format!(
-        "\nThis rebase was REFUSED AT EXPORT, not by jj. jj reported the rebased commit {} as \
-         conflict-free, but its tree root carries jj conflict scaffolding ({}), and a tree like \
-         that cannot be materialized on any machine. It was never exported: your branch and its \
-         git ref stay on your last clean tip{tip}, and a `/rebase` session is open for this \
-         conflict at `cairn:~/rebase`. The files changed on both sides are where jj merged the \
-         two versions silently; read both versions of each through that session, commit any \
+        "\nThis replay was WITHHELD BEFORE PUBLICATION. The attempted commit {} carries jj \
+         conflict scaffolding ({}), and a tree like that cannot be materialized on any machine. \
+         It was never exported: your branch and its git ref stay on your last clean tip{tip}, \
+         and a `/rebase` session is open for this conflict at `cairn:~/rebase`. Read both versions \
+         of the affected files through that session, commit any \
          merged result your work needs with ordinary edits, {REQUEST_THE_REPLAY}. Never \
          rebase or force-push by hand. If a replay meets the same refusal, the branch needs an \
          operator to repair it in the store.",
@@ -6650,7 +7426,7 @@ fn append_conflict_diagnostic(
         }
     };
     let conflicting_label = if diagnostic.scaffolding.is_some() {
-        "Changed on both sides, merged by jj without a recorded conflict"
+        "Affected files in the replay withheld for conflict scaffolding"
     } else if diagnostic.condition == crate::jj::ConflictCondition::Unparseable {
         "Changed on both sides, merged by jj into files that do not parse"
     } else {
@@ -7248,39 +8024,72 @@ async fn repoint_children_of_merged_branch(
     project_id: &str,
     merged_branch: &str,
     new_base: &str,
+    store: &Path,
+    destination: &str,
 ) -> Result<(), String> {
+    let project = project_id.to_string();
+    let merged = merged_branch.to_string();
+    let base = new_base.to_string();
+    let path = store.to_string_lossy().into_owned();
+    let destination = destination.to_string();
     let now = chrono::Utc::now().timestamp();
-    // The update target is not aliased: the liveness predicate is evaluated in a
-    // subselect that owns the `j` alias, which keeps one predicate usable from
-    // both a SELECT and an UPDATE.
-    let jobs_sql = format!(
-        "UPDATE jobs SET base_branch = ?3, updated_at = ?4
-          WHERE id IN (
-            SELECT j.id FROM jobs j
-             WHERE j.project_id = ?1 AND j.base_branch = ?2 AND {LIVE_JOB_PREDICATE}
-          )"
-    );
-    let jobs = db
-        .execute(&jobs_sql, params![project_id, merged_branch, new_base, now])
-        .await
-        .map_err(|error| format!("re-point jobs cut from `{merged_branch}`: {error}"))?;
-    let pull_requests = db
-        .execute(
-            "UPDATE merge_requests SET target_branch = ?3, updated_at = ?4
-              WHERE project_id = ?1 AND target_branch = ?2
-                AND status NOT IN ('merged', 'closed')",
-            params![project_id, merged_branch, new_base, now],
-        )
-        .await
-        .map_err(|error| format!("re-target pull requests aimed at `{merged_branch}`: {error}"))?;
-
-    if jobs > 0 || pull_requests > 0 {
-        log::info!(
-            "merged branch `{merged_branch}` was folded into `{new_base}`: re-pointed {jobs} job(s) \
-             and {pull_requests} open pull request(s) that were cut from it"
-        );
-    }
-    Ok(())
+    db.write(move |conn| {
+        let (project, merged, base, path, destination) = (project.clone(), merged.clone(), base.clone(), path.clone(), destination.clone());
+        Box::pin(async move {
+            let mut rows = conn.query(&format!("SELECT DISTINCT j.branch FROM jobs j WHERE j.project_id=?1 AND j.base_branch=?2 AND j.branch IS NOT NULL AND {LIVE_JOB_PREDICATE}"), params![project.as_str(),merged.as_str()]).await?;
+            let mut branches = Vec::new();
+            while let Some(row) = rows.next().await? { branches.push(row.text(0)?); }
+            drop(rows);
+            for branch in branches {
+                let mut rows = conn.query(
+                    "SELECT n.id,n.destination_commit,n.target_branch,i.held_replay_source_cut,i.held_replay_source_tip
+                     FROM jj_reconcile_items i JOIN jj_reconcile_intents n ON n.id=i.intent_id
+                     WHERE n.project_id=?1 AND n.store_path=?2 AND i.bookmark=?3 AND i.held_replay_source_tip IS NOT NULL",
+                    params![project.as_str(),path.as_str(),branch.as_str()]).await?;
+                let mut receipts = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    receipts.push(HeldReplaySource { intent_id:row.text(0)?,destination:row.text(1)?,base_branch:row.text(2)?,cut:row.opt_text(3)?,tip:row.text(4)? });
+                }
+                drop(rows);
+                if receipts.is_empty() { continue; }
+                if receipts.len()!=1 || receipts[0].base_branch!=merged {
+                    return Err(DbError::Row(format!("retarget of `{branch}` refuses competing held authority")));
+                }
+                let expected = &receipts[0];
+                let candidate = uuid::Uuid::new_v4().to_string();
+                conn.execute("INSERT INTO jj_reconcile_intents (id,project_id,store_path,target_branch,destination_commit,trigger_sources_json,status,created_at,updated_at)
+                    VALUES (?1,?2,?3,?4,?5,'[\"held_retarget\"]','pending',?6,?6)
+                    ON CONFLICT(project_id,store_path,target_branch,destination_commit) DO NOTHING",
+                    params![candidate,project.as_str(),path.as_str(),base.as_str(),destination.as_str(),now]).await?;
+                let mut rows = conn.query("SELECT id FROM jj_reconcile_intents WHERE project_id=?1 AND store_path=?2 AND target_branch=?3 AND destination_commit=?4",
+                    params![project.as_str(),path.as_str(),base.as_str(),destination.as_str()]).await?;
+                let intent = rows.next().await?.ok_or_else(|| DbError::Row("retarget intent missing".into()))?.text(0)?;
+                drop(rows);
+                let mut rows = conn.query("SELECT 1 FROM jj_reconcile_items WHERE intent_id=?1 AND bookmark=?2 AND (held_replay_source_tip IS NOT NULL OR resolution_state='open' OR (replay_request_id IS NOT NULL AND replay_served_at IS NULL))",
+                    params![intent.as_str(),branch.as_str()]).await?;
+                if rows.next().await?.is_some() { return Err(DbError::Row(format!("retarget of `{branch}` refuses newer destination authority"))); }
+                drop(rows);
+                if consume_held_replay_source_conn(conn,Path::new(&path),&branch,expected).await? != 1 {
+                    return Err(DbError::Row("retarget held-source generation changed".into()));
+                }
+                // Only the obligation moves. The old open session and request
+                // retain their real coordinates and per-path resolution basis.
+                conn.execute("INSERT INTO jj_reconcile_items (intent_id,bookmark,status,observed_tip,outcome_kind,updated_at,held_replay_source_cut,held_replay_source_tip)
+                    VALUES (?1,?2,'pending',?4,'held_retarget',?5,?3,?4)
+                    ON CONFLICT(intent_id,bookmark) DO UPDATE SET status='pending',outcome_kind='held_retarget',observed_tip=excluded.observed_tip,updated_at=excluded.updated_at,held_replay_source_cut=excluded.held_replay_source_cut,held_replay_source_tip=excluded.held_replay_source_tip",
+                    params![intent.as_str(),branch.as_str(),expected.cut.as_deref(),expected.tip.as_str(),now]).await?;
+                // A running lease keeps its owner. Its finisher observes the
+                // pending follow-up; a completed destination becomes claimable.
+                conn.execute("UPDATE jj_reconcile_intents SET status='pending',updated_at=?2 WHERE id=?1 AND status IN ('completed','superseded')",
+                    params![intent.as_str(),now]).await?;
+            }
+            conn.execute(&format!("UPDATE jobs SET base_branch=?3,updated_at=?4 WHERE id IN (SELECT j.id FROM jobs j WHERE j.project_id=?1 AND j.base_branch=?2 AND {LIVE_JOB_PREDICATE})"),
+                params![project.as_str(),merged.as_str(),base.as_str(),now]).await?;
+            conn.execute("UPDATE merge_requests SET target_branch=?3,updated_at=?4 WHERE project_id=?1 AND target_branch=?2 AND status NOT IN ('merged','closed')",
+                params![project.as_str(),merged.as_str(),base.as_str(),now]).await?;
+            Ok(())
+        })
+    }).await.map_err(|error| format!("retarget children of `{merged_branch}`: {error}"))
 }
 
 /// The live jobs cut from base `?2` in project `?1`, other than job `?3`.
@@ -7299,6 +8108,37 @@ fn sibling_jobs_sql() -> String {
             AND j.id != ?3
             AND {LIVE_JOB_PREDICATE}"
     )
+}
+
+async fn load_jobs_on_branch(
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+) -> Result<Vec<SiblingJob>, String> {
+    let project_id = project_id.to_string();
+    let branch = branch.to_string();
+    let sql = format!(
+        "SELECT j.id, j.branch, j.base_commit FROM jobs j
+         WHERE j.project_id = ?1 AND j.branch = ?2 AND {LIVE_JOB_PREDICATE}"
+    );
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(&sql, params![project_id.as_str(), branch.as_str()])
+                .await?;
+            let mut jobs = Vec::new();
+            while let Some(row) = rows.next().await? {
+                jobs.push(SiblingJob {
+                    id: row.text(0)?,
+                    branch: row.opt_text(1)?,
+                    base_commit: row.opt_text(2)?,
+                });
+            }
+            Ok(jobs)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn load_sibling_jobs(
@@ -7523,24 +8363,13 @@ pub(crate) async fn load_project_default_branch(
 /// The git-backed checkout path for a project (the source of the jj-managed
 /// signal and the anchor for the shared jj store).
 pub(crate) async fn load_project_repo_path(
-    db: &LocalDb,
+    dbs: &crate::db::DbState,
     project_id: &str,
 ) -> Result<Option<String>, String> {
-    let project_id = project_id.to_string();
-    db.read(|conn| {
-        let project_id = project_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT repo_path FROM projects WHERE id = ?1",
-                    params![project_id.as_str()],
-                )
-                .await?;
-            rows.next().await?.map(|row| row.text(0)).transpose()
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
+    crate::projects::crud::resolve_local_repo_path_and_key(dbs, project_id)
+        .await
+        .map(|(path, _)| path)
+        .map_err(|error| error.to_string())
 }
 
 /// Projects eligible for startup default-advance catch-up: those with a local git
@@ -7576,7 +8405,12 @@ pub(crate) async fn load_projects_for_default_reconcile(
             })
             .await
             .map_err(|error| error.to_string())?;
-        all_projects.extend(projects.drain(..).map(|project| (db.clone(), project)));
+        for mut project in projects.drain(..) {
+            if let Some(repo_path) = load_project_repo_path(&orch.db, &project.id).await? {
+                project.repo_path = repo_path;
+                all_projects.push((db.clone(), project));
+            }
+        }
     }
     Ok(all_projects)
 }
@@ -7762,7 +8596,7 @@ mod tests {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
         let claim =
-            claim_reconcile_intent(&db, "/repo", Path::new("/store"), "main", "dest-a", "test")
+            claim_reconcile_intent(&db, "proj-1", Path::new("/store"), "main", "dest-a", "test")
                 .await
                 .unwrap()
                 .unwrap();
@@ -8013,9 +8847,16 @@ mod tests {
         .await
         .unwrap();
 
-        repoint_children_of_merged_branch(&db, "proj-1", "agent/merged", "integration")
-            .await
-            .unwrap();
+        repoint_children_of_merged_branch(
+            &db,
+            "proj-1",
+            "agent/merged",
+            "integration",
+            Path::new("/store"),
+            "integration-tip",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             text_field(&db, JOB_BASE, "job-child").await.as_deref(),
@@ -8203,7 +9044,7 @@ mod tests {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
         let claim =
-            claim_reconcile_intent(&db, "/repo", Path::new("/store"), "main", "dest-a", "test")
+            claim_reconcile_intent(&db, "proj-1", Path::new("/store"), "main", "dest-a", "test")
                 .await
                 .unwrap()
                 .unwrap();
@@ -8235,7 +9076,7 @@ mod tests {
         let store = Path::new("/store");
         let stale = claim_reconcile_intent(
             &db,
-            "/repo",
+            "proj-1",
             store,
             "main",
             "destination-a",
@@ -8247,7 +9088,6 @@ mod tests {
 
         let current = refresh_stale_durable_intent(
             &db,
-            "/repo",
             store,
             "main",
             "destination-a",
@@ -8606,7 +9446,7 @@ mod tests {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
         let store = Path::new("/store");
-        let claim = claim_reconcile_intent(&db, "/repo", store, "main", "dest-a", "local_merge")
+        let claim = claim_reconcile_intent(&db, "proj-1", store, "main", "dest-a", "local_merge")
             .await
             .unwrap()
             .unwrap();
@@ -8713,7 +9553,7 @@ mod tests {
 
         let mut fingerprints = Vec::new();
         for dest in ["dest-a", "dest-b"] {
-            let claim = claim_reconcile_intent(&db, "/repo", store, "main", dest, "local_merge")
+            let claim = claim_reconcile_intent(&db, "proj-1", store, "main", dest, "local_merge")
                 .await
                 .unwrap()
                 .unwrap();
@@ -8869,7 +9709,7 @@ mod tests {
                 .expect("an open session")
         };
 
-        let d1 = claim_reconcile_intent(&db, "/repo", store, "main", "d1", "local_merge")
+        let d1 = claim_reconcile_intent(&db, "proj-1", store, "main", "d1", "local_merge")
             .await
             .unwrap()
             .unwrap();
@@ -8900,7 +9740,7 @@ mod tests {
         .unwrap();
 
         // A newer advance records over the unmoved resolution.
-        let d2 = claim_reconcile_intent(&db, "/repo", store, "main", "d2", "local_merge")
+        let d2 = claim_reconcile_intent(&db, "proj-1", store, "main", "d2", "local_merge")
             .await
             .unwrap()
             .unwrap();
@@ -8922,7 +9762,7 @@ mod tests {
         let store = Path::new("/store");
         let first = claim_reconcile_intent(
             &db,
-            "/repo",
+            "proj-1",
             store,
             "main",
             "dest-a",
@@ -8935,7 +9775,7 @@ mod tests {
         assert!(
             claim_reconcile_intent(
                 &db,
-                "/repo",
+                "proj-1",
                 store,
                 "main",
                 "dest-a",
@@ -8951,6 +9791,7 @@ mod tests {
         let waiter = tokio::spawn(async move {
             wait_for_reconcile_slot(
                 &waiting_db,
+                "proj-1",
                 Path::new("/store"),
                 "main",
                 "dest-a",
@@ -8968,12 +9809,12 @@ mod tests {
             .await
             .unwrap();
         waiter.await.unwrap().unwrap();
-        reopen_reconcile_intent(&db, store, "main", "dest-a", "agent/second")
+        reopen_reconcile_intent(&db, "proj-1", store, "main", "dest-a", "agent/second")
             .await
             .unwrap();
         let second = claim_reconcile_intent(
             &db,
-            "/repo",
+            "proj-1",
             store,
             "main",
             "dest-a",
@@ -8989,7 +9830,7 @@ mod tests {
         // satisfied by the older pass releasing its different destination.
         let moved = claim_reconcile_intent(
             &db,
-            "/repo",
+            "proj-1",
             store,
             "main",
             "dest-b",
@@ -9002,6 +9843,7 @@ mod tests {
         let moved_waiter = tokio::spawn(async move {
             wait_for_reconcile_slot(
                 &moved_waiting_db,
+                "proj-1",
                 Path::new("/store"),
                 "main",
                 "dest-b",
@@ -9022,12 +9864,12 @@ mod tests {
             .await
             .unwrap();
         moved_waiter.await.unwrap().unwrap();
-        reopen_reconcile_intent(&db, store, "main", "dest-b", "agent/second")
+        reopen_reconcile_intent(&db, "proj-1", store, "main", "dest-b", "agent/second")
             .await
             .unwrap();
         let moved_follow_on = claim_reconcile_intent(
             &db,
-            "/repo",
+            "proj-1",
             store,
             "main",
             "dest-b",
@@ -9040,17 +9882,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_coordinates_are_scoped_to_the_known_project() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        db.execute("INSERT INTO projects (id,workspace_id,name,key,repo_path,default_branch,created_at,updated_at)
+            VALUES ('proj-2','default','Second','second','/repo','main',1,1)",()).await.unwrap();
+        let store = Path::new("/store");
+        let first = claim_reconcile_intent(&db, "proj-1", store, "main", "dest", "first")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = claim_reconcile_intent(&db, "proj-2", store, "main", "dest", "second")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.project_id, "proj-2");
+        assert_eq!(
+            reconcile_intent_id(&db, "proj-1", store, "main", "dest")
+                .await
+                .as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(
+            reconcile_intent_id(&db, "proj-2", store, "main", "dest")
+                .await
+                .as_deref(),
+            Some(second.id.as_str())
+        );
+        finish_reconcile_intent(&db, &second.id, &second.owner, false)
+            .await
+            .unwrap();
+        wait_for_reconcile_slot(
+            &db,
+            "proj-2",
+            store,
+            "main",
+            "dest",
+            tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.query_text(
+                "SELECT status FROM jj_reconcile_intents WHERE id=?1",
+                (first.id.clone(),)
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("running")
+        );
+        finish_reconcile_intent(&db, &first.id, &first.owner, false)
+            .await
+            .unwrap();
+        reopen_reconcile_intent(&db, "proj-2", store, "main", "dest", "agent/second")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.query_text(
+                "SELECT status FROM jj_reconcile_intents WHERE id=?1",
+                (first.id.clone(),)
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("completed")
+        );
+        assert_eq!(
+            db.query_text(
+                "SELECT status FROM jj_reconcile_intents WHERE id=?1",
+                (second.id.clone(),)
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_intents_coalesce_and_stale_claims_resume() {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
         let store = Path::new("/store");
 
-        let claim = claim_reconcile_intent(&db, "/repo", store, "main", "dest-a", "local_merge")
+        let claim = claim_reconcile_intent(&db, "proj-1", store, "main", "dest-a", "local_merge")
             .await
             .unwrap()
             .expect("first trigger claims the pinned intent");
         assert!(
-            claim_reconcile_intent(&db, "/repo", store, "main", "dest-a", "webhook")
+            claim_reconcile_intent(&db, "proj-1", store, "main", "dest-a", "webhook")
                 .await
                 .unwrap()
                 .is_none(),
@@ -9122,14 +10044,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            claim_reconcile_intent(&db, "/repo", store, "main", "dest-a", "webhook")
+            claim_reconcile_intent(&db, "proj-1", store, "main", "dest-a", "webhook")
                 .await
                 .unwrap()
                 .is_none(),
             "completed duplicate delivery remains acknowledged"
         );
         assert!(
-            claim_reconcile_intent(&db, "/repo", store, "main", "dest-b", "webhook")
+            claim_reconcile_intent(&db, "proj-1", store, "main", "dest-b", "webhook")
                 .await
                 .unwrap()
                 .is_some(),
@@ -10085,9 +11007,15 @@ mod tests {
         assert!(message.contains(&"o".repeat(40)), "{message}");
         assert!(!message.contains("nothing to resolve"), "{message}");
         assert!(!message.contains("nothing to merge"), "{message}");
+        assert!(!message.contains("not by jj"), "{message}");
+        assert!(!message.contains("jj reported"), "{message}");
+        assert!(
+            !message.contains("without a recorded conflict"),
+            "{message}"
+        );
         assert!(
             !message.contains("the two sides genuinely disagree"),
-            "jj recorded no disagreement; the guidance must not claim one: {message}"
+            "scaffolding alone does not prove native disagreement: {message}"
         );
     }
 
@@ -11865,6 +12793,1196 @@ mod real_store_collision_tests {
         wait_for_worker(r).await;
     }
 
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn held_workspace_lookup_matches_repository_identity_not_branch_name() {
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for held workspace lookup");
+        let r = replay_harness(&bin, "held-workspace-identity.db", &[(LIST, "base\n")]).await;
+        let foreign = replay_harness(&bin, "foreign-held-workspace.db", &[(LIST, "base\n")]).await;
+        let tip = branch_tip(&r);
+        for (id, store, bookmark) in [
+            ("owned-held", &r.fx.store, "agent/owned-held"),
+            ("foreign-held", &foreign.fx.store, "agent/foreign-held"),
+        ] {
+            r.db.execute("INSERT INTO jj_reconcile_intents (id,project_id,store_path,target_branch,destination_commit,status,created_at,updated_at) VALUES (?1,'proj-1',?2,'main',?3,'completed',1,1)",
+                params![id,store.to_string_lossy().as_ref(),tip.as_str()]).await.unwrap();
+            r.db.execute("INSERT INTO jj_reconcile_items (intent_id,bookmark,status,updated_at,held_replay_source_cut,held_replay_source_tip) VALUES (?1,?2,'completed',1,?3,?3)",
+                params![id,bookmark,tip.as_str()]).await.unwrap();
+        }
+        let held = held_replay_bookmarks_for_repository(&r.orch.db, &r.branch_ws)
+            .await
+            .unwrap();
+        assert_eq!(held, ["agent/owned-held".to_string()].into_iter().collect());
+        assert_eq!(
+            crate::jj::repository_directory(&r.branch_ws),
+            crate::jj::repository_directory(&r.fx.store)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn held_child_retargets_after_parent_merge_and_recovers_after_parent_deletion() {
+        recover_retargeted_held_child(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn held_child_retargets_while_the_merged_parent_bookmark_still_exists() {
+        recover_retargeted_held_child(false).await;
+    }
+
+    async fn recover_retargeted_held_child(delete_parent: bool) {
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for held parent retarget");
+        let r = replay_harness(&bin, "held-retarget.db", &[(LIST, "base\n")]).await;
+        held_owner_snapshot(&r).await;
+        let cut = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("parent.txt", "old parent\n")],
+            "parent work",
+        );
+        let child = "agent/retarget-child";
+        let child_ws = r.fx.workspaces.path().join("retarget-child");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &child_ws, child, BRANCH, None).unwrap();
+        let held_tip = commit(
+            &r.fx,
+            &child_ws,
+            child,
+            &[(LIST, "child\n"), ("own.txt", "child own work\n")],
+            "child work",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, child).unwrap();
+        r.db.execute("INSERT INTO jobs (id,execution_id,recipe_node_id,issue_id,project_id,status,branch,base_branch,base_commit,created_at,updated_at)
+            VALUES ('retarget-child','exec-1','child','issue-1','proj-1','running',?1,?2,?3,1,1)",
+            params![child,BRANCH,cut.as_str()]).await.unwrap();
+        let main = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "incoming\n")],
+            "main changes child path",
+        );
+        set_main(&r.fx, &main);
+        automatic_advance(&r).await;
+        let original = held_replay_source(&r.db, &r.fx.store, child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.cut.as_deref(), Some(cut.as_str()));
+        assert_eq!(original.tip, held_tip);
+        let old_session = crate::orchestrator::conflict_session::load_active_session(&r.db, child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_session.target_branch, BRANCH);
+        assert_eq!(old_session.ours.as_deref(), Some(held_tip.as_str()));
+
+        let child_ws = r.fx.workspaces.path().join("retarget-child-resolution");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &child_ws, child, child, None).unwrap();
+        let resolution_tip = commit(
+            &r.fx,
+            &child_ws,
+            child,
+            &[(LIST, "incoming\n")],
+            "commit child resolution",
+        );
+        let resolution_basis = old_session
+            .resolution_basis_at(&r.fx.jj, &r.fx.store, &resolution_tip)
+            .unwrap();
+        assert!(
+            !resolution_basis.is_empty(),
+            "the open session carries actual committed-resolution evidence"
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, child).unwrap();
+        crate::jj::merge_into_bookmark(&r.fx.jj, &r.fx.store, "main", BRANCH).unwrap();
+        let folded_main = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, "main").unwrap();
+        let accepted_ws = r.fx.workspaces.path().join("accepted-main-landing");
+        let accepted_branch = "agent/accepted-main-landing";
+        crate::jj::add_workspace(
+            &r.fx.jj,
+            &r.fx.store,
+            &accepted_ws,
+            accepted_branch,
+            &folded_main,
+            None,
+        )
+        .unwrap();
+        let destination = commit(
+            &r.fx,
+            &accepted_ws,
+            accepted_branch,
+            &[
+                ("parent.txt", "accepted parent\n"),
+                ("after-merge.txt", "new main work\n"),
+            ],
+            "accepted parent landing",
+        );
+        set_main(&r.fx, &destination);
+        assert!(
+            !crate::jj::revset_descends_from(&r.fx.jj, &r.fx.store, &destination, &cut),
+            "the destination does not carry obsolete parent commit identity"
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, BRANCH).unwrap();
+        if delete_parent {
+            let deleted = crate::env::command(&bin)
+                .current_dir(&r.fx.store)
+                .env("JJ_CONFIG", r.fx.home.join("jj/config.toml"))
+                .args(["bookmark", "forget", BRANCH, "--ignore-working-copy"])
+                .output()
+                .unwrap();
+            assert!(
+                deleted.status.success(),
+                "{}",
+                String::from_utf8_lossy(&deleted.stderr)
+            );
+            let deleted_git = crate::env::git()
+                .current_dir(&r.fx.repo)
+                .args(["update-ref", "-d", &format!("refs/heads/{BRANCH}")])
+                .output()
+                .unwrap();
+            assert!(deleted_git.status.success());
+            assert!(crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, BRANCH).is_none());
+        } else {
+            assert_eq!(
+                crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, BRANCH).as_deref(),
+                Some(folded_main.as_str())
+            );
+        }
+
+        let in_flight = claim_reconcile_intent(
+            &r.db,
+            "proj-1",
+            &r.fx.store,
+            "main",
+            &destination,
+            "existing main pass",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // A newer active destination row must not be overwritten, and refusal
+        // rolls back the jobs and original obligation together.
+        r.db.execute("INSERT INTO jj_reconcile_items (intent_id,bookmark,status,updated_at,resolution_state) VALUES (?1,?2,'completed',1,'open')",
+            params![in_flight.id.as_str(),child]).await.unwrap();
+        {
+            let _guard = r
+                .orch
+                .acquire_jj_store_lock(
+                    &r.fx.store,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    "test held child retarget",
+                )
+                .await;
+            assert!(repoint_children_of_merged_branch(
+                &r.db,
+                "proj-1",
+                BRANCH,
+                "main",
+                &r.fx.store,
+                &destination
+            )
+            .await
+            .unwrap_err()
+            .contains("newer destination authority"));
+        }
+        assert_eq!(
+            held_replay_source(&r.db, &r.fx.store, child)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&original)
+        );
+        assert_eq!(
+            r.db.query_text("SELECT base_branch FROM jobs WHERE id='retarget-child'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(BRANCH)
+        );
+        r.db.execute(
+            "DELETE FROM jj_reconcile_items WHERE intent_id=?1 AND bookmark=?2",
+            params![in_flight.id.as_str(), child],
+        )
+        .await
+        .unwrap();
+        {
+            let _guard = r
+                .orch
+                .acquire_jj_store_lock(
+                    &r.fx.store,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    "test accepted parent retarget",
+                )
+                .await;
+            repoint_children_of_merged_branch(
+                &r.db,
+                "proj-1",
+                BRANCH,
+                "main",
+                &r.fx.store,
+                &destination,
+            )
+            .await
+            .unwrap();
+        }
+        let transported = held_replay_source(&r.db, &r.fx.store, child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(transported.base_branch, "main");
+        assert_eq!(transported.destination, destination);
+        assert_eq!(transported.cut, original.cut);
+        assert_eq!(transported.tip, original.tip);
+        let historical = crate::orchestrator::conflict_session::load_active_session(&r.db, child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.intent_id, old_session.intent_id);
+        assert_eq!(historical.target_branch, old_session.target_branch);
+        assert_eq!(
+            historical.destination_commit,
+            old_session.destination_commit
+        );
+        assert_eq!(historical.theirs, old_session.theirs);
+        assert_eq!(historical.resolution_basis, old_session.resolution_basis);
+        assert_eq!(
+            historical
+                .resolution_basis_at(&r.fx.jj, &r.fx.store, &resolution_tip)
+                .unwrap(),
+            resolution_basis
+        );
+        assert_eq!(
+            r.db.query_text(
+                "SELECT lease_owner FROM jj_reconcile_intents WHERE id=?1",
+                (in_flight.id.clone(),)
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(in_flight.owner.as_str())
+        );
+        finish_reconcile_intent(&r.db, &in_flight.id, &in_flight.owner, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.db.query_text(
+                "SELECT status FROM jj_reconcile_intents WHERE id=?1",
+                (in_flight.id.clone(),)
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("pending"),
+            "a pass that captured its siblings before retarget must leave the new item claimable"
+        );
+
+        request_branch_replay(&r.orch, &r.db, "retarget-child", child, None, true, None)
+            .await
+            .unwrap();
+        wait_for_worker(&r).await;
+        assert!(crate::jj::revset_descends_from(
+            &r.fx.jj,
+            &r.fx.store,
+            child,
+            &destination
+        ));
+        assert!(held_replay_source(&r.db, &r.fx.store, child)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::jj::text_at_revision(&r.fx.jj, &r.fx.store, child, "own.txt")
+                .unwrap()
+                .as_deref(),
+            Some("child own work\n")
+        );
+        assert_eq!(
+            crate::jj::text_at_revision(&r.fx.jj, &r.fx.store, child, "parent.txt")
+                .unwrap()
+                .as_deref(),
+            Some("accepted parent\n")
+        );
+        assert_eq!(
+            crate::jj::text_at_revision(&r.fx.jj, &r.fx.store, child, "after-merge.txt")
+                .unwrap()
+                .as_deref(),
+            Some("new main work\n")
+        );
+        // Simulate the consume-before-close window seen by a delayed request.
+        r.db.execute("UPDATE jj_reconcile_items SET resolution_state='open' WHERE intent_id=?1 AND bookmark=?2",params![old_session.intent_id.as_str(),child]).await.unwrap();
+        assert!(held_replay_source(&r.db, &r.fx.store, child)
+            .await
+            .unwrap()
+            .is_none());
+        let accepted_tip = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, child).unwrap();
+        request_branch_replay(&r.orch, &r.db, "retarget-child", child, None, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, child).as_deref(),
+            Some(accepted_tip.as_str())
+        );
+        assert_eq!(
+            r.db.query_text("SELECT base_commit FROM jobs WHERE id='retarget-child'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(destination.as_str()),
+            "a historical session cannot regain routing authority after receipt discharge"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn held_ownership_routes_across_databases_sharing_a_physical_store() {
+        cross_project_held_ownership(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn held_ownership_routes_across_projects_in_one_database() {
+        cross_project_held_ownership(false).await;
+    }
+
+    async fn cross_project_held_ownership(separate_database: bool) {
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for physical-store ownership");
+        let r = replay_harness(&bin, "physical-owner-a.db", &[(LIST, "base\n")]).await;
+        let other = replay_harness(&bin, "physical-owner-b.db", &[(LIST, "base\n")]).await;
+        held_owner_snapshot(&r).await;
+        let scoped = |suffix: &str| {
+            if separate_database {
+                format!("teamABC123~00000000-0000-4000-8000-{suffix}")
+            } else {
+                format!("local-{suffix}")
+            }
+        };
+        let b_project = scoped("000000000001");
+        let b_issue = scoped("000000000002");
+        let b_execution = scoped("000000000003");
+        let b_job = scoped("000000000004");
+        let g_job = scoped("000000000005");
+        let b_db = if separate_database {
+            other.db.clone()
+        } else {
+            r.db.clone()
+        };
+        if separate_database {
+            r.orch
+                .db
+                .register_team_db_for_test("teamABC123".to_string(), b_db.clone())
+                .await;
+            r.orch
+                .db
+                .set_route("project-b", Some("teamABC123".into()))
+                .await;
+        }
+        if separate_database {
+            r.db.execute("INSERT INTO teams (id,name,sync_url,replica_path,created_at) VALUES ('teamABC123','Held team','http://sync','/tmp/held-team.db',1)",()).await.unwrap();
+            r.db.execute("INSERT INTO project_routes (project_key,team_id,local_repo_path,created_at) VALUES ('project-b','teamABC123',?1,1)",params![r.fx.repo.to_string_lossy().as_ref()]).await.unwrap();
+        }
+        let synced_repo = if separate_database {
+            "/creator/machine/repository".to_string()
+        } else {
+            r.fx.repo.to_string_lossy().into_owned()
+        };
+        b_db.execute("INSERT INTO projects (id,workspace_id,name,key,repo_path,default_branch,created_at,updated_at)
+            VALUES (?1,'default','Other owner','project-b',?2,?3,1,1)",params![b_project.as_str(),synced_repo.as_str(),BRANCH]).await.unwrap();
+        b_db.execute(
+            "INSERT INTO issues (id,project_id,number,title,status,created_at,updated_at)
+            VALUES (?1,?2,1,'Other owner','active',1,1)",
+            params![b_issue.as_str(), b_project.as_str()],
+        )
+        .await
+        .unwrap();
+        let mut snapshot: crate::models::ExecutionSnapshot = serde_json::from_str(
+            &crate::test_support::shipping_execution_snapshot_json(&b_issue, &b_project),
+        )
+        .unwrap();
+        let mut prototype = snapshot
+            .recipe
+            .nodes
+            .iter()
+            .find(|node| node.agent_config.is_some())
+            .unwrap()
+            .clone();
+        prototype.agent_config.as_mut().unwrap().git_config = Some(crate::models::AgentGitConfig {
+            branch_mode: crate::models::BranchMode::Isolate,
+            ..Default::default()
+        });
+        snapshot.recipe.nodes = ["independent-b", "grandchild-b"]
+            .into_iter()
+            .map(|id| {
+                let mut node = prototype.clone();
+                node.id = id.to_string();
+                node
+            })
+            .collect();
+        b_db.execute("INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,seq,snapshot)
+            VALUES (?1,'recipe-default',?2,?3,'running',1,1,?4)",params![b_execution.as_str(),b_issue.as_str(),b_project.as_str(),serde_json::to_string(&snapshot).unwrap()]).await.unwrap();
+
+        let parent_cut = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("parent.txt", "parent\n")],
+            "parent work",
+        );
+        let c = "agent/physical-owner-c";
+        let c_ws = r.fx.workspaces.path().join("physical-owner-c");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &c_ws, c, BRANCH, None).unwrap();
+        let c_cut = commit(&r.fx, &c_ws, c, &[(LIST, "C own conflict\n")], "C work");
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, c).unwrap();
+        r.db.execute("INSERT INTO jobs (id,execution_id,recipe_node_id,issue_id,project_id,status,branch,base_branch,base_commit,created_at,updated_at)
+            VALUES ('physical-c','exec-1','child','issue-1','proj-1','running',?1,?2,?3,1,1)",params![c,BRANCH,c_cut.as_str()]).await.unwrap();
+        // C's mint cut is the original parent, not its own sealed tip.
+        r.db.execute(
+            "UPDATE jobs SET base_commit=?1 WHERE id='physical-c'",
+            params![parent_cut.as_str()],
+        )
+        .await
+        .unwrap();
+        let observer = scoped("000000000008");
+        b_db.execute("INSERT INTO jobs (id,project_id,status,branch,base_branch,base_commit,created_at,updated_at) VALUES (?1,?2,'running',?3,?3,?4,1,1)",
+            params![observer.as_str(),b_project.as_str(),c,c_cut.as_str()]).await.unwrap();
+        r.db.execute("INSERT INTO workflow_run (run_id,job_id,workflow_id,project_id,anchor_branch,branch_mode,package_path,script_path,args_json,output_name,created_at) VALUES (?1,?2,'observer',?3,?4,'inherit','/workflow','/workflow/main.ts','{}','result',1)",
+            params![scoped("000000000009"),observer.as_str(),b_project.as_str(),c]).await.unwrap();
+        let independent = "agent/physical-owner-b";
+        let b_ws = r.fx.workspaces.path().join("physical-owner-b");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &b_ws, independent, BRANCH, None).unwrap();
+        let b_tip = commit(
+            &r.fx,
+            &b_ws,
+            independent,
+            &[(LIST, "B own conflict\n")],
+            "B work",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, independent).unwrap();
+        let grandchild = "agent/physical-owner-g";
+        let g_ws = r.fx.workspaces.path().join("physical-owner-g");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &g_ws, grandchild, c, None).unwrap();
+        let g_tip = commit(
+            &r.fx,
+            &g_ws,
+            grandchild,
+            &[("grandchild.txt", "G own work\n")],
+            "G work",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, grandchild).unwrap();
+        for (id, node, branch, base, cut) in [
+            (
+                b_job.as_str(),
+                "independent-b",
+                independent,
+                BRANCH,
+                parent_cut.as_str(),
+            ),
+            (
+                g_job.as_str(),
+                "grandchild-b",
+                grandchild,
+                c,
+                c_cut.as_str(),
+            ),
+        ] {
+            b_db.execute("INSERT INTO jobs (id,execution_id,recipe_node_id,issue_id,project_id,status,branch,base_branch,base_commit,created_at,updated_at)
+                VALUES (?1,?6,?2,?7,?8,'running',?3,?4,?5,1,1)",params![id,node,branch,base,cut,b_execution.as_str(),b_issue.as_str(),b_project.as_str()]).await.unwrap();
+            b_db.execute(
+                "INSERT INTO runs (id,issue_id,project_id,job_id,status,created_at,updated_at)
+                VALUES (?1,?3,?4,?2,'live',1,1)",
+                params![
+                    scoped(if id == b_job {
+                        "000000000006"
+                    } else {
+                        "000000000007"
+                    }),
+                    id,
+                    b_issue.as_str(),
+                    b_project.as_str()
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let main = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "incoming\n")],
+            "main advance",
+        );
+        set_main(&r.fx, &main);
+        automatic_advance(&r).await;
+        let b_source = held_replay_source(&b_db, &r.fx.store, independent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b_source.cut.as_deref(), Some(parent_cut.as_str()));
+        assert_eq!(b_source.tip, b_tip);
+        let b_session =
+            crate::orchestrator::conflict_session::load_active_session(&b_db, independent)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(b_session.target_branch, BRANCH);
+        assert_eq!(
+            b_db.query_text(
+                "SELECT project_id FROM jj_reconcile_intents WHERE id=?1",
+                (b_session.intent_id.clone(),)
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(b_project.as_str())
+        );
+        assert_eq!(r.db.query_text("SELECT CAST(COUNT(*) AS TEXT) FROM jj_reconcile_items i JOIN jj_reconcile_intents n ON n.id=i.intent_id WHERE n.project_id='proj-1' AND i.bookmark=?1",(independent,)).await.unwrap().as_deref(),Some("0"));
+        if separate_database {
+            assert!(held_replay_source(&r.db, &r.fx.store, independent)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let g_source = held_replay_source(&b_db, &r.fx.store, grandchild)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            b_db.query_text(
+                "SELECT project_id FROM jj_reconcile_intents WHERE id=?1",
+                (g_source.intent_id.clone(),)
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(b_project.as_str())
+        );
+        assert_eq!(g_source.cut.as_deref(), Some(c_cut.as_str()));
+        assert!(
+            held_replay_source_cut(&r.orch, &b_db, &r.fx.jj, &r.fx.store, grandchild, c)
+                .await
+                .unwrap_err()
+                .contains("waits for immediate parent"),
+            "a parent session in another database is still authoritative in this physical store"
+        );
+        assert!(
+            crate::orchestrator::conflict_session::load_active_session(&b_db, grandchild)
+                .await
+                .unwrap()
+                .is_none(),
+            "the full held map blocks G behind C across ownership boundaries"
+        );
+        let foreign_tip = branch_tip(&other);
+        other.db.execute("INSERT INTO jj_reconcile_intents (id,project_id,store_path,target_branch,destination_commit,status,created_at,updated_at) VALUES ('unrelated-held','proj-1',?1,'main',?2,'completed',1,1)",params![other.fx.store.to_string_lossy().as_ref(),foreign_tip.as_str()]).await.unwrap();
+        other.db.execute("INSERT INTO jj_reconcile_items (intent_id,bookmark,status,updated_at,held_replay_source_cut,held_replay_source_tip) VALUES ('unrelated-held','agent/unrelated-held','completed',1,?1,?1)",params![foreign_tip.as_str()]).await.unwrap();
+        let union = held_replay_bookmarks_for_repository(&r.orch.db, &r.fx.store)
+            .await
+            .unwrap();
+        assert!(union.contains(independent) && union.contains(grandchild));
+        assert!(
+            !union.contains("agent/unrelated-held"),
+            "another database's unrelated physical store is excluded"
+        );
+
+        let recovery_ws = r.fx.workspaces.path().join("physical-c-resolution");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &recovery_ws, c, c, None).unwrap();
+        commit(
+            &r.fx,
+            &recovery_ws,
+            c,
+            &[
+                (LIST, "incoming\n"),
+                ("after-resolution.txt", "C later work\n"),
+            ],
+            "resolve C and add work",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, c).unwrap();
+        request_branch_replay(&r.orch, &r.db, "physical-c", c, None, true, None)
+            .await
+            .unwrap();
+        wait_for_worker(&r).await;
+        let c_after = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, c).unwrap();
+        assert!(crate::jj::revset_descends_from(
+            &r.fx.jj,
+            &r.fx.store,
+            c,
+            &main
+        ));
+        assert_eq!(
+            crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, grandchild).as_deref(),
+            Some(g_tip.as_str()),
+            "A's clean implicit rewrite must preserve B's original cut"
+        );
+        assert_eq!(
+            held_replay_source(&b_db, &r.fx.store, grandchild)
+                .await
+                .unwrap()
+                .unwrap()
+                .cut
+                .as_deref(),
+            Some(c_cut.as_str())
+        );
+        // The same team overlay must route automatic publication, not only an
+        // explicit request. A completed merge into C advances its live child G.
+        let merged_job = scoped("000000000010");
+        b_db.execute("INSERT INTO jobs (id,project_id,status,base_branch,created_at,updated_at) VALUES (?1,?2,'complete',?3,1,1)",params![merged_job.as_str(),b_project.as_str(),c]).await.unwrap();
+        notify_downstream_of_base_advance(&r.orch, &merged_job)
+            .await
+            .unwrap();
+        wait_for_reconcile_workers(&b_db).await;
+        assert!(
+            crate::jj::revset_descends_from(&r.fx.jj, &r.fx.store, grandchild, &c_after),
+            "automatic publication must use the machine-local team repository"
+        );
+        assert!(held_replay_source(&b_db, &r.fx.store, grandchild)
+            .await
+            .unwrap()
+            .is_none());
+        request_branch_replay(&r.orch, &b_db, &g_job, grandchild, None, false, None)
+            .await
+            .unwrap();
+        assert_eq!(b_db.query_text("SELECT project_id FROM jj_reconcile_intents WHERE store_path=?1 AND target_branch=?2 AND destination_commit=?3 AND project_id=?4",params![r.fx.store.to_string_lossy().as_ref(),c,c_after.as_str(),b_project.as_str()]).await.unwrap().as_deref(),Some(b_project.as_str()));
+        assert!(crate::jj::revset_descends_from(
+            &r.fx.jj,
+            &r.fx.store,
+            grandchild,
+            &c_after
+        ));
+        assert!(held_replay_source(&b_db, &r.fx.store, grandchild)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::jj::text_at_revision(&r.fx.jj, &r.fx.store, grandchild, "grandchild.txt")
+                .unwrap()
+                .as_deref(),
+            Some("G own work\n")
+        );
+        assert_eq!(
+            crate::jj::text_at_revision(&r.fx.jj, &r.fx.store, grandchild, "after-resolution.txt")
+                .unwrap()
+                .as_deref(),
+            Some("C later work\n")
+        );
+    }
+
+    async fn held_owner_snapshot(r: &Replay) {
+        let mut snapshot: crate::models::ExecutionSnapshot = serde_json::from_str(
+            &crate::test_support::shipping_execution_snapshot_json("issue-1", "proj-1"),
+        )
+        .unwrap();
+        let mut prototype = snapshot
+            .recipe
+            .nodes
+            .iter()
+            .find(|node| node.agent_config.is_some())
+            .unwrap()
+            .clone();
+        prototype.agent_config.as_mut().unwrap().git_config = Some(crate::models::AgentGitConfig {
+            branch_mode: crate::models::BranchMode::Isolate,
+            ..Default::default()
+        });
+        snapshot.recipe.nodes = ["node", "child", "grandchild"]
+            .into_iter()
+            .map(|id| {
+                let mut node = prototype.clone();
+                node.id = id.to_string();
+                node
+            })
+            .collect();
+        r.db.execute(
+            "UPDATE executions SET snapshot=?1 WHERE id='exec-1'",
+            (serde_json::to_string(&snapshot).unwrap(),),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn clean_parent_advance_opens_only_the_held_childs_session() {
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for held-child session regression");
+        let r = replay_harness(&bin, "held-child-session.db", &[(LIST, "base\n")]).await;
+        held_owner_snapshot(&r).await;
+        let parent_before = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("parent.txt", "parent\n")],
+            "parent work",
+        );
+        let child = "agent/child";
+        let child_ws = r.fx.workspaces.path().join("child");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &child_ws, child, BRANCH, None).unwrap();
+        let child_before = commit(&r.fx, &child_ws, child, &[(LIST, "child\n")], "child work");
+        let grandchild = "agent/grandchild";
+        let grandchild_ws = r.fx.workspaces.path().join("grandchild");
+        crate::jj::add_workspace(
+            &r.fx.jj,
+            &r.fx.store,
+            &grandchild_ws,
+            grandchild,
+            child,
+            None,
+        )
+        .unwrap();
+        let grandchild_before = commit(
+            &r.fx,
+            &grandchild_ws,
+            grandchild,
+            &[("grandchild.txt", "grandchild\n")],
+            "grandchild work",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, grandchild).unwrap();
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, child).unwrap();
+        r.db.execute_script(format!(
+            "INSERT INTO jobs
+             (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('job-child', 'exec-1', 'child', 'issue-1', 'proj-1', 'running', '{child}', '{BRANCH}', 1, 1);
+             INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+             VALUES ('run-child', 'issue-1', 'proj-1', 'job-child', 'live', 1, 1);
+             INSERT INTO jobs
+             (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('job-grandchild', 'exec-1', 'grandchild', 'issue-1', 'proj-1', 'running', '{grandchild}', '{child}', 1, 1);
+             INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+             VALUES ('run-grandchild', 'issue-1', 'proj-1', 'job-grandchild', 'live', 1, 1);"
+        )).await.unwrap();
+        r.db.execute(
+            "UPDATE jobs SET base_commit=?1 WHERE id='job-child'",
+            (parent_before.as_str(),),
+        )
+        .await
+        .unwrap();
+        r.db.execute(
+            "UPDATE jobs SET base_commit=?1 WHERE id='job-grandchild'",
+            (child_before.as_str(),),
+        )
+        .await
+        .unwrap();
+        r.db.execute(
+            "INSERT INTO jobs (id, project_id, parent_job_id, status, branch, base_branch, base_commit, created_at, updated_at)
+             VALUES ('inherited-observer','proj-1','job-grandchild','running',?1,?2,?3,1,1)",
+            params![grandchild, child, parent_before.as_str()],
+        ).await.unwrap();
+        let main = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "incoming\n")],
+            "main changes child path",
+        );
+        set_main(&r.fx, &main);
+        automatic_advance(&r).await;
+
+        let parent_after = branch_tip(&r);
+        let source = held_replay_source(&r.db, &r.fx.store, grandchild)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source.cut.as_deref(),
+            Some(child_before.as_str()),
+            "inherited observer is not a cut owner"
+        );
+        assert_eq!(source.tip, grandchild_before);
+        assert!(
+            refuse_held_continuity(&r.db, &r.fx.jj, &r.fx.store, &grandchild_before)
+                .await
+                .unwrap_err()
+                .contains("held branch")
+        );
+        assert!(crate::jj::revset_descends_from(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &main
+        ));
+        assert_eq!(
+            crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, child).as_deref(),
+            Some(child_before.as_str())
+        );
+        assert!(!crate::jj::branch_has_conflict(&r.fx.jj, &r.fx.store, child).unwrap());
+        assert!(
+            crate::orchestrator::conflict_session::load_active_session(&r.db, BRANCH)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let session = crate::orchestrator::conflict_session::load_active_session(&r.db, child)
+            .await
+            .unwrap()
+            .expect("the held child owns an independent session");
+        assert_eq!(session.ours.as_deref(), Some(child_before.as_str()));
+        assert_eq!(session.theirs.as_deref(), Some(parent_after.as_str()));
+        assert_eq!(session.incoming.base_branch, BRANCH);
+        assert_eq!(session.target_branch, BRANCH);
+        assert_eq!(session.destination_commit, parent_after);
+        // Storing one held child is not a verdict for the whole destination:
+        // the same parent advance must still service another sibling.
+        let sibling = "agent/same-destination";
+        let sibling_ws = r.fx.workspaces.path().join("same-destination");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &sibling_ws, sibling, BRANCH, None)
+            .unwrap();
+        commit(
+            &r.fx,
+            &sibling_ws,
+            sibling,
+            &[("sibling.txt", "sibling\n")],
+            "sibling work",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, sibling).unwrap();
+        r.db.execute(
+            "INSERT INTO jobs (id, project_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('job-same-destination', 'proj-1', 'running', ?1, ?2, 1, 1)",
+            params![sibling, BRANCH],
+        )
+        .await
+        .unwrap();
+        let serviced = reconcile_base_advance(
+            &r.orch,
+            &r.db,
+            "proj-1",
+            "same destination",
+            &r.fx.repo.to_string_lossy(),
+            BRANCH,
+            BRANCH,
+            vec![SiblingJob {
+                id: "job-same-destination".to_string(),
+                branch: Some(sibling.to_string()),
+                base_commit: None,
+            }],
+            BaseAdvanceNotes {
+                conflict: build_jj_conflict_note(BRANCH, None, None),
+                clean: build_jj_clean_note(BRANCH, None, None),
+                incoming: IncomingIdentity {
+                    base_branch: BRANCH.to_string(),
+                    ..IncomingIdentity::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serviced.eligible, 1,
+            "the session-only intent does not coalesce away a sibling pass"
+        );
+        wait_for_worker(&r).await;
+        assert_eq!(
+            r.db.query_opt_text(
+                "SELECT base_commit FROM jobs WHERE id = 'job-same-destination'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(parent_after.as_str())
+        );
+        assert!(
+            crate::orchestrator::conflict_session::load_active_session(&r.db, grandchild)
+                .await
+                .unwrap()
+                .is_none(),
+            "a blocked grandchild must not resolve onto the ancestor"
+        );
+        assert_eq!(
+            crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, grandchild).as_deref(),
+            Some(grandchild_before.as_str())
+        );
+        // Resolve the child on its held clean tip, then add work that did not
+        // exist at the ancestor's advance. Recovery must inherit both.
+        let recovery_ws = r.fx.workspaces.path().join("child-recovery");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &recovery_ws, child, child, None).unwrap();
+        commit(
+            &r.fx,
+            &recovery_ws,
+            child,
+            &[(LIST, "incoming\n")],
+            "resolve child",
+        );
+        commit(
+            &r.fx,
+            &recovery_ws,
+            child,
+            &[("after-resolution.txt", "child later work\n")],
+            "child later work",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, child).unwrap();
+        request_branch_replay(&r.orch, &r.db, "job-child", child, None, true, None)
+            .await
+            .unwrap();
+        wait_for_worker(&r).await;
+        let child_after = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, child).unwrap();
+        assert!(crate::jj::revset_descends_from(
+            &r.fx.jj,
+            &r.fx.store,
+            child,
+            &parent_after
+        ));
+        let expected_source = held_replay_source(&r.db, &r.fx.store, grandchild)
+            .await
+            .unwrap()
+            .unwrap();
+        // Closing the owning intent cannot erase an unconsumed branch obligation.
+        r.db.execute("UPDATE jj_reconcile_intents SET status='completed' WHERE id IN (SELECT intent_id FROM jj_reconcile_items WHERE bookmark=?1)", (grandchild,)).await.unwrap();
+        assert_eq!(
+            held_replay_source(&r.db, &r.fx.store, grandchild)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected_source)
+        );
+        r.db.execute("UPDATE jj_reconcile_items SET held_replay_source_cut=NULL WHERE bookmark=?1 AND held_replay_source_tip IS NOT NULL", (grandchild,)).await.unwrap();
+        assert!(
+            held_replay_source_cut(&r.orch, &r.db, &r.fx.jj, &r.fx.store, grandchild, child)
+                .await
+                .unwrap_err()
+                .contains("no proven")
+        );
+        assert!(held_replay_source(&r.db, &r.fx.store, grandchild)
+            .await
+            .unwrap()
+            .unwrap()
+            .cut
+            .is_none());
+        r.db.execute("UPDATE jj_reconcile_items SET held_replay_source_cut=?1 WHERE bookmark=?2 AND held_replay_source_tip IS NOT NULL", params![child_before.as_str(),grandchild]).await.unwrap();
+
+        let preview_op = crate::jj::operation_id(&r.fx.jj, &r.fx.store).unwrap();
+        crate::jj::rebase_branch_onto_from_cut(
+            &r.fx.jj,
+            &r.fx.store,
+            grandchild,
+            &child_after,
+            &child_before,
+        )
+        .unwrap();
+        assert_eq!(
+            held_replay_source(&r.db, &r.fx.store, grandchild)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected_source),
+            "preview preserves receipt values"
+        );
+        let mut stale = expected_source.clone();
+        stale.tip = parent_before.clone();
+        clear_held_replay_source(
+            &r.db,
+            &r.fx.jj,
+            &r.fx.store,
+            grandchild,
+            &child_after,
+            grandchild,
+            Some(&stale),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            held_replay_source(&r.db, &r.fx.store, grandchild)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected_source),
+            "stale generation cannot consume a newer receipt"
+        );
+        crate::jj::restore_operation(&r.fx.jj, &r.fx.store, &preview_op).unwrap();
+        request_branch_replay(
+            &r.orch,
+            &r.db,
+            "job-grandchild",
+            grandchild,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_worker(&r).await;
+        assert!(
+            crate::jj::revset_descends_from(&r.fx.jj, &r.fx.store, grandchild, &child_after),
+            "grandchild recovery follows the resolved immediate parent"
+        );
+        assert!(
+            held_replay_source(&r.db, &r.fx.store, grandchild)
+                .await
+                .unwrap()
+                .is_none(),
+            "accepted exact replay consumes the outstanding generation"
+        );
+        let grandchild_after =
+            crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, grandchild).unwrap();
+        assert_eq!(
+            crate::jj::text_at_revision(
+                &r.fx.jj,
+                &r.fx.store,
+                &grandchild_after,
+                "after-resolution.txt"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("child later work\n")
+        );
+        assert_eq!(
+            crate::jj::text_at_revision(&r.fx.jj, &r.fx.store, &grandchild_after, "grandchild.txt")
+                .unwrap()
+                .as_deref(),
+            Some("grandchild\n")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn held_session_installation_precedes_queued_parent_writer() {
+        let bin = crate::jj::tests::jj_bin()
+            .expect("real jj required for pinned held-session coordinates");
+        let r = replay_harness(&bin, "held-pinned-parent.db", &[(LIST, "base\n")]).await;
+        held_owner_snapshot(&r).await;
+        let parent_before = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("parent.txt", "parent\n")],
+            "parent work",
+        );
+        let child = "agent/clean-child";
+        let child_ws = r.fx.workspaces.path().join("clean-child");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &child_ws, child, BRANCH, None).unwrap();
+        let child_before = commit(
+            &r.fx,
+            &child_ws,
+            child,
+            &[("child.txt", "child\n")],
+            "child work",
+        );
+        let grandchild = "agent/held-grandchild";
+        let grandchild_ws = r.fx.workspaces.path().join("held-grandchild");
+        crate::jj::add_workspace(
+            &r.fx.jj,
+            &r.fx.store,
+            &grandchild_ws,
+            grandchild,
+            child,
+            None,
+        )
+        .unwrap();
+        let ours = commit(
+            &r.fx,
+            &grandchild_ws,
+            grandchild,
+            &[(LIST, "grandchild\n")],
+            "grandchild conflict",
+        );
+        crate::jj::forget_workspace(&r.fx.jj, &r.fx.store, grandchild).unwrap();
+        for (id, branch, base) in [
+            ("clean-child-job", child, BRANCH),
+            ("held-grandchild-job", grandchild, child),
+        ] {
+            r.db.execute(
+                "INSERT INTO jobs (id, project_id, status, branch, base_branch, created_at, updated_at)
+                 VALUES (?1, 'proj-1', 'running', ?2, ?3, 1, 1)",
+                params![id, branch, base],
+            ).await.unwrap();
+        }
+        r.db.execute("UPDATE jobs SET execution_id='exec-1', recipe_node_id='child', base_commit=?1 WHERE id='clean-child-job'",
+            (parent_before.as_str(),)).await.unwrap();
+        r.db.execute("UPDATE jobs SET execution_id='exec-1', recipe_node_id='grandchild', base_commit=?1 WHERE id='held-grandchild-job'",
+            (child_before.as_str(),)).await.unwrap();
+        let main = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "incoming\n")],
+            "incoming conflict",
+        );
+        set_main(&r.fx, &main);
+        let guard = r
+            .orch
+            .acquire_jj_store_lock(
+                &r.fx.store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "pin held coordinates",
+            )
+            .await;
+        let held =
+            match crate::jj::rebase_branch_onto(&r.fx.jj, &r.fx.store, BRANCH, "main").unwrap() {
+                crate::jj::RebaseOutcome::Rebased { held_descendants } => held_descendants,
+                other => panic!("parent must advance cleanly: {other:?}"),
+            };
+        assert!(held.contains_key(grandchild));
+        assert!(
+            !held.contains_key(child),
+            "the immediate parent advanced cleanly"
+        );
+        let failed_tip = held[grandchild].conflicted_tip.clone();
+        let child_at_replay = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, child).unwrap();
+        // Poll the queued writer before installation. It cannot acquire this
+        // guard until the owning replay has established the held session.
+        let writer = async {
+            let writer_guard = r
+                .orch
+                .acquire_jj_store_lock(
+                    &r.fx.store,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    "queued parent writer",
+                )
+                .await;
+            let pinned =
+                crate::orchestrator::conflict_session::load_active_session(&r.db, grandchild)
+                    .await
+                    .unwrap()
+                    .expect("a queued writer must observe the held session");
+            assert_eq!(pinned.target_branch, child);
+            assert_eq!(pinned.incoming.base_branch, child);
+            assert_eq!(pinned.destination_commit, child_at_replay);
+            assert_eq!(pinned.theirs.as_deref(), Some(child_at_replay.as_str()));
+            assert_eq!(pinned.ours.as_deref(), Some(ours.as_str()));
+            assert_eq!(pinned.conflicted_tip, failed_tip);
+            let later = commit(
+                &r.fx,
+                &child_ws,
+                child,
+                &[("later.txt", "new destination work\n")],
+                "parent advances again",
+            );
+            drop(writer_guard);
+            later
+        };
+        let install = async {
+            tokio::task::yield_now().await;
+            persist_held_descendant_sessions(&r.orch, &r.db, "proj-1", &r.fx.store, &held)
+                .await
+                .unwrap();
+            drop(guard);
+        };
+        let (child_later, ()) = tokio::join!(writer, install);
+        assert_ne!(child_at_replay, child_later);
+        let pinned = crate::orchestrator::conflict_session::load_active_session(&r.db, grandchild)
+            .await
+            .unwrap()
+            .expect("parent-only movement preserves the recovery obligation");
+        assert_eq!(pinned.destination_commit, child_at_replay);
+        assert_eq!(pinned.conflicted_tip, failed_tip);
+        request_branch_replay(
+            &r.orch,
+            &r.db,
+            "held-grandchild-job",
+            grandchild,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_worker(&r).await;
+        let current = crate::orchestrator::conflict_session::load_active_session(&r.db, grandchild)
+            .await
+            .unwrap()
+            .expect("the fresh replay records the remaining real conflict");
+        assert_eq!(current.target_branch, child);
+        assert_eq!(current.destination_commit, child_later);
+        assert_eq!(current.theirs.as_deref(), Some(child_later.as_str()));
+    }
+
     /// Conflict notes queued for `BRANCH`, as (message id, wake level).
     async fn conflict_wakes(r: &Replay) -> Vec<(String, String)> {
         let pattern = format!("reconcile:%:{BRANCH}:conflicted%");
@@ -13248,7 +15366,7 @@ mod real_store_collision_tests {
         };
         let phases_listed = |line: &str| line.contains("phases=[") && !line.contains("phases=[]");
         std::fs::write(&gate, "delay").unwrap();
-        reopen_reconcile_intent(&r.db, &r.fx.store, "main", &d1, BRANCH)
+        reopen_reconcile_intent(&r.db, "proj-1", &r.fx.store, "main", &d1, BRANCH)
             .await
             .unwrap();
 
@@ -15577,7 +17695,7 @@ mod real_store_collision_tests {
         // The pass in flight at this destination, its remaining work held.
         let pass = claim_reconcile_intent(
             &r.db,
-            &r.fx.repo.to_string_lossy(),
+            "proj-1",
             &r.fx.store,
             "main",
             &destination,
