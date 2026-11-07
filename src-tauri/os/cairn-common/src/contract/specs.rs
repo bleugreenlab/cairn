@@ -499,6 +499,11 @@ pub(crate) const PERMISSION_EXPIRES_IN_SECONDS: KeySpec = KeySpec::new(
     KeyType::Int,
     "explicit expiry for an allow decision, in seconds from now",
 );
+pub(crate) const PERMISSION_MESSAGE: KeySpec = KeySpec::new(
+    "message",
+    KeyType::Str,
+    "a deny's reason or workaround, delivered to the requesting agent with the refusal (deny only)",
+);
 pub(crate) const ANSWERS: KeySpec = KeySpec::new(
     "answers",
     KeyType::Array,

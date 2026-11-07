@@ -2,7 +2,7 @@
 
 use super::super::{build_failure, payload_non_empty_str, payload_str, ResourceMutationResult};
 use crate::mcp::handlers::permission::{
-    AnswerSurface, PermissionAnswer, PermissionDecision, PermissionScope,
+    AnswerSurface, PermissionAnswer, PermissionDecision, PermissionScope, ResolveOutcome,
 };
 use crate::mcp::handlers::planning;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
@@ -26,6 +26,10 @@ use cairn_common::uri::CairnResource;
 /// prompt the resolver refuses the allow outright, whichever lifetime was
 /// asked for. An agent approving its own escalation is the thing this whole
 /// path exists to prevent; denying and cancelling stay available.
+///
+/// `message` is a deny's reason or workaround, delivered to the requesting
+/// agent with its refusal. An allow has nothing to explain to the agent the
+/// way a refusal does, so a message on one is refused rather than dropped.
 ///
 /// Returns the parsed answer alongside the raw decision word for the summary.
 fn parse_permission_answer(
@@ -61,13 +65,45 @@ fn parse_permission_answer(
             Some(chrono::Utc::now().timestamp() + seconds)
         }
     };
+    let note = match payload.get("message") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(message)) => {
+            Some(message.trim()).filter(|message| !message.is_empty())
+        }
+        Some(_) => return Err("payload.message must be a string".to_string()),
+    };
+    if note.is_some() && matches!(decision, PermissionDecision::Allow) {
+        return Err(
+            "payload.message rides only on a deny; append to the node's messages to say \
+                    something with an allow"
+                .to_string(),
+        );
+    }
+    let answer = PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
+        .with_containment_scope(scope)
+        .with_lifetime(lifetime)
+        .with_expiry(expires_at);
     Ok((
-        PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
-            .with_containment_scope(scope)
-            .with_lifetime(lifetime)
-            .with_expiry(expires_at),
+        match note {
+            Some(note) => answer.with_note(note),
+            None => answer,
+        },
         decision_word,
     ))
+}
+
+/// What a `permissions` patch reports. An answer that arrived after another
+/// had won is told what won, not that it was refused.
+fn permission_receipt(segment: &str, outcome: ResolveOutcome, decision: &str) -> String {
+    if let Some(notice) = outcome.withdrawn {
+        notice
+    } else if let Some(prior) = outcome.prior {
+        prior.receipt(segment)
+    } else if outcome.duplicate {
+        format!("Permission {segment} was already answered")
+    } else {
+        format!("Answered permission {segment}: {decision}")
+    }
 }
 
 pub(super) async fn dispatch(
@@ -203,13 +239,7 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                if let Some(notice) = outcome.withdrawn {
-                    notice
-                } else if outcome.duplicate {
-                    format!("Permission {} was already answered", segment)
-                } else {
-                    format!("Answered permission {}: {}", segment, decision_str)
-                }
+                permission_receipt(segment, outcome, decision_str)
             }
         }
         (
@@ -257,13 +287,7 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                if let Some(notice) = outcome.withdrawn {
-                    notice
-                } else if outcome.duplicate {
-                    format!("Permission {} was already answered", segment)
-                } else {
-                    format!("Answered permission {}: {}", segment, decision_str)
-                }
+                permission_receipt(segment, outcome, decision_str)
             }
         }
         (CairnResource::NodeQuestions { .. }, ChangeMode::Append) => {
@@ -288,4 +312,49 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn deny() -> PermissionAnswer {
+        PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch)
+    }
+
+    #[test]
+    fn a_message_rides_on_a_deny_and_is_refused_on_an_allow() {
+        let (answer, word) = parse_permission_answer(
+            &json!({"decision": "deny", "message": "  write it under $TMPDIR instead "}),
+        )
+        .unwrap();
+        assert_eq!(word, "deny");
+        assert_eq!(answer, deny().with_note("write it under $TMPDIR instead"));
+
+        let (blank, _) =
+            parse_permission_answer(&json!({"decision": "deny", "message": "  "})).unwrap();
+        assert_eq!(blank, deny(), "a blank message is no message");
+
+        let refusal = parse_permission_answer(&json!({"decision": "allow", "message": "go ahead"}))
+            .unwrap_err();
+        assert!(refusal.contains("rides only on a deny"), "{refusal}");
+        assert!(parse_permission_answer(&json!({"decision": "deny", "message": 7})).is_err());
+    }
+
+    #[test]
+    fn both_permission_resources_declare_the_message_key() {
+        use cairn_common::contract::{contract_for, ResourceKind};
+        for kind in [ResourceKind::NodePermission, ResourceKind::TaskPermission] {
+            let contract = contract_for(kind).unwrap();
+            assert!(
+                contract
+                    .mutations
+                    .iter()
+                    .any(|spec| spec.mode == ChangeMode::Patch
+                        && spec.optional.iter().any(|key| key.key == "message")),
+                "{kind:?} must accept payload.message"
+            );
+        }
+    }
 }

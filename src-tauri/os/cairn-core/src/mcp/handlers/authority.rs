@@ -205,10 +205,13 @@ pub async fn raise_authority(
             if response_is_allow(&response) {
                 AuthorityGate::Allow
             } else {
-                AuthorityGate::Deny(format!(
-                    "Denied by operator: {} (scope: {})",
-                    authority.summary,
-                    authority.scope.shorthand()
+                AuthorityGate::Deny(super::permission::denial_text(
+                    &format!(
+                        "{} (scope: {})",
+                        authority.summary,
+                        authority.scope.shorthand()
+                    ),
+                    &response,
                 ))
             }
         }

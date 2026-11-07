@@ -1493,6 +1493,10 @@ pub struct PermissionAnswer {
     /// transaction that records this answer. Only [`PermissionAnswer::allow_all`]
     /// sets it, and that constructor requires the operator capability.
     allow_all: bool,
+    /// A deny's reason or workaround, delivered to the requesting agent with
+    /// the refusal. The ledger stores who answered and what, not this text, so
+    /// it rides only on the answer its own caller executes.
+    note: Option<String>,
 }
 
 impl PermissionAnswer {
@@ -1516,6 +1520,7 @@ impl PermissionAnswer {
             expires_at: None,
             answerer: Answerer::Operator(Box::new(approval)),
             allow_all: false,
+            note: None,
             authenticated_appearance: None,
             provenance_actor: None,
             provenance_provider: None,
@@ -1533,6 +1538,7 @@ impl PermissionAnswer {
             expires_at: None,
             answerer: Answerer::Surface(surface),
             allow_all: false,
+            note: None,
             authenticated_appearance: None,
             provenance_actor: None,
             provenance_provider: None,
@@ -1543,6 +1549,13 @@ impl PermissionAnswer {
 
     pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
         self.provenance_actor = Some(actor.into());
+        self
+    }
+
+    /// Attach a deny's reason or workaround. Only a deny delivers it; the
+    /// `permissions` resource refuses one on an allow.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
         self
     }
 
@@ -1680,6 +1693,157 @@ pub struct ResolveOutcome {
     /// not recorded, nothing was replayed, and no turn was started. Carries
     /// [`withdrawn_notice`], which every answer surface shows verbatim.
     pub withdrawn: Option<String>,
+    /// Another answerer's answer had already won the gate, so this one was not
+    /// recorded: what won, and whether it has been applied.
+    pub prior: Option<PriorAnswer>,
+}
+
+/// The answer that had already won when a later one arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorAnswer {
+    /// The winning answer as the gate stores it: `allow`, `allow_session` or
+    /// `deny`.
+    pub answer: String,
+    /// Who gave it, as [`answerer_label`] words it.
+    pub answered_by: String,
+    /// Whether its effect has been applied. Until it is, only the answerer who
+    /// won may apply it when that answerer is the operator.
+    pub applied: bool,
+}
+
+impl PriorAnswer {
+    fn from_winner(winner: &crate::channels::ledger::AskResolution) -> Self {
+        let answered_by = match stored_winner_transport(winner) {
+            Some(transport) => answerer_label(
+                transport,
+                non_empty(&winner.winner_actor),
+                non_empty(&winner.winner_provider),
+            ),
+            None => format!("an answerer recorded as '{}'", winner.winner_surface),
+        };
+        Self {
+            answer: winner.answer.clone(),
+            answered_by,
+            applied: winner.domain_resolved,
+        }
+    }
+
+    /// What the later answerer is told about the permission at `segment`.
+    pub fn receipt(&self, segment: &str) -> String {
+        let decision = match self.answer.as_str() {
+            "allow_session" => "allow for this session",
+            other => other,
+        };
+        let pending = if self.applied {
+            ""
+        } else {
+            ", and is still being applied"
+        };
+        format!(
+            "Permission {segment} was already answered: {decision}, by {}{pending}. This answer \
+             was not recorded.",
+            self.answered_by
+        )
+    }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn stored_winner_transport(
+    winner: &crate::channels::ledger::AskResolution,
+) -> Option<AppearanceTransport> {
+    serde_json::from_value(serde_json::Value::String(winner.winner_surface.clone())).ok()
+}
+
+/// The transports whose answer carries operator authority, which
+/// [`AnswerSurface::from_transport`] refuses to rebuild from a stored label.
+fn is_operator_transport(transport: AppearanceTransport) -> bool {
+    matches!(
+        transport,
+        AppearanceTransport::AuthenticatedOperator
+            | AppearanceTransport::AuthenticatedDesktop
+            | AppearanceTransport::CompanionApp
+    )
+}
+
+/// Whether a later answer from anyone but the winner has nothing left to
+/// drive: the winner's effect is applied, or only the operator who gave it can
+/// apply it, because operator authority is never rebuilt from a stored label.
+/// First answer wins, so a later answer never replaces either.
+fn winner_settled_for_a_later_answer(winner: &crate::channels::ledger::AskResolution) -> bool {
+    winner.domain_resolved || stored_winner_transport(winner).is_some_and(is_operator_transport)
+}
+
+/// Who gave an answer, in words the requesting agent and a later answerer can
+/// act on. Every operator transport reads as the operator; an agent's resource
+/// patch names the node that sent it.
+pub(crate) fn answerer_label(
+    transport: AppearanceTransport,
+    actor: Option<&str>,
+    provider: Option<&str>,
+) -> String {
+    match transport {
+        AppearanceTransport::AuthenticatedOperator
+        | AppearanceTransport::AuthenticatedDesktop
+        | AppearanceTransport::CompanionApp => "the operator".to_string(),
+        // The actor is the answering agent's serialized principal; rows stored
+        // before the principal was recorded hold the node URI as plain text.
+        AppearanceTransport::ResourcePatch => match actor {
+            None => "an agent".to_string(),
+            Some(actor) => match serde_json::from_str::<PrincipalRef>(actor) {
+                Ok(PrincipalRef::Agent { node, .. }) => node,
+                Ok(_) => "an agent".to_string(),
+                Err(_) => actor.to_string(),
+            },
+        },
+        AppearanceTransport::ChannelReply => provider.map_or_else(
+            || "a channel reply".to_string(),
+            |provider| format!("a reply on {provider}"),
+        ),
+        AppearanceTransport::RemoteIntent => "another Cairn client".to_string(),
+        AppearanceTransport::NonOperatorInvoke => {
+            "a signed-in user without operator rights".to_string()
+        }
+        AppearanceTransport::LocalInvoke => "an unauthenticated local call".to_string(),
+        AppearanceTransport::Ingress | AppearanceTransport::ServedApi => {
+            "an unrecognized answerer".to_string()
+        }
+    }
+}
+
+/// Key naming who denied a fence crossing or authority request, on its
+/// structured response.
+pub(crate) const DENIED_BY_KEY: &str = "deniedBy";
+
+/// The refusal a requesting agent receives for a denied fence crossing or
+/// authority request, rendered from the stored or broadcast response. Every
+/// deny site uses it, so the agent learns who refused and, when they said, what
+/// to do instead. A response recorded before the denier was stored reads as a
+/// plain "Denied".
+pub(crate) fn denial_text(subject: &str, response_json: &str) -> String {
+    fn field<'a>(response: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+        response?
+            .get(key)?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+    let response = serde_json::from_str::<serde_json::Value>(response_json).ok();
+    let denier = field(response.as_ref(), DENIED_BY_KEY);
+    let mut text = match denier {
+        Some(denier) => format!("Denied by {denier}: {subject}"),
+        None => format!("Denied: {subject}"),
+    };
+    if let Some(message) = field(response.as_ref(), "message") {
+        match denier {
+            Some(denier) => text.push_str(&format!("\nMessage from {denier}: {message}")),
+            None => text.push_str(&format!("\nMessage: {message}")),
+        }
+    }
+    text
 }
 
 /// A `permission_requests` row, loaded for resolution.
@@ -2134,6 +2298,7 @@ async fn resolve_permission_request_impl(
                 record.response.as_deref(),
                 answer.allow_all,
             )),
+            prior: None,
         });
     }
 
@@ -2267,10 +2432,29 @@ async fn resolve_permission_request_impl(
             chrono::Utc::now().timestamp_millis(),
         )
         .await?;
-        let winner = match claim {
-            crate::channels::ledger::AskClaim::Won(winner)
-            | crate::channels::ledger::AskClaim::Existing(winner) => winner,
+        let (won, winner) = match claim {
+            crate::channels::ledger::AskClaim::Won(winner) => (true, winner),
+            crate::channels::ledger::AskClaim::Existing(winner) => (false, winner),
         };
+        let answered_by_this_caller = won
+            || (winner.winner_surface == resolution_surface
+                && winner.winner_actor == resolution_actor.as_deref().unwrap_or_default());
+        // A later answer from someone else is told what already won. It is not
+        // an authority failure: nothing about this caller was refused, there is
+        // simply nothing left for it to decide or apply.
+        if !answered_by_this_caller && winner_settled_for_a_later_answer(&winner) {
+            return Ok(ResolveOutcome {
+                duplicate: true,
+                issue_id: None,
+                withdrawn: None,
+                prior: Some(PriorAnswer::from_winner(&winner)),
+            });
+        }
+        // The stored winner is what executes. A retry by the winner itself
+        // that asked for something else is told so too.
+        let prior = (!answered_by_this_caller || winner.answer != behavior)
+            .then(|| PriorAnswer::from_winner(&winner));
+        let caller_note = answer.note.clone();
         let (winning_decision, winning_scope) = match winner.answer.as_str() {
             "allow" => (PermissionDecision::Allow, PermissionScope::Once),
             "allow_session" => (PermissionDecision::Allow, PermissionScope::Session),
@@ -2299,6 +2483,15 @@ async fn resolve_permission_request_impl(
         };
         winning_answer.decision = winning_decision;
         winning_answer.provenance_resolution_id = Some(winner.resolution_id.clone());
+        // The note is the caller's own words, so it rides only on the caller's
+        // own answer. A winner recovered after its answerer went away (a crash
+        // mid-apply) is applied without one: the ledger keeps the decision, not
+        // the text.
+        winning_answer.note = if answered_by_this_caller {
+            caller_note
+        } else {
+            None
+        };
         let now = chrono::Utc::now().timestamp_millis();
         let Some(lease) =
             crate::channels::ledger::try_lease_ask_action(&owning_db, request_id, now, 60_000)
@@ -2308,6 +2501,7 @@ async fn resolve_permission_request_impl(
                 duplicate: true,
                 issue_id: None,
                 withdrawn: None,
+                prior,
             });
         };
         let result = Box::pin(resolve_permission_request_impl(
@@ -2331,7 +2525,13 @@ async fn resolve_permission_request_impl(
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
-                Ok(outcome)
+                // This call applied someone else's winning answer; its own was
+                // not recorded, and the receipt says so.
+                let prior = prior.map(|prior| PriorAnswer {
+                    applied: true,
+                    ..prior
+                });
+                Ok(ResolveOutcome { prior, ..outcome })
             }
             // The ledger decides whether this is worth attempting again. A
             // recovered winner may be an answer that is not allowed to approve
@@ -2355,7 +2555,18 @@ async fn resolve_permission_request_impl(
     // fence crossing does: both re-drive the originating verb, so the waiting
     // handler only needs to know allow from deny.
     let structured = crossing.is_some() || authority.is_some();
-    let response_json = build_permission_response_json(&record, behavior, structured);
+    let answered_by = answerer_label(
+        resolution_transport,
+        resolution_actor.as_deref(),
+        resolution_provider.as_deref(),
+    );
+    let response_json = build_permission_response_json(
+        &record,
+        behavior,
+        structured,
+        &answered_by,
+        answer.note.as_deref(),
+    );
 
     // "Allow all" is planned before the record and written BY it, so the fence
     // turns off exactly when the answer is accepted and never otherwise.
@@ -2386,6 +2597,7 @@ async fn resolve_permission_request_impl(
             duplicate: false,
             issue_id: None,
             withdrawn: Some(with_allow_all_note(notice, answer.allow_all)),
+            prior: None,
         });
     }
 
@@ -2569,6 +2781,7 @@ async fn resolve_permission_request_impl(
         duplicate: resume.duplicate,
         issue_id: resume.issue_id,
         withdrawn: None,
+        prior: None,
     })
 }
 
@@ -2690,17 +2903,29 @@ async fn lookup_permission_request_for_node(
         .map_err(|e| e.to_string())
 }
 
-/// Build the response JSON for a resolved request. A fence crossing gets a
-/// minimal `{behavior}` the waiting verb handler parses; a legacy prompt gets
-/// the exact Claude/Codex permission schema.
+/// Build the response JSON for a resolved request. A fence crossing or
+/// authority request gets a minimal `{behavior}` the waiting verb handler
+/// parses, and a deny also names its denier and carries the denier's note, which
+/// [`denial_text`] renders for the agent. A legacy prompt gets the exact
+/// Claude/Codex permission schema.
 fn build_permission_response_json(
     record: &PermissionRequestRecord,
     behavior: &str,
     structured: bool,
+    answered_by: &str,
+    note: Option<&str>,
 ) -> String {
     if structured {
         return match behavior {
-            "deny" => serde_json::json!({"behavior": "deny"}).to_string(),
+            "deny" => {
+                let mut response = serde_json::Map::new();
+                response.insert("behavior".to_string(), "deny".into());
+                if let Some(note) = note {
+                    response.insert("message".to_string(), note.into());
+                }
+                response.insert(DENIED_BY_KEY.to_string(), answered_by.into());
+                serde_json::Value::Object(response).to_string()
+            }
             _ => serde_json::json!({"behavior": "allow"}).to_string(),
         };
     }
@@ -2712,7 +2937,7 @@ fn build_permission_response_json(
     } else if is_codex_request {
         build_codex_permission_response(&record.tool_name, &record.tool_input, behavior).to_string()
     } else if behavior == "deny" {
-        deny_response("User denied")
+        deny_response(note.unwrap_or("User denied"))
     } else {
         let original_input = serde_json::from_str::<serde_json::Value>(&record.tool_input)
             .unwrap_or(serde_json::json!({}));
@@ -2820,10 +3045,13 @@ async fn resume_suspended_permission(
         }
         let (content, is_error) = match decision {
             PermissionDecision::Deny => (
-                format!(
-                    "Denied by operator: {} (scope: {})",
-                    detail.authority.summary,
-                    detail.scope_shorthand()
+                denial_text(
+                    &format!(
+                        "{} (scope: {})",
+                        detail.authority.summary,
+                        detail.scope_shorthand()
+                    ),
+                    response_json,
                 ),
                 true,
             ),
@@ -2853,10 +3081,7 @@ async fn resume_suspended_permission(
 
     let (content, is_error) = match crossing {
         Some(detail) => match decision {
-            PermissionDecision::Deny => (
-                format!("Denied by worktree fence: {}", detail.summary),
-                true,
-            ),
+            PermissionDecision::Deny => (denial_text(&detail.summary, response_json), true),
             PermissionDecision::Allow => {
                 // A `once` grant is not persisted; insert the descriptor
                 // transiently so the re-dispatched verb passes the fence exactly
@@ -3966,6 +4191,14 @@ pub(crate) mod tests {
             1,
             "only the action-lease winner may execute the permission effect"
         );
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.prior.as_ref().is_some_and(|prior| {
+                    prior.answer == "allow_session" && prior.answered_by == winner_actor
+                })),
+            "a retry whose own deny was not recorded is told the winner: {outcomes:?}"
+        );
         assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
         assert!(
             orch.session_allowed_tools.lock().unwrap().contains("read"),
@@ -4033,6 +4266,14 @@ pub(crate) mod tests {
             1,
             "only one matching retry may execute the stored winner"
         );
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.prior.as_ref().is_some_and(|prior| {
+                    prior.answer == "allow" && prior.answered_by == "the operator"
+                })),
+            "a retry that asked to deny is told the stored allow won: {outcomes:?}"
+        );
         assert_eq!(
             perm_status(&orch).await.as_deref(),
             Some("allowed"),
@@ -4084,13 +4325,25 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-            resolve_permission_request(
+            // Another operator's unapplied answer is only theirs to apply. A
+            // mismatched proof is told it already won rather than carrying it.
+            let outcome = resolve_permission_request(
                 &orch,
                 "perm-request-1",
                 PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
             )
             .await
-            .expect_err("mismatched fresh proof must not recover authenticated authority");
+            .expect("a mismatched proof is told what won");
+            assert!(outcome.duplicate);
+            assert_eq!(
+                outcome.prior,
+                Some(PriorAnswer {
+                    answer: "allow".to_string(),
+                    answered_by: "the operator".to_string(),
+                    applied: false,
+                }),
+                "mismatched fresh proof must not recover authenticated authority"
+            );
 
             assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
             assert_eq!(
@@ -4534,6 +4787,240 @@ pub(crate) mod tests {
         .expect("deny stays open to every surface");
 
         assert_eq!(perm_status(&orch).await.as_deref(), Some("denied"));
+    }
+
+    /// A stored escape, as an earlier build raised one for a command the
+    /// sandbox blocked without reporting a path.
+    fn stored_escape() -> super::super::fence::Crossing {
+        super::super::fence::Crossing::shell_command(
+            "command blocked by the executor sandbox".to_string(),
+            "make check > /var/tmp/check.log",
+        )
+    }
+
+    async fn perm_column(orch: &Orchestrator, column: &str) -> Option<String> {
+        orch.db
+            .local
+            .query_opt_text(
+                format!("SELECT {column} FROM permission_requests WHERE id = 'perm-request-1'"),
+                (),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn tool_results(orch: &Orchestrator) -> i64 {
+        orch.db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'tool_result'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// cairn/5529's specimen: the operator's desktop allowed the escape, then
+    /// the parent thread's deny arrived. That deny was refused with "cannot
+    /// reconstruct AuthenticatedDesktop permission authority", which read as
+    /// the thread lacking authority to deny. It is told what won instead.
+    #[tokio::test]
+    async fn a_late_deny_after_the_operators_allow_is_told_what_won() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        store_crossing(&orch, stored_escape()).await;
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+        )
+        .await
+        .expect("the operator allows first");
+        let results_before = tool_results(&orch).await;
+
+        let outcome = resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            agent_resource_answer(PermissionDecision::Deny)
+                .with_note("write it under $TMPDIR instead"),
+        )
+        .await
+        .expect("a late deny is a duplicate, not an authority failure");
+
+        assert!(outcome.duplicate);
+        let prior = outcome.prior.expect("the late answerer learns what won");
+        assert_eq!(
+            prior.receipt("perm-1"),
+            "Permission perm-1 was already answered: allow, by the operator. This answer was \
+             not recorded."
+        );
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+        assert_eq!(
+            perm_column(&orch, "resolution_surface").await.as_deref(),
+            Some("authenticated_desktop"),
+            "the late answer is not recorded over the winner"
+        );
+        assert_eq!(
+            tool_results(&orch).await,
+            results_before,
+            "the late answer resumes nothing"
+        );
+    }
+
+    /// The same race before the operator's answer has been applied. Only the
+    /// operator's own retry can apply it, so a later answer neither replaces it
+    /// nor fails trying to rebuild the operator's authority.
+    #[tokio::test]
+    async fn a_late_deny_while_the_operators_allow_is_unapplied_leaves_it_to_the_operator() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        store_crossing(&orch, stored_escape()).await;
+        let operator = serde_json::to_string(desktop_approval().actor()).unwrap();
+        crate::channels::ledger::claim_ask_resolution(
+            &orch.db.local,
+            "perm-request-1",
+            "allow",
+            AppearanceTransport::AuthenticatedDesktop,
+            None,
+            None,
+            Some(&operator),
+            "permission",
+            "perm-request-1",
+            10,
+        )
+        .await
+        .unwrap();
+
+        let outcome = resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            agent_resource_answer(PermissionDecision::Deny),
+        )
+        .await
+        .expect("a late deny is a duplicate, not an authority failure");
+
+        assert!(outcome.duplicate);
+        let receipt = outcome
+            .prior
+            .expect("the winner is reported")
+            .receipt("perm-1");
+        assert!(
+            receipt
+                .contains("already answered: allow, by the operator, and is still being applied"),
+            "{receipt}"
+        );
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+        let winner =
+            crate::channels::ledger::resolution_for_action(&orch.db.local, "perm-request-1")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (
+                winner.answer.as_str(),
+                winner.winner_surface.as_str(),
+                winner.domain_resolved
+            ),
+            ("allow", "authenticated_desktop", false),
+            "the agent's answer is not recorded and the operator's stays unapplied"
+        );
+
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+        )
+        .await
+        .expect("the operator's own retry still applies it");
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+    }
+
+    /// An agent's deny names the agent, not the operator, and its note reaches
+    /// both a waiter that is still inline (through the broadcast) and the
+    /// durable record.
+    #[tokio::test]
+    async fn an_agents_deny_names_its_denier_and_carries_its_note() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        store_crossing(&orch, stored_escape()).await;
+        let mut responses = orch.permission_responses.subscribe();
+
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            agent_resource_answer(PermissionDecision::Deny)
+                .with_note("write it under $TMPDIR instead"),
+        )
+        .await
+        .expect("an agent may deny an escape");
+
+        let (request_id, broadcast) = responses.try_recv().expect("the inline waiter is woken");
+        assert_eq!(request_id, "perm-request-1");
+        assert_eq!(
+            denial_text("the blocked command", &broadcast),
+            "Denied by cairn://p/prj/1/1/builder: the blocked command\nMessage from \
+             cairn://p/prj/1/1/builder: write it under $TMPDIR instead"
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(&perm_column(&orch, "response").await.unwrap()).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::json!({
+                "behavior": "deny",
+                "message": "write it under $TMPDIR instead",
+                "deniedBy": "cairn://p/prj/1/1/builder",
+            })
+        );
+        assert_eq!(
+            perm_column(&orch, "resolution_actor").await.as_deref(),
+            Some("cairn://p/prj/1/1/builder")
+        );
+    }
+
+    #[test]
+    fn a_denial_names_its_denier_and_reads_plainly_without_one() {
+        assert_eq!(
+            denial_text("s", r#"{"behavior":"deny","deniedBy":"the operator"}"#),
+            "Denied by the operator: s"
+        );
+        // A row answered before the denier was recorded.
+        assert_eq!(denial_text("s", r#"{"behavior":"deny"}"#), "Denied: s");
+        assert_eq!(
+            denial_text("s", r#"{"behavior":"deny","message":"use $TMPDIR"}"#),
+            "Denied: s\nMessage: use $TMPDIR"
+        );
+        assert_eq!(
+            answerer_label(
+                AppearanceTransport::ChannelReply,
+                Some("8771562567"),
+                Some("telegram")
+            ),
+            "a reply on telegram"
+        );
+    }
+
+    #[test]
+    fn an_agent_denier_is_labelled_by_its_node_uri() {
+        let node = "cairn://p/cairn/5529/1/builder";
+        let principal = serde_json::to_string(&PrincipalRef::Agent {
+            node: node.to_string(),
+            run_id: Some("run-1".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            answerer_label(AppearanceTransport::ResourcePatch, Some(&principal), None),
+            node
+        );
+        // A row stored before the principal was recorded holds the bare URI.
+        assert_eq!(
+            answerer_label(AppearanceTransport::ResourcePatch, Some(node), None),
+            node
+        );
+        assert_eq!(
+            answerer_label(AppearanceTransport::ResourcePatch, None, None),
+            "an agent"
+        );
     }
 
     fn codex_mcp_request_input() -> String {

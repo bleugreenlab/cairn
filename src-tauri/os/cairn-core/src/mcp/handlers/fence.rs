@@ -510,10 +510,7 @@ pub(crate) async fn raise_fence_with_handoff(
             if response_is_allow(&response) {
                 FenceDecision::Allow
             } else {
-                FenceDecision::Deny(format!(
-                    "Denied by logical namespace fence: {}",
-                    crossing.summary
-                ))
+                FenceDecision::Deny(super::permission::denial_text(&crossing.summary, &response))
             }
         }
         PermissionWait::Suspended => FenceDecision::Suspended,
@@ -865,6 +862,20 @@ mod tests {
             }
         }
         assert_eq!(permission_rows(&orch).await, 0);
+    }
+
+    /// A blocked command with no recovered path raises no prompt on either
+    /// platform, so this refusal is all its agent sees. It has to say what it
+    /// is: which path is missing, that an approval would mean no sandbox at
+    /// all, and the route inside the sandbox.
+    #[test]
+    fn the_pathless_refusal_names_the_missing_path_the_absent_sandbox_and_the_route() {
+        for phrase in ["could not say which path", "no sandbox at all", "`$TMPDIR`"] {
+            assert!(
+                NO_PATH_RECOVERED.contains(phrase),
+                "{phrase}: {NO_PATH_RECOVERED}"
+            );
+        }
     }
 
     /// A read and a write of one path are two grants, and neither answers the

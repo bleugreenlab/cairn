@@ -428,11 +428,12 @@ async fn codex_answer_with_open_provider_turn_broadcasts_and_mints_nothing() {
 // typed into the composer. These drive the real answer path against the state
 // the durable suspend leaves behind.
 
-/// A path-scoped fence crossing as `raise_fence` stores it. Allowing it
-/// re-dispatches a `read` with an empty payload, which is harmless here.
-fn late_crossing_input(tool_use_id: &str) -> String {
+/// A fence crossing of `kind` as `raise_fence` stores it. Allowing a
+/// path-scoped one re-dispatches a `read` with an empty payload, which is
+/// harmless here.
+fn late_crossing_input(tool_use_id: &str, kind: &str) -> String {
     serde_json::json!({
-        "kind": "shell_path_crossing",
+        "kind": kind,
         "verb": "read",
         "descriptor": format!("/host/secret-{tool_use_id}"),
         "summary": format!("read of a sensitive host path ({tool_use_id})"),
@@ -484,7 +485,12 @@ async fn seed_suspended_at_budget(db: &LocalDb, requests: &[(&str, &str, &str)])
             "INSERT INTO permission_requests (id, run_id, job_id, tool_use_id, tool_name, tool_input,
                                               status, created_at, turn_id, uri_segment)
              VALUES (?1, 'run-1', 'job-1', ?2, 'read', ?3, 'pending', 1, 'turn-pred', ?4)",
-            params![*id, *tool_use_id, late_crossing_input(tool_use_id), *segment],
+            params![
+                *id,
+                *tool_use_id,
+                late_crossing_input(tool_use_id, "shell_path_crossing"),
+                *segment
+            ],
         )
         .await
         .unwrap();
@@ -653,7 +659,7 @@ async fn assert_late_answer_resumes(
     );
     if matches!(decision, PermissionDecision::Deny) {
         assert!(
-            prompt.contains("Denied by worktree fence"),
+            prompt.contains("Denied by cairn://p/late/1/1/builder"),
             "{label}: the deny reaches the agent: {prompt}"
         );
     }
@@ -670,6 +676,87 @@ async fn assert_late_answer_resumes(
 async fn late_fence_deny_once_resumes_the_job_into_its_successor() {
     use cairn_core::internal::mcp::handlers::permission::{PermissionDecision, PermissionScope};
     assert_late_answer_resumes(PermissionDecision::Deny, PermissionScope::Once).await;
+}
+
+/// cairn/5529: a parent thread denies its child's command escape with a
+/// workaround. The child resumes once, its refusal names the parent and carries
+/// the workaround, and the row records who denied it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parents_deny_with_a_message_resumes_the_child_once_with_the_workaround() {
+    use cairn_core::internal::mcp::handlers::permission::{
+        resolve_permission_request, AnswerSurface, PermissionAnswer, PermissionDecision,
+    };
+    const PARENT: &str = "cairn://p/late/thread";
+    const WORKAROUND: &str = "write it under $TMPDIR instead";
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed_suspended_at_budget(&db, &[("perm-a", "toolu-a", "perm-1")]).await;
+    db.execute(
+        "UPDATE permission_requests SET tool_input = ?1 WHERE id = 'perm-a'",
+        params![late_crossing_input("toolu-a", "shell_command_escape")],
+    )
+    .await
+    .unwrap();
+    let (orch, delivered) = late_answer_host(&temp, db.clone());
+
+    let outcome = resolve_permission_request(
+        &orch,
+        "perm-a",
+        PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch)
+            .with_actor(PARENT)
+            .with_note(WORKAROUND),
+    )
+    .await
+    .expect("a parent may deny its child's escape");
+    assert!(!outcome.duplicate && outcome.prior.is_none(), "{outcome:?}");
+
+    let successors = permission_response_turns(&db).await;
+    assert_eq!(successors.len(), 1, "one resume: {successors:?}");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM events WHERE event_type = 'tool_result'"
+        )
+        .await,
+        1,
+        "one refusal reaches the child"
+    );
+    let prompt = delivered_text(&delivered);
+    assert!(
+        prompt.contains(&format!("Denied by {PARENT}")),
+        "the refusal names the parent: {prompt}"
+    );
+    assert!(
+        prompt.contains(WORKAROUND),
+        "the refusal carries the workaround: {prompt}"
+    );
+
+    let (status, surface, actor, response) = db
+        .query_one(
+            "SELECT status, resolution_surface, resolution_actor, response
+             FROM permission_requests WHERE id = 'perm-a'",
+            (),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.opt_text(1)?,
+                    row.opt_text(2)?,
+                    row.opt_text(3)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, "denied");
+    assert_eq!(surface.as_deref(), Some("resource_patch"));
+    assert_eq!(actor.as_deref(), Some(PARENT));
+    let response: serde_json::Value = serde_json::from_str(&response.unwrap()).unwrap();
+    assert_eq!(response["message"], WORKAROUND);
+    assert_eq!(response["deniedBy"], PARENT);
+    assert!(
+        stranded_running_turns(&orch, &db).await.is_empty(),
+        "no running turn is left unserved"
+    );
 }
 
 /// Acceptance 2: the same for every decision and scope.
@@ -748,7 +835,7 @@ async fn two_late_answers_for_one_turn_share_one_successor_and_queue_the_second(
         "both answers land their synthetic results"
     );
     assert!(
-        delivered_text(&delivered).contains("Denied by worktree fence"),
+        delivered_text(&delivered).contains("Denied by cairn://p/late/1/1/builder"),
         "the first answer drove the warm process"
     );
     assert!(
@@ -792,7 +879,7 @@ async fn assert_second_answer_queues_after_sibling_delivered(
         "{window}: the first answer drove it"
     );
     assert!(
-        delivered_text(&delivered).contains("Denied by worktree fence"),
+        delivered_text(&delivered).contains("Denied by cairn://p/late/1/1/builder"),
         "{window}: the successor's prompt was delivered"
     );
     leave_serving(&orch);

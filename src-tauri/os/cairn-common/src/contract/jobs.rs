@@ -285,9 +285,10 @@ pub(crate) const NODE_PERMISSION_CONTRACT: ResourceContract =
                 PERMISSION_SCOPE,
                 PERMISSION_LIFETIME,
                 PERMISSION_EXPIRES_IN_SECONDS,
+                PERMISSION_MESSAGE,
             ],
             label: "answer permission",
-            example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/permissions/perm-1\",mode:\"patch\",payload:{decision:\"allow\",scope:\"once\"}}]})",
+            example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/permissions/perm-1\",mode:\"patch\",payload:{decision:\"deny\",message:\"write it under $TMPDIR instead\"}}]})",
         }],
     };
 
@@ -320,9 +321,10 @@ pub(crate) const TASK_PERMISSION_CONTRACT: ResourceContract =
                 PERMISSION_SCOPE,
                 PERMISSION_LIFETIME,
                 PERMISSION_EXPIRES_IN_SECONDS,
+                PERMISSION_MESSAGE,
             ],
             label: "answer permission",
-            example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/task/review/permissions/perm-1\",mode:\"patch\",payload:{decision:\"allow\",scope:\"once\"}}]})",
+            example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/task/review/permissions/perm-1\",mode:\"patch\",payload:{decision:\"deny\",message:\"write it under $TMPDIR instead\"}}]})",
         }],
     };
 
