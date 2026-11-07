@@ -2083,21 +2083,25 @@ mod projection_tests {
     #[tokio::test]
     async fn the_migration_retires_review_pushes_of_resolved_issues() {
         use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
-        let dir = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(dir.path().join("resolved-review-pushes.db"))
-            .await
-            .unwrap();
-        let before = TURSO_MIGRATIONS
-            .iter()
-            .take_while(|migration| migration.name() != "retire_review_pushes_of_resolved_issues")
-            .copied()
-            .collect::<Vec<_>>();
-        assert!(
-            before.len() < TURSO_MIGRATIONS.len(),
-            "the migration must be in the lineage"
-        );
-        MigrationRunner::new(before).run(&db).await.unwrap();
-        db.execute_script(
+        for name in [
+            "retire_review_pushes_of_resolved_issues",
+            "retire_late_reviews_of_resolved_issues",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = LocalDb::open(dir.path().join("resolved-review-pushes.db"))
+                .await
+                .unwrap();
+            let before = TURSO_MIGRATIONS
+                .iter()
+                .take_while(|migration| migration.name() != name)
+                .copied()
+                .collect::<Vec<_>>();
+            assert!(
+                before.len() < TURSO_MIGRATIONS.len(),
+                "the migration must be in the lineage"
+            );
+            MigrationRunner::new(before).run(&db).await.unwrap();
+            db.execute_script(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
@@ -2127,45 +2131,46 @@ mod projection_tests {
         .await
         .unwrap();
 
-        const AUDIT: &str = "SELECT p.id FROM attention_pushes p
+            const AUDIT: &str = "SELECT p.id FROM attention_pushes p
             JOIN issues i ON p.key = 'review:cairn://p/' || (SELECT key FROM projects WHERE id = i.project_id) || '/' || i.number
            WHERE p.delivered_event_id IS NULL AND p.retired_at IS NULL AND i.status IN ('merged', 'closed')
            ORDER BY p.id";
-        let selected = ids(&db, AUDIT).await;
-        assert_eq!(selected, vec!["r-closed", "r-merged"]);
+            let selected = ids(&db, AUDIT).await;
+            assert_eq!(selected, vec!["r-closed", "r-merged"]);
 
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+            MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+                .run(&db)
+                .await
+                .unwrap();
 
-        assert_eq!(
-            ids(
-                &db,
-                "SELECT id FROM attention_pushes
+            assert_eq!(
+                ids(
+                    &db,
+                    "SELECT id FROM attention_pushes
                   WHERE retirement_reason = 'review_resolved' AND retired_at IS NOT NULL
                     AND id <> 'r-retired' ORDER BY id"
-            )
-            .await,
-            selected,
-            "exactly the audited rows retire"
-        );
-        assert!(ids(&db, AUDIT).await.is_empty());
-        for (id, expected) in [
-            ("r-active", "::"),
-            ("r-failed", "::"),
-            ("r-other-project", "::"),
-            ("r-delivered", "ev-1::"),
-            ("r-retired", ":5:review_resolved"),
-            ("q-merged", "::"),
-            ("resolved-merged", "::"),
-        ] {
-            assert_eq!(push_state(&db, id).await, expected, "{id}");
+                )
+                .await,
+                selected,
+                "exactly the audited rows retire"
+            );
+            assert!(ids(&db, AUDIT).await.is_empty());
+            for (id, expected) in [
+                ("r-active", "::"),
+                ("r-failed", "::"),
+                ("r-other-project", "::"),
+                ("r-delivered", "ev-1::"),
+                ("r-retired", ":5:review_resolved"),
+                ("q-merged", "::"),
+                ("resolved-merged", "::"),
+            ] {
+                assert_eq!(push_state(&db, id).await, expected, "{id}");
+            }
+            assert_eq!(
+                ids(&db, "SELECT id FROM attention_pushes").await.len(),
+                9,
+                "nothing is deleted"
+            );
         }
-        assert_eq!(
-            ids(&db, "SELECT id FROM attention_pushes").await.len(),
-            9,
-            "nothing is deleted"
-        );
     }
 }

@@ -571,12 +571,9 @@ fn issue_uri_of_push_key(key: &str) -> Option<String> {
 }
 
 /// Like [`push`], but stamps a `fingerprint` — a lightweight content key of the
-/// underlying reviewable state — on the row. Only the review creator
-/// (`lifecycle::create_review_push_on_turn_end`) uses this: it compares the
-/// latest review push's fingerprint ([`latest_push_fingerprint`]) against the
-/// current reviewable state and skips re-creating an unchanged review push
-/// (CAIRN-1889, change-triggered review). All other push kinds are
-/// event-triggered and leave the fingerprint NULL.
+/// underlying state — on the row. Content-state creators compare it with
+/// [`latest_push_fingerprint`] to skip unchanged state. Review creators use
+/// [`push_review_with_fingerprint`] instead, which also guards issue status.
 pub async fn push_with_fingerprint(
     db: &LocalDb,
     recipient: &str,
@@ -616,6 +613,66 @@ pub async fn push_with_fingerprint(
         })
     })
     .await
+}
+
+/// Mint a review only while its issue is unresolved. Every review-readiness
+/// edge uses this write; a stale caller context cannot authorize the insert.
+/// Returns None when the issue is missing, merged, or closed.
+pub async fn push_review_with_fingerprint(
+    db: &LocalDb,
+    issue_id: &str,
+    recipient: &str,
+    content_ref: &str,
+    key: &str,
+    fingerprint: &str,
+) -> DbResult<Option<(String, Wake)>> {
+    let wake = source_mute_downgrade(db, recipient, key, Wake::Wake).await?;
+    let issue_id = issue_id.to_string();
+    let recipient = recipient.to_string();
+    let content_ref = content_ref.to_string();
+    let key = key.to_string();
+    let fingerprint = fingerprint.to_string();
+    db.write(|conn| {
+        let issue_id = issue_id.clone();
+        let recipient = recipient.clone();
+        let content_ref = content_ref.clone();
+        let key = key.clone();
+        let fingerprint = fingerprint.clone();
+        Box::pin(async move {
+            let eligible = review_issue_eligible_conn(conn, &issue_id).await?;
+            if eligible == 0 {
+                return Ok(None);
+            }
+            push_fingerprinted_conn(
+                conn,
+                &recipient,
+                &content_ref,
+                wake,
+                Boundary::Event,
+                &key,
+                Some(&fingerprint),
+                false,
+            )
+            .await
+        })
+    })
+    .await
+}
+
+async fn review_issue_eligible_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    issue_id: &str,
+) -> DbResult<u64> {
+    // BEGIN CONCURRENT reads do not conflict with resolution. Touch the
+    // same issue row resolution writes so one loses and retries: either
+    // resolution retires our earlier push, or we see its terminal status.
+    Ok(conn
+        .execute(
+            "UPDATE issues SET status = status
+          WHERE id = ?1 AND status NOT IN ('merged', 'closed')",
+            (issue_id,),
+        )
+        .await?)
 }
 
 /// Insert or supersede a push using the caller's transaction. With deduplication,
@@ -2360,6 +2417,87 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_eligibility_retries_a_snapshot_older_than_resolution() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let db = Arc::new(migrated_db().await);
+        seed(&db).await;
+        let snapshot_ready = Arc::new(tokio::sync::Notify::new());
+        let resolution_done = Arc::new(tokio::sync::Notify::new());
+        let first = Arc::new(AtomicBool::new(true));
+        let resolver = {
+            let db = db.clone();
+            let snapshot_ready = snapshot_ready.clone();
+            let resolution_done = resolution_done.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result = runtime.block_on(async {
+                    snapshot_ready.notified().await;
+                    db.write(|conn| {
+                        Box::pin(async move {
+                            conn.execute(
+                                "UPDATE issues SET status = 'merged' WHERE id = 'issue-1'",
+                                (),
+                            )
+                            .await?;
+                            retire_reviews_of_resolved_issue_conn(conn, ISSUE_URI, 500).await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                });
+                resolution_done.notify_one();
+                result.unwrap();
+            })
+        };
+        let minted = db
+            .write(|conn| {
+                let first = first.clone();
+                let snapshot_ready = snapshot_ready.clone();
+                let resolution_done = resolution_done.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query("SELECT status FROM issues WHERE id = 'issue-1'", ())
+                        .await?;
+                    let status = rows.next().await?.unwrap().text(0)?;
+                    drop(rows);
+                    if first.swap(false, Ordering::SeqCst) {
+                        assert_eq!(status, "active");
+                        snapshot_ready.notify_one();
+                        resolution_done.notified().await;
+                    }
+                    if review_issue_eligible_conn(conn, "issue-1").await? == 0 {
+                        return Ok(None);
+                    }
+                    push_fingerprinted_conn(
+                        conn,
+                        "watcher",
+                        ISSUE_URI,
+                        Wake::Wake,
+                        Boundary::Event,
+                        "review:cairn://p/proj/2",
+                        Some("artifact:2:501"),
+                        false,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        resolver.join().unwrap();
+        assert!(
+            minted.is_none(),
+            "a stale eligible snapshot must retry into refusal"
+        );
+        assert!(list_pending(&db, "watcher").await.unwrap().is_empty());
     }
 
     const ASK: &str = "question:cairn://p/proj/2/1/planner/questions/q-1";

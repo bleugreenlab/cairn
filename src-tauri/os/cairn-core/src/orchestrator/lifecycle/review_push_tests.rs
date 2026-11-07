@@ -2093,6 +2093,134 @@ async fn run_pr_open(orch: &Orchestrator) {
 }
 
 #[tokio::test]
+async fn review_mint_racing_resolution_leaves_no_pending_review() {
+    for resolution in [
+        crate::transitions::Resolution::Merged,
+        crate::transitions::Resolution::Closed,
+    ] {
+        for _ in 0..8 {
+            let db = test_db().await;
+            seed(&db, "initial").await;
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let mint = scope.spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    barrier.wait();
+                    runtime
+                        .block_on(
+                            crate::orchestrator::attention_push::push_review_with_fingerprint(
+                                &db,
+                                "i-rev",
+                                "j-watch",
+                                "cairn://p/prj/7/1/builder/create-pr",
+                                REVIEW_KEY,
+                                "artifact:2:501",
+                            ),
+                        )
+                        .unwrap()
+                });
+                let resolve = scope.spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    barrier.wait();
+                    runtime
+                        .block_on(crate::issues::crud::resolve(
+                            &db,
+                            &crate::services::RealClock,
+                            "i-rev",
+                            resolution,
+                            "device",
+                        ))
+                        .unwrap();
+                });
+                mint.join().unwrap();
+                resolve.join().unwrap();
+            });
+            assert!(list_pending(&db, "j-watch").await.unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn resolved_issue_artifact_rewrite_cannot_mint_a_review() {
+    for resolution in [
+        crate::transitions::Resolution::Merged,
+        crate::transitions::Resolution::Closed,
+    ] {
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_artifact(&db, "create-pr", 1).await;
+        let orch = test_orchestrator(db);
+        let db = &orch.db.local;
+        run_review_push(&orch).await;
+        assert_eq!(pending(&orch, "j-watch").await.len(), 1);
+
+        crate::issues::crud::resolve(
+            db,
+            orch.services.clock.as_ref(),
+            "i-rev",
+            resolution,
+            "device",
+        )
+        .await
+        .unwrap();
+        db.execute_script(
+            "INSERT INTO artifacts
+             (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-rewrite','j-prod','create-pr',1,'{}',2,'create-pr',1,501,501);"
+        ).await.unwrap();
+        run_review_push(&orch).await;
+        run_pr_open(&orch).await;
+        let count = db.read(|conn| Box::pin(async move {
+            let mut rows = conn.query(
+                "SELECT COUNT(*) FROM attention_pushes WHERE key = 'review:cairn://p/prj/7'", ()).await?;
+            Ok(rows.next().await?.unwrap().get::<i64>(0)?)
+        })).await.unwrap();
+        assert_eq!(
+            count, 1,
+            "resolution must not mint even a subsequently retired row"
+        );
+        assert!(pending(&orch, "j-watch").await.is_empty());
+
+        crate::issues::crud::unresolve(db, orch.services.clock.as_ref(), "i-rev")
+            .await
+            .unwrap();
+        for (status, stamp) in [("active", 502), ("backlog", 503)] {
+            db.execute(
+                "UPDATE issues SET status = ?1 WHERE id = 'i-rev'",
+                (status,),
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE artifacts SET updated_at = updated_at + 1 WHERE id = 'a-rewrite'",
+                (),
+            )
+            .await
+            .unwrap();
+            run_review_push(&orch).await;
+            assert_eq!(
+                pending(&orch, "j-watch").await.len(),
+                1,
+                "reopened {status} issue mints"
+            );
+            assert_eq!(
+                latest_push_fingerprint(db, "j-watch", REVIEW_KEY)
+                    .await
+                    .unwrap(),
+                Some(Some(format!("artifact:2:{stamp}"))),
+                "the changed state is minted, not just an older pending row"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn work_idle_with_unconfirmed_create_pr_artifact_pushes_review() {
     // The create-pr idle: the PR is not open yet, but the unconfirmed
     // artifact is observable -> the second predicate arm fires.

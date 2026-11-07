@@ -2,7 +2,6 @@
 //! plus the turn-end attention/checks emitters shared by finalize and warm
 //! transition. Sliced verbatim from the former `lifecycle.rs`.
 
-use crate::orchestrator::attention_push::{Boundary, Wake};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, RowExt};
 
@@ -1513,17 +1512,20 @@ async fn create_review_push_rows(
                 continue;
             }
         }
-        let (_, effective) = crate::orchestrator::attention_push::push_with_fingerprint(
-            db,
-            &recipient,
-            &content_ref,
-            Wake::Wake,
-            Boundary::Event,
-            &key,
-            Some(&fingerprint),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let Some((_, effective)) =
+            crate::orchestrator::attention_push::push_review_with_fingerprint(
+                db,
+                issue_id,
+                &recipient,
+                &content_ref,
+                &key,
+                &fingerprint,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
         // A watcher that muted this issue gets a `Passive` review row that rides
         // along on its next run; it is not handed back to `wake_review_recipients`
         // so an idle muted watcher is never woken (CAIRN-1900).
