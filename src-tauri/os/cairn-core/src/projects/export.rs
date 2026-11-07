@@ -169,6 +169,16 @@ const EXPORT_KEYED: &[(&str, &str)] = &[("project_routes", "project_key = ?1")];
 /// A manifest entry named here is dropped from the plan, so the sweep keeps it
 /// while the export does not.
 const EXPORT_EXCLUDED: &[(&str, &str)] = &[
+    ("requests", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_requesters", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_waiting", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_cohorts", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_cohort_members", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_attempts", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_attempt_members", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_facts", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_outbox", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
+    ("request_report_receipts", "install-local operator authorization/runtime evidence; must not export, delete with project, or move to team"),
     (
         "ci_logs_cache",
         "its run_id is a GitHub Actions run id, not a Cairn run; a refetchable cache of CI logs",

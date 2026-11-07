@@ -177,6 +177,7 @@ const THREAD_STATUS_INPUT_TABLES: &[&str] = &[
     "runs",
     "events",
     "tenets",
+    "requests",
 ];
 
 /// The tables `list_issues` reads: the issue rows themselves, their labels, and
@@ -235,7 +236,7 @@ const OPERATOR_NOTIFICATION_INPUT_TABLES: &[&str] = &[
 /// them legitimately carries no `projectId` and invalidates every key.
 #[cfg(test)]
 pub(crate) const WORKSPACE_PROJECTION_INPUT_TABLES: &[&str] =
-    &["labels", "projects", "executor_enrollments"];
+    &["labels", "projects", "executor_enrollments", "requests"];
 
 /// Every table some sidebar projection reads, deduplicated.
 ///
@@ -421,7 +422,7 @@ impl ProjectionInvalidatingEmitter {
         match table {
             // A tenet hangs off its proposing thread, not a job, so there is no
             // job set to place it against.
-            "threads" | "tenets" => true,
+            "threads" | "tenets" | "requests" => true,
             // A job frame names its owner outright, and does so before the job
             // can produce any rows of its own, which is what lets a job that has
             // never appeared in a snapshot still cold it the moment it joins a
@@ -2900,6 +2901,7 @@ mod tests {
             ("threads", (true, false, false)),
             ("events", (true, false, false)),
             ("tenets", (true, false, false)),
+            ("requests", (true, false, false)),
             ("turns", (true, true, false)),
             ("jobs", (false, false, false)),
             ("prompts", (true, true, false)),

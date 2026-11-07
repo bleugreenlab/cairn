@@ -996,7 +996,7 @@ pub(crate) async fn rebuild_thread_status(
     let db = crate::execution::routing::owning_db_for_project(dbs, project_id)
         .await
         .map_err(|error| error.to_string())?;
-    thread_status_snapshot(&db, project_id)
+    thread_status_snapshot(&db, &dbs.local, project_id)
         .await
         .map_err(|error| error.to_string())
 }
@@ -1027,13 +1027,65 @@ pub(crate) struct ThreadStatusSnapshot {
     pub(crate) thread_job_ids: HashSet<String>,
 }
 
+/// Request authority stays private even when the threads being projected live
+/// in a team replica. Contributions are routed at filing; count each open card
+/// once per destination rather than once per rationale or member identity.
+async fn thread_pending_request_counts(
+    db: &LocalDb,
+    private_db: &LocalDb,
+    project_id: &str,
+) -> Result<HashMap<String, i64>, CairnError> {
+    let pending = private_db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT rr.wake_destination, COUNT(DISTINCT r.cohort_id)
+             FROM request_requesters rr JOIN requests r ON r.id=rr.request_id
+             JOIN request_cohorts c ON c.id=r.cohort_id
+             WHERE rr.active=1 AND r.state='open' AND c.state='open'
+             GROUP BY rr.wake_destination",
+                        (),
+                    )
+                    .await?;
+                let mut counts = HashMap::new();
+                while let Some(row) = rows.next().await? {
+                    counts.insert(row.text(0)?, row.i64(1)?);
+                }
+                Ok(counts)
+            })
+        })
+        .await?;
+    let project_id = project_id.to_string();
+    db.read(move |conn| {
+        let project_id = project_id.clone();
+        let pending = pending.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(
+                "SELECT t.id, p.key, t.name FROM threads t JOIN projects p ON p.id = t.project_id
+                 WHERE p.id = ?1", params![project_id.as_str()],
+            ).await?;
+            let mut counts = HashMap::new();
+            while let Some(row) = rows.next().await? {
+                let uri = cairn_common::uri::build_thread_uri(&row.text(1)?, &row.text(2)?);
+                counts.insert(row.text(0)?, pending.get(&uri).copied().unwrap_or_default());
+            }
+            Ok(counts)
+        })
+    })
+    .await
+    .map_err(CairnError::Storage)
+}
+
 async fn thread_status_snapshot(
     db: &LocalDb,
+    private_db: &LocalDb,
     project_id: &str,
 ) -> Result<ThreadStatusSnapshot, CairnError> {
     let activity = thread_activity_rows(db, project_id).await?;
     let unread = thread_unread_counts(db, project_id).await?;
     let pending_tenets = thread_pending_tenet_counts(db, project_id).await?;
+    let pending_requests = thread_pending_request_counts(db, private_db, project_id).await?;
     Ok(ThreadStatusSnapshot {
         indicators: activity
             .rows
@@ -1045,6 +1097,10 @@ async fn thread_status_snapshot(
                     activity: row.activity,
                     unread_count: unread.count,
                     latest_event_rowid: unread.latest_event_rowid,
+                    pending_request_count: pending_requests
+                        .get(&row.thread_id)
+                        .copied()
+                        .unwrap_or_default(),
                     pending_tenet_count: pending_tenets
                         .get(&row.thread_id)
                         .copied()
@@ -1082,6 +1138,8 @@ pub struct ThreadStatusIndicator {
     /// `proposed`). Work filed behind a tenet is held on exactly these, so a
     /// nonzero count is the operator's own blocker and outranks the unread count.
     pending_tenet_count: i64,
+    /// Distinct open operator-request cohorts contributed by this thread.
+    pending_request_count: i64,
 }
 
 /// One thread's live activity — the half of a thread row that is a pure function
@@ -1906,6 +1964,54 @@ mod tests {
     use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
     use cairn_db::turso::params;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn thread_pending_request_counts_read_private_cohorts_for_team_threads() {
+        let owning = test_db().await;
+        let private = test_db().await;
+        owning
+            .execute_script(
+                "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('team-project','default','Team','team','/tmp/team',1,1);
+             INSERT INTO threads(id,project_id,name,created_at,updated_at)
+             VALUES('team-thread','team-project','ops',1,1);",
+            )
+            .await
+            .unwrap();
+        private.execute_script(
+            "INSERT INTO request_cohorts(id,workspace_id,kind,state,created_at,updated_at)
+             VALUES('card','default','rebuild','open',1,1),
+                   ('closed-card','default','rebuild','done',1,1);
+             INSERT INTO requests(id,workspace_id,kind,target_identity,cohort_id,state,created_at,updated_at)
+             VALUES('older','default','rebuild','install','card','open',1,1),
+                   ('newer','default','rebuild','install','card','open',1,1),
+                   ('closed','default','rebuild','install','closed-card','done',1,1);
+             INSERT INTO request_requesters(id,request_id,origin_uri,run_id,principal_json,wake_destination,rationale,requirements_json,normalized_target_json,active,created_at,filing_key)
+             VALUES('a','older','cairn://p/team/1/1/builder','r1','{}','cairn://p/team/ops','first','{}','null',1,1,'fixture'),
+                   ('b','newer','cairn://p/team/2/1/builder','r2','{}','cairn://p/team/ops','second','{}','null',1,1,'fixture'),
+                   ('c','closed','cairn://p/team/3/1/builder','r3','{}','cairn://p/team/ops','done','{}','null',1,1,'fixture');"
+        ).await.unwrap();
+        let counts = super::thread_pending_request_counts(&owning, &private, "team-project")
+            .await
+            .unwrap();
+        assert_eq!(
+            counts.get("team-thread"),
+            Some(&1),
+            "two member identities still occupy one operator card"
+        );
+        let no_private = super::thread_pending_request_counts(&owning, &owning, "team-project")
+            .await
+            .unwrap();
+        assert_eq!(no_private.get("team-thread"), Some(&0));
+        exec(&private, "UPDATE request_requesters SET active=0").await;
+        assert_eq!(
+            super::thread_pending_request_counts(&owning, &private, "team-project")
+                .await
+                .unwrap()
+                .get("team-thread"),
+            Some(&0)
+        );
+    }
 
     #[test]
     fn idle_when_no_turn_and_no_waits() {
@@ -3310,7 +3416,7 @@ mod tests {
         .await;
         seed_tenets(&db, "q", &[("q1", 1, "elsewhere", "proposed")]).await;
 
-        let snapshot = super::thread_status_snapshot(&db, "p").await.unwrap();
+        let snapshot = super::thread_status_snapshot(&db, &db, "p").await.unwrap();
         let pending: HashMap<String, i64> = snapshot
             .indicators
             .iter()
@@ -4557,7 +4663,7 @@ mod tests {
             let description_bytes: usize = issues.iter().map(|issue| issue.description.len()).sum();
 
             let started = std::time::Instant::now();
-            let thread = super::thread_status_snapshot(&db, &project_id)
+            let thread = super::thread_status_snapshot(&db, &db, &project_id)
                 .await
                 .unwrap();
             let thread_census = started.elapsed();

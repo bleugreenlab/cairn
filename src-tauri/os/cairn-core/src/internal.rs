@@ -73,6 +73,10 @@ pub mod authorization {
     pub use crate::authorization::*;
 }
 
+pub mod operator_requests {
+    pub use crate::operator_requests::*;
+}
+
 pub mod agent_process {
     pub use crate::agent_process::*;
 }

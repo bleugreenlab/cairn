@@ -370,6 +370,7 @@ pub struct NewAuthorizationEvent {
     pub grant_id: Option<String>,
     pub decision_actor: Option<PrincipalRef>,
     pub appearance_snapshot: Option<AppearanceSnapshot>,
+    pub request_acceptance: Option<cairn_common::requests::RequestAcceptance>,
     pub decided_at: i64,
 }
 
@@ -389,12 +390,13 @@ pub struct AuthorizationEventRecord {
     pub grant_id: Option<String>,
     pub decision_actor: Option<PrincipalRef>,
     pub appearance_snapshot: Option<AppearanceSnapshot>,
+    pub request_acceptance: Option<cairn_common::requests::RequestAcceptance>,
     pub decided_at: i64,
 }
 
 const EVENT_COLUMNS: &str = "id,scope_json,mutation,summary,outcome,reason,principal_json,\
      audience_json,run_id,request_uri,grant_id,decided_at,actor_principal_json,\
-     appearance_snapshot_json";
+     appearance_snapshot_json,request_acceptance_json";
 
 fn event_from_row(row: &crate::turso::Row) -> DbResult<AuthorizationEventRecord> {
     let (decision_actor, appearance_snapshot) =
@@ -413,6 +415,10 @@ fn event_from_row(row: &crate::turso::Row) -> DbResult<AuthorizationEventRecord>
         grant_id: row.opt_text(10)?,
         decision_actor,
         appearance_snapshot,
+        request_acceptance: row
+            .opt_text(14)?
+            .map(|s| decode("request acceptance", &s))
+            .transpose()?,
         decided_at: row.i64(11)?,
     })
 }
@@ -423,84 +429,75 @@ fn event_from_row(row: &crate::turso::Row) -> DbResult<AuthorizationEventRecord>
 /// written: an allow whose authority cannot be named is exactly the record an
 /// audit needs to be able to trust.
 pub async fn append_event(db: &LocalDb, event: NewAuthorizationEvent) -> DbResult<String> {
-    if event.outcome == "allowed_by_grant" && event.grant_id.is_none() {
+    if event.outcome == "request_accepted" || event.request_acceptance.is_some() {
         return Err(DbError::internal(
-            "an allowed_by_grant authorization event must cite the grant that authorized it",
+            "request_accepted may only be written by transactional request acceptance",
         ));
     }
-    let scope_json = serde_json::to_string(&event.scope)
-        .map_err(|e| DbError::internal(format!("scope is not serializable: {e}")))?;
-    let principal_json = serde_json::to_string(&event.principal)
-        .map_err(|e| DbError::internal(format!("principal is not serializable: {e}")))?;
-    let audience_json = serde_json::to_string(&event.audience)
-        .map_err(|e| DbError::internal(format!("audience is not serializable: {e}")))?;
-    let (actor_principal_json, appearance_snapshot_json) = encode_attribution(
+    let id = uuid::Uuid::new_v4().to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        let event = event.clone();
+        Box::pin(async move { insert_event_conn(conn, &id, &event).await })
+    })
+    .await
+}
+
+/// Only the request acceptance transaction may call this writer. It constructs
+/// the journal record itself: callers cannot substitute scope, provenance or grant.
+pub(super) async fn append_request_acceptance_conn(
+    conn: &super::TrackedConnection,
+    acceptance: &cairn_common::requests::RequestAcceptance,
+) -> DbResult<String> {
+    use cairn_common::authorization::{AuthorityAction, AuthorityPlace};
+    let event = NewAuthorizationEvent {
+        scope: AuthorityScope::new(
+            AuthorityPlace::Resource {
+                canonical_uri: format!("cairn://requests/{}", acceptance.request_ids[0]),
+            },
+            AuthorityAction::Run,
+        ),
+        mutation: "update".into(),
+        summary: format!("accept {} operator request", acceptance.kind.as_str()),
+        outcome: "request_accepted".into(),
+        reason: "operator_request_acceptance".into(),
+        principal: AuthorityPrincipal {
+            actor: Some(acceptance.operator.clone()),
+            ..Default::default()
+        },
+        audience: AuthorityAudience::workspace(&acceptance.workspace_id),
+        run_id: None,
+        request_uri: Some(format!("cairn://requests/{}", acceptance.request_ids[0])),
+        grant_id: None,
+        decision_actor: Some(acceptance.operator.clone()),
+        appearance_snapshot: Some(acceptance.appearance.clone()),
+        request_acceptance: Some(acceptance.clone()),
+        decided_at: acceptance.accepted_at,
+    };
+    insert_event_conn(conn, &uuid::Uuid::new_v4().to_string(), &event).await
+}
+async fn insert_event_conn(
+    conn: &super::TrackedConnection,
+    id: &str,
+    event: &NewAuthorizationEvent,
+) -> DbResult<String> {
+    if event.outcome == "allowed_by_grant" && event.grant_id.is_none() {
+        return Err(DbError::internal(
+            "an allowed_by_grant authorization event must cite its grant",
+        ));
+    }
+    let (actor, snapshot) = encode_attribution(
         event.decision_actor.as_ref(),
         event.appearance_snapshot.as_ref(),
     )?;
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let result = id.clone();
-    let scope_key = event.scope.shorthand();
-    let place_kind = event.scope.place_kind().to_string();
-    let action = event.scope.action.as_str().to_string();
-    let workspace_id = event.audience.workspace_id.clone();
-
-    db.write(move |conn| {
-        let values = (
-            id.clone(),
-            scope_key.clone(),
-            place_kind.clone(),
-            action.clone(),
-            scope_json.clone(),
-            event.mutation.clone(),
-            event.summary.clone(),
-            event.outcome.clone(),
-            event.reason.clone(),
-            principal_json.clone(),
-            audience_json.clone(),
-            workspace_id.clone(),
-        );
-        let run_id = event.run_id.clone();
-        let request_uri = event.request_uri.clone();
-        let grant_id = event.grant_id.clone();
-        let decided_at = event.decided_at;
-        let actor_principal_json = actor_principal_json.clone();
-        let appearance_snapshot_json = appearance_snapshot_json.clone();
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO authorization_events (id,scope_key,place_kind,action,scope_json,\
-                 mutation,summary,outcome,reason,principal_json,audience_json,workspace_id,\
-                 run_id,request_uri,grant_id,decided_at,actor_principal_json,\
-                 appearance_snapshot_json) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-                params![
-                    values.0,
-                    values.1,
-                    values.2,
-                    values.3,
-                    values.4,
-                    values.5,
-                    values.6,
-                    values.7,
-                    values.8,
-                    values.9,
-                    values.10,
-                    values.11,
-                    run_id,
-                    request_uri,
-                    grant_id,
-                    decided_at,
-                    actor_principal_json,
-                    appearance_snapshot_json
-                ],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await?;
-    Ok(result)
+    conn.execute("INSERT INTO authorization_events(id,scope_key,place_kind,action,scope_json,mutation,summary,outcome,reason,principal_json,audience_json,workspace_id,run_id,request_uri,grant_id,decided_at,actor_principal_json,appearance_snapshot_json,request_acceptance_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+        params![id,event.scope.shorthand(),event.scope.place_kind().to_string(),event.scope.action.as_str(),serde_json::to_string(&event.scope).map_err(|e|DbError::internal(e.to_string()))?,
+        event.mutation.clone(),event.summary.clone(),event.outcome.clone(),event.reason.clone(),
+        serde_json::to_string(&event.principal).map_err(|e|DbError::internal(e.to_string()))?,
+        serde_json::to_string(&event.audience).map_err(|e|DbError::internal(e.to_string()))?,
+        event.audience.workspace_id.clone(),event.run_id.clone(),event.request_uri.clone(),event.grant_id.clone(),event.decided_at,actor,snapshot,
+        event.request_acceptance.as_ref().map(serde_json::to_string).transpose().map_err(|e|DbError::internal(e.to_string()))?]).await?;
+    Ok(id.to_string())
 }
 
 /// The most recent decisions in a workspace, newest first.
@@ -924,6 +921,7 @@ mod tests {
             grant_id: None,
             decision_actor: None,
             appearance_snapshot: None,
+            request_acceptance: None,
             decided_at: 3000,
         };
         assert!(append_event(&db, base.clone()).await.is_err());
@@ -958,6 +956,7 @@ mod tests {
                 grant_id: None,
                 decision_actor: Some(actor.clone()),
                 appearance_snapshot: Some(snapshot.clone()),
+                request_acceptance: None,
                 decided_at: 3000,
             },
         )
@@ -1009,6 +1008,7 @@ mod tests {
                 grant_id: None,
                 decision_actor: None,
                 appearance_snapshot: None,
+                request_acceptance: None,
                 decided_at: 3000,
             },
         )

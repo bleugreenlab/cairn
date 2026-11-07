@@ -246,6 +246,7 @@ pub async fn journal_served_api_decision(
         },
         decision_actor: actor.principal.actor.clone(),
         appearance_snapshot: Some(appearance.clone()),
+        request_acceptance: None,
         decided_at: now(),
     };
     if let Err(error) = store::append_event(&actor.db, event).await {
@@ -323,6 +324,7 @@ pub async fn journal_dev_instance_launch(
         grant_id: None,
         decision_actor: None,
         appearance_snapshot: None,
+        request_acceptance: None,
         decided_at: now(),
     };
     if let Err(error) = store::append_event(&db, event).await {
@@ -361,6 +363,7 @@ pub async fn journal_operator_act(
         grant_id: None,
         decision_actor: Some(operator),
         appearance_snapshot: None,
+        request_acceptance: None,
         decided_at: now(),
     };
     match store::append_event(db, event).await {
@@ -421,6 +424,7 @@ pub async fn journal_instrumented_write(
             grant_id: None,
             decision_actor: actor.principal.actor.clone(),
             appearance_snapshot: Some(appearance.clone()),
+            request_acceptance: None,
             decided_at: now(),
         };
         if let Err(error) = store::append_event(&actor.db, event).await {
@@ -640,6 +644,7 @@ async fn journal(
         grant_id,
         decision_actor,
         appearance_snapshot,
+        request_acceptance: None,
         decided_at: now(),
     };
     match store::append_event(&actor.db, event).await {

@@ -1019,6 +1019,12 @@ pub enum CairnResource {
     /// Every journaled authority grant in this workspace, plus the recent
     /// authorization decisions that cite them.
     Grants,
+    /// This install's durable requests for operator acceptance.
+    Requests,
+    /// One request identity, retained across attempts and cohorts.
+    Request {
+        id: String,
+    },
     /// One authority grant by id, with the decisions it authorized.
     Grant {
         id: String,
@@ -1262,6 +1268,8 @@ impl CairnResource {
             Self::ChannelsAmbientFeedback => ResourceKind::ChannelsAmbientFeedback,
             Self::Executors => ResourceKind::Executors,
             Self::Executor { .. } => ResourceKind::Executor,
+            Self::Requests => ResourceKind::Requests,
+            Self::Request { .. } => ResourceKind::Request,
             Self::Grants => ResourceKind::Grants,
             Self::Grant { .. } => ResourceKind::Grant,
             Self::Models => ResourceKind::Models,

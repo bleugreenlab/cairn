@@ -139,6 +139,17 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["channels", "conversations"] => Some(CairnResource::ChannelsConversations),
         ["channels", "ambient", "feedback"] => Some(CairnResource::ChannelsAmbientFeedback),
         ["executors"] => Some(CairnResource::Executors),
+        ["requests"] => Some(CairnResource::Requests),
+        ["requests", id]
+            if !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
+        {
+            Some(CairnResource::Request {
+                id: (*id).to_string(),
+            })
+        }
         ["grants"] => Some(CairnResource::Grants),
         ["grants", id] => Some(CairnResource::Grant {
             id: (*id).to_string(),

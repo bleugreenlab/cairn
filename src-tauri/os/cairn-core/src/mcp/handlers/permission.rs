@@ -3004,6 +3004,7 @@ async fn journal_permission_authority_refusal(
         grant_id: None,
         decision_actor,
         appearance_snapshot,
+        request_acceptance: None,
         decided_at: chrono::Utc::now().timestamp(),
     };
     if let Err(error) = cairn_db::storage::authority::append_event(&orch.db.local, event).await {

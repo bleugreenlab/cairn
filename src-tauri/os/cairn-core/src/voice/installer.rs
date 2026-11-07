@@ -1382,7 +1382,19 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            let mut received = 0;
+            while !request[..received].ends_with(b"\r\n\r\n") {
+                assert!(
+                    received < request.len(),
+                    "request header exceeds fixture buffer"
+                );
+                let count = socket.read(&mut request[received..]).await.unwrap();
+                assert_ne!(
+                    count, 0,
+                    "connection closed before request header completed"
+                );
+                received += count;
+            }
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nevil")
                 .await

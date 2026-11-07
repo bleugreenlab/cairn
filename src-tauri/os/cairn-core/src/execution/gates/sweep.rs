@@ -8,7 +8,7 @@
 //! [`super::pulse::run_gate_sweep_loop`], the only production sweeper, so two
 //! passes never overlap and nothing else waits on one. The satisfying
 //! transitions — an issue resolving, a PR merging, an artifact confirming, a
-//! check observation landing — call [`notify_gate_evidence_changed`], which
+//! check observation landing or a request acceptance/completion — call [`notify_gate_evidence_changed`], which
 //! only shortens the wait: a dropped notification costs one tick of latency,
 //! never a stranded execution.
 //!

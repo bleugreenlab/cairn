@@ -1848,6 +1848,7 @@ async fn produce_record_page(
     params: &[QueryParam],
 ) -> Option<Result<RecordPage, String>> {
     Some(match resource {
+        CairnResource::Requests => super::requests::list_page(orch, params).await,
         CairnResource::ProjectVcsLog { project } => {
             super::vcs::read_log_page(orch, request, project, params).await
         }
@@ -2144,6 +2145,8 @@ async fn render_resource_body(
         // private database: a team run's grants live in its own replica, but
         // the workspace-level listing is the operator's own view of the
         // authority they have handed out from this install.
+        CairnResource::Requests => crate::resources::requests::read_requests(orch, &params).await,
+        CairnResource::Request { id } => crate::resources::requests::read_request(orch, &id).await,
         CairnResource::Grants => match find_query_value(&params, "view") {
             Some("decisions") => crate::resources::grants::read_decisions(&orch.db.local).await,
             Some("leases") => crate::resources::grants::read_leases(),

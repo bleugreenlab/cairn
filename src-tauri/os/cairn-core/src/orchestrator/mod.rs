@@ -933,6 +933,9 @@ impl OrchestratorBuilder {
             operator_notifications_cache: self.operator_notifications_cache,
             pending_deliveries_cache: self.pending_deliveries_cache,
             hold_sources: self.hold_sources,
+            operator_requests: Arc::new(
+                crate::operator_requests::registry::RequestRegistry::default(),
+            ),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1726,6 +1729,8 @@ pub struct Orchestrator {
     pub(crate) pending_deliveries_cache: Arc<generation_cache::PendingDeliveriesCache>,
     /// The producers of hold entries in the notification center.
     pub(crate) hold_sources: Arc<crate::notifications::HoldRegistry>,
+    /// Closed, runner-owned adapter slots; never populated from agent input.
+    pub(crate) operator_requests: Arc<crate::operator_requests::registry::RequestRegistry>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
@@ -2714,6 +2719,7 @@ impl Orchestrator {
     pub fn start_background_workers(&self) {
         crate::threads::era_worker::spawn(self.clone(), &self.era_summary_tx);
         crate::tenets::evidence::spawn(self.clone());
+        crate::operator_requests::delivery::spawn(self.clone());
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
         crate::fleet::models::spawn(self.clone());

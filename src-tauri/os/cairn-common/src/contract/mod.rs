@@ -24,6 +24,7 @@ mod pages;
 mod posts;
 mod projects;
 mod registry;
+mod requests;
 mod responses;
 mod routes;
 mod services;
@@ -86,6 +87,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::CHANNELS_AMBIENT_FEEDBACK_CONTRACT,
     globals::EXECUTORS_CONTRACT,
     globals::EXECUTOR_CONTRACT,
+    requests::REQUESTS_CONTRACT,
+    requests::REQUEST_CONTRACT,
     globals::GRANTS_CONTRACT,
     globals::GRANT_CONTRACT,
     models::MODELS_CONTRACT,

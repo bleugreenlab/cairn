@@ -1550,6 +1550,8 @@ impl CairnResource {
             Self::ChannelsConversations => "cairn://channels/conversations".to_string(),
             Self::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback".to_string(),
             Self::Executors => "cairn://executors".to_string(),
+            Self::Requests => "cairn://requests".to_string(),
+            Self::Request { id } => format!("cairn://requests/{id}"),
             Self::Grants => "cairn://grants".to_string(),
             Self::Grant { id } => format!("cairn://grants/{id}"),
             Self::Models => "cairn://models".to_string(),

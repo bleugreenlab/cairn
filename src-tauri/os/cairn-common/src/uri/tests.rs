@@ -2166,3 +2166,29 @@ fn project_map_uri_parses_builds_and_reports_its_kind() {
     assert_eq!(resource.to_uri(), "cairn://p/cairn/map");
     assert_eq!(resource.kind(), ResourceKind::ProjectMap);
 }
+
+#[test]
+fn request_uris_roundtrip_and_reject_unsafe_ids() {
+    for (uri, kind) in [
+        ("cairn://requests", ResourceKind::Requests),
+        ("cairn://requests/request-1_A", ResourceKind::Request),
+    ] {
+        let resource = parse_uri(uri).expect("request URI");
+        assert_eq!(resource.kind(), kind);
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.project(), None);
+        assert_eq!(resource.issue_number(), None);
+        assert_eq!(resource.to_route(), None);
+        assert!(crate::contract::contract_for(kind).is_some());
+    }
+    for uri in [
+        "cairn://requests/a/b",
+        "cairn://requests/a%2Fb",
+        "cairn://requests/a%3Fb",
+        "cairn://requests/a#fragment",
+        "cairn://requests/..",
+        "cairn://requests/é",
+    ] {
+        assert!(parse_uri(uri).is_none(), "{uri}");
+    }
+}

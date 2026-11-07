@@ -2340,6 +2340,46 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "authorization_events",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    (
+        "requests",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_requesters",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_waiting",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_cohorts",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_cohort_members",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_attempts",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_attempt_members",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_facts",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_outbox",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "request_report_receipts",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     // cairn/5712: who may spend this install's models through the served API,
     // and the journal of what each such client spent. Same reasoning as the
     // grants: a teammate's install never issued these keys.

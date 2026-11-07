@@ -216,6 +216,7 @@ impl Default for GateVocabulary {
                 Arc::new(CheckVerdictFact),
                 Arc::new(ClockFact),
                 Arc::new(TenetVerdictFact),
+                Arc::new(RequestFact),
             ],
         }
     }
@@ -840,6 +841,147 @@ async fn confirmed_artifact_types(
             })
         })
         .await
+}
+
+// ---------------------------------------------------------------------------
+// request
+// ---------------------------------------------------------------------------
+
+/// Install-local request evidence, even when the held execution lives in a team
+/// replica. Acceptance is historical membership, not the request's current state.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestFact;
+
+#[async_trait]
+impl GateFact for RequestFact {
+    fn fact(&self) -> &'static str {
+        "request"
+    }
+
+    fn fields(&self) -> &'static [(&'static str, FieldKind)] {
+        &[
+            ("request", FieldKind::Scalar),
+            ("outcome", FieldKind::Scalar),
+        ]
+    }
+
+    fn example(&self) -> TriggerClause {
+        BTreeMap::from([
+            ("fact".into(), Value::String("request".into())),
+            (
+                "request".into(),
+                Value::String("cairn://requests/request-1".into()),
+            ),
+            ("outcome".into(), Value::String("done".into())),
+        ])
+    }
+
+    fn validate(&self, clause: &TriggerClause) -> Result<(), String> {
+        request_id(clause)?;
+        match clause_str(clause, "outcome") {
+            Some("accepted" | "done") => Ok(()),
+            _ => Err("request outcome must be exactly 'accepted' or 'done'".into()),
+        }
+    }
+
+    async fn resolve(
+        &self,
+        ctx: &GateContext<'_>,
+        clause: &TriggerClause,
+    ) -> DbResult<GateOutcome> {
+        self.validate(clause).map_err(DbError::Row)?;
+        let id = request_id(clause).map_err(DbError::Row)?;
+        let evidence =
+            cairn_db::storage::requests::request_gate_state(&ctx.orch().db.local, &id).await?;
+        Ok(request_evidence_outcome(
+            evidence.as_ref().map(|value| (value.state, value.accepted)),
+            clause_str(clause, "outcome") == Some("accepted"),
+        ))
+    }
+
+    async fn foreclosed(
+        &self,
+        ctx: &GateContext<'_>,
+        clause: &TriggerClause,
+    ) -> DbResult<Option<String>> {
+        use cairn_common::requests::RequestState;
+        self.validate(clause).map_err(DbError::Row)?;
+        let id = request_id(clause).map_err(DbError::Row)?;
+        // Propagate unreadable storage: an unavailable database is not a missing
+        // request and must never permanently foreclose a live gate.
+        let evidence =
+            cairn_db::storage::requests::request_gate_state(&ctx.orch().db.local, &id).await?;
+        let accepted = clause_str(clause, "outcome") == Some("accepted");
+        if request_evidence_outcome(
+            evidence.as_ref().map(|value| (value.state, value.accepted)),
+            accepted,
+        ) == GateOutcome::Satisfied
+        {
+            return Ok(None);
+        }
+        Ok(match evidence {
+            None => Some(format!("request cairn://requests/{id} no longer exists")),
+            Some(value)
+                if matches!(
+                    value.state,
+                    RequestState::Declined | RequestState::Withdrawn
+                ) =>
+            {
+                let report = cairn_db::storage::requests::get_request(&ctx.orch().db.local, &id)
+                    .await?
+                    .and_then(|request| request.report);
+                let reason = report
+                    .as_ref()
+                    .and_then(|report| report.get("reason"))
+                    .and_then(Value::as_str);
+                Some(match reason {
+                    Some(reason) => format!(
+                        "request cairn://requests/{id} was {}; recorded reason: {reason:?}",
+                        value.state.as_str()
+                    ),
+                    None => format!("request cairn://requests/{id} was {}", value.state.as_str()),
+                })
+            }
+            _ => None,
+        })
+    }
+
+    fn render(&self, clause: &TriggerClause) -> String {
+        format!(
+            "{} {}",
+            clause_str(clause, "request").unwrap_or("?"),
+            clause_str(clause, "outcome").unwrap_or("?")
+        )
+    }
+}
+
+fn request_id(clause: &TriggerClause) -> Result<String, String> {
+    let raw = clause_str(clause, "request")
+        .ok_or_else(|| "request gate needs a canonical 'request' URI".to_string())?;
+    match cairn_common::uri::parse_uri(raw) {
+        Some(cairn_common::uri::CairnResource::Request { id })
+            if raw == format!("cairn://requests/{id}") =>
+        {
+            Ok(id)
+        }
+        _ => Err(
+            "request gate needs exactly cairn://requests/<id>, without a query, alias or selector"
+                .into(),
+        ),
+    }
+}
+
+fn request_evidence_outcome(
+    evidence: Option<(cairn_common::requests::RequestState, bool)>,
+    accepted: bool,
+) -> GateOutcome {
+    use cairn_common::requests::RequestState;
+    match evidence {
+        Some((_, true)) if accepted => GateOutcome::Satisfied,
+        Some((RequestState::Done, _)) if !accepted => GateOutcome::Satisfied,
+        Some((RequestState::Declined | RequestState::Withdrawn, _)) | None => GateOutcome::Refuted,
+        _ => GateOutcome::NoEvidence,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,6 +1805,198 @@ mod tests {
         clause(&pairs)
     }
 
+    async fn seed_request_evidence(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO request_cohorts(id,workspace_id,kind,state,created_at,updated_at)
+             VALUES('evidence-cohort','default','rebuild','open',1,1);
+             INSERT INTO requests(id,workspace_id,kind,target_identity,cohort_id,state,created_at,updated_at)
+             VALUES('request-1','default','rebuild','install','evidence-cohort','accepted',1,1);"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_gate_resolves_after_missed_notification_and_reboot_from_private_db() {
+        let (orch, db) = gate_env("request-level").await;
+        seed_request_evidence(&db).await;
+        let mut accepted = RequestFact.example();
+        accepted.insert("outcome".into(), text("accepted"));
+        let done = RequestFact.example();
+        let ctx = GateContext::new(&orch, 1);
+        // State alone is never operator-accepted membership.
+        assert_eq!(
+            RequestFact.resolve(&ctx, &accepted).await.unwrap(),
+            GateOutcome::NoEvidence
+        );
+        assert_eq!(
+            RequestFact.resolve(&ctx, &done).await.unwrap(),
+            GateOutcome::NoEvidence
+        );
+        db.execute("UPDATE requests SET state='done' WHERE id='request-1'", ())
+            .await
+            .unwrap();
+
+        // No evidence-change notifier is called. Recreate both connection and
+        // orchestrator; the only evidence carried across boot is the database.
+        let reopened = Arc::new(LocalDb::open(db.path()).await.unwrap());
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = Arc::new(DbState::new(
+            reopened,
+            Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
+        ));
+        let rebooted =
+            Orchestrator::builder(state, Arc::new(TestServicesBuilder::new().build()), root)
+                .build();
+        let replica = Arc::new(migrated_test_db("request-team-decoy").await);
+        seed_request_evidence(&replica).await;
+        replica
+            .execute("UPDATE requests SET state='declined'", ())
+            .await
+            .unwrap();
+        rebooted
+            .db
+            .register_team_db_for_test("team".into(), replica.clone())
+            .await;
+        rebooted.db.set_route("cairn", Some("team".into())).await;
+        let ctx = GateContext::new(&rebooted, 2);
+        assert!(Arc::ptr_eq(
+            &ctx.db_for_issue("cairn://p/cairn/123").await,
+            &replica
+        ));
+        assert_eq!(
+            RequestFact.resolve(&ctx, &done).await.unwrap(),
+            GateOutcome::Satisfied
+        );
+        assert_eq!(
+            RequestFact.resolve(&ctx, &accepted).await.unwrap(),
+            GateOutcome::NoEvidence
+        );
+        assert!(RequestFact.foreclosed(&ctx, &done).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn request_gate_unreadable_is_not_missing_and_terminal_refusals_foreclose() {
+        let (orch, db) = gate_env("request-unreadable").await;
+        seed_request_evidence(&db).await;
+        let done = RequestFact.example();
+        let ctx = GateContext::new(&orch, 1);
+        for state in ["open", "failed", "acting"] {
+            db.execute("UPDATE requests SET state=?1", params![state])
+                .await
+                .unwrap();
+            assert_eq!(
+                RequestFact.resolve(&ctx, &done).await.unwrap(),
+                GateOutcome::NoEvidence
+            );
+            assert!(RequestFact.foreclosed(&ctx, &done).await.unwrap().is_none());
+        }
+        for state in ["declined", "withdrawn"] {
+            let (terminal_orch, terminal_db) = gate_env("request-terminal-refusal").await;
+            seed_request_evidence(&terminal_db).await;
+            let terminal_ctx = GateContext::new(&terminal_orch, 1);
+            terminal_db
+                .execute(
+                    "UPDATE requests SET state=?1,report_json=?2",
+                    params![
+                        state,
+                        serde_json::json!({"reason":"operator declined this change"}).to_string()
+                    ],
+                )
+                .await
+                .unwrap();
+            let reason = RequestFact
+                .foreclosed(&terminal_ctx, &done)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(reason.contains(state));
+            if state == "declined" {
+                assert!(reason.contains("operator declined this change"));
+            }
+        }
+        let mut missing = done.clone();
+        missing.insert("request".into(), text("cairn://requests/missing"));
+        assert!(RequestFact
+            .foreclosed(&ctx, &missing)
+            .await
+            .unwrap()
+            .unwrap()
+            .contains("no longer exists"));
+        db.execute_script("ALTER TABLE requests RENAME TO requests_unreadable;")
+            .await
+            .unwrap();
+        assert!(RequestFact.resolve(&ctx, &done).await.is_err());
+        assert!(RequestFact.foreclosed(&ctx, &done).await.is_err());
+    }
+
+    #[test]
+    fn request_gates_require_exact_uri_and_closed_scalar_outcome() {
+        let vocabulary = GateVocabulary::default();
+        let valid = RequestFact.example();
+        vocabulary.validate(&valid).unwrap();
+        for uri in [
+            "cairn://requests",
+            "request-1",
+            "cairn://requests/r?state=open",
+            "cairn://requests/r/",
+            "cairn://requests/r/accepted",
+            "cairn:~/requests/r",
+        ] {
+            let mut invalid = valid.clone();
+            invalid.insert("request".into(), text(uri));
+            assert!(vocabulary.validate(&invalid).is_err(), "{uri}");
+        }
+        for outcome in [Value::Null, text("failed"), serde_json::json!(["done"])] {
+            let mut invalid = valid.clone();
+            invalid.insert("outcome".into(), outcome);
+            assert!(vocabulary.validate(&invalid).is_err());
+        }
+        let mut invalid = valid;
+        invalid.insert("ask".into(), text("latest"));
+        assert!(vocabulary.validate(&invalid).is_err());
+    }
+
+    #[test]
+    fn request_acceptance_is_historical_membership_not_current_state() {
+        use cairn_common::requests::RequestState::*;
+        for state in [Open, Accepted, Acting, Done, Failed, Declined, Withdrawn] {
+            assert_eq!(
+                request_evidence_outcome(Some((state, true)), true),
+                GateOutcome::Satisfied
+            );
+        }
+        // Linked success can fulfill a request without ever accepting it.
+        assert_eq!(
+            request_evidence_outcome(Some((Done, false)), true),
+            GateOutcome::NoEvidence
+        );
+        assert_eq!(
+            request_evidence_outcome(Some((Accepted, false)), true),
+            GateOutcome::NoEvidence
+        );
+        assert_eq!(
+            request_evidence_outcome(Some((Done, false)), false),
+            GateOutcome::Satisfied
+        );
+        for state in [Open, Accepted, Acting, Failed] {
+            assert_eq!(
+                request_evidence_outcome(Some((state, true)), false),
+                GateOutcome::NoEvidence
+            );
+        }
+        for state in [Declined, Withdrawn] {
+            assert_eq!(
+                request_evidence_outcome(Some((state, false)), true),
+                GateOutcome::Refuted
+            );
+            assert_eq!(
+                request_evidence_outcome(Some((state, true)), false),
+                GateOutcome::Refuted
+            );
+        }
+        assert_eq!(request_evidence_outcome(None, true), GateOutcome::Refuted);
+        assert_eq!(request_evidence_outcome(None, false), GateOutcome::Refuted);
+    }
+
     // -- authoring refusals ------------------------------------------------
 
     #[test]
@@ -1678,7 +2012,7 @@ mod tests {
         assert_eq!(
             error,
             "unknown gate fact 'decision' \u{2014} known: issue_resolution, pr_state, \
-             artifact_confirmed, check_verdict, clock, tenet_verdict"
+             artifact_confirmed, check_verdict, clock, tenet_verdict, request"
         );
     }
 

@@ -28,6 +28,7 @@ pub mod merge_requests;
 pub mod messages;
 pub mod navigation;
 pub mod notifications;
+pub mod operator_requests;
 pub mod pages;
 pub mod pr_data;
 pub mod pressure;

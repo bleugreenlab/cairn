@@ -148,6 +148,18 @@ const TOOL_ANALYTICS: &str = "upserts the invocation's hour bucket by its id and
 
 /// Every trigger in either lineage, private and team alike.
 pub const AUDITED_TRIGGERS: &[AuditedTrigger] = &[
+    trigger("authorization_events_no_update", "authorization_events", IMMUTABLE),
+    trigger("authorization_events_no_delete", "authorization_events", IMMUTABLE),
+    trigger("request_attempt_members_no_update", "request_attempt_members", IMMUTABLE),
+    trigger("request_attempt_members_no_delete", "request_attempt_members", IMMUTABLE),
+    trigger("request_attempt_inputs_immutable", "request_attempts", ROW_CHECK),
+    trigger("request_attempts_no_delete", "request_attempts", IMMUTABLE),
+    trigger("request_accepted_facts_no_update", "request_facts", "checks acceptance history by indexed cohort_id before refusing mutation of an accepted facts version"),
+    trigger("request_accepted_facts_no_delete", "request_facts", "checks acceptance history by indexed cohort_id before refusing deletion of an accepted facts version"),
+    trigger("request_receipts_no_update", "request_report_receipts", IMMUTABLE),
+    trigger("request_receipts_no_delete", "request_report_receipts", IMMUTABLE),
+    trigger("request_decline_immutable", "requests", ROW_CHECK),
+    trigger("request_identity_no_delete", "requests", IMMUTABLE),
     trigger("search_artifacts_insert", "artifacts", SEARCH_OUTBOX),
     trigger("search_artifacts_update", "artifacts", SEARCH_OUTBOX),
     trigger("search_artifacts_delete", "artifacts", SEARCH_OUTBOX),

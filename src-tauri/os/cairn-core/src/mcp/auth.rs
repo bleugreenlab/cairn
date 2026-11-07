@@ -634,6 +634,12 @@ mod tests {
             // the token in the loopback request header. Its test names the
             // header only to assert it is sent.
             "src-tauri/src/commands/grants.rs",
+            // Request acceptance and decline: main-webview-only native proxies
+            // forward decision arguments unchanged through the privileged
+            // runner client. The credential stays in the request header, never
+            // in JavaScript arguments or the returned runner payload. Tests use
+            // throwaway credentials to verify that header and exact payload.
+            "src-tauri/src/commands/requests.rs",
             // Served-API client revocation (Settings -> Served API): the same
             // shape as `grants.rs`. Routed through `operator_target` with no
             // peer, it names only `invoke_as_operator`, forwards the client id

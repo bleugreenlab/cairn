@@ -175,7 +175,26 @@ fn issue_resolution_watch(
 pub fn fact_clause_ref(
     clause: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<String, String> {
-    serde_json::to_string(clause).map_err(|error| error.to_string())
+    let mut canonical = clause.clone();
+    if clause.get("fact").and_then(serde_json::Value::as_str) == Some("request") {
+        let raw = clause
+            .get("request")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("request fact subscription requires a request URI")?;
+        let Some(resource @ cairn_common::uri::CairnResource::Request { .. }) =
+            cairn_common::uri::parse_uri(raw)
+        else {
+            return Err("request fact subscription requires cairn://requests/<id>".into());
+        };
+        let uri = resource.to_uri();
+        if raw != uri {
+            return Err(
+                "request fact subscription requires a canonical URI without query or alias".into(),
+            );
+        }
+        canonical.insert("request".into(), serde_json::Value::String(uri));
+    }
+    serde_json::to_string(&canonical).map_err(|error| error.to_string())
 }
 
 fn compile_derived_thread_scopes(
@@ -853,4 +872,36 @@ async fn upsert_subscription(
     })
     .await
     .map_err(|error| format!("Failed to upsert wake subscription: {error}"))
+}
+
+#[cfg(test)]
+mod request_subscription_tests {
+    use super::*;
+
+    #[test]
+    fn request_fact_subscription_identity_is_sorted_and_has_no_selectors() {
+        let clause = std::collections::BTreeMap::from([
+            ("request".into(), serde_json::json!("cairn://requests/r")),
+            ("outcome".into(), serde_json::json!("done")),
+            ("fact".into(), serde_json::json!("request")),
+        ]);
+        assert_eq!(
+            fact_clause_ref(&clause).unwrap(),
+            r#"{"fact":"request","outcome":"done","request":"cairn://requests/r"}"#
+        );
+        for uri in [
+            "cairn://requests",
+            "cairn://requests/r?outcome=accepted",
+            "cairn://p/cairn/1",
+            "cairn://requests/r/",
+        ] {
+            let mut invalid = clause.clone();
+            invalid.insert("request".into(), serde_json::json!(uri));
+            assert!(fact_clause_ref(&invalid).is_err(), "{uri}");
+        }
+        let scopes = compile_derived_thread_scopes(&[clause.clone(), clause]).unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].source_kind, SOURCE_KIND_FACT);
+        assert_eq!(scopes[0].fact_kinds, ["request"]);
+    }
 }

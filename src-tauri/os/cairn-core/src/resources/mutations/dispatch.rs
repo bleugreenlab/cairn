@@ -45,6 +45,7 @@ mod rebase;
 pub(crate) use rebase::rebase_authority;
 mod recipes;
 mod repls;
+mod requests;
 mod responses;
 mod routes;
 mod self_rebuild;
@@ -484,6 +485,20 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         off_frame(|| labels::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) = off_frame(|| {
+        requests::dispatch(
+            orch,
+            request,
+            index,
+            item,
+            dry_run,
+            &resource,
+            &mut applied_data,
+        )
+    })
+    .await?
     {
         summary
     } else if let Some(summary) =

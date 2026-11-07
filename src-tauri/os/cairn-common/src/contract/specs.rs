@@ -267,7 +267,7 @@ pub(crate) const QUEUE_PLACE: KeySpec = KeySpec::new(
 pub(crate) const AFTER_GATES: KeySpec = KeySpec::new(
     "after",
     KeyType::Array,
-    "gate clause OBJECTS (never prose); the execution is filed HELD — no jobs, no slot — and starts by itself, exactly once, when every clause is satisfied. Facts: {fact:\"issue_resolution\",issue:URI,resolution?:\"merged\"|\"closed\"} · {fact:\"pr_state\",issue:URI,state?:\"open\"|\"merged\"|\"closed\"} · {fact:\"artifact_confirmed\",issue:URI,artifact?:TYPE} · {fact:\"check_verdict\",check:NAME,issue:URI,verdict?:\"passed\"|\"failed\"} · {fact:\"clock\",notBefore:RFC3339} · {fact:\"tenet_verdict\",tenet:\"cairn://p/PROJECT/tenets/N\",outcome:\"answered\"|\"ratified\"} (the operator's verdict on a tenet proposed through cairn://p/PROJECT/tenets; the only way to hold a filing on one). An omitted field means any; an array means any of. A clause that can never come true leaves the execution held and wakes its filer; a wait cycle across issues is refused",
+    "gate clause OBJECTS (never prose); the execution is filed HELD — no jobs, no slot — and starts by itself, exactly once, when every clause is satisfied. Facts: {fact:\"issue_resolution\",issue:URI,resolution?:\"merged\"|\"closed\"} · {fact:\"pr_state\",issue:URI,state?:\"open\"|\"merged\"|\"closed\"} · {fact:\"artifact_confirmed\",issue:URI,artifact?:TYPE} · {fact:\"check_verdict\",check:NAME,issue:URI,verdict?:\"passed\"|\"failed\"} · {fact:\"clock\",notBefore:RFC3339} · {fact:\"tenet_verdict\",tenet:\"cairn://p/PROJECT/tenets/N\",outcome:\"answered\"|\"ratified\"} (the operator's verdict on a tenet proposed through cairn://p/PROJECT/tenets; the only way to hold a filing on one). Request gates use {fact:\"request\",request:\"cairn://requests/ID\",outcome:\"accepted\"|\"done\"}: both fields mandatory and scalar, always read from the private DB of this install even for team work. Accepted means historical acceptance membership; done means successful fulfillment, never merely a finished failed attempt. Other optional fields mean any when omitted, and an array means any of. A clause that can never come true leaves the execution held and wakes its filer; a wait cycle across issues is refused",
 );
 /// Ad-hoc launch deltas, shared verbatim by the executions-collection append and
 /// the issue-create `execution` block — one grammar, described once.
@@ -290,7 +290,7 @@ pub(crate) const CONFIRMED: KeySpec = KeySpec::new(
 pub(crate) const DEFER: KeySpec = KeySpec::new(
     "defer",
     KeyType::Object,
-    "{until:[gate clause, ...]} — defer a gated artifact pending on you until every clause holds, in the `after:` vocabulary (issue_resolution, pr_state, artifact_confirmed, check_verdict, clock, tenet_verdict); you are woken once when it comes true or can no longer come true. Deferring again replaces the last deferral (mutually exclusive with confirmed and action)",
+    "{until:[gate clause, ...]} — defer a gated artifact pending on you until every clause holds, in the `after:` vocabulary (issue_resolution, pr_state, artifact_confirmed, check_verdict, clock, tenet_verdict, request); e.g. {until:[{fact:\"request\",request:\"cairn://requests/ID\",outcome:\"done\"}]}; you are woken once when it comes true or can no longer come true. Deferring again replaces the last deferral (mutually exclusive with confirmed and action)",
 );
 pub(crate) const PR_ACTION: KeySpec = KeySpec::new(
     "action",

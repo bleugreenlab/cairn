@@ -322,7 +322,7 @@ pub(crate) fn resolve_mcp_server_entries(
 /// withholds a machine service no machine has ready, which is right for a
 /// connection list and the prompt, but a call or a read naming it must still be
 /// told which machines it is selected on and what state each is in.
-pub(crate) fn machine_service_entry_named(
+pub fn machine_service_entry_named(
     config_dir: &Path,
     project_path: Option<&Path>,
     name: &str,

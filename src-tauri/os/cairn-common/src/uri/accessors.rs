@@ -402,6 +402,8 @@ impl CairnResource {
             | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }
+            | Self::Requests
+            | Self::Request { .. }
             | Self::Grants
             | Self::Grant { .. }
             | Self::Models
@@ -637,6 +639,8 @@ impl CairnResource {
             | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }
+            | Self::Requests
+            | Self::Request { .. }
             | Self::Grants
             | Self::Grant { .. }
             | Self::Models
@@ -840,6 +844,8 @@ impl CairnResource {
             | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }
+            | Self::Requests
+            | Self::Request { .. }
             | Self::Grants
             | Self::Grant { .. }
             | Self::Models
