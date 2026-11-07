@@ -273,8 +273,12 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
             REBASE_RESOLUTION,
             REBASE_DROP_INCOMING_REASON,
             REBASE_FAST_FORWARD_BRANCH,
+            REBASE_CATCH_UP_MODE,
+            REBASE_REVIEW_PATHS,
+            REBASE_REVIEWED_THROUGH,
+            REBASE_THROUGH,
         ],
-        label: "replay this branch, or take origin's fast-forward of it or its base",
+        label: "replay this branch, take origin's fast-forward of it or its base, set its catch-up mode, or mark its review",
         example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]})",
     }],
 };

@@ -154,6 +154,13 @@ pub enum AuthorityPlace {
     /// caps, which span every project database. `Write` reorders that line
     /// across threads; `Run` starts held work past every cap.
     ExecutionQueue { workspace_id: String },
+    /// How one store bookmark catches up with its base. `Write` sets or clears
+    /// its merge catch-up mode, which exempts that one branch from replay and
+    /// turns on its landing review gate.
+    BranchCatchUp {
+        project_id: String,
+        bookmark: String,
+    },
 }
 
 /// What operation is performed at a place.
@@ -267,6 +274,14 @@ impl AuthorityScope {
             AuthorityPlace::ExecutionQueue { workspace_id } => {
                 format!("workspace/{}/queue", shorthand_segment(workspace_id))
             }
+            AuthorityPlace::BranchCatchUp {
+                project_id,
+                bookmark,
+            } => format!(
+                "project/{}/branch/{}/catch-up",
+                shorthand_segment(project_id),
+                shorthand_segment(bookmark)
+            ),
         };
         format!("{place}:{}", self.action.as_str())
     }
@@ -284,6 +299,7 @@ impl AuthorityScope {
             AuthorityPlace::HostPath { .. } => "host_path",
             AuthorityPlace::Resource { .. } => "resource",
             AuthorityPlace::ExecutionQueue { .. } => "execution_queue",
+            AuthorityPlace::BranchCatchUp { .. } => "branch_catch_up",
         }
     }
 }
@@ -1374,6 +1390,10 @@ pub enum AuthorityReason {
     /// over whatever private matter the object shows, so only the operator may
     /// allow it (cairn/6318).
     StoredContentRemoval,
+    /// Setting or clearing one branch's merge catch-up mode: that branch is
+    /// never replayed onto its base, and its landing is gated on the owner's
+    /// review of declared paths. Only the operator may make that exception.
+    BranchCatchUpMode,
     /// Within the actor's established authority; no blast radius expansion.
     WithinExistingAuthority,
     /// Structurally invalid or an invariant violation. Approval cannot legalize
@@ -1394,6 +1414,7 @@ impl AuthorityReason {
             AuthorityReason::QueueReorderAcrossThreads => "queue_reorder_across_threads",
             AuthorityReason::QueueStartNow => "queue_start_now",
             AuthorityReason::StoredContentRemoval => "stored_content_removal",
+            AuthorityReason::BranchCatchUpMode => "branch_catch_up_mode",
             AuthorityReason::WithinExistingAuthority => "within_existing_authority",
             AuthorityReason::StructurallyInvalid => "structurally_invalid",
         }
@@ -2574,6 +2595,10 @@ mod thread_constraint_tests {
         assert_eq!(
             AuthorityReason::StoredContentRemoval.as_str(),
             "stored_content_removal"
+        );
+        assert_eq!(
+            AuthorityReason::BranchCatchUpMode.as_str(),
+            "branch_catch_up_mode"
         );
     }
 }

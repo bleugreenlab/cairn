@@ -60,7 +60,7 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
 /// in which case `git rev-parse` would successfully discover the ancestor's
 /// object database while silently choosing the wrong store. Plain-Git
 /// coordinates remain independent of jj.
-fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+pub(crate) fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     if is_jj_dir(ws) {
         return jj.run(ws, &["git", "root"], "jj git root");
     }

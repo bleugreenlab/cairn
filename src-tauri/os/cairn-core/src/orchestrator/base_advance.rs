@@ -803,7 +803,9 @@ fn quarantine_blocks_automatic_replay(
     }
     quarantine.failure_kind != "ambiguous_divergence"
         && quarantine.observed_tip() == current_tip.unwrap_or("missing")
-        && (quarantine.failure_kind != ROLLED_BACK_CONFLICT || !replay_is_explicit(label))
+        && ((quarantine.failure_kind != ROLLED_BACK_CONFLICT
+            && quarantine.failure_kind != crate::orchestrator::catch_up::MERGE_CONFLICT_QUARANTINE)
+            || !replay_is_explicit(label))
 }
 
 /// Invalidate every cached GitHub verdict for a branch that moved locally but
@@ -1296,8 +1298,22 @@ struct ReconcileQuarantine {
 }
 
 impl ReconcileQuarantine {
+    /// A merge catch-up's quarantine names both coordinates, `tip:dest`: the
+    /// same pair is never retried, and a newer destination is.
+    fn is_merge_catch_up(&self) -> bool {
+        self.failure_kind == crate::orchestrator::catch_up::MERGE_CONFLICT_QUARANTINE
+            || self.failure_kind == crate::jj::MERGE_CATCH_UP_REFUSED
+    }
+
+    /// The destination a merge catch-up quarantine was recorded against.
+    fn observed_dest(&self) -> Option<&str> {
+        self.is_merge_catch_up()
+            .then(|| self.fingerprint.split_once(':').map(|(_, dest)| dest))
+            .flatten()
+    }
+
     fn observed_tip(&self) -> &str {
-        if self.failure_kind == RECONCILE_TIMEOUT {
+        if self.failure_kind == RECONCILE_TIMEOUT || self.is_merge_catch_up() {
             // Both coordinates are immutable commit ids, which cannot contain ':'.
             self.fingerprint
                 .split_once(':')
@@ -4480,6 +4496,11 @@ async fn execute_reconcile_claim_body(
     // once the store guard is released.
     let mut recovery_recorded = false;
 
+    // The branches of this store that catch up by one merge commit and are
+    // never replayed. Loaded once per pass; every other branch is untouched.
+    let merge_mode =
+        crate::orchestrator::catch_up::merge_mode_bookmarks(db, &claim.project_id, &store).await?;
+
     for branch in &specs {
         *explicit_trace = None;
         heartbeat_reconcile_intent(db, &claim).await?;
@@ -4594,9 +4615,21 @@ async fn execute_reconcile_claim_body(
         };
         let mut quarantine =
             load_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
+        // A merge catch-up parked against an older destination is attempted
+        // again: one merge, so a newer base is worth one more try.
+        if quarantine
+            .as_ref()
+            .and_then(ReconcileQuarantine::observed_dest)
+            .is_some_and(|dest| dest != pinned_dest)
+        {
+            release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
+            quarantine = None;
+        }
         let parked_unannounced = match quarantine.as_ref() {
             Some(existing)
-                if existing.failure_kind == ROLLED_BACK_CONFLICT
+                if (existing.failure_kind == ROLLED_BACK_CONFLICT
+                    || existing.failure_kind
+                        == crate::orchestrator::catch_up::MERGE_CONFLICT_QUARANTINE)
                     && quarantine_blocks_automatic_replay(
                         existing,
                         current_tip.as_deref(),
@@ -5066,7 +5099,38 @@ async fn execute_reconcile_claim_body(
             let already_landed = resolved_request
                 && resolution_session.is_none()
                 && crate::jj::branch_carries_commit(&jj, &store, branch, &pinned_dest);
-            let carry_plan = if resolved_request && !already_landed {
+            let merge_mode_branch = merge_mode.contains(branch);
+            // A merge-mode resolution is the owner's committed tip on top of the
+            // tip that conflicted: each session path is taken whole from it into
+            // a merge against the destination it was resolved against.
+            let merge_resolution = (merge_mode_branch && resolved_request && !already_landed)
+                .then(|| match (resolution_session.as_ref(), before.get(branch)) {
+                    (Some(session), Some(live_tip)) => {
+                        let paths: Vec<String> =
+                            session.conflicting().map(|file| file.path.clone()).collect();
+                        Ok((
+                            crate::jj::ResolutionCarry::from_tip(live_tip, &paths),
+                            session.theirs.clone(),
+                        ))
+                    }
+                    (None, _) => Err("the requested take-committed-tip merge no longer has an open conflict session; re-read cairn:~/rebase".to_string()),
+                    (_, None) => Err("the current committed tip could not be read; no resolution was carried".to_string()),
+                });
+            let merge_options =
+                |resolution: Option<(crate::jj::ResolutionCarry, Option<String>)>| {
+                    let (resolution, resolution_dest) = match resolution {
+                        Some((carry, dest)) => (Some((branch.clone(), carry)), dest),
+                        None => (None, None),
+                    };
+                    crate::jj::ReconcileOptions {
+                        merge_mode: [branch.clone()].into_iter().collect(),
+                        target_name: Some(rebase_dest.to_string()),
+                        resolution,
+                        resolution_dest,
+                        ..crate::jj::ReconcileOptions::default()
+                    }
+                };
+            let carry_plan = if resolved_request && !already_landed && !merge_mode_branch {
                 Some(match (resolution_session.as_ref(), before.get(branch)) {
                     (Some(session), Some(live_tip)) => guard.blocking_phase("plan resolution carry", || {
                         plan_current_requested_resolution(
@@ -5092,6 +5156,49 @@ async fn execute_reconcile_claim_body(
                     error,
                 });
                 refused
+            } else if let Some(merge_resolution) = merge_resolution {
+                match merge_resolution {
+                    Ok(resolution) => {
+                        let item = vec![branch.clone()];
+                        let options = merge_options(Some(resolution));
+                        guard
+                            .blocking_phase("resolved catch-up merge and export", || {
+                                crate::jj::reconcile_siblings_with_options(
+                                    &jj,
+                                    &store,
+                                    &pinned_dest,
+                                    &item,
+                                    &options,
+                                )
+                            })
+                            .unwrap_or_else(|error| failed_reconcile_report(branch, error))
+                    }
+                    Err(error) => {
+                        let mut refused = crate::jj::ReconcileReport::default();
+                        refused.failed.push(crate::jj::ReconcileFailure {
+                            branch: branch.clone(),
+                            error: format!(
+                                "your committed resolution could not be merged with \
+                                 `{pinned_dest}`, so the branch was left untouched: {error}"
+                            ),
+                        });
+                        refused
+                    }
+                }
+            } else if merge_mode_branch {
+                let item = vec![branch.clone()];
+                let options = merge_options(None);
+                guard
+                    .blocking_phase("catch-up merge and export", || {
+                        crate::jj::reconcile_siblings_with_options(
+                            &jj,
+                            &store,
+                            &pinned_dest,
+                            &item,
+                            &options,
+                        )
+                    })
+                    .unwrap_or_else(|error| failed_reconcile_report(branch, error))
             } else if let Some(carry_plan) = carry_plan {
                 match carry_plan {
                     Ok(plan) => {
@@ -5208,8 +5315,13 @@ async fn execute_reconcile_claim_body(
                     // untouched, and pays for no comparison: dormant branches
                     // are armed lazily, when someone waits on their checks.
                     if orch.turn_end_checks_in_flight(&sibling.id) {
-                        let patch_unchanged =
-                            guard.blocking_phase("replayed patch comparison", || {
+                        // A clean catch-up merge leaves the branch's own patch
+                        // against its base exactly as it was, so a running wave
+                        // finishes; a merge that carried a resolution changed it.
+                        let merged = item_report.merged_clean.get(branch);
+                        let patch_unchanged = match merged {
+                            Some(merged) => !merged.resolved,
+                            None => guard.blocking_phase("replayed patch comparison", || {
                                 replay_kept_patch(
                                     &jj,
                                     &store,
@@ -5217,7 +5329,8 @@ async fn execute_reconcile_claim_body(
                                     after.get(branch),
                                     &pinned_dest,
                                 )
-                            });
+                            }),
+                        };
                         drop(guard);
                         crate::execution::checks::cancel_stale_review_on_branch_advance(
                             orch,
@@ -5231,7 +5344,12 @@ async fn execute_reconcile_claim_body(
             item_report
         };
 
-        if item_report.conflicted.contains(branch) && item_report.failed.is_empty() {
+        // A merge-mode conflict is the owner's: the structural repair below
+        // replays the branch, which this mode never does.
+        if item_report.conflicted.contains(branch)
+            && item_report.failed.is_empty()
+            && !merge_mode.contains(branch)
+        {
             if let Some(diagnostic) = item_report.conflict_diagnostics.get(branch).cloned() {
                 // A reported conflict proves the first transaction was restored.
                 // Structural repair is a new transaction, but NOT a new forward deadline.
@@ -5503,22 +5621,37 @@ async fn execute_reconcile_claim_body(
         }
 
         if item_report.conflicted.contains(branch) {
-            let fingerprint = after
+            let tip = after
                 .get(branch)
                 .or_else(|| before.get(branch))
                 .map_or("missing", String::as_str);
-            upsert_reconcile_quarantine(
-                db,
-                &claim.project_id,
-                &store,
-                branch,
-                ROLLED_BACK_CONFLICT,
-                fingerprint,
-                Some(
-                    "automatic base-advance replay conflicted and was rolled back; unchanged tips are parked until an explicit replay is requested or the branch tip changes",
-                ),
-            )
-            .await?;
+            if merge_mode.contains(branch) {
+                upsert_reconcile_quarantine(
+                    db,
+                    &claim.project_id,
+                    &store,
+                    branch,
+                    crate::orchestrator::catch_up::MERGE_CONFLICT_QUARANTINE,
+                    &format!("{tip}:{pinned_dest}"),
+                    Some(
+                        "automatic catch-up merge conflicted and was undone; this tip and destination are not merged again until the tip changes, the base advances, or an explicit replay is requested",
+                    ),
+                )
+                .await?;
+            } else {
+                upsert_reconcile_quarantine(
+                    db,
+                    &claim.project_id,
+                    &store,
+                    branch,
+                    ROLLED_BACK_CONFLICT,
+                    tip,
+                    Some(
+                        "automatic base-advance replay conflicted and was rolled back; unchanged tips are parked until an explicit replay is requested or the branch tip changes",
+                    ),
+                )
+                .await?;
+            }
         }
 
         // Origin transfer and durable lineage persistence are deliberately
@@ -5584,10 +5717,15 @@ async fn execute_reconcile_claim_body(
             .or_else(|| before.get(branch))
             .map_or("missing", String::as_str);
         if permanent {
+            let fingerprint = if failure_kind == Some(crate::jj::MERGE_CATCH_UP_REFUSED) {
+                format!("{quarantine_fingerprint}:{pinned_dest}")
+            } else {
+                quarantine_fingerprint.to_string()
+            };
             pending_quarantines.push(PendingReconcileQuarantine {
                 bookmark: branch.clone(),
                 failure_kind: failure_kind.unwrap_or("unknown").to_string(),
-                fingerprint: quarantine_fingerprint.to_string(),
+                fingerprint,
                 diagnostic: item_diagnostic.map(str::to_string),
             });
         }
@@ -5695,7 +5833,7 @@ async fn execute_reconcile_claim_body(
                 matches!(
                     existing.failure_kind.as_str(),
                     ROLLED_BACK_CONFLICT | RECONCILE_TIMEOUT
-                )
+                ) || existing.is_merge_catch_up()
             }) {
                 release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
             }
@@ -5753,6 +5891,27 @@ async fn execute_reconcile_claim_body(
             )?;
         }
 
+        // A merge-mode branch's outcome goes to its audit trail, and a clean
+        // merge carries its own wake (or passive note) naming what it brought
+        // in, in place of the generic clean note below.
+        if merge_mode.contains(branch) {
+            crate::orchestrator::catch_up::announce_reconcile_outcome(
+                orch,
+                db,
+                &claim.project_id,
+                &store,
+                branch,
+                rebase_dest,
+                &item_report,
+            )
+            .await;
+        }
+        report
+            .merged_clean
+            .extend(std::mem::take(&mut item_report.merged_clean));
+        report
+            .merge_refused
+            .extend(std::mem::take(&mut item_report.merge_refused));
         report.rebased_clean.append(&mut item_report.rebased_clean);
         report.conflicted.append(&mut item_report.conflicted);
         report.silent.append(&mut item_report.silent);
@@ -5818,11 +5977,20 @@ async fn execute_reconcile_claim_body(
     // passive (non-waking) note rides along into their next natural run.
     let mut clean_rewritten = siblings_rewritten(&report.rebased_clean, &before, &after);
     clean_rewritten.retain(|branch| !report.silent.contains(branch));
+    // A catch-up merge already announced itself with what it brought in.
+    let merge_announced: Vec<String> = clean_rewritten
+        .iter()
+        .filter(|branch| report.merged_clean.contains_key(*branch))
+        .cloned()
+        .collect();
     // A clean replay closes its branch's session on the way through, so a
     // session open now was recorded since, and "nothing to resolve" would
     // contradict the blocking note that session sent.
     let mut clean_announced = Vec::with_capacity(clean_rewritten.len());
     for branch in &clean_rewritten {
+        if merge_announced.contains(branch) {
+            continue;
+        }
         if crate::orchestrator::conflict_session::load_active_session(db, branch)
             .await?
             .is_none()

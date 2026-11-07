@@ -205,8 +205,9 @@ pub(super) async fn read_node_rebase(
     // replay can run, so everything below it describes a branch that cannot
     // move until this is settled.
     let name_section = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         recovery_fence_section(orch, &db, &rows, &branch).await,
+        catch_up_section(orch, &db, &rows, &branch).await,
         own_origin_section(orch, &rows, &branch).await,
         conflicted_name_section(orch, &rows, &branch).await
     );
@@ -504,6 +505,11 @@ pub(crate) struct NodeRebaseRows {
 }
 
 impl NodeRebaseRows {
+    /// The id of the project this node's job belongs to, when it could be read.
+    pub(crate) fn project_id(&self) -> Option<&str> {
+        self.project_id.as_deref()
+    }
+
     /// The project's branch store, where this node's bookmark lives.
     pub(crate) fn store_path(&self, orch: &Orchestrator) -> Result<std::path::PathBuf, String> {
         self.repo_path
@@ -564,6 +570,119 @@ fn capitalized(sentence: &str) -> String {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
     }
+}
+
+/// The page's section for a branch in merge catch-up mode, or nothing: who set
+/// it and when, the declared review paths, the owner's review mark and how
+/// many review-path changes the base has made since it, the last refusal if
+/// the last attempt was refused, and the recent audit trail.
+async fn catch_up_section(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    rows: &NodeRebaseRows,
+    branch: &str,
+) -> String {
+    let (Some(project_id), Ok(store)) = (rows.project_id(), rows.store_path(orch)) else {
+        return String::new();
+    };
+    let mode = match crate::orchestrator::catch_up::mode_for(db, project_id, &store, branch).await {
+        Ok(Some(mode)) => mode,
+        Ok(None) => return String::new(),
+        Err(error) => return format!("# Catch-up mode\n\nCould not be read: {error}\n\n"),
+    };
+    let stamp = |at: i64| crate::clock::stamp(at).unwrap_or_else(|| at.to_string());
+    let default_branch = db
+        .query_opt_text(
+            "SELECT default_branch FROM projects WHERE id = ?1",
+            (project_id.to_string(),),
+        )
+        .await
+        .ok()
+        .flatten();
+    let pending = match default_branch {
+        Some(default_branch) => {
+            let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+            let (read_store, read_mode) = (store.clone(), mode.clone());
+            tokio::task::spawn_blocking(move || {
+                let tip = crate::jj::bookmark_commit(&jj, &read_store, &default_branch)
+                    .ok_or_else(|| format!("`{default_branch}` does not resolve"))?;
+                crate::orchestrator::catch_up::unreviewed_base_paths(
+                    &jj,
+                    &read_store,
+                    &read_mode,
+                    &tip,
+                )
+                .map(|paths| (tip, paths))
+            })
+            .await
+            .unwrap_or_else(|error| Err(error.to_string()))
+        }
+        None => Err("the default branch could not be read".to_string()),
+    };
+    let mut out = format!(
+        "# Catch-up mode\n\nthis branch catches up by merge (set by {}, {})\n",
+        mode.set_by,
+        stamp(mode.set_at)
+    );
+    out.push_str(&format!(
+        "review-required paths: {}\n",
+        if mode.review_paths.is_empty() {
+            "none".to_string()
+        } else {
+            mode.review_paths.join(", ")
+        }
+    ));
+    out.push_str(&format!(
+        "reviewed through {} by {} at {}; ",
+        mode.reviewed_through,
+        mode.reviewed_by,
+        stamp(mode.reviewed_at)
+    ));
+    match pending {
+        Ok((tip, paths)) if paths.is_empty() => out.push_str(&format!(
+            "base since then touches review paths: 0 (as of {tip})\n"
+        )),
+        Ok((tip, paths)) => out.push_str(&format!(
+            "base since then touches review paths: {} ({}) as of {tip}. Landing is refused until \
+             you review them and mark it: write cairn:~/rebase {{action:\"mark-reviewed\", \
+             through:\"{tip}\"}}\n",
+            paths.len(),
+            paths.join(", ")
+        )),
+        Err(error) => out.push_str(&format!(
+            "base since then touches review paths: unknown ({error}); landing is refused until \
+             this can be measured\n"
+        )),
+    }
+    let events = crate::orchestrator::catch_up::recent_events(db, project_id, &store, branch, 5)
+        .await
+        .unwrap_or_default();
+    if let Some(last) = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.kind.as_str(),
+                "merged" | "merge_conflicted" | "merge_refused"
+            )
+        })
+        .filter(|event| event.kind == "merge_refused")
+    {
+        out.push_str(&format!("catch-up refused: {}\n", last.detail));
+    }
+    if !events.is_empty() {
+        out.push_str("recent:\n");
+        for event in &events {
+            out.push_str(&format!(
+                "- {} {} by {}: {}\n",
+                stamp(event.at),
+                event.kind,
+                event.actor,
+                event.detail
+            ));
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// The page's section for a node whose OWN branch the store knows to be behind

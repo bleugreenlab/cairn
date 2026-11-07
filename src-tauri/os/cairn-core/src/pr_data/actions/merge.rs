@@ -711,6 +711,14 @@ async fn after_github_merge(
     // GitHub merged: mark the merge request merged, then resolve the issue
     // through the terminal cascade (live work stopped, sessions closed, warm
     // processes evicted). Runs only after the GitHub call succeeded.
+    crate::orchestrator::catch_up::end_on_landing(
+        orch,
+        &db,
+        &merge_context.project_id,
+        &repo_path,
+        &source_branch,
+    )
+    .await;
     let resolve_started = std::time::Instant::now();
     resolve_pr_node(
         orch,
@@ -1228,6 +1236,14 @@ async fn merge_pr_for_job_past_barrier(
         super::default_landing::record_allocations(orch, &db, &merge_context, landed).await;
     }
 
+    crate::orchestrator::catch_up::end_on_landing(
+        orch,
+        &db,
+        &merge_context.project_id,
+        &merge_context.mr.repo_path,
+        &merge_context.source_branch,
+    )
+    .await;
     let resolve_started = std::time::Instant::now();
     resolve_pr_node(
         orch,

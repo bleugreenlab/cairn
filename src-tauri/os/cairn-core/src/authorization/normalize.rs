@@ -443,6 +443,48 @@ pub(crate) fn start_now_request(
     }))
 }
 
+/// The authority a branch's catch-up mode write crosses. The act digest binds
+/// exactly what is set (mode, declared review paths, review mark as written),
+/// so approving one setting never covers another.
+pub(crate) fn branch_catch_up_request(
+    project_id: &str,
+    bookmark: &str,
+    mode: &str,
+    review_paths: &[String],
+    reviewed_through: Option<&str>,
+) -> AuthorityRequest {
+    let summary = if mode == "merge" {
+        format!(
+            "let `{bookmark}` catch up with its base by one merge commit instead of a replay, with \
+             landing refused while the base has changed {} since the owner's review mark {}",
+            if review_paths.is_empty() {
+                "no declared path (none declared)".to_string()
+            } else {
+                format!("any of {}", join_and(review_paths))
+            },
+            reviewed_through.unwrap_or("(the current merge base)")
+        )
+    } else {
+        format!("return `{bookmark}` to catching up by replay, ending its merge catch-up mode")
+    };
+    AuthorityRequest::new(
+        AuthorityScope::new(
+            AuthorityPlace::BranchCatchUp {
+                project_id: project_id.to_string(),
+                bookmark: bookmark.to_string(),
+            },
+            AuthorityAction::Write,
+        ),
+        AuthorityMutation::Update,
+        summary,
+    )
+    .with_act(ActDigest::of("branch.catch_up_mode", |encoder| {
+        encoder.field("mode", mode);
+        encoder.field("review_paths", &review_paths.join("\n"));
+        encoder.field("reviewed_through", reviewed_through.unwrap_or(""));
+    }))
+}
+
 /// `a`, `a and b`, `a, b and c`.
 fn join_and(items: &[String]) -> String {
     match items {

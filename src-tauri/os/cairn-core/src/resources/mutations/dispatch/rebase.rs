@@ -7,14 +7,398 @@
 //! git/jj escape hatch beside it — the shared store stays the single authority on
 //! ancestry.
 
-use super::super::{build_failure, payload_non_empty_str, ResourceMutationResult};
+//!
+//! Two more actions concern the branch's catch-up mode (see
+//! `orchestrator::catch_up`). `catch-up-mode` sets or clears it, and is the
+//! operator's to approve: [`rebase_authority`] names the authority ahead of any
+//! side effect, the write handler raises the operator's card, and the dispatch
+//! re-derives the same request and consumes the grant just before it acts.
+//! `mark-reviewed` moves the owner's review mark forward and is direct: the
+//! operator decides which paths need review, the owner says what it has read.
+
+use super::super::{
+    build_failure, payload_non_empty_str, target_resource_for_request, ResourceMutationResult,
+};
+use crate::authorization::prepare::Prepared;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
+use cairn_common::authorization::AuthorityDecision;
 use cairn_common::uri::CairnResource;
+
+/// A parsed `catch-up-mode` payload.
+struct CatchUpSetting {
+    mode: String,
+    review_paths: Vec<String>,
+    reviewed_through: Option<String>,
+}
+
+fn parse_catch_up_setting(payload: &serde_json::Value) -> Result<CatchUpSetting, String> {
+    let mode = payload_non_empty_str(payload, "mode", &[]).ok_or_else(|| {
+        "catch-up-mode needs payload.mode: 'merge' (catch up by one merge commit) or 'replay' \
+         (end the mode)"
+            .to_string()
+    })?;
+    if !matches!(mode, "merge" | "replay") {
+        return Err(format!(
+            "payload.mode must be 'merge' or 'replay', got '{mode}'"
+        ));
+    }
+    let review_paths = match payload.get("review_paths") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    "payload.review_paths is a list of path globs (strings)".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("payload.review_paths is a list of path globs".to_string()),
+    };
+    let reviewed_through =
+        payload_non_empty_str(payload, "reviewed_through", &[]).map(str::to_string);
+    if mode == "replay" && (!review_paths.is_empty() || reviewed_through.is_some()) {
+        return Err(
+            "review_paths and reviewed_through apply only to mode:'merge'; mode:'replay' ends the \
+             mode"
+                .to_string(),
+        );
+    }
+    crate::orchestrator::catch_up::validate_review_paths(&review_paths)?;
+    Ok(CatchUpSetting {
+        mode: mode.to_string(),
+        review_paths,
+        reviewed_through,
+    })
+}
+
+/// The authority a `catch-up-mode` write crosses, for `authorization::prepare`:
+/// `None` unless the change is that action on a node's rebase page.
+pub(crate) async fn rebase_authority(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    item: &ChangeItem,
+) -> Option<Prepared> {
+    if item.mode != ChangeMode::Patch {
+        return None;
+    }
+    let payload = item.payload.as_ref()?;
+    if payload_non_empty_str(payload, "action", &[]) != Some("catch-up-mode") {
+        return None;
+    }
+    let CairnResource::NodeRebase {
+        project,
+        number,
+        exec_seq,
+        node_id,
+    } = target_resource_for_request(orch, request, item)
+        .await
+        .ok()?
+    else {
+        return None;
+    };
+    Some(
+        match catch_up_authority(orch, &project, number, exec_seq, &node_id, payload).await {
+            Ok(authority) => Prepared::Authority(authority),
+            Err(error) => Prepared::Invalid(error),
+        },
+    )
+}
+
+/// Prepare and dispatch both derive the request here, so they name the same
+/// one.
+async fn catch_up_authority(
+    orch: &Orchestrator,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    payload: &serde_json::Value,
+) -> Result<cairn_common::authorization::AuthorityRequest, String> {
+    let setting = parse_catch_up_setting(payload)?;
+    let db = orch.db.for_project(project).await;
+    let rows =
+        crate::resources::NodeRebaseRows::read(&db, project, number, exec_seq, node_id).await?;
+    let branch = rows
+        .branch
+        .clone()
+        .ok_or_else(|| "This node has no branch to set a catch-up mode on.".to_string())?;
+    let project_id = rows
+        .project_id()
+        .ok_or_else(|| "this node's project could not be read".to_string())?;
+    Ok(crate::authorization::normalize::branch_catch_up_request(
+        project_id,
+        &branch,
+        &setting.mode,
+        &setting.review_paths,
+        setting.reviewed_through.as_deref(),
+    ))
+}
+
+/// Who is writing: the run's node home, or `operator` for a write no run makes.
+/// A run may write only for its own node.
+async fn writer(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    owning_job: &str,
+) -> Result<String, String> {
+    if request.run_id.as_deref().is_none_or(str::is_empty) {
+        return Ok("operator".to_string());
+    }
+    let (context, _) =
+        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
+    if context.job_id != owning_job {
+        return Err(
+            "Refused: only this branch's owning node or the operator may mark its review. \
+             Nothing changed."
+                .to_string(),
+        );
+    }
+    Ok(
+        crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
+            .await
+            .unwrap_or_else(|_| format!("run {}", context.run_id)),
+    )
+}
+
+/// The commit `revision` names, proven to lie in both the branch's and the
+/// default branch's history.
+fn shared_commit(
+    jj: &crate::jj::JjEnv,
+    store: &std::path::Path,
+    branch: &str,
+    default_branch: &str,
+    revision: &str,
+) -> Result<String, String> {
+    let commit = crate::jj::revset_commit_checked(jj, store, revision)?
+        .ok_or_else(|| format!("`{revision}` does not name one commit in the store"))?;
+    let branch_revset = format!("bookmarks(exact:{branch:?})");
+    let default_revset = format!("bookmarks(exact:{default_branch:?})");
+    if !crate::jj::revset_descends_from(jj, store, &branch_revset, &commit)
+        || !crate::jj::revset_descends_from(jj, store, &default_revset, &commit)
+    {
+        return Err(format!(
+            "{commit} is not in the history of both `{branch}` and `{default_branch}`; a review \
+             mark is a base commit this branch already contains"
+        ));
+    }
+    Ok(commit)
+}
+
+async fn project_default_branch(
+    db: &crate::storage::LocalDb,
+    project_id: &str,
+) -> Result<String, String> {
+    db.query_opt_text(
+        "SELECT default_branch FROM projects WHERE id = ?1",
+        (project_id.to_string(),),
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "the project's default branch could not be read".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_catch_up_mode(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    db: &crate::storage::LocalDb,
+    rows: &crate::resources::NodeRebaseRows,
+    branch: &str,
+    resource: (&str, i32, i32, &str),
+    payload: &serde_json::Value,
+    dry_run: bool,
+) -> Result<String, String> {
+    let setting = parse_catch_up_setting(payload)?;
+    let project_id = rows
+        .project_id()
+        .ok_or_else(|| "this node's project could not be read".to_string())?
+        .to_string();
+    let store = rows.store_path(orch)?;
+    let default_branch = project_default_branch(db, &project_id).await?;
+    if branch == default_branch {
+        return Err(format!(
+            "Refused: `{branch}` is the project's default branch, which never catches up with \
+             anything. Nothing changed."
+        ));
+    }
+    if db
+        .query_opt_text(
+            "SELECT id FROM jobs WHERE project_id = ?1 AND base_branch = ?2 AND id != ?3 LIMIT 1",
+            (project_id.clone(), branch.to_string(), rows.job_id.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err(format!(
+            "Refused: `{branch}` is an integration branch other work is cut from; the catch-up \
+             mode applies only to a branch nothing else is based on. Nothing changed."
+        ));
+    }
+    let (project, number, exec_seq, node_id) = resource;
+    let authority = catch_up_authority(orch, project, number, exec_seq, node_id, payload).await?;
+    if dry_run {
+        return Ok(format!("Would {}", authority.summary));
+    }
+    let Some(actor) = crate::authorization::resolve_actor(orch, request).await else {
+        return Err(format!(
+            "Denied: a branch's catch-up mode is the operator's to approve, and this request comes \
+             from no run that could ask. Ask an agent on this node to request it; the operator's \
+             approval of that card sets it. Asked: {}.",
+            authority.summary
+        ));
+    };
+    let (decision, event_id) = crate::authorization::authorize_recorded(&actor, &authority).await?;
+    match decision {
+        AuthorityDecision::Direct | AuthorityDecision::AllowedByGrant { .. } => {}
+        AuthorityDecision::ApprovalRequired(reason) | AuthorityDecision::Forbidden(reason) => {
+            return Err(crate::authorization::refusal_message(&authority, reason))
+        }
+    }
+    let asker = actor
+        .principal
+        .node_uri
+        .clone()
+        .or_else(|| actor.principal.run_id.clone())
+        .unwrap_or_else(|| "an unnamed run".to_string());
+    let who = match event_id {
+        Some(event) => format!("operator (approved {event}, asked by {asker})"),
+        None => format!("operator (asked by {asker})"),
+    };
+
+    if setting.mode == "replay" {
+        let cleared = crate::orchestrator::catch_up::clear(
+            db,
+            &project_id,
+            &store,
+            branch,
+            &who,
+            "returned to catching up by replay",
+        )
+        .await?;
+        return Ok(if cleared {
+            format!("`{branch}` catches up by replay again; its merge catch-up mode is cleared.")
+        } else {
+            format!("`{branch}` had no catch-up mode; it catches up by replay.")
+        });
+    }
+
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let (read_store, read_branch, read_default, through) = (
+        store.clone(),
+        branch.to_string(),
+        default_branch.clone(),
+        setting.reviewed_through.clone(),
+    );
+    let reviewed_through = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        match through {
+            Some(revision) => {
+                shared_commit(&jj, &read_store, &read_branch, &read_default, &revision)
+            }
+            None => {
+                let tip = crate::jj::bookmark_commit_checked(&jj, &read_store, &read_branch)?
+                    .ok_or_else(|| format!("`{read_branch}` does not resolve in the store"))?;
+                let default_tip =
+                    crate::jj::bookmark_commit_checked(&jj, &read_store, &read_default)?
+                        .ok_or_else(|| format!("`{read_default}` does not resolve in the store"))?;
+                let bases = crate::jj::merge_bases(&jj, &read_store, &tip, &default_tip)?;
+                match bases.as_slice() {
+                    [base] => Ok(base.clone()),
+                    _ => Err(format!(
+                        "`{read_branch}` and `{read_default}` share {} merge bases ({}), so there \
+                         is no one default review mark; pass reviewed_through explicitly",
+                        bases.len(),
+                        bases.join(", ")
+                    )),
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("review mark worker failed: {error}"))??;
+    let mode = crate::orchestrator::catch_up::set(
+        db,
+        crate::orchestrator::catch_up::SetCatchUpMode {
+            project_id: &project_id,
+            store: &store,
+            bookmark: branch,
+            job_id: &rows.job_id,
+            actor: &who,
+            review_paths: &setting.review_paths,
+            reviewed_through: &reviewed_through,
+        },
+    )
+    .await?;
+    Ok(format!(
+        "`{branch}` now catches up by merge (set by {who}). Review-required paths: {}. Reviewed \
+         through {}. It is never replayed; the next base advance merges the base into it.",
+        if mode.review_paths.is_empty() {
+            "none".to_string()
+        } else {
+            mode.review_paths.join(", ")
+        },
+        mode.reviewed_through
+    ))
+}
+
+async fn mark_reviewed(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    db: &crate::storage::LocalDb,
+    rows: &crate::resources::NodeRebaseRows,
+    branch: &str,
+    payload: &serde_json::Value,
+    dry_run: bool,
+) -> Result<String, String> {
+    let through = payload_non_empty_str(payload, "through", &[])
+        .ok_or_else(|| {
+            "mark-reviewed needs payload.through: the base commit you reviewed through".to_string()
+        })?
+        .to_string();
+    let project_id = rows
+        .project_id()
+        .ok_or_else(|| "this node's project could not be read".to_string())?
+        .to_string();
+    let store = rows.store_path(orch)?;
+    let mode = crate::orchestrator::catch_up::mode_for(db, &project_id, &store, branch)
+        .await?
+        .ok_or_else(|| {
+            format!("`{branch}` has no catch-up mode, so there is no review mark to move")
+        })?;
+    let who = writer(orch, request, &rows.job_id).await?;
+    let default_branch = project_default_branch(db, &project_id).await?;
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let (read_store, read_branch, previous) = (
+        store.clone(),
+        branch.to_string(),
+        mode.reviewed_through.clone(),
+    );
+    let commit = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let commit = shared_commit(&jj, &read_store, &read_branch, &default_branch, &through)?;
+        if !crate::jj::revset_descends_from(&jj, &read_store, &commit, &previous) {
+            return Err(format!(
+                "{commit} is not at or after the current review mark {previous}; a review mark \
+                 only moves forward"
+            ));
+        }
+        Ok(commit)
+    })
+    .await
+    .map_err(|error| format!("review mark worker failed: {error}"))??;
+    if dry_run {
+        return Ok(format!("Would mark `{branch}` reviewed through {commit}"));
+    }
+    crate::orchestrator::catch_up::mark_reviewed(db, &mode, &commit, &who).await?;
+    Ok(format!(
+        "`{branch}` is marked reviewed through {commit} by {who} (was {}).",
+        mode.reviewed_through
+    ))
+}
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
-    _request: &McpCallbackRequest,
+    request: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
     dry_run: bool,
@@ -36,14 +420,50 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
             let action = payload_non_empty_str(payload, "action", &[])
                 .ok_or_else(|| build_failure(index, item, "payload.action is required"))?;
-            if !matches!(action, "replay" | "fast-forward-from-origin" | "repair") {
+            if !matches!(
+                action,
+                "replay"
+                    | "fast-forward-from-origin"
+                    | "repair"
+                    | "catch-up-mode"
+                    | "mark-reviewed"
+            ) {
                 return Err(build_failure(
                     index,
                     item,
                     format!(
-                        "payload.action must be 'replay', 'fast-forward-from-origin' or 'repair', got '{action}'"
+                        "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'catch-up-mode' or 'mark-reviewed', got '{action}'"
                     ),
                 ));
+            }
+            if matches!(action, "catch-up-mode" | "mark-reviewed") {
+                let db = orch.db.for_project(project).await;
+                let rows = crate::resources::NodeRebaseRows::read(
+                    &db, project, *number, *exec_seq, node_id,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                let branch = rows.branch.clone().ok_or_else(|| {
+                    build_failure(index, item, "This node has no branch.".to_string())
+                })?;
+                let outcome = if action == "catch-up-mode" {
+                    set_catch_up_mode(
+                        orch,
+                        request,
+                        &db,
+                        &rows,
+                        &branch,
+                        (project.as_str(), *number, *exec_seq, node_id.as_str()),
+                        payload,
+                        dry_run,
+                    )
+                    .await
+                } else {
+                    mark_reviewed(orch, request, &db, &rows, &branch, payload, dry_run).await
+                };
+                return outcome
+                    .map(Some)
+                    .map_err(|error| build_failure(index, item, error));
             }
             let fast_forward_branch = payload_non_empty_str(payload, "branch", &[]);
             if fast_forward_branch.is_some() && action != "fast-forward-from-origin" {

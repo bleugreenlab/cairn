@@ -40,6 +40,24 @@ pub struct ReconcileReport {
     /// again, so there is nothing left to enumerate and a later probe would
     /// report none.
     pub conflict_diagnostics: std::collections::HashMap<String, ConflictDiagnostic>,
+    /// Branches in merge catch-up mode that were brought current by one merge
+    /// commit. Each is also in `rebased_clean`, so every downstream consumer
+    /// treats it as a clean catch-up; this carries what the merge brought in.
+    pub merged_clean: std::collections::HashMap<String, MergedCatchUp>,
+    /// Branches in merge catch-up mode whose merge was refused untouched (an
+    /// ambiguous merge base). Each is also in `failed`.
+    pub merge_refused: std::collections::HashMap<String, String>,
+}
+
+/// One clean merge catch-up: the merge commit and the base range it brought in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedCatchUp {
+    pub merge: String,
+    pub old_base: String,
+    pub new_base: String,
+    /// Whether a committed resolution was carried into the merge, which
+    /// changes the branch's own patch where a plain clean merge does not.
+    pub resolved: bool,
 }
 
 /// The refusal an agent receives when its branch cannot be rebased onto an
@@ -1124,7 +1142,7 @@ pub(crate) fn roll_back_rebase(
 /// asserts the pre-rebase commit rather than publishing anything new. It is
 /// what proves the git ref was never dragged onto the refused tip. Anything
 /// short of that proof is [`rollback_incomplete`].
-fn roll_back_conflicting_rebase(
+pub(crate) fn roll_back_conflicting_rebase(
     jj: &JjEnv,
     store: &Path,
     branch: &str,

@@ -819,6 +819,18 @@ pub async fn resolve(
             .await?;
 
             let closed_sessions = close_sessions_for_issue_conn(conn, &id, reason, now).await?;
+            // A branch's catch-up mode ends with its issue.
+            crate::orchestrator::catch_up::clear_for_issue_conn(
+                conn,
+                &id,
+                if matches!(reason, SessionCloseReason::IssueMerged) {
+                    "merged"
+                } else {
+                    "closed"
+                },
+                now,
+            )
+            .await?;
 
             let mut subject = conn
                 .query(

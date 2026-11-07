@@ -42,6 +42,7 @@ mod prompts;
 mod queue;
 pub(crate) use queue::{asking_thread_id, authorize_start_now, queue_authority};
 mod rebase;
+pub(crate) use rebase::rebase_authority;
 mod recipes;
 mod repls;
 mod responses;

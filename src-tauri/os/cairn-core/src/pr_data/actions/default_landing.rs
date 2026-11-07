@@ -82,6 +82,9 @@ struct Prospect {
     binds: bool,
     rules: Vec<(String, IdentifierRule)>,
     plan: bind::BindPlan,
+    /// Whether the branch catches up by merge: it was merged with the target,
+    /// never replayed, and every later step must keep it that way.
+    merge_mode: bool,
 }
 
 struct Store {
@@ -114,7 +117,18 @@ pub(super) async fn land_on_default(
     let source = merge_context.source_branch.as_str();
     let target = merge_context.target_branch.as_str();
     let store = store_of(orch, merge_context);
-    if via_github {
+    // A branch that catches up by merge always takes the full loop: it is
+    // merged with the live target and bound there, never replayed, and its
+    // merged head is what is judged.
+    let mode = crate::orchestrator::catch_up::mode_for_project(
+        orch,
+        &merge_context.project_id,
+        &store.path,
+        source,
+    )
+    .await?;
+    let mode = mode.as_ref();
+    if via_github && mode.is_none() {
         if let Some(landed) =
             github_without_prospect(orch, merge_context, method, &store, verified_head).await?
         {
@@ -130,7 +144,7 @@ pub(super) async fn land_on_default(
                     format!("landing prospect for {source}"),
                 )
                 .await;
-            build_prospect(orch, merge_context, method, &store).await?
+            build_prospect(orch, merge_context, method, &store, mode).await?
         };
         if let Some(verified) = verified_head {
             if prospect.binds || prospect.merge.source_tip != verified {
@@ -143,7 +157,7 @@ pub(super) async fn land_on_default(
             }
         }
 
-        validate_prospect(&store, merge_context, &prospect).await?;
+        validate_prospect(&store, merge_context, &prospect, mode.is_some()).await?;
 
         let landed = {
             let guard = orch
@@ -154,15 +168,34 @@ pub(super) async fn land_on_default(
                 )
                 .await;
             let _phase = guard.phase("recheck, bind and land");
-            land_if_unchanged(orch, merge_context, method, via_github, &store, &prospect).await?
+            land_if_unchanged(
+                orch,
+                merge_context,
+                method,
+                via_github,
+                &store,
+                &prospect,
+                mode.is_some(),
+            )
+            .await?
         };
         match landed {
             Some(Landed { commit, dropped }) => {
+                if let Some(mode) = mode {
+                    crate::orchestrator::catch_up::record_landing_merged(
+                        orch,
+                        mode,
+                        &store.path,
+                        target,
+                        commit.as_deref(),
+                    )
+                    .await;
+                }
                 return Ok(DefaultLanding {
                     landed_commit: commit,
                     plan: prospect.plan,
                     dropped,
-                })
+                });
             }
             None => log::info!(
                 "landing[{job_id}]: `{source}` or `{target}` moved while the landing was \
@@ -184,12 +217,44 @@ async fn validate_prospect(
     store: &Store,
     merge_context: &MergeMrContext,
     prospect: &Prospect,
+    merge_mode: bool,
 ) -> Result<(), String> {
     let (jj, path) = (store.jj.clone(), store.path.clone());
     let (head, tip) = (
         prospect.merge.commit_id.clone(),
         prospect.merge.target_tip.clone(),
     );
+    if prospect.binds {
+        // What is judged is exactly the head whose tree is recorded, and the
+        // landing later proves it lands that tree. A merge-mode head must also
+        // carry the target tip it was merged with, or it was judged without
+        // the base's content.
+        let (jj, path, head, tip, expected) = (
+            jj.clone(),
+            path.clone(),
+            head.clone(),
+            tip.clone(),
+            prospect.merge.tree_hash.clone(),
+        );
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let tree = crate::jj::sealed_tree_hash_via_git(&jj, &path, &head)?;
+            if tree != expected {
+                return Err(format!(
+                    "Refusing to merge: the judged head {head} has tree {tree}, not the recorded \
+                     {expected}. Nothing was merged; merge again."
+                ));
+            }
+            if merge_mode && !crate::jj::revset_descends_from(&jj, &path, &head, &tip) {
+                return Err(format!(
+                    "Refusing to merge: the judged head {head} does not contain the target tip \
+                     {tip} it was merged with. Nothing was merged; merge again."
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("landing head check did not finish: {error}"))??;
+    }
     let (target, source) = (
         merge_context.target_branch.clone(),
         merge_context.source_branch.clone(),
@@ -262,13 +327,17 @@ async fn github_without_prospect(
     }))
 }
 
-/// Replay `source` onto `target_tip` unless it already descends from it, then
-/// bind it there. The caller holds the store lock.
+/// Bring `source` onto `target_tip` unless it already descends from it, then
+/// bind it there: by ONE merge commit for a branch in merge catch-up mode,
+/// otherwise by a replay. The merge is deterministic for fixed parents, so
+/// redoing it under the landing lock yields the tree that was judged. The
+/// caller holds the store lock.
 fn replay_and_bind(
     store: &Store,
     merge_context: &MergeMrContext,
     target_tip: &str,
     rules: &[(String, IdentifierRule)],
+    merge_mode: bool,
 ) -> Result<bind::BoundLanding, String> {
     let source = merge_context.source_branch.as_str();
     let descends = crate::jj::revset_commit(
@@ -277,7 +346,39 @@ fn replay_and_bind(
         &format!("{target_tip} & ::bookmarks(exact:{source:?})"),
     )
     .is_some();
-    if !descends {
+    if !descends && merge_mode {
+        let target = merge_context.target_branch.as_str();
+        let message = crate::jj::catch_up_merge_message(target, target_tip, source);
+        match crate::jj::merge_base_into_branch(
+            &store.jj,
+            &store.path,
+            source,
+            target_tip,
+            &message,
+            None,
+        )? {
+            crate::jj::MergeCatchUp::AlreadyCurrent
+            | crate::jj::MergeCatchUp::FastForwarded { .. }
+            | crate::jj::MergeCatchUp::Merged { .. } => {}
+            crate::jj::MergeCatchUp::Conflicted { diagnostic } => {
+                return Err(format!(
+                    "{}\nThis branch catches up by merge: the next base advance opens a \
+                     resolution session for exactly this merge on its rebase page \
+                     (cairn:~/rebase).",
+                    crate::jj::base_conflict_refusal(
+                        target,
+                        source,
+                        &diagnostic.conflicting_paths()
+                    )
+                ))
+            }
+            crate::jj::MergeCatchUp::Refused { reason } => {
+                return Err(format!(
+                    "Refusing to merge `{source}` into `{target}`: {reason}"
+                ))
+            }
+        }
+    } else if !descends {
         crate::orchestrator::base_advance::replay_for_landing(
             &store.jj,
             &store.path,
@@ -303,27 +404,42 @@ async fn build_prospect(
     merge_context: &MergeMrContext,
     method: &str,
     store: &Store,
+    mode: Option<&crate::orchestrator::catch_up::CatchUpMode>,
 ) -> Result<Prospect, String> {
     let (source_tip, target_tip) = live_default_landing_tips(orch, merge_context).await?;
+    if let Some(mode) = mode {
+        crate::orchestrator::catch_up::landing_review_gate(
+            orch,
+            mode,
+            &store.jj,
+            &store.path,
+            &merge_context.target_branch,
+            &target_tip,
+        )
+        .await?;
+    }
     let rules = landing::identifier_rules(&landing::landing_settings_at(
         &store.jj,
         &store.path,
         &target_tip,
     ))?;
-    let binds =
-        bind::touches_identifiers(&store.jj, &store.path, &source_tip, &target_tip, &rules)?;
+    // With no identifier rule touched, `bind_onto` returns the merged head
+    // unchanged and the parse gate still judges it.
+    let binds = mode.is_some()
+        || bind::touches_identifiers(&store.jj, &store.path, &source_tip, &target_tip, &rules)?;
     if !binds {
         return Ok(Prospect {
             merge: prospective_default_landing(orch, merge_context, method).await?,
             binds,
             rules,
             plan: bind::BindPlan::default(),
+            merge_mode: false,
         });
     }
 
     let operation = crate::jj::operation_id(&store.jj, &store.path)?;
     let built = (|| -> Result<Prospect, String> {
-        let bound = replay_and_bind(store, merge_context, &target_tip, &rules)?;
+        let bound = replay_and_bind(store, merge_context, &target_tip, &rules, mode.is_some())?;
         let tree_hash = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head)?;
         let patch = store.jj.run(
             &store.path,
@@ -350,6 +466,7 @@ async fn build_prospect(
             binds,
             rules: rules.clone(),
             plan: bound.plan,
+            merge_mode: mode.is_some(),
         })
     })();
     let restored = crate::jj::restore_operation(&store.jj, &store.path, &operation);
@@ -375,6 +492,7 @@ async fn land_if_unchanged(
     via_github: bool,
     store: &Store,
     prospect: &Prospect,
+    merge_mode: bool,
 ) -> Result<Option<Landed>, String> {
     let live = live_default_landing_tips(orch, merge_context).await?;
     if live
@@ -398,6 +516,7 @@ async fn land_if_unchanged(
             merge_context,
             &prospect.merge.target_tip,
             &prospect.rules,
+            merge_mode,
         )
         .map_err(&rollback)?;
         let tree = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head)
@@ -437,6 +556,7 @@ async fn land_if_unchanged(
             &store.path,
             &merge_context.target_branch,
             &merge_context.source_branch,
+            merge_mode,
         )
         .map_err(|error| {
             rollback(format!(
@@ -704,6 +824,13 @@ impl LandingWorld for GatedLanding<'_> {
 
     async fn observe(&mut self) -> Result<Observation, String> {
         let source = self.merge_context.source_branch.as_str();
+        let mode = crate::orchestrator::catch_up::mode_for_project(
+            self.orch,
+            &self.merge_context.project_id,
+            &self.store.path,
+            source,
+        )
+        .await?;
         let prospect = {
             let _guard = self
                 .orch
@@ -713,9 +840,22 @@ impl LandingWorld for GatedLanding<'_> {
                     format!("approval prospect for {source}"),
                 )
                 .await;
-            build_prospect(self.orch, self.merge_context, self.method, &self.store).await?
+            build_prospect(
+                self.orch,
+                self.merge_context,
+                self.method,
+                &self.store,
+                mode.as_ref(),
+            )
+            .await?
         };
-        validate_prospect(&self.store, self.merge_context, &prospect).await?;
+        validate_prospect(
+            &self.store,
+            self.merge_context,
+            &prospect,
+            prospect.merge_mode,
+        )
+        .await?;
         let strategy = approval_strategy(self.method, self.via_github)?;
         // Everything below runs with no store lock held.
         let auth = installation_authority(&self.orch.db.local, &self.owner).await?;
@@ -823,6 +963,7 @@ impl LandingWorld for GatedLanding<'_> {
                     self.merge_context,
                     &approved.target_oid,
                     &prospect.rules,
+                    prospect.merge_mode,
                 ) {
                     Ok(bound) => bound,
                     Err(error) => {
@@ -891,7 +1032,13 @@ impl LandingWorld for GatedLanding<'_> {
         // tip to another commit with the approved tree; GitHub is bound to the
         // head origin then holds.
         let (head, dropped) = if prospect.binds {
-            match publish_landing_source(&store.jj, &store.path, target, source) {
+            match publish_landing_source(
+                &store.jj,
+                &store.path,
+                target,
+                source,
+                prospect.merge_mode,
+            ) {
                 Ok(published) => (published.head, published.dropped),
                 Err(error) => {
                     return Execution::Refused(format!(

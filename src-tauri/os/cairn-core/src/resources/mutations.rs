@@ -24,7 +24,7 @@ pub(crate) use blocking::{
 };
 pub(crate) use dispatch::{
     asking_thread_id, attachment_removal_authority, authorize_start_now, dispatch_resource_change,
-    inference_records_authority, queue_authority,
+    inference_records_authority, queue_authority, rebase_authority,
 };
 pub(crate) use hash::hash_resource_target;
 pub(crate) use mcp::workspace_mcp_authority;

@@ -11,6 +11,7 @@
 //! `EDITOR=true`/`JJ_EDITOR=true` and points `JJ_CONFIG` at a Cairn-managed file.
 
 mod bookmark;
+mod catch_up;
 mod combine;
 mod conflict;
 mod diff;
@@ -38,6 +39,7 @@ mod tests;
 pub mod testing;
 
 pub use bookmark::*;
+pub use catch_up::*;
 pub use combine::{TwinStack, VersionBase};
 pub use conflict::*;
 pub use diff::*;

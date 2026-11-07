@@ -625,7 +625,7 @@ async fn publication_drops_an_emptied_write_check_commit_and_pushes_the_survivin
     let work = crate::jj::bookmark_commit(&fx.jj, &fx.store, &source).unwrap();
     let empty = empty_commit_on_source(&fx, &bin, "fix: apply write-check changes");
 
-    let published = publish_landing_source(&fx.jj, &fx.store, "main", &source)
+    let published = publish_landing_source(&fx.jj, &fx.store, "main", &source, false)
         .expect("an empty commit never refuses publication");
     assert_eq!(
         published,
@@ -671,7 +671,7 @@ async fn publication_refuses_an_undescribed_commit_made_outside_cairn() {
         ],
     );
 
-    let error = publish_landing_source(&fx.jj, &fx.store, "main", &source)
+    let error = publish_landing_source(&fx.jj, &fx.store, "main", &source, false)
         .expect_err("a commit with changes and no description is refused");
     assert!(
         error.contains("carry changes but no description") && error.contains("made outside Cairn"),

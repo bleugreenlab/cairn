@@ -121,6 +121,13 @@ pub async fn prepare_batch(
         {
             prepared.push((index, outcome));
         }
+        // Exempting one branch from replay is the operator's to approve; an
+        // agent's `catch-up-mode` write on a node's rebase page asks with a card.
+        if let Some(outcome) =
+            crate::resources::mutations::rebase_authority(orch, request, item).await
+        {
+            prepared.push((index, outcome));
+        }
         for request in crate::resources::mutations::workspace_settings_authority(item) {
             prepared.push((
                 index,

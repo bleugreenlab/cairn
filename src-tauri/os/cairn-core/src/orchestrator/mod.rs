@@ -15,6 +15,7 @@ pub mod base_advance;
 pub(crate) mod branch_recovery;
 pub mod build_change;
 pub mod build_services;
+pub(crate) mod catch_up;
 mod claude_credentials;
 pub mod config_resource;
 pub mod conflict_session;

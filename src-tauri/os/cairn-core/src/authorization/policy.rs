@@ -164,6 +164,15 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
             AuthorityPolicy::RequiresApproval(AuthorityReason::QueueStartNow)
         }
 
+        // ── A branch's catch-up mode ─────────────────────────────────────
+        // Exempting a branch from replay, and gating its landing on declared
+        // review paths, is an exception to how every branch is kept current.
+        // Security's condition (cairn/6080): it must not become a general way
+        // out of replay, so it is never the asking agent's own to make.
+        (AuthorityPlace::BranchCatchUp { .. }, AuthorityAction::Write) => {
+            AuthorityPolicy::RequiresApproval(AuthorityReason::BranchCatchUpMode)
+        }
+
         // ── Stored content ───────────────────────────────────────────
         // Removing a stored object deletes its bytes for every reader, which
         // no one can undo, and decides over whatever private matter it shows.
@@ -240,6 +249,23 @@ mod tests {
             AuthorityAction::Write,
         );
         assert_eq!(classify(&other, false), AuthorityPolicy::Direct);
+    }
+
+    #[test]
+    fn a_branch_catch_up_mode_write_always_requires_approval() {
+        let scope = AuthorityScope::new(
+            AuthorityPlace::BranchCatchUp {
+                project_id: "proj".to_string(),
+                bookmark: "agent/cairn-4113-builder-0".to_string(),
+            },
+            AuthorityAction::Write,
+        );
+        for owned in [false, true] {
+            assert_eq!(
+                classify(&scope, owned),
+                AuthorityPolicy::RequiresApproval(AuthorityReason::BranchCatchUpMode)
+            );
+        }
     }
 
     fn settings(section: &str) -> AuthorityScope {
