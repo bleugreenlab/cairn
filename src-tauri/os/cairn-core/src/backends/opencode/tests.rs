@@ -745,6 +745,7 @@ fn each_familys_one_shot_usage_journals_as_its_golden() {
         "cli one-shot",
         &CompletionOutcome {
             text: String::new(),
+            reasoning: None,
             parsed: None,
             model: String::new(),
             usage,

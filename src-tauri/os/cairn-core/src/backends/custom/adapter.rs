@@ -93,6 +93,7 @@ impl CustomAdapter {
             .to_string();
         Ok(CompletionOutcome {
             text,
+            reasoning: cairn_models::interface::complete::chat_reasoning_text(&response),
             parsed: None,
             // Inference on hardware the operator owns has no per-token price to
             // report. Reporting zero would claim a measurement nobody made.

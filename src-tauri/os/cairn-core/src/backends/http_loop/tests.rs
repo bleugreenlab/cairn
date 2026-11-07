@@ -92,7 +92,7 @@ fn usage_maps_token_counts() {
         completion_tokens: Some(5),
         total_tokens: Some(15),
         reasoning_tokens: None,
-        prompt_tokens_details: Some(json!({"cached_tokens": 3})),
+        prompt_tokens_details: Some(json!({"cached_tokens": 3, "cache_write_tokens": 4})),
         completion_tokens_details: Some(json!({"reasoning_tokens": 2})),
         cost: None,
         cost_details: None,
@@ -100,10 +100,10 @@ fn usage_maps_token_counts() {
     assert_eq!(
         usage.token_counts(),
         TokenCounts {
-            input: Some(7),
+            input: Some(3),
             output: Some(5),
             cache_read: Some(3),
-            cache_create: None,
+            cache_create: Some(4),
             thinking: Some(2)
         }
     );

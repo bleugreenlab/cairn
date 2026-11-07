@@ -159,6 +159,8 @@ impl CompletionRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionOutcome {
     pub text: String,
+    /// Plain reasoning exposed by the wire, bounded to 16 KiB of UTF-8.
+    pub reasoning: Option<String>,
     pub parsed: Option<Value>,
     pub model: String,
     /// What the completion consumed and, when the provider said, what it cost.

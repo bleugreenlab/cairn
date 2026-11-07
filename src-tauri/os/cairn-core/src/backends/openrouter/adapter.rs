@@ -81,7 +81,18 @@ impl WireAdapter for OpenRouterAdapter {
         session_id: &str,
         system_prompt: &str,
     ) -> Result<Vec<ChatMessage>, String> {
-        conversation::build_conversation_messages(orch, config, session_id, system_prompt)
+        let mut messages =
+            conversation::build_conversation_messages(orch, config, session_id, system_prompt)?;
+        messages[0].content = Some(cairn_models::openrouter::system_content(
+            config
+                .model
+                .as_ref()
+                .map(|model| model.as_str())
+                .unwrap_or(self.default_model()),
+            system_prompt,
+            config.system_prompt_dynamic_tail.as_deref(),
+        ));
+        Ok(messages)
     }
 
     fn context_window(&self, orch: &Orchestrator, model: &str) -> Option<i64> {
@@ -134,5 +145,15 @@ mod tests {
             json!(true)
         );
         assert_eq!(body["stream"], json!(false));
+
+        let mut request = request;
+        request.model = "anthropic/claude-haiku-5.5".into();
+        request.system = Some("x".repeat(16_384));
+        let body = completion_body(&request, &family).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(body["messages"][1]["content"].is_string());
     }
 }

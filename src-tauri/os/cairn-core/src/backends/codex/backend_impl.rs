@@ -652,6 +652,7 @@ impl AgentBackend for CodexBackend {
             };
             Ok(CompletionOutcome {
                 text: reply.text,
+                reasoning: None,
                 parsed,
                 model: request.model,
                 // Codex reports no price; a subscription's would be notional.

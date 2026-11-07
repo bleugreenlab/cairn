@@ -1947,6 +1947,81 @@ async fn row_grain_cost_partial_and_zero_metering_stays_exact_only() {
     }
 }
 
+/// OpenRouter's cache-write premium belongs to cache_create, not uncached
+/// input. A provider settlement replaces the estimate, including a real zero.
+#[tokio::test]
+async fn openrouter_cache_writes_keep_their_premium_and_exact_cost() {
+    let model = "anthropic/claude-haiku-5.5";
+    for exact in [None, Some(0.0), Some(0.0042)] {
+        let db = cost_db().await;
+        seed_run(&db, "cache", "openrouter", model).await;
+        ins_ev(
+            &db,
+            "cached",
+            "run-cache",
+            "sess-cache",
+            0,
+            "assistant",
+            JAN_2025 + 10,
+            1_000,
+            20_000,
+            10_000,
+            500,
+            100,
+            None,
+        )
+        .await;
+        // Result usage repeats the final generation, but must not repeat its
+        // tokens in analytics; its cost is the per-turn provider settlement.
+        ins_ev(
+            &db,
+            "settled",
+            "run-cache",
+            "sess-cache",
+            1,
+            "result:success",
+            JAN_2025 + 20,
+            1_000,
+            20_000,
+            10_000,
+            500,
+            100,
+            exact,
+        )
+        .await;
+        queries::fold_token_rollup(&db).await.unwrap();
+
+        let scope = Scope::default();
+        let range = TimeRange::default();
+        let out = model_role_economics(&db, &scope, &range).await.unwrap();
+        assert_eq!(out.by_model.len(), 1);
+        let row = &out.by_model[0];
+        assert_eq!(row.input_tokens, 1_000);
+        assert_eq!(row.cache_read_tokens, 20_000);
+        assert_eq!(row.cache_create_tokens, 10_000);
+        assert_eq!(row.output_tokens, 500);
+        assert_eq!(row.thinking_tokens, 100);
+        assert_eq!(row.billable_tokens, 31_500);
+        assert!((row.cache_hit_ratio - 20_000.0 / 31_000.0).abs() < 1e-12);
+        // Per-million rates: input 0.10, read 0.01, write 0.125
+        // (the explicit 1.25x premium), output 0.50. Thinking is inside output.
+        let estimated = (1_000.0 * 0.10 + 20_000.0 * 0.01 + 10_000.0 * 0.125 + 500.0 * 0.50) / 1e6;
+        let expected = exact.unwrap_or(estimated);
+        assert!((row.cost_usd - expected).abs() < 1e-12);
+        let points = cost_timeseries(&db, &scope, &range, Bucket::Hour)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].cost_usd - expected).abs() < 1e-12);
+        let provider = crate::cost::provider_model_costs(&db, "openrouter", &scope, &range)
+            .await
+            .unwrap();
+        assert_eq!(provider.len(), 1);
+        assert_eq!(provider[0].billable_tokens, 31_500);
+        assert!((provider[0].cost_usd - expected).abs() < 1e-12);
+    }
+}
+
 #[tokio::test]
 async fn row_grain_cost_oracle_matches_nullable_dimensions() {
     let db = cost_db().await;

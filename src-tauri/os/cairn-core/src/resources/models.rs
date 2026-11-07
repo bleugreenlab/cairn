@@ -863,7 +863,7 @@ const COMPLETE_MODELS_NAMED: usize = 5;
 /// line with its count and a few names, and the catalog holds the rest.
 pub(crate) fn render_complete(facet: &dyn Models) -> String {
     let mut out = String::from(
-        "# Complete\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/complete\", payload:{args_json:{model, prompt | messages, system?, options?, output?}}}]})`. One tool-free completion, sent and journaled exactly as a named response's is, without writing a definition first. `output` is a JSON Schema the answer must meet; the parsed answer comes back as `structured`. The model is never chosen for you.\n\n",
+        "# Complete\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/complete\", payload:{args_json:{model, prompt | messages, system?, options?, output?}}}]})`. One tool-free completion, sent and journaled exactly as a named response's is, without writing a definition first. `output` is a JSON Schema the answer must meet; the parsed answer comes back as `structured`. The model is never chosen for you.\n\nThe reply contains `text`, nullable `reasoning`, the selected `model` and `provider`, `usage`, optional `cost` (USD), `latencyMs`, and `history` (the response-history URI). `structured` is present only when an output schema was supplied and satisfied. `usage` contains `inputTokens`, `outputTokens`, `cachedInputTokens`, and `reasoningTokens`: each is null when unreported, preserves an explicit zero, and otherwise carries the provider-reported count. Reasoning tokens are a detail of output tokens, not an additional total. `reasoning` contains only visible plain reasoning or summaries, concatenated in provider order up to 16 KiB of UTF-8 in total; absent, empty, or over-limit reasoning is null, never truncated. Opaque signatures, redacted thinking, and encrypted continuation state are excluded. Chat accepts `reasoning` and `reasoning_content`; visible structured details take precedence, otherwise plain text is used. Messages exposes visible thinking, and Responses exposes summary text. Claude and Codex one-shot CLI replies currently return null reasoning. After a schema retry, reply text, reasoning, and usage describe the accepted attempt.\n\n",
     );
     let catalog = match facet.catalog(&ModelScope::workspace()) {
         Ok(catalog) => catalog,
@@ -2125,10 +2125,11 @@ pub(crate) fn render_usage_history(
         out.push_str("No usage readings recorded for this account yet. A reading is written each time a usage refresh measures it; see cairn://models/accounts.\n");
         return out;
     }
-    let mut windows: Vec<(
-        (&str, &str, &str),
-        Vec<&cairn_db::storage::usage_readings::UsageWindowReadingRow>,
-    )> = Vec::new();
+    type WindowReadings<'a> = (
+        (&'a str, &'a str, &'a str),
+        Vec<&'a cairn_db::storage::usage_readings::UsageWindowReadingRow>,
+    );
+    let mut windows: Vec<WindowReadings<'_>> = Vec::new();
     for row in rows {
         let key = (
             row.window_name.as_str(),
@@ -2385,6 +2386,35 @@ mod tests {
             super::accountless(&cairn_gateway_descriptor()),
             Some("this device's Cairn token")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_complete_page_documents_the_full_reply() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let page = read(&orch, "cairn://models/complete").await;
+        for term in [
+            "`text`",
+            "`reasoning`",
+            "`structured`",
+            "`model`",
+            "`provider`",
+            "`usage`",
+            "`cost`",
+            "`latencyMs`",
+            "`history`",
+            "`inputTokens`",
+            "`outputTokens`",
+            "`cachedInputTokens`",
+            "`reasoningTokens`",
+            "null when unreported",
+            "explicit zero",
+            "16 KiB of UTF-8",
+            "never truncated",
+            "encrypted continuation state",
+            "accepted attempt",
+        ] {
+            assert!(page.contains(term), "missing {term}: {page}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

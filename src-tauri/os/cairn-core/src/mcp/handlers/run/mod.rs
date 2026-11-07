@@ -10485,6 +10485,7 @@ pub(crate) mod host_batch_tests {
                 std::thread::sleep(delay);
                 Ok(CompletionOutcome {
                     text: "the long answer".into(),
+                    reasoning: None,
                     parsed: None,
                     model: "test-model".into(),
                     usage: Default::default(),

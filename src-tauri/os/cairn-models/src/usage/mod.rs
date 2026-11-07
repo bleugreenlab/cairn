@@ -124,14 +124,18 @@ mod tests {
         let usage: TurnUsage = serde_json::from_value(serde_json::json!({
             "prompt_tokens": 194,
             "completion_tokens": 2,
-            "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+            "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 100},
+            "cost": 0.0042,
+            "cost_details": {"upstream_inference_cost": 0.003}
         }))
         .unwrap();
         let metered = metered(&usage);
-        assert_eq!(tokens(&metered, Charge::Input), Some(94));
-        assert_eq!(tokens(&metered, Charge::CacheRead), Some(0));
+        assert_eq!(tokens(&metered, Charge::Input), Some(34));
+        assert_eq!(tokens(&metered, Charge::CacheRead), Some(60));
         assert_eq!(tokens(&metered, Charge::CacheWrite), Some(100));
         assert_eq!(metered.prompt_tokens(), Some(194));
+        // The customer charge, not upstream cost or a cache-adjusted estimate.
+        assert_eq!(metered.cost_usd, Some(0.0042));
     }
 
     #[test]

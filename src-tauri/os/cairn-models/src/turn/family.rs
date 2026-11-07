@@ -66,6 +66,26 @@ pub struct ChatFamily {
     pub extras: Map<String, Value>,
 }
 
+impl ChatFamily {
+    /// Build either delivery form with the same provider policy. The neutral
+    /// wire builder knows syntax; the facet owns OpenRouter's caching rules.
+    pub fn request_body(
+        &self,
+        dialect: &ChatDialect,
+        model: &str,
+        conversation: &[chat::wire::ChatMessage],
+        config: &GenerationConfig,
+        stream: bool,
+    ) -> Value {
+        let mut body =
+            chat::http::build_body(dialect, model, conversation, config, &self.extras, stream);
+        if self.endpoint.backend_key == "openrouter" {
+            crate::openrouter::apply_prompt_caching(&mut body, stream);
+        }
+        body
+    }
+}
+
 impl ProtocolFamily for ChatFamily {
     type Message = chat::wire::ChatMessage;
 
@@ -83,14 +103,7 @@ impl ProtocolFamily for ChatFamily {
         conversation: &[Self::Message],
         config: &GenerationConfig,
     ) -> Value {
-        chat::http::build_body(
-            &self.dialect,
-            model,
-            conversation,
-            config,
-            &self.extras,
-            true,
-        )
+        self.request_body(&self.dialect, model, conversation, config, true)
     }
 
     fn read(

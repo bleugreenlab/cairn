@@ -312,6 +312,7 @@ fn unrunnable_reason(
 pub struct ResponseOutcome {
     pub seq: i64,
     pub text: String,
+    pub reasoning: Option<String>,
     pub parsed: Option<Value>,
     pub model: String,
     pub backend: String,
@@ -319,6 +320,8 @@ pub struct ResponseOutcome {
     pub cost: Option<f64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// A caller's bound on a whole model call, and what decided it.
@@ -577,6 +580,8 @@ impl ResponseCaller {
 #[serde(rename_all = "camelCase")]
 pub struct ResponseTestOutcome {
     pub text: String,
+    #[serde(skip)]
+    reasoning: Option<String>,
     pub parsed: Option<Value>,
     pub model: String,
     pub backend: String,
@@ -586,6 +591,10 @@ pub struct ResponseTestOutcome {
     input_tokens: Option<u64>,
     #[serde(skip)]
     output_tokens: Option<u64>,
+    #[serde(skip)]
+    cached_input_tokens: Option<u64>,
+    #[serde(skip)]
+    reasoning_tokens: Option<u64>,
     /// The account that served it, for the journal.
     #[serde(skip)]
     account_id: Option<String>,
@@ -870,6 +879,7 @@ async fn record_attempt(
             Ok(ResponseOutcome {
                 seq: record.seq,
                 text: outcome.text,
+                reasoning: outcome.reasoning,
                 parsed: outcome.parsed,
                 model: outcome.model,
                 backend: outcome.backend,
@@ -877,6 +887,8 @@ async fn record_attempt(
                 cost: outcome.cost,
                 input_tokens: outcome.input_tokens,
                 output_tokens: outcome.output_tokens,
+                cached_input_tokens: outcome.cached_input_tokens,
+                reasoning_tokens: outcome.reasoning_tokens,
             })
         }
         Err(AttemptFailure { error, account_id }) => {
@@ -1212,6 +1224,7 @@ async fn execute_completion(
                         };
                         accepted = Some(ResponseTestOutcome {
                             text: outcome.text,
+                            reasoning: outcome.reasoning,
                             parsed,
                             model: outcome.model,
                             backend: backend_name.clone(),
@@ -1220,6 +1233,14 @@ async fn execute_completion(
                             input_tokens: outcome.usage.prompt_tokens(),
                             output_tokens: outcome.usage.quantity(
                                 cairn_models::types::usage::Charge::Output,
+                                cairn_models::types::usage::BillingUnit::Tokens,
+                            ),
+                            cached_input_tokens: outcome.usage.quantity(
+                                cairn_models::types::usage::Charge::CacheRead,
+                                cairn_models::types::usage::BillingUnit::Tokens,
+                            ),
+                            reasoning_tokens: outcome.usage.quantity(
+                                cairn_models::types::usage::Charge::Reasoning,
                                 cairn_models::types::usage::BillingUnit::Tokens,
                             ),
                             account_id: outcome.account_id,
@@ -2057,6 +2078,7 @@ mod tests {
                 *captured_for_backend.lock().unwrap() = Some((backend, request));
                 Ok(CompletionOutcome {
                     text: r#"{"answer":"done"}"#.into(),
+                    reasoning: None,
                     parsed: None,
                     model: "test-model".into(),
                     usage: Default::default(),
@@ -2292,6 +2314,7 @@ mod tests {
                 }
                 Ok(CompletionOutcome {
                     text: "answer".into(),
+                    reasoning: None,
                     parsed: None,
                     model: "test-model".into(),
                     usage: Default::default(),
@@ -2564,6 +2587,7 @@ mod tests {
         .unwrap();
         let off_contract = |account: &str| CompletionOutcome {
             text: "not json".into(),
+            reasoning: None,
             parsed: None,
             model: "test-model".into(),
             usage: Default::default(),

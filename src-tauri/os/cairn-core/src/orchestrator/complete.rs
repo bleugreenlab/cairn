@@ -80,6 +80,8 @@ pub(crate) struct CompleteDoorRequest {
 pub(crate) struct CompleteUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// What the complete door returns.
@@ -87,6 +89,7 @@ pub(crate) struct CompleteUsage {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CompleteOutcome {
     pub text: String,
+    pub reasoning: Option<String>,
     /// The answer parsed and checked against `output`, when one was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured: Option<Value>,
@@ -312,12 +315,15 @@ impl Orchestrator {
         };
         Ok(CompleteOutcome {
             text: outcome.text,
+            reasoning: outcome.reasoning,
             structured: outcome.parsed,
             model: outcome.model,
             provider: outcome.backend,
             usage: CompleteUsage {
                 input_tokens: outcome.input_tokens,
                 output_tokens: outcome.output_tokens,
+                cached_input_tokens: outcome.cached_input_tokens,
+                reasoning_tokens: outcome.reasoning_tokens,
             },
             cost: outcome.cost,
             latency_ms: outcome.latency_ms,
@@ -359,6 +365,47 @@ mod tests {
     async fn workspace(
         answers: Vec<&str>,
     ) -> (Orchestrator, Arc<Mutex<Vec<CompletionRequest>>>, String) {
+        workspace_with_replies(
+            answers
+                .into_iter()
+                .map(|text| (text, usage(None), None))
+                .collect(),
+        )
+        .await
+    }
+
+    fn usage(detail: Option<u64>) -> MeteredUsage {
+        let mut measures = vec![
+            Measure {
+                meter: Meter::tokens(Charge::Input),
+                quantity: 12,
+            },
+            Measure {
+                meter: Meter::tokens(Charge::Output),
+                quantity: 3,
+            },
+        ];
+        if let Some(quantity) = detail {
+            measures.extend([
+                Measure {
+                    meter: Meter::tokens(Charge::CacheRead),
+                    quantity,
+                },
+                Measure {
+                    meter: Meter::tokens(Charge::Reasoning),
+                    quantity,
+                },
+            ]);
+        }
+        MeteredUsage {
+            measures,
+            cost_usd: Some(0.0002),
+        }
+    }
+
+    async fn workspace_with_replies(
+        replies: Vec<(&str, MeteredUsage, Option<&str>)>,
+    ) -> (Orchestrator, Arc<Mutex<Vec<CompletionRequest>>>, String) {
         let (orch, _, key) = crate::orchestrator::decide_fixtures::workspace_with_server(
             CustomProtocol::OpenAiChatCompletions,
             None,
@@ -367,10 +414,12 @@ mod tests {
         )
         .await;
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let answers = Arc::new(Mutex::new(
-            answers
+        let replies = Arc::new(Mutex::new(
+            replies
                 .into_iter()
-                .map(str::to_string)
+                .map(|(text, usage, reasoning)| {
+                    (text.to_string(), usage, reasoning.map(str::to_string))
+                })
                 .collect::<VecDeque<_>>(),
         ));
         let kept = sent.clone();
@@ -379,33 +428,62 @@ mod tests {
             Arc::new(move |_backend, request: CompletionRequest, _orch| {
                 let model = request.model.clone();
                 kept.lock().unwrap().push(request);
+                let (text, usage, reasoning) = replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("an unscripted request");
                 Ok(CompletionOutcome {
-                    text: answers
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .expect("an unscripted request"),
+                    text,
+                    reasoning,
                     parsed: None,
                     model,
-                    usage: MeteredUsage {
-                        measures: vec![
-                            Measure {
-                                meter: Meter::tokens(Charge::Input),
-                                quantity: 12,
-                            },
-                            Measure {
-                                meter: Meter::tokens(Charge::Output),
-                                quantity: 3,
-                            },
-                        ],
-                        cost_usd: Some(0.0002),
-                    },
+                    usage,
                     latency_ms: 40,
                     account_id: None,
                 })
             }),
         );
         (orch, sent, key)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completion_reply_preserves_unknown_zero_and_reported_usage_and_reasoning() {
+        let mut zero_usage = usage(Some(0));
+        for measure in &mut zero_usage.measures {
+            measure.quantity = 0;
+        }
+        let (orch, _, _) = workspace_with_replies(vec![
+            ("unknown", MeteredUsage::default(), None),
+            ("zero", zero_usage, Some("visible zero")),
+            ("reported", usage(Some(7)), Some("visible reported")),
+        ])
+        .await;
+        for (text, input, output, detail, reasoning) in [
+            ("unknown", None, None, None, None),
+            ("zero", Some(0), Some(0), Some(0), Some("visible zero")),
+            (
+                "reported",
+                Some(19),
+                Some(3),
+                Some(7),
+                Some("visible reported"),
+            ),
+        ] {
+            let outcome = complete(&orch, json!({"model": "qwen3", "prompt": "answer"}))
+                .await
+                .unwrap();
+            let reply = serde_json::to_value(outcome).unwrap();
+            assert_eq!(reply["text"], text);
+            assert_eq!(reply["reasoning"], json!(reasoning));
+            assert_eq!(
+                reply["usage"],
+                json!({
+                    "inputTokens": input, "outputTokens": output,
+                    "cachedInputTokens": detail, "reasoningTokens": detail
+                })
+            );
+        }
     }
 
     fn bound() -> InvocationBound {
@@ -484,7 +562,11 @@ mod tests {
     /// is retried once naming the violation, then returned parsed.
     #[tokio::test(flavor = "multi_thread")]
     async fn messages_and_a_schema_round_trip_through_the_contract_retry() {
-        let (orch, sent, _) = workspace(vec!["not json", r#"{"answer": 4}"#]).await;
+        let (orch, sent, _) = workspace_with_replies(vec![
+            ("not json", usage(Some(99)), Some("rejected attempt")),
+            (r#"{"answer": 4}"#, usage(Some(7)), Some("accepted attempt")),
+        ])
+        .await;
         let outcome = complete(
             &orch,
             json!({"model": "qwen3",
@@ -497,6 +579,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.structured, Some(json!({"answer": 4})));
+        assert_eq!(outcome.reasoning.as_deref(), Some("accepted attempt"));
+        assert_eq!(outcome.usage.cached_input_tokens, Some(7));
+        assert_eq!(outcome.usage.reasoning_tokens, Some(7));
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 2, "one corrective retry");
         assert_eq!(sent[0].messages.len(), 3);

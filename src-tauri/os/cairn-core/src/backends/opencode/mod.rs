@@ -203,6 +203,7 @@ fn complete_chat(
         .to_string();
     Ok(CompletionOutcome {
         text,
+        reasoning: cairn_models::interface::complete::chat_reasoning_text(&response),
         parsed: None,
         usage: response
             .usage
@@ -275,6 +276,7 @@ fn complete_messages(
     let cost = crate::backends::anthropic_messages::wire::parse_cost(response.cost.as_ref());
     Ok(CompletionOutcome {
         text,
+        reasoning: cairn_models::interface::complete::messages_reasoning_text(&response),
         parsed: None,
         usage: response
             .usage
@@ -346,6 +348,7 @@ fn complete_responses(
     }
     Ok(CompletionOutcome {
         text,
+        reasoning: cairn_models::interface::complete::responses_reasoning_text(&response),
         parsed: None,
         usage: response
             .usage

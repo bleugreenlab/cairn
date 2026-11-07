@@ -68,6 +68,7 @@ impl ActualAdapter {
             .to_string();
         Ok(CompletionOutcome {
             text,
+            reasoning: cairn_models::interface::complete::chat_reasoning_text(&response),
             parsed: None,
             // Inference runs on hardware the user owns. There is no
             // provider-side price to report, and deriving one from token counts

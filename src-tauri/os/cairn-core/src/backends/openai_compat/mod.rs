@@ -53,12 +53,11 @@ pub(crate) fn completion_body(
         response_format: true,
         ..family.dialect
     };
-    Ok(http::build_body(
+    Ok(family.request_body(
         &dialect,
         &request.model,
         &messages,
         &completion_generation(request),
-        &family.extras,
         false,
     ))
 }

@@ -2074,6 +2074,7 @@ fn serve_one_shot(
     };
     Ok(CompletionOutcome {
         text,
+        reasoning: None,
         parsed,
         model: request.model.clone(),
         usage: reply
