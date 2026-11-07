@@ -32,10 +32,13 @@ fn gate_accepts_the_rebase_replay_action() {
         })),
     );
     let spec = gate(&it).expect("the replay mutation is gated in");
-    assert_eq!(spec.label, REBASE_LABEL);
+    assert!(std::ptr::eq(spec, rebase_patch_spec()));
 }
 
-const REBASE_LABEL: &str = "replay this branch, or take origin's fast-forward of it or its base";
+fn rebase_patch_spec() -> &'static MutationSpec {
+    cairn_common::contract::mutation_spec(ResourceKind::NodeRebase, ChangeMode::Patch)
+        .expect("the node rebase contract declares patch")
+}
 
 /// The sanctioned repair for a branch the store holds behind origin (cairn/5038)
 /// has to reach dispatch, for the node's own branch and for its base.
@@ -51,7 +54,7 @@ fn gate_accepts_fast_forward_from_origin() {
             Some(payload),
         );
         let spec = gate(&it).expect("the fast-forward mutation is gated in");
-        assert_eq!(spec.label, REBASE_LABEL);
+        assert!(std::ptr::eq(spec, rebase_patch_spec()));
     }
 }
 

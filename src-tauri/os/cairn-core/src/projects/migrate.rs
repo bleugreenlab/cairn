@@ -1681,6 +1681,10 @@ pub(super) mod tests {
               VALUES ('project-delete', '/store', 'bookmark', 'permanent', 'fingerprint', 1, 1);
             INSERT INTO jj_branch_recoveries(id, project_id, store_path, scope, status, phase, budget_class, operation, affected, coordinates, diagnostic, next_repair_at, created_at, updated_at)
               VALUES ('recovery-delete', 'project-delete', '/store', 'branch', 'fenced', 'replay', 'interactive', 'operation', '[]', '{}', 'repair pending', 1, 1, 1);
+            INSERT INTO branch_catch_up_modes(project_id, store_path, bookmark, mode, job_id, set_by, set_at, review_paths, reviewed_through, reviewed_by, reviewed_at)
+              VALUES ('project-delete', '/store', 'bookmark', 'merge', 'job-delete', 'human', 1, '[]', 'base', 'human', 1);
+            INSERT INTO branch_catch_up_events(project_id, store_path, bookmark, kind, actor, detail, at)
+              VALUES ('project-delete', '/store', 'bookmark', 'set', 'human', '{}', 1);
             INSERT INTO job_browsers(id, job_id, project_id, slug, webview_label, status, created_at)
               VALUES ('browser-delete', 'job-delete', 'project-delete', 'browser', 'browser', 'closed', 1);
             INSERT INTO job_repls(id, job_id, project_id, slug, interpreter, generation, status, created_at)
