@@ -40,6 +40,10 @@ fn clocks() -> TickClocks {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeReading {
     pub resident_bytes: u64,
+    /// Physical footprint summed over exactly the members `resident_bytes`
+    /// sums, so the two are floors together. `None` when any of those members
+    /// has no footprint reading; a reader then shows RSS, named as RSS.
+    pub physical_footprint_bytes: Option<u64>,
     pub members_read: usize,
     pub members_total: usize,
     pub incomplete: bool,
@@ -59,6 +63,9 @@ pub enum SamplingStatus {
 #[derive(Clone, Default)]
 pub struct WatchOptions {
     pub storage: bool,
+    /// Ask for members' physical footprint where reading it is not free
+    /// (Linux's `smaps_rollup`); macOS reports it for every watch.
+    pub footprint: bool,
     /// Optional monotonic deadline; expiry is serviced by the existing sampler.
     pub expires_at_ms: Option<u64>,
     #[cfg(windows)]
@@ -392,6 +399,12 @@ impl ProcessTreeSampler {
                     .storage_wanted
                     .extend(registration.membership.members.keys().copied());
             }
+            for registration in state.registrations.values().filter(|r| r.options.footprint) {
+                census.footprint_wanted.push(registration.leader.pid);
+                census
+                    .footprint_wanted
+                    .extend(registration.membership.members.keys().copied());
+            }
             state.registrations.keys().copied().collect::<Vec<_>>()
         };
         if ids.is_empty() {
@@ -399,6 +412,8 @@ impl ProcessTreeSampler {
         }
         census.storage_wanted.sort_unstable();
         census.storage_wanted.dedup();
+        census.footprint_wanted.sort_unstable();
+        census.footprint_wanted.dedup();
         if !(self.source)(census) {
             let mut failed = Vec::new();
             let mut state = self.state.lock().unwrap();
@@ -534,21 +549,29 @@ impl ProcessTreeSampler {
                 } else {
                     let mut reading = TreeReading {
                         resident_bytes: 0,
+                        physical_footprint_bytes: None,
                         members_read: 0,
                         members_total: members.len(),
                         incomplete: membership_incomplete,
                         measured_at: now,
                     };
+                    let mut footprint = Some(0_u64);
                     for member in &members {
-                        match census.row(member.pid).and_then(|row| row.resident_bytes) {
+                        let row = census.row(member.pid);
+                        match row.and_then(|row| row.resident_bytes) {
                             Some(bytes) => {
                                 reading.resident_bytes =
                                     reading.resident_bytes.saturating_add(bytes);
                                 reading.members_read += 1;
+                                footprint = footprint
+                                    .zip(row.and_then(|row| row.physical_footprint_bytes))
+                                    .map(|(sum, bytes)| sum.saturating_add(bytes));
                             }
                             None => reading.incomplete = true,
                         }
                     }
+                    reading.physical_footprint_bytes =
+                        footprint.filter(|_| reading.members_read > 0);
                     SamplingStatus::Measured(reading)
                 };
                 registration.status = status.clone();
@@ -803,6 +826,7 @@ mod tests {
                 start: StartKey(1, 0),
             },
             resident_bytes: rss,
+            physical_footprint_bytes: None,
             cpu_ms: Some(10),
             storage_io_bytes: Some(20),
             uninterruptible: false,
@@ -859,6 +883,7 @@ mod tests {
             reading,
             TreeReading {
                 resident_bytes: 30,
+                physical_footprint_bytes: None,
                 members_read: 1,
                 members_total: 2,
                 incomplete: true,
@@ -870,6 +895,63 @@ mod tests {
         );
         assert_eq!(watch.members().len(), 2);
         assert_eq!(observer.ticks.lock().unwrap()[0].0, sampler.sequence());
+    }
+    #[test]
+    fn footprint_sums_over_exactly_the_members_rss_sums() {
+        let with = |mut row: CensusRow, footprint: Option<u64>| {
+            row.physical_footprint_bytes = footprint;
+            row
+        };
+        let script: Script = Arc::new(Mutex::new(Some((
+            vec![
+                with(row(10, 1, Some(300)), Some(70)),
+                with(row(11, 10, Some(200)), Some(30)),
+            ],
+            vec![],
+            false,
+        ))));
+        let sampler = manual(&script, Arc::new(Observer::default()));
+        let watch = sampler
+            .watch(
+                identity(10),
+                WatchOptions {
+                    footprint: true,
+                    ..WatchOptions::default()
+                },
+            )
+            .unwrap();
+        let tick = || {
+            let mut census = Census::default();
+            sampler.sample_once(&mut census);
+            let SamplingStatus::Measured(reading) = watch.latest() else {
+                panic!("not measured")
+            };
+            (
+                reading.resident_bytes,
+                reading.physical_footprint_bytes,
+                census.footprint_wanted,
+            )
+        };
+        // The leader is wanted before its tree is known; members after.
+        assert_eq!(tick(), (500, Some(100), vec![10]));
+        assert_eq!(tick(), (500, Some(100), vec![10, 11]));
+        script.lock().unwrap().as_mut().unwrap().0[1].physical_footprint_bytes = None;
+        assert_eq!(
+            tick(),
+            (500, None, vec![10, 11]),
+            "a member without footprint leaves the tree on RSS"
+        );
+        {
+            let mut guard = script.lock().unwrap();
+            let child = &mut guard.as_mut().unwrap().0[1];
+            child.physical_footprint_bytes = Some(30);
+            child.resident_bytes = None;
+        }
+        assert_eq!(
+            tick(),
+            (300, Some(70), vec![10, 11]),
+            "footprint floors over the same members RSS floors over"
+        );
     }
     #[test]
     fn failed_census_ages_previous_success_and_recovery_replaces_it() {
@@ -1192,6 +1274,7 @@ mod delivery_tests {
                 start: StartKey(1, 0),
             },
             resident_bytes: Some(1),
+            physical_footprint_bytes: None,
             cpu_ms: Some(1),
             storage_io_bytes: None,
             uninterruptible: false,
@@ -1545,6 +1628,7 @@ mod watch_settle_tests {
                             start: StartKey(1, 0),
                         },
                         resident_bytes: Some(1),
+                        physical_footprint_bytes: None,
                         cpu_ms: Some(1),
                         storage_io_bytes: None,
                         uninterruptible: false,

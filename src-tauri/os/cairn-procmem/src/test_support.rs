@@ -45,6 +45,7 @@ fn row(
             start: StartKey(start, 0),
         },
         resident_bytes: Some(rss),
+        physical_footprint_bytes: None,
         cpu_ms: Some(cpu),
         storage_io_bytes: Some(storage),
         uninterruptible: false,

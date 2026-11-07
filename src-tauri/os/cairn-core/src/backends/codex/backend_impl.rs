@@ -620,6 +620,7 @@ impl AgentBackend for CodexBackend {
                 .codex
                 .open(runtime.host.as_ref(), spec)
                 .map_err(map_open_error)?;
+            server.record_thread_start(started.elapsed());
             let thread_id = launched.facts.backend_session_id.clone().ok_or_else(|| {
                 CompletionError::InvalidResponse("Codex opened a thread without an id".to_string())
             })?;
@@ -990,7 +991,9 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
             resume_fallback: None,
         }),
     };
+    let opening = std::time::Instant::now();
     let launched = runtime.codex.open(runtime.host.as_ref(), spec)?;
+    server.record_thread_start(opening.elapsed());
     let thread_id = launched
         .facts
         .backend_session_id
@@ -1030,10 +1033,14 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
         return Err("a pooled Codex thread opened with no app-server".to_string());
     };
 
-    // A NULL child is the isolation lever: `kill_session_with_reason` /
-    // `stop_and_remove` resolve `child.lock().take()` to None and skip
-    // `graceful_stop`, so the shared app-server is never signalled. Interrupt
-    // still reaches this call through `CodexControl` -> `turn/interrupt`.
+    // A NULL child is the isolation lever: teardown finds no child to stop,
+    // so the shared app-server is never signalled. It releases the thread
+    // through `pooled_thread` instead, which interrupts the turn the reader
+    // tracks in `current_turn` and unsubscribes it.
+    let cleanup = Arc::new(
+        super::pool::PooledCall::new(server.clone(), thread_id.clone())
+            .tracking_turn(current_turn.clone()),
+    );
     let process_job_id: Option<String> = run_job_id(CODEX_BACKEND_NAME, &run_db, &config.run_id);
     {
         let mut active_process = ActiveProcess::new(
@@ -1052,6 +1059,7 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
             config.account_id.as_deref(),
         );
         active_process.facts = Some(launched.facts);
+        active_process.pooled_thread = Some(cleanup.clone());
         orch.process_state
             .register_process(config.run_id.clone(), active_process)?;
     }
@@ -1061,7 +1069,6 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
     let run_id = config.run_id.clone();
     let emitter = orch.services.emitter.clone();
     let event_session_id = session_id;
-    let cleanup = super::pool::PooledCall::new(server.clone(), thread_id.clone());
     let reader_host = CodexBackend::session_runtime(
         orch,
         &run_id,

@@ -46,6 +46,13 @@ pub fn process_rss_bytes(_: u32) -> Option<u64> {
     None
 }
 
+/// Windows reports no footprint distinct from its working set yet, so its rows
+/// carry RSS alone.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_footprint_bytes(_: u32) -> Option<u64> {
+    None
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -57,6 +64,7 @@ mod tests {
         assert_eq!(read_start_token(pid), Some(process.start.token()));
         let mut out = Census::default();
         out.storage_wanted.push(pid);
+        out.footprint_wanted.push(pid);
         assert!(census(&mut out));
         let row = out
             .rows

@@ -35,20 +35,20 @@ use crate::env::{
 use crate::fake_responses::{Mode, FAKE_TEXT};
 use crate::surface::{sent_requests, Fixture, KnownDead, Schema};
 
-const TURN: Duration = Duration::from_secs(60);
+pub(crate) const TURN: Duration = Duration::from_secs(60);
 
 /// How long `thread/start` may take while a server request it triggered goes
 /// unanswered. 0.163.0 answers in about 1.3 s (cairn/5138); Cairn's own
 /// request timeout is 60 s.
 const THREAD_START_BOUND: Duration = Duration::from_secs(15);
 
-fn turn_completed<'a>(turn: &'a str) -> impl Fn(&Value) -> bool + 'a {
+pub(crate) fn turn_completed<'a>(turn: &'a str) -> impl Fn(&Value) -> bool + 'a {
     move |message| {
         method_of(message) == Some("turn/completed") && notification_turn_id(message) == Some(turn)
     }
 }
 
-fn completed_status(message: &Value) -> Option<ProviderTurnStatus<'_>> {
+pub(crate) fn completed_status(message: &Value) -> Option<ProviderTurnStatus<'_>> {
     match Notification::parse(message) {
         Notification::TurnCompleted { status, .. } => Some(status),
         _ => None,
@@ -56,7 +56,7 @@ fn completed_status(message: &Value) -> Option<ProviderTurnStatus<'_>> {
 }
 
 /// Start a turn and read it to its end, keeping the thread's messages.
-fn run_turn(
+pub(crate) fn run_turn(
     c: Check,
     stream: &mut Stream,
     session: &mut Session,

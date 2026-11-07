@@ -30,17 +30,7 @@ pub fn system_memory() -> Option<SystemMemory> {
 pub fn own_resident_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: `proc_pid_rusage` fills a zeroed `rusage_info_v4` for our own
-        // pid; the cast matches the C `(rusage_info_t *)&buf` convention.
-        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V4,
-                &mut info as *mut _ as *mut libc::rusage_info_t,
-            )
-        };
-        return (rc == 0).then_some(info.ri_phys_footprint);
+        return cairn_procmem::platform::process_footprint_bytes(std::process::id());
     }
     #[cfg(target_os = "linux")]
     {

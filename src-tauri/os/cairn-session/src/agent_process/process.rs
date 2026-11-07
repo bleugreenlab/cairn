@@ -404,6 +404,10 @@ pub struct RunHandle {
     /// The attached child's pid and kernel start time, read at registration.
     /// A tree reading starts here and confers nothing on a recycled pid.
     leader: Option<ProcessAnchor>,
+    /// Set for a thread on a shared Codex app-server, whose `child` is None:
+    /// tearing this run down releases the thread there instead of signalling
+    /// a process.
+    pub pooled_thread: Option<Arc<crate::backends::codex::pool::PooledCall>>,
 }
 
 /// Durable admission identity carried by a dedicated ordinary process.
@@ -464,6 +468,7 @@ impl RunHandle {
             seen_affordances: Arc::new(Mutex::new(HashSet::new())),
             admission_claim: None,
             leader: None,
+            pooled_thread: None,
         }
     }
 
@@ -861,7 +866,10 @@ impl RunnerMemoryBindings {
                     pid: tree.leader.pid,
                     start_time,
                 },
-                cairn_procmem::WatchOptions::default(),
+                cairn_procmem::WatchOptions {
+                    footprint: true,
+                    ..cairn_procmem::WatchOptions::default()
+                },
             ) {
                 Ok(watch) => {
                     index.registered.insert(
@@ -1801,6 +1809,11 @@ impl AgentProcessState {
         let Some(handle) = handle else {
             return false;
         };
+        // A pooled thread's reader holds the thread too, so dropping the
+        // handle alone would not let it go: release it explicitly.
+        if let Some(thread) = handle.pooled_thread.as_ref() {
+            thread.release();
+        }
         if let Ok(mut child_guard) = handle.child.lock() {
             if let Some(child) = child_guard.as_mut() {
                 graceful_stop(child.as_mut());

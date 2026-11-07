@@ -1253,6 +1253,7 @@ dependencies = [
  "cairn-models",
  "cairn-models-types",
  "cairn-platform",
+ "cairn-procmem",
  "cairn-speech-wire",
  "cairn-tls",
  "chrono",

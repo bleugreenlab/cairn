@@ -43,6 +43,8 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 # Integration tests plant releases through `managed::testing`.
 cairn-models = { path = ".", features = ["test-utils"] }
 cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
+# The codex-contract suite counts and measures the processes under a server.
+cairn-procmem = { path = "../cairn-procmem" }
 # The claude-contract suite reads a live process's launch environment.
 libc = "0.2"
 tempfile = "3"

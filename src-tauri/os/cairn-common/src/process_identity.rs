@@ -634,6 +634,7 @@ mod tests {
                 start: cairn_procmem::StartKey(1, 0),
             },
             resident_bytes: None,
+            physical_footprint_bytes: None,
             cpu_ms: None,
             uninterruptible: false,
             storage_io_bytes: None,

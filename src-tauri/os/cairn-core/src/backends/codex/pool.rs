@@ -62,14 +62,52 @@ pub(crate) mod testing {
         fn server_closed(&self, _server_id: &str) {}
     }
 
+    /// A server on `pools` that never reads its stdin: every write to it
+    /// blocks until `gate`'s sender is dropped.
+    pub(crate) fn unread_server(
+        pools: &Arc<CodexAppServerPool>,
+        gate: crossbeam_channel::Receiver<()>,
+    ) -> Arc<PooledAppServer> {
+        let client = AppServerClient::for_test_unread(gate);
+        pools
+            .ensure(&"identity-unread".to_string(), |_| {
+                Ok((
+                    Arc::new(client),
+                    Arc::new(QuietPoolHost) as Arc<dyn PoolHost>,
+                ))
+            })
+            .unwrap()
+    }
+
     /// A server on `pools`. Its notification stream stays open, and the server
     /// with it, while the returned sender lives.
     pub(crate) fn live_server(
         pools: &Arc<CodexAppServerPool>,
     ) -> (Arc<PooledAppServer>, crossbeam_channel::Sender<Value>) {
+        let (server, stream, _requests) = recording_server(pools);
+        (server, stream)
+    }
+
+    /// [`live_server`], with every request sent to it recorded. It answers
+    /// `thread/unsubscribe` and `thread/goal/get` (no goal) as Codex does and
+    /// every other request with `{}`.
+    pub(crate) fn recording_server(
+        pools: &Arc<CodexAppServerPool>,
+    ) -> (
+        Arc<PooledAppServer>,
+        crossbeam_channel::Sender<Value>,
+        Arc<Mutex<Vec<Value>>>,
+    ) {
+        let requests: Arc<Mutex<Vec<Value>>> = Default::default();
         let (client, stream) = AppServerClient::for_test_with_notifications(
-            |_| Ok(serde_json::json!({})),
-            Default::default(),
+            |request| match request["method"].as_str() {
+                Some("thread/unsubscribe") => {
+                    Ok(serde_json::json!({ "result": { "status": "unsubscribed" } }))
+                }
+                Some("thread/goal/get") => Ok(serde_json::json!({ "result": { "goal": null } })),
+                _ => Ok(serde_json::json!({ "result": {} })),
+            },
+            requests.clone(),
         );
         let server = pools
             .ensure(&"identity".to_string(), |_| {
@@ -79,6 +117,6 @@ pub(crate) mod testing {
                 ))
             })
             .unwrap();
-        (server, stream)
+        (server, stream, requests)
     }
 }

@@ -266,7 +266,76 @@ impl AppServerClient {
         (client, notif_tx)
     }
 
+    /// A client whose server records every request and never answers one:
+    /// a hung server, with its pipe still open.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test_silent(requests: Arc<Mutex<Vec<Value>>>) -> Self {
+        let (_notifications, notif_rx) = unbounded();
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let writer = SilentAppServerWriter {
+            requests,
+            buffer: Vec::new(),
+        };
+        Self::new(None, Box::new(writer), pending, notif_rx, None)
+    }
+
+    /// A client whose every write blocks until `gate`'s sender is dropped,
+    /// then fails: a server that has stopped reading its stdin.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test_unread(gate: Receiver<()>) -> Self {
+        let (_notifications, notif_rx) = unbounded();
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        Self::new(
+            None,
+            Box::new(UnreadAppServerWriter { gate }),
+            pending,
+            notif_rx,
+            None,
+        )
+    }
+
     pub fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
+        let (_, rx) = self.dispatch(method, params)?;
+        self.await_response(method, &rx)?.and_then(Self::result_of)
+    }
+
+    /// [`Self::send_request`], given up at `deadline` rather than after the
+    /// full request timeout: for cleanup that must finish on a server that
+    /// has stopped answering.
+    pub fn send_request_within(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: std::time::Instant,
+    ) -> Result<Value, String> {
+        let (id, rx) = self.dispatch(method, params)?;
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(response) => response.and_then(Self::result_of),
+            Err(_) => {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&id);
+                }
+                Err(format!(
+                    "codex app-server request {method} gave no answer before its deadline"
+                ))
+            }
+        }
+    }
+
+    fn result_of(message: Value) -> Result<Value, String> {
+        match message.get("error") {
+            Some(error) => Err(error.to_string()),
+            None => Ok(message["result"].clone()),
+        }
+    }
+
+    /// Send `method` and answer the request's id and the channel its
+    /// response arrives on.
+    fn dispatch(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(u64, Receiver<Result<Value, String>>), String> {
         let id = {
             let mut guard = self
                 .next_id
@@ -289,14 +358,7 @@ impl AppServerClient {
             "method": method,
             "params": params,
         }))?;
-
-        self.await_response(method, &rx)?.and_then(|msg| {
-            if let Some(error) = msg.get("error") {
-                Err(error.to_string())
-            } else {
-                Ok(msg["result"].clone())
-            }
-        })
+        Ok((id, rx))
     }
 
     /// Wait for `method`'s response. Past `sample_after` the server's stacks
@@ -373,14 +435,28 @@ impl AppServerClient {
     /// Normal user Stop uses `turn/interrupt`, which hard-aborts the active turn
     /// while preserving the app-server for a warm follow-up. Reserve shutdown for
     /// hard teardown paths such as crashes, watchdog expiry, and session eviction.
+    ///
+    /// Never waits on the writer: a write blocked on a server that has stopped
+    /// reading holds the writer lock, and only the child's death releases it.
+    /// So the child is killed first, and the writer is dropped only if no
+    /// write holds it; a write still in flight then fails on the dead pipe.
     pub fn shutdown(&self) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.take();
-        }
         if let Ok(mut child_guard) = self.child.lock() {
             if let Some(child) = child_guard.as_mut() {
                 let _ = child.kill();
             }
+        }
+        if let Ok(mut writer) = self.writer.try_lock() {
+            let _ = writer.take();
+        }
+    }
+
+    /// Close the server's stdin and signal nothing: a server exits on EOF by
+    /// itself, as it does when the runner holding its pipe dies. Every later
+    /// request fails with stdin unavailable.
+    pub fn close_stdin(&self) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.take();
         }
     }
 
@@ -443,6 +519,50 @@ impl Write for ScriptedAppServerWriter {
             }
             if !line.is_empty() {
                 self.process_line(&line)?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct UnreadAppServerWriter {
+    gate: Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Write for UnreadAppServerWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.gate.recv();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the test server's stdin was never read",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+struct SilentAppServerWriter {
+    requests: Arc<Mutex<Vec<Value>>>,
+    buffer: Vec<u8>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Write for SilentAppServerWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=newline).collect();
+            if let Ok(request) = serde_json::from_slice::<Value>(&line) {
+                self.requests.lock().unwrap().push(request);
             }
         }
         Ok(buf.len())

@@ -15,6 +15,8 @@
 mod cases;
 mod env;
 mod fake_responses;
+mod pool_probes;
+mod proc_tree;
 mod surface;
 
 use env::{CaseResult, ContractEnv, Surface};
@@ -75,6 +77,37 @@ contract!(
     protocol_surface,
     protocol_surface_exemptions_are_narrow,
 );
+
+macro_rules! probe {
+    ($($case:ident),* $(,)?) => {$(
+        #[test]
+        fn $case() {
+            pass(pool_probes::$case(&env()));
+        }
+    )*};
+}
+
+probe!(
+    pool_resume_after_unsubscribe_while_loaded,
+    pool_interrupt_during_hung_mcp_call,
+    pool_tool_call_thread_id_comes_from_codex,
+    pool_thread_brings_its_own_mcp_server,
+    pool_goal_on_a_shared_server,
+    pool_active_goal_paused_before_resume_after_server_loss,
+    pool_load,
+);
+
+#[cfg(unix)]
+probe!(pool_shim_lifetime);
+
+#[cfg(unix)]
+probe!(pool_agent_cannot_spawn_under_the_server);
+
+#[test]
+#[ignore = "long: waits out Codex's thread unload, polling for up to 40 minutes; run alone with --run-ignored only"]
+fn pool_resume_after_unload() {
+    pass(pool_probes::pool_resume_after_unload(&env()));
+}
 
 #[test]
 fn error_notification_will_retry() {

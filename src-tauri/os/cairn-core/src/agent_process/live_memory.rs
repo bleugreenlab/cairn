@@ -24,8 +24,14 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(CPU_ADMISSION_SAMPLE_INT
 #[serde(rename_all = "camelCase")]
 pub struct AgentResident {
     pub run_id: String,
-    /// Readable resident bytes: a floor when incomplete.
+    /// Readable resident bytes (RSS): a floor when incomplete.
     pub resident_bytes: u64,
+    /// Physical footprint over the same members as `resident_bytes`, absent
+    /// when any of them has none (Windows, or Linux without a readable
+    /// `smaps_rollup`). A reader shows this where present, since RSS counts
+    /// shared pages a tree does not privately cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_footprint_bytes: Option<u64>,
     pub members: u32,
     pub complete: bool,
 }
@@ -171,6 +177,7 @@ impl AgentMemorySampler {
                 rows.push(AgentResident {
                     run_id,
                     resident_bytes: reading.resident_bytes,
+                    physical_footprint_bytes: reading.physical_footprint_bytes,
                     members: reading.members_total.min(u32::MAX as usize) as u32,
                     complete: !reading.incomplete,
                 });
@@ -280,6 +287,7 @@ mod tests {
                 start: StartKey(10, 0),
             },
             resident_bytes: bytes,
+            physical_footprint_bytes: None,
             cpu_ms: Some(1),
             uninterruptible: false,
             storage_io_bytes: Some(1),
@@ -432,6 +440,28 @@ mod tests {
             }
             assert_eq!(rig.reads.load(Ordering::SeqCst), before);
         }
+    }
+
+    #[test]
+    fn golden_footprint_rides_beside_rss_only_when_every_member_has_one() {
+        let with = |mut row: CensusRow, footprint| {
+            row.physical_footprint_bytes = footprint;
+            row
+        };
+        let rig = Rig::new(
+            vec![
+                with(row(41, 0, Some(100)), Some(40)),
+                with(row(42, 41, Some(23)), Some(5)),
+            ],
+            true,
+        );
+        rig.tick();
+        rig.golden(
+            r#"{"measuredAtUnixMs":1700000000123,"reading":{"kind":"measured","value":[{"runId":"run-a","residentBytes":123,"physicalFootprintBytes":45,"members":2,"complete":true}]}}"#,
+        );
+        rig.script.lock().unwrap().rows[1].physical_footprint_bytes = None;
+        rig.tick();
+        rig.golden(PAIR_GOLDEN);
     }
 
     #[test]

@@ -668,6 +668,161 @@ async fn crash_finalize_leaves_one_open_agent_failed_entry() {
     assert!(emitter.events_named("agent-attention").is_empty());
 }
 
+/// A pooled call has no child of its own. Tearing its run down interrupts its
+/// live turn and unsubscribes its thread on the shared server, which keeps
+/// running for its neighbours.
+#[tokio::test]
+async fn killing_a_pooled_run_releases_its_thread_and_spares_the_server() {
+    let db = test_db().await;
+    seed_top_level_run(&db, "run-pooled", "job-pooled", "turn-pooled", "none").await;
+    let orch = test_orchestrator(db);
+    let (server, _stream, requests) =
+        crate::backends::codex::pool::testing::recording_server(&orch.codex_pool);
+    let _call = server.register_call("thread-pooled", "run-pooled");
+    let _neighbour = server.register_call("thread-neighbour", "run-neighbour");
+    let mut handle = crate::agent_process::process::RunHandle::test_handle(
+        Some("session-pooled"),
+        Some("job-pooled"),
+    );
+    handle.pooled_thread = Some(Arc::new(
+        crate::backends::codex::pool::PooledCall::new(server.clone(), "thread-pooled".into())
+            .tracking_turn(Arc::new(Mutex::new(Some("turn-live".into())))),
+    ));
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run-pooled".into(), handle);
+
+    crate::orchestrator::lifecycle::kill_session_with_reason(&orch, "run-pooled", "user_stopped")
+        .unwrap();
+    assert!(server.settle_releases(std::time::Duration::from_secs(5)));
+
+    let sent: Vec<(String, Value)> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            (
+                request["method"].as_str().unwrap_or_default().to_string(),
+                request["params"]["threadId"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            (
+                "thread/goal/get".to_string(),
+                serde_json::json!("thread-pooled")
+            ),
+            (
+                "turn/interrupt".to_string(),
+                serde_json::json!("thread-pooled")
+            ),
+            (
+                "thread/unsubscribe".to_string(),
+                serde_json::json!("thread-pooled")
+            ),
+        ]
+    );
+    assert!(orch
+        .codex_pool
+        .binding_for_thread("thread-pooled")
+        .is_none());
+    assert!(!server.is_closed(), "the shared server is never stopped");
+    assert_eq!(
+        orch.codex_pool
+            .binding_for_thread("thread-neighbour")
+            .map(|binding| binding.run_id),
+        Some("run-neighbour".to_string())
+    );
+}
+
+/// `stop_and_remove` (admission replacement, call finalization) releases a
+/// pooled thread too, even while its reader still holds the thread: removing
+/// the handle alone would leave a hung turn running and subscribed.
+#[tokio::test]
+async fn stop_and_remove_releases_a_pooled_thread_its_reader_still_holds() {
+    let db = test_db().await;
+    let orch = test_orchestrator(db);
+    let (server, _stream, requests) =
+        crate::backends::codex::pool::testing::recording_server(&orch.codex_pool);
+    let _call = server.register_call("thread-held", "run-held");
+    let thread = Arc::new(
+        crate::backends::codex::pool::PooledCall::new(server.clone(), "thread-held".into())
+            .tracking_turn(Arc::new(Mutex::new(Some("turn-live".into())))),
+    );
+    let reader_holds = thread.clone();
+    let mut handle = RunHandle::test_handle(Some("session-held"), Some("job-held"));
+    handle.pooled_thread = Some(thread);
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run-held".into(), handle);
+
+    assert!(orch.process_state.stop_and_remove("run-held"));
+    assert!(server.settle_releases(std::time::Duration::from_secs(5)));
+
+    let methods: Vec<String> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request["method"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        methods,
+        ["thread/goal/get", "turn/interrupt", "thread/unsubscribe"]
+    );
+    assert!(orch.codex_pool.binding_for_thread("thread-held").is_none());
+    assert!(!server.is_closed());
+    drop(reader_holds);
+    assert!(server.settle_releases(std::time::Duration::from_secs(5)));
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "the reader's drop sends nothing more"
+    );
+}
+
+/// A pooled server that has stopped reading its stdin blocks every write to
+/// it. Stopping a run there must still complete promptly and end its
+/// binding: the release's writes wait on the server's own worker, not on the
+/// stop.
+#[tokio::test]
+async fn stopping_a_pooled_run_completes_when_its_server_stops_reading() {
+    let db = test_db().await;
+    let orch = test_orchestrator(db);
+    let (unblock, gate) = crossbeam_channel::bounded::<()>(0);
+    let server = crate::backends::codex::pool::testing::unread_server(&orch.codex_pool, gate);
+    let _call = server.register_call("thread-unread", "run-unread");
+    let mut handle = RunHandle::test_handle(Some("session-unread"), Some("job-unread"));
+    handle.pooled_thread = Some(Arc::new(
+        crate::backends::codex::pool::PooledCall::new(server.clone(), "thread-unread".into())
+            .tracking_turn(Arc::new(Mutex::new(Some("turn-live".into())))),
+    ));
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run-unread".into(), handle);
+
+    let started = std::time::Instant::now();
+    assert!(orch.process_state.stop_and_remove("run-unread"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the stop took {:?}",
+        started.elapsed()
+    );
+    assert!(orch
+        .codex_pool
+        .binding_for_thread("thread-unread")
+        .is_none());
+    drop(unblock);
+    assert!(server.settle_releases(std::time::Duration::from_secs(5)));
+}
+
 /// A pooled Codex server's bearer outlives every run it serves, so finalizing a
 /// run is what stops that bearer speaking for it: its threads stop resolving,
 /// the moment it finalizes, while its neighbour on the same server keeps going.

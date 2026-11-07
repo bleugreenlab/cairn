@@ -164,6 +164,11 @@ impl ThreadRouter {
     }
 
     /// Whether `thread_id` is routed now.
+    /// How many threads are routed now.
+    pub fn routed_count(&self) -> usize {
+        self.routes.lock().unwrap().senders.len()
+    }
+
     pub fn is_routed(&self, thread_id: &str) -> bool {
         self.routes.lock().unwrap().senders.contains_key(thread_id)
     }

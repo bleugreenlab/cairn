@@ -9,6 +9,9 @@ use crate::wire::codex_app_server::goal::{
 };
 
 use crate::wire::codex_app_server::errors::is_missing_rollout_error;
+use crate::wire::codex_app_server::thread::{
+    ThreadLoadedListResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
+};
 
 pub fn verify_resumed_thread_binding(
     session_start: &SessionStart,
@@ -90,6 +93,81 @@ pub fn reconcile_goal(
         return Err("Codex goal reconciliation returned unexpected state".to_string());
     }
     Ok(())
+}
+
+/// End this client's subscription to `thread_id`. A running turn keeps
+/// running: interrupt it first.
+pub fn unsubscribe_thread(
+    client: &AppServerClient,
+    thread_id: &str,
+) -> Result<ThreadUnsubscribeStatus, String> {
+    let response = client.send_request(
+        "thread/unsubscribe",
+        serde_json::json!({ "threadId": thread_id }),
+    )?;
+    Ok(parse_response::<ThreadUnsubscribeResponse>("thread/unsubscribe", response)?.status)
+}
+
+/// Pause `thread_id`'s native goal if it is active, and say whether it was.
+/// An active goal keeps starting turns on an unsubscribed thread, so a
+/// thread being let go has its goal paused first.
+/// Each request is given up at its own `step` past when it is sent.
+pub fn pause_active_goal(
+    client: &AppServerClient,
+    thread_id: &str,
+    step: std::time::Duration,
+) -> Result<bool, String> {
+    let current = client.send_request_within(
+        "thread/goal/get",
+        serde_json::json!({ "threadId": thread_id }),
+        std::time::Instant::now() + step,
+    )?;
+    let active = parse_response::<GoalResponse>("thread/goal/get", current)?
+        .goal
+        .is_some_and(|goal| goal.status == GoalStatus::Active);
+    if active {
+        client.send_request_within(
+            "thread/goal/set",
+            serde_json::json!({ "threadId": thread_id, "status": GoalStatus::Paused }),
+            std::time::Instant::now() + step,
+        )?;
+    }
+    Ok(active)
+}
+
+/// [`unsubscribe_thread`], given up at `deadline`.
+pub fn unsubscribe_thread_within(
+    client: &AppServerClient,
+    thread_id: &str,
+    deadline: std::time::Instant,
+) -> Result<ThreadUnsubscribeStatus, String> {
+    let response = client.send_request_within(
+        "thread/unsubscribe",
+        serde_json::json!({ "threadId": thread_id }),
+        deadline,
+    )?;
+    Ok(parse_response::<ThreadUnsubscribeResponse>("thread/unsubscribe", response)?.status)
+}
+
+/// Every thread the server holds loaded, across all pages. Takes no
+/// server-wide permit, so it answers while threads are busy: what a liveness
+/// probe asks.
+pub fn loaded_threads(client: &AppServerClient) -> Result<Vec<String>, String> {
+    let mut threads = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut params = serde_json::json!({});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = serde_json::json!(cursor);
+        }
+        let response = client.send_request("thread/loaded/list", params)?;
+        let page = parse_response::<ThreadLoadedListResponse>("thread/loaded/list", response)?;
+        threads.extend(page.data);
+        match page.next_cursor {
+            Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+            _ => return Ok(threads),
+        }
+    }
 }
 
 pub fn resume_thread(

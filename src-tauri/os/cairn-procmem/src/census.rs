@@ -6,6 +6,10 @@ use std::sync::Arc;
 pub struct CensusRow {
     pub process: KernelProcess,
     pub resident_bytes: Option<u64>,
+    /// What the process privately costs, which RSS overstates by counting
+    /// shared pages: `ri_phys_footprint` on macOS, `Pss` from `smaps_rollup` on
+    /// Linux. `None` where the platform cannot say.
+    pub physical_footprint_bytes: Option<u64>,
     pub cpu_ms: Option<u64>,
     pub uninterruptible: bool,
     /// Physical storage bytes, not pipe or page-cache traffic.
@@ -18,6 +22,10 @@ pub struct Census {
     pub rows: Vec<CensusRow>,
     pub unreadable: Vec<u32>,
     pub storage_wanted: Vec<u32>,
+    /// Pids whose footprint a watch wants. Linux pays a page-table walk per
+    /// read, so it reads only these and their direct children (a child that
+    /// joined this tick); macOS reads every row, the cost being one syscall.
+    pub footprint_wanted: Vec<u32>,
     /// Unverified parent hints, never identities. These can prove a gap, not membership.
     pub unverified_parents: Vec<(u32, u32)>,
     /// An enumeration gap is not evidence that an absent known member departed.
@@ -29,12 +37,17 @@ impl Census {
         self.rows.clear();
         self.unreadable.clear();
         self.storage_wanted.clear();
+        self.footprint_wanted.clear();
         self.unverified_parents.clear();
         self.enumeration_incomplete = false;
     }
 
     pub fn wants_storage(&self, pid: u32) -> bool {
         self.storage_wanted.binary_search(&pid).is_ok()
+    }
+
+    pub fn wants_footprint(&self, pid: u32) -> bool {
+        self.footprint_wanted.binary_search(&pid).is_ok()
     }
 
     pub fn row(&self, pid: u32) -> Option<&CensusRow> {

@@ -109,6 +109,25 @@ pub fn parse_linux_storage_io(io: &str) -> Option<u64> {
     (fields == 3).then_some(total)
 }
 
+/// Proportional set size from `/proc/<pid>/smaps_rollup`, in bytes: private
+/// pages whole and each shared page divided among its sharers, which is the
+/// closest Linux reading to macOS's physical footprint. Only the bare `Pss:`
+/// line counts; `Pss_Anon:` and its siblings are its parts.
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_smaps_rollup_pss(rollup: &str) -> Option<u64> {
+    let line = rollup.lines().find_map(|line| line.strip_prefix("Pss:"))?;
+    let mut fields = line.split_whitespace();
+    let kib: u64 = fields.next()?.parse().ok()?;
+    (fields.next() == Some("kB")).then(|| kib.saturating_mul(1024))
+}
+
+/// Physical footprint as Linux can give it, `Pss`; `None` when `smaps_rollup`
+/// is unreadable (another user's process, or a kernel before 4.14), so the
+/// caller shows RSS instead.
+pub fn process_footprint_bytes(pid: u32) -> Option<u64> {
+    parse_smaps_rollup_pss(&std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?)
+}
+
 /// The page size and clock-tick rate, constant for the daemon's lifetime and
 /// cached so CPU measurement adds no syscall to the per-census or per-process
 /// path. A tick rate of zero is no rate.
@@ -198,9 +217,20 @@ pub fn census(out: &mut Census) -> bool {
         } else {
             None
         };
+        // smaps_rollup walks the process's page tables, so only watched
+        // members pay for it, plus the children they spawned since last tick.
+        let physical_footprint_bytes =
+            if out.wants_footprint(pid) || out.wants_footprint(process.parent_pid) {
+                read_into(format!("/proc/{pid}/smaps_rollup"), &mut buffer)
+                    .ok()
+                    .and_then(|()| parse_smaps_rollup_pss(&buffer))
+            } else {
+                None
+            };
         out.rows.push(CensusRow {
             process,
             resident_bytes,
+            physical_footprint_bytes,
             cpu_ms: ticks
                 .filter(|_| ticks_per_second > 0)
                 .map(|ticks| ticks_to_ms(ticks, ticks_per_second)),
@@ -271,5 +301,31 @@ cancelled_write_bytes: 3"
             Some(33)
         );
         assert_eq!(parse_linux_storage_io("read_bytes: 1"), None);
+    }
+    #[test]
+    fn smaps_rollup_reads_only_the_total_pss() {
+        let rollup =
+            "55d4c7a00000-7ffd2b5fe000 ---p 00000000 00:00 0                          [rollup]
+Rss:              180224 kB
+Pss:               45678 kB
+Pss_Dirty:         30000 kB
+Pss_Anon:          40000 kB
+Pss_File:           5678 kB
+Pss_Shmem:             0 kB
+Shared_Clean:     120000 kB
+Private_Dirty:     30000 kB
+Swap:                  0 kB
+SwapPss:               0 kB
+";
+        assert_eq!(parse_smaps_rollup_pss(rollup), Some(45678 * 1024));
+        let without_total: String = rollup
+            .lines()
+            .filter(|line| !line.starts_with("Pss:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(parse_smaps_rollup_pss(&without_total), None);
+        assert_eq!(parse_smaps_rollup_pss("Pss: many kB"), None);
+        assert_eq!(parse_smaps_rollup_pss("Pss: 12 pages"), None);
+        assert_eq!(parse_smaps_rollup_pss(""), None);
     }
 }

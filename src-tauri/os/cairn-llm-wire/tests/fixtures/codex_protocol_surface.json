@@ -14,6 +14,8 @@
     "thread/goal/get",
     "thread/goal/set",
     "thread/goal/clear",
+    "thread/unsubscribe",
+    "thread/loaded/list",
     "mcpServerStatus/list",
     "config/mcpServer/reload"
   ],
@@ -69,12 +71,16 @@
     { "type": "ListMcpServerStatusResponse", "path": "data", "required": true },
     { "type": "McpServerStatus", "path": "name", "required": true },
     { "type": "McpServerStatus", "path": "tools", "required": true },
+    { "type": "ThreadUnsubscribeResponse", "path": "status", "required": true },
+    { "type": "ThreadLoadedListResponse", "path": "data", "required": true },
+    { "type": "ThreadLoadedListResponse", "path": "nextCursor", "required": false },
     { "type": "ChatgptAuthTokensRefreshResponse", "path": "accessToken", "required": true },
     { "type": "ChatgptAuthTokensRefreshResponse", "path": "chatgptAccountId", "required": true }
   ],
   "enums": {
     "TurnStatus": ["completed", "interrupted", "failed"],
-    "ThreadGoalStatus": ["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]
+    "ThreadGoalStatus": ["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"],
+    "ThreadUnsubscribeStatus": ["notLoaded", "notSubscribed", "unsubscribed"]
   },
   "itemTypes": ["userMessage", "agentMessage", "reasoning", "commandExecution", "fileChange", "mcpToolCall", "imageGeneration"],
   "knownDead": []

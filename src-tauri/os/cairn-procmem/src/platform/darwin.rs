@@ -141,14 +141,17 @@ pub fn census(out: &mut Census) -> bool {
             // A process whose identity read but whose usage did not is still a
             // row: it is present, only unmeasured.
             let task = macos_task_info(pid);
-            let storage_io_bytes = if out.wants_storage(pid as u32) {
-                macos_storage_io_bytes(pid)
-            } else {
-                None
-            };
+            // One rusage read answers both footprint and storage, so footprint
+            // is read for every row rather than only for wanted pids.
+            let usage = macos_rusage(pid);
+            let storage_io_bytes = usage
+                .as_ref()
+                .filter(|_| out.wants_storage(pid as u32))
+                .map(rusage_storage_bytes);
             out.rows.push(CensusRow {
                 process,
                 resident_bytes: task.map(|task| task.pti_resident_size),
+                physical_footprint_bytes: usage.map(|usage| usage.ri_phys_footprint),
                 cpu_ms: task.map(|task| macos_task_cpu_ms(&task, timebase)),
                 // Darwin keeps no per-process uninterruptible state to read, so
                 // on macOS only storage bytes speak for a disk-bound tree.
@@ -197,6 +200,7 @@ pub fn census_process_group(process_group_id: u32, out: &mut Census) -> bool {
             KernelRead::Live(process) => out.rows.push(CensusRow {
                 process,
                 resident_bytes: None,
+                physical_footprint_bytes: None,
                 cpu_ms: None,
                 uninterruptible: false,
                 storage_io_bytes: None,
@@ -233,10 +237,10 @@ pub fn macos_task_cpu_ms(task: &libc::proc_taskinfo, timebase: (u32, u32)) -> u6
     )
 }
 
-/// Bytes the process has read from and written to storage, from the kernel's
-/// own resource accounting.
+/// The kernel's resource accounting for one process: the one reader of
+/// `proc_pid_rusage` in Cairn. Fails for another user's process.
 #[cfg(target_os = "macos")]
-pub fn macos_storage_io_bytes(pid: i32) -> Option<u64> {
+fn macos_rusage(pid: i32) -> Option<libc::rusage_info_v2> {
     let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
     // SAFETY: the kernel fills a caller-owned struct of the flavor named.
     let status = unsafe {
@@ -246,10 +250,27 @@ pub fn macos_storage_io_bytes(pid: i32) -> Option<u64> {
             (&mut info as *mut libc::rusage_info_v2).cast(),
         )
     };
-    (status == 0).then(|| {
-        info.ri_diskio_bytesread
-            .saturating_add(info.ri_diskio_byteswritten)
-    })
+    (status == 0).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn rusage_storage_bytes(info: &libc::rusage_info_v2) -> u64 {
+    info.ri_diskio_bytesread
+        .saturating_add(info.ri_diskio_byteswritten)
+}
+
+/// Bytes the process has read from and written to storage, from the kernel's
+/// own resource accounting.
+#[cfg(target_os = "macos")]
+pub fn macos_storage_io_bytes(pid: i32) -> Option<u64> {
+    macos_rusage(pid).as_ref().map(rusage_storage_bytes)
+}
+
+/// The process's physical footprint, `ri_phys_footprint`: what `footprint`
+/// and `vmmap -summary` report and what memory-pressure kills count, with
+/// compressed pages included and shared pages excluded.
+pub fn process_footprint_bytes(pid: u32) -> Option<u64> {
+    macos_rusage(pid as i32).map(|info| info.ri_phys_footprint)
 }
 
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {
@@ -263,5 +284,23 @@ mod tests {
         assert_eq!(mach_ticks_to_ms(24_000_000, (125, 3)), 1000);
         assert_eq!(mach_ticks_to_ms(1_000_000_000, (1, 1)), 1000);
         assert_eq!(mach_ticks_to_ms(u64::MAX, (u32::MAX, 1)), u64::MAX);
+    }
+
+    #[test]
+    fn own_footprint_is_read_and_bounded_by_rss_scale() {
+        let pid = std::process::id();
+        let footprint = process_footprint_bytes(pid).expect("own footprint");
+        let rss = process_rss_bytes(pid).expect("own rss");
+        assert!(footprint > 0);
+        // Footprint counts compressed pages RSS does not, so it can exceed
+        // RSS, but not by an order of magnitude for a test binary.
+        assert!(
+            footprint <= rss.saturating_mul(4),
+            "{footprint} vs rss {rss}"
+        );
+        let mut out = Census::default();
+        assert!(census(&mut out));
+        let row = out.rows.iter().find(|row| row.process.pid == pid).unwrap();
+        assert!(row.physical_footprint_bytes.is_some_and(|bytes| bytes > 0));
     }
 }

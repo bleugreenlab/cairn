@@ -14,6 +14,7 @@ mod image;
 mod input;
 mod items;
 mod notification;
+pub mod thread;
 mod usage;
 
 #[cfg(test)]

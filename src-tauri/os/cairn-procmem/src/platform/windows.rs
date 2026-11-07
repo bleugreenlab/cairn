@@ -154,6 +154,7 @@ fn row(handle: &OwnedHandle, pid: u32, parent: u32, observed: &Times) -> CensusR
     CensusRow {
         process: process(pid, parent, observed.start),
         resident_bytes: rss(handle),
+        physical_footprint_bytes: None,
         cpu_ms: Some(observed.cpu_ms),
         uninterruptible: false,
         // GetProcessIoCounters includes logical/cache/pipe I/O, not physical storage.

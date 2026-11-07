@@ -1087,6 +1087,16 @@ pub(super) fn teardown_process(
     };
 
     if let Some(handle) = handle {
+        // A pooled thread has no child of its own, and its shared server is
+        // never signalled: the thread is interrupted and unsubscribed there.
+        if let Some(thread) = handle.pooled_thread.as_ref() {
+            thread.release();
+            log::info!(
+                "Released pooled Codex thread {} for run {}",
+                thread.thread_id(),
+                &run_id[..run_id.len().min(8)]
+            );
+        }
         if let Ok(mut child_guard) = handle.child.lock() {
             if let Some(mut child) = child_guard.take() {
                 crate::agent_process::process::graceful_stop(&mut *child);

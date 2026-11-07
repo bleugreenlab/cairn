@@ -29,17 +29,42 @@
 //! - That credential outlives every run it serves, so a run's bindings end when
 //!   the run does ([`CodexAppServerPool::release_run`]), whatever its reader is
 //!   still doing.
+//! - A thread is let go by [`PooledCall::release`]: an active goal is paused,
+//!   its live turn is interrupted, its binding ends, and it is unsubscribed,
+//!   in that order, because unsubscribing leaves a running turn running and
+//!   an active goal starting new ones. Codex unloads
+//!   it only after its unload delay (30 minutes upstream), so the server
+//!   remembers when each thread was released ([`PoolSnapshot`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use serde::Serialize;
 use serde_json::Value;
 
 use cairn_models::codex::app_server::AppServerClient;
 use cairn_models::codex::thread_router::{Scoped, ThreadRouter};
+use cairn_models::session::codex::thread::{pause_active_goal, unsubscribe_thread_within};
+use cairn_models::wire::codex_app_server::errors::is_no_active_turn_error;
 use cairn_models::wire::codex_app_server::Notification;
+
+/// How long a released thread is reported as awaiting unload. Codex unloads
+/// an unsubscribed idle thread after 30 minutes; past this a thread still
+/// listed is overdue, which only a liveness check can say.
+const AWAITING_UNLOAD_HORIZON: Duration = Duration::from_secs(35 * 60);
+
+/// How long the release worker waits for each answer. A server that has
+/// stopped answering keeps its pipe open, so without this one stuck thread
+/// would hold every later release on its server behind the full request
+/// timeout.
+const RELEASE_STEP: Duration = Duration::from_secs(3);
+
+/// Upper bounds, in milliseconds, of the `thread/start` latency buckets; the
+/// last bucket counts everything slower.
+pub const THREAD_START_BUCKETS_MS: [u64; 7] = [5, 25, 100, 500, 2_000, 10_000, 60_000];
 /// Application actions for a pool's shared identity and disconnected runs.
 pub trait PoolHost: Send + Sync {
     fn refresh_tokens(&self, client: &AppServerClient, request_id: &Value);
@@ -114,11 +139,102 @@ pub struct PooledAppServer {
     retiring: AtomicBool,
     /// The pool's shared identity, which answers the server's token requests.
     host: Arc<dyn PoolHost>,
+    /// Its key's digest ([`key_digest`]): telemetry never sees the key.
+    key_digest: String,
+    created_at: Instant,
+    stats: Arc<Mutex<ServerStats>>,
+    /// The queue of this server's release worker, started by its first
+    /// release. The worker alone writes a release's requests, so a server
+    /// that stops reading its stdin blocks that one thread, never a stop.
+    releaser: Mutex<Option<crossbeam_channel::Sender<ReleaseJob>>>,
+}
+
+/// One unit of work for a server's release worker.
+enum ReleaseJob {
+    Release {
+        client: Arc<AppServerClient>,
+        thread_id: String,
+        live_turn: Option<String>,
+        step: Duration,
+        state: Arc<Mutex<ReleaseState>>,
+        stats: Arc<Mutex<ServerStats>>,
+    },
+    /// Answered once every job queued before it has run.
+    Settle(crossbeam_channel::Sender<()>),
+}
+
+/// Pause an active goal, interrupt the live turn and unsubscribe, waiting at
+/// most `step` for each answer, then record whether Codex confirmed it.
+fn run_release_job(job: ReleaseJob) {
+    let ReleaseJob::Release {
+        client,
+        thread_id,
+        live_turn,
+        step,
+        state,
+        stats,
+    } = job
+    else {
+        if let ReleaseJob::Settle(done) = job {
+            let _ = done.send(());
+        }
+        return;
+    };
+    if let Err(error) = pause_active_goal(&client, &thread_id, step) {
+        log::warn!(
+            "codex pool: pausing thread {thread_id}'s goal before its release failed: {error}"
+        );
+    }
+    if let Some(turn_id) = live_turn {
+        let interrupted = client.send_request_within(
+            "turn/interrupt",
+            serde_json::json!({ "threadId": thread_id, "turnId": turn_id }),
+            Instant::now() + step,
+        );
+        if let Err(error) = interrupted.as_ref() {
+            if !is_no_active_turn_error(error) {
+                log::warn!("codex pool: interrupting thread {thread_id} before its release failed: {error}");
+            }
+        }
+    }
+    let unsubscribed = unsubscribe_thread_within(&client, &thread_id, Instant::now() + step);
+    let now = Instant::now();
+    let outcome = {
+        let mut stats = stats.lock().unwrap_or_else(|e| e.into_inner());
+        stats.last_activity = Some(now);
+        match unsubscribed {
+            Ok(status) => {
+                log::debug!("codex pool: released thread {thread_id} ({status:?})");
+                stats.uncertain.remove(&thread_id);
+                stats.released.insert(thread_id, now);
+                ReleaseState::Released
+            }
+            Err(error) => {
+                log::warn!("codex pool: unsubscribing thread {thread_id} failed: {error}");
+                stats.uncertain.insert(thread_id, now);
+                ReleaseState::Uncertain
+            }
+        }
+    };
+    *state.lock().unwrap_or_else(|e| e.into_inner()) = outcome;
+}
+
+#[derive(Default)]
+struct ServerStats {
+    last_activity: Option<Instant>,
+    /// Threads released here, with when, until Codex should have unloaded them.
+    released: HashMap<String, Instant>,
+    /// Threads whose unsubscribe went unanswered, with when: they may still
+    /// be subscribed, and their next release retries.
+    uncertain: HashMap<String, Instant>,
+    /// `thread/start` latencies, bucketed by [`THREAD_START_BUCKETS_MS`].
+    thread_starts: [u64; THREAD_START_BUCKETS_MS.len() + 1],
 }
 
 impl PooledAppServer {
     fn new(
         id: String,
+        key: &str,
         router: Arc<ThreadRouter>,
         thread_runs: Arc<Mutex<HashMap<String, CallBinding>>>,
         host: Arc<dyn PoolHost>,
@@ -129,6 +245,120 @@ impl PooledAppServer {
             thread_runs,
             retiring: AtomicBool::new(false),
             host,
+            key_digest: key_digest(key),
+            created_at: Instant::now(),
+            stats: Arc::new(Mutex::new(ServerStats::default())),
+            releaser: Mutex::new(None),
+        }
+    }
+
+    /// Hand `job` to this server's release worker, starting it if need be.
+    /// The worker holds no reference to the server, so it ends with it.
+    fn queue_release(&self, job: ReleaseJob) {
+        let mut releaser = self.releaser.lock().unwrap_or_else(|e| e.into_inner());
+        if releaser.is_none() {
+            let (sender, jobs) = crossbeam_channel::unbounded::<ReleaseJob>();
+            let started = std::thread::Builder::new()
+                .name(format!("{}-release", self.id))
+                .spawn(move || {
+                    for job in jobs {
+                        run_release_job(job);
+                    }
+                });
+            match started {
+                Ok(_) => *releaser = Some(sender),
+                Err(error) => {
+                    log::error!(
+                        "codex pool: could not start {}'s release worker: {error}",
+                        self.id
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(sender) = releaser.as_ref() {
+            let _ = sender.send(job);
+        }
+    }
+
+    /// Wait at most `within` for every release queued here so far to have
+    /// been sent and answered or given up. Answers whether they all were.
+    pub fn settle_releases(&self, within: Duration) -> bool {
+        let (done, settled) = crossbeam_channel::bounded(1);
+        {
+            let releaser = self.releaser.lock().unwrap_or_else(|e| e.into_inner());
+            match releaser.as_ref() {
+                Some(sender) => {
+                    if sender.send(ReleaseJob::Settle(done)).is_err() {
+                        return false;
+                    }
+                }
+                None => return true,
+            }
+        }
+        settled.recv_timeout(within).is_ok()
+    }
+
+    fn stats(&self) -> std::sync::MutexGuard<'_, ServerStats> {
+        self.stats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn touch(&self) {
+        self.stats().last_activity = Some(Instant::now());
+    }
+
+    /// Count one `thread/start` that took `elapsed` on this server.
+    pub fn record_thread_start(&self, elapsed: Duration) {
+        let ms = elapsed.as_millis() as u64;
+        let bucket = THREAD_START_BUCKETS_MS
+            .iter()
+            .position(|bound| ms <= *bound)
+            .unwrap_or(THREAD_START_BUCKETS_MS.len());
+        let mut stats = self.stats();
+        stats.thread_starts[bucket] += 1;
+        stats.last_activity = Some(Instant::now());
+    }
+
+    /// The app-server's pid, while its child is attached.
+    fn pid(&self) -> Option<u32> {
+        let child = self.router.client().child_handle();
+        let guard = child.lock().ok()?;
+        guard.as_ref().map(|child| child.id())
+    }
+
+    /// What this server looks like now.
+    fn snapshot(&self, retiring: bool) -> PooledServerSnapshot {
+        let now = Instant::now();
+        let mut stats = self.stats();
+        stats
+            .released
+            .retain(|_, at| now.duration_since(*at) < AWAITING_UNLOAD_HORIZON);
+        let mut awaiting_unload: Vec<ReleasedThread> = stats
+            .released
+            .iter()
+            .map(|(thread_id, at)| ReleasedThread {
+                thread_id: thread_id.clone(),
+                released_secs_ago: now.duration_since(*at).as_secs(),
+            })
+            .collect();
+        awaiting_unload.sort_by_key(|thread| thread.released_secs_ago);
+        let mut release_uncertain: Vec<String> = stats.uncertain.keys().cloned().collect();
+        release_uncertain.sort();
+        PooledServerSnapshot {
+            server_id: self.id.clone(),
+            key_digest: self.key_digest.clone(),
+            pid: self.pid(),
+            age_secs: now.duration_since(self.created_at).as_secs(),
+            idle_secs: stats
+                .last_activity
+                .map(|at| now.duration_since(at).as_secs()),
+            live_threads: self.router.routed_count(),
+            awaiting_unload,
+            release_uncertain,
+            thread_start_buckets_ms: THREAD_START_BUCKETS_MS.to_vec(),
+            thread_start_counts: stats.thread_starts.to_vec(),
+            retiring,
+            closed: self.is_closed(),
         }
     }
 
@@ -146,6 +376,7 @@ impl PooledAppServer {
     /// Register a call thread before `turn/start`, so its first tool call routes
     /// to the authenticated run, and return its notification receiver.
     pub fn register_call(&self, thread_id: &str, run_id: &str) -> Receiver<Value> {
+        self.touch();
         self.thread_runs.lock().unwrap().insert(
             thread_id.to_string(),
             CallBinding {
@@ -163,6 +394,7 @@ impl PooledAppServer {
     /// and fails closed, and a pool death reaches it only by closing this
     /// channel, never as a run [`PoolHost::disconnected`] must fail.
     pub fn register_completion(&self, thread_id: &str) -> Receiver<Value> {
+        self.touch();
         self.router.route(thread_id)
     }
 
@@ -223,6 +455,7 @@ impl PooledAppServer {
         let scoped_host = host.clone();
         Arc::new(Self::new(
             next_server_id(),
+            "test-identity",
             ThreadRouter::new(client, move |client, message| {
                 Self::scoped(scoped_host.as_ref(), client, message)
             }),
@@ -232,22 +465,98 @@ impl PooledAppServer {
     }
 }
 
-/// A pooled thread's cleanup handle, held by whoever reads it. Its routing
-/// entries go when it is dropped, on every exit path; removing them is
-/// idempotent with an explicit [`Self::deregister`] and with crash teardown.
+/// A pooled thread's handle, held by whoever reads it and by its run's
+/// process handle. The thread is released ([`Self::release`]) when its reader
+/// closes, when its run is torn down, or when the last holder drops it,
+/// whichever comes first. Once released or queued, later releases do
+/// nothing; a release whose unsubscribe went unanswered is retried by the
+/// next.
 pub struct PooledCall {
     server: Arc<PooledAppServer>,
     thread_id: String,
+    /// The thread's live provider turn, as its reader tracks it.
+    current_turn: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<ReleaseState>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseState {
+    Held,
+    /// Unbound and unrouted; its requests wait on the release worker.
+    Queued,
+    Released,
+    /// Unbound, but Codex never confirmed the unsubscribe.
+    Uncertain,
 }
 
 impl PooledCall {
     pub fn new(server: Arc<PooledAppServer>, thread_id: String) -> Self {
-        Self { server, thread_id }
+        Self {
+            server,
+            thread_id,
+            current_turn: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(ReleaseState::Held)),
+        }
     }
 
-    /// Remove this call's `threadId -> run_id` and per-call sender entries.
-    pub fn deregister(&self) {
-        self.server.deregister_call(&self.thread_id);
+    /// Track the thread's live turn through `current_turn`, the cell its
+    /// reader keeps, so a release interrupts a turn still running.
+    pub fn tracking_turn(mut self, current_turn: Arc<Mutex<Option<String>>>) -> Self {
+        self.current_turn = current_turn;
+        self
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    /// Let the thread go on its server. Here, at once: end its run binding,
+    /// so a stray tool call from it is refused, and drop its route. Then, on
+    /// the server's release worker: pause an active goal, interrupt its live
+    /// turn, and unsubscribe it, in that order, because unsubscribing stops
+    /// neither a running turn nor an active goal's next one.
+    ///
+    /// Nothing here writes to the server, so a stop that calls this returns
+    /// promptly even when the server has stopped reading its stdin; only the
+    /// worker waits, each answer for at most [`RELEASE_STEP`]. An unanswered
+    /// unsubscribe leaves the thread uncertain
+    /// ([`PooledServerSnapshot::release_uncertain`]) and the next release
+    /// retries it.
+    ///
+    /// On a server that has died nothing is sent and the binding stays, so
+    /// the death callback can still find and fail the run it belongs to.
+    pub fn release(&self) {
+        self.release_within(RELEASE_STEP);
+    }
+
+    fn release_within(&self, step: Duration) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*state, ReleaseState::Released | ReleaseState::Queued) {
+                return;
+            }
+            *state = ReleaseState::Queued;
+        }
+        let server = &self.server;
+        if server.is_closed() {
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = ReleaseState::Released;
+            server.deregister_call(&self.thread_id);
+            return;
+        }
+        server
+            .thread_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.thread_id);
+        server.queue_release(ReleaseJob::Release {
+            client: server.router.client(),
+            thread_id: self.thread_id.clone(),
+            live_turn: self.current_turn.lock().ok().and_then(|turn| turn.clone()),
+            step,
+            state: self.state.clone(),
+            stats: server.stats.clone(),
+        });
+        server.deregister_call(&self.thread_id);
     }
 
     /// The pool's standing token-request refusal ([`PoolHost::standing_token_refusal`]):
@@ -259,8 +568,60 @@ impl PooledCall {
 
 impl Drop for PooledCall {
     fn drop(&mut self) {
-        self.deregister();
+        self.release();
     }
+}
+
+/// One released thread, not yet past [`AWAITING_UNLOAD_HORIZON`].
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleasedThread {
+    pub thread_id: String,
+    pub released_secs_ago: u64,
+}
+
+/// One pooled app-server as telemetry sees it. Carries no account id, email
+/// or credential: its key appears only as a digest.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PooledServerSnapshot {
+    pub server_id: String,
+    /// The first 12 hex digits of the SHA-256 of the pool key.
+    pub key_digest: String,
+    pub pid: Option<u32>,
+    pub age_secs: u64,
+    /// Since a thread last opened, started or was released here.
+    pub idle_secs: Option<u64>,
+    /// Threads routed on the server now.
+    pub live_threads: usize,
+    /// Released threads Codex should still be holding loaded.
+    pub awaiting_unload: Vec<ReleasedThread>,
+    /// Released threads whose unsubscribe went unanswered: they may still be
+    /// subscribed until a later release confirms it.
+    pub release_uncertain: Vec<String>,
+    /// Upper bounds of the `thread/start` latency buckets, in milliseconds.
+    pub thread_start_buckets_ms: Vec<u64>,
+    /// Counts per bucket; one more entry than the bounds, for slower starts.
+    pub thread_start_counts: Vec<u64>,
+    pub retiring: bool,
+    pub closed: bool,
+}
+
+/// Every pooled app-server this runner holds.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PoolSnapshot {
+    pub servers: Vec<PooledServerSnapshot>,
+}
+
+fn key_digest(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Per-key pool of long-lived app-servers, owned by the `Orchestrator`.
@@ -283,6 +644,21 @@ impl CodexAppServerPool {
     #[cfg(test)]
     fn insert_test_server(&self, key: PoolKey, server: Arc<PooledAppServer>) {
         self.pools.lock().unwrap().insert(key, server);
+    }
+
+    /// Every server this pool holds, in lookup and retiring.
+    pub fn snapshot(&self) -> PoolSnapshot {
+        let mut servers: Vec<PooledServerSnapshot> = {
+            let pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools
+                .values()
+                .map(|server| server.snapshot(false))
+                .collect()
+        };
+        let retiring = self.retiring.lock().unwrap_or_else(|e| e.into_inner());
+        servers.extend(retiring.iter().map(|server| server.snapshot(true)));
+        servers.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        PoolSnapshot { servers }
     }
 
     /// Map a pooled call's `threadId` (from `_meta.threadId`) to its owning run. A `threadId` is a globally-unique Codex uuid, so a
@@ -406,7 +782,7 @@ impl CodexAppServerPool {
             move |client, message| PooledAppServer::scoped(scoped_host.as_ref(), client, message),
             closed,
         );
-        let server = Arc::new(PooledAppServer::new(id, router, thread_runs, host));
+        let server = Arc::new(PooledAppServer::new(id, key, router, thread_runs, host));
         self.pools
             .lock()
             .unwrap()
@@ -749,6 +1125,268 @@ mod tests {
             "a call that reaches a closed server fails closed"
         );
         assert!(!current.is_closed());
+    }
+
+    // Releasing a thread interrupts its live turn, ends its binding, and only
+    // then unsubscribes it, because unsubscribing leaves a running turn
+    // running; a second release sends nothing. The snapshot then reports the
+    // thread as awaiting unload and names its key only by digest.
+    #[test]
+    fn release_interrupts_unbinds_then_unsubscribes_once() {
+        let thread_runs: Arc<Mutex<HashMap<String, CallBinding>>> = Arc::default();
+        let bound_at_unsubscribe = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = {
+            let thread_runs = thread_runs.clone();
+            let bound = bound_at_unsubscribe.clone();
+            Arc::new(AppServerClient::for_test_responding(
+                move |request| match request["method"].as_str() {
+                    Some("thread/goal/get") => {
+                        let thread = request["params"]["threadId"].as_str().unwrap();
+                        let goal = (thread == "thread-busy").then(|| {
+                            serde_json::json!({
+                                "threadId": thread, "objective": "keep going", "status": "active",
+                                "tokenBudget": null, "tokensUsed": 0, "timeUsedSeconds": 0,
+                                "createdAt": 0, "updatedAt": 0
+                            })
+                        });
+                        Ok(serde_json::json!({ "result": { "goal": goal } }))
+                    }
+                    Some("thread/goal/set") => Ok(serde_json::json!({ "result": {} })),
+                    Some("turn/interrupt") => Ok(serde_json::json!({ "result": {} })),
+                    Some("thread/unsubscribe") => {
+                        let thread = request["params"]["threadId"].as_str().unwrap();
+                        bound
+                            .lock()
+                            .unwrap()
+                            .push(thread_runs.lock().unwrap().contains_key(thread));
+                        Ok(serde_json::json!({ "result": { "status": "unsubscribed" } }))
+                    }
+                    other => Err(format!("unexpected request {other:?}")),
+                },
+                requests.clone(),
+            ))
+        };
+        let host: Arc<dyn PoolHost> = Arc::new(TestPoolHost);
+        let server = Arc::new(PooledAppServer::new(
+            next_server_id(),
+            "codex-oauth:secret-account@codex-1.0.0",
+            ThreadRouter::new(client, |_, _| Scoped::Passed),
+            thread_runs,
+            host,
+        ));
+        let pool = CodexAppServerPool::default();
+        pool.insert_test_server("codex-oauth:secret-account".to_string(), server.clone());
+        let _busy = server.register_call("thread-busy", "run-busy");
+        let _idle = server.register_call("thread-idle", "run-idle");
+
+        let busy = PooledCall::new(server.clone(), "thread-busy".to_string())
+            .tracking_turn(Arc::new(Mutex::new(Some("turn-1".to_string()))));
+        busy.release();
+        busy.release();
+        PooledCall::new(server.clone(), "thread-idle".to_string()).release();
+        assert!(server.settle_releases(Duration::from_secs(5)));
+
+        let sent: Vec<(String, Value)> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                (
+                    request["method"].as_str().unwrap_or_default().to_string(),
+                    request["params"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                (
+                    "thread/goal/get".to_string(),
+                    serde_json::json!({ "threadId": "thread-busy" })
+                ),
+                (
+                    "thread/goal/set".to_string(),
+                    serde_json::json!({ "threadId": "thread-busy", "status": "paused" })
+                ),
+                (
+                    "turn/interrupt".to_string(),
+                    serde_json::json!({ "threadId": "thread-busy", "turnId": "turn-1" })
+                ),
+                (
+                    "thread/unsubscribe".to_string(),
+                    serde_json::json!({ "threadId": "thread-busy" })
+                ),
+                (
+                    "thread/goal/get".to_string(),
+                    serde_json::json!({ "threadId": "thread-idle" })
+                ),
+                (
+                    "thread/unsubscribe".to_string(),
+                    serde_json::json!({ "threadId": "thread-idle" })
+                ),
+            ],
+            "only an active goal is paused and a live turn interrupted, each before the unsubscribe, and each thread is released once"
+        );
+        assert_eq!(
+            *bound_at_unsubscribe.lock().unwrap(),
+            vec![false, false],
+            "the binding ends before the unsubscribe"
+        );
+        assert!(pool.binding_for_thread("thread-busy").is_none());
+        assert!(!server.router.is_routed("thread-busy"));
+
+        let snapshot = pool.snapshot();
+        let only = &snapshot.servers[0];
+        assert_eq!(only.live_threads, 0);
+        let mut awaiting: Vec<&str> = only
+            .awaiting_unload
+            .iter()
+            .map(|thread| thread.thread_id.as_str())
+            .collect();
+        awaiting.sort();
+        assert_eq!(awaiting, vec!["thread-busy", "thread-idle"]);
+        assert_eq!(only.key_digest.len(), 12);
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains("secret-account"), "{rendered}");
+    }
+
+    // A server that stops answering keeps its pipe open, so every request of
+    // a release would otherwise wait out the full request timeout. Each is
+    // bounded instead: the binding still ends, the thread is reported
+    // uncertain, and the next release retries rather than doing nothing.
+    #[test]
+    fn a_silent_server_bounds_the_release_and_leaves_it_retryable() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server =
+            PooledAppServer::for_test(Arc::new(AppServerClient::for_test_silent(requests.clone())));
+        let pool = CodexAppServerPool::default();
+        pool.insert_test_server("identity-a".to_string(), server.clone());
+        let _rx = server.register_call("thread-stuck", "run-stuck");
+        let call = PooledCall::new(server.clone(), "thread-stuck".to_string())
+            .tracking_turn(Arc::new(Mutex::new(Some("turn-1".to_string()))));
+
+        let started = Instant::now();
+        call.release_within(Duration::from_millis(100));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the release took {:?}",
+            started.elapsed()
+        );
+        assert!(pool.binding_for_thread("thread-stuck").is_none());
+        assert!(!server.router.is_routed("thread-stuck"));
+        assert!(server.settle_releases(Duration::from_secs(5)));
+        let snapshot = server.snapshot(false);
+        assert_eq!(snapshot.release_uncertain, vec!["thread-stuck".to_string()]);
+        assert!(snapshot.awaiting_unload.is_empty());
+
+        let sent = requests.lock().unwrap().len();
+        call.release_within(Duration::from_millis(50));
+        assert!(server.settle_releases(Duration::from_secs(5)));
+        assert!(
+            requests.lock().unwrap().len() > sent,
+            "an unconfirmed release is retried"
+        );
+    }
+
+    // A server that stops reading its stdin blocks every write to it. A
+    // release writes nothing itself, so it still returns at once with the
+    // binding and route gone; the server's one release worker waits on the
+    // pipe instead, the later release queued behind it, and both are
+    // reported unconfirmed once the pipe gives way.
+    #[test]
+    fn a_server_that_stops_reading_cannot_hold_up_a_release() {
+        let (unblock, gate) = crossbeam_channel::bounded::<()>(0);
+        let server = PooledAppServer::for_test(Arc::new(AppServerClient::for_test_unread(gate)));
+        let pool = CodexAppServerPool::default();
+        pool.insert_test_server("identity-a".to_string(), server.clone());
+        let _a = server.register_call("thread-a", "run-a");
+        let _b = server.register_call("thread-b", "run-b");
+
+        let started = Instant::now();
+        let calls: Vec<PooledCall> = ["thread-a", "thread-b"]
+            .into_iter()
+            .map(|thread| {
+                let call = PooledCall::new(server.clone(), thread.to_string())
+                    .tracking_turn(Arc::new(Mutex::new(Some("turn-1".to_string()))));
+                call.release();
+                call
+            })
+            .collect();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "releasing on a server that stopped reading took {:?}",
+            started.elapsed()
+        );
+        for thread in ["thread-a", "thread-b"] {
+            assert!(pool.binding_for_thread(thread).is_none(), "{thread}");
+            assert!(!server.router.is_routed(thread), "{thread}");
+        }
+        assert!(
+            !server.settle_releases(Duration::from_millis(200)),
+            "the worker is still blocked on the unread pipe"
+        );
+
+        drop(unblock);
+        assert!(server.settle_releases(Duration::from_secs(5)));
+        assert_eq!(
+            server.snapshot(false).release_uncertain,
+            vec!["thread-a".to_string(), "thread-b".to_string()]
+        );
+        drop(calls);
+    }
+
+    // The last release on a retiring server shuts it down on the caller's
+    // thread. With an earlier release's worker blocked in a write the server
+    // never reads, that shutdown must still return: it cannot wait on the
+    // writer the blocked worker holds.
+    #[test]
+    fn the_last_release_on_a_retiring_server_returns_while_a_write_is_blocked() {
+        let (unblock, gate) = crossbeam_channel::bounded::<()>(0);
+        let server = PooledAppServer::for_test(Arc::new(AppServerClient::for_test_unread(gate)));
+        let _a = server.register_call("thread-a", "run-a");
+        let _b = server.register_call("thread-b", "run-b");
+        server.retiring.store(true, Ordering::SeqCst);
+
+        let a = PooledCall::new(server.clone(), "thread-a".to_string());
+        a.release();
+        assert!(
+            !server.settle_releases(Duration::from_millis(200)),
+            "A's release worker is blocked in its write"
+        );
+        assert!(!server.is_closed(), "B's route still holds the server open");
+
+        let b = PooledCall::new(server.clone(), "thread-b".to_string());
+        let started = Instant::now();
+        b.release();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the last release took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            server.is_closed(),
+            "the drained retiring server is shut down"
+        );
+
+        drop(unblock);
+        assert!(server.settle_releases(Duration::from_secs(5)));
+        drop((a, b));
+    }
+
+    #[test]
+    fn thread_start_latencies_fall_into_their_buckets() {
+        let server = PooledAppServer::for_test(scripted_client());
+        server.record_thread_start(Duration::from_millis(3));
+        server.record_thread_start(Duration::from_millis(40));
+        server.record_thread_start(Duration::from_secs(54));
+        server.record_thread_start(Duration::from_secs(90));
+        let snapshot = server.snapshot(false);
+        assert_eq!(snapshot.thread_start_counts, vec![1, 0, 1, 0, 0, 0, 1, 1]);
+        assert_eq!(
+            snapshot.thread_start_counts.len(),
+            snapshot.thread_start_buckets_ms.len() + 1
+        );
     }
 
     // A notification for a thread that already finalized is dropped, not routed

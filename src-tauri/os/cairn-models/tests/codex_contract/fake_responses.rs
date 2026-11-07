@@ -6,6 +6,12 @@
 //! As `HTTPS_PROXY` it logs and refuses every `CONNECT` (and every absolute-URL
 //! request), so any traffic Codex tries to send off the machine is recorded
 //! rather than sent. A case asserts that record is empty.
+//!
+//! Requests are answered from one shared queue, or, for a request whose body
+//! carries a marker a case registered ([`FakeResponses::queue_for`]), from
+//! that marker's own queue. A thread's history repeats its first prompt in
+//! every later request, so a marker in that prompt routes all of the
+//! thread's requests, however many threads share a server.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,6 +30,8 @@ const FAKE_CHUNKS: [&str; 3] = ["Hello", " from", " fake"];
 pub enum Mode {
     /// Stream [`FAKE_TEXT`] and complete.
     Normal,
+    /// Stream this text and complete.
+    Reply(String),
     /// Stream a delta every 250 ms until the client hangs up.
     Slow,
     /// Answer with this HTTP status and a JSON error body.
@@ -38,12 +46,20 @@ pub enum Mode {
         needle: &'static str,
         arguments: &'static str,
     },
+    /// One `custom_tool_call` (a freeform tool, such as code mode's `exec`)
+    /// named `name`, with this raw input.
+    Custom { name: &'static str, input: String },
 }
 
 /// One request the provider answered.
 #[derive(Debug, Clone)]
 pub struct Served {
     pub mode: String,
+    /// The registered marker the request carried, if any.
+    pub marker: Option<String>,
+    /// The last few thousand characters of the request's `input`, where the
+    /// previous tool call's output arrives.
+    pub input_tail: String,
     /// Every tool name the request offered, nested namespaces included.
     pub tools: Vec<String>,
 }
@@ -51,6 +67,8 @@ pub struct Served {
 #[derive(Default)]
 struct State {
     queue: VecDeque<Mode>,
+    /// Per-marker queues, in registration order.
+    marked: Vec<(String, VecDeque<Mode>)>,
     served: Vec<Served>,
     egress: Vec<String>,
     counter: usize,
@@ -92,6 +110,19 @@ impl FakeResponses {
     /// Answer the next requests with `modes`, in order; afterwards, [`Mode::Normal`].
     pub fn queue(&self, modes: impl IntoIterator<Item = Mode>) {
         self.state.lock().unwrap().queue.extend(modes);
+    }
+
+    /// Answer requests whose body contains `marker` with `modes`, in order;
+    /// afterwards, [`Mode::Normal`]. Such a request never takes from the
+    /// shared queue. No marker may contain another.
+    pub fn queue_for(&self, marker: &str, modes: impl IntoIterator<Item = Mode>) {
+        let mut state = self.state.lock().unwrap();
+        match state.marked.iter_mut().find(|(known, _)| known == marker) {
+            Some((_, queue)) => queue.extend(modes),
+            None => state
+                .marked
+                .push((marker.to_string(), modes.into_iter().collect())),
+        }
     }
 
     /// Answer every provider request (websocket upgrades included) with the
@@ -186,6 +217,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     if state.lock().unwrap().reject_auth {
         state.lock().unwrap().served.push(Served {
             mode: format!("Unauthorized {method} {target}"),
+            marker: None,
+            input_tail: String::new(),
             tools: Vec::new(),
         });
         return respond(
@@ -207,12 +240,30 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let mut tools = Vec::new();
     tool_names(&request["tools"], None, &mut tools);
+    let input = request["input"].to_string();
+    let input_tail: String = {
+        let chars: Vec<char> = input.chars().collect();
+        chars[chars.len().saturating_sub(4000)..].iter().collect()
+    };
+    let text = String::from_utf8_lossy(&body);
     let (mode, n) = {
         let mut state = state.lock().unwrap();
         state.counter += 1;
-        let mode = state.queue.pop_front().unwrap_or(Mode::Normal);
+        let (marker, mode) = match state
+            .marked
+            .iter_mut()
+            .find(|(marker, _)| text.contains(marker.as_str()))
+        {
+            Some((marker, queue)) => (
+                Some(marker.clone()),
+                queue.pop_front().unwrap_or(Mode::Normal),
+            ),
+            None => (None, state.queue.pop_front().unwrap_or(Mode::Normal)),
+        };
         state.served.push(Served {
             mode: format!("{mode:?}"),
+            marker,
+            input_tail,
             tools: tools.clone(),
         });
         (mode, state.counter)
@@ -287,6 +338,21 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             ))?;
             stream.write_all(&completed())?;
         }
+        Mode::Custom { name, input } => {
+            let item = json!({"type": "custom_tool_call", "id": format!("ctc_{n}"),
+                "call_id": format!("call_{n}"), "name": name, "input": input});
+            let mut added = item.clone();
+            added["input"] = json!("");
+            stream.write_all(&sse(
+                "response.output_item.added",
+                json!({"output_index": 0, "item": added}),
+            ))?;
+            stream.write_all(&sse(
+                "response.output_item.done",
+                json!({"output_index": 0, "item": item}),
+            ))?;
+            stream.write_all(&completed())?;
+        }
         Mode::Slow => {
             stream.write_all(&message_added())?;
             for tick in 0..480 {
@@ -299,15 +365,19 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             stream.write_all(&message_added())?;
             stream.write_all(&delta(FAKE_CHUNKS[0]))?;
         }
-        Mode::Normal | Mode::Http(_) => {
+        Mode::Normal | Mode::Http(_) | Mode::Reply(_) => {
+            let (chunks, full): (Vec<&str>, &str) = match &mode {
+                Mode::Reply(reply) => (vec![reply.as_str()], reply.as_str()),
+                _ => (FAKE_CHUNKS.to_vec(), FAKE_TEXT),
+            };
             stream.write_all(&message_added())?;
-            for chunk in FAKE_CHUNKS {
+            for chunk in chunks {
                 stream.write_all(&delta(chunk))?;
             }
             stream.write_all(&sse(
                 "response.output_item.done",
                 json!({"output_index": 0, "item": {"type": "message", "role": "assistant",
-                    "id": message_id, "content": [{"type": "output_text", "text": FAKE_TEXT,
+                    "id": message_id, "content": [{"type": "output_text", "text": full,
                     "annotations": []}]}}),
             ))?;
             stream.write_all(&completed())?;

@@ -422,7 +422,7 @@ impl CodexBackend {
         run_db: Arc<LocalDb>,
         client: Arc<AppServerClient>,
         oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
-        cleanup: Option<super::pool::PooledCall>,
+        cleanup: Option<Arc<super::pool::PooledCall>>,
     ) -> CodexRuntime {
         codex_runtime(
             super::super::transcript_host::SessionTranscriptHost {
@@ -453,7 +453,7 @@ impl CodexBackend {
         oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
         backend_key: String,
         run_db: Arc<LocalDb>,
-        cleanup: Option<super::pool::PooledCall>,
+        cleanup: Option<Arc<super::pool::PooledCall>>,
     ) {
         let ephemeral = cleanup.is_some();
         let host = Self::session_runtime(
@@ -482,7 +482,7 @@ pub(super) fn codex_runtime(
     session: super::super::transcript_host::SessionTranscriptHost,
     client: Option<Arc<AppServerClient>>,
     oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
-    cleanup: Option<super::pool::PooledCall>,
+    cleanup: Option<Arc<super::pool::PooledCall>>,
 ) -> CodexRuntime {
     CodexRuntime {
         process_state: session.orch.process_state.clone(),
@@ -536,7 +536,7 @@ struct CodexReaderHost {
     session: super::super::transcript_host::SessionTranscriptHost,
     client: Option<Arc<AppServerClient>>,
     oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
-    cleanup: Mutex<Option<super::pool::PooledCall>>,
+    cleanup: Mutex<Option<Arc<super::pool::PooledCall>>>,
 }
 impl CodexReaderHost {
     /// Cairn's notice for a token request it refused this session, while the
@@ -767,7 +767,7 @@ impl CodexHost for CodexReaderHost {
 
     fn reader_closed(&self) {
         if let Some(cleanup) = self.cleanup.lock().unwrap().take() {
-            cleanup.deregister();
+            cleanup.release();
         }
     }
 }

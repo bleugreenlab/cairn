@@ -186,8 +186,8 @@ fn suite_file(name: &str) -> String {
     format!("{}/tests/codex_contract/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// One stdio MCP server with one `echo` tool, configured exactly as Cairn
-/// configures any stdio server it hands a Codex process.
+/// The fixture stdio MCP server (`echo` and `hang`), configured exactly as
+/// Cairn configures any stdio server it hands a Codex process.
 pub fn fixture_mcp() -> McpServers {
     McpServers::new(vec![McpServer {
         name: "fixture".to_string(),
@@ -197,9 +197,85 @@ pub fn fixture_mcp() -> McpServers {
             env: BTreeMap::new(),
             inherit_env: Vec::new(),
         },
-        required_tools: vec!["echo".to_string()],
+        required_tools: vec!["echo".to_string(), "hang".to_string()],
     }])
     .expect("the fixture server name is valid")
+}
+
+/// The fixture server with both its tools (`echo` and `hang`), logging to
+/// `log` ([`FixtureLog`]).
+pub fn logged_fixture_mcp(log: &Path) -> McpServers {
+    McpServers::new(vec![McpServer {
+        name: "fixture".to_string(),
+        transport: McpTransport::Stdio {
+            command: bun(),
+            args: vec![
+                suite_file("mcp_fixture.ts"),
+                log.to_string_lossy().into_owned(),
+            ],
+            env: BTreeMap::new(),
+            inherit_env: Vec::new(),
+        },
+        required_tools: vec!["echo".to_string(), "hang".to_string()],
+    }])
+    .expect("the fixture server name is valid")
+}
+
+/// What every fixture shim logging to one file reported: one JSON object
+/// per line, each with an `event` and the shim's `pid`.
+pub struct FixtureLog {
+    path: PathBuf,
+}
+
+impl FixtureLog {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn events(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    pub fn named(&self, event: &str) -> Vec<Value> {
+        self.events()
+            .into_iter()
+            .filter(|logged| logged["event"] == event)
+            .collect()
+    }
+
+    /// The pids of shims that started and have not logged their exit.
+    pub fn live_pids(&self) -> std::collections::BTreeSet<u64> {
+        let pid = |logged: &Value| logged["pid"].as_u64();
+        let exited: std::collections::BTreeSet<u64> =
+            self.named("exit").iter().filter_map(pid).collect();
+        self.named("start")
+            .iter()
+            .filter_map(pid)
+            .filter(|started| !exited.contains(started))
+            .collect()
+    }
+
+    /// Wait at most `timeout` for a logged event `holds` accepts.
+    pub fn until(&self, timeout: Duration, holds: impl Fn(&Value) -> bool) -> Option<Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(found) = self.events().into_iter().find(|logged| holds(logged)) {
+                return Some(found);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 /// A ChatGPT login whose tokens expired long ago (unsigned, `alg: none`),
@@ -663,6 +739,19 @@ impl ContractEnv {
         let root = self.dir.path().join("fresh");
         stage(&root, &self.staged)?;
         Ok(install_root(&root))
+    }
+
+    /// A fixture server logging to a file of its own in this case's dir.
+    pub fn logged_fixture(&self, name: &str) -> (McpServers, FixtureLog) {
+        let path = self.dir.path().join(format!("{name}.jsonl"));
+        (logged_fixture_mcp(&path), FixtureLog::new(path))
+    }
+
+    /// The pid of `client`'s app-server, while its child is attached.
+    pub fn server_pid(&self, client: &Arc<AppServerClient>) -> Option<u32> {
+        let child = client.child_handle();
+        let guard = child.lock().ok()?;
+        guard.as_ref().map(|child| child.id())
     }
 
     /// The `config.toml` Cairn rendered, before the contract provider.
