@@ -1118,6 +1118,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_service_reads_whole_vcs_log_json_pages_without_a_context_budget_cut() {
+        use cairn_codec::testutil::{commit_all, git, init_repo};
+        use cairn_common::protocol::{stamp_callback_origin, MODEL_FACING_ORIGIN};
+
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let mut orch = seeded_orch().await;
+        orch.jj_binary_path = bin;
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::write(repo.path().join("seed.txt"), "seed\n").unwrap();
+        let base = commit_all(repo.path(), "base");
+        let tree = git(repo.path(), &["rev-parse", "HEAD^{tree}"]);
+        let mut commits = Vec::new();
+        let mut parent = base.clone();
+        for index in 0..734 {
+            let description = format!("change {index}\n\n{}", "history detail ".repeat(20));
+            parent = git(
+                repo.path(),
+                &[
+                    "commit-tree",
+                    tree.trim(),
+                    "-p",
+                    &parent,
+                    "-m",
+                    &description,
+                ],
+            )
+            .trim()
+            .to_string();
+            commits.push(parent.clone());
+        }
+        git(repo.path(), &["update-ref", "refs/heads/main", &parent]);
+        commits.reverse();
+        let repo_path = repo.path().display().to_string();
+        orch.db
+            .local
+            .write(move |conn| {
+                let repo_path = repo_path.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO projects(id,workspace_id,name,key,repo_path,default_branch,created_at,updated_at)
+                         VALUES('p','w','P','proj',?1,'main',1,1)",
+                        [repo_path],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let first_uri =
+            format!("cairn://p/proj/vcs/log?from={base}&to=main&format=json&limit=500&offset=0");
+        let cursors = Mutex::new(HashMap::new());
+        // A service's ctx.cairn carries its run, but no model-facing stamp.
+        let request = |uri: &str| McpCallbackRequest {
+            run_id: Some("service-vcs-log".to_string()),
+            tool: "read_batch".to_string(),
+            payload: serde_json::json!({"paths": [uri], "include_bodies": true}),
+            ..Default::default()
+        };
+        let mut uri = first_uri.clone();
+        let mut seen = Vec::new();
+        for (offset, count, more) in [(0, 500, true), (500, 234, false)] {
+            let service_request = request(&uri);
+            assert_eq!(
+                read_budget_for(&service_request),
+                view::ReadBudget::Whole {
+                    byte_ceiling: view::WHOLE_READ_BYTE_CEILING
+                }
+            );
+            let raw = handle_read_batch(&orch, &service_request, &cursors).await;
+            let envelope: ReadBatchEnvelope = serde_json::from_str(&raw).unwrap();
+            assert_eq!(envelope.segments.len(), 1);
+            let meta = &envelope.segments[0];
+            assert_eq!(meta.kind, SegmentKind::Resource, "{}", envelope.text);
+            assert_eq!(meta.natural_unit, NaturalUnit::Record);
+            assert_eq!(meta.offset, offset);
+            assert_eq!(meta.shown_units, count);
+            assert_eq!(meta.more_records, more);
+            assert!(!meta.char_continuation);
+            // Record paging, not a context-budget cut, marks the first page partial.
+            assert_eq!(meta.truncated, more);
+            let body = &envelope.bodies.as_ref().unwrap()[0];
+            assert!(!body.contains("output truncated to fit budget"));
+            let mut documents =
+                serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
+            let document = documents
+                .next()
+                .unwrap()
+                .expect("one complete log document");
+            let remainder = body[documents.byte_offset()..].trim();
+            assert_eq!(document["offset"], offset);
+            assert_eq!(document["more"], more);
+            let rows = document["commits"].as_array().unwrap();
+            assert_eq!(rows.len(), count);
+            seen.extend(
+                rows.iter()
+                    .map(|row| row["commit"].as_str().unwrap().to_string()),
+            );
+            if more {
+                assert!(body.len() > view::CLIENT_TOOL_RESULT_BYTE_CEILING);
+                let next = meta.continuation.as_ref().expect("record continuation");
+                assert!(next.contains("offset=500"), "{next}");
+                assert!(next.contains("limit=500"), "{next}");
+                assert_eq!(remainder, format!("[commits 1–500 — continue: {next}]"));
+                uri = next.clone();
+            } else {
+                assert!(meta.continuation.is_none());
+                assert!(remainder.is_empty(), "{remainder}");
+            }
+        }
+        assert_eq!(seen, commits, "all 734 commits exactly once and in order");
+
+        let mut model_request = request(&first_uri);
+        stamp_callback_origin(&mut model_request.payload, MODEL_FACING_ORIGIN);
+        let raw = handle_read_batch(&orch, &model_request, &cursors).await;
+        let model: ReadBatchEnvelope = serde_json::from_str(&raw).unwrap();
+        assert!(model.segments[0].truncated);
+        assert!(model.text.len() <= view::CLIENT_TOOL_RESULT_BYTE_CEILING);
+        assert!(model.bodies.as_ref().unwrap()[0].contains("output truncated to fit budget"));
+        let next = model.segments[0].continuation.as_ref().unwrap();
+        assert!(next.contains("offset=0"), "{next}");
+        assert!(!next.contains("limit=500"), "{next}");
+    }
+
+    #[tokio::test]
     async fn explicit_windows_bypass_dedup_while_unwindowed_repeats_are_duplicates() {
         let orch = seeded_orch().await;
         orch.process_state.processes.lock().unwrap().register(
