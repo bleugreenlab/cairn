@@ -563,7 +563,9 @@ pub(crate) fn select_row_sql(
 
 /// A JSON payload value as the SQL value it binds to: the one mapping for
 /// `?sql=` params and structured row payloads alike. Booleans bind as 0/1;
-/// arrays and objects have no SQL value.
+/// an array or object binds as its JSON text, which is what a JSON column
+/// (the journal's `refs`) stores, so `refs:["cairn://…"]` needs no
+/// hand-encoding.
 pub(crate) fn sql_param(value: &serde_json::Value) -> Result<Value, String> {
     Ok(match value {
         serde_json::Value::Null => Value::Null,
@@ -581,9 +583,30 @@ pub(crate) fn sql_param(value: &serde_json::Value) -> Result<Value, String> {
         }
         serde_json::Value::String(value) => Value::Text(value.clone()),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            return Err("values must be null, booleans, numbers, or strings".into());
+            Value::Text(value.to_string())
         }
     })
+}
+
+#[cfg(test)]
+mod sql_param_tests {
+    use super::*;
+
+    #[test]
+    fn arrays_and_objects_bind_as_their_json_text() {
+        assert_eq!(
+            sql_param(&serde_json::json!(["cairn://p/cairn/1"])).unwrap(),
+            Value::Text(r#"["cairn://p/cairn/1"]"#.into())
+        );
+        assert_eq!(
+            sql_param(&serde_json::json!({"a": 1})).unwrap(),
+            Value::Text(r#"{"a":1}"#.into())
+        );
+        assert_eq!(
+            sql_param(&serde_json::json!(true)).unwrap(),
+            Value::Integer(1)
+        );
+    }
 }
 
 /// Which columns a structured payload may name.
@@ -2061,13 +2084,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("row's address"), "{error}");
-        let error = payload_columns(
-            &shape,
-            &payload(serde_json::json!({"problem": [1]})),
-            PayloadUse::Insert,
-        )
-        .unwrap_err();
-        assert!(error.starts_with("payload.problem:"), "{error}");
+        // An array binds as its JSON text, which is what a JSON column stores.
+        assert_eq!(
+            payload_columns(
+                &shape,
+                &payload(serde_json::json!({"problem": [1]})),
+                PayloadUse::Insert,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
         assert_eq!(
             payload_columns(
                 &shape,

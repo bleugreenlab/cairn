@@ -355,6 +355,37 @@ pub(super) struct ResolvedResourceProfile {
     pub process_evidence: ProcessEvidence,
 }
 
+impl ResolvedResourceProfile {
+    /// Stamp the reservation with the most this work has been measured to
+    /// hold, which admission charges a running command until its tree grows
+    /// into it: the larger of the tree peak this machine measured (set by
+    /// [`resolve_reservation`]) and the largest single process measured of this
+    /// work on any platform, with headroom.
+    ///
+    /// Measured, never declared (tenet 946). A class prior is the project's
+    /// largest rustc, not a measurement of this work, so it does not count; nor
+    /// does a borrowed tree peak, which scales with the width of the machine
+    /// that measured it rather than with this one.
+    pub(super) fn charge_measured_peak(&mut self) {
+        self.reservation.measured_peak_bytes =
+            measured_peak_bytes(self.reservation.measured_peak_bytes, &self.process_evidence);
+    }
+}
+
+/// The larger of this machine's own tree peak and the measured largest
+/// process, or `None` when neither was measured.
+fn measured_peak_bytes(own_tree_peak: Option<u64>, evidence: &ProcessEvidence) -> Option<u64> {
+    let process = evidence
+        .demand
+        .as_ref()
+        .filter(|demand| !matches!(demand.basis, ProcessDemandBasis::ClassPrior { .. }))
+        .map(ProcessDemand::demand_bytes);
+    match (own_tree_peak, process) {
+        (Some(tree), Some(process)) => Some(tree.max(process)),
+        (tree, process) => tree.or(process),
+    }
+}
+
 /// The largest single process a request's work is known to hold, and where
 /// that was learned.
 ///
@@ -1053,6 +1084,7 @@ pub(super) fn cold_start_prior(
         // different question with no evidence behind it yet.
         concurrency_units: 1,
         source: ResourceReservationSource::Unmeasured,
+        measured_peak_bytes: None,
     }
 }
 
@@ -1119,6 +1151,7 @@ fn fleet_prior(
         // executor's cold-work brake applying to it and keeps every downstream
         // reader from mistaking another machine's history for this one's.
         source: ResourceReservationSource::Unmeasured,
+        measured_peak_bytes: None,
     })
 }
 
@@ -1485,12 +1518,16 @@ pub(super) async fn resolve_reservation(
     let memory_quarantined = profile
         .upper_peak_rss_bytes
         .is_some_and(|peak| memory_peak_quarantined(peak, memory_budget_bytes));
-    let reservation = reservation_for_profile(
+    let mut reservation = reservation_for_profile(
         &profile,
         prior.clone(),
         memory_budget_bytes,
         memory_quarantined,
     );
+    // This machine's own tree peak, never a borrowed one and never one the
+    // saturation quarantine discarded: what admission charges a running
+    // command until its tree has grown into it.
+    reservation.measured_peak_bytes = measured_memory_demand(&profile, memory_quarantined);
     let resolved = ResolvedResourceProfile {
         reservation: reservation.clone(),
         learned_estimate: Some(cairn_common::executor_protocol::LearnedResourceEstimate {
@@ -1909,6 +1946,7 @@ fn reservation_for_profile(
             true => ResourceReservationSource::Learned,
             false => prior.source,
         },
+        measured_peak_bytes: None,
     }
 }
 
@@ -2939,6 +2977,7 @@ mod tests {
                 disk_growth_bytes: 200,
                 concurrency_units,
                 source: ResourceReservationSource::Unmeasured,
+                measured_peak_bytes: None,
             };
             for sample_count in [0, 1, 4, MIN_CONFIDENT_SAMPLES, 500] {
                 let reservation = reservation_for_profile(
@@ -2971,6 +3010,7 @@ mod tests {
             disk_growth_bytes: 200,
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
+            measured_peak_bytes: None,
         };
         for sample_count in 0..MIN_CONFIDENT_SAMPLES {
             let smaller = reservation_for_profile(
@@ -3020,6 +3060,7 @@ mod tests {
                 disk_growth_bytes: 200,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
+                measured_peak_bytes: None,
             },
             None,
             false,
@@ -3055,6 +3096,7 @@ mod tests {
             disk_growth_bytes: 4 * GIB,
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
+            measured_peak_bytes: None,
         }
     }
 
@@ -3208,6 +3250,7 @@ mod tests {
             disk_growth_bytes: 200,
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
+            measured_peak_bytes: None,
         };
         let profile = |upper_peak_rss_bytes| ResourceProfile {
             sample_count: 50,
@@ -3509,6 +3552,7 @@ mod tests {
                 disk_growth_bytes: 2_000,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
+                measured_peak_bytes: None,
             },
             None,
             test_duration_context(),
@@ -3558,6 +3602,7 @@ mod tests {
             disk_growth_bytes: 4 * GIB,
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
+            measured_peak_bytes: None,
         };
         let resolved = resolve_reservation(
             db,
@@ -3736,6 +3781,57 @@ mod tests {
         .await;
         assert_eq!(resolved.reservation.memory_bytes, SPECIMEN_CAP);
         assert_eq!(resolved.memory_fit, MemoryFit::Unknown);
+        assert_eq!(
+            resolved.reservation.measured_peak_bytes, None,
+            "a borrowed tree peak is another machine's width, not a measured peak here"
+        );
+    }
+
+    fn process_demand(peak_bytes: u64, basis: ProcessDemandBasis) -> ProcessEvidence {
+        ProcessEvidence {
+            demand: Some(ProcessDemand {
+                peak_bytes,
+                name: Some("rustc".into()),
+                suite: None,
+                measured_on: None,
+                kills_here: None,
+                basis,
+            }),
+            ..ProcessEvidence::default()
+        }
+    }
+
+    /// What admission charges a running command is measured, never declared:
+    /// the larger of this machine's own tree peak and the largest process of
+    /// this work measured on any platform; the largest process alone when the
+    /// tree peak was quarantined or borrowed (and so is absent); never a class
+    /// prior; and nothing when nothing was measured.
+    #[test]
+    fn the_measured_peak_is_the_larger_measurement_and_never_a_prior() {
+        let here = process_demand(9 * GIB, ProcessDemandBasis::ThisPlatform);
+        assert_eq!(
+            measured_peak_bytes(Some(4 * GIB), &here),
+            Some(with_headroom(9 * GIB))
+        );
+        assert_eq!(measured_peak_bytes(Some(20 * GIB), &here), Some(20 * GIB));
+        assert_eq!(
+            measured_peak_bytes(None, &here),
+            Some(with_headroom(9 * GIB)),
+            "a quarantined or borrowed tree peak leaves the largest process standing"
+        );
+        let elsewhere = process_demand(
+            9 * GIB,
+            ProcessDemandBasis::OtherPlatform {
+                platform: "aarch64".into(),
+            },
+        );
+        assert_eq!(
+            measured_peak_bytes(None, &elsewhere),
+            Some(with_headroom(9 * GIB))
+        );
+        let prior = process_demand(9 * GIB, ProcessDemandBasis::ClassPrior { platform: None });
+        assert_eq!(measured_peak_bytes(None, &prior), None);
+        assert_eq!(measured_peak_bytes(None, &ProcessEvidence::default()), None);
     }
 
     /// cairn/5472's first specimen: bgsrv-ub had run the whole suite past the
@@ -4050,6 +4146,7 @@ mod tests {
                 disk_growth_bytes: 10,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
+                measured_peak_bytes: None,
             },
             Some(100),
             true,

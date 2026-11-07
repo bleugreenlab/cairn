@@ -737,48 +737,6 @@ pub(super) fn artifact_affordance_spec_with_schema(
         guidance: None,
     }];
 
-    // Decisions are project tenets and open questions live in the thread
-    // database. Keep both paths beside the prose artifact action so callers do
-    // not infer JSON collection writes.
-    if addressed_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
-        actions.push(ActionSpec {
-            label: "propose a tenet".to_string(),
-            mode: ChangeMode::Append.as_str().to_string(),
-            uri_template: "cairn:@/tenets".to_string(),
-            uri: None,
-            required: vec![schema_key("statement")],
-            optional: vec![schema_key("supersedes")],
-            example: crate::resources::sql_policy::TENET_APPEND_EXAMPLE.to_string(),
-            guidance: Some(
-                "; a decision is a tenet: one statement of how the project does things, which the operator answers yes or no"
-                    .to_string(),
-            ),
-        });
-        actions.push(ActionSpec {
-            label: "append one open question in the thread database".to_string(),
-            mode: ChangeMode::Patch.as_str().to_string(),
-            uri_template: "cairn:~/db".to_string(),
-            uri: None,
-            required: vec![schema_key("sql"), schema_key("params")],
-            optional: Vec::new(),
-            example: "write({changes:[{target:\"cairn:~/db\",mode:\"patch\",payload:{sql:\"INSERT INTO _cairn_open_questions(question,provenance) VALUES(?,?)\",params:[\"...\",\"[\\\"cairn://p/PROJECT/NUMBER\\\"]\"]}}]})".to_string(),
-            guidance: None,
-        });
-        actions.push(ActionSpec {
-            label: "read open questions from the thread database".to_string(),
-            mode: "read".to_string(),
-            uri_template: "cairn:~/db".to_string(),
-            uri: None,
-            required: Vec::new(),
-            optional: Vec::new(),
-            example:
-                "read({paths:[\"cairn:~/db?sql=SELECT * FROM _cairn_open_questions ORDER BY id\"]})"
-                    .to_string(),
-            guidance: Some("; the arc's format=json projection contains prose only".to_string()),
-        });
-    }
-
-    // Ordinary field merge remains available after the collection SQL actions.
     if let Some(patch) = contract.mutation(ChangeMode::Patch) {
         let mut spec = action_spec(patch.label, contract, patch, current);
         spec.uri_template = example_uri.clone();
@@ -1646,30 +1604,6 @@ mod tests {
                 "create example key `{key}` is not a schema property: {payload}"
             );
         }
-    }
-
-    #[test]
-    fn arc_affordance_points_collection_operations_to_the_thread_database() {
-        let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../../../resources/schemas/arc.json")).unwrap();
-        let block =
-            artifact_affordance_with_schema(ResourceKind::NodeArtifact, Some("arc"), &schema)
-                .unwrap();
-        let propose = block.find("[propose a tenet]").unwrap();
-        let question = block
-            .find("[append one open question in the thread database]")
-            .unwrap();
-        let generic = block
-            .find(&format!(
-                "[{}]",
-                cairn_common::contract::PR_ARTIFACT_ACTION_LABEL
-            ))
-            .unwrap();
-        assert!(propose < question && question < generic, "{block}");
-        assert!(block.contains("cairn:@/tenets"));
-        assert!(block.contains("SELECT * FROM _cairn_open_questions ORDER BY id"));
-        assert!(!block.contains("_cairn_rulings"), "{block}");
-        assert!(block.contains("format=json projection contains prose only"));
     }
 
     #[test]

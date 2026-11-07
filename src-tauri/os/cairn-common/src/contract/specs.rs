@@ -1043,7 +1043,7 @@ pub(crate) const SETTINGS_THREAD_COMPACT_THRESHOLD: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_SEED_BUDGET_TOKENS: KeySpec = KeySpec::new(
     "seedBudgetTokens",
     KeyType::Int,
-    "approximate token budget for non-arc thread seed context",
+    "approximate token budget for thread seed context below its intent and journal",
 );
 pub(crate) const SETTINGS_SEED_ERAS: KeySpec = KeySpec::new(
     "seedEras",

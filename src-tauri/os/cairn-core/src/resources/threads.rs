@@ -354,7 +354,8 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
             request_id: (*request_id).to_string(),
         ),
         // A trailing non-reserved segment names an artifact type, exactly as it
-        // does under a node. `arc` resolves here. The guard is
+        // does under a node, where a thread session's own write is refused (a
+        // thread keeps no artifacts) and its tasks' return. The guard is
         // `is_reserved_node_segment` at both levels now: the ad-hoc four-name
         // exclusion list this replaced is why `browser`, `checks`, and `diff`
         // from a thread session became artifacts of that name (CAIRN-3760).
@@ -633,7 +634,9 @@ pub(super) async fn read_thread(
             {
                 out.push_str(&format!("{}\n\n", default.line()));
             }
-            out.push_str(&format!("- [arc]({canonical}/arc)\n"));
+            out.push_str(&format!(
+                "- [intent]({canonical}/db/intent/1) · [journal]({canonical}/db/journal)\n"
+            ));
             match session {
                 Some((job_id, segment, session_status)) => out.push_str(&format!(
                     "- Live session: {}{} ({})\n",
@@ -905,9 +908,9 @@ mod delegation_tests {
     #[test]
     fn delegation_carries_the_reserved_thread_coordinate() {
         assert!(matches!(
-            delegate("arc").unwrap(),
+            delegate("plan").unwrap(),
             CairnResource::NodeArtifact { number: 0, exec_seq: 0, ref node_id, name: Some(ref name), .. }
-                if node_id == "design-review" && name == "arc"
+                if node_id == "design-review" && name == "plan"
         ));
         assert!(matches!(
             delegate("task/probe/return").unwrap(),
@@ -1002,7 +1005,7 @@ mod delegation_tests {
             for segment in cairn_common::uri::RESERVED_NODE_SEGMENTS
                 .iter()
                 .copied()
-                .chain(["return", "arc"])
+                .chain(["return", "notes"])
             {
                 // What the parser does with this segment under a node is the
                 // specification; a segment it resolves to nothing there is not
@@ -1156,7 +1159,10 @@ mod tests {
         // A thread's heading is its one identifier, the same string its URI
         // carries and its pane header shows.
         assert!(overview.contains("# design-review"));
-        assert!(overview.contains("[arc](cairn://p/thr/design-review/arc)"));
+        assert!(
+            overview.contains("[intent](cairn://p/thr/design-review/db/intent/1) · [journal](cairn://p/thr/design-review/db/journal)"),
+            "{overview}"
+        );
         assert!(overview.contains("[12 — Child issue](cairn://p/thr/12)"));
         assert!(overview.contains("Live session: not started"));
         // The page a caller appends to says what an append does to the session.
@@ -1255,12 +1261,6 @@ mod tests {
         let job_id = crate::threads::ensure_thread_session(&db, "t-design")
             .await
             .unwrap();
-        db.execute(
-            r#"INSERT INTO artifacts (id, job_id, artifact_type, output_name, data, created_at, updated_at) VALUES ('a-arc', ?1, 'document', 'arc', '{"content":"Canonical arc"}', 5, 5)"#,
-            (job_id.as_str(),),
-        )
-        .await
-        .unwrap();
         db.execute(
             "INSERT INTO memories (id, name, project_id, content, scope, scope_value, job_id, node_seq, created_at, updated_at) VALUES ('m-thread', 'Thread fact', 'p-threads', 'Remember this detail', 'project', 'p-threads', ?1, 1, 6, 6)",
             (job_id.as_str(),),

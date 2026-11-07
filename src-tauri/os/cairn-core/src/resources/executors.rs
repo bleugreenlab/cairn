@@ -137,10 +137,11 @@ pub(crate) fn render_listener_identity(listener: Option<&ExecutorListenerAdverti
 // fleet-visibility types on a separate line means two branches working on this
 // file do not collide on one line neither of them cares about.
 use cairn_common::executor_protocol::{
-    AllocatorState, BuildPrerequisiteStatus, CpuAdmissionHealth, CpuAdmissionState, EnrolledRemote,
-    ExecutorCapabilities, ExecutorListenerAdvertisement, GenerationEndMemory, RemoteArtifactFault,
-    RemoteAttachAttempt, RemoteConnectionPhase, RemoteConnectionTransition, RemoteLinkState,
-    UpdateReport, UpdateState, CPU_ADMISSION_BLIND_AFTER_MS, MACHINE_READING_STALE_AFTER_MS,
+    AllocatorState, BuildPrerequisiteStatus, EnrolledRemote, ExecutorCapabilities,
+    ExecutorListenerAdvertisement, GenerationEndMemory, RemoteArtifactFault, RemoteAttachAttempt,
+    RemoteConnectionPhase, RemoteConnectionTransition, RemoteLinkState, StallInstrument,
+    StallInstrumentHealth, StallInstrumentPolicy, StallInstrumentState, UpdateReport, UpdateState,
+    CPU_ADMISSION_BLIND_AFTER_MS, MACHINE_READING_STALE_AFTER_MS,
 };
 
 use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
@@ -1550,14 +1551,43 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             executor.occupancy.orphaned_provisioning_releases
         ));
     }
-    // The measured-CPU brake is the only thing standing between a saturated
-    // machine and more work, so whether it can currently see is a fact the
-    // Admission section owes its reader. A machine that stopped measuring reads
-    // as idle everywhere else on this page.
-    out.push_str(&format!(
-        "- Measured CPU brake: {}\n",
-        cpu_brake_summary(&health.host.cpu_admission, executor.captured_at_unix_ms)
-    ));
+    // The host-stall brake is what stands between a saturated or thrashing
+    // machine and more work, so whether each instrument can currently see is a
+    // fact the Admission section owes its reader. A machine that stopped
+    // measuring reads as idle everywhere else on this page.
+    for instrument in StallInstrument::ALL {
+        out.push_str(&format!(
+            "- {} brake: {}\n",
+            instrument.label(),
+            stall_brake_summary(
+                instrument,
+                health.host.stall(instrument),
+                health.applied_policy.stall_policy(instrument),
+                executor.captured_at_unix_ms,
+            )
+        ));
+    }
+    if let Some(owed) = health.admission.owed_memory_bytes {
+        let owing = &health.admission.owing;
+        out.push_str(&format!(
+            "- Owed memory: {} still to be taken by {} running {}{}\n",
+            cairn_common::executor_protocol::describe_gib(owed),
+            owing.len(),
+            if owing.len() == 1 { "item" } else { "items" },
+            if owing.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    owing
+                        .iter()
+                        .map(|work| work.describe())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        ));
+    }
     if health.queues.is_empty() {
         out.push_str("- Queues: empty\n");
     } else {
@@ -3510,14 +3540,20 @@ fn allocator_split(state: &AllocatorState) -> String {
     )
 }
 
-/// What the executor's own CPU circuit breaker can currently see.
+/// What one instrument of the executor's host-stall brake can currently see,
+/// and the bars it is held to.
 ///
 /// Blindness is judged against the clock here, not read off the reported state,
 /// for the same reason the executor judges it that way: the state only advances
 /// when the sampler runs, and a sampler that has stopped cannot report that it
 /// stopped.
-fn cpu_brake_summary(cpu: &CpuAdmissionHealth, captured_at_unix_ms: u64) -> String {
-    let Some(measured_at) = cpu.measured_at_unix_ms else {
+fn stall_brake_summary(
+    instrument: StallInstrument,
+    health: &StallInstrumentHealth,
+    policy: StallInstrumentPolicy,
+    captured_at_unix_ms: u64,
+) -> String {
+    let Some(measured_at) = health.measured_at_unix_ms else {
         return "never measured on this machine — the brake cannot engage".to_string();
     };
     let age_ms = captured_at_unix_ms.saturating_sub(measured_at);
@@ -3528,16 +3564,43 @@ fn cpu_brake_summary(cpu: &CpuAdmissionHealth, captured_at_unix_ms: u64) -> Stri
             CPU_ADMISSION_BLIND_AFTER_MS / 1_000
         );
     }
-    let utilization = match cpu.utilization {
-        Some(value) => format!("{:.0}%", value * 100.0),
-        None => "unreported".to_string(),
+    let percent = |fraction: f64| match instrument {
+        // A stall share is small where it matters, so it keeps a decimal.
+        StallInstrument::Memory => format!("{:.1}%", fraction * 100.0),
+        StallInstrument::Cpu => format!("{:.0}%", fraction * 100.0),
     };
-    match cpu.state {
-        CpuAdmissionState::Pressured => format!(
-            "pressured at {utilization} — holding new non-interactive work (measured {})",
-            age(age_ms)
-        ),
-        _ => format!("accepting at {utilization} (measured {})", age(age_ms)),
+    let reading = match (health.reading, instrument) {
+        (Some(value), StallInstrument::Cpu) => percent(value),
+        (Some(value), StallInstrument::Memory) => format!("{} full (avg10)", percent(value)),
+        (None, _) => "unreported".to_string(),
+    };
+    let seconds = |ms: u64| format!("{} s", ms / 1_000);
+    let entry = format!(
+        "enters ≥{} for {}",
+        percent(policy.entry),
+        seconds(policy.entry_window_ms)
+    );
+    let clear = format!(
+        "clears ≤{} for {}",
+        percent(policy.clear),
+        seconds(policy.clear_window_ms)
+    );
+    match health.state {
+        StallInstrumentState::Pressured => {
+            let verb = match instrument {
+                StallInstrument::Cpu => "pressured",
+                StallInstrument::Memory => "stalled",
+            };
+            let since = health
+                .state_since_unix_ms
+                .map(|since| format!(" for {}", age(captured_at_unix_ms.saturating_sub(since))))
+                .unwrap_or_default();
+            format!(
+                "{verb} at {reading}{since} — holding new non-interactive work (measured {}; {entry}, {clear})",
+                age(age_ms)
+            )
+        }
+        _ => format!("accepting at {reading} (measured {}; {entry})", age(age_ms)),
     }
 }
 
@@ -8388,23 +8451,23 @@ mod tests {
     fn the_admission_section_says_when_the_cpu_brake_has_gone_blind() {
         let mut executor = inspection("blind", false);
         let went_quiet = executor.captured_at_unix_ms - CPU_ADMISSION_BLIND_AFTER_MS - 1;
-        executor.health.host.cpu_admission = CpuAdmissionHealth {
-            state: CpuAdmissionState::Accepting,
-            utilization: Some(0.99),
+        executor.health.host.cpu_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Accepting,
+            reading: Some(0.99),
             state_since_unix_ms: Some(went_quiet),
             measured_at_unix_ms: Some(went_quiet),
         };
 
         let rendered = render_executor(&executor);
 
-        assert!(rendered.contains("Measured CPU brake: BLIND"), "{rendered}");
+        assert!(rendered.contains("CPU brake: BLIND"), "{rendered}");
         assert!(
             !rendered.contains("accepting at 99%"),
             "a frozen reading must not be presented as a current verdict: {rendered}"
         );
 
         // Never measured is a different fact and must not read as blindness.
-        executor.health.host.cpu_admission = CpuAdmissionHealth::default();
+        executor.health.host.cpu_admission = StallInstrumentHealth::default();
         let rendered = render_executor(&executor);
         assert!(
             rendered.contains("never measured on this machine"),
@@ -8413,14 +8476,99 @@ mod tests {
         assert!(!rendered.contains("BLIND"), "{rendered}");
 
         // And a fresh reading is reported as the verdict it is.
-        executor.health.host.cpu_admission = CpuAdmissionHealth {
-            state: CpuAdmissionState::Pressured,
-            utilization: Some(0.97),
+        executor.health.host.cpu_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.97),
             state_since_unix_ms: Some(executor.captured_at_unix_ms),
             measured_at_unix_ms: Some(executor.captured_at_unix_ms),
         };
         let rendered = render_executor(&executor);
         assert!(rendered.contains("pressured at 97%"), "{rendered}");
+        assert!(
+            rendered.contains("enters ≥90% for 15 s, clears ≤75% for 10 s"),
+            "the CPU line carries the bars it is judged against: {rendered}"
+        );
+    }
+
+    /// The memory instrument renders beside the CPU one in the same four
+    /// states, each with the policy it is judged against.
+    #[test]
+    fn the_admission_section_renders_the_memory_brake_with_its_policy() {
+        let mut executor = inspection("memory", false);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered
+                .contains("Memory brake: never measured on this machine — the brake cannot engage"),
+            "a platform without PSI fails open, and says so: {rendered}"
+        );
+
+        let now = executor.captured_at_unix_ms;
+        executor.health.host.memory_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Accepting,
+            reading: Some(0.004),
+            state_since_unix_ms: Some(now - 60_000),
+            measured_at_unix_ms: Some(now - 3_000),
+        };
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Memory brake: accepting at 0.4% full (avg10)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("enters ≥10.0% for 10 s)"), "{rendered}");
+
+        executor.health.host.memory_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.23),
+            state_since_unix_ms: Some(now - 120_000),
+            measured_at_unix_ms: Some(now),
+        };
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Memory brake: stalled at 23.0% full (avg10) for 2m"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("holding new non-interactive work"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("enters ≥10.0% for 10 s, clears ≤2.0% for 30 s"),
+            "{rendered}"
+        );
+
+        executor.health.host.memory_admission.measured_at_unix_ms =
+            Some(now - CPU_ADMISSION_BLIND_AFTER_MS - 1);
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("Memory brake: BLIND"), "{rendered}");
+    }
+
+    /// What admitted work still owes is shown with who owes it, so a memory
+    /// refusal on an apparently roomy machine explains itself.
+    #[test]
+    fn the_admission_section_names_owed_memory_and_who_owes_it() {
+        use cairn_common::executor_protocol::{LiveUsageSubject, OwingWork};
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut executor = inspection("owed", false);
+        assert!(!render_executor(&executor).contains("Owed memory"));
+        executor.health.admission.owed_memory_bytes = Some(17 * GIB);
+        executor.health.admission.owing = vec![OwingWork {
+            subject: LiveUsageSubject::Command {
+                request_id: "r1".into(),
+                attempt_id: "a1".into(),
+            },
+            cell_id: "slot-118".into(),
+            command: Some("cargo check".into()),
+            charge_bytes: 9 * GIB,
+            resident_bytes: Some(GIB),
+        }];
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "Owed memory: 17.0 GiB still to be taken by 1 running item \
+                 (`cargo check` in slot-118: 9.0 GiB charged, 1.0 GiB resident)"
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -10663,6 +10811,7 @@ mod tests {
                     disk_growth_bytes: 4 * 1024 * 1024 * 1024,
                     concurrency_units: 1,
                     source: ResourceReservationSource::Learned,
+                    measured_peak_bytes: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),

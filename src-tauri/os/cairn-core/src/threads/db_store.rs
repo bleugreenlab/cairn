@@ -14,7 +14,7 @@ use crate::{
         sql_policy,
         sql_schema::{quote_identifier, USER_TABLE_PREDICATE},
     },
-    storage::{db_set_paths, LocalDb, MigrationRunner},
+    storage::{db_set_paths, LocalDb, MigrationRunner, RowExt},
 };
 
 static CACHE: OnceLock<RwLock<HashMap<PathBuf, Arc<LocalDb>>>> = OnceLock::new();
@@ -435,6 +435,7 @@ pub(crate) async fn open_path(path: PathBuf) -> Result<Arc<LocalDb>, String> {
         return Ok(db);
     }
     let db = Arc::new(LocalDb::open(&path).await.map_err(sanitize_error)?);
+    let claimed = claim_app_table_names(&db).await.map_err(sanitize_error)?;
     let migrations: Vec<_> = match unimported_rulings(&db, &path)
         .await
         .map_err(sanitize_error)?
@@ -457,8 +458,110 @@ pub(crate) async fn open_path(path: PathBuf) -> Result<Arc<LocalDb>, String> {
         .run(&db)
         .await
         .map_err(sanitize_error)?;
+    for claim in &claimed {
+        db.execute(
+            "INSERT INTO journal(kind, note, refs) VALUES ('event', ?1, ?2)",
+            cairn_db::turso::params![claim.notice(), THREAD_DB_SKILL_REFS],
+        )
+        .await
+        .map_err(sanitize_error)?;
+    }
     let mut cache = cache().write().await;
     Ok(cache.entry(path).or_insert(db).clone())
+}
+
+const THREAD_DB_SKILL_REFS: &str = "[\"cairn://skills/thread-db\"]";
+
+/// A thread's own table that held an app-known name, moved aside so the
+/// starter record could take the name.
+struct ClaimedName {
+    name: &'static str,
+    moved_to: String,
+    /// The thread's own indexes and triggers that moved with it, as
+    /// `index `x``: what a service query or trigger body breaks on.
+    objects: Vec<String>,
+}
+
+impl ClaimedName {
+    fn notice(&self) -> String {
+        let carried = if self.objects.is_empty() {
+            String::new()
+        } else {
+            format!(", and its {} moved with it", self.objects.join(", "))
+        };
+        format!(
+            "Cairn's starter record claimed `{name}`; this thread's own table of that name is now `{moved}`, rows unchanged{carried}. Update any query, service or prompt that names it.",
+            name = self.name,
+            moved = self.moved_to,
+        )
+    }
+}
+
+/// Before the starter-record migration installs `intent` and `journal`, move a
+/// thread's own table of either name to `<name>_own` (`_own_2`, … when that is
+/// taken). Rows, indexes and triggers go with it. A store that has applied the
+/// migration is never touched again, so a rename happens at most once.
+async fn claim_app_table_names(db: &LocalDb) -> crate::storage::DbResult<Vec<ClaimedName>> {
+    async fn named(db: &LocalDb, name: &str, table_only: bool) -> crate::storage::DbResult<bool> {
+        let sql = if table_only {
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1"
+        } else {
+            "SELECT 1 FROM sqlite_schema WHERE name = ?1"
+        };
+        Ok(db
+            .query_opt_i64(sql, cairn_db::turso::params![name.to_string()])
+            .await?
+            .is_some())
+    }
+    if named(db, "cairn_schema_migrations", true).await?
+        && db
+            .query_opt_i64(
+                "SELECT 1 FROM cairn_schema_migrations WHERE version = ?1",
+                cairn_db::turso::params![super::db_schema::THREAD_RECORD],
+            )
+            .await?
+            .is_some()
+    {
+        return Ok(Vec::new());
+    }
+    let mut claimed = Vec::new();
+    for &name in super::db_schema::APP_TABLES {
+        if !named(db, name, true).await? {
+            continue;
+        }
+        let mut moved_to = format!("{name}_own");
+        let mut suffix = 2;
+        while named(db, &moved_to, false).await? {
+            moved_to = format!("{name}_own_{suffix}");
+            suffix += 1;
+        }
+        let objects = db
+            .query_all(
+                "SELECT type, name FROM sqlite_schema
+                 WHERE tbl_name = ?1 AND type IN ('index', 'trigger') AND sql IS NOT NULL
+                 ORDER BY type, name",
+                cairn_db::turso::params![name.to_string()],
+                |row| Ok(format!("{} `{}`", row.text(0)?, row.text(1)?)),
+            )
+            .await?;
+        db.execute_batch(&format!(
+            "ALTER TABLE {} RENAME TO {}",
+            quote_identifier(name),
+            quote_identifier(&moved_to)
+        ))
+        .await?;
+        tracing::warn!(
+            table = name,
+            moved_to = %moved_to,
+            "thread store held its own table under an app-known name; renamed it for the starter record"
+        );
+        claimed.push(ClaimedName {
+            name,
+            moved_to,
+            objects,
+        });
+    }
+    Ok(claimed)
 }
 
 fn imported() -> &'static std::sync::RwLock<HashSet<PathBuf>> {
@@ -741,16 +844,73 @@ fn validate_write_statement(statement: &str) -> Result<(), String> {
         other => return Err(format!("Unsupported SQL statement '{other}' for a thread database write")),
     }
     if matches!(first, "CREATE" | "DROP" | "ALTER") {
-        if let Some(identifier) = identifiers
+        let prefixed = identifiers
             .into_iter()
-            .find(|identifier| identifier.to_ascii_lowercase().starts_with("_cairn_"))
-        {
+            .find(|identifier| identifier.to_ascii_lowercase().starts_with("_cairn_"));
+        // The friendly names are matched only where a statement reshapes them,
+        // never as any word: a column called `intent` is the thread's business.
+        let known = || {
+            ddl_reshaped_names(statement).into_iter().find(|name| {
+                name.eq_ignore_ascii_case("cairn_schema_migrations")
+                    || super::db_schema::APP_TABLES
+                        .iter()
+                        .any(|table| name.eq_ignore_ascii_case(table))
+            })
+        };
+        if let Some(identifier) = prefixed.or_else(known) {
             return Err(format!(
                 "`{identifier}` is app-contract schema — INSERT, UPDATE, and DELETE its rows, but its shape is Cairn's"
             ));
         }
     }
     Ok(())
+}
+
+/// The names a CREATE, DROP or ALTER statement reshapes: the table, view,
+/// index or trigger it names; the table an index or trigger is created ON; and
+/// the name an ALTER renames to. A schema-qualified `main.x` contributes both
+/// words, which is harmless to a membership test.
+fn ddl_reshaped_names(statement: &str) -> Vec<String> {
+    let words = sql_policy::sql_identifiers(statement);
+    let upper = |index: usize| words.get(index).map(|word| word.to_ascii_uppercase());
+    let is = |index: usize, expected: &str| upper(index).as_deref() == Some(expected);
+    let qualified = |index: usize| -> Vec<String> {
+        let mut names: Vec<String> = words.get(index).cloned().into_iter().collect();
+        if matches!(upper(index).as_deref(), Some("MAIN" | "TEMP")) {
+            names.extend(words.get(index + 1).cloned());
+        }
+        names
+    };
+    let mut names = Vec::new();
+    let mut index = 1;
+    while matches!(
+        upper(index).as_deref(),
+        Some("TEMP" | "TEMPORARY" | "UNIQUE" | "VIRTUAL")
+    ) {
+        index += 1;
+    }
+    let object = upper(index);
+    if matches!(
+        object.as_deref(),
+        Some("TABLE" | "VIEW" | "INDEX" | "TRIGGER")
+    ) {
+        index += 1;
+        if is(index, "IF") {
+            index += if is(index + 1, "NOT") { 3 } else { 2 };
+        }
+        names.extend(qualified(index));
+        if matches!(object.as_deref(), Some("INDEX" | "TRIGGER")) && is(0, "CREATE") {
+            if let Some(on) = (index + 1..words.len()).find(|&at| is(at, "ON")) {
+                names.extend(qualified(on + 1));
+            }
+        }
+    }
+    if is(0, "ALTER") {
+        if let Some(rename) = (1..words.len()).find(|&at| is(at, "RENAME") && is(at + 1, "TO")) {
+            names.extend(qualified(rename + 2));
+        }
+    }
+    names
 }
 
 /// [`split_write_sql`] then the per-statement policy: the whole check on SQL
@@ -841,6 +1001,38 @@ mod tests {
             "DELETE FROM [_cairn_open_questions]",
         ] {
             assert!(validate_write_sql(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn write_policy_protects_the_starter_record_and_the_ledger_by_name() {
+        for sql in [
+            "DROP TABLE journal",
+            "DROP TABLE IF EXISTS \"intent\"",
+            "ALTER TABLE journal ADD COLUMN extra TEXT",
+            "ALTER TABLE notes RENAME TO journal",
+            "CREATE TABLE IF NOT EXISTS Intent(id INTEGER)",
+            "CREATE VIEW journal AS SELECT 1",
+            "CREATE INDEX mine ON journal(note)",
+            "CREATE TRIGGER mine AFTER INSERT ON main.intent BEGIN SELECT 1; END",
+            "DROP TABLE cairn_schema_migrations",
+            "DROP TRIGGER _cairn_journal_resolve",
+        ] {
+            let error = validate_write_statement(sql).unwrap_err();
+            assert!(error.contains("app-contract schema"), "{sql}: {error}");
+        }
+        // One statement each: a trigger body's `;` is the splitter's concern,
+        // not this policy's.
+        for sql in [
+            "INSERT INTO journal(kind, note) VALUES ('event', 'x')",
+            "UPDATE intent SET working = 'x' WHERE id = 1",
+            "CREATE TABLE tasks(id INTEGER PRIMARY KEY, intent TEXT, journal TEXT)",
+            "CREATE TABLE journal_notes(id INTEGER)",
+            "CREATE TABLE digest AS SELECT note FROM journal",
+            "CREATE TRIGGER mine AFTER INSERT ON notes BEGIN INSERT INTO journal(kind, note) VALUES ('event', NEW.body); END",
+            "ALTER TABLE notes RENAME COLUMN body TO note",
+        ] {
+            assert!(validate_write_statement(sql).is_ok(), "{sql}");
         }
     }
 
@@ -980,6 +1172,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_starter_record_holds_one_intent_row_and_a_kinded_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_path(dir.path().join("record.db")).await.unwrap();
+        let stamp = || async {
+            db.query_opt_text("SELECT updated_at FROM intent WHERE id = 1", ())
+                .await
+                .unwrap()
+        };
+        assert_eq!(stamp().await, None, "an unwritten intent row is unstamped");
+        db.execute(
+            "UPDATE intent SET current_intent = 'Ship it' WHERE id = 1",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(stamp().await.is_some_and(|at| at.ends_with('Z')));
+        assert!(db
+            .execute("DELETE FROM intent WHERE id = 1", ())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("intent is one row"));
+        assert!(db
+            .execute("INSERT INTO intent(id) VALUES (2)", ())
+            .await
+            .is_err());
+
+        assert!(db
+            .execute("INSERT INTO journal(kind, note) VALUES ('ruling', 'x')", ())
+            .await
+            .is_err());
+        assert!(db
+            .execute(
+                "INSERT INTO journal(kind, note, resolution) VALUES ('event', 'x', 'done')",
+                ()
+            )
+            .await
+            .is_err());
+        assert!(db
+            .execute(
+                "INSERT INTO journal(kind, note, refs) VALUES ('event', 'x', 'a b')",
+                ()
+            )
+            .await
+            .is_err());
+        db.execute(
+            "INSERT INTO journal(kind, note) VALUES ('watch', 'Lease renewal')",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE journal SET resolution = 'Renewed' WHERE kind = 'watch'",
+            (),
+        )
+        .await
+        .unwrap();
+        let (ts, refs, resolved_at) = db
+            .query_one(
+                "SELECT ts, refs, resolved_at FROM journal WHERE kind = 'watch'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.get::<Option<String>>(2)?)),
+            )
+            .await
+            .unwrap();
+        assert!(ts.ends_with('Z'));
+        assert_eq!(refs, "[]");
+        assert!(
+            resolved_at.is_some(),
+            "patching a resolution stamps its time"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_starter_record_folds_in_open_questions_and_moves_a_colliding_table_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collide.db");
+        let staged = stage_store_for_test(&path, "0004").await;
+        staged
+            .execute_script(
+                "INSERT INTO _cairn_open_questions(question, provenance, created_at)
+                 VALUES ('Who owns aliases?', '[\"cairn://p/cairn/1\"]', 1762387200);
+                 INSERT INTO _cairn_open_questions(question) VALUES ('Second?');",
+            )
+            .await
+            .unwrap();
+        staged
+            .execute_batch(
+                "CREATE TABLE journal(id INTEGER PRIMARY KEY, at TEXT NOT NULL, entry TEXT NOT NULL);
+                 CREATE INDEX journal_at ON journal(at);
+                 CREATE TABLE journal_own(id INTEGER);",
+            )
+            .await
+            .unwrap();
+        staged
+            .execute_script("INSERT INTO journal(at, entry) VALUES ('11-05', 'mine')")
+            .await
+            .unwrap();
+        drop(staged);
+
+        let db = open_path(path.clone()).await.unwrap();
+        let questions = db
+            .query_all(
+                "SELECT ts, note, refs FROM journal WHERE kind = 'question' ORDER BY id",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(questions.len(), 2);
+        assert_eq!(
+            questions[0],
+            (
+                "2025-11-06T00:00:00Z".to_string(),
+                "Who owns aliases?".to_string(),
+                "[\"cairn://p/cairn/1\"]".to_string()
+            )
+        );
+        assert_eq!(questions[1].2, "[]");
+        assert_eq!(
+            db.query_opt_text("SELECT entry FROM journal_own_2", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("mine"),
+            "`journal_own` was taken, so the thread's table moved to `journal_own_2`"
+        );
+        let notices = db
+            .query_all("SELECT note FROM journal WHERE kind = 'event'", (), |row| {
+                row.text(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("now `journal_own_2`"), "{}", notices[0]);
+        assert!(notices[0].contains("index `journal_at`"), "{}", notices[0]);
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = '_cairn_open_questions'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(0)
+        );
+
+        // A second open, as the next process makes it, changes nothing.
+        drop(db);
+        cache().write().await.remove(&path);
+        let again = open_path(path).await.unwrap();
+        assert_eq!(
+            again
+                .query_opt_i64("SELECT COUNT(*) FROM journal", ())
+                .await
+                .unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn the_census_predicate_names_every_app_table() {
+        for table in crate::threads::db_schema::APP_TABLES {
+            assert!(
+                USER_TABLE_PREDICATE.contains(&format!("'{table}'")),
+                "the census predicate must leave out `{table}`"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn inspecting_a_missing_store_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent.db");
@@ -1022,7 +1384,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!names.iter().any(|name| name == "_cairn_rulings"));
-        assert!(names.iter().any(|name| name == "_cairn_open_questions"));
+        assert!(!names.iter().any(|name| name == "_cairn_open_questions"));
+        assert!(names.iter().any(|name| name == "intent"));
+        assert!(names.iter().any(|name| name == "journal"));
         assert!(names.iter().any(|name| name == "cairn_schema_migrations"));
         assert!(names
             .iter()

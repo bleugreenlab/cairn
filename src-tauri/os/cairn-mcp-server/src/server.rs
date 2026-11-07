@@ -912,7 +912,7 @@ mod tests {
         let result = mcp
             .read(
                 Parameters(ReadFileInput {
-                    paths: vec!["cairn:~/arc?format=json".to_string()],
+                    paths: vec!["cairn:~/db/intent/1?format=json".to_string()],
                 }),
                 rmcp::model::RequestMetaObject::default(),
             )
@@ -923,7 +923,7 @@ mod tests {
         // The home shorthand is forwarded raw; the host resolves it from the run.
         assert_eq!(
             sink.requests()[0].payload["paths"][0],
-            "cairn:~/arc?format=json"
+            "cairn:~/db/intent/1?format=json"
         );
     }
 

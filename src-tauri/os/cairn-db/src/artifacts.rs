@@ -157,8 +157,9 @@ pub async fn list_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<Artifact
     .map_err(|e| db_error("Failed to list artifacts for issue", e))
 }
 
-/// The latest artifact per (job, output name) for every job a thread owns — its
-/// session's `arc` and whatever its tasks returned.
+/// The latest artifact per (job, output name) for every job a thread owns:
+/// whatever its tasks returned, and its session's history from before a thread
+/// kept no artifacts.
 ///
 /// The issue-scoped sibling above is the same query under the other owner
 /// column; a thread's jobs carry no `issue_id`, so it could never see them.
@@ -407,7 +408,7 @@ mod latest_recency_tests {
 
     /// A thread's artifacts are reachable by the thread, not by an issue: its
     /// jobs carry no `issue_id`, so the issue-scoped listing could never see the
-    /// session's `arc` or what its tasks returned.
+    /// session's history or what its tasks returned.
     #[tokio::test]
     async fn thread_listing_returns_the_latest_per_name_for_every_job_the_thread_owns() {
         let db = crate::storage::migrated_test_db("artifacts-for-thread.db").await;
@@ -427,17 +428,17 @@ mod latest_recency_tests {
             async move {
                 db.execute(
                     "INSERT INTO artifacts (id,job_id,artifact_type,schema_version,data,version,output_name,created_at,updated_at,confirmed)
-                     VALUES (?1,?2,'arc',1,'{}',?3,?4,1,1,1)",
+                     VALUES (?1,?2,'document',1,'{}',?3,?4,1,1,1)",
                     params![id, job, version, name],
                 )
                 .await
                 .unwrap();
             }
         };
-        insert("arc-v1", "session", "arc", 1).await;
-        insert("arc-v2", "session", "arc", 2).await;
+        insert("notes-v1", "session", "notes", 1).await;
+        insert("notes-v2", "session", "notes", 2).await;
         insert("task-return", "task", "return", 1).await;
-        insert("elsewhere-arc", "elsewhere", "arc", 1).await;
+        insert("elsewhere-notes", "elsewhere", "notes", 1).await;
 
         let mut listed: Vec<(String, String)> = list_for_thread(&db, "th")
             .await
@@ -450,10 +451,10 @@ mod latest_recency_tests {
         assert_eq!(
             listed,
             vec![
-                ("arc-v2".to_string(), "session".to_string()),
+                ("notes-v2".to_string(), "session".to_string()),
                 ("task-return".to_string(), "task".to_string()),
             ],
-            "the latest arc plus the task's return, and nothing from another thread"
+            "the session's latest version plus the task's return, and nothing from another thread"
         );
     }
 }

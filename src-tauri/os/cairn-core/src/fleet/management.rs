@@ -2000,10 +2000,10 @@ mod tests {
         let (first_sender, _first_executor) = tokio::sync::mpsc::unbounded_channel();
         let snapshotted_generation = orch.fleet.attach_executor(first_sender);
         let expected_policy = ExecutorRuntimePolicy {
-            cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy {
-                entry_utilization: 0.75,
-                clear_utilization: 0.60,
-                ..Default::default()
+            cpu_admission: cairn_common::executor_protocol::StallInstrumentPolicy {
+                entry: 0.75,
+                clear: 0.60,
+                ..cairn_common::executor_protocol::StallInstrumentPolicy::CPU_DEFAULT
             },
             ..Default::default()
         };

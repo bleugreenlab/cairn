@@ -19383,7 +19383,8 @@ cairn-common = { path = "../cairn-common" }
                     Some(vec![HostPressureCondition::MemoryAvailable {
                         available_bytes: 1,
                         floor_bytes: 2,
-                        unmeasured_hold_bytes: 0,
+                        owed_bytes: 0,
+                        owing: Vec::new(),
                     }]),
                 ),
                 SubstrateFailureShape::Capacity,
@@ -19541,7 +19542,8 @@ cairn-common = { path = "../cairn-common" }
                 Some(vec![HostPressureCondition::MemoryAvailable {
                     available_bytes: 1,
                     floor_bytes: 2,
-                    unmeasured_hold_bytes: 0,
+                    owed_bytes: 0,
+                    owing: Vec::new(),
                 }]),
             ),
             deadline(

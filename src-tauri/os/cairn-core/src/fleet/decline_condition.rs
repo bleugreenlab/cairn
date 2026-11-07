@@ -27,10 +27,10 @@
 use std::borrow::Cow;
 
 use cairn_common::executor_protocol::{
-    admission_provisions, AdmissionHoldEvidence, CellPriority, CellRequest, CpuAdmissionState,
-    DeclineReason, DiskHealthStatus, ExecutorSubstrateReport, FleetSnapshot, ProvisioningHold,
-    RepositoryLocator, ResidencyFence, StoragePressureOutcome, StorageSweepStatus,
-    ADMISSION_MEMORY_FLOOR_BYTES, CPU_ADMISSION_BLIND_AFTER_MS,
+    admission_memory_floor, admission_provisions, memory_short, AdmissionHoldEvidence,
+    CellPriority, CellRequest, DeclineReason, DiskHealthStatus, ExecutorSubstrateReport,
+    FleetSnapshot, ProvisioningHold, RepositoryLocator, ResidencyFence, StallInstrumentState,
+    StoragePressureOutcome, StorageSweepStatus,
 };
 
 /// How the executor will judge one piece of work: the facts the offer carries
@@ -124,9 +124,9 @@ pub(crate) struct PostedHold {
 /// work, as the executor skips it). Capacity is not a hold: units that do not
 /// fit are priced by the queue forecast.
 ///
-/// The CPU verdict counts only while it is fresh, the same bound ranking uses
-/// to call a machine blind; a stale verdict is blindness, which ranking
-/// handles on its own.
+/// Each host-stall instrument's verdict counts only while it is fresh, the
+/// same bound ranking uses to call a machine blind; a stale verdict is
+/// blindness, which ranking handles on its own.
 pub(crate) fn posted_hold(
     view: &AdmissionView,
     request: &CellRequest,
@@ -149,31 +149,59 @@ pub(crate) fn posted_hold(
         return Some(reading.into_hold(DeclineReason::Disk, sweeping));
     }
     if !view.interactive {
-        let cpu_fresh = health
-            .host
-            .cpu_admission
-            .measured_at_unix_ms
-            .is_some_and(|measured_at| {
-                now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_BLIND_AFTER_MS
-            });
-        if let Some(mut reading) = read_pressure(request, health) {
+        if let Some(mut reading) = read_pressure(request, machine) {
             let AdmissionHoldEvidence::Pressure {
                 cpu_pressured,
+                memory_stalled,
                 available_memory_bytes,
+                owed_memory_bytes,
                 memory_floor_bytes,
             } = &mut reading.evidence
             else {
                 unreachable!("the pressure reader reads pressure");
             };
-            *cpu_pressured &= cpu_fresh;
-            let memory_short =
-                available_memory_bytes.is_some_and(|available| available < *memory_floor_bytes);
-            if *cpu_pressured || memory_short {
+            *cpu_pressured &= health.host.cpu_admission.fresh(now_unix_ms);
+            *memory_stalled &= health.host.memory_admission.fresh(now_unix_ms);
+            let short = available_memory_bytes.is_some_and(|available| {
+                memory_short(available, *owed_memory_bytes, *memory_floor_bytes)
+            });
+            if *cpu_pressured || *memory_stalled || short {
                 return Some(reading.into_hold(DeclineReason::Pressure, true));
             }
         }
     }
     None
+}
+
+/// What admitted work still owes this machine's memory, as placement charges
+/// it: the executor's own posted sum, or, from an executor too old to post
+/// one, the runner's own account of the commands it placed there that are
+/// still executing, each at its charge less what its tree holds now. The
+/// fallback cannot see residents or a measured peak an older executor dropped,
+/// but it is never looser than that executor's own admission, which charges
+/// nothing at all, so a mixed fleet resolves on the stricter side.
+pub(crate) fn owed_memory_bytes(machine: PostedState<'_>) -> u64 {
+    machine
+        .health
+        .admission
+        .owed_memory_bytes
+        .unwrap_or_else(|| {
+            machine
+                .snapshot
+                .executing_requests
+                .iter()
+                .map(|executing| {
+                    let resident = executing
+                        .live_usage
+                        .and_then(|usage| usage.resident_bytes)
+                        .unwrap_or(0);
+                    executing
+                        .resource_reservation
+                        .memory_charge_bytes()
+                        .saturating_sub(resident)
+                })
+                .fold(0, u64::saturating_add)
+        })
 }
 
 /// A reason's posted condition with the figures a person reads it by.
@@ -299,23 +327,29 @@ fn read_provisioning(
     })
 }
 
-fn read_pressure(request: &CellRequest, health: &ExecutorSubstrateReport) -> Option<Reading> {
-    let cpu_pressured = health.host.cpu_admission.state == CpuAdmissionState::Pressured;
-    let floor = ADMISSION_MEMORY_FLOOR_BYTES.max(request.resource_reservation.memory_bytes);
+fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Reading> {
+    let health = machine.health;
+    let cpu_pressured = health.host.cpu_admission.state == StallInstrumentState::Pressured;
+    let memory_stalled = health.host.memory_admission.state == StallInstrumentState::Pressured;
+    let floor = admission_memory_floor(request.resource_reservation.memory_bytes);
+    let owed = owed_memory_bytes(machine);
     let available = health
         .machine
         .memory
         .value()
         .map(|memory| memory.available_bytes);
-    let memory_short = available.is_some_and(|available| available < floor);
-    (cpu_pressured || memory_short).then_some(Reading {
+    let memory_short = available.is_some_and(|available| memory_short(available, owed, floor));
+    (cpu_pressured || memory_stalled || memory_short).then_some(Reading {
         condition: PostedCondition::Pressure {
             cpu_pressured,
+            memory_stalled,
             memory_short,
         },
         evidence: AdmissionHoldEvidence::Pressure {
             cpu_pressured,
+            memory_stalled,
             available_memory_bytes: available,
+            owed_memory_bytes: owed,
             memory_floor_bytes: floor,
         },
     })
@@ -324,10 +358,12 @@ fn read_pressure(request: &CellRequest, health: &ExecutorSubstrateReport) -> Opt
 /// The part of a machine's posted state that a decline reason depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PostedCondition {
-    /// The machine's sustained CPU verdict, and whether its posted free memory
-    /// is below the floor this request would have to leave.
+    /// The machine's sustained CPU and memory-stall verdicts, and whether its
+    /// posted free memory, less what admitted work still owes, is below the
+    /// floor this request would have to leave.
     Pressure {
         cpu_pressured: bool,
+        memory_stalled: bool,
         memory_short: bool,
     },
     /// The machine's disk verdict, the state of the work that could relieve
@@ -419,7 +455,7 @@ pub(crate) fn posted_condition(
     machine: PostedState<'_>,
 ) -> Option<PostedCondition> {
     let reading = match reason {
-        DeclineReason::Pressure => read_pressure(request, machine.health),
+        DeclineReason::Pressure => read_pressure(request, machine),
         DeclineReason::Disk => read_disk(view, request, machine),
         DeclineReason::Capacity => {
             let health = machine.health;
@@ -455,7 +491,9 @@ pub(crate) fn posted_condition(
 mod tests {
     use super::*;
     use cairn_common::executor_protocol::{
-        CpuAdmissionHealth, MachineMemory, MachineVolume, Measurement, ProvisioningHold,
+        ExecutingCellRequest, LiveUsageSample, MachineMemory, MachineVolume, Measurement,
+        MeasurementQuality, ProvisioningHold, ResourceReservation, StallInstrumentHealth,
+        CPU_ADMISSION_BLIND_AFTER_MS,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -510,12 +548,38 @@ mod tests {
 
     fn with_cpu(
         mut health: ExecutorSubstrateReport,
-        state: CpuAdmissionState,
+        state: StallInstrumentState,
     ) -> ExecutorSubstrateReport {
-        health.host.cpu_admission = CpuAdmissionHealth {
+        health.host.cpu_admission = StallInstrumentHealth {
             state,
-            ..CpuAdmissionHealth::default()
+            ..StallInstrumentHealth::default()
         };
+        health
+    }
+
+    fn with_memory_stall(
+        mut health: ExecutorSubstrateReport,
+        state: StallInstrumentState,
+    ) -> ExecutorSubstrateReport {
+        health.host.memory_admission = StallInstrumentHealth {
+            state,
+            measured_at_unix_ms: Some(NOW),
+            ..StallInstrumentHealth::default()
+        };
+        health
+    }
+
+    fn with_available(
+        mut health: ExecutorSubstrateReport,
+        available: u64,
+    ) -> ExecutorSubstrateReport {
+        health.machine.memory = Measurement::measured(
+            1,
+            MachineMemory {
+                total_bytes: 12 * GIB + GIB / 10,
+                available_bytes: available,
+            },
+        );
         health
     }
 
@@ -616,16 +680,16 @@ mod tests {
     #[test]
     fn a_cpu_pressure_decline_reads_the_verdict_not_the_utilization() {
         let snapshot = FleetSnapshot::default();
-        let mut pressured = with_cpu(health(), CpuAdmissionState::Pressured);
+        let mut pressured = with_cpu(health(), StallInstrumentState::Pressured);
         let recorded =
             condition(DeclineReason::Pressure, &request(), &snapshot, &pressured).unwrap();
-        pressured.host.cpu_admission.utilization = Some(0.97);
+        pressured.host.cpu_admission.reading = Some(0.97);
         pressured.host.cpu_admission.measured_at_unix_ms = Some(123);
         assert_eq!(
             condition(DeclineReason::Pressure, &request(), &snapshot, &pressured),
             Some(recorded.clone())
         );
-        let cleared = with_cpu(health(), CpuAdmissionState::Accepting);
+        let cleared = with_cpu(health(), StallInstrumentState::Accepting);
         assert_ne!(
             condition(DeclineReason::Pressure, &request(), &snapshot, &cleared),
             Some(recorded)
@@ -638,7 +702,7 @@ mod tests {
     #[test]
     fn an_unexplained_pressure_decline_has_no_condition() {
         let snapshot = FleetSnapshot::default();
-        let mut fine = with_cpu(health(), CpuAdmissionState::Accepting);
+        let mut fine = with_cpu(health(), StallInstrumentState::Accepting);
         fine.machine.memory = Measurement::measured(
             1,
             MachineMemory {
@@ -661,6 +725,7 @@ mod tests {
             condition(DeclineReason::Pressure, &request(), &snapshot, &fine),
             Some(PostedCondition::Pressure {
                 cpu_pressured: false,
+                memory_stalled: false,
                 memory_short: true
             })
         );
@@ -802,10 +867,10 @@ mod tests {
         let view = AdmissionView::of_request(&request);
         let snapshot = provisioning("holder", Some("holder-entry"));
         let mut machine = disk_at(10 * GIB + GIB / 2, 0);
-        machine.host.cpu_admission = CpuAdmissionHealth {
-            state: CpuAdmissionState::Pressured,
+        machine.host.cpu_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
             measured_at_unix_ms: Some(NOW),
-            ..CpuAdmissionHealth::default()
+            ..StallInstrumentHealth::default()
         };
         machine.disk.cleanup_blocked = true;
         machine.disk.cleanup_last_error = Some("permission denied".into());
@@ -869,7 +934,7 @@ mod tests {
     fn interactive_work_and_a_stale_verdict_are_not_held_on_cpu() {
         let request = request();
         let snapshot = FleetSnapshot::default();
-        let mut machine = with_cpu(health(), CpuAdmissionState::Pressured);
+        let mut machine = with_cpu(health(), StallInstrumentState::Pressured);
         machine.host.cpu_admission.measured_at_unix_ms = Some(NOW);
         let batch = AdmissionView::of_request(&request);
         assert_eq!(
@@ -971,13 +1036,200 @@ mod tests {
         );
     }
 
+    /// The memory instrument's decline reads its verdict, not its reading,
+    /// exactly as the CPU one does: a new stall share every sample is the same
+    /// condition, and the verdict clearing reads differently.
+    #[test]
+    fn a_memory_stall_decline_reads_the_verdict_not_the_stall_share() {
+        let snapshot = FleetSnapshot::default();
+        let mut stalled = with_memory_stall(health(), StallInstrumentState::Pressured);
+        let recorded = condition(DeclineReason::Pressure, &request(), &snapshot, &stalled).unwrap();
+        assert_eq!(
+            recorded,
+            PostedCondition::Pressure {
+                cpu_pressured: false,
+                memory_stalled: true,
+                memory_short: false,
+            }
+        );
+        stalled.host.memory_admission.reading = Some(0.31);
+        assert_eq!(
+            condition(DeclineReason::Pressure, &request(), &snapshot, &stalled),
+            Some(recorded.clone())
+        );
+        let cleared = with_memory_stall(health(), StallInstrumentState::Accepting);
+        assert_ne!(
+            condition(DeclineReason::Pressure, &request(), &snapshot, &cleared),
+            Some(recorded)
+        );
+    }
+
+    /// A machine posting a memory-stall verdict at 0% CPU is held for batch
+    /// work and not for interactive work, and a stale verdict is blindness
+    /// rather than pressure.
+    #[test]
+    fn interactive_work_and_a_stale_verdict_are_not_held_on_memory_stall() {
+        let request = request();
+        let snapshot = FleetSnapshot::default();
+        let mut machine = with_cpu(
+            with_memory_stall(health(), StallInstrumentState::Pressured),
+            StallInstrumentState::Accepting,
+        );
+        machine.host.cpu_admission.reading = Some(0.0);
+        machine.host.cpu_admission.measured_at_unix_ms = Some(NOW);
+        let batch = AdmissionView::of_request(&request);
+        let held = hold(&batch, &request, &snapshot, &machine).expect("memory stall holds");
+        assert_eq!(held.reason, DeclineReason::Pressure);
+        assert!(held.relieves_itself, "held and ranked, never hard-rejected");
+        assert!(matches!(
+            held.evidence,
+            AdmissionHoldEvidence::Pressure {
+                cpu_pressured: false,
+                memory_stalled: true,
+                ..
+            }
+        ));
+        assert_eq!(held.evidence.describe_at(NOW), "held: memory stall");
+        let interactive = AdmissionView {
+            interactive: true,
+            ..batch.clone()
+        };
+        assert_eq!(hold(&interactive, &request, &snapshot, &machine), None);
+        machine.host.memory_admission.measured_at_unix_ms =
+            Some(NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1);
+        assert_eq!(hold(&batch, &request, &snapshot, &machine), None);
+    }
+
+    /// An executor that predates the memory instrument posts none. Its health
+    /// decodes as never measured, and it is not held on memory stall.
+    #[test]
+    fn an_older_executor_without_a_memory_instrument_is_not_held() {
+        let mut value = serde_json::to_value(health()).unwrap();
+        value["host"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memoryAdmission");
+        let older: ExecutorSubstrateReport = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            older.host.memory_admission,
+            StallInstrumentHealth::default()
+        );
+        let request = request();
+        assert_eq!(
+            hold(
+                &AdmissionView::of_request(&request),
+                &request,
+                &FleetSnapshot::default(),
+                &older
+            ),
+            None
+        );
+    }
+
+    /// A running command, as the snapshot names it.
+    fn executing(
+        request_id: &str,
+        reservation: ResourceReservation,
+        resident: u64,
+    ) -> ExecutingCellRequest {
+        let mut executing: ExecutingCellRequest = serde_json::from_value(serde_json::json!({
+            "requestId": request_id,
+            "attemptId": "a",
+            "startedAtUnixMs": 0,
+            "processIds": [],
+        }))
+        .unwrap();
+        executing.resource_reservation = reservation;
+        executing.live_usage = Some(LiveUsageSample {
+            window_cpu_ms: 0,
+            window_ms: 5_000,
+            resident_bytes: Some(resident),
+            measured_at_unix_ms: NOW,
+            quality: MeasurementQuality::Sampled,
+            quiet_window: None,
+        });
+        executing
+    }
+
+    fn cargo_check() -> ResourceReservation {
+        ResourceReservation {
+            memory_bytes: 2 * GIB,
+            measured_peak_bytes: Some(9 * GIB),
+            ..ResourceReservation::default()
+        }
+    }
+
+    /// The bgsrv-ub lead-up seen from placement: 10 GiB available, two
+    /// `cargo check` cells running at 1 GiB each that will each reach 9 GiB.
+    /// The third is held on the executor's posted owed sum, and with no sum
+    /// posted (an older executor) the runner's own account of the commands it
+    /// placed there holds it just the same.
+    #[test]
+    fn the_third_cargo_check_is_held_on_what_the_first_two_still_owe() {
+        let mut third = request();
+        third.resource_reservation = cargo_check();
+        let view = AdmissionView::of_request(&third);
+        let snapshot = FleetSnapshot {
+            executing_requests: vec![
+                executing("first", cargo_check(), GIB),
+                executing("second", cargo_check(), GIB),
+            ],
+            ..FleetSnapshot::default()
+        };
+        let roomy = with_available(health(), 10 * GIB);
+        assert_eq!(
+            hold(&view, &third, &FleetSnapshot::default(), &roomy),
+            None,
+            "available memory alone reads as room"
+        );
+
+        let mut posted = roomy.clone();
+        posted.admission.owed_memory_bytes = Some(16 * GIB);
+        let held = hold(&view, &third, &FleetSnapshot::default(), &posted)
+            .expect("the executor's owed sum holds it");
+        assert_eq!(
+            held.evidence,
+            AdmissionHoldEvidence::Pressure {
+                cpu_pressured: false,
+                memory_stalled: false,
+                available_memory_bytes: Some(10 * GIB),
+                owed_memory_bytes: 16 * GIB,
+                memory_floor_bytes: 2 * GIB,
+            }
+        );
+        assert_eq!(
+            held.evidence.describe_at(NOW),
+            "held: memory 10.0 GiB available less 16.0 GiB owed (floor 2.0 GiB)"
+        );
+
+        let older = held_by_runner_account(&view, &third, &snapshot, &roomy);
+        assert!(matches!(
+            older.evidence,
+            AdmissionHoldEvidence::Pressure {
+                owed_memory_bytes,
+                ..
+            } if owed_memory_bytes == 16 * GIB
+        ));
+    }
+
+    fn held_by_runner_account(
+        view: &AdmissionView,
+        request: &CellRequest,
+        snapshot: &FleetSnapshot,
+        machine: &ExecutorSubstrateReport,
+    ) -> PostedHold {
+        assert_eq!(machine.admission.owed_memory_bytes, None);
+        hold(view, request, snapshot, machine)
+            .expect("with no posted sum, the runner charges what it placed there")
+    }
+
     /// The two consumers cannot drift: whatever a hold reports is what a
     /// decline for its reason would record.
     #[test]
     fn a_hold_reports_the_condition_a_decline_would_record() {
         let request = growing(GIB);
         let view = AdmissionView::of_request(&request);
-        let mut cpu = with_cpu(health(), CpuAdmissionState::Pressured);
+        let mut cpu = with_cpu(health(), StallInstrumentState::Pressured);
         cpu.host.cpu_admission.measured_at_unix_ms = Some(NOW);
         let mut latched = disk_at(30 * GIB, 0);
         latched.disk.cleanup_blocked = true;
@@ -986,6 +1238,10 @@ mod tests {
             (provisioning("holder", Some("e")), health()),
             (FleetSnapshot::default(), disk_at(10 * GIB, 4 * GIB)),
             (FleetSnapshot::default(), cpu),
+            (
+                FleetSnapshot::default(),
+                with_memory_stall(health(), StallInstrumentState::Pressured),
+            ),
         ];
         for (snapshot, machine) in &cases {
             let hold = hold(&view, &request, snapshot, machine).expect("each case holds");

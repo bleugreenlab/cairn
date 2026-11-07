@@ -33,33 +33,6 @@ pub async fn append_issue_comment(
     .await
 }
 
-fn reject_retired_arc_collection_keys(payload: &serde_json::Value) -> Result<(), String> {
-    let Some(keys) = payload.as_object() else {
-        return Ok(());
-    };
-    if ["ruling", "ruling_slug", "rulings"]
-        .iter()
-        .any(|key| keys.contains_key(*key))
-    {
-        return Err(format!(
-            "Arc ruling artifact operations have retired: {}, for example `{}`",
-            crate::resources::sql_policy::RULINGS_ARE_TENETS,
-            crate::resources::sql_policy::TENET_APPEND_EXAMPLE
-        ));
-    }
-    // Open questions left the artifact in the same move as rulings. The schema
-    // refuses them either way as an undeclared field, which reports that the arc
-    // has no such field but not where the field went — the asymmetry that leaves
-    // a caller knowing only that its write bounced.
-    if ["open_question", "open_questions"]
-        .iter()
-        .any(|key| keys.contains_key(*key))
-    {
-        return Err("Arc open-question artifact operations have retired. Write open questions through `cairn:~/db`, for example: `write({changes:[{target:\"cairn:~/db\",mode:\"patch\",payload:{sql:\"INSERT INTO _cairn_open_questions(question,provenance) VALUES(?,?)\",params:[\"...\",\"[\\\"cairn://p/PROJECT/NUMBER\\\"]\"]}}]})`".to_string());
-    }
-    Ok(())
-}
-
 pub(crate) async fn append_issue_comment_for_remote_intent(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -239,6 +212,27 @@ pub(crate) struct ResolvedArtifactContract {
     pub terminal_has_schema: bool,
 }
 
+/// A thread session's own artifact is refused before anything resolves or
+/// mints its job: a thread keeps no artifacts. Its sub-agent tasks keep their
+/// ordinary return artifacts.
+fn refuse_thread_session_artifact(
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: Option<&str>,
+    artifact_name: Option<&str>,
+) -> Result<(), String> {
+    match (
+        cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
+        task_name,
+    ) {
+        (cairn_common::uri::NodeAddress::Thread { .. }, None) => {
+            Err(crate::threads::thread_artifact_refusal(artifact_name))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Load and parse a job's persisted `DelegatedOutputContract` (CAIRN-2481).
 /// `None` when the column is NULL (a child task) or the job is absent, so the
 /// caller falls through to the fixed `return` contract.
@@ -260,15 +254,6 @@ async fn load_job_output_contract(
     serde_json::from_str(&json).ok()
 }
 
-/// Whether `job_id` is thread-owned, read from the one canonical ownership
-/// answer (`jobs.thread_id`) rather than from a second signal that could drift.
-async fn job_is_thread_owned(orch: &Orchestrator, job_id: &str) -> bool {
-    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
-        return false;
-    };
-    crate::threads::job_owner(&db, job_id).await == crate::threads::JobOwner::Thread
-}
-
 /// Resolve the terminal (context-out) contract and the ctx-self living-doc
 /// targets for a job, then route by the addressed artifact name.
 ///
@@ -278,9 +263,6 @@ async fn job_is_thread_owned(orch: &Orchestrator, job_id: &str) -> bool {
 /// auto-confirms — the PR lifecycle is the gate (CAIRN-1219). Task jobs have no
 /// recipe node: they validate against the `return` contract every child task is
 /// started with.
-///
-/// A thread-owned job answers to the contract on its own row, ahead of any
-/// recipe node it carries: see the comment at the ownership check below.
 ///
 /// A `context-self` living doc validates against its OWN schema, always
 /// auto-confirms, and NEVER arms the terminal interrupt or satisfies the output
@@ -297,21 +279,6 @@ pub(crate) async fn resolve_artifact_contract(
         .ok()
         .flatten()
         .unwrap_or_default();
-
-    // Ownership decides which contract a job answers to, not which columns its
-    // row happens to carry. A thread's session job acquires an execution — and
-    // through it a recipe node — the moment it takes a turn or delegates (see
-    // `threads::classify_owner`). That node is a passive host that declares no
-    // artifact, so consulting it first resolved NO contract: the arc's schema
-    // went unenforced, a stray key was merged into the thread's durable memory
-    // verbatim, and the read fell back to the generic artifact affordance. The
-    // arc preset on the job row is the thread's contract whatever machinery the
-    // row has since acquired.
-    if job_is_thread_owned(orch, job_id).await {
-        if let Some(contract) = load_job_output_contract(orch, job_id).await {
-            return thread_session_contract(contract, artifact_name);
-        }
-    }
 
     let mut terminal_policy = ConfirmPolicy::Auto;
     let mut terminal_schema: Option<crate::models::OutputSchema> = None;
@@ -380,50 +347,13 @@ fn addressed_confirm_policy(
     }
 }
 
-/// The contract a thread session job answers to, built from the output
-/// contract on its row (or, for a preview, the one a write would mint or
-/// backfill there).
-///
-/// A thread's arc is a living document, not a deliverable: the thread writes and
-/// rewrites it as decisions happen, and the role contract is that doing so never
-/// ends its turn. A thread session declares no `context-self` port, so its
-/// OWNERSHIP is what marks the arc as one. The arc still validates against its
-/// schema and still auto-confirms; what it must never do is arm the turn-ending
-/// handoff a terminal artifact arms.
-fn thread_session_contract(
-    contract: crate::models::DelegatedOutputContract,
-    artifact_name: Option<&str>,
-) -> ResolvedArtifactContract {
-    let terminal_name = contract.artifact_name();
-    let is_thread_arc = artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME)
-        && terminal_name == crate::threads::ARC_ARTIFACT_NAME;
-    ResolvedArtifactContract {
-        confirm_policy: ConfirmPolicy::Auto,
-        validation_schema: Some(contract.schema_type),
-        is_ctx_self: is_thread_arc,
-        terminal_name: Some(terminal_name),
-        terminal_has_schema: true,
-    }
-}
-
 /// The object a create or patch would store: the submitted payload merged over
 /// the latest version (`latest`), before durable-content normalization.
-///
-/// A `create` carrying the arc's retired collection keys is the wholesale-replace
-/// shape — the move an agent reaches for when one ruling needs amending, and the
-/// one most likely to drop an unrelated rejection on the way through. The schema
-/// refuses it either way; routing both modes through this guard, ahead of the
-/// schema, is what makes the refusal name the collections' new home instead of
-/// only reporting that the artifact has no such field.
 fn compose_artifact_payload(
-    artifact_name: Option<&str>,
     latest: Option<&serde_json::Value>,
     payload: &serde_json::Value,
     is_patch: bool,
 ) -> Result<serde_json::Value, String> {
-    if artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
-        reject_retired_arc_collection_keys(payload)?;
-    }
     match (is_patch, latest) {
         (true, Some(base)) => apply_artifact_patch(base.clone(), payload),
         (true, None) if is_text_replacement_patch(payload) => {
@@ -434,20 +364,16 @@ fn compose_artifact_payload(
     }
 }
 
-/// Hold a composed artifact write to its resolved contract: the arc keeps only
-/// its prose, and a schema (when the contract has one) refuses undeclared keys
-/// and validates the full resulting object.
+/// Hold a composed artifact write to its resolved contract: a schema (when the
+/// contract has one) refuses undeclared keys and validates the full resulting
+/// object.
 fn enforce_artifact_schema(
     orch: &Orchestrator,
     schema: Option<&crate::models::OutputSchema>,
-    artifact_name: Option<&str>,
     payload: &serde_json::Value,
     is_patch: bool,
     effective_payload: &mut serde_json::Value,
 ) -> Result<(), String> {
-    if artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
-        crate::threads::arc_store::retain_prose_only(effective_payload);
-    }
     let Some(schema) = schema else {
         return Ok(());
     };
@@ -529,69 +455,25 @@ pub(crate) async fn preview_artifact_change(
     is_patch: bool,
 ) -> Result<(), String> {
     refuse_generic_page(artifact_name)?;
+    refuse_thread_session_artifact(number, exec_seq, node_name, task_name, artifact_name)?;
     let db = orch.db.for_project(project_key).await;
-    let thread_session = match (
-        cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
+    let job_id = crate::resources::resolve_node_or_task_job_id_for_read(
+        &db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
         task_name,
-    ) {
-        (cairn_common::uri::NodeAddress::Thread { name }, None) => Some(name.to_string()),
-        _ => None,
-    };
-    let (job_id, contract) = if let Some(name) = thread_session {
-        // A write to a thread's own resource mints its session job when it has
-        // none and backfills the arc contract onto one that predates it. The
-        // preview resolves the same session read-only and answers to the
-        // contract that write would leave on the row, so a thread that has
-        // never run is previewed against its arc rather than waved through.
-        let project_key = project_key.to_string();
-        let job_id = db
-            .read(move |conn| {
-                let (project_key, name) = (project_key.clone(), name.clone());
-                Box::pin(async move {
-                    crate::threads::planned_thread_session_conn(conn, &project_key, &name).await
-                })
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        let row_contract = match job_id.as_deref() {
-            Some(job_id) => load_job_output_contract(orch, job_id).await,
-            None => None,
-        };
-        let contract = thread_session_contract(
-            row_contract.unwrap_or_else(crate::threads::session_output_contract),
-            artifact_name,
-        );
-        (job_id, contract)
-    } else {
-        let job_id = crate::resources::resolve_node_or_task_job_id_for_read(
-            &db,
-            project_key,
-            number,
-            exec_seq,
-            node_name,
-            task_name,
-        )
-        .await?;
-        let contract = resolve_artifact_contract(orch, &job_id, task_name, artifact_name).await;
-        (Some(job_id), contract)
-    };
-    let latest = match job_id.as_deref() {
-        Some(job_id) => {
-            let (_, output_name) = resolve_artifact_identity(orch, job_id, artifact_name).await;
-            load_latest_artifact(orch, job_id, &output_name).await
-        }
-        None => None,
-    };
-    let mut effective_payload = compose_artifact_payload(
-        artifact_name,
-        latest.as_ref().map(|(base, _)| base),
-        payload,
-        is_patch,
-    )?;
+    )
+    .await?;
+    let contract = resolve_artifact_contract(orch, &job_id, task_name, artifact_name).await;
+    let (_, output_name) = resolve_artifact_identity(orch, &job_id, artifact_name).await;
+    let latest = load_latest_artifact(orch, &job_id, &output_name).await;
+    let mut effective_payload =
+        compose_artifact_payload(latest.as_ref().map(|(base, _)| base), payload, is_patch)?;
     enforce_artifact_schema(
         orch,
         contract.validation_schema.as_ref(),
-        artifact_name,
         payload,
         is_patch,
         &mut effective_payload,
@@ -625,6 +507,7 @@ pub(crate) async fn write_artifact_change(
     is_patch: bool,
 ) -> Result<String, String> {
     let services = &orch.services;
+    refuse_thread_session_artifact(number, exec_seq, node_name, task_name, artifact_name)?;
     // Resolve the project's owning database (a team project's jobs/artifacts live
     // wholly in its synced replica). The agent writing the artifact runs on the
     // member's machine where that replica is open; if it is not, the job lookup
@@ -678,23 +561,13 @@ pub(crate) async fn write_artifact_change(
     let latest = load_latest_artifact(orch, &job_id, &output_name).await;
     let prior_confirmed = latest.as_ref().map(|(_, confirmed)| *confirmed);
 
-    if artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
-        if let Some((legacy_base, _)) = &latest {
-            crate::threads::arc_store::import_legacy_collections(&db, &job_id, legacy_base).await?;
-        }
-    }
-    let mut effective_payload = compose_artifact_payload(
-        artifact_name,
-        latest.as_ref().map(|(base, _)| base),
-        payload,
-        is_patch,
-    )?;
+    let mut effective_payload =
+        compose_artifact_payload(latest.as_ref().map(|(base, _)| base), payload, is_patch)?;
     crate::durable_content::normalize_json(orch, request, project_key, &mut effective_payload)
         .await?;
     enforce_artifact_schema(
         orch,
         validation_schema.as_ref(),
-        artifact_name,
         payload,
         is_patch,
         &mut effective_payload,
@@ -814,7 +687,7 @@ pub(crate) async fn write_artifact_change(
     // deriving it from the one canonical home resolution keeps every owner shape
     // right without a per-shape builder here. A thread reached this through the
     // internal `(0, 0, name)` node coordinate, which rebuilt as the unaddressable
-    // `cairn://p/KEY/0/0/{thread}/arc` and taught agents a URI that does not
+    // `cairn://p/KEY/0/0/{thread}/<name>` and taught agents a URI that does not
     // resolve.
     //
     // The name is the one the artifact is stored under, which is also what
@@ -1699,7 +1572,7 @@ async fn job_node_execution(
 mod tests {
     use super::{
         apply_artifact_patch, drop_inherited_undeclared_keys, merge_artifact_payload,
-        reject_retired_arc_collection_keys, reject_undeclared_artifact_keys, resolve_confirmed,
+        refuse_thread_session_artifact, reject_undeclared_artifact_keys, resolve_confirmed,
         should_arm_output_artifact_interrupt, terminal_handoff_suffix, validate_against_schema,
     };
     use crate::models::ConfirmPolicy;
@@ -1735,21 +1608,17 @@ mod tests {
     }
 
     #[test]
-    fn retired_arc_ruling_operations_point_at_tenets() {
-        for payload in [
-            json!({"ruling": {}}),
-            json!({"ruling_slug": "old"}),
-            json!({"rulings": []}),
-        ] {
-            let error = reject_retired_arc_collection_keys(&payload).unwrap_err();
-            assert!(
-                error.contains(crate::resources::sql_policy::RULINGS_ARE_TENETS),
-                "{error}"
-            );
-            assert!(error.contains("target:\"cairn:@/tenets\""), "{error}");
-            assert!(!error.contains("_cairn_rulings"), "{error}");
-        }
-        assert!(reject_retired_arc_collection_keys(&json!({"working": "now"})).is_ok());
+    fn a_thread_session_artifact_is_refused_with_where_its_record_lives() {
+        let arc = refuse_thread_session_artifact(0, 0, "library", None, Some("arc")).unwrap_err();
+        assert!(arc.starts_with("`cairn:~/arc` is retired."), "{arc}");
+        assert!(arc.contains("cairn:~/db/intent/1"), "{arc}");
+        let plan = refuse_thread_session_artifact(0, 0, "library", None, Some("plan")).unwrap_err();
+        assert_eq!(plan, crate::threads::THREAD_KEEPS_NO_ARTIFACTS);
+        assert!(
+            refuse_thread_session_artifact(0, 0, "library", Some("research"), Some("plan")).is_ok(),
+            "a thread's sub-agent task keeps its return artifact"
+        );
+        assert!(refuse_thread_session_artifact(12, 1, "builder", None, Some("plan")).is_ok());
     }
 
     #[test]

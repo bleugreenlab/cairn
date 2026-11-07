@@ -307,7 +307,6 @@ async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
 
     let definition = serde_json::json!({
         "agent": "thread",
-        "artifacts": ["arc"],
         "triggers": [{
             "fact": "attention",
             "detailUri": CHILD_URI,
@@ -381,7 +380,6 @@ async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
         .unwrap();
     let failing_definition = serde_json::json!({
         "agent": "thread",
-        "artifacts": ["arc"],
         "triggers": [{
             "fact": "attention",
             "detailUri": "cairn://p/p/3",
@@ -477,7 +475,6 @@ async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
 
     let rewritten = serde_json::json!({
         "agent": "thread",
-        "artifacts": ["arc"],
         "triggers": []
     })
     .to_string();

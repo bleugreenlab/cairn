@@ -161,10 +161,10 @@ pub fn built_in_placement_profiles() -> BTreeMap<String, PlacementProfile> {
             profile.executor_policy_overrides.insert(
                 LOCAL_EXECUTOR_NAME.to_string(),
                 cairn_common::executor_protocol::ExecutorRuntimePolicy {
-                    cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy {
-                        entry_utilization: 0.75,
-                        clear_utilization: 0.60,
-                        ..Default::default()
+                    cpu_admission: cairn_common::executor_protocol::StallInstrumentPolicy {
+                        entry: 0.75,
+                        clear: 0.60,
+                        ..cairn_common::executor_protocol::StallInstrumentPolicy::CPU_DEFAULT
                     },
                     ..Default::default()
                 },
@@ -223,8 +223,11 @@ pub struct FleetConfig {
     /// Workspace fallback used when a machine has no complete runtime-policy
     /// override. Profile and machine-specific resolution can layer above this
     /// single baseline without putting policy into executor inventory.
-    #[serde(default)]
-    pub cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy,
+    #[serde(default = "cairn_common::executor_protocol::default_cpu_admission")]
+    pub cpu_admission: cairn_common::executor_protocol::StallInstrumentPolicy,
+    /// The memory-stall instrument's workspace fallback, beside the CPU one.
+    #[serde(default = "cairn_common::executor_protocol::default_memory_admission")]
+    pub memory_admission: cairn_common::executor_protocol::StallInstrumentPolicy,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub executor_policies: HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>,
     /// Runner-owned SSH executor declarations, keyed by stable executor ID.
@@ -948,6 +951,7 @@ impl FleetConfig {
             .cloned()
             .unwrap_or_else(|| cairn_common::executor_protocol::ExecutorRuntimePolicy {
                 cpu_admission: self.cpu_admission,
+                memory_admission: self.memory_admission,
                 ..Default::default()
             })
     }
@@ -1061,7 +1065,10 @@ impl FleetConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        self.cpu_admission.validate()?;
+        self.cpu_admission
+            .validate(cairn_common::executor_protocol::StallInstrument::Cpu)?;
+        self.memory_admission
+            .validate(cairn_common::executor_protocol::StallInstrument::Memory)?;
         self.machine_services.validate()?;
         for (executor_id, policy) in &self.executor_policies {
             policy
@@ -1134,7 +1141,9 @@ impl Default for FleetConfig {
             placement_profiles: BTreeMap::new(),
             capacity_wait_horizon_seconds: default_capacity_wait_horizon_seconds(),
             default_timeout_seconds: default_timeout_seconds(),
-            cpu_admission: Default::default(),
+            cpu_admission: cairn_common::executor_protocol::StallInstrumentPolicy::CPU_DEFAULT,
+            memory_admission:
+                cairn_common::executor_protocol::StallInstrumentPolicy::MEMORY_DEFAULT,
             executor_policies: HashMap::new(),
             remote_executors: BTreeMap::new(),
             remote_host_identities: BTreeMap::new(),

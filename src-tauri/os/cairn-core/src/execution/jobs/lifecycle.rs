@@ -4388,9 +4388,9 @@ fn assemble_resume_prompt(
 
 /// Header that leads a compacted THREAD seed, framing the three sections that
 /// follow. A thread is never finished, so the framing points at what keeps it
-/// cheap rather than apologizing for a reconstruction: the arc is the only part
-/// of this context nothing can regenerate.
-const THREAD_SEED_HEADER: &str = "This thread's session was rebuilt so it stays cheap to run indefinitely. Below: the arc you authored, a table of contents for history that has been compacted away, and the most recent turns verbatim. Every compacted chapter names what it was and where to read it in full — read one only when it bears on what you are doing now, because re-reading costs more than it saves unless the range is genuinely load-bearing. Re-read any file whose content still matters, and keep `cairn:~/arc` current: decisions, the paths you rejected and why, and the open questions are the only things here that cannot be rebuilt from the transcript.";
+/// cheap rather than apologizing for a reconstruction: the intent and journal
+/// are the only part of this context nothing can regenerate.
+const THREAD_SEED_HEADER: &str = "This thread's session was rebuilt so it stays cheap to run indefinitely. Below: your intent and journal, the tenets you proposed, a table of contents for history that has been compacted away, and the most recent turns verbatim. Every compacted chapter names what it was and where to read it in full — read one only when it bears on what you are doing now, because re-reading costs more than it saves unless the range is genuinely load-bearing. Re-read any file whose content still matters. Keep `cairn:~/db/intent/1` current and journal what you decide, learn and watch in `cairn:~/db/journal`: they are the only things here that cannot be rebuilt from the transcript.";
 
 /// Header that leads a non-thread node's seed, framing the three sections that
 /// follow.
@@ -5472,7 +5472,7 @@ fn apply_thread_compaction(
         recency_start_block: seed.recency_start_block,
         consumed_child_issue_ids: seed.consumed_child_issue_ids,
         minted_eras: seed.minted_eras,
-        arc_bytes: seed.arc_bytes,
+        record_bytes: seed.record_bytes,
         eras_through_seq: seed.eras_through_seq,
     };
     let now = orch.services.clock.now();
@@ -9604,7 +9604,7 @@ mod tests {
         // The thread seed is framed for a session that never ends, but it is the
         // same header-then-body shape, so it remains an ordinary `user:seed`
         // everywhere downstream.
-        let content = super::build_thread_seed_content("## Arc\n\nCOMPOSED_BODY", None);
+        let content = super::build_thread_seed_content("## Intent\n\nCOMPOSED_BODY", None);
         assert!(content.starts_with(super::THREAD_SEED_HEADER));
         assert!(content.contains("COMPOSED_BODY"));
 

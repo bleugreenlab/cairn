@@ -7,7 +7,7 @@
 //!
 //! Resolving once, against the home the batch started with, is right for every
 //! batch but the one a new thread always sends first: rename this thread off its
-//! `thread-<n>` placeholder, then write its arc. The rename moves the home the
+//! `thread-<n>` placeholder, then patch its intent row. The rename moves the home the
 //! second item names, so a resolution taken before it lands addresses a thread
 //! that no longer exists — and the resulting rejection names only the old name,
 //! which the caller never typed.
@@ -132,7 +132,7 @@ pub(super) async fn resolve(
 /// belongs to.
 ///
 /// The item must address that thread ITSELF: a patch of something beneath it —
-/// the arc, a message — is not a rename however its payload reads. A run whose
+/// its intent row, a message — is not a rename however its payload reads. A run whose
 /// home is a task beneath the thread moves with it, because the thread name is a
 /// segment of the task's address too.
 fn renamed_home(home_uri: &str, item: &ChangeItem) -> Option<RenamedHome> {
@@ -183,7 +183,7 @@ mod tests {
             index: 0,
             new_name: "execution".to_string(),
         });
-        assert!(rename_dependency("cairn:~/arc", &rename).is_some());
+        assert!(rename_dependency("cairn:~/db/intent/1", &rename).is_some());
         assert!(rename_dependency("cairn:@/messages", &rename).is_none());
         assert!(rename_dependency("cairn:@messages", &rename).is_none());
     }
@@ -237,7 +237,10 @@ mod tests {
         // payload reads.
         assert!(renamed_home(
             "cairn://p/cairn/thread-7",
-            &patch("cairn://p/cairn/thread-7/arc", json!({"name": "execution"})),
+            &patch(
+                "cairn://p/cairn/thread-7/db/intent/1",
+                json!({"name": "execution"}),
+            ),
         )
         .is_none());
         // Another thread's rename is not this run's home moving.

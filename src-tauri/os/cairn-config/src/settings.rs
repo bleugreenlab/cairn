@@ -366,7 +366,8 @@ pub struct SettingsFile {
     /// Fraction of the model's context window at which a warm thread session rebuilds.
     #[serde(default)]
     thread_compact_threshold: Option<f64>,
-    /// Approximate token budget for non-arc thread seed context.
+    /// Approximate token budget for thread seed context below its intent and
+    /// journal.
     #[serde(default)]
     seed_budget_tokens: Option<i32>,
     /// Number of recent era summaries rendered into a thread seed.
@@ -3545,7 +3546,12 @@ buildSlots:
         let fleet = file.fleet.as_ref().unwrap();
         assert_eq!(fleet.capacity_wait_horizon_seconds, 900);
         assert_eq!(fleet.default_timeout_seconds, 1800);
-        assert_eq!(fleet.cpu_admission.entry_utilization, 0.8);
+        assert_eq!(fleet.cpu_admission.entry, 0.8);
+        assert_eq!(
+            fleet.memory_admission,
+            cairn_common::executor_protocol::StallInstrumentPolicy::MEMORY_DEFAULT,
+            "a settings file written before the memory instrument loads its defaults"
+        );
         assert_eq!(
             fleet
                 .resolve_executor_policy("executor-without-override")
@@ -3938,11 +3944,17 @@ extraSshArgs: []
             }),
             capacity_wait_horizon_seconds: 120,
             default_timeout_seconds: 900,
-            cpu_admission: cairn_common::executor_protocol::CpuAdmissionPolicy {
-                entry_utilization: 0.82,
-                clear_utilization: 0.68,
+            cpu_admission: cairn_common::executor_protocol::StallInstrumentPolicy {
+                entry: 0.82,
+                clear: 0.68,
                 entry_window_ms: 20_000,
                 clear_window_ms: 10_000,
+            },
+            memory_admission: cairn_common::executor_protocol::StallInstrumentPolicy {
+                entry: 0.15,
+                clear: 0.03,
+                entry_window_ms: 10_000,
+                clear_window_ms: 30_000,
             },
             ..FleetConfig::default()
         };
@@ -3953,6 +3965,7 @@ extraSshArgs: []
         let yaml = std::fs::read_to_string(super::get_settings_path(dir)).unwrap();
         assert!(yaml.contains("logLevel: standard"));
         assert!(yaml.contains("cpuAdmission:"));
+        assert!(yaml.contains("memoryAdmission:"));
         assert!(!yaml.contains("projects:"));
     }
 
@@ -4048,7 +4061,10 @@ extraSshArgs: []
     #[test]
     fn fleet_validation_rejects_an_invalid_workspace_cpu_fallback() {
         let mut fleet = crate::fleet::FleetConfig::default();
-        fleet.cpu_admission.clear_utilization = fleet.cpu_admission.entry_utilization;
+        fleet.cpu_admission.clear = fleet.cpu_admission.entry;
+        assert!(fleet.validate().is_err());
+        let mut fleet = crate::fleet::FleetConfig::default();
+        fleet.memory_admission.clear = fleet.memory_admission.entry;
         assert!(fleet.validate().is_err());
     }
 }

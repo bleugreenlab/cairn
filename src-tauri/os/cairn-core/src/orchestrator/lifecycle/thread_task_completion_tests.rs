@@ -397,7 +397,7 @@ async fn thread_session_never_derives_complete() {
     db.execute(
         "INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name,
                                 created_at, updated_at)
-         VALUES ('arc', ?1, 'arc', 1, '{}', 1, 'arc', 1, 1)",
+         VALUES ('notes', ?1, 'document', 1, '{}', 1, 'notes', 1, 1)",
         params![SESSION],
     )
     .await

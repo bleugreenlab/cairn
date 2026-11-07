@@ -41,10 +41,13 @@ use cairn_common::executor_protocol::needs_build_volume;
 use cairn_common::executor_protocol::DiskHealthStatus;
 use cairn_common::executor_protocol::MachineSample;
 use cairn_common::executor_protocol::SandboxCapabilityEvidence;
+use cairn_common::executor_protocol::StallInstrumentState;
+#[cfg(test)]
+use cairn_common::executor_protocol::CPU_ADMISSION_BLIND_AFTER_MS;
 use cairn_common::executor_protocol::{
     aged_priority, CacheWarmthEvidence, CellAdmissionKind, CellCheckoutKind, CellCommandClass,
-    CellResidency, ContentionEstimate, CpuAdmissionState, DeclineReason, DurationEstimate,
-    DurationFallback, EnrolledRemote, ExecutionLoadContext, ExecutionWarmth, ExecutorAdvertisement,
+    CellResidency, ContentionEstimate, DeclineReason, DurationEstimate, DurationFallback,
+    EnrolledRemote, ExecutionLoadContext, ExecutionWarmth, ExecutorAdvertisement,
     ExecutorCapabilities, ExecutorConfig, ExecutorHealthSnapshot, ExecutorHealthStatus,
     ExecutorIdentity, ExecutorInspection, ExecutorListenerAdvertisement, ExecutorMessage,
     ExecutorSelector, ExecutorSubstrateEvidence, ExecutorSubstrateReport, ExecutorSubstrateState,
@@ -61,10 +64,9 @@ use cairn_common::executor_protocol::{
     ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence,
     ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
     ResidentProcessEvent, ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult,
-    UpdateReport, WarmthUnknownReason, CPU_ADMISSION_BLIND_AFTER_MS,
-    EXECUTOR_HEARTBEAT_INTERVAL_MS, EXECUTOR_LINK_STALL_REMEDIATION_MS,
-    EXECUTOR_PROGRESS_FRESHNESS_MS, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS, LOCAL_EXECUTOR_NAME,
-    RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    UpdateReport, WarmthUnknownReason, EXECUTOR_HEARTBEAT_INTERVAL_MS,
+    EXECUTOR_LINK_STALL_REMEDIATION_MS, EXECUTOR_PROGRESS_FRESHNESS_MS,
+    EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS, LOCAL_EXECUTOR_NAME, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, AdmissionHoldEvidence, ClaimedAttemptAccount,
@@ -238,7 +240,7 @@ fn load_context(
         co_resident_light_jobs: light,
         cpu_utilization_millis: host
             .cpu_admission
-            .utilization
+            .reading
             .map(|value| (value.clamp(0.0, 1.0) * 1_000.0).round() as u32),
         io_pressure_full_millis: host
             .io_pressure
@@ -17587,29 +17589,26 @@ impl<'a> ScoredCandidate<'a> {
         // different bounds here — one interval to trust it, three to call it
         // blind — left a ten-second gap where a machine ranked as neither
         // pressured nor blind, which is to say as idle.
-        let cpu_admission_fresh = cpu_admission
-            .measured_at_unix_ms
-            .is_some_and(|measured_at| {
-                now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_BLIND_AFTER_MS
-            });
-        // A machine that measured its own cores and stopped is not a machine
-        // with headroom, and ranking it as one is how work keeps arriving at a
-        // host nobody can see into. Derived from the reading's age rather than
-        // from any state the executor sent, because the executor could only set
-        // such a state from the sampler whose silence is the condition itself.
-        let cpu_blind = cpu_admission
-            .measured_at_unix_ms
-            .is_some_and(|measured_at| {
-                now_unix_ms.saturating_sub(measured_at) > CPU_ADMISSION_BLIND_AFTER_MS
-            });
-        let cpu_headroom_risk = (cpu_admission_fresh
-            && cpu_admission.state == CpuAdmissionState::Accepting)
+        //
+        // A machine where any host-stall instrument measured and stopped is not
+        // a machine with headroom, and ranking it as one is how work keeps
+        // arriving at a host nobody can see into. Derived from each reading's
+        // age rather than from any state the executor sent, because the
+        // executor could only set such a state from the sampler whose silence
+        // is the condition itself. An instrument that never measured is not
+        // blind: that is a platform without the probe, and it fails open.
+        let stall_blind = entry
+            .health
+            .host
+            .blind_stall_instrument(now_unix_ms)
+            .is_some();
+        let cpu_headroom_risk = (cpu_admission.fresh(now_unix_ms)
+            && cpu_admission.state == StallInstrumentState::Accepting)
             .then(|| {
-                let utilization = cpu_admission.utilization?;
+                let utilization = cpu_admission.reading?;
                 let policy = entry.health.applied_policy.cpu_admission;
-                let span = policy.entry_utilization - policy.clear_utilization;
-                (span > 0.0)
-                    .then(|| ((utilization - policy.clear_utilization) / span).clamp(0.0, 1.0))
+                let span = policy.entry - policy.clear;
+                (span > 0.0).then(|| ((utilization - policy.clear) / span).clamp(0.0, 1.0))
             })
             .flatten();
         // A held machine's queue has no forecastable relief: nothing Cairn
@@ -17628,7 +17627,7 @@ impl<'a> ScoredCandidate<'a> {
                 .saturating_add(prediction.host_stall_penalty_ms());
         }
         prediction.declined_here = declined_here;
-        let admission_accepts = !cpu_blind
+        let admission_accepts = !stall_blind
             && queue_depth < entry.health.applied_policy.maximum_queue_depth
             && admission.memory_capacity_bytes.is_none_or(|capacity| {
                 active.memory_bytes.saturating_add(demand.memory_bytes) <= capacity
@@ -19276,6 +19275,7 @@ impl ReservationPlan {
             resolved.rationale.declared_concurrency_units = Some(clamped);
         }
         resolved.process_evidence = self.process_evidence(&context).await;
+        resolved.charge_measured_peak();
         resolved
     }
 
@@ -23939,6 +23939,7 @@ mod tests {
             disk_growth_bytes: 0,
             concurrency_units: 1,
             source: ResourceReservationSource::Declared,
+            measured_peak_bytes: None,
         };
         let resolved = ReservationPlan::new(db.clone(), &request, None)
             .resolve_for(
@@ -30387,16 +30388,16 @@ mod tests {
             900 * 1024 * 1024 * 1024,
         );
         Arc::make_mut(&mut local.health).host.cpu_admission =
-            cairn_common::executor_protocol::CpuAdmissionHealth {
-                state: CpuAdmissionState::Accepting,
-                utilization: Some(0.02),
+            cairn_common::executor_protocol::StallInstrumentHealth {
+                state: StallInstrumentState::Accepting,
+                reading: Some(0.02),
                 state_since_unix_ms: Some(NOW),
                 measured_at_unix_ms: Some(NOW),
             };
         Arc::make_mut(&mut remote.health).host.cpu_admission =
-            cairn_common::executor_protocol::CpuAdmissionHealth {
-                state: CpuAdmissionState::Accepting,
-                utilization: Some(0.89),
+            cairn_common::executor_protocol::StallInstrumentHealth {
+                state: StallInstrumentState::Accepting,
+                reading: Some(0.89),
                 state_since_unix_ms: Some(NOW),
                 measured_at_unix_ms: Some(NOW),
             };
@@ -30422,9 +30423,9 @@ mod tests {
             900 * 1024 * 1024 * 1024,
         );
         Arc::make_mut(&mut local.health).host.cpu_admission =
-            cairn_common::executor_protocol::CpuAdmissionHealth {
-                state: CpuAdmissionState::Pressured,
-                utilization: Some(0.95),
+            cairn_common::executor_protocol::StallInstrumentHealth {
+                state: StallInstrumentState::Pressured,
+                reading: Some(0.95),
                 state_since_unix_ms: Some(NOW - 20_000),
                 measured_at_unix_ms: Some(NOW),
             };
@@ -30877,6 +30878,7 @@ mod tests {
                 disk_growth_bytes: 4 * GIB,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
+                measured_peak_bytes: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -31138,9 +31140,9 @@ mod tests {
             500 * 1024 * 1024 * 1024,
         );
         Arc::make_mut(&mut local.health).host.cpu_admission =
-            cairn_common::executor_protocol::CpuAdmissionHealth {
-                state: CpuAdmissionState::Accepting,
-                utilization: Some(0.85),
+            cairn_common::executor_protocol::StallInstrumentHealth {
+                state: StallInstrumentState::Accepting,
+                reading: Some(0.85),
                 state_since_unix_ms: Some(NOW),
                 measured_at_unix_ms: Some(NOW),
             };
@@ -31157,9 +31159,9 @@ mod tests {
         );
         let went_quiet = NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1;
         Arc::make_mut(&mut remote.health).host.cpu_admission =
-            cairn_common::executor_protocol::CpuAdmissionHealth {
-                state: CpuAdmissionState::Accepting,
-                utilization: Some(0.01),
+            cairn_common::executor_protocol::StallInstrumentHealth {
+                state: StallInstrumentState::Accepting,
+                reading: Some(0.01),
                 state_since_unix_ms: Some(went_quiet),
                 measured_at_unix_ms: Some(went_quiet),
             };
@@ -31205,9 +31207,9 @@ mod tests {
     fn sampled_readings_keep_a_machine_placeable_while_its_refresh_pass_is_minutes_old() {
         let gib = 1024 * 1024 * 1024;
         let pass_measured_at = NOW - 4 * 60 * 1_000;
-        let brake = |measured_at_unix_ms| cairn_common::executor_protocol::CpuAdmissionHealth {
-            state: CpuAdmissionState::Accepting,
-            utilization: Some(0.2),
+        let brake = |measured_at_unix_ms| cairn_common::executor_protocol::StallInstrumentHealth {
+            state: StallInstrumentState::Accepting,
+            reading: Some(0.2),
             state_since_unix_ms: Some(pass_measured_at),
             measured_at_unix_ms: Some(measured_at_unix_ms),
         };
@@ -31714,6 +31716,7 @@ mod tests {
                 disk_growth_bytes: 1024 * 1024 * 1024,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
+                measured_peak_bytes: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -31770,6 +31773,7 @@ mod tests {
                 disk_growth_bytes: 1024 * 1024 * 1024,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
+                measured_peak_bytes: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -31902,6 +31906,7 @@ mod tests {
                 disk_growth_bytes: 2 * GIB,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
+                measured_peak_bytes: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -33643,6 +33648,7 @@ mod tests {
                 disk_growth_bytes: 2_000,
                 concurrency_units: 3,
                 source: ResourceReservationSource::Declared,
+                measured_peak_bytes: None,
             },
         });
         let mut second = fleet_entry("second", "linux", 0, &[]).1;
@@ -33653,6 +33659,7 @@ mod tests {
                 disk_growth_bytes: 8_000,
                 concurrency_units: 5,
                 source: ResourceReservationSource::Declared,
+                measured_peak_bytes: None,
             },
         });
         pool.lock_connections()

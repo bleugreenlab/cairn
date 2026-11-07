@@ -271,6 +271,73 @@ fn port_for(profile: &InferenceProfile) -> u16 {
     }
 }
 
+/// The running row a verification claims its pool with.
+#[derive(Clone)]
+struct Claim {
+    id: String,
+    profile: String,
+    digest: String,
+    pool: String,
+    deployment: String,
+    machines_json: String,
+    requested_by: String,
+    started_at: i64,
+}
+
+/// Insert `claim`'s running row unless a verification is already running on its
+/// pool, whose id is returned instead, and trim the profile's history on the
+/// pool to [`KEPT`] rows. Two claims of one idle pool each read it idle under
+/// their own snapshot, so the read alone admits both; the partial unique index
+/// over running rows per pool makes the later commit conflict and re-run this
+/// closure, which then finds the earlier claim.
+async fn claim_pool(db: &LocalDb, claim: Claim) -> Result<Option<String>, String> {
+    db.write(move |conn| {
+        let claim = claim.clone();
+        Box::pin(async move {
+            let mut running = conn
+                .query(
+                    "SELECT id FROM inference_verifications
+                      WHERE pool_id = ?1 AND outcome = 'running' LIMIT 1",
+                    params![claim.pool.clone()],
+                )
+                .await?;
+            if let Some(row) = running.next().await? {
+                return Ok(Some(row.text(0)?));
+            }
+            drop(running);
+            conn.execute(
+                "INSERT INTO inference_verifications
+                   (id, profile_id, profile_digest, pool_id, deployment_id, machines_json,
+                    requested_by, started_at, outcome, stage)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', 'render')",
+                params![
+                    claim.id,
+                    claim.profile.clone(),
+                    claim.digest,
+                    claim.pool.clone(),
+                    claim.deployment,
+                    claim.machines_json,
+                    claim.requested_by,
+                    claim.started_at
+                ],
+            )
+            .await?;
+            conn.execute(
+                "DELETE FROM inference_verifications
+                  WHERE profile_id = ?1 AND pool_id = ?2 AND outcome != 'running'
+                    AND id NOT IN (SELECT id FROM inference_verifications
+                                    WHERE profile_id = ?1 AND pool_id = ?2
+                                    ORDER BY started_at DESC LIMIT ?3)",
+                params![claim.profile, claim.pool, KEPT],
+            )
+            .await?;
+            Ok(None)
+        })
+    })
+    .await
+    .map_err(|error| format!("write inference_verifications: {error}"))
+}
+
 /// Refuse a verification that cannot start, write its deployment and its row,
 /// and return what to run. A machine it would use whose address is unknown is
 /// refused before anything is written.
@@ -351,74 +418,20 @@ pub async fn begin(
         },
     )
     .await?;
-    let machines_json =
-        serde_json::to_string(&machines.iter().map(|m| m.to_string()).collect::<Vec<_>>())
-            .expect("machine names serialize");
-    let (profile_key, pool_key) = (profile.id.to_string(), pool_id.to_string());
-    let (row_id, digest, requester, deployment_key) = (
-        id.clone(),
-        digest(&profile),
-        requested_by.to_string(),
-        deployment.id.to_string(),
-    );
-    let busy: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
-    let busy_in = std::sync::Arc::clone(&busy);
-    db.write(move |conn| {
-        let busy = std::sync::Arc::clone(&busy_in);
-        let (row_id, profile_key, digest, pool_key, deployment_key, machines_json, requester) = (
-            row_id.clone(),
-            profile_key.clone(),
-            digest.clone(),
-            pool_key.clone(),
-            deployment_key.clone(),
-            machines_json.clone(),
-            requester.clone(),
-        );
-        Box::pin(async move {
-            let mut running = conn
-                .query(
-                    "SELECT id FROM inference_verifications
-                      WHERE pool_id = ?1 AND outcome = 'running' LIMIT 1",
-                    params![pool_key.clone()],
-                )
-                .await?;
-            if let Some(row) = running.next().await? {
-                *busy.lock().unwrap() = Some(row.text(0)?);
-                return Ok(());
-            }
-            drop(running);
-            conn.execute(
-                "INSERT INTO inference_verifications
-                   (id, profile_id, profile_digest, pool_id, deployment_id, machines_json,
-                    requested_by, started_at, outcome, stage)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', 'render')",
-                params![
-                    row_id,
-                    profile_key.clone(),
-                    digest,
-                    pool_key.clone(),
-                    deployment_key,
-                    machines_json,
-                    requester,
-                    now
-                ],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM inference_verifications
-                  WHERE profile_id = ?1 AND pool_id = ?2 AND outcome != 'running'
-                    AND id NOT IN (SELECT id FROM inference_verifications
-                                    WHERE profile_id = ?1 AND pool_id = ?2
-                                    ORDER BY started_at DESC LIMIT ?3)",
-                params![profile_key, pool_key, KEPT],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| format!("write inference_verifications: {error}"))?;
-    if let Some(running) = busy.lock().unwrap().take() {
+    let claim = Claim {
+        id: id.clone(),
+        profile: profile.id.to_string(),
+        digest: digest(&profile),
+        pool: pool_id.to_string(),
+        deployment: deployment.id.to_string(),
+        machines_json: serde_json::to_string(
+            &machines.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+        )
+        .expect("machine names serialize"),
+        requested_by: requested_by.to_string(),
+        started_at: now,
+    };
+    if let Some(running) = claim_pool(db, claim).await? {
         return Err(format!(
             "pool {pool_id} is already being verified (verification {running}); wait for it to finish"
         ));
@@ -1776,6 +1789,70 @@ machines:
                 first.id
             )
         );
+    }
+
+    /// Two verifications of one pool claim it at once. Each reads the pool as
+    /// idle and inserts its own row, so only a key over the running rows can
+    /// make them conflict (cairn/6166). It races the claim itself: through
+    /// `begin`, the inventory write before it staggers the two and hides the
+    /// race. Looped, from two OS threads: two tasks on one test runtime did
+    /// not interleave these transactions when measured (0 doubled claims in
+    /// 200 rounds, against 199 in 200 from threads without the index).
+    #[test]
+    fn racing_claims_of_one_pool_admit_exactly_one() {
+        use crate::storage::RowExt;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = runtime.block_on(seeded("inference-verify-race"));
+        for round in 0..100 {
+            let barrier = std::sync::Barrier::new(2);
+            let claims = ["chat", "embed"].map(|profile| Claim {
+                id: format!("{profile}-{round}"),
+                profile: profile.into(),
+                digest: "digest".into(),
+                pool: "box".into(),
+                deployment: format!("verify-{profile}-box"),
+                machines_json: r#"["box"]"#.into(),
+                requested_by: "operator".into(),
+                started_at: round,
+            });
+            let admitted = std::thread::scope(|scope| {
+                let claimed: Vec<_> = claims
+                    .into_iter()
+                    .map(|claim| {
+                        let (db, barrier, handle) = (&db, &barrier, runtime.handle().clone());
+                        scope.spawn(move || {
+                            barrier.wait();
+                            handle.block_on(claim_pool(db, claim)).unwrap().is_none()
+                        })
+                    })
+                    .collect();
+                claimed
+                    .into_iter()
+                    .map(|claim| claim.join().unwrap())
+                    .filter(|admitted| *admitted)
+                    .count()
+            });
+            let running = runtime
+                .block_on(db.query_one(
+                    "SELECT COUNT(*) FROM inference_verifications
+                      WHERE pool_id = 'box' AND outcome = 'running'",
+                    (),
+                    |row| row.i64(0),
+                ))
+                .unwrap();
+            assert_eq!(
+                (admitted, running),
+                (1, 1),
+                "round {round}: one verification holds the pool"
+            );
+            runtime
+                .block_on(db.execute("DELETE FROM inference_verifications", ()))
+                .unwrap();
+        }
     }
 
     #[test]

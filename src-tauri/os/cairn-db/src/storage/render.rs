@@ -2653,7 +2653,7 @@ mod tests {
                      and affordance block must remain visible so the agent can continue safely.\n"
             .repeat(1_000);
 
-        for (uri, specimen) in [("file:batch.rs", code), ("cairn:~/arc", prose.as_str())] {
+        for (uri, specimen) in [("file:batch.rs", code), ("cairn:~/plan", prose.as_str())] {
             let body = specimen
                 .lines()
                 .enumerate()

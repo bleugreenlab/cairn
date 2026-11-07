@@ -6,10 +6,12 @@
 //! its window's trigger rotates again before it has done anything. So every
 //! seed is held to one token budget (`seed_budget_tokens`, measured by
 //! [`seed_tokens`]). The thread composer bounds every generated part of a
-//! rebuilt seed while leaving the authored arc verbatim and budget-exempt. It
-//! renders, in order:
+//! rebuilt seed while leaving the thread's authored record outside that budget.
+//! It renders, in order:
 //!
-//! 1. the authored arc;
+//! 1. the thread's record, read from its own store: the `intent` row verbatim,
+//!    the `journal` under [`JOURNAL_BUDGET_TOKENS`] (every open row first, then
+//!    the newest entries), and its tenets under [`TENET_FULL_BUDGET_TOKENS`];
 //! 2. a live, bounded children census;
 //! 3. recent persisted era summaries with an address to older eras; and
 //! 4. a V5-token-budgeted verbatim selection with an unconditional recency floor,
@@ -21,7 +23,7 @@
 //! runs. So the bound is made true at final composition, where an oversized body
 //! is recomposed under an inverted priority — the newest turn at the center,
 //! every child collapsed to the line that addresses it, and a tokenizer cut as
-//! the last boundary. The authored arc stays verbatim and exempt.
+//! the last boundary. The record stays outside it, bounded by its own budgets.
 //!
 //! Chapters remain internal natural fold boundaries. They never render, and eras
 //! replace their lifetime accumulation with generation-independent summaries.
@@ -34,8 +36,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::storage::{DbResult, LocalDb, RowExt};
 use crate::tenets::{TenetOrigin, TenetStatus, TenetView};
-use crate::threads::arc_store::ArcProjection;
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
+use crate::threads::record::{Intent, JournalRow, ThreadRecord};
 
 use super::common::{job_status_icon, read_resource};
 use super::transcript::DigestCoordinate;
@@ -97,17 +99,27 @@ fn seed_cut(text: &str, budget: usize) -> usize {
     }
 }
 
-/// The artifact a thread authors its arc into.
-const ARC_ARTIFACT_NAME: &str = "arc";
+const INTENT_MISSING_NOTICE: &str = "_No intent written. Patch `cairn:~/db/intent/1` with `current_intent` (where this thread is going) and `working` (what is in motion); it is the one section a rebuilt session cannot regenerate. See cairn://skills/thread-db._";
 
-const ARC_MISSING_NOTICE: &str = "_No arc has been authored for this thread yet. Write one to `cairn:~/arc` — your current intent and the work in motion, each with the URI it came from. Decisions are tenets, proposed at `cairn:@/tenets`; open questions go in `cairn:~/db`. The arc is the only part of this context that cannot be regenerated from the transcript, so nothing else in this seed substitutes for it._";
+const JOURNAL_EMPTY_NOTICE: &str = "_The journal is empty. Append what this thread decides, learns and watches to `cairn:~/db/journal`; see cairn://skills/thread-db._";
+
+/// Where the open journal rows past the seed are, newest first.
+const JOURNAL_OPEN_URI: &str = "cairn:~/db?sql=SELECT * FROM journal WHERE resolved_at IS NULL AND kind IN ('watch','question','queue') ORDER BY id DESC";
+
+const JOURNAL_FULL_LINE: &str = "Full journal: `cairn:~/db/journal?order=-id`\n";
+
+/// What the journal section may weigh.
+pub(crate) const JOURNAL_BUDGET_TOKENS: usize = 2_000;
+
+/// How much of one journal note the seed carries; the row's URI has the rest.
+const JOURNAL_NOTE_CHARS: usize = 400;
 
 const NO_HISTORY_NOTICE: &str =
     "_Nothing has been compacted yet; the whole session so far is below._";
 
 /// Framing for the children census. It says where the lines came from, because
 /// a resumed thread that reads them as prose it once wrote will re-verify them.
-const CHILDREN_NOTICE: &str = "_Read from live state as this seed was composed — not authored, not inherited. Trust it over anything the arc says about where a child stands, and re-read a child only when you need detail this line does not carry._";
+const CHILDREN_NOTICE: &str = "_Read from live state as this seed was composed — not authored, not inherited. Trust it over anything your intent or journal says about where a child stands, and re-read a child only when you need detail this line does not carry._";
 
 /// The census's framing once the budget forces it to collapse. It keeps the
 /// provenance claim in a fraction of the tokens and adds the one fact only a
@@ -119,7 +131,7 @@ const CENSUS_TERMINAL_CHILDREN: usize = 30;
 
 /// A composed thread seed, and the two measurements that price it.
 pub(crate) struct ThreadSeed {
-    /// The seed body: arc, table of contents, verbatim window.
+    /// The seed body: record, table of contents, verbatim window.
     pub content: String,
     /// `P` — what the turns this composition would drop weigh verbatim.
     pub source_bytes: i64,
@@ -138,7 +150,7 @@ pub(crate) struct ThreadSeed {
     /// failed rotation retryable.
     pub source_session_id: String,
     pub minted_eras: Vec<crate::threads::compaction::EraMint>,
-    pub arc_bytes: i64,
+    pub record_bytes: i64,
     pub eras_through_seq: Option<i64>,
 }
 
@@ -280,7 +292,7 @@ pub(crate) async fn compose_thread_seed_with_policy(
         status: &coordinates.status,
     };
 
-    let arc = render_arc(db, job_id, now).await;
+    let record = render_record(db, job_id, now).await;
     let census = render_children(&children, now);
 
     let mut era_text = String::from("## Eras\n\n");
@@ -441,8 +453,7 @@ pub(crate) async fn compose_thread_seed_with_policy(
     let dropped = render_blocks(&blocks, &dropped_indices, &chat_uri, &meta);
 
     let mut content = String::new();
-    content.push_str("## Arc\n\n");
-    content.push_str(arc.trim());
+    content.push_str(record.trim());
     content.push_str("\n\n");
     content.push_str(&body);
 
@@ -467,7 +478,7 @@ pub(crate) async fn compose_thread_seed_with_policy(
         consumed_child_issue_ids,
         source_session_id,
         minted_eras,
-        arc_bytes: arc.len() as i64,
+        record_bytes: record.len() as i64,
         eras_through_seq,
     })
 }
@@ -794,13 +805,15 @@ fn render_blocks(
 
 // ── The budget's last boundary ──────────────────────────────────────────────
 
-/// A non-arc body recomposed to fit, and the turns that survived into it.
+/// The body below the record, recomposed to fit, and the turns that survived
+/// into it.
 struct DegradedBody {
     body: String,
     selected: Vec<usize>,
 }
 
-/// Recompose the non-arc body when the ordinary policy does not fit `budget`.
+/// Recompose the body below the record when the ordinary policy does not fit
+/// `budget`.
 ///
 /// Trimming that policy would not help: what fails to fit is its shape, not its
 /// margin. A thread with sixty open children pays their detail blocks whatever
@@ -1147,77 +1160,132 @@ fn cut_newest_turn(
     }
 }
 
-async fn render_arc(db: &LocalDb, job_id: &str, now: i64) -> String {
-    match crate::artifacts::queries::get_named(db, job_id, ARC_ARTIFACT_NAME).await {
-        Ok(Some(artifact)) => {
-            match crate::threads::arc_store::render(db, job_id, &artifact.data, now).await {
-                Ok(rendered) => rendered,
-                Err(error) => {
-                    log::warn!("thread arc projection failed for job {job_id}: {error}");
-                    render_arc_data(&artifact.data)
-                }
-            }
+async fn render_record(db: &LocalDb, job_id: &str, now: i64) -> String {
+    match crate::threads::record::load(db, job_id).await {
+        Ok(record) => {
+            let ranked = default_tenet_selector()
+                .rank(
+                    db,
+                    &TenetSelection {
+                        thread_id: &record.thread_id,
+                        project_id: &record.project_id,
+                        project_key: &record.project_key,
+                        own: &record.tenets,
+                        vectors: crate::tenets::evidence::vectors::vector_db(db),
+                        now,
+                    },
+                )
+                .await;
+            render_thread_record(&record, &ranked)
         }
-        // A thread whose agent has not written an arc still gets a valid seed;
-        // it is told, in the seed, that the one irreplaceable section is empty.
-        Ok(None) => ARC_MISSING_NOTICE.to_string(),
+        // A seed still composes; it says the one irreplaceable section is
+        // unread, and where it lives.
         Err(error) => {
-            log::warn!("thread arc could not be read for job {job_id}: {error}");
-            ARC_MISSING_NOTICE.to_string()
+            log::warn!("thread record could not be read for job {job_id}: {error}");
+            format!(
+                "## Intent\n\n_This thread's record could not be read ({error}). Its intent is at `cairn:~/db/intent/1` and its journal at `cairn:~/db/journal`._\n"
+            )
         }
     }
 }
 
-/// Render the authored prose of an arc as stable Markdown, copying every
-/// authored string exactly. Anything this does not recognize is passed through
-/// rather than dropped: the compactor is not allowed to decide that authored
-/// intent was unimportant. The collections an older arc embedded (`rulings`,
-/// `open_questions`) are not prose and are not rendered here; their homes are
-/// tenets and the thread store.
-pub(crate) fn render_arc_data(data: &serde_json::Value) -> String {
-    let mut out = String::new();
-
-    if let Some(intent) = data
-        .get("current_intent")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        out.push_str(intent);
-        out.push('\n');
-    }
-
-    if let Some(working) = data
-        .get("working")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        out.push_str("\n### Working (volatile)\n\n");
-        out.push_str(working);
-        out.push('\n');
-    }
-
-    if out.trim().is_empty() {
-        // Not the provenance-first shape. Copy whatever the thread did author.
-        let mut rest = data.clone();
-        crate::threads::arc_store::retain_prose_only(&mut rest);
-        return data
-            .get("content")
-            .or_else(|| data.get("body"))
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| match &rest {
-                serde_json::Value::Null => String::new(),
-                serde_json::Value::Object(object) if object.is_empty() => String::new(),
-                other => compact_json(other),
-            });
+/// Render a thread's record: `## Intent` verbatim, `## Journal` under
+/// [`JOURNAL_BUDGET_TOKENS`], then `## Tenets` (awaiting a verdict, the
+/// selected ones in full under [`TENET_FULL_BUDGET_TOKENS`], related tenets
+/// from other threads, and a one-line index of the rest).
+pub(crate) fn render_thread_record(record: &ThreadRecord, ranked: &[RankedTenet]) -> String {
+    let mut out = String::from("## Intent\n\n");
+    out.push_str(&render_intent(&record.intent));
+    out.push_str("\n## Journal\n\n");
+    out.push_str(&render_journal(record));
+    let tenets = render_tenets(record, ranked);
+    if !tenets.is_empty() {
+        out.push_str("\n## Tenets\n");
+        out.push_str(&tenets);
     }
     out
 }
 
-// ── Tenets in the arc ───────────────────────────────────────────────────────
+/// The intent row, copied exactly. It is the one authored section a rebuilt
+/// session cannot regenerate, so it is exempt from every budget.
+fn render_intent(intent: &Intent) -> String {
+    let mut out = String::new();
+    match intent.current_intent.trim() {
+        "" => out.push_str(INTENT_MISSING_NOTICE),
+        current => out.push_str(current),
+    }
+    out.push('\n');
+    let working = intent.working.trim();
+    if !working.is_empty() {
+        out.push_str("\n### Working (volatile)\n\n");
+        out.push_str(working);
+        out.push('\n');
+    }
+    out
+}
+
+/// The journal within [`JOURNAL_BUDGET_TOKENS`]: open rows first, newest
+/// first, then the newest entries in what remains. Open rows the budget or
+/// the read leaves out are counted on one line with their address; a cut note
+/// carries its row's.
+fn render_journal(record: &ThreadRecord) -> String {
+    if record.open_total == 0 && record.journal_recent.is_empty() {
+        return format!("{JOURNAL_EMPTY_NOTICE}\n");
+    }
+    let pointer = |hidden: usize| {
+        if hidden == 0 {
+            String::new()
+        } else {
+            format!("_{hidden} more open → `{JOURNAL_OPEN_URI}`_\n")
+        }
+    };
+    // Measured against the widest pointer this section could carry, so the
+    // pointer actually rendered never pushes it past the budget.
+    let reserve = format!("{}\n{JOURNAL_FULL_LINE}", pointer(record.open_total));
+    let fits = |lines: &str| seed_tokens(&format!("{lines}{reserve}")) <= JOURNAL_BUDGET_TOKENS;
+
+    let mut open = String::new();
+    let mut shown = 0;
+    for row in &record.journal_open {
+        let candidate = format!("{open}{}", journal_line(row));
+        if !fits(&candidate) {
+            break;
+        }
+        open = candidate;
+        shown += 1;
+    }
+    let mut recent = String::new();
+    for row in &record.journal_recent {
+        let candidate = format!("{recent}{}", journal_line(row));
+        if fits(&format!("{open}{candidate}")) {
+            recent = candidate;
+        }
+    }
+    format!(
+        "{open}{}{recent}\n{JOURNAL_FULL_LINE}",
+        pointer(record.open_total.saturating_sub(shown))
+    )
+}
+
+/// `- **watch** #42 · 2026-11-06 — note (refs: …)`, on one line.
+fn journal_line(row: &JournalRow) -> String {
+    let collapsed = row.note.split_whitespace().collect::<Vec<_>>().join(" ");
+    let note = if collapsed.chars().count() > JOURNAL_NOTE_CHARS {
+        let cut: String = collapsed.chars().take(JOURNAL_NOTE_CHARS).collect();
+        format!("{}… (full: cairn:~/db/journal/{})", cut.trim_end(), row.id)
+    } else {
+        collapsed
+    };
+    let date = row.ts.get(..10).unwrap_or(&row.ts);
+    let mut line = format!("- **{}** #{} · {date} — {note}", row.kind, row.id);
+    if !row.refs.is_empty() {
+        line.push_str(&format!(" (refs: {})", row.refs.join(", ")));
+    }
+    line.push('\n');
+    line
+}
+
+// ── Tenets in the record ───────────────────────────────────────────────────────
 
 /// What the full-form tenets section may weigh. Tenets past it are still
 /// listed, one line each, in the index.
@@ -1236,7 +1304,6 @@ const RECENT_EVIDENCE_BOOST: f32 = 0.05;
 /// What a selector ranks from.
 pub(crate) struct TenetSelection<'a> {
     pub thread_id: &'a str,
-    pub thread_name: &'a str,
     pub project_id: &'a str,
     pub project_key: &'a str,
     /// Every tenet this thread proposed, oldest first.
@@ -1255,7 +1322,7 @@ pub(crate) struct RankedTenet {
     pub own: bool,
 }
 
-/// Which tenets an arc shows in full, best first. The composer owns the
+/// Which tenets a seed shows in full, best first. The composer owns the
 /// budget, the index, and the awaiting-verdict list; a selector only orders.
 #[async_trait::async_trait]
 pub(crate) trait TenetSelector: Send + Sync {
@@ -1291,10 +1358,10 @@ fn recency_rank(own: &[TenetView]) -> Vec<RankedTenet> {
 }
 
 /// Tenets ranked by how near they are to what the thread is working on: its
-/// arc and its open child issues. The thread's own approved tenets come first,
-/// best first, then its own tenets that have no vector yet in recency order;
-/// other threads' approved tenets follow when they are near enough. With no
-/// vector for the arc or any open child, this is [`RecencySelector`].
+/// open child issues. The thread's own approved tenets come first, best first,
+/// then its own tenets that have no vector yet in recency order; other threads'
+/// approved tenets follow when they are near enough. With no vector for any
+/// open child, this is [`RecencySelector`].
 pub(crate) struct RelevanceSelector;
 
 #[async_trait::async_trait]
@@ -1317,10 +1384,6 @@ async fn relevance_rank(
 ) -> Result<Option<Vec<RankedTenet>>, String> {
     use crate::tenets::evidence::vectors::{project_tenet_vectors, resource_vector};
 
-    let mut work_uris = vec![format!(
-        "{}/arc",
-        cairn_common::uri::build_thread_uri(input.project_key, input.thread_name)
-    )];
     let open_children = db
         .query_all(
             "SELECT number FROM issues
@@ -1330,11 +1393,10 @@ async fn relevance_rank(
         )
         .await
         .map_err(|error| format!("failed to read open children: {error}"))?;
-    work_uris.extend(
-        open_children
-            .into_iter()
-            .map(|number| cairn_common::uri::build_issue_uri(input.project_key, number as i32)),
-    );
+    let work_uris: Vec<String> = open_children
+        .into_iter()
+        .map(|number| cairn_common::uri::build_issue_uri(input.project_key, number as i32))
+        .collect();
     let mut work: Vec<(crate::embeddings::VectorKey, Vec<f32>)> = Vec::new();
     for uri in &work_uris {
         if let Some(stored) = resource_vector(input.vectors, uri)
@@ -1434,14 +1496,15 @@ pub(crate) fn default_tenet_selector() -> &'static dyn TenetSelector {
     &RelevanceSelector
 }
 
-/// Render an arc: the authored prose, the thread's tenets awaiting a verdict,
-/// its selected tenets in full under [`TENET_FULL_BUDGET_TOKENS`], a one-line
-/// index of the rest, and its open questions.
+/// The tenet sections: the thread's tenets awaiting a verdict, its selected
+/// tenets in full under [`TENET_FULL_BUDGET_TOKENS`], related tenets from
+/// other threads in what that leaves, and a one-line index of the rest. Empty
+/// for a thread with no tenets to show.
 ///
 /// A withdrawn tenet never renders. A declined or superseded one is never in
 /// the full slice, so it always lands in the index.
-pub(crate) fn render_arc_projection(projection: &ArcProjection, ranked: &[RankedTenet]) -> String {
-    let mut out = render_arc_data(&projection.prose);
+fn render_tenets(projection: &ThreadRecord, ranked: &[RankedTenet]) -> String {
+    let mut out = String::new();
 
     let visible: Vec<&TenetView> = projection
         .tenets
@@ -1488,7 +1551,7 @@ pub(crate) fn render_arc_projection(projection: &ArcProjection, ranked: &[Ranked
         }
     }
     if !full.is_empty() {
-        out.push_str("\n### Tenets\n\n");
+        out.push_str("\n### Approved\n\n");
         out.push_str(&full);
     }
     if !related.is_empty() {
@@ -1517,22 +1580,6 @@ pub(crate) fn render_arc_projection(projection: &ArcProjection, ranked: &[Ranked
             "\nFull text: {tenets}/<n> · all of this thread's: {tenets}?thread={}\n",
             projection.thread_name
         ));
-    }
-
-    if !projection.open_questions.is_empty() {
-        out.push_str("\n### Open questions\n\n");
-        for question in &projection.open_questions {
-            let text = question
-                .get("question")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| compact_json(question));
-            out.push_str(&format!("- {text}"));
-            if let Some(provenance) = provenance_uris(question) {
-                out.push_str(&format!(" (provenance: {provenance})"));
-            }
-            out.push('\n');
-        }
     }
     out
 }
@@ -1652,24 +1699,6 @@ fn tenet_first_sentence(text: &str, max: usize) -> String {
     }
     let truncated: String = sentence.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", truncated.trim_end())
-}
-
-fn provenance_uris(value: &serde_json::Value) -> Option<String> {
-    let provenance = value.get("provenance")?;
-    let joined = match provenance {
-        serde_json::Value::String(uri) => uri.trim().to_string(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| item.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        _ => String::new(),
-    };
-    (!joined.is_empty()).then_some(joined)
-}
-
-fn compact_json(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
 }
 
 // ── Turn inspection ─────────────────────────────────────────────────────────
@@ -2582,7 +2611,7 @@ const NODE_TOC_SHARE: usize = 25;
 /// An issue's node has an objective and an ending, but one that lives long — a
 /// coordinator running for days — accumulates history exactly as a thread does,
 /// and a seed that carries all of it opens the next session as full as the one
-/// it replaced. A node has no arc, eras, or children, and nothing here persists:
+/// it replaced. A node has no record, eras, or children, and nothing here persists:
 /// every composition reads the transcript afresh, so the table of contents is
 /// derived each time rather than carried between generations.
 ///
@@ -3080,11 +3109,16 @@ mod tests {
         }
     }
 
-    fn projection(tenets: Vec<TenetView>) -> ArcProjection {
-        ArcProjection {
-            prose: serde_json::json!({"current_intent": "Keep going."}),
+    fn record(tenets: Vec<TenetView>) -> ThreadRecord {
+        ThreadRecord {
+            intent: Intent {
+                current_intent: "Keep going.".into(),
+                working: String::new(),
+            },
+            journal_open: vec![journal_row(3, "question", "What next?")],
+            open_total: 1,
+            journal_recent: Vec::new(),
             tenets,
-            open_questions: vec![serde_json::json!({"question": "What next?"})],
             thread_id: "thread".into(),
             project_id: "p".into(),
             project_key: "prj".into(),
@@ -3092,9 +3126,19 @@ mod tests {
         }
     }
 
+    fn journal_row(id: i64, kind: &str, note: &str) -> JournalRow {
+        JournalRow {
+            id,
+            ts: "2026-11-06T01:02:03Z".into(),
+            kind: kind.into(),
+            note: note.into(),
+            refs: Vec::new(),
+        }
+    }
+
     fn render_tenets(tenets: Vec<TenetView>) -> String {
         let ranked = recency_rank(&tenets);
-        render_arc_projection(&projection(tenets), &ranked)
+        render_thread_record(&record(tenets), &ranked)
     }
 
     #[test]
@@ -3133,12 +3177,14 @@ mod tests {
             tenet(3, TenetStatus::Proposed, "Add a timeout"),
         ]);
         let order = [
+            "## Intent",
             "Keep going.",
+            "## Journal",
+            "## Tenets",
             "### Awaiting verdict",
-            "### Tenets",
+            "### Approved",
             "### Tenet index",
             "Full text: cairn://p/prj/tenets/<n> · all of this thread's: cairn://p/prj/tenets?thread=topic",
-            "### Open questions",
         ]
         .map(|needle| {
             rendered
@@ -3159,7 +3205,7 @@ mod tests {
             tenet(2, TenetStatus::Declined, "Rejected idea"),
             tenet(3, TenetStatus::Withdrawn, "Withdrawn idea"),
         ]);
-        assert!(!rendered.contains("### Tenets\n"), "{rendered}");
+        assert!(!rendered.contains("### Approved\n"), "{rendered}");
         assert!(
             rendered.contains("- #1 · superseded · Old rule\n"),
             "{rendered}"
@@ -3175,14 +3221,15 @@ mod tests {
     fn a_thread_without_tenets_renders_no_tenet_sections() {
         let rendered = render_tenets(vec![tenet(1, TenetStatus::Withdrawn, "Gone")]);
         for absent in [
+            "## Tenets",
             "### Awaiting verdict",
-            "### Tenets",
+            "### Approved",
             "### Tenet index",
             "Full text:",
         ] {
             assert!(!rendered.contains(absent), "{rendered}");
         }
-        assert!(rendered.contains("### Open questions"));
+        assert!(rendered.contains("- **question** #3"), "{rendered}");
     }
 
     #[test]
@@ -3199,7 +3246,7 @@ mod tests {
             .collect();
         let rendered = render_tenets(tenets);
         let full = &rendered
-            [rendered.find("### Tenets").unwrap()..rendered.find("### Tenet index").unwrap()];
+            [rendered.find("### Approved").unwrap()..rendered.find("### Tenet index").unwrap()];
         assert!(
             seed_tokens(full) <= TENET_FULL_BUDGET_TOKENS + 10,
             "{}",
@@ -3236,14 +3283,110 @@ mod tests {
 
     #[test]
     fn volatile_working_state_is_carried_beside_durable_intent() {
-        let data = serde_json::json!({
-            "current_intent": "Keep the durable direction.",
-            "working": "Ratify A, then watch B, then start C."
+        let rendered = render_intent(&Intent {
+            current_intent: "Keep the durable direction.".into(),
+            working: "Ratify A, then watch B, then start C.".into(),
         });
-        let rendered = render_arc_data(&data);
         assert!(rendered.starts_with("Keep the durable direction."));
         assert!(rendered.contains("### Working (volatile)"));
         assert!(rendered.contains("Ratify A, then watch B, then start C."));
+    }
+
+    #[test]
+    fn every_open_row_renders_before_any_recent_row() {
+        let mut record = record(Vec::new());
+        record.journal_open = vec![
+            journal_row(9, "watch", "Lease renewal"),
+            journal_row(4, "queue", "File the panel"),
+        ];
+        record.open_total = 2;
+        record.journal_recent = vec![journal_row(12, "decision", "Chose leases")];
+        let rendered = render_thread_record(&record, &[]);
+        let watch = rendered
+            .find("- **watch** #9 · 2026-11-06 — Lease renewal\n")
+            .unwrap();
+        let queue = rendered.find("- **queue** #4").unwrap();
+        let decision = rendered.find("- **decision** #12").unwrap();
+        assert!(watch < queue && queue < decision, "{rendered}");
+        assert!(rendered.contains(JOURNAL_FULL_LINE), "{rendered}");
+        assert!(!rendered.contains("more open"), "{rendered}");
+    }
+
+    #[test]
+    fn a_cut_note_carries_its_row_address_and_refs_ride_on_the_line() {
+        let mut row = journal_row(42, "lesson", &"word ".repeat(200));
+        row.refs = vec!["cairn://p/prj/20".into(), "cairn://p/prj/21".into()];
+        let line = journal_line(&row);
+        assert!(
+            line.ends_with(
+                "… (full: cairn:~/db/journal/42) (refs: cairn://p/prj/20, cairn://p/prj/21)\n"
+            ),
+            "{line}"
+        );
+        assert!(line.chars().count() < 520, "{line}");
+        assert_eq!(line.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn open_rows_past_the_read_or_the_budget_are_counted_on_one_line() {
+        let mut record = record(Vec::new());
+        record.journal_open = (1..=40)
+            .rev()
+            .map(|id| journal_row(id, "watch", &format!("watch {id} {}", "x ".repeat(90))))
+            .collect();
+        record.open_total = 55;
+        record.journal_recent = vec![journal_row(99, "event", "RECENT_ENTRY")];
+        let journal = render_journal(&record);
+        assert!(
+            seed_tokens(&journal) <= JOURNAL_BUDGET_TOKENS,
+            "{} tokens",
+            seed_tokens(&journal)
+        );
+        let shown = journal.matches("- **watch**").count();
+        assert!(shown > 0 && shown < 40, "{shown} shown");
+        assert!(
+            journal.contains(&format!(
+                "_{} more open → `{JOURNAL_OPEN_URI}`_",
+                55 - shown
+            )),
+            "{journal}"
+        );
+        // Recent entries fill only what the open rows leave, after the pointer.
+        if let Some(recent) = journal.find("RECENT_ENTRY") {
+            assert!(journal.find("more open").unwrap() < recent, "{journal}");
+        }
+    }
+
+    #[test]
+    fn an_empty_journal_points_at_the_skill() {
+        let mut record = record(Vec::new());
+        record.journal_open.clear();
+        record.open_total = 0;
+        let rendered = render_thread_record(&record, &[]);
+        assert!(rendered.contains(JOURNAL_EMPTY_NOTICE), "{rendered}");
+        assert!(!rendered.contains("## Tenets"), "{rendered}");
+    }
+
+    #[test]
+    fn the_journal_budget_never_displaces_intent_or_tenets() {
+        let mut record = record(vec![tenet(
+            4,
+            TenetStatus::Approved,
+            "Ship the lease change",
+        )]);
+        record.intent.current_intent = "LONG_INTENT ".repeat(800);
+        record.journal_open = (1..=40)
+            .rev()
+            .map(|id| journal_row(id, "question", &"q ".repeat(300)))
+            .collect();
+        record.open_total = 40;
+        let ranked = recency_rank(&record.tenets);
+        let rendered = render_thread_record(&record, &ranked);
+        assert_eq!(rendered.matches("LONG_INTENT").count(), 800);
+        assert!(rendered.contains("- **#4** (approved"), "{rendered}");
+        let journal =
+            &rendered[rendered.find("## Journal").unwrap()..rendered.find("## Tenets").unwrap()];
+        assert!(seed_tokens(journal) <= JOURNAL_BUDGET_TOKENS + 10);
     }
 
     /// A thread with fourteen turns: four old ones behind the recency window,
@@ -3408,32 +3551,38 @@ mod tests {
         .unwrap();
     }
 
-    async fn write_arc(db: &LocalDb, version: i64, intent: &str) {
-        let data = serde_json::json!({
-            "current_intent": intent,
-            "rulings": [{
-                "text": "Do not rebuild the fleet view",
-                "status": "rejected",
-                "rationale": "premature until residency leases settle",
-                "provenance": ["cairn://p/prj/20"]
-            }],
-            "open_questions": [{ "question": "Who owns lease renewal?" }]
-        })
-        .to_string();
-        db.execute(
-            "INSERT INTO artifacts(id, job_id, artifact_type, schema_version, data, version, output_name, created_at, updated_at, confirmed)
-             VALUES (?1,'job-thread','context-self',1,?2,?3,'arc',?3,?3,1)",
-            params![format!("arc-{version}"), data, version],
-        )
-        .await
-        .unwrap();
+    /// Patch the fixture thread's intent row, as `cairn:~/db/intent/1` does.
+    async fn write_intent(intent: &str) {
+        crate::threads::db_store::open("t-thread")
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE intent SET current_intent = ?1 WHERE id = 1",
+                params![intent],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Append one row to the fixture thread's journal.
+    async fn append_journal(kind: &str, note: &str) {
+        crate::threads::db_store::open("t-thread")
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO journal(kind, note) VALUES (?1, ?2)",
+                params![kind, note],
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn a_composed_seed_uses_eras_and_a_token_budget_without_rendering_chapters() {
         let db = thread_fixture("thread-seed-compose.db").await;
         mark_done_child(&db).await;
-        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        write_intent("Getting the fleet onto lease-based residency.").await;
+        append_journal("question", "Who owns lease renewal?").await;
 
         // A budget the composed seed can actually honor. At 300 this fixture
         // costs more than the bound it is given, so what it demonstrated was the
@@ -3453,9 +3602,6 @@ mod tests {
         assert!(seed
             .content
             .contains("Getting the fleet onto lease-based residency."));
-        // An embedded arc ruling is a tenet once the boot import runs; the seed
-        // never renders it from the arc itself.
-        assert!(!seed.content.contains("Do not rebuild the fleet view"));
         assert!(seed.content.contains("Who owns lease renewal?"));
         assert!(seed.content.contains("OPEN_CHILD_TURN_FOUR"));
         assert!(seed.content.contains("## Turn 14 ·"));
@@ -3698,7 +3844,7 @@ mod tests {
         let db = thread_fixture("thread-seed-children.db").await;
         mark_done_child(&db).await;
         make_open_child_live(&db).await;
-        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        write_intent("Getting the fleet onto lease-based residency.").await;
 
         let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
@@ -3725,14 +3871,16 @@ mod tests {
             seed.content
         );
 
-        // The census sits between authored intent and persisted eras.
-        let arc = seed.content.find("## Arc").expect("an arc section");
+        // The record opens the seed; the census sits between it and the eras.
+        assert!(seed.content.starts_with("## Intent\n"), "{}", seed.content);
+        let journal = seed.content.find("## Journal").expect("a journal section");
         let children = seed
             .content
             .find("## Children")
             .expect("a children section");
         let eras = seed.content.find("## Eras").expect("an eras section");
-        assert!(arc < children && children < eras);
+        assert!(journal < children && children < eras);
+        assert!(!seed.content.contains("## Arc"));
     }
 
     #[tokio::test]
@@ -3846,10 +3994,10 @@ mod tests {
         assert_eq!(db.live_connections(), 0);
     }
 
-    /// The part of a composed seed the budget governs. The authored arc is
-    /// copied verbatim and is deliberately exempt, so measuring it here would be
-    /// measuring the one thing the bound does not claim.
-    fn non_arc_body(content: &str) -> &str {
+    /// The part of a composed seed the budget governs. The record sits outside
+    /// it under budgets of its own, so measuring it here would be measuring
+    /// what this bound does not claim.
+    fn body_below_record(content: &str) -> &str {
         // Whichever generated section comes first. Under a budget too small for
         // the census the body opens at a later header, or is empty outright.
         ["## Children", "## Eras", "## Recent"]
@@ -3891,7 +4039,7 @@ mod tests {
         // this budget; the same twenty as one addressable line each do not.
         let db = thread_fixture("thread-seed-oversized-census.db").await;
         many_live_open_children(&db, 20).await;
-        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        write_intent("Getting the fleet onto lease-based residency.").await;
 
         let policy = SeedPolicy {
             budget_tokens: 1_500,
@@ -3900,7 +4048,7 @@ mod tests {
         let seed = compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy)
             .await
             .unwrap();
-        let body = non_arc_body(&seed.content);
+        let body = body_below_record(&seed.content);
 
         // Measured the way production measures, not by a bytes-over-four guess.
         assert!(
@@ -3935,7 +4083,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            seed_tokens(non_arc_body(&generous.content)) > policy.budget_tokens,
+            seed_tokens(body_below_record(&generous.content)) > policy.budget_tokens,
             "the fixture fits the budget on its own, so the boundary went untested"
         );
         assert!(
@@ -3950,7 +4098,7 @@ mod tests {
         // floor would pass it straight through, and dropping it would hand the
         // thread a seed with no present in it.
         let db = thread_fixture("thread-seed-oversized-turn.db").await;
-        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        write_intent("Getting the fleet onto lease-based residency.").await;
         turn(
             &db,
             15,
@@ -3969,7 +4117,7 @@ mod tests {
         let seed = compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy)
             .await
             .unwrap();
-        let body = non_arc_body(&seed.content);
+        let body = body_below_record(&seed.content);
 
         assert!(
             seed_tokens(body) <= policy.budget_tokens,
@@ -3999,7 +4147,7 @@ mod tests {
         // caller should ever pass.
         let db = thread_fixture("thread-seed-budget-below-framing.db").await;
         make_open_child_live(&db).await;
-        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        write_intent("Getting the fleet onto lease-based residency.").await;
 
         // Below the tokenizer's own message framing no string can qualify, the
         // empty one included, so the sweep starts where the claim is meaningful.
@@ -4015,13 +4163,13 @@ mod tests {
             )
             .await
             .unwrap();
-            let body = non_arc_body(&seed.content);
+            let body = body_below_record(&seed.content);
             assert!(
                 seed_tokens(body) <= budget,
                 "a budget of {budget} composed a {}-token body:\n{body}",
                 seed_tokens(body)
             );
-            // The arc is exempt, so it survives a budget that leaves nothing else.
+            // The intent is exempt, so it survives a budget that leaves nothing else.
             assert!(seed
                 .content
                 .contains("Getting the fleet onto lease-based residency."));
@@ -4029,27 +4177,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_census_contradicts_a_stale_arc_rather_than_echoing_it() {
-        // The defect this block exists for: a thread inherits its arc verbatim,
-        // so a census authored into `current_intent` is stale by construction.
-        // The generated lines must state live status regardless of what the arc
-        // claims, and both must survive — a thread that only saw the arc's
-        // version would act on it.
-        let db = thread_fixture("thread-seed-children-vs-arc.db").await;
+    async fn the_census_contradicts_a_stale_intent_rather_than_echoing_it() {
+        // The defect this block exists for: a thread inherits its intent
+        // verbatim, so a census authored into `current_intent` is stale by
+        // construction. The generated lines must state live status regardless
+        // of what the intent claims, and both must survive — a thread that only
+        // saw the intent's version would act on it.
+        let db = thread_fixture("thread-seed-children-vs-intent.db").await;
         make_open_child_live(&db).await;
-        write_arc(
-            &db,
-            1,
-            "21 is still unstarted and has no PR; nothing is waiting on me.",
-        )
-        .await;
+        write_intent("21 is still unstarted and has no PR; nothing is waiting on me.").await;
 
         let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(seed.content.contains("21 is still unstarted and has no PR"));
         assert!(
             seed.content.contains("PR #892 open"),
-            "the census deferred to the arc's stale claim: {}",
+            "the census deferred to the intent's stale claim: {}",
             seed.content
         );
         assert!(seed.content.contains("1 unanswered question"));
@@ -4095,7 +4238,7 @@ mod tests {
         // thread be after I compact it", which is the question the menu is asked.
         let db = thread_fixture("thread-seed-preview-boundary.db").await;
         mark_done_child(&db).await;
-        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        write_intent("Getting the fleet onto lease-based residency.").await;
 
         let seed = compose_thread_seed_with_policy(
             &db,
@@ -4124,13 +4267,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_projected_size_follows_the_arc_it_copies() {
-        // The arc is copied into every seed verbatim, so authoring more of one is
-        // exactly the kind of sprawl the number exists to make visible.
-        let db = thread_fixture("thread-seed-preview-arc.db").await;
+    async fn the_projected_size_follows_the_intent_it_copies() {
+        // The intent is copied into every seed verbatim, so authoring more of it
+        // is exactly the kind of sprawl the number exists to make visible.
+        let db = thread_fixture("thread-seed-preview-intent.db").await;
         mark_done_child(&db).await;
 
-        write_arc(&db, 1, "Short intent.").await;
+        write_intent("Short intent.").await;
         let small = DigestPreview::of(
             &compose_thread_seed(&db, THREAD_JOB, NOW)
                 .await
@@ -4138,7 +4281,7 @@ mod tests {
                 .content,
         );
 
-        write_arc(&db, 2, &"A much longer statement of intent. ".repeat(40)).await;
+        write_intent(&"A much longer statement of intent. ".repeat(40)).await;
         let large = DigestPreview::of(
             &compose_thread_seed(&db, THREAD_JOB, NOW)
                 .await
@@ -4148,7 +4291,7 @@ mod tests {
 
         assert!(
             large.estimated_tokens > small.estimated_tokens,
-            "a longer arc must project a larger seed: {} vs {}",
+            "a longer intent must project a larger seed: {} vs {}",
             large.estimated_tokens,
             small.estimated_tokens
         );
@@ -4161,7 +4304,7 @@ mod tests {
         // one and the number must move with it.
         let db = thread_fixture("thread-seed-preview-transcript.db").await;
         mark_done_child(&db).await;
-        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        write_intent("Getting the fleet onto lease-based residency.").await;
 
         let before = DigestPreview::of(
             &compose_thread_seed(&db, THREAD_JOB, NOW)
@@ -4206,18 +4349,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_thread_with_no_arc_is_told_so_rather_than_given_a_generated_one() {
-        let db = thread_fixture("thread-seed-no-arc.db").await;
+    async fn a_thread_with_no_intent_is_told_so_rather_than_given_a_generated_one() {
+        let db = thread_fixture("thread-seed-no-intent.db").await;
         mark_done_child(&db).await;
 
         let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(
-            seed.content
-                .contains("No arc has been authored for this thread yet"),
-            "the missing-arc notice is the only substitute for an authored arc"
+            seed.content.contains(INTENT_MISSING_NOTICE),
+            "the missing-intent notice is the only substitute for an authored intent"
         );
-        // The mechanical half still works: a missing arc is a soft dependency.
+        assert!(seed.content.contains(JOURNAL_EMPTY_NOTICE));
+        // The mechanical half still works: a missing intent is a soft dependency.
         assert!(seed.content.contains(DONE_CHILD));
     }
 
@@ -4244,15 +4387,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_arc_changes_the_seed_without_changing_the_chapters() {
+    async fn the_intent_changes_the_seed_without_changing_the_chapters() {
         // Authored intent and generated chapters are produced by different
         // things, so editing one must not move the other.
-        let db = thread_fixture("thread-seed-arc-independence.db").await;
+        let db = thread_fixture("thread-seed-intent-independence.db").await;
         mark_done_child(&db).await;
-        write_arc(&db, 1, "FIRST INTENT").await;
+        write_intent("FIRST INTENT").await;
         let first = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
-        write_arc(&db, 2, "SECOND INTENT").await;
+        write_intent("SECOND INTENT").await;
         let second = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
         assert!(first.content.contains("FIRST INTENT"));
@@ -4280,7 +4423,7 @@ mod tests {
                 recency_start_block: first.recency_start_block,
                 consumed_child_issue_ids: first.consumed_child_issue_ids.clone(),
                 minted_eras: first.minted_eras.clone(),
-                arc_bytes: first.arc_bytes,
+                record_bytes: first.record_bytes,
                 eras_through_seq: first.eras_through_seq,
             },
             1_000,
@@ -4330,7 +4473,7 @@ mod tests {
                 recency_start_block: first.recency_start_block,
                 consumed_child_issue_ids: first.consumed_child_issue_ids.clone(),
                 minted_eras: first.minted_eras.clone(),
-                arc_bytes: first.arc_bytes,
+                record_bytes: first.record_bytes,
                 eras_through_seq: first.eras_through_seq,
             },
             1_000,
@@ -4393,27 +4536,44 @@ mod tests {
         assert!(compose_thread_seed(&db, THREAD_JOB, NOW).await.is_err());
     }
 
-    #[test]
-    fn the_canonical_arc_schema_declares_the_fields_this_composer_reads() {
-        let schema =
-            crate::output_schemas::load_embedded_preset_schema(crate::threads::ARC_ARTIFACT_NAME)
-                .expect("the arc preset is embedded");
-        let properties = schema["properties"]
-            .as_object()
-            .expect("the arc schema declares properties");
-        for field in ["current_intent", "working"] {
-            assert!(
-                properties.contains_key(field),
-                "the arc schema dropped {field}"
-            );
-        }
-        // Decisions are tenets and open questions live in the thread store;
-        // neither is an arc field.
-        for field in ["rulings", "open_questions"] {
-            assert!(
-                !properties.contains_key(field),
-                "the arc schema declares {field}"
-            );
+    #[tokio::test]
+    async fn the_starter_schema_declares_the_columns_this_composer_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::threads::db_store::open_path(dir.path().join("schema.db"))
+            .await
+            .unwrap();
+        for (table, columns) in [
+            (
+                "intent",
+                &["id", "current_intent", "working", "updated_at"][..],
+            ),
+            (
+                "journal",
+                &[
+                    "id",
+                    "ts",
+                    "kind",
+                    "note",
+                    "refs",
+                    "resolution",
+                    "resolved_at",
+                ][..],
+            ),
+        ] {
+            let declared = store
+                .query_all(
+                    format!("SELECT name FROM pragma_table_info('{table}')"),
+                    (),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap();
+            for column in columns {
+                assert!(
+                    declared.iter().any(|name| name == column),
+                    "`{table}` dropped `{column}`: {declared:?}"
+                );
+            }
         }
     }
 
@@ -4439,22 +4599,6 @@ mod tests {
     fn an_overview_skips_the_clock_stamp_and_the_system_reminder() {
         let content = "[Fri 23:19 PST — resumed after 1m]\n\n<system-reminder>noise</system-reminder>\nLand the residency lease change. Then look at the panel.";
         assert_eq!(first_sentence(content), "Land the residency lease change");
-    }
-
-    #[test]
-    fn an_arc_in_an_unrecognized_shape_is_passed_through_whole() {
-        // The compactor is not allowed to decide that authored intent it does not
-        // recognize was unimportant.
-        let data = serde_json::json!({ "content": "free-form arc the thread wrote" });
-        assert_eq!(render_arc_data(&data), "free-form arc the thread wrote");
-    }
-
-    #[test]
-    fn the_prose_fallback_ignores_embedded_collections() {
-        let data = serde_json::json!({
-            "rulings": [{ "text": "Park the migration", "status": "accepted" }]
-        });
-        assert_eq!(render_arc_data(&data), "");
     }
 
     // ── Relevance ranking ────────────────────────────────────────────────────────
@@ -4509,7 +4653,6 @@ mod tests {
                 db,
                 &TenetSelection {
                     thread_id: "thread",
-                    thread_name: "topic",
                     project_id: "p",
                     project_key: "prj",
                     own,
@@ -4523,11 +4666,15 @@ mod tests {
             .collect()
     }
 
-    fn arc_uri() -> String {
-        format!(
-            "{}/arc",
-            cairn_common::uri::build_thread_uri("prj", "topic")
+    /// An open child of `topic`, whose vector stands for the thread's work.
+    async fn open_child_uri(db: &LocalDb) -> String {
+        db.execute_script(
+            "INSERT INTO issues (id, project_id, number, title, status, parent_thread_id, created_at, updated_at)
+               VALUES ('work', 'p', 39, 'Work', 'active', 'thread', 1, 1);",
         )
+        .await
+        .unwrap();
+        "cairn://p/prj/39".to_string()
     }
 
     fn with_recent_evidence(mut view: TenetView, at: i64) -> TenetView {
@@ -4545,7 +4692,7 @@ mod tests {
     #[tokio::test]
     async fn relevance_orders_own_tenets_by_score_then_appends_near_related_ones() {
         let db = relevance_db("seed-relevance-order.db").await;
-        store_vector(&db, &arc_uri(), &[1.0, 0.0, 0.0]).await;
+        store_vector(&db, &open_child_uri(&db).await, &[1.0, 0.0, 0.0]).await;
         store_vector(&db, "cairn://p/prj/tenets/1", &[0.6, 0.8, 0.0]).await;
         store_vector(&db, "cairn://p/prj/tenets/2", &[1.0, 0.0, 0.0]).await;
         store_vector(&db, "cairn://p/prj/tenets/4", &[0.6, 0.8, 0.0]).await;
@@ -4623,7 +4770,7 @@ mod tests {
     #[tokio::test]
     async fn ranking_reads_stored_vectors_only_and_never_embeds() {
         let db = relevance_db("seed-relevance-no-network.db").await;
-        store_vector(&db, &arc_uri(), &[1.0, 0.0, 0.0]).await;
+        store_vector(&db, &open_child_uri(&db).await, &[1.0, 0.0, 0.0]).await;
         let own: Vec<TenetView> = (1..=3)
             .map(|n| tenet(n, TenetStatus::Approved, "Rule"))
             .collect();
@@ -4659,11 +4806,11 @@ mod tests {
                 own: false,
             },
         ];
-        let rendered = render_arc_projection(
-            &projection(vec![own, tenet(2, TenetStatus::Declined, "Drop leases")]),
+        let rendered = render_thread_record(
+            &record(vec![own, tenet(2, TenetStatus::Declined, "Drop leases")]),
             &ranked,
         );
-        let tenets = rendered.find("### Tenets\n").unwrap();
+        let tenets = rendered.find("### Approved\n").unwrap();
         let related_at = rendered
             .find("### Related tenets from other threads\n")
             .unwrap_or_else(|| panic!("{rendered}"));
@@ -4690,8 +4837,8 @@ mod tests {
             &format!("Far. {}", "w ".repeat(1_200)),
         );
         far.proposing_thread = "prj/other".into();
-        let rendered = render_arc_projection(
-            &projection(vec![big.clone()]),
+        let rendered = render_thread_record(
+            &record(vec![big.clone()]),
             &[
                 RankedTenet {
                     tenet: big,

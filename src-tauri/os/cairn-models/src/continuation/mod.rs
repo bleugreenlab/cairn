@@ -727,7 +727,7 @@ mod tests {
     fn a_cold_rebuild_must_show_what_it_saves() {
         // CAIRN-4618's census, read correctly: an expiry compaction replaced
         // ~195,077 bytes of verbatim turns with ~921 bytes of chapter lines. The
-        // seed still carries the recent window and the arc, so call the delivered
+        // seed still carries the recent window and the record, so call the delivered
         // seed 20 KB — the rebuild sends a ninth of what native resume would.
         let saved = 195_077 - 921;
         let seed_bytes = 20_000;

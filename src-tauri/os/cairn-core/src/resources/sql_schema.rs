@@ -6,15 +6,35 @@ pub(crate) const OVERVIEW_DEFAULT_TABLES: usize = 40;
 pub(crate) const OVERVIEW_MAX_TABLES: usize = 200;
 const OVERVIEW_MAX_COLUMNS: usize = 8;
 
-/// The canonical predicate for user-owned tables in a thread database.
+/// The tables a database's catalog lists: everything but engine storage and
+/// the `_cairn_`-prefixed app contract. In a thread database that includes the
+/// app-known starter record (`intent`, `journal`), which is addressable through
+/// the row grammar like any table the thread made.
 ///
 /// Prefix comparison is deliberate: `_` is a wildcard in SQL `LIKE`, which
 /// would also hide unrelated names such as `xcairn_notes`.
-pub(crate) const USER_TABLE_PREDICATE: &str = "type = 'table'
+pub(crate) const CATALOG_TABLE_PREDICATE: &str = "type = 'table'
   AND substr(name, 1, 7) <> 'sqlite_'
   AND substr(name, 1, 17) <> '__turso_internal_'
   AND substr(name, 1, 7) <> '_cairn_'
   AND name <> 'cairn_schema_migrations'";
+
+/// The tables a thread made for itself: the catalog less the starter record,
+/// which the seed renders in sections of its own.
+pub(crate) const USER_TABLE_PREDICATE: &str = "type = 'table'
+  AND substr(name, 1, 7) <> 'sqlite_'
+  AND substr(name, 1, 17) <> '__turso_internal_'
+  AND substr(name, 1, 7) <> '_cairn_'
+  AND name <> 'cairn_schema_migrations'
+  AND name NOT IN ('intent', 'journal')";
+
+/// Whether `name` is schema Cairn owns: the `_cairn_` contract, the migration
+/// ledger, and the app-known starter record.
+pub(crate) fn is_cairn_owned(name: &str) -> bool {
+    name.starts_with("_cairn_")
+        || name == "cairn_schema_migrations"
+        || crate::threads::db_schema::APP_TABLES.contains(&name)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OverviewParams {
@@ -48,7 +68,7 @@ pub(crate) async fn render_source(db: &LocalDb) -> DbResult<String> {
                 let kind = row.get::<String>(0)?;
                 let name = row.get::<String>(1)?;
                 let sql = row.get::<String>(2)?;
-                let owner = if name.starts_with("_cairn_") || name == "cairn_schema_migrations" {
+                let owner = if is_cairn_owned(&name) {
                     "cairn-owned"
                 } else {
                     "agent-owned"
@@ -136,7 +156,8 @@ pub(crate) async fn render_overview(
 type IndexEntry = (String, Option<String>);
 
 struct Catalog {
-    /// User tables, by name.
+    /// Listed tables: the app-known starter record first, then the rest by
+    /// name.
     tables: Vec<String>,
     /// Every index in the catalog by its table, each list ordered by index
     /// name. Read from `sqlite_schema` itself so no kind of index (non-unique,
@@ -151,7 +172,7 @@ async fn read_catalog(db: &LocalDb) -> DbResult<Catalog> {
         .query_all(
             format!(
                 "SELECT type, name, tbl_name, sql FROM sqlite_schema \
-                 WHERE ({USER_TABLE_PREDICATE}) OR type = 'index' \
+                 WHERE ({CATALOG_TABLE_PREDICATE}) OR type = 'index' \
                  ORDER BY name"
             ),
             (),
@@ -176,6 +197,10 @@ async fn read_catalog(db: &LocalDb) -> DbResult<Catalog> {
             catalog.tables.push(name);
         }
     }
+    // Stable, so each half keeps its name order.
+    catalog
+        .tables
+        .sort_by_key(|name| !crate::threads::db_schema::APP_TABLES.contains(&name.as_str()));
     Ok(catalog)
 }
 
@@ -264,7 +289,12 @@ async fn describe_table(
                 };
                 size_note(high_water, counted)
             };
-            let mut lines = vec![format!("{table}({}){size}", columns.join(", "))];
+            let owner = if is_cairn_owned(&table) {
+                " · cairn-owned shape, rows are yours"
+            } else {
+                ""
+            };
+            let mut lines = vec![format!("{table}({}){size}{owner}", columns.join(", "))];
 
             if detail {
                 for (name, sql) in indexes {
@@ -383,6 +413,9 @@ async fn table_document(
                 "maxRowid": max_rowid,
                 "primaryKey": shape.primary_key().map(|column| column.name.clone()),
             });
+            if is_cairn_owned(&table) {
+                entry["cairnOwned"] = json!(true);
+            }
             if count {
                 let sql = format!("SELECT count(*) FROM {}", quote_identifier(&table));
                 let mut rows = conn.query(sql, ()).await?;

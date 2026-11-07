@@ -2,16 +2,12 @@ use crate::routes::TriggerClause;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The thread's living document, addressed as `cairn:~/arc`. The name is the
-/// artifact's identity, the key of its version chain, and the preset schema it
-/// validates against — one string, so the three cannot drift apart.
-pub const ARC_ARTIFACT_NAME: &str = "arc";
-
+/// A thread keeps no artifacts: its authored record is its database's
+/// `intent` and `journal` (`cairn://skills/thread-db`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadDefinition {
     pub agent: String,
-    pub artifacts: Vec<String>,
     pub triggers: Vec<TriggerClause>,
 }
 
@@ -19,9 +15,6 @@ impl ThreadDefinition {
     pub fn validate(&self) -> Result<(), String> {
         if self.agent.trim().is_empty() {
             return Err("thread definition must contain exactly one agent".into());
-        }
-        if self.artifacts != [ARC_ARTIFACT_NAME] {
-            return Err("thread definition must declare exactly the arc artifact".into());
         }
         let registry = crate::routes::FactRegistry::default();
         for clause in &self.triggers {
@@ -39,7 +32,6 @@ impl ThreadDefinition {
 pub fn default_thread_definition() -> ThreadDefinition {
     ThreadDefinition {
         agent: "thread".into(),
-        artifacts: vec![ARC_ARTIFACT_NAME.into()],
         triggers: Vec::new(),
     }
 }
@@ -70,18 +62,21 @@ mod tests {
 
     #[test]
     fn rejects_zero_or_multiple_agents() {
+        assert!(resolve_thread_definition(Some(r#"{"agent":"","triggers":[]}"#)).is_err());
         assert!(
-            resolve_thread_definition(Some(r#"{"agent":"","artifacts":[],"triggers":[]}"#))
-                .is_err()
+            resolve_thread_definition(Some(r#"{"agent":["one","two"],"triggers":[]}"#)).is_err()
         );
-        assert!(resolve_thread_definition(Some(
-            r#"{"agent":["one","two"],"artifacts":[],"triggers":[]}"#
+    }
+
+    /// The arc retired with the `artifacts` key; a definition naming it is a
+    /// definition from before, and says so rather than being half-read.
+    #[test]
+    fn a_definition_declaring_artifacts_is_refused() {
+        let error = resolve_thread_definition(Some(
+            r#"{"agent":"thread","artifacts":["arc"],"triggers":[]}"#,
         ))
-        .is_err());
-        assert!(resolve_thread_definition(Some(
-            r#"{"agent":"thread","artifacts":[],"triggers":[]}"#
-        ))
-        .is_err());
+        .unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
     }
 
     /// Any clause the fact registry accepts is a standing trigger; the registry
@@ -93,12 +88,12 @@ mod tests {
             r#"[{"fact":"file_changed","pathPrefix":"src/ui/"}]"#,
         ] {
             resolve_thread_definition(Some(&format!(
-                r#"{{"agent":"thread","artifacts":["arc"],"triggers":{triggers}}}"#
+                r#"{{"agent":"thread","triggers":{triggers}}}"#
             )))
             .unwrap_or_else(|error| panic!("{triggers}: {error}"));
         }
         let error = resolve_thread_definition(Some(
-            r#"{"agent":"thread","artifacts":["arc"],"triggers":[{"fact":"file_changed","folderPrefix":"src/"}]}"#,
+            r#"{"agent":"thread","triggers":[{"fact":"file_changed","folderPrefix":"src/"}]}"#,
         ))
         .unwrap_err();
         assert!(error.contains("unknown field"), "{error}");

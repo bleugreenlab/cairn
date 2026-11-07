@@ -152,6 +152,9 @@ pub(crate) fn pressure_relieves_itself(evidence: &HostPressureEvidence) -> bool 
             HostPressureCondition::MemoryAvailable { .. }
             | HostPressureCondition::ResidentOccupancy { .. }
             | HostPressureCondition::CpuUtilization { .. }
+            // A memory stall ends as the work thrashing the host finishes or
+            // is killed, which is the machine being busy, not broken.
+            | HostPressureCondition::MemoryStall { .. }
             // Telemetry goes blind when the machine is too loaded to sample
             // itself, so the work already running is what clears it: the
             // sampler gets its turn back as that work drains. Waiting is the
@@ -543,7 +546,16 @@ mod tests {
         assert!(settled(&held(vec![HostPressureCondition::MemoryAvailable {
             available_bytes: 1,
             floor_bytes: 2,
-            unmeasured_hold_bytes: 0
+            owed_bytes: 0,
+            owing: Vec::new(),
+        }]))
+        .is_capacity());
+        assert!(settled(&held(vec![HostPressureCondition::MemoryStall {
+            full_avg10_millis: 230,
+            entry_millis: 100,
+            clear_millis: 20,
+            stalled_since_unix_ms: 1,
+            measured_at_unix_ms: 2,
         }]))
         .is_capacity());
         assert!(!settled(&held(vec![HostPressureCondition::DiskFree {
@@ -559,7 +571,8 @@ mod tests {
             HostPressureCondition::MemoryAvailable {
                 available_bytes: 1,
                 floor_bytes: 2,
-                unmeasured_hold_bytes: 0
+                owed_bytes: 0,
+                owing: Vec::new(),
             },
             HostPressureCondition::DiskFree {
                 free_bytes: 1,

@@ -357,8 +357,9 @@ async fn rulings_from_both_sources_become_numbered_migrated_tenets_exactly_once(
         1
     );
     assert_eq!(
-        count(&a, "SELECT COUNT(*) FROM _cairn_open_questions").await,
-        1
+        count(&a, "SELECT COUNT(*) FROM journal WHERE kind = 'question'").await,
+        1,
+        "the store's open question is a journal row once the starter record lands"
     );
 
     // A third boot, with A's table gone and its ledger row present, takes the
@@ -374,12 +375,12 @@ async fn rulings_from_both_sources_become_numbered_migrated_tenets_exactly_once(
     assert!(entity.contains("migrated ruling"), "{entity}");
 }
 
-/// A failed boot import leaves no trace, and the thread keeps running. Its arc
-/// read copies the open questions (writing an arc-import marker) and its next
-/// prose patch stores an arc without the `rulings` key. Neither may hide the
-/// arc-only rulings from the next boot's retry.
+/// A failed boot import leaves no trace, and the boot goes on: the intent
+/// import moves the arc's intent and open questions into the thread's record,
+/// writing an arc-import marker. That marker must not hide the arc-only
+/// rulings from the next boot's retry.
 #[tokio::test]
-async fn arc_reads_and_writes_after_a_failed_import_do_not_hide_arc_rulings_from_the_retry() {
+async fn the_intent_import_after_a_failed_ruling_import_does_not_hide_arc_rulings_from_the_retry() {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
     db.execute_script(
@@ -411,27 +412,20 @@ async fn arc_reads_and_writes_after_a_failed_import_do_not_hide_arc_rulings_from
     ruling_row(&staged, "table-only", "Only in the table", "accepted", 10).await;
     drop(staged);
 
-    // No import has committed. The thread reads its arc, then patches its prose.
-    let orch = orchestrator(&temp, db.clone());
-    let read = common::read_resource(&orch, "cairn://p/retry/thread-f/arc").await;
-    assert!(read.contains("Still open?"), "{read}");
-    let patched = common::change_resource(
-        &orch,
-        json!([{"target": "cairn://p/retry/thread-f/arc", "mode": "patch",
-                "payload": {"working": "moving on"}}]),
-    )
-    .await;
-    assert!(patched.contains("version 2"), "{patched}");
-    let latest = db
-        .query_one(
-            "SELECT data FROM artifacts WHERE job_id = 'j-retry-f' ORDER BY version DESC LIMIT 1",
-            (),
-            |row| row.text(0),
-        )
-        .await
-        .unwrap();
-    assert!(!latest.contains("rulings"), "{latest}");
+    // No ruling import has committed. The intent import runs anyway.
+    let mut intents = cairn_core::threads::intent_import::IntentImportReport::default();
+    cairn_core::threads::intent_import::import_database(&db, &mut intents).await;
+    assert!(intents.errors.is_empty(), "{:?}", intents.errors);
+    assert_eq!((intents.intents, intents.questions), (1, 1));
     let store = db_store::open("retry-f").await.unwrap();
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM intent WHERE current_intent = 'Carry on.'"
+        )
+        .await,
+        1
+    );
     assert_eq!(
         count(&store, "SELECT COUNT(*) FROM _cairn_rulings").await,
         1

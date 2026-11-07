@@ -7,24 +7,23 @@
 //! - Its session must stay cheap to run for weeks. [`compaction`] is the
 //!   mechanism that makes that true: it replaces concluded history with a table
 //!   of contents whose lines are re-readable at their URIs, and keeps the
-//!   thread's authored arc and a recency window verbatim.
+//!   thread's authored record ([`record`]) and a recency window verbatim.
 //! - Its session owns no branch, so direct-to-base tracked writes are refused and
 //!   repository changes go through a child issue. [`commit_refusal_for_job`] is
 //!   the refusal both commit verbs take before they act on a `commit_msg`.
 
-pub mod arc_store;
 pub mod compaction;
 pub mod crud;
-mod db_schema;
+pub(crate) mod db_schema;
 pub mod db_store;
 pub mod definition;
 pub mod era_worker;
 pub mod eras;
+pub mod intent_import;
+pub mod record;
 pub(crate) use cairn_db::lineage::{is_dormant_thread_session, thread_status_conn};
 
-pub use definition::{
-    default_thread_definition, resolve_thread_definition, ThreadDefinition, ARC_ARTIFACT_NAME,
-};
+pub use definition::{default_thread_definition, resolve_thread_definition, ThreadDefinition};
 
 use crate::storage::LocalDb;
 
@@ -210,22 +209,6 @@ pub(crate) async fn session_job_id_by_name_conn(
         .map_err(Into::into)
 }
 
-/// The output contract every thread session job carries: the `arc` preset, by
-/// name. The name resolves through the shared preset registry, so the schema
-/// the thread's arc validates against is the same one the artifact resource
-/// advertises on read.
-pub(crate) fn session_output_contract() -> crate::models::DelegatedOutputContract {
-    crate::models::DelegatedOutputContract {
-        schema_type: crate::models::OutputSchema::Preset(ARC_ARTIFACT_NAME.to_string()),
-        tool_name: None,
-        description: None,
-    }
-}
-
-fn arc_output_contract() -> String {
-    serde_json::to_string(&session_output_contract()).expect("a preset output contract serializes")
-}
-
 /// The thread a `(project key, thread name)` coordinate names, or the error a
 /// write to it reports when either does not resolve.
 pub(crate) async fn thread_id_for_coordinate_conn(
@@ -284,41 +267,18 @@ async fn live_session_job_id_conn(
         .map_err(Into::into)
 }
 
-/// What [`ensure_thread_session_conn`] would resolve for the thread at a
-/// coordinate, establishing nothing: `Some` live session job, `None` when a
-/// write would mint one, or the error that write would report (no such project
-/// or thread, or a closed thread with no session to resume).
-pub(crate) async fn planned_thread_session_conn(
-    conn: &cairn_db::storage::TrackedConnection,
-    project_key: &str,
-    name: &str,
-) -> crate::storage::DbResult<Option<String>> {
-    let thread_id = thread_id_for_coordinate_conn(conn, project_key, name).await?;
-    if let Some(job_id) = live_session_job_id_conn(conn, &thread_id).await? {
-        return Ok(Some(job_id));
+/// What a write to a thread's own artifact is told. A thread keeps no
+/// artifacts (tenet 1235): what it authors lives in its database.
+pub(crate) const THREAD_KEEPS_NO_ARTIFACTS: &str = "A thread keeps no artifacts: its intent is `cairn:~/db/intent/1`, its running record `cairn:~/db/journal` (cairn://skills/thread-db); broadcast goes to `cairn://posts`.";
+
+/// The refusal for an artifact named `name` on a thread session, leading with
+/// the arc's retirement when that is what was addressed.
+pub(crate) fn thread_artifact_refusal(name: Option<&str>) -> String {
+    if name == Some(intent_import::RETIRED_ARC_NAME) {
+        format!("`cairn:~/arc` is retired. {THREAD_KEEPS_NO_ARTIFACTS}")
+    } else {
+        THREAD_KEEPS_NO_ARTIFACTS.to_string()
     }
-    let mut rows = conn
-        .query(
-            "SELECT status FROM threads WHERE id = ?1",
-            cairn_db::turso::params![thread_id.as_str()],
-        )
-        .await?;
-    let status = rows
-        .next()
-        .await?
-        .map(|row| row.get::<String>(0))
-        .transpose()?
-        .ok_or_else(|| {
-            crate::storage::DbError::Internal(format!("thread not found: {thread_id}"))
-        })?;
-    let status =
-        crate::models::ThreadStatus::parse(&status).map_err(crate::storage::DbError::Row)?;
-    if !status.is_active() {
-        return Err(crate::storage::DbError::Internal(closed_thread_refusal(
-            &thread_id,
-        )));
-    }
-    Ok(None)
 }
 
 /// The one answer to "which job is this thread's task", addressed the way a URI
@@ -415,24 +375,15 @@ pub(crate) async fn ensure_thread_session_conn(
         .map_err(crate::storage::DbError::Row)?;
 
     let existing_job_id = live_session_job_id_conn(conn, thread_id).await?;
+    // A thread session job carries no output contract: a thread keeps no
+    // artifacts.
     let job_id = if let Some(job_id) = existing_job_id {
-        // A session job minted before the arc had a registered contract carries
-        // none, so its arc writes are stored unvalidated and its `cairn:~/arc`
-        // read has no fields to advertise. Backfilling here means every thread
-        // — migrated or born after the cutover — answers to the same contract,
-        // rather than the answer depending on when the thread was created.
-        conn.execute(
-            "UPDATE jobs SET output_contract = ?1 WHERE id = ?2 AND output_contract IS NULL",
-            cairn_db::turso::params![arc_output_contract().as_str(), job_id.as_str()],
-        )
-        .await?;
         job_id
     } else if !status.is_active() {
         return Err(crate::storage::DbError::Internal(closed_thread_refusal(
             thread_id,
         )));
     } else {
-        let output_contract = arc_output_contract();
         let job_id = cairn_common::ids::mint_child(thread_id);
         let session_id = cairn_common::ids::mint_session_id().into_string();
         let now = chrono::Utc::now().timestamp() as i32;
@@ -441,15 +392,14 @@ pub(crate) async fn ensure_thread_session_conn(
                 id, thread_id, project_id, status, agent_config_id,
                 current_session_id, output_contract, node_name, uri_segment,
                 branch, execution_id, issue_id, model, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'idle', ?4, ?5, ?6, 'thread', 'thread',
-                       NULL, NULL, NULL, ?7, ?8, ?8)",
+             ) VALUES (?1, ?2, ?3, 'idle', ?4, ?5, NULL, 'thread', 'thread',
+                       NULL, NULL, NULL, ?6, ?7, ?7)",
             cairn_db::turso::params![
                 job_id.as_str(),
                 thread_id,
                 project_id.as_str(),
                 definition.agent.as_str(),
                 session_id.as_str(),
-                output_contract.as_str(),
                 model.map(|selection| selection.model.as_str()),
                 now,
             ],

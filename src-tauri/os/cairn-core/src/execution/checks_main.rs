@@ -6949,7 +6949,7 @@ mod tests {
         const TIP: &str = "8a3cd1160000000000000000";
         const SP2_TREE: &str = "2702605c0000000000000000";
         let colocated = "cairn-exec::link_tests::a_colocated_ready_reprobes_the_managed_tools";
-        let arc = "cairn-core::resources::common::tests::arc_affordance_points_collection_operations_to_the_thread_database";
+        let named = "cairn-core::resources::common::tests::artifact_affordance_falls_back_without_properties";
         let born = "cairn-core::resources::common::tests::a_test_born_in_the_bracket";
         let stuck = "cairn-core::stuck";
         let previous = on(
@@ -6960,7 +6960,7 @@ mod tests {
                 HOUR,
                 &[
                     (colocated, TestOutcome::Passed),
-                    (arc, TestOutcome::Passed),
+                    (named, TestOutcome::Passed),
                     (stuck, failed("refresh computed twice")),
                 ],
             ),
@@ -6973,7 +6973,7 @@ mod tests {
                 2 * HOUR,
                 &[
                     (colocated, TestOutcome::Passed),
-                    (arc, TestOutcome::Passed),
+                    (named, TestOutcome::Passed),
                     (born, TestOutcome::Passed),
                     (stuck, TestOutcome::Passed),
                 ],
@@ -6987,7 +6987,7 @@ mod tests {
                 3 * HOUR,
                 &[
                     (colocated, failed("managed tools were not reprobed")),
-                    (arc, failed("assertion `left == right` failed")),
+                    (named, failed("assertion `left == right` failed")),
                     (born, failed("assertion failed: born red")),
                     (stuck, failed("refresh computed twice")),
                 ],

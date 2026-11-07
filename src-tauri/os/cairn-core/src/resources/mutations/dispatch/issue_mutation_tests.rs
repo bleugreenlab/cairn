@@ -3006,7 +3006,7 @@ async fn thread_subtree_mutations_all_have_dispatch_arms() {
 
     let mut covered = 0;
     for path in [
-        "arc",
+        "plan",
         "todos",
         "tasks",
         "wakes",

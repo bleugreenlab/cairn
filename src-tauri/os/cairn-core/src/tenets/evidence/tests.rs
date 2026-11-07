@@ -1778,14 +1778,3 @@ fn nothing_in_tenets_reaches_the_responses_layer() {
         }
     }
 }
-
-#[test]
-fn an_arc_embeds_its_intent_and_working_prose() {
-    let text = crate::embeddings::artifact_embed_text(
-        "arc",
-        &json!({"current_intent": "Ship direct uploads", "working": "Benchmarking the store"}),
-    )
-    .unwrap();
-    assert!(text.contains("Ship direct uploads"));
-    assert!(text.contains("Benchmarking the store"));
-}

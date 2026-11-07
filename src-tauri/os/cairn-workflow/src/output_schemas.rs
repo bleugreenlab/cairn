@@ -16,7 +16,6 @@ fn embedded_preset_schema(schema_name: &str) -> Option<&'static str> {
             "../../../resources/schemas/implementation.json"
         )),
         "return" => Some(include_str!("../../../resources/schemas/return.json")),
-        "arc" => Some(include_str!("../../../resources/schemas/arc.json")),
         // Embedded but deliberately NOT a preset: see `page_is_a_shape_not_an_output_contract`.
         "page" => Some(include_str!("../../../resources/schemas/page.json")),
         _ => None,
@@ -36,11 +35,6 @@ pub const PRESET_SCHEMAS: &[&str] = &[
     "checklist",
     "implementation",
     "return",
-    // The thread's living arc. It is a structured artifact like its siblings —
-    // a thread's session job carries `arc` as its output contract, so a thread
-    // that never existed before the cutover resolves its schema here on the
-    // first `write cairn:~/arc` rather than being refused by name.
-    "arc",
 ];
 
 /// Check if a schema name is a preset
@@ -120,7 +114,6 @@ mod tests {
         assert!(is_preset_schema("checklist"));
         assert!(is_preset_schema("implementation"));
         assert!(is_preset_schema("return"));
-        assert!(is_preset_schema("arc"));
         assert!(!is_preset_schema("custom"));
         assert!(!is_preset_schema(""));
     }
@@ -148,8 +141,7 @@ mod tests {
         // The name list and the embedded registry are two halves of one answer.
         // A name on the list with nothing behind it resolves to an error at
         // write time, and a schema behind a name that is not listed is refused
-        // by name before it is ever read — which is exactly how a new thread
-        // came to be unable to create its arc.
+        // by name before it is ever read.
         for name in PRESET_SCHEMAS {
             let schema = resolve_output_schema(
                 None,

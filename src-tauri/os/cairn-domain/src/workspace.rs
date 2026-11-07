@@ -344,7 +344,8 @@ pub struct Settings {
     /// live it is done only because the window is running out — never because it
     /// would be cheaper.
     pub thread_compact_threshold: f64,
-    /// Approximate token budget for non-arc thread seed context.
+    /// Approximate token budget for thread seed context below its intent and
+    /// journal.
     pub seed_budget_tokens: i32,
     /// Number of recent era summaries rendered into a thread seed.
     pub seed_eras: i32,
@@ -445,7 +446,8 @@ pub struct UpdateSettings {
     pub pending_memory_threshold: Option<i32>,
     /// Fraction of the model's context window at which a warm thread session rebuilds.
     pub thread_compact_threshold: Option<f64>,
-    /// Approximate token budget for non-arc thread seed context.
+    /// Approximate token budget for thread seed context below its intent and
+    /// journal.
     pub seed_budget_tokens: Option<i32>,
     /// Number of recent era summaries rendered into a thread seed.
     pub seed_eras: Option<i32>,

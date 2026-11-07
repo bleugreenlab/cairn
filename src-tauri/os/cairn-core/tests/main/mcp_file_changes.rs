@@ -1199,7 +1199,7 @@ async fn a_task_re_acquiring_the_store_lock_it_holds_fails_fast_and_releases_it(
 
 /// The refusal is keyed on the `commit_msg`, which is the whole surface a
 /// tracked write needs — so a thread keeps every resource mutation it depends on
-/// to do its actual job (arc, children, messages, todos). A guard that fired on
+/// to do its actual job (its record, children, messages, todos). A guard that fired on
 /// authorship rather than on the commit field would silence the thread.
 #[tokio::test]
 async fn a_thread_still_writes_resources() {

@@ -1313,6 +1313,7 @@ async fn run_launch_session_from(
                     disk_growth_bytes: 0,
                     concurrency_units: 1,
                     source: ResourceReservationSource::Declared,
+                    measured_peak_bytes: None,
                 }),
                 process: ResidentProcessSpec {
                     stdout_framing: ResidentStreamFraming::Bytes,

@@ -514,7 +514,10 @@ async fn arc_candidates(db: &LocalDb, thread: &ThreadRow) -> Result<Vec<Candidat
                  WHERE job_id = ?1 AND output_name = ?2
                    AND json_valid(data) AND json_type(data, '$.rulings') IS NOT NULL
                  ORDER BY version DESC LIMIT 1",
-                (job.clone(), crate::threads::ARC_ARTIFACT_NAME.to_string()),
+                (
+                    job.clone(),
+                    crate::threads::intent_import::RETIRED_ARC_NAME.to_string(),
+                ),
                 |row| Ok((row.text(0)?, row.i64(1)?, row.i64(2)?)),
             )
             .await
@@ -623,7 +626,7 @@ async fn log_orphan_arcs(db: &LocalDb) {
             "SELECT DISTINCT a.job_id FROM artifacts a JOIN jobs j ON j.id = a.job_id
              WHERE a.output_name = ?1 AND j.thread_id IS NULL
                AND json_valid(a.data) AND json_array_length(a.data, '$.rulings') > 0",
-            (crate::threads::ARC_ARTIFACT_NAME.to_string(),),
+            (crate::threads::intent_import::RETIRED_ARC_NAME.to_string(),),
             |row| row.text(0),
         )
         .await;

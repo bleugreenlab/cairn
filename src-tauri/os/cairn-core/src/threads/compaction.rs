@@ -15,7 +15,8 @@
 //!   forward across generations so a chapter keeps one stable overview and
 //!   address for the life of the thread.
 //!
-//! The thread's authored arc lives in its own artifact and is never copied here.
+//! The thread's authored record lives in its own store (`intent`, `journal`)
+//! and is never copied here.
 //! Generation and authorship stay separable on purpose: two stores of "where
 //! things stand" is the drift the design exists to avoid.
 
@@ -133,7 +134,10 @@ pub struct AppliedCompaction {
     /// The marks this generation consumed, by child issue id.
     pub consumed_child_issue_ids: Vec<String>,
     pub minted_eras: Vec<EraMint>,
-    pub arc_bytes: i64,
+    /// What the seed's record sections weighed. Stored in the column
+    /// `arc_bytes`, named for the artifact the record replaced: the table syncs
+    /// to team replicas, where a column rename is not safe.
+    pub record_bytes: i64,
     pub eras_through_seq: Option<i64>,
 }
 
@@ -364,7 +368,7 @@ pub async fn persist_generation(
                     applied.candidate_bytes,
                     applied.trigger.as_db(),
                     now,
-                    applied.arc_bytes,
+                    applied.record_bytes,
                     applied.eras_through_seq.unwrap_or(eras_through_seq)
                 ],
             )
@@ -474,7 +478,7 @@ mod tests {
             recency_start_block: 5,
             consumed_child_issue_ids: consumed,
             minted_eras: Vec::new(),
-            arc_bytes: 1_000,
+            record_bytes: 1_000,
             eras_through_seq: None,
         }
     }

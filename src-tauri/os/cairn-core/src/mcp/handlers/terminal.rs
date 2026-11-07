@@ -578,6 +578,7 @@ async fn restart_terminal_process(
         .map_err(|error| error.to_string())?;
     target.selector = selector;
     target.created_by_run_id = row.8.clone();
+    target.replaces = Some(terminal_id.clone());
     // This is the fenced recovery of the row that already owns the slug, not a
     // competing create. New terminal creation performs the live-slug admission
     // check before it reaches this path.
@@ -1453,6 +1454,10 @@ struct TerminalResourceTarget {
     /// recovery. A project terminal speaks for no run, so this is what says who
     /// is answerable for it.
     created_by_run_id: Option<String>,
+    /// The row a recovery restart supersedes, which may still read `running`
+    /// because its process died with the runner. A create replaces only exited
+    /// rows of its slug and leaves this `None`.
+    replaces: Option<String>,
 }
 
 async fn resolve_terminal_resource_target(
@@ -1525,6 +1530,7 @@ async fn resolve_terminal_resource_target(
                         lease: None,
                         selector: None,
                         created_by_run_id: None,
+                        replaces: None,
                     })
                 }
                 CairnResource::TaskTerminal {
@@ -1592,6 +1598,7 @@ async fn resolve_terminal_resource_target(
                         lease: None,
                         selector: None,
                         created_by_run_id: None,
+                        replaces: None,
                     })
                 }
                 CairnResource::ProjectTerminal { project, slug } => {
@@ -1617,6 +1624,7 @@ async fn resolve_terminal_resource_target(
                         lease: None,
                         selector: None,
                         created_by_run_id: None,
+                        replaces: None,
                     })
                 }
                 _ => Err(crate::storage::DbError::Row(
@@ -1677,9 +1685,11 @@ async fn insert_terminal_resource(
     let lease = target.lease.clone();
     let selector = crate::fleet::residency::persisted_resident_selector(target.selector.as_ref());
     let created_by_run_id = target.created_by_run_id.clone();
+    let replaces = target.replaces.clone();
 
     db.write(|conn| {
         let created_by_run_id = created_by_run_id.clone();
+        let replaces = replaces.clone();
         let job_id = job_id.clone();
         let project_id = project_id.clone();
         let run_id = run_id.clone();
@@ -1694,25 +1704,41 @@ async fn insert_terminal_resource(
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp() as i32;
             let id = Uuid::new_v4().to_string();
-            // Reclaim a lingering exited row for this (scope, slug). The
-            // create-availability check only blocks running slugs, so an exited
-            // row could still collide with the unique (scope, slug) index.
-            match job_id.as_deref() {
-                Some(job_id) => {
-                    conn.execute(
-                        "DELETE FROM job_terminals WHERE job_id = ?1 AND slug = ?2",
-                        (job_id, slug.as_str()),
-                    )
-                    .await?;
-                }
-                None => {
-                    conn.execute(
-                        "DELETE FROM job_terminals WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2",
-                        (project_id.as_str(), slug.as_str()),
-                    )
-                    .await?;
-                }
+            // Free the slug in the unique (scope, slug) index: reclaim its
+            // lingering exited rows and the row a restart supersedes, never
+            // another live row. Creation's availability read runs before this
+            // transaction, so two creates can both pass it; the recheck here
+            // refuses the later one instead of deleting the earlier one's live
+            // terminal, and the index makes a concurrent pair collide into it.
+            let (scope, scope_id) = match job_id.as_deref() {
+                Some(job_id) => ("job_id = ?1", job_id),
+                None => ("project_id = ?1 AND job_id IS NULL", project_id.as_str()),
+            };
+            let mut live = conn
+                .query(
+                    format!(
+                        "SELECT 1 FROM job_terminals
+                          WHERE {scope} AND slug = ?2 AND status != 'exited'
+                            AND (?3 IS NULL OR id != ?3)
+                          LIMIT 1"
+                    ),
+                    (scope_id, slug.as_str(), replaces.as_deref()),
+                )
+                .await?;
+            if live.next().await?.is_some() {
+                return Err(crate::storage::DbError::Row(format!(
+                    "A running terminal already exists in this scope: {slug}"
+                )));
             }
+            drop(live);
+            conn.execute(
+                format!(
+                    "DELETE FROM job_terminals
+                      WHERE {scope} AND slug = ?2 AND (status = 'exited' OR id = ?3)"
+                ),
+                (scope_id, slug.as_str(), replaces.as_deref()),
+            )
+            .await?;
             conn.execute(
                 "
                 INSERT INTO job_terminals (
@@ -3722,6 +3748,7 @@ mod terminal_finalize_tests {
             lease: None,
             selector: None,
             created_by_run_id: None,
+            replaces: None,
         }
     }
 
@@ -4358,6 +4385,7 @@ mod terminal_finalize_tests {
                 lease: Some(fence.clone()),
                 selector: None,
                 created_by_run_id: None,
+                replaces: None,
             },
             fence,
         )
@@ -6415,6 +6443,72 @@ mod terminal_finalize_tests {
                 .any(|sub| sub.source_ref.as_deref() == Some(uri)),
             "an absent terminal must not leave an immortal one-shot subscription"
         );
+    }
+
+    /// Two creates of one slug that each passed the availability read, which
+    /// runs before the insert's transaction. Whichever inserts second, in
+    /// sequence or in a race the unique index settles, must be refused rather
+    /// than delete the first one's running row as if it were a lingering exited
+    /// one (cairn/6166). Looped, from two OS threads: two tasks on one test
+    /// runtime did not interleave these transactions when measured.
+    #[test]
+    fn racing_creates_of_one_slug_never_delete_the_running_row() {
+        use crate::storage::RowExt;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = runtime.block_on(crate::storage::migrated_test_db("term_slug_create_race.db"));
+        runtime.block_on(seed(&db));
+        for round in 0..100 {
+            let slug = format!("race-{round}");
+            let (target, _) = test_terminal_target(&slug);
+            let barrier = std::sync::Barrier::new(2);
+            let created: Vec<String> = std::thread::scope(|scope| {
+                let creates: Vec<_> = ["a", "b"]
+                    .into_iter()
+                    .map(|who| {
+                        let (db, target, barrier) = (&db, &target, &barrier);
+                        let (handle, session) = (runtime.handle().clone(), format!("{slug}-{who}"));
+                        scope.spawn(move || {
+                            barrier.wait();
+                            handle
+                                .block_on(insert_terminal_resource(
+                                    db,
+                                    target,
+                                    &session,
+                                    "sleep 100",
+                                    None,
+                                    None,
+                                ))
+                                .map(|()| session)
+                        })
+                    })
+                    .collect();
+                creates
+                    .into_iter()
+                    .filter_map(|create| create.join().unwrap().ok())
+                    .collect()
+            });
+            let running = runtime
+                .block_on(db.query_all(
+                    "SELECT session_id FROM job_terminals
+                      WHERE job_id = 'j' AND slug = ?1 AND status = 'running'",
+                    (slug.clone(),),
+                    |row| row.text(0),
+                ))
+                .unwrap();
+            assert_eq!(
+                created.len(),
+                1,
+                "round {round}: exactly one create of a slug succeeds, got {created:?}"
+            );
+            assert_eq!(
+                running, created,
+                "round {round}: the create that succeeded owns the running row"
+            );
+        }
     }
 
     /// Reusing a slug must not transfer a prior incarnation's wake to the new

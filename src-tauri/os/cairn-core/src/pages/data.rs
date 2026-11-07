@@ -12,7 +12,7 @@ pub(crate) const DEFAULT_ENTRY: &str = "index.js";
 pub const MAX_PAGE_BYTES: usize = 1 << 20;
 
 /// The `output_name` a page is stored under. The prefix keeps a page called
-/// `arc` or `plan` from colliding with the living artifacts of that name.
+/// `plan` or `review` from colliding with the artifacts of that name.
 pub(crate) fn output_name(name: &str) -> String {
     format!("pages/{name}")
 }

@@ -1363,11 +1363,8 @@ pub(crate) async fn produce_cairn_resource(
             | CairnResource::ThreadService { .. }
     ) && find_query_value(&split.params, "format") == Some("json");
     // A raw artifact read returns the stored JSON and nothing else, so a caller
-    // can parse the read result directly. That holds for the arc too, whose JSON
-    // projection is prose only because its rulings and open questions are rows
-    // in the thread database rather than artifact fields: the place to say so is
-    // the Markdown affordance and the refusal on a write that carries them, not
-    // trailing Markdown appended to a machine channel.
+    // can parse the read result directly: guidance belongs in the Markdown
+    // affordance, not appended to a machine channel.
     let affordance = if raw_artifact {
         None
     } else {
@@ -3943,7 +3940,7 @@ mod tests {
             "y".repeat(2_500)
         );
         let mut meta = SegmentMeta::new(
-            "cairn://p/prj/1/1/node/arc?format=json",
+            "cairn://p/prj/1/1/node/plan?format=json",
             SegmentKind::Resource,
             NaturalUnit::Line,
         );
@@ -4890,9 +4887,10 @@ line2', X'0001020AFF', 2.5),
     /// sub-resource got the generic thread block, which advertised only
     /// patch/append/delete and said nothing about what the descendant accepts.
     ///
-    /// It also pins the arc's machine channel: `?format=json` is the prose
-    /// alone, and a legacy arc ruling reads back exactly through the tenet the
-    /// boot import made of it.
+    /// It also pins what became of the retired arc: its address answers with
+    /// where a thread's record lives now and its last version as history, and
+    /// a legacy arc ruling reads back exactly through the tenet the boot import
+    /// made of it.
     #[tokio::test]
     async fn thread_descendants_read_with_their_node_familys_affordances() {
         use crate::db::DbState;
@@ -4901,8 +4899,8 @@ line2', X'0001020AFF', 2.5),
         use crate::storage::{LocalDb, SearchIndex};
 
         let dir = tempfile::tempdir().unwrap();
-        // The arc read opens the thread's own store; without this it would be
-        // created under the real CAIRN_HOME.
+        // The boot import opens the thread's own store; without this it would
+        // be created under the real CAIRN_HOME.
         crate::threads::db_store::use_test_path("t-ux", dir.path().join("t-ux.db"));
         let local = LocalDb::open_migrated_for_test(dir.path().join("thread-read.db"))
             .await
@@ -4978,31 +4976,25 @@ line2', X'0001020AFF', 2.5),
             assert!(!rendered.content.contains("/0/0/"), "{}", rendered.content);
         }
 
-        // (d) the affordance block is the delegated kind's, so it advertises the
-        // mutations that descendant actually accepts.
+        // (d) the retired arc's address says where the record lives now, then
+        // carries its last version as history, which tenet evidence and posts
+        // still cite.
         let arc = produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/arc").await;
-        assert!(arc.content.contains("The canonical arc — café"));
-        assert_ne!(arc.content, stored_arc);
-        let block = arc.affordance.map(|a| a.block).unwrap_or_default();
-        assert!(block.contains("[propose a tenet]"), "{block}");
         assert!(
-            block.contains("[append one open question in the thread database]"),
-            "{block}"
+            arc.content.starts_with("`cairn:~/arc` is retired."),
+            "{}",
+            arc.content
         );
-        assert!(!block.contains("_cairn_rulings"), "{block}");
-
-        // The JSON projection is the stored prose only, byte for byte: rulings
-        // are tenets and open questions are thread-database rows, so neither is
-        // inlined, and non-ASCII text is not escaped.
-        let raw =
-            produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/arc?format=json")
-                .await;
-        assert_eq!(
-            raw.content,
-            "{\n  \"current_intent\": \"The canonical arc — café\"\n}"
+        assert!(
+            arc.content.contains("cairn:~/db/intent/1"),
+            "{}",
+            arc.content
         );
-        assert!(raw.affordance.is_none());
-        assert!(!raw.content.contains("## actions"));
+        assert!(
+            arc.content.contains("The canonical arc — café"),
+            "{}",
+            arc.content
+        );
 
         // The ruling the arc carried reads back exactly from its tenet: its text
         // is the tenet's one statement, escaped quote and newline intact; an

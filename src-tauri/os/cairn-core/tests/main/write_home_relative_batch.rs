@@ -1,11 +1,11 @@
 //! `cairn:~` across one write batch.
 //!
 //! A new thread's first two canonical actions are renaming itself off its
-//! `thread-<n>` placeholder and writing its arc. Sent as one batch, the rename
-//! moves the very home the arc item names — and the write handler resolves every
-//! home-relative target to canonical before ANY item applies, because
-//! blocking-append classification reads the raw target ahead of dispatch. The
-//! arc item therefore used to be dispatched at the pre-rename address and
+//! `thread-<n>` placeholder and writing its intent. Sent as one batch, the
+//! rename moves the very home the intent item names — and the write handler
+//! resolves every home-relative target to canonical before ANY item applies,
+//! because blocking-append classification reads the raw target ahead of
+//! dispatch. The second item therefore used to be dispatched at the pre-rename address and
 //! rejected with `Thread 'thread-7' not found in hom`: a name the caller never
 //! typed, which by then genuinely did not exist.
 //!
@@ -29,6 +29,10 @@ async fn fixture() -> (
     let (temp, db, orch, _repo) = common::project_resource_fixture(PROJECT).await;
     common::seed_authenticated_thread_run(&db, &format!("project-{PROJECT}"), PLACEHOLDER, RUN)
         .await;
+    cairn_core::threads::db_store::use_test_path(
+        &format!("thread-{RUN}"),
+        temp.path().join("thread-store.db"),
+    );
     (temp, db, orch)
 }
 
@@ -70,47 +74,44 @@ async fn thread_name(db: &LocalDb) -> String {
     .unwrap()
 }
 
-/// The job that owns the stored arc, or `None` when no arc was ever written.
-async fn arc_owner(db: &LocalDb) -> Option<String> {
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT job_id FROM artifacts WHERE output_name = 'arc' LIMIT 1",
-                    (),
-                )
-                .await?;
-            rows.next().await?.map(|row| row.opt_text(0)).transpose()
-        })
-    })
-    .await
-    .unwrap()
-    .flatten()
+/// The thread's written intent, or `None` while its intent row is unwritten.
+async fn written_intent() -> Option<String> {
+    let store = cairn_core::threads::db_store::open(&format!("thread-{RUN}"))
+        .await
+        .unwrap();
+    store
+        .query_opt_text(
+            "SELECT current_intent FROM intent WHERE id = 1 AND updated_at IS NOT NULL",
+            (),
+        )
+        .await
+        .unwrap()
 }
 
 fn rename_to(name: &str) -> serde_json::Value {
     json!({ "target": "cairn:~", "mode": "patch", "payload": { "name": name } })
 }
 
-fn create_arc(intent: &str) -> serde_json::Value {
+fn patch_intent(intent: &str) -> serde_json::Value {
     json!({
-        "target": "cairn:~/arc",
-        "mode": "create",
+        "target": "cairn:~/db/intent/1",
+        "mode": "patch",
         "payload": { "current_intent": intent }
     })
 }
 
-/// The motivating batch: rename this thread, then write its arc, in one call.
-/// Both items land, and the arc lands on the thread under its NEW name.
+/// The motivating batch: rename this thread, then write its intent, in one
+/// call. Both items land, and the intent lands in the thread under its NEW
+/// name.
 #[tokio::test]
-async fn a_thread_renames_itself_and_writes_its_arc_in_one_batch() {
+async fn a_thread_renames_itself_and_writes_its_intent_in_one_batch() {
     let (_temp, db, orch) = fixture().await;
 
     let result = common::change_resource_as_run(
         &orch,
         json!([
             rename_to("execution"),
-            create_arc("Placing work on machines.")
+            patch_intent("Placing work on machines.")
         ]),
         Some(RUN),
     )
@@ -121,23 +122,20 @@ async fn a_thread_renames_itself_and_writes_its_arc_in_one_batch() {
         "the rename must land: {result}"
     );
     assert!(
-        result.contains("version 1"),
-        "the arc must land in the same batch: {result}"
-    );
-    assert!(
         !result.contains("not found"),
         "nothing in this batch addresses a thread that does not exist: {result}"
     );
     assert!(
-        result.contains(&format!("cairn://p/{PROJECT}/execution/arc")),
-        "the arc item resolves against the renamed thread: {result}"
+        result.contains(&format!(
+            "Updated cairn://p/{PROJECT}/execution/db/intent/1"
+        )),
+        "the intent item resolves against the renamed thread: {result}"
     );
 
     assert_eq!(thread_name(&db).await, "execution");
     assert_eq!(
-        arc_owner(&db).await.as_deref(),
-        Some(format!("job-{RUN}").as_str()),
-        "the arc lands on the renamed thread's own session job"
+        written_intent().await.as_deref(),
+        Some("Placing work on machines.")
     );
 }
 
@@ -152,13 +150,13 @@ async fn an_item_that_resolves_through_a_failed_rename_names_the_rename() {
     // and item 1's resolution is left hanging off a rename that never happened.
     let result = common::change_resource_as_run(
         &orch,
-        json!([rename_to("Execution_Thread"), create_arc("Placing work.")]),
+        json!([rename_to("Execution_Thread"), patch_intent("Placing work.")]),
         Some(RUN),
     )
     .await;
 
     assert!(
-        result.contains("item 1's `cairn:~/arc` resolves through item 0's rename"),
+        result.contains("item 1's `cairn:~/db/intent/1` resolves through item 0's rename"),
         "the dependent item must name the rename it resolved through: {result}"
     );
     assert!(
@@ -176,7 +174,7 @@ async fn an_item_that_resolves_through_a_failed_rename_names_the_rename() {
         "a refused rename leaves the thread where it was"
     );
     assert_eq!(
-        arc_owner(&db).await,
+        written_intent().await,
         None,
         "the dependent item wrote nothing"
     );
@@ -188,14 +186,16 @@ async fn an_item_that_resolves_through_a_failed_rename_names_the_rename() {
 /// it happened to reach used.
 #[tokio::test]
 async fn an_unresolvable_home_fails_the_item_naming_the_shorthand() {
-    let (_temp, db, orch) = fixture().await;
+    let (_temp, _db, orch) = fixture().await;
 
     // No run id: there is no authenticated run whose home `cairn:~` could name.
     let result =
-        common::change_resource_as_run(&orch, json!([create_arc("Placing work.")]), None).await;
+        common::change_resource_as_run(&orch, json!([patch_intent("Placing work.")]), None).await;
 
     assert!(
-        result.contains("`cairn:~/arc` names the calling run's home, which could not be resolved"),
+        result.contains(
+            "`cairn:~/db/intent/1` names the calling run's home, which could not be resolved"
+        ),
         "the refusal must name the shorthand and say what failed: {result}"
     );
     assert!(
@@ -203,7 +203,7 @@ async fn an_unresolvable_home_fails_the_item_naming_the_shorthand() {
             && result.contains("`cairn://p/PROJECT/...`"),
         "an outside caller is told where `~` resolves and what to address instead: {result}"
     );
-    assert_eq!(arc_owner(&db).await, None, "nothing was written");
+    assert_eq!(written_intent().await, None, "nothing was written");
 }
 
 /// Whatever a home-derived item fails on, the rejection names the bridge the
@@ -215,26 +215,24 @@ async fn an_unresolvable_home_fails_the_item_naming_the_shorthand() {
 async fn a_home_derived_failure_names_the_shorthand_and_what_it_resolved_to() {
     let (_temp, _db, orch) = fixture().await;
 
-    common::change_resource_as_run(&orch, json!([create_arc("Placing work.")]), Some(RUN)).await;
-
     let result = common::change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn:~/arc",
+            "target": "cairn:~/db/intent/1",
             "mode": "patch",
-            "payload": { "census": "a field the arc does not have" }
+            "payload": { "census": "a column the intent row does not have" }
         }]),
         Some(RUN),
     )
     .await;
 
     assert!(
-        result.contains("has no field"),
+        result.contains("census"),
         "the underlying rejection survives: {result}"
     );
     assert!(
         result.contains(&format!(
-            "(`cairn:~/arc` resolved to `cairn://p/{PROJECT}/{PLACEHOLDER}/arc`)"
+            "(`cairn:~/db/intent/1` resolved to `cairn://p/{PROJECT}/{PLACEHOLDER}/db/intent/1`)"
         )),
         "the rejection must name the shorthand and its canonical target: {result}"
     );
@@ -246,7 +244,7 @@ async fn a_home_derived_failure_names_the_shorthand_and_what_it_resolved_to() {
 /// rather than dispatched as an ordinary resource write.
 #[tokio::test]
 async fn a_home_relative_tasks_append_is_still_classified_as_a_blocking_append() {
-    let (_temp, db, orch) = fixture().await;
+    let (_temp, _db, orch) = fixture().await;
 
     let result = common::change_resource_as_run(
         &orch,
@@ -277,9 +275,9 @@ async fn a_home_relative_tasks_append_is_still_classified_as_a_blocking_append()
         "the blocking group must be the path that ran: {result}"
     );
     assert_eq!(
-        arc_owner(&db).await,
+        written_intent().await,
         None,
-        "a tasks append writes no artifact"
+        "a tasks append writes no record"
     );
 }
 

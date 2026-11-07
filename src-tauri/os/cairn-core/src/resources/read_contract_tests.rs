@@ -43,7 +43,7 @@ const FORBIDDEN_IN_READ: &[&str] = &[
     ".get(hash)",
     "reconstruct_events",
     "db_store::",
-    "arc_store::",
+    "record::",
 ];
 
 /// `(file suffix, function, reason)` for a read call this scan misjudges.

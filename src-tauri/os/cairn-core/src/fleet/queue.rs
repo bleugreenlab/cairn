@@ -2954,6 +2954,7 @@ pub(super) mod tests {
     fn cpu_pressured() -> PostedCondition {
         PostedCondition::Pressure {
             cpu_pressured: true,
+            memory_stalled: false,
             memory_short: false,
         }
     }
@@ -2993,6 +2994,7 @@ pub(super) mod tests {
 
         *posted.borrow_mut() = PostedCondition::Pressure {
             cpu_pressured: false,
+            memory_stalled: false,
             memory_short: false,
         };
         assert!(queue.supersede_declines_for("machine", 100_000, still_posted));

@@ -276,8 +276,8 @@ pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnEr
 
     let id = ids::mint_child(&input.project_id);
     let now = chrono::Utc::now().timestamp();
-    // A thread's arc collections are app-owned SQL, so its database is part of
-    // birth rather than lazy user state. Install it before establishing the
+    // A thread's starter record (`intent`, `journal`) is app-owned SQL, so its
+    // database is part of birth rather than lazy user state. Install it before establishing the
     // first session; if the primary transaction fails, remove the unowned file.
     let store_path = super::db_store::initialize_for_creation(&id, db.path())
         .await
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_mints_current_arc_tables_before_any_database_resource_access() {
+    async fn creation_mints_the_starter_record_before_any_database_resource_access() {
         let db = db("thread-eager-database.db").await;
         seed_project(&db, "project-a").await;
 
@@ -560,15 +560,17 @@ mod tests {
             .query_one(
                 "SELECT
                    (SELECT COUNT(*) FROM sqlite_schema WHERE name = '_cairn_rulings'),
-                   (SELECT COUNT(*) FROM _cairn_open_questions),
-                   (SELECT COUNT(*) FROM cairn_schema_migrations WHERE version IN ('0001', '0002'))",
+                   (SELECT COUNT(*) FROM intent WHERE id = 1 AND updated_at IS NULL),
+                   (SELECT COUNT(*) FROM journal WHERE resolved_at IS NULL),
+                   (SELECT COUNT(*) FROM cairn_schema_migrations WHERE version IN ('0001', '0002', '0005'))",
                 (),
-                |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?)),
+                |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?, row.i64(3)?)),
             )
             .await
             .unwrap();
-        // A fresh store passes the import guard: 0002 runs on an empty table.
-        assert_eq!(shape, (0, 0, 2));
+        // A fresh store passes the import guard (0002 runs on an empty table)
+        // and is born with an unwritten intent row and an empty journal.
+        assert_eq!(shape, (0, 1, 0, 3));
     }
 
     /// An absent name is the server's cue to allocate, and allocation counts
@@ -892,7 +894,6 @@ mod tests {
 
         let definition = serde_json::json!({
             "agent": "thread",
-            "artifacts": ["arc"],
             "triggers": [{
                 "fact": "attention",
                 "detailUri": "cairn://p/project-a/9",

@@ -3963,9 +3963,9 @@ pub const CPU_ADMISSION_SAMPLE_INTERVAL_MS: u64 = 5_000;
 /// far shorter than the minutes a genuinely starved sampler goes quiet for.
 pub const CPU_ADMISSION_BLIND_AFTER_MS: u64 = 3 * CPU_ADMISSION_SAMPLE_INTERVAL_MS;
 
-/// Available memory a non-interactive admission must leave the machine beyond
-/// what the arriving request asks for, and beyond the memory the executor is
-/// already holding for resident work it has never measured. Room for the
+/// The least available memory a non-interactive admission must leave the
+/// machine, once what admitted work still owes is subtracted, when the
+/// arriving request asks for less ([`admission_memory_floor`]). Room for the
 /// operating system, the executor, and the request's own error in estimating
 /// itself.
 ///
@@ -3973,6 +3973,21 @@ pub const CPU_ADMISSION_BLIND_AFTER_MS: u64 = 3 * CPU_ADMISSION_SAMPLE_INTERVAL_
 /// while the machine's posted memory is still below it, and the two ends must
 /// agree on where that line is.
 pub const ADMISSION_MEMORY_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The available memory a non-interactive request asking for
+/// `requested_bytes` must leave once what admitted work still owes is
+/// subtracted.
+pub fn admission_memory_floor(requested_bytes: u64) -> u64 {
+    ADMISSION_MEMORY_FLOOR_BYTES.max(requested_bytes)
+}
+
+/// Whether a machine is too short of memory to admit: available memory, less
+/// what admitted work still owes, under the request's floor. The one
+/// subtraction the executor's admission and the runner's placement both make,
+/// so the two cannot come to disagree about the same machine (tenet 834).
+pub fn memory_short(available_bytes: u64, owed_bytes: u64, floor_bytes: u64) -> bool {
+    available_bytes.saturating_sub(owed_bytes) < floor_bytes
+}
 
 /// How old an executor's machine reading may be before a reader must treat it
 /// as history rather than as the machine's current state.
@@ -3985,13 +4000,52 @@ pub const ADMISSION_MEMORY_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// most likely to be far below the truth (CAIRN-4627).
 pub const MACHINE_READING_STALE_AFTER_MS: u64 = CPU_ADMISSION_BLIND_AFTER_MS;
 
+/// One instrument of the host-stall brake: a reading of how stalled the host
+/// is, held to its own entry and clear bars with hysteresis.
+///
+/// The brake is one mechanism with named instruments rather than one brake per
+/// signal, so every instrument shares the tracker, the blindness rule, the
+/// placement hold and the page's rendering. CPU saturation and memory stall
+/// (PSI `full`) gate admission today (tenet 1309). I/O stall is priced, never
+/// gated (tenet 1139); it is the next instrument only once that tenet moves
+/// (cairn/5658), and adding it is one more variant and one more field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StallInstrument {
+    /// Non-idle share of processor time.
+    Cpu,
+    /// Share of wall time every non-idle task was stalled on memory at once
+    /// (PSI `full` avg10).
+    Memory,
+}
+
+impl StallInstrument {
+    pub const ALL: [Self; 2] = [Self::Cpu, Self::Memory];
+
+    /// The reading this instrument is, in the vocabulary blindness is
+    /// reported in.
+    pub fn measurement(self) -> MachineMeasurement {
+        match self {
+            Self::Cpu => MachineMeasurement::Cpu,
+            Self::Memory => MachineMeasurement::Memory,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Memory => "Memory",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum CpuAdmissionState {
-    /// No utilization reading has ever been taken on this machine — the first
-    /// sample is still establishing its baseline, or this platform has no CPU
-    /// probe at all. Reachable only before the first successful sample: nothing
-    /// afterwards returns here, because a machine cannot stop having measured.
+pub enum StallInstrumentState {
+    /// No reading has ever been taken by this instrument on this machine — the
+    /// first sample is still establishing its baseline, or this platform has no
+    /// probe for it at all (memory stall off Linux, or a kernel without PSI).
+    /// Reachable only before the first successful sample: nothing afterwards
+    /// returns here, because a machine cannot stop having measured.
     #[default]
     Unknown,
     Accepting,
@@ -4007,18 +4061,51 @@ pub enum CpuAdmissionState {
 // parties that can: every consumer already holds `measured_at_unix_ms` and a
 // clock, which is the whole answer. `measured_at_unix_ms.is_none()` means never
 // measured; an age past `CPU_ADMISSION_BLIND_AFTER_MS` means blind; otherwise
-// the state below is the verdict. One definition, derived wherever it is read.
+// the state below is the verdict. One definition, derived wherever it is read:
+// [`StallInstrumentHealth::blind_age_ms`] and [`StallInstrumentHealth::fresh`].
 
+/// One instrument's sustained verdict, with the reading it was last drawn from.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct CpuAdmissionHealth {
-    pub state: CpuAdmissionState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub utilization: Option<f64>,
+pub struct StallInstrumentHealth {
+    pub state: StallInstrumentState,
+    /// The last reading, a fraction from 0 to 1: utilization for CPU, the
+    /// fully-stalled share of wall time for memory. Serialized as
+    /// `utilization`, the name it carried while CPU was the only instrument,
+    /// so the wire shape did not move when memory joined.
+    #[serde(
+        default,
+        rename = "utilization",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reading: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_since_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at_unix_ms: Option<u64>,
+}
+
+impl StallInstrumentHealth {
+    /// How old the last reading is, when that age makes this instrument blind:
+    /// it measured, and has not for longer than [`CPU_ADMISSION_BLIND_AFTER_MS`].
+    /// `None` for an instrument that never measured, which is not blind.
+    pub fn blind_age_ms(&self, now_unix_ms: u64) -> Option<u64> {
+        let age = now_unix_ms.saturating_sub(self.measured_at_unix_ms?);
+        (age > CPU_ADMISSION_BLIND_AFTER_MS).then_some(age)
+    }
+
+    /// Whether the verdict speaks for the machine now: measured, and recently.
+    pub fn fresh(&self, now_unix_ms: u64) -> bool {
+        self.measured_at_unix_ms.is_some_and(|measured_at| {
+            now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_BLIND_AFTER_MS
+        })
+    }
+
+    /// Whether this instrument holds new non-interactive work now: pressured
+    /// on a fresh reading.
+    pub fn holds(&self, now_unix_ms: u64) -> bool {
+        self.state == StallInstrumentState::Pressured && self.fresh(now_unix_ms)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -4459,7 +4546,7 @@ pub struct LearnedResourceEstimate {
 /// existed.
 ///
 /// Bumped to 67 because a stale CPU reading now brakes admission instead of
-/// releasing it. An executor at 66 wipes [`CpuAdmissionHealth`] to its default
+/// releasing it. An executor at 66 wipes `CpuAdmissionHealth` to its default
 /// on any missed sample and on any policy write, so a machine that had been
 /// measuring for hours reports `measuredAtUnixMs: null` — indistinguishable
 /// from a platform with no CPU probe, and admitted against as if idle. One at
@@ -7053,6 +7140,25 @@ pub struct LearnedResourceEstimate {
 /// talking to an older executor gets nothing wrong: that executor reads the
 /// 500 as a failed request like any other non-success, and no longer mistakes
 /// a runner fault for its own credential having been refused.
+///
+/// cairn/5578 does not move the number. It adds a memory instrument to the
+/// host-stall brake and an owed-memory sum to admission, and every shape it
+/// adds is a defaulted field or variant beside an unchanged one:
+/// `memoryAdmission` beside `cpuAdmission` on [`HostHealth`], [`MachineSample`]
+/// and [`ExecutorRuntimePolicy`]; [`HostPressureCondition::MemoryStall`];
+/// `owedBytes` and `owing` on [`HostPressureCondition::MemoryAvailable`];
+/// [`AdmissionHealth::owed_memory_bytes`]; `memoryStalled` and
+/// `owedMemoryBytes` on [`AdmissionHoldEvidence::Pressure`]; and
+/// [`ResourceReservation::measured_peak_bytes`]. The CPU types were renamed in
+/// Rust only; their serialized names did not move. What a runner gets wrong
+/// talking to an older executor: nothing it decodes differently. That
+/// executor posts no memory instrument, which reads as never measured and
+/// fails open, exactly as a platform without PSI does; and it posts no owed
+/// sum, so the runner charges what it has placed there from the reservations
+/// it holds, which makes the runner the stricter side and a mixed fleet
+/// resolve closed. An older runner ignores the new keys and holds on CPU and
+/// available memory as before, while the newer executor's own admission
+/// enforces the rest.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 166;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -8977,6 +9083,13 @@ pub struct ResourceReservation {
     pub concurrency_units: u32,
     #[serde(default)]
     pub source: ResourceReservationSource,
+    /// The most this work has been measured to hold, never declared (tenet
+    /// 946): the larger of this machine's own learned tree peak and the
+    /// learned largest-process demand. Admission charges a running command the
+    /// larger of this and `memory_bytes` until its tree has grown into it.
+    /// `None` when nothing has been measured anywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_peak_bytes: Option<u64>,
 }
 
 const fn default_concurrency_units() -> u32 {
@@ -8990,6 +9103,7 @@ impl Default for ResourceReservation {
             disk_growth_bytes: 0,
             concurrency_units: default_concurrency_units(),
             source: ResourceReservationSource::Unmeasured,
+            measured_peak_bytes: None,
         }
     }
 }
@@ -9005,6 +9119,12 @@ impl ResourceReservation {
     /// budget can never fit, so an unclamped saturating demand would queue until
     /// its deadline instead of running.
     pub const WHOLE_MACHINE_CONCURRENCY: u32 = u32::MAX;
+
+    /// What a running command with this reservation is charged against
+    /// memory: its reservation, or its measured peak where that is larger.
+    pub fn memory_charge_bytes(&self) -> u64 {
+        self.memory_bytes.max(self.measured_peak_bytes.unwrap_or(0))
+    }
 }
 
 /// What a project needs of a machine before that machine can prepare a cell
@@ -10298,18 +10418,22 @@ pub enum StorageFailureKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum HostPressureCondition {
+    /// Available memory, less what admitted work still owes, is under the
+    /// floor the arriving request must leave: `available_bytes - owed_bytes <
+    /// floor_bytes`.
     MemoryAvailable {
         available_bytes: u64,
+        /// `max(ADMISSION_MEMORY_FLOOR_BYTES, requested)`.
         floor_bytes: u64,
-        /// How much of `floor_bytes` is held for resident work whose demand has
-        /// never been measured, rather than asked for by the arriving request.
-        ///
-        /// Without this the floor is a number with no derivation: an operator
-        /// reading "floor 112 GiB" against a request that asked for 16 cannot
-        /// tell a policy from a bug. Defaulted so an executor that predates the
-        /// hold still deserializes.
+        /// What running commands and unmeasured residents have yet to take:
+        /// each one's charge (the larger of its reservation and its measured
+        /// peak) less what its tree holds now. Available memory is a lagging
+        /// signal, and this is the growth it has not seen yet.
         #[serde(default)]
-        unmeasured_hold_bytes: u64,
+        owed_bytes: u64,
+        /// The work that owes it, each with its charge and current resident.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        owing: Vec<OwingWork>,
     },
     DiskFree {
         free_bytes: u64,
@@ -10326,6 +10450,17 @@ pub enum HostPressureCondition {
         state_since_unix_ms: u64,
         measured_at_unix_ms: u64,
     },
+    /// The host-stall brake's memory instrument holds: every non-idle task has
+    /// been stalled on memory (PSI `full` avg10) at or above the entry bar for
+    /// the entry window, and has not yet stayed under the clear bar long
+    /// enough to release.
+    MemoryStall {
+        full_avg10_millis: u32,
+        entry_millis: u32,
+        clear_millis: u32,
+        stalled_since_unix_ms: u64,
+        measured_at_unix_ms: u64,
+    },
     /// A reading admission decides on has stopped moving on a machine that was
     /// producing it. Named by the same [`MachineMeasurement`] the runner's
     /// placement seam reports blindness with, so the two ends of the fleet
@@ -10336,6 +10471,86 @@ pub enum HostPressureCondition {
         age_ms: u64,
         blind_after_ms: u64,
     },
+}
+
+/// One piece of admitted work that has yet to take memory it is charged:
+/// a running command, or a resident whose demand is unmeasured.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwingWork {
+    pub subject: LiveUsageSubject,
+    #[serde(rename = "slotId")]
+    pub cell_id: String,
+    /// The command line, for a command; absent for a resident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The larger of its reservation and its measured peak.
+    pub charge_bytes: u64,
+    /// What its tree holds now, or `None` before the sampler has read it, in
+    /// which case it owes its whole charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_bytes: Option<u64>,
+}
+
+impl OwingWork {
+    pub fn owed_bytes(&self) -> u64 {
+        self.charge_bytes
+            .saturating_sub(self.resident_bytes.unwrap_or(0))
+    }
+
+    /// `` `cargo check` in slot-118: 9.0 GiB charged, 0.4 GiB resident ``.
+    pub fn describe(&self) -> String {
+        let what = match (&self.command, &self.subject) {
+            (Some(command), _) => format!("`{command}` in {}", self.cell_id),
+            (None, LiveUsageSubject::Resident { process_key, .. }) => {
+                format!("resident {process_key} in {}", self.cell_id)
+            }
+            (None, LiveUsageSubject::Command { request_id, .. }) => {
+                format!("request {request_id} in {}", self.cell_id)
+            }
+        };
+        let resident = self
+            .resident_bytes
+            .map_or_else(|| "not yet read".to_string(), describe_gib);
+        format!(
+            "{what}: {} charged, {resident} resident",
+            describe_gib(self.charge_bytes)
+        )
+    }
+}
+
+/// The refusal [`HostPressureCondition::MemoryAvailable`] reads as, with its
+/// numbers: `memory short: available 6.1 GiB less 17.4 GiB owed by 2 running
+/// commands (...), under the 2.0 GiB floor`.
+pub fn describe_memory_short(
+    available_bytes: u64,
+    owed_bytes: u64,
+    owing: &[OwingWork],
+    floor_bytes: u64,
+) -> String {
+    let mut out = format!(
+        "memory short: available {} less {} owed",
+        describe_gib(available_bytes),
+        describe_gib(owed_bytes)
+    );
+    if !owing.is_empty() {
+        out.push_str(&format!(
+            " by {} running {} ({})",
+            owing.len(),
+            if owing.len() == 1 {
+                "command"
+            } else {
+                "commands"
+            },
+            owing
+                .iter()
+                .map(OwingWork::describe)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    out.push_str(&format!(", under the {} floor", describe_gib(floor_bytes)));
+    out
 }
 
 // This protocol is JSON-only, and JSON cannot represent non-finite numbers.
@@ -11069,6 +11284,7 @@ impl ResidencyFootprint {
             disk_growth_bytes: self.disk_growth_bytes,
             concurrency_units: 0,
             source: ResourceReservationSource::Declared,
+            measured_peak_bytes: None,
         }
     }
 }
@@ -11544,6 +11760,7 @@ impl CellOccupancy {
             disk_growth_bytes: 0,
             concurrency_units: 0,
             source: ResourceReservationSource::Declared,
+            measured_peak_bytes: None,
         };
         for (key, process) in self.live_processes() {
             let fallback = ResourceReservation::default();
@@ -12409,6 +12626,16 @@ pub struct AdmissionHealth {
     pub memory_capacity_bytes: Option<u64>,
     pub disk_growth_capacity_bytes: Option<u64>,
     pub active_reservation: ResourceReservation,
+    /// What admitted work still owes this machine's memory: the executor's own
+    /// owed sum, which its admission subtracts from available memory before
+    /// comparing with the floor. Placement subtracts the same figure. `None`
+    /// from an executor that predates the sum, which the runner then answers
+    /// from the reservations of the commands it placed there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owed_memory_bytes: Option<u64>,
+    /// The work behind `owed_memory_bytes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owing: Vec<OwingWork>,
     pub queued_reservation_bytes: u64,
     pub accepted_count: u64,
     pub rejected_count: u64,
@@ -13296,11 +13523,16 @@ impl MachineTelemetry {
 #[serde(rename_all = "camelCase")]
 pub struct HostHealth {
     pub pressure: Option<HostPressureEvidence>,
-    /// The executor's sustained-pressure verdict. This is separate from the
+    /// The host-stall brake's sustained CPU verdict. This is separate from the
     /// latest machine reading because admission acts on hysteresis, not a
     /// single sample.
     #[serde(default)]
-    pub cpu_admission: CpuAdmissionHealth,
+    pub cpu_admission: StallInstrumentHealth,
+    /// The host-stall brake's sustained memory-stall verdict. Defaulted, so an
+    /// executor that predates it reads as never having measured memory stall,
+    /// which fails open.
+    #[serde(default)]
+    pub memory_admission: StallInstrumentHealth,
     pub logical_cores: Option<usize>,
     pub tokio_worker_count: Option<usize>,
     pub tokio_alive_tasks: Option<usize>,
@@ -13418,7 +13650,9 @@ pub struct MachineSample {
     #[serde(default)]
     pub gpus: Measurement<Vec<GpuDevice>>,
     #[serde(default)]
-    pub cpu_admission: CpuAdmissionHealth,
+    pub cpu_admission: StallInstrumentHealth,
+    #[serde(default)]
+    pub memory_admission: StallInstrumentHealth,
     /// What each executing command attempt and each resident process is using
     /// now, from the process-tree sampler's last window. A platform with no
     /// tree sampler (Windows) reports [`MeasurementGap::UnsupportedPlatform`]
@@ -13442,8 +13676,42 @@ impl MachineSample {
             memory_pressure: report.host.memory_pressure.clone(),
             gpus: report.host.gpus.clone(),
             cpu_admission: report.host.cpu_admission.clone(),
+            memory_admission: report.host.memory_admission.clone(),
             live_usage: Measurement::default(),
         }
+    }
+
+    pub fn stall(&self, instrument: StallInstrument) -> &StallInstrumentHealth {
+        match instrument {
+            StallInstrument::Cpu => &self.cpu_admission,
+            StallInstrument::Memory => &self.memory_admission,
+        }
+    }
+}
+
+impl HostHealth {
+    /// One instrument of the host-stall brake.
+    pub fn stall(&self, instrument: StallInstrument) -> &StallInstrumentHealth {
+        match instrument {
+            StallInstrument::Cpu => &self.cpu_admission,
+            StallInstrument::Memory => &self.memory_admission,
+        }
+    }
+
+    pub fn stall_mut(&mut self, instrument: StallInstrument) -> &mut StallInstrumentHealth {
+        match instrument {
+            StallInstrument::Cpu => &mut self.cpu_admission,
+            StallInstrument::Memory => &mut self.memory_admission,
+        }
+    }
+
+    /// The first instrument that measured and has gone blind, with its age.
+    pub fn blind_stall_instrument(&self, now_unix_ms: u64) -> Option<(StallInstrument, u64)> {
+        StallInstrument::ALL.into_iter().find_map(|instrument| {
+            self.stall(instrument)
+                .blind_age_ms(now_unix_ms)
+                .map(|age| (instrument, age))
+        })
     }
 }
 
@@ -13565,11 +13833,16 @@ impl ExecutorSubstrateReport {
         adopted |= newer(&mut host.io_pressure, &sample.io_pressure);
         adopted |= newer(&mut host.memory_pressure, &sample.memory_pressure);
         adopted |= newer(&mut host.gpus, &sample.gpus);
-        // `None` orders before every stamp, so a brake that has never measured
-        // never displaces one that has.
-        if sample.cpu_admission.measured_at_unix_ms > host.cpu_admission.measured_at_unix_ms {
-            host.cpu_admission = sample.cpu_admission.clone();
-            adopted = true;
+        // Instrument by instrument, each by its own stamp. `None` orders before
+        // every stamp, so an instrument that has never measured never displaces
+        // one that has.
+        for instrument in StallInstrument::ALL {
+            let candidate = sample.stall(instrument);
+            let current = host.stall_mut(instrument);
+            if candidate.measured_at_unix_ms > current.measured_at_unix_ms {
+                *current = candidate.clone();
+                adopted = true;
+            }
         }
         adopted
     }
@@ -13764,7 +14037,11 @@ impl IoPressure {
 /// How much of the time every non-idle task on the host was stalled waiting
 /// for memory at once (Linux PSI `full` in `/proc/pressure/memory`): a machine
 /// reclaiming and swapping instead of working. Measured, rendered and priced
-/// the way [`IoPressure`] is, and never an admission gate.
+/// the way [`IoPressure`] is. Past the host-stall brake's memory bound it also
+/// holds new non-interactive admission: `full_avg10_millis` is the reading the
+/// brake's [`StallInstrument::Memory`] instrument tracks, because the ten-second
+/// window is the one that still shows a stall while it is happening. PSI `full`
+/// already counts tasks stalled on swap-in, so swap is not a second instrument.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryPressure {
@@ -14485,47 +14762,90 @@ pub struct ExecutorRuntimePolicy {
     /// that budget above this floor, across the materialized pool.
     #[serde(default = "default_slot_target_max_bytes")]
     pub slot_target_max_bytes: u64,
-    #[serde(default)]
-    pub cpu_admission: CpuAdmissionPolicy,
+    /// The host-stall brake's CPU instrument bars.
+    #[serde(default = "default_cpu_admission")]
+    pub cpu_admission: StallInstrumentPolicy,
+    /// The host-stall brake's memory instrument bars. Defaulted, so a policy
+    /// written before the memory instrument loads with its defaults.
+    #[serde(default = "default_memory_admission")]
+    pub memory_admission: StallInstrumentPolicy,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CpuAdmissionPolicy {
-    pub entry_utilization: f64,
-    pub clear_utilization: f64,
-    pub entry_window_ms: u64,
-    pub clear_window_ms: u64,
+pub fn default_cpu_admission() -> StallInstrumentPolicy {
+    StallInstrumentPolicy::CPU_DEFAULT
 }
 
-impl Default for CpuAdmissionPolicy {
-    fn default() -> Self {
-        Self {
-            entry_utilization: 0.90,
-            clear_utilization: 0.75,
-            entry_window_ms: 15_000,
-            clear_window_ms: 10_000,
+pub fn default_memory_admission() -> StallInstrumentPolicy {
+    StallInstrumentPolicy::MEMORY_DEFAULT
+}
+
+impl ExecutorRuntimePolicy {
+    /// The bars `instrument` is held to.
+    pub fn stall_policy(&self, instrument: StallInstrument) -> StallInstrumentPolicy {
+        match instrument {
+            StallInstrument::Cpu => self.cpu_admission,
+            StallInstrument::Memory => self.memory_admission,
         }
     }
 }
 
-impl CpuAdmissionPolicy {
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.entry_utilization.is_finite() || !(0.0..=1.0).contains(&self.entry_utilization) {
-            return Err(
-                "CPU admission entry utilization must be a finite fraction in [0, 1]".into(),
-            );
+/// One instrument's bars: the brake engages once the reading has stayed at or
+/// above `entry` for `entry_window_ms`, and releases once it has stayed at or
+/// below `clear` for `clear_window_ms`. Readings are fractions from 0 to 1.
+///
+/// The bars serialize as `entryUtilization` and `clearUtilization`, the names
+/// they carried while CPU was the only instrument, for every instrument: one
+/// wire shape, unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StallInstrumentPolicy {
+    #[serde(rename = "entryUtilization")]
+    pub entry: f64,
+    #[serde(rename = "clearUtilization")]
+    pub clear: f64,
+    pub entry_window_ms: u64,
+    pub clear_window_ms: u64,
+}
+
+impl StallInstrumentPolicy {
+    /// CPU: hold at 90% busy for 15 s, release at 75% for 10 s.
+    pub const CPU_DEFAULT: Self = Self {
+        entry: 0.90,
+        clear: 0.75,
+        entry_window_ms: 15_000,
+        clear_window_ms: 10_000,
+    };
+
+    /// Memory: hold once every task has been stalled on memory for a tenth of
+    /// wall time across 10 s, and release only after 30 s at 2% or less. The
+    /// clear window is long because a host that has just stopped thrashing
+    /// has reclaimed its way there and is the host most likely to start again.
+    pub const MEMORY_DEFAULT: Self = Self {
+        entry: 0.10,
+        clear: 0.02,
+        entry_window_ms: 10_000,
+        clear_window_ms: 30_000,
+    };
+
+    pub fn validate(&self, instrument: StallInstrument) -> Result<(), String> {
+        let name = instrument.label();
+        if !self.entry.is_finite() || !(0.0..=1.0).contains(&self.entry) {
+            return Err(format!(
+                "{name} brake entry must be a finite fraction in [0, 1]"
+            ));
         }
-        if !self.clear_utilization.is_finite() || !(0.0..=1.0).contains(&self.clear_utilization) {
-            return Err(
-                "CPU admission clear utilization must be a finite fraction in [0, 1]".into(),
-            );
+        if !self.clear.is_finite() || !(0.0..=1.0).contains(&self.clear) {
+            return Err(format!(
+                "{name} brake clear must be a finite fraction in [0, 1]"
+            ));
         }
-        if self.clear_utilization >= self.entry_utilization {
-            return Err("CPU admission clear utilization must be below entry utilization".into());
+        if self.clear >= self.entry {
+            return Err(format!("{name} brake clear must be below its entry"));
         }
         if self.entry_window_ms == 0 || self.clear_window_ms == 0 {
-            return Err("CPU admission entry and clear windows must be greater than zero".into());
+            return Err(format!(
+                "{name} brake entry and clear windows must be greater than zero"
+            ));
         }
         Ok(())
     }
@@ -14690,14 +15010,17 @@ impl Default for ExecutorRuntimePolicy {
             storage_critical_free_bytes: default_storage_critical_free_bytes(),
             quarantine_forensic_window_ms: default_quarantine_forensic_window_ms(),
             slot_target_max_bytes: default_slot_target_max_bytes(),
-            cpu_admission: CpuAdmissionPolicy::default(),
+            cpu_admission: StallInstrumentPolicy::CPU_DEFAULT,
+            memory_admission: StallInstrumentPolicy::MEMORY_DEFAULT,
         }
     }
 }
 
 impl ExecutorRuntimePolicy {
     pub fn validate(&self) -> Result<(), String> {
-        self.cpu_admission.validate()?;
+        for instrument in StallInstrument::ALL {
+            self.stall_policy(instrument).validate(instrument)?;
+        }
         if self.concurrency_units == 0 {
             return Err("executor concurrency units must be greater than zero".into());
         }
@@ -16677,13 +17000,19 @@ pub enum AdmissionHoldEvidence {
         holder_entry_id: Option<String>,
         since_unix_ms: u64,
     },
-    /// Sustained CPU pressure, or posted free memory under the floor this
-    /// request would have to leave. `available_memory_bytes` is `None` when the
-    /// machine posted no memory reading.
+    /// A host-stall instrument holding (sustained CPU saturation or memory
+    /// stall), or posted free memory, less what admitted work still owes,
+    /// under the floor this request would have to leave.
+    /// `available_memory_bytes` is `None` when the machine posted no memory
+    /// reading.
     Pressure {
         cpu_pressured: bool,
+        #[serde(default)]
+        memory_stalled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_memory_bytes: Option<u64>,
+        #[serde(default)]
+        owed_memory_bytes: u64,
         memory_floor_bytes: u64,
     },
     /// Free space under the floor admission would charge this request.
@@ -16734,21 +17063,35 @@ impl AdmissionHoldEvidence {
             ),
             Self::Pressure {
                 cpu_pressured,
+                memory_stalled,
                 available_memory_bytes,
+                owed_memory_bytes,
                 memory_floor_bytes,
             } => {
                 let memory = available_memory_bytes
-                    .filter(|available| available < memory_floor_bytes)
+                    .filter(|available| {
+                        available.saturating_sub(*owed_memory_bytes) < *memory_floor_bytes
+                    })
                     .map(|available| {
-                        format!(
-                            "memory {} available (floor {})",
-                            describe_gib(available),
-                            describe_gib(*memory_floor_bytes)
-                        )
+                        if *owed_memory_bytes > 0 {
+                            format!(
+                                "memory {} available less {} owed (floor {})",
+                                describe_gib(available),
+                                describe_gib(*owed_memory_bytes),
+                                describe_gib(*memory_floor_bytes)
+                            )
+                        } else {
+                            format!(
+                                "memory {} available (floor {})",
+                                describe_gib(available),
+                                describe_gib(*memory_floor_bytes)
+                            )
+                        }
                     });
                 let parts: Vec<String> = cpu_pressured
                     .then(|| "sustained CPU pressure".to_string())
                     .into_iter()
+                    .chain(memory_stalled.then(|| "memory stall".to_string()))
                     .chain(memory)
                     .collect();
                 format!("held: {}", parts.join(", "))
@@ -20807,9 +21150,9 @@ mod tests {
                         8,
                         MeasurementGap::BuildVolumeAbsent,
                     )),
-                    cpu_admission: CpuAdmissionHealth {
-                        state: CpuAdmissionState::Accepting,
-                        utilization: Some(0.5),
+                    cpu_admission: StallInstrumentHealth {
+                        state: StallInstrumentState::Accepting,
+                        reading: Some(0.5),
                         state_since_unix_ms: Some(1),
                         measured_at_unix_ms: Some(8),
                     },
@@ -21331,6 +21674,7 @@ mod tests {
             disk_growth_bytes: 4_096,
             concurrency_units: 1,
             source: ResourceReservationSource::Declared,
+            measured_peak_bytes: None,
         };
         let process = |status: ResidentProcessStatus| ResidentProcess {
             generation: 1,
@@ -21748,6 +22092,7 @@ mod tests {
                     disk_growth_bytes: 4_096,
                     concurrency_units: 1,
                     source: ResourceReservationSource::Learned,
+                    measured_peak_bytes: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),
@@ -21847,6 +22192,7 @@ mod tests {
                 disk_growth_bytes: 20,
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
+                measured_peak_bytes: None,
             },
             learned_estimate: None,
             scratch_sync: None,
@@ -22257,6 +22603,7 @@ mod tests {
                 disk_growth_bytes: 2048,
                 concurrency_units: 0,
                 source: ResourceReservationSource::Declared,
+                measured_peak_bytes: None,
             }),
             live_usage: None,
             charge: None,
@@ -22472,6 +22819,7 @@ mod tests {
             disk_growth_bytes: 64,
             concurrency_units: 1,
             source: ResourceReservationSource::Learned,
+            measured_peak_bytes: None,
         };
         let learned_estimate = LearnedResourceEstimate {
             sample_count: 5,
@@ -22528,7 +22876,24 @@ mod tests {
                     HostPressureCondition::MemoryAvailable {
                         available_bytes: 1,
                         floor_bytes: 2,
-                        unmeasured_hold_bytes: 0,
+                        owed_bytes: 3,
+                        owing: vec![OwingWork {
+                            subject: LiveUsageSubject::Command {
+                                request_id: "request-1".into(),
+                                attempt_id: "attempt-1".into(),
+                            },
+                            cell_id: "slot-1".into(),
+                            command: Some("cargo check".into()),
+                            charge_bytes: 4,
+                            resident_bytes: Some(1),
+                        }],
+                    },
+                    HostPressureCondition::MemoryStall {
+                        full_avg10_millis: 230,
+                        entry_millis: 100,
+                        clear_millis: 20,
+                        stalled_since_unix_ms: 3,
+                        measured_at_unix_ms: 4,
                     },
                     HostPressureCondition::DiskFree {
                         free_bytes: 3,
@@ -22540,9 +22905,15 @@ mod tests {
                     },
                 ],
             }),
-            cpu_admission: CpuAdmissionHealth {
-                state: CpuAdmissionState::Pressured,
-                utilization: Some(0.94),
+            cpu_admission: StallInstrumentHealth {
+                state: StallInstrumentState::Pressured,
+                reading: Some(0.94),
+                state_since_unix_ms: Some(3),
+                measured_at_unix_ms: Some(4),
+            },
+            memory_admission: StallInstrumentHealth {
+                state: StallInstrumentState::Pressured,
+                reading: Some(0.23),
                 state_since_unix_ms: Some(3),
                 measured_at_unix_ms: Some(4),
             },
@@ -23126,6 +23497,8 @@ mod tests {
                     memory_capacity_bytes: Some(22),
                     disk_growth_capacity_bytes: Some(23),
                     active_reservation: reservation.clone(),
+                    owed_memory_bytes: Some(28),
+                    owing: Vec::new(),
                     queued_reservation_bytes: 24,
                     accepted_count: 25,
                     rejected_count: 26,
@@ -24460,61 +24833,146 @@ mod tests {
     }
 
     #[test]
-    fn cpu_admission_policy_defaults_validate_and_legacy_runtime_policy_decodes() {
-        let expected = CpuAdmissionPolicy::default();
-        assert_eq!(expected.entry_utilization, 0.90);
-        assert_eq!(expected.clear_utilization, 0.75);
-        assert_eq!(expected.entry_window_ms, 15_000);
-        assert_eq!(expected.clear_window_ms, 10_000);
-        assert!(expected.validate().is_ok());
+    fn stall_policy_defaults_validate_and_a_policy_without_them_decodes() {
+        let cpu = StallInstrumentPolicy::CPU_DEFAULT;
+        assert_eq!(cpu.entry, 0.90);
+        assert_eq!(cpu.clear, 0.75);
+        assert_eq!(cpu.entry_window_ms, 15_000);
+        assert_eq!(cpu.clear_window_ms, 10_000);
+        let memory = StallInstrumentPolicy::MEMORY_DEFAULT;
+        assert_eq!(memory.entry, 0.10);
+        assert_eq!(memory.clear, 0.02);
+        assert_eq!(memory.entry_window_ms, 10_000);
+        assert_eq!(memory.clear_window_ms, 30_000);
+        assert!(ExecutorRuntimePolicy::default().validate().is_ok());
 
         let mut legacy = serde_json::to_value(ExecutorRuntimePolicy::default()).unwrap();
         legacy.as_object_mut().unwrap().remove("cpuAdmission");
+        legacy.as_object_mut().unwrap().remove("memoryAdmission");
         let decoded: ExecutorRuntimePolicy = serde_json::from_value(legacy).unwrap();
-        assert_eq!(decoded.cpu_admission, expected);
+        assert_eq!(decoded.cpu_admission, cpu);
+        assert_eq!(decoded.memory_admission, memory);
+    }
+
+    /// The CPU bars keep the serialized names they had while CPU was the only
+    /// instrument, and the memory bars are written in the same shape beside
+    /// them, so the policy's wire form only grew.
+    #[test]
+    fn the_stall_policy_wire_shape_only_grew() {
+        let written = serde_json::to_value(ExecutorRuntimePolicy::default()).unwrap();
+        assert_eq!(written["cpuAdmission"]["entryUtilization"], 0.90);
+        assert_eq!(written["cpuAdmission"]["clearWindowMs"], 10_000);
+        assert_eq!(written["memoryAdmission"]["entryUtilization"], 0.10);
+        assert_eq!(written["memoryAdmission"]["clearWindowMs"], 30_000);
+        let health = serde_json::to_value(StallInstrumentHealth {
+            state: StallInstrumentState::Accepting,
+            reading: Some(0.5),
+            state_since_unix_ms: None,
+            measured_at_unix_ms: Some(1),
+        })
+        .unwrap();
+        assert_eq!(health["utilization"], 0.5);
     }
 
     #[test]
-    fn cpu_admission_policy_rejects_invalid_bars_and_windows() {
-        let valid = CpuAdmissionPolicy::default();
-        for invalid in [
-            CpuAdmissionPolicy {
-                entry_utilization: f64::NAN,
-                ..valid
-            },
-            CpuAdmissionPolicy {
-                entry_utilization: 1.01,
-                ..valid
-            },
-            CpuAdmissionPolicy {
-                clear_utilization: -0.01,
-                ..valid
-            },
-            CpuAdmissionPolicy {
-                clear_utilization: valid.entry_utilization,
-                ..valid
-            },
-            CpuAdmissionPolicy {
-                entry_window_ms: 0,
-                ..valid
-            },
-            CpuAdmissionPolicy {
-                clear_window_ms: 0,
-                ..valid
-            },
+    fn stall_instrument_policy_rejects_invalid_bars_and_windows() {
+        for (instrument, valid) in [
+            (StallInstrument::Cpu, StallInstrumentPolicy::CPU_DEFAULT),
+            (
+                StallInstrument::Memory,
+                StallInstrumentPolicy::MEMORY_DEFAULT,
+            ),
         ] {
-            assert!(invalid.validate().is_err(), "{invalid:?} must be rejected");
+            for invalid in [
+                StallInstrumentPolicy {
+                    entry: f64::NAN,
+                    ..valid
+                },
+                StallInstrumentPolicy {
+                    entry: 1.01,
+                    ..valid
+                },
+                StallInstrumentPolicy {
+                    clear: -0.01,
+                    ..valid
+                },
+                StallInstrumentPolicy {
+                    clear: valid.entry,
+                    ..valid
+                },
+                StallInstrumentPolicy {
+                    entry_window_ms: 0,
+                    ..valid
+                },
+                StallInstrumentPolicy {
+                    clear_window_ms: 0,
+                    ..valid
+                },
+            ] {
+                let error = invalid.validate(instrument).unwrap_err();
+                assert!(error.starts_with(instrument.label()), "{error}");
+            }
+            let mut policy = ExecutorRuntimePolicy::default();
+            match instrument {
+                StallInstrument::Cpu => policy.cpu_admission.clear = policy.cpu_admission.entry,
+                StallInstrument::Memory => {
+                    policy.memory_admission.clear = policy.memory_admission.entry
+                }
+            }
+            assert!(policy.validate().is_err());
         }
     }
 
     #[test]
-    fn cpu_admission_health_and_pressure_evidence_round_trip() {
-        let health = CpuAdmissionHealth {
-            state: CpuAdmissionState::Pressured,
-            utilization: Some(0.94),
+    fn stall_instrument_blindness_and_freshness_derive_from_the_reading_age() {
+        let never = StallInstrumentHealth::default();
+        assert_eq!(never.blind_age_ms(1_000_000), None);
+        assert!(!never.fresh(1_000_000));
+        let pressured = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.2),
+            state_since_unix_ms: Some(0),
+            measured_at_unix_ms: Some(10_000),
+        };
+        let at_bound = 10_000 + CPU_ADMISSION_BLIND_AFTER_MS;
+        assert!(pressured.holds(at_bound));
+        assert_eq!(pressured.blind_age_ms(at_bound), None);
+        assert!(!pressured.holds(at_bound + 1));
+        assert_eq!(
+            pressured.blind_age_ms(at_bound + 1),
+            Some(CPU_ADMISSION_BLIND_AFTER_MS + 1)
+        );
+        let host = HostHealth {
+            memory_admission: pressured,
+            ..HostHealth::default()
+        };
+        assert_eq!(
+            host.blind_stall_instrument(at_bound + 1),
+            Some((StallInstrument::Memory, CPU_ADMISSION_BLIND_AFTER_MS + 1))
+        );
+    }
+
+    #[test]
+    fn stall_brake_health_and_pressure_evidence_round_trip() {
+        let health = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.94),
             state_since_unix_ms: Some(1_000),
             measured_at_unix_ms: Some(2_000),
         };
+        let stall = HostPressureCondition::MemoryStall {
+            full_avg10_millis: 230,
+            entry_millis: 100,
+            clear_millis: 20,
+            stalled_since_unix_ms: 1_000,
+            measured_at_unix_ms: 2_000,
+        };
+        let stall_value = serde_json::to_value(&stall).unwrap();
+        assert_eq!(stall_value["memoryStall"]["fullAvg10Millis"], 230);
+        assert_eq!(
+            serde_json::from_value::<HostPressureCondition>(stall_value).unwrap(),
+            stall
+        );
         let condition = HostPressureCondition::CpuUtilization {
             utilization: 0.94,
             entry_utilization: 0.90,
@@ -24526,7 +24984,7 @@ mod tests {
         let health_value = serde_json::to_value(&health).unwrap();
         assert_eq!(health_value["state"], "pressured");
         assert_eq!(
-            serde_json::from_value::<CpuAdmissionHealth>(health_value).unwrap(),
+            serde_json::from_value::<StallInstrumentHealth>(health_value).unwrap(),
             health
         );
         let condition_value = serde_json::to_value(&condition).unwrap();
@@ -24585,7 +25043,25 @@ mod tests {
         let mut host_value = serde_json::to_value(HostHealth::default()).unwrap();
         host_value.as_object_mut().unwrap().remove("cpuAdmission");
         let host: HostHealth = serde_json::from_value(host_value).unwrap();
-        assert_eq!(host.cpu_admission, CpuAdmissionHealth::default());
+        assert_eq!(host.cpu_admission, StallInstrumentHealth::default());
+
+        // An executor that predates the memory instrument posts the CPU
+        // verdict alone, and its memory instrument reads as never measured.
+        let mut older = serde_json::to_value(HostHealth {
+            cpu_admission: StallInstrumentHealth {
+                state: StallInstrumentState::Accepting,
+                reading: Some(0.4),
+                state_since_unix_ms: Some(1),
+                measured_at_unix_ms: Some(5),
+            },
+            ..HostHealth::default()
+        })
+        .unwrap();
+        older.as_object_mut().unwrap().remove("memoryAdmission");
+        let host: HostHealth = serde_json::from_value(older).unwrap();
+        assert_eq!(host.cpu_admission.state, StallInstrumentState::Accepting);
+        assert_eq!(host.memory_admission, StallInstrumentHealth::default());
+        assert_eq!(host.blind_stall_instrument(5), None);
     }
 
     #[test]

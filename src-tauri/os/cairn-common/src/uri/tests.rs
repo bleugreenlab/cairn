@@ -49,8 +49,8 @@ fn the_thread_coordinate_renders_as_a_thread_address() {
         "cairn://p/cairn/thread-ux"
     );
     assert_eq!(
-        build_node_artifact_uri_named("cairn", 0, 0, "thread-ux", Some("arc")),
-        "cairn://p/cairn/thread-ux/arc"
+        build_node_artifact_uri_named("cairn", 0, 0, "thread-ux", Some("plan")),
+        "cairn://p/cairn/thread-ux/plan"
     );
     assert_eq!(
         build_node_terminal_uri("cairn", 0, 0, "thread-ux", "smoke"),
@@ -951,7 +951,7 @@ fn parses_first_class_thread_resources() {
         ("cairn://p/cairn/design-review/wakes", vec!["wakes"]),
         ("cairn://p/cairn/design-review/memories", vec!["memories"]),
         ("cairn://p/cairn/design-review/eras", vec!["eras"]),
-        ("cairn://p/cairn/design-review/arc", vec!["arc"]),
+        ("cairn://p/cairn/design-review/plan", vec!["plan"]),
     ] {
         let resource = parse_uri(uri).unwrap();
         assert_eq!(

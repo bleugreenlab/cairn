@@ -2769,8 +2769,8 @@ pub(super) async fn artifact_affordance_spec(
 
 /// [`artifact_affordance_spec`] for a job that is already resolved — a thread's
 /// session job, which is addressed by thread name rather than by node
-/// coordinates. Same contract, same schema, so the arc advertises on read what
-/// it enforces on write.
+/// coordinates. Same contract, same schema, so an artifact advertises on read
+/// what it enforces on write.
 pub(super) async fn job_artifact_affordance_spec(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
@@ -2871,32 +2871,27 @@ pub(super) async fn read_node_artifact(
         Ok(read) => read,
         Err(error) => return error,
     };
+    // A thread keeps no artifacts. Its session's addresses still resolve, to
+    // the refusal that says where its record lives and then, as history, the
+    // last version stored there (the retired arc, which tenet evidence, posts
+    // and eras still cite).
+    if format != ArtifactFormat::Json
+        && matches!(
+            cairn_common::uri::NodeAddress::new(number, exec_seq, node_name),
+            cairn_common::uri::NodeAddress::Thread { .. }
+        )
+    {
+        let refusal = crate::threads::thread_artifact_refusal(artifact_name);
+        return match &artifact {
+            Some(a) => format!(
+                "{refusal}\n\n## History: the last version stored here (read-only)\n\n{}",
+                render_artifact_markdown(&a.data)
+            ),
+            None => refusal,
+        };
+    }
     let body = match &artifact {
-        Some(a)
-            if format == ArtifactFormat::Json
-                && artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME) =>
-        {
-            match serde_json::from_str(&a.data) {
-                Ok(data) => crate::threads::arc_store::prose_json(db, &job.id, &data)
-                    .await
-                    .and_then(|projected| {
-                        serde_json::to_string_pretty(&projected).map_err(|error| error.to_string())
-                    })
-                    .unwrap_or_else(|_| a.data.clone()),
-                Err(_) => a.data.clone(),
-            }
-        }
         Some(a) if format == ArtifactFormat::Json => a.data.clone(),
-        Some(a) if artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME) => {
-            match serde_json::from_str(&a.data) {
-                Ok(data) => {
-                    crate::threads::arc_store::render(db, &job.id, &data, orch.services.clock.now())
-                        .await
-                        .unwrap_or_else(|_| render_artifact_markdown(&a.data))
-                }
-                Err(_) => render_artifact_markdown(&a.data),
-            }
-        }
         Some(a) => render_artifact_markdown(&a.data),
         None => format!(
             "No artifact found for node '{}' in issue {}/{}",

@@ -201,6 +201,62 @@ async fn count(db: &LocalDb, sql: &str) -> i64 {
     .await
     .unwrap()
 }
+/// Two runs of one checkpoint record at once. Each counts the job's rows and
+/// inserts the next attempt as its own row, so only a key over (job, attempt)
+/// makes them conflict; without it both record the same attempt and the cap
+/// undercounts (cairn/6166). Looped because the interleaving is a matter of
+/// luck on any one round.
+#[test]
+fn racing_checkpoint_records_never_reuse_an_attempt_number() {
+    let tokio = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (runtime, host, _dir) = tokio.block_on(fixture(false));
+    tokio.block_on(async {
+        seed(&host.owning, vec![], vec![]).await;
+        host.owning
+            .execute_script(
+                "INSERT INTO jobs(id,project_id,issue_id,execution_id,uri_segment,status,created_at,updated_at)
+                 VALUES('job','p','issue','exec','checkpoint','running',1,1);",
+            )
+            .await
+            .unwrap();
+    });
+    let output = crate::conditions::CheckpointRunOutput {
+        passed: false,
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    for round in 0..100_i64 {
+        let barrier = std::sync::Barrier::new(2);
+        let mut attempts: Vec<i64> = std::thread::scope(|scope| {
+            let records: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        crate::checkpoint_runs::record_checkpoint_run(
+                            &runtime, "job", "false", None, &output,
+                        )
+                    })
+                })
+                .collect();
+            records
+                .into_iter()
+                .map(|record| record.join().unwrap().unwrap())
+                .collect()
+        });
+        attempts.sort();
+        assert_eq!(
+            attempts,
+            vec![2 * round + 1, 2 * round + 2],
+            "round {round}: each run records its own attempt"
+        );
+    }
+}
+
 fn advance(id: Option<String>) -> WorkflowEffect {
     WorkflowEffect::AdvanceDag {
         execution_id: "exec".into(),
