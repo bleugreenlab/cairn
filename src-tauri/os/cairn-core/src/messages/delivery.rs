@@ -443,6 +443,19 @@ pub enum Hold {
     Permission,
     /// Held for a provider usage limit until `retry_not_before` (unix seconds).
     ProviderLimit { retry_not_before: Option<i64> },
+    /// Its launch or continuation was refused because nothing can serve
+    /// `subject` now. It retries at `retry_not_before` (the soonest declared
+    /// reset, on `account`), or on the bounded re-check when none is declared,
+    /// and sooner when the accounts change.
+    NoSupply {
+        subject: String,
+        retry_not_before: Option<i64>,
+        account: Option<String>,
+        recheck_at: Option<i64>,
+    },
+    /// Supply can serve its work again, but the fleet cap is full; it takes
+    /// the next free slot, oldest held first, asking again at `next_at`.
+    FleetSlot { next_at: Option<i64> },
 }
 
 impl Hold {
@@ -482,10 +495,65 @@ impl Hold {
             ),
             Hold::ProviderLimit {
                 retry_not_before: None,
+            } => format!(
+                "it is held for a provider usage limit with no known reset time; it re-checks every {} minutes and reads this when the limit clears or the operator resumes it",
+                crate::orchestrator::wakes::SUPPLY_RECHECK_SECS / 60
+            ),
+            Hold::NoSupply {
+                subject,
+                retry_not_before,
+                account,
+                recheck_at,
             } => {
-                "it is held for a provider usage limit with no known reset time; it reads this when the limit clears or the operator resumes it".into()
+                let retry = match (retry_not_before, account) {
+                    (Some(at), Some(account)) => format!(
+                        "it retries at {} (the soonest reset, on {account})",
+                        Self::time(*at)
+                    ),
+                    (Some(at), None) => {
+                        format!("it retries at {} (the soonest reset)", Self::time(*at))
+                    }
+                    (None, _) => format!(
+                        "no reset time is known, so it re-checks every {} minutes{}",
+                        crate::orchestrator::wakes::SUPPLY_RECHECK_SECS / 60,
+                        recheck_at
+                            .map(|at| format!(", next at {}", Self::time(at)))
+                            .unwrap_or_default()
+                    ),
+                };
+                format!(
+                    "it is held because no account can serve {subject} now; {retry}, or sooner if an account frees up, and it reads this once it launches"
+                )
             }
+            Hold::FleetSlot { next_at } => format!(
+                "an account can serve it again, but every fleet slot is in use; it starts when one frees up, oldest held work first{}, and it reads this then",
+                next_at
+                    .map(|at| format!(" (it asks again at {})", Self::time(at)))
+                    .unwrap_or_default()
+            ),
         }
+    }
+
+    /// The hold that `hold` is, when it is one a refused launch armed.
+    pub(crate) fn no_supply(hold: &crate::orchestrator::wakes::ProviderLimitHold) -> Option<Self> {
+        if !hold.kind.is_supply() {
+            return None;
+        }
+        if hold.boundary_source == "fleet_slot" {
+            return Some(Hold::FleetSlot {
+                next_at: hold.next_due_at(),
+            });
+        }
+        let subject = hold
+            .subject
+            .clone()
+            .unwrap_or_else(|| format!("its {} model", hold.backend));
+        Some(Hold::NoSupply {
+            subject,
+            retry_not_before: hold.retry_not_before,
+            account: hold.boundary_account_id.clone(),
+            recheck_at: hold.next_due_at(),
+        })
     }
 
     /// The short form a node summary's title carries beside its status icon.
@@ -507,6 +575,12 @@ impl Hold {
                 retry_not_before: Some(at),
             } => format!("held: provider limit until {}", Self::time(*at)),
             Hold::ProviderLimit { .. } => "held: provider limit".into(),
+            Hold::NoSupply {
+                retry_not_before: Some(at),
+                ..
+            } => format!("held: no supply until {}", Self::time(*at)),
+            Hold::NoSupply { .. } => "held: no supply".into(),
+            Hold::FleetSlot { .. } => "held: waiting for a fleet slot".into(),
         }
     }
 
@@ -530,6 +604,14 @@ impl Hold {
 /// does (it is idle, mid-turn, or its read failed).
 pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
     use crate::models::TurnYieldReason;
+    // A refused launch owns no yielded head, so it is asked first.
+    if let Some(hold) = crate::orchestrator::wakes::active_supply_hold(db, job_id)
+        .await
+        .ok()
+        .flatten()
+    {
+        return Hold::no_supply(&hold);
+    }
     let row = head_turn_row(db, job_id).await.ok()??;
     Some(match row.self_suspend_reason()? {
         TurnYieldReason::Wait => {
@@ -556,20 +638,27 @@ pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
         },
         TurnYieldReason::UserInput => Hold::Question,
         TurnYieldReason::Permission => Hold::Permission,
-        TurnYieldReason::ProviderLimit => Hold::ProviderLimit {
-            retry_not_before: db
+        TurnYieldReason::ProviderLimit => {
+            let (retry_not_before, source) = db
                 .query_opt(
-                    "SELECT retry_not_before FROM provider_limit_holds
+                    "SELECT retry_not_before, boundary_source FROM provider_limit_holds
                      WHERE job_id = ?1 AND state = 'active'
                      ORDER BY created_at DESC LIMIT 1",
                     params![job_id],
-                    |row| row.opt_i64(0),
+                    |row| Ok((row.opt_i64(0)?, row.text(1)?)),
                 )
                 .await
                 .ok()
                 .flatten()
-                .flatten(),
-        },
+                .unwrap_or((None, String::new()));
+            if source == "fleet_slot" {
+                Hold::FleetSlot {
+                    next_at: retry_not_before,
+                }
+            } else {
+                Hold::ProviderLimit { retry_not_before }
+            }
+        }
         TurnYieldReason::SafetyPause => return None,
     })
 }

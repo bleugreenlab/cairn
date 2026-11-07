@@ -1632,8 +1632,24 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
 
     // ---- Model ----------------------------------------------------------
     // Chosen now, at the node's own launch, and stored before the session is
-    // prepared so the session opens on the chosen provider.
-    node_selection::select_job_model(orch, &owning_db, &job, Some(Path::new(&repo_path)))?;
+    // prepared so the session opens on the chosen provider. A launch nothing
+    // can serve now holds; its refusal still returns, and the seam that would
+    // fail the start records it on the hold instead.
+    if let Err(refusal) =
+        node_selection::select_job_model(orch, &owning_db, &job, Some(Path::new(&repo_path)))
+    {
+        if let crate::execution::model_selection::SelectionRefusal::NoSupply(capacity) = &refusal {
+            super::hold_refused_launch(
+                &owning_db,
+                job_id,
+                crate::orchestrator::wakes::HoldKind::Launch,
+                None,
+                None,
+                capacity,
+            )?;
+        }
+        return Err(refusal.into());
+    }
 
     // ---- Reload job with its durable branch coordinate and model --------
     let job = run_db(load_job(
@@ -4525,6 +4541,7 @@ fn launch_account_for_continuation(
                 job.model.as_deref(),
                 snapshot_account.as_deref(),
             )
+            .map_err(String::from)
         });
     if let Err(error) = resolved {
         log::warn!(

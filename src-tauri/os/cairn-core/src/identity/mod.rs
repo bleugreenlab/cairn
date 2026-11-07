@@ -145,12 +145,7 @@ impl CredentialStoreExt for CredentialStore {
         project_id: Option<&str>,
     ) -> Option<(String, UserIdentity)> {
         let account_id = self
-            .accounts_for_provider(provider.api_provider(), project_id)
-            .into_iter()
-            .find(|account| {
-                matches!(account.auth, ProviderAuth::ApiKey { .. })
-                    && account.serves_backend(provider.backend())
-            })?
+            .routed_api_key_fallback(provider, project_id)?
             .id
             .clone();
         let identity = self.resolve_with_routed_account(provider, project_id, &account_id);

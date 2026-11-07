@@ -11,7 +11,7 @@ pub mod store;
 
 pub use cairn_models_types::usage::{AccountHold, AccountHoldKind};
 pub use cairn_models_types::ApiProvider;
-pub use handle::CredentialStoreHandle;
+pub use handle::{ChangeListener, CredentialStoreHandle};
 pub use plan::{jwt_claims, subscription_plan};
 pub use sign_in::{SignInExpiry, SignInExpirySource, SignInStage};
 
@@ -36,6 +36,36 @@ pub struct RoutedAccountDiagnostic {
     pub blocked_until: Option<i64>,
     pub live_windows: Vec<cairn_models_types::usage::ProviderUsageWindow>,
     pub rejection: Option<String>,
+    /// What `rejection` says, as a kind a caller can act on.
+    pub cause: Option<RejectionCause>,
+}
+
+/// Why routing set one account aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionCause {
+    OutOfScope,
+    OtherAccountSelected,
+    Excluded,
+    NotRoutable,
+    IncompatibleBackend,
+    SignedOut,
+    /// Held for something only an operator's act clears (credits, terms).
+    Held,
+    /// A provider block that has not lapsed.
+    Blocked,
+    /// A usage window applying to the model is empty.
+    NoHeadroom,
+}
+
+impl RejectionCause {
+    /// Whether the account is only out of supply: a window that resets, a
+    /// block that lapses, or a hold a top-up or acceptance clears, each of
+    /// which shows up as a change to the credential store. A signed-out or
+    /// incompatible account is configuration, which waiting never cures.
+    pub fn is_supply(self) -> bool {
+        matches!(self, Self::Held | Self::Blocked | Self::NoHeadroom)
+    }
 }
 
 /// Sampling controls understood by OpenAI-compatible inference servers.
@@ -1138,20 +1168,33 @@ impl CredentialStore {
             .map(|account| {
                 let in_scope = account.project_id.is_none()
                     || project_id.is_some_and(|id| account.project_id.as_deref() == Some(id));
-                let rejection = if !in_scope {
-                    Some("project scope does not include this project".to_string())
+                let rejected = if !in_scope {
+                    Some((
+                        RejectionCause::OutOfScope,
+                        "project scope does not include this project".to_string(),
+                    ))
                 } else if override_id.is_some_and(|id| id != account.id) {
-                    Some("a different account is explicitly selected for this project".to_string())
+                    Some((
+                        RejectionCause::OtherAccountSelected,
+                        "a different account is explicitly selected for this project".to_string(),
+                    ))
                 } else if excluded_id == Some(account.id.as_str()) {
-                    Some("account was excluded from this selection attempt".to_string())
+                    Some((
+                        RejectionCause::Excluded,
+                        "account was excluded from this selection attempt".to_string(),
+                    ))
                 } else if override_id.is_none() && !provider.routes(&account.auth) {
-                    Some(format!(
-                        "auth type '{}' is not a routable subscription profile",
-                        account.auth.auth_type_label()
+                    Some((
+                        RejectionCause::NotRoutable,
+                        format!(
+                            "auth type '{}' is not a routable subscription profile",
+                            account.auth.auth_type_label()
+                        ),
                     ))
                 } else if !account.serves_backend(backend) {
-                    Some(format!(
-                        "account is not compatible with backend '{backend}'"
+                    Some((
+                        RejectionCause::IncompatibleBackend,
+                        format!("account is not compatible with backend '{backend}'"),
                     ))
                 } else if let Some(expiry) = account
                     .sign_in_expiry()
@@ -1159,7 +1202,10 @@ impl CredentialStore {
                 {
                     let signed_in_as = account.email.as_deref().unwrap_or(&account.label);
                     // Unterminated: callers punctuate the reasons they join.
-                    Some(expiry.describe_lapse(signed_in_as))
+                    Some((
+                        RejectionCause::SignedOut,
+                        expiry.describe_lapse(signed_in_as),
+                    ))
                 } else if let Some(hold) = account
                     .health
                     .as_ref()
@@ -1167,27 +1213,33 @@ impl CredentialStore {
                 {
                     let signed_in_as = account.email.as_deref().unwrap_or(&account.label);
                     // Unterminated: callers punctuate the reasons they join.
-                    Some(format!(
-                        "{} since {} ({}). {}",
-                        hold.kind.summary(),
-                        hold.since,
-                        hold.detail,
-                        hold.kind
-                            .operator_action(signed_in_as)
-                            .trim_end_matches('.')
+                    Some((
+                        RejectionCause::Held,
+                        format!(
+                            "{} since {} ({}). {}",
+                            hold.kind.summary(),
+                            hold.since,
+                            hold.detail,
+                            hold.kind
+                                .operator_action(signed_in_as)
+                                .trim_end_matches('.')
+                        ),
                     ))
                 } else if account
                     .health
                     .as_ref()
                     .is_some_and(|health| health.is_blocked(now))
                 {
-                    Some(format!(
-                        "provider block remains active until {}",
-                        account
-                            .health
-                            .as_ref()
-                            .and_then(|health| health.blocked_until)
-                            .unwrap_or(now)
+                    Some((
+                        RejectionCause::Blocked,
+                        format!(
+                            "provider block remains active until {}",
+                            account
+                                .health
+                                .as_ref()
+                                .and_then(|health| health.blocked_until)
+                                .unwrap_or(now)
+                        ),
                     ))
                 } else if account
                     .health
@@ -1195,12 +1247,19 @@ impl CredentialStore {
                     .and_then(|health| health.live_headroom(requested_model, now))
                     .is_some_and(|headroom| headroom <= 0.0)
                 {
-                    Some(format!(
-                        "no current headroom for {}",
-                        requested_model.unwrap_or("the requested model")
+                    Some((
+                        RejectionCause::NoHeadroom,
+                        format!(
+                            "no current headroom for {}",
+                            requested_model.unwrap_or("the requested model")
+                        ),
                     ))
                 } else {
                     None
+                };
+                let (cause, rejection) = match rejected {
+                    Some((cause, rejection)) => (Some(cause), Some(rejection)),
+                    None => (None, None),
                 };
                 let live_windows = account
                     .health
@@ -1225,6 +1284,7 @@ impl CredentialStore {
                         .and_then(|health| health.blocked_until),
                     live_windows,
                     rejection,
+                    cause,
                 }
             })
             .collect()
@@ -1651,6 +1711,37 @@ impl CredentialStore {
 
     /// Whether `project_id`'s scope holds any subscription login Automatic
     /// routing would choose among for `provider`, usable now or not.
+    /// The account a project names for `provider`, which routing treats as
+    /// exclusive: such a project never falls back to another account.
+    pub fn routed_project_override(
+        &self,
+        provider: RoutedProvider,
+        project_id: Option<&str>,
+    ) -> Option<&str> {
+        let overrides = self.project_overrides.get(project_id?)?;
+        match provider {
+            RoutedProvider::Claude => overrides.anthropic_account_id.as_deref(),
+            RoutedProvider::Codex => overrides.openai_account_id.as_deref(),
+        }
+    }
+
+    /// The API-key account routing falls back to when no subscription account
+    /// can serve `provider`: the first, in priority order, that serves its
+    /// backend. Supply asks the same question, so a launch that routing would
+    /// serve on an API key is never held for want of subscription headroom.
+    pub fn routed_api_key_fallback(
+        &self,
+        provider: RoutedProvider,
+        project_id: Option<&str>,
+    ) -> Option<&ProviderAccount> {
+        self.accounts_for_provider(provider.api_provider(), project_id)
+            .into_iter()
+            .find(|account| {
+                matches!(account.auth, ProviderAuth::ApiKey { .. })
+                    && account.serves_backend(provider.backend())
+            })
+    }
+
     pub fn routes_any(&self, provider: RoutedProvider, project_id: Option<&str>) -> bool {
         self.routed_candidates(provider, project_id)
             .next()

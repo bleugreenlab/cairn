@@ -10,7 +10,10 @@
 //! its builder's choice and a resumed job never re-selects.
 //!
 //! A model named directly is never replaced: when it is the allotment's only
-//! candidate and cannot be served, the launch is refused naming why.
+//! candidate and cannot be served, the launch is refused naming why. A refusal
+//! whose only cause is supply (every account out of usage, blocked, or out of
+//! credits) is [`SelectionRefusal::NoSupply`], which holds the node until
+//! supply returns rather than failing it.
 
 pub mod constraints;
 pub mod requirement;
@@ -23,7 +26,9 @@ use cairn_config::allotment::{
     LevelSource, ModelsConfig,
 };
 use cairn_models::interface::{BenchmarkPlacement, Catalog, CatalogProvider};
-use cairn_models::supply::{self, Supply, SupplyAccount, SupplyInputs, SupplyKey};
+use cairn_models::supply::{
+    self, CapacityRefusal, Shortfall, Supply, SupplyAccount, SupplyInputs, SupplyKey,
+};
 use cairn_models::types::catalog::VerbKind;
 use cairn_models::types::supply::CostClass;
 use serde::{Deserialize, Serialize};
@@ -97,26 +102,58 @@ pub struct SelectionSubject {
     pub job_id: Option<String>,
 }
 
-/// A launch the selection cannot place, said so it can be fixed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectionRefusal {
-    pub message: String,
+/// A launch the selection cannot place.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectionRefusal {
+    /// Nothing waiting cures: said so it can be fixed.
+    Misconfigured { message: String },
+    /// Something could serve this launch but nothing can now.
+    NoSupply(CapacityRefusal),
+}
+
+impl SelectionRefusal {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Misconfigured { message } => message,
+            Self::NoSupply(refusal) => &refusal.reason,
+        }
+    }
+
+    /// The same refusal, its text led by `context`.
+    pub fn context(self, context: impl fmt::Display) -> Self {
+        match self {
+            Self::Misconfigured { message } => Self::Misconfigured {
+                message: format!("{context}: {message}"),
+            },
+            Self::NoSupply(mut refusal) => {
+                refusal.reason = format!("{context}: {}", refusal.reason);
+                Self::NoSupply(refusal)
+            }
+        }
+    }
 }
 
 impl fmt::Display for SelectionRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(self.message())
     }
 }
 
 impl From<SelectionRefusal> for String {
     fn from(refusal: SelectionRefusal) -> Self {
-        refusal.message
+        refusal.message().to_string()
+    }
+}
+
+/// Every other launch error is one waiting does not cure.
+impl From<String> for SelectionRefusal {
+    fn from(message: String) -> Self {
+        Self::Misconfigured { message }
     }
 }
 
 fn refuse(message: impl Into<String>) -> SelectionRefusal {
-    SelectionRefusal {
+    SelectionRefusal::Misconfigured {
         message: message.into(),
     }
 }
@@ -421,7 +458,7 @@ pub fn select(
     }
 
     // 4. Supply, inside the band.
-    let mut ranked: Vec<(&Live<'_>, Result<Supply, String>)> = in_band
+    let mut ranked: Vec<(&Live<'_>, Result<Supply, Shortfall>)> = in_band
         .iter()
         .map(|l| {
             (
@@ -439,11 +476,59 @@ pub fn select(
     let sole_named = expanded.candidates.len() == 1 && expanded.candidates[0].named;
     let (first, first_supply) = &ranked[0];
     if let (true, Err(why)) = (sole_named, first_supply) {
+        let model = model_ref(&first.candidate.model);
+        if why.supply {
+            return Err(SelectionRefusal::NoSupply(CapacityRefusal::of(
+                &model,
+                format!("{model} cannot run now: {why}"),
+                why,
+            )));
+        }
         return Err(refuse(format!(
-            "{} cannot run now: {why}. A model named directly is never replaced by another; name a pool or another model beside it",
-            model_ref(&first.candidate.model)
+            "{model} cannot run now: {why}. A model named directly is never replaced by another; name a pool or another model beside it"
         )));
     }
+    // Ranking puts every candidate that can run first, so an unrunnable
+    // first means none in the band can. Supply never moves work across
+    // bands, so the launch waits for one of these.
+    let Ok(first_supply) = first_supply else {
+        let shortfalls: Vec<(String, &Shortfall)> = ranked
+            .iter()
+            .filter_map(|(l, supply)| {
+                supply
+                    .as_ref()
+                    .err()
+                    .map(|why| (model_ref(&l.candidate.model), why))
+            })
+            .collect();
+        let reasons = shortfalls
+            .iter()
+            .map(|(model, why)| format!("{model}: {why}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let soonest = shortfalls
+            .iter()
+            .filter(|(_, why)| why.supply)
+            .filter_map(|(_, why)| why.resets_at.map(|at| (at, *why)))
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, why)| why);
+        if shortfalls.iter().any(|(_, why)| why.supply) {
+            let reason = format!("nothing in [{names}] can run now: {reasons}");
+            return Err(SelectionRefusal::NoSupply(match soonest {
+                Some(why) => CapacityRefusal::of(format!("[{names}]"), reason, why),
+                None => CapacityRefusal {
+                    subject: format!("[{names}]"),
+                    reason,
+                    retry_at: None,
+                    retry_account: None,
+                },
+            }));
+        }
+        return Err(refuse(format!(
+            "nothing in [{names}] can run {}: {reasons}",
+            verb.as_str()
+        )));
+    };
     let mut candidates: Vec<RankedCandidate> = ranked
         .iter()
         .map(|(l, supply)| RankedCandidate {
@@ -455,7 +540,7 @@ pub fn select(
             class: supply.as_ref().ok().map(|s| s.cost.class()),
             note: match supply {
                 Ok(s) => supply::describe(&l.provider.descriptor.display_name, s),
-                Err(why) => why.clone(),
+                Err(why) => why.reason.clone(),
             },
         })
         .collect();
@@ -499,12 +584,7 @@ pub fn select(
         }
     }
 
-    let clause = match first_supply {
-        Ok(s) => supply::describe(&first.provider.descriptor.display_name, s),
-        Err(why) => {
-            format!("{why}; every candidate is out of usage now, so the launch waits for capacity")
-        }
-    };
+    let clause = supply::describe(&first.provider.descriptor.display_name, first_supply);
     let mut notes = relaxations.clone();
     let ours = first.maker.as_deref();
     match maker {
@@ -540,7 +620,7 @@ pub fn select(
         band,
         candidates,
         maker: first.maker.clone(),
-        account: first_supply.as_ref().ok().and_then(|s| s.account.clone()),
+        account: first_supply.account.clone(),
         chosen,
         extras,
         relaxations,

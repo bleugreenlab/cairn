@@ -7,6 +7,9 @@ use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use crate::store;
 use crate::CredentialStore;
 
+/// Called after every write this handle makes to the store.
+pub type ChangeListener = Arc<dyn Fn() + Send + Sync>;
+
 /// The credential store as one process holds it.
 ///
 /// Clones share the same in-memory copy. Every write goes to the file under
@@ -16,6 +19,7 @@ use crate::CredentialStore;
 pub struct CredentialStoreHandle {
     config_dir: PathBuf,
     cached: Arc<Mutex<Option<CredentialStore>>>,
+    listener: Arc<Mutex<Option<ChangeListener>>>,
 }
 
 impl CredentialStoreHandle {
@@ -23,6 +27,24 @@ impl CredentialStoreHandle {
         Self {
             config_dir,
             cached: Arc::new(Mutex::new(initial)),
+            listener: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Hear of every write any clone of this handle makes: an account added
+    /// or removed, a sign-in, a block set or cleared, a usage reading. Supply
+    /// is read from the store, so this is how work waiting on supply learns
+    /// that it may have moved. Replaces any listener set before.
+    pub fn set_change_listener(&self, listener: ChangeListener) {
+        if let Ok(mut guard) = self.listener.lock() {
+            *guard = Some(listener);
+        }
+    }
+
+    fn changed(&self) {
+        let listener = self.listener.lock().ok().and_then(|guard| guard.clone());
+        if let Some(listener) = listener {
+            listener();
         }
     }
 
@@ -47,6 +69,7 @@ impl CredentialStoreHandle {
     pub fn persist_locked(&self, store: &mut CredentialStore) -> Result<(), String> {
         store::save_credential_store(&self.config_dir, store)?;
         store.config_dir = self.config_dir.clone();
+        self.changed();
         Ok(())
     }
 
@@ -63,6 +86,7 @@ impl CredentialStoreHandle {
         if let Ok(mut guard) = self.cached.lock() {
             *guard = Some(store);
         }
+        self.changed();
         Ok(())
     }
 
@@ -88,6 +112,7 @@ impl CredentialStoreHandle {
         if let Ok(mut guard) = self.cached.lock() {
             *guard = Some(store);
         }
+        self.changed();
         Ok(outcome)
     }
 
@@ -120,6 +145,7 @@ impl CredentialStoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn empty_store(user_id: &str) -> CredentialStore {
         CredentialStore {
@@ -174,5 +200,26 @@ mod tests {
         let cached = ours.get().unwrap();
         assert_eq!(cached.user_id, "theirs+updated");
         assert_eq!(cached.config_dir, home.path());
+    }
+
+    #[test]
+    fn every_write_through_any_clone_reaches_the_listener() {
+        let home = tempfile::tempdir().unwrap();
+        let handle = CredentialStoreHandle::new(home.path().to_path_buf(), None);
+        let heard = Arc::new(AtomicUsize::new(0));
+        let counter = heard.clone();
+        handle.set_change_listener(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let clone = handle.clone();
+        clone.save(empty_store("a")).unwrap();
+        handle.update(|_| Ok(())).unwrap();
+        let mut store = handle.get().unwrap();
+        handle.persist_locked(&mut store).unwrap();
+        assert_eq!(heard.load(Ordering::SeqCst), 3);
+        // Reading changes nothing.
+        handle.get();
+        handle.durable();
+        assert_eq!(heard.load(Ordering::SeqCst), 3);
     }
 }

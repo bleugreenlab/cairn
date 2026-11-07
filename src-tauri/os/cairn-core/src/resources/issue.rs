@@ -536,7 +536,17 @@ async fn render_issue_parts(
 
             let node_segment = visible_job_node_segment(conn, job).await;
 
-            let status = job_status_icon(&job.status);
+            // A node held for want of supply reads `pending` or at rest
+            // otherwise; the tree says it is held and until when.
+            let held = crate::orchestrator::wakes::active_supply_hold_conn(conn, &job.id)
+                .await
+                .ok()
+                .flatten()
+                .as_ref()
+                .and_then(crate::messages::delivery::Hold::no_supply)
+                .map(|hold| format!(" {}", hold.qualifier()))
+                .unwrap_or_default();
+            let status = format!("{}{held}", job_status_icon(&job.status));
 
             // Resource indicators
             let has_artifact = has_artifact_for_job(conn, &job.id).await;

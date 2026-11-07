@@ -37,7 +37,7 @@ mod goal_intent;
 mod inputs;
 mod lifecycle;
 mod node_selection;
-pub(crate) use node_selection::pinned;
+pub(crate) use node_selection::{pinned, probe_launch_supply};
 mod ordinary_admission;
 mod persistence;
 mod private_lane;
@@ -158,12 +158,58 @@ use turns::*;
 // duplicate column list, so the `runs` projection has one source of truth.
 use crate::runs::queries::{run_from_row, RUN_COLUMNS};
 
+/// Hold `job_id` because nothing can serve its launch now (see
+/// [`crate::orchestrator::wakes::arm_supply_hold`]). The refused launch still
+/// returns its error; whichever seam would then fail the start finds the hold
+/// and records the run instead ([`mark_job_start_failed`]).
+fn hold_refused_launch(
+    owning_db: &Arc<LocalDb>,
+    job_id: &str,
+    kind: crate::orchestrator::wakes::HoldKind,
+    run_id: Option<&str>,
+    turn_id: Option<&str>,
+    refusal: &cairn_models::supply::CapacityRefusal,
+) -> Result<(), String> {
+    let backend = refusal
+        .subject
+        .split_once('/')
+        .filter(|_| !refusal.subject.starts_with('['))
+        .map_or(crate::backends::CLAUDE_FAMILY_BACKEND, |(backend, _)| {
+            backend
+        })
+        .to_string();
+    let refused = crate::orchestrator::wakes::SupplyRefusal {
+        job_id: job_id.to_string(),
+        kind,
+        backend,
+        run_id: run_id.map(str::to_string),
+        turn_id: turn_id.map(str::to_string),
+        refusal: refusal.clone(),
+        now: chrono::Utc::now().timestamp(),
+    };
+    let db = owning_db.clone();
+    let hold =
+        run_db(async move { crate::orchestrator::wakes::arm_supply_hold(&db, refused).await })?;
+    log::info!(
+        "[supply] job {job_id}: {} hold {} armed, retry at {:?}: {}",
+        hold.kind.as_str(),
+        hold.id,
+        hold.retry_not_before,
+        refusal.reason
+    );
+    Ok(())
+}
+
 /// Mark the latest run for a job crashed and fail the job after a failed start.
 ///
 /// Both a direct start and a start promoted out of ordinary admission end here,
 /// so a launch that cannot begin is terminalized the same way whichever path
 /// attempted it. A preparation failure may precede any run row; one is then
 /// inserted so the failure stays visible on the job.
+///
+/// A start refused for want of supply armed a hold before its error reached
+/// here. That job is not failed: its run records the refusal and the job
+/// re-derives as held (see [`crate::orchestrator::wakes::settle_supply_held_start`]).
 pub async fn mark_job_start_failed(
     orch: &Orchestrator,
     owning_db: &LocalDb,
@@ -171,6 +217,16 @@ pub async fn mark_job_start_failed(
     error: &str,
     preparation_failed: bool,
 ) {
+    match crate::orchestrator::wakes::settle_supply_held_start(orch, owning_db, job_id, error).await
+    {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(hold_error) => {
+            log::warn!(
+                "Could not read job {job_id}'s supply hold before failing its start: {hold_error}"
+            );
+        }
+    }
     let exit_reason = if preparation_failed {
         "job_preparation_failed"
     } else {

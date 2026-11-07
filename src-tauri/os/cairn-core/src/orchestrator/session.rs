@@ -135,15 +135,104 @@ pub(crate) fn routed_project_override(
     provider: crate::credentials::RoutedProvider,
     project_id: Option<&str>,
 ) -> Option<String> {
-    project_id
-        .and_then(|project_id| {
-            orch.get_credential_store()
-                .and_then(|store| store.project_overrides.get(project_id).cloned())
+    orch.get_credential_store()?
+        .routed_project_override(provider, project_id)
+        .map(str::to_string)
+}
+
+/// Routing's refusal of a launch.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RouteRefusal {
+    /// The policy names accounts that could serve the model, and none can now:
+    /// each is out of usage, blocked, or out of credits. The launch holds.
+    NoSupply(cairn_models::supply::CapacityRefusal),
+    /// Anything waiting does not cure, said so it can be fixed.
+    Refused(String),
+}
+
+impl std::fmt::Display for RouteRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSupply(refusal) => f.write_str(&refusal.reason),
+            Self::Refused(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<RouteRefusal> for String {
+    fn from(refusal: RouteRefusal) -> Self {
+        refusal.to_string()
+    }
+}
+
+impl From<String> for RouteRefusal {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+
+/// `text` as routing's refusal: [`RouteRefusal::NoSupply`] when what set the
+/// policy's accounts aside is supply, with the soonest reset any of them
+/// declares; [`RouteRefusal::Refused`] when it is configuration (every account
+/// signed out, or none serving this backend).
+pub(crate) fn routing_refusal(
+    orch: &Orchestrator,
+    provider: crate::credentials::RoutedProvider,
+    project_id: Option<&str>,
+    explicit_account: Option<&str>,
+    requested_model: Option<&str>,
+    text: String,
+) -> RouteRefusal {
+    use crate::credentials::{RejectionCause, RoutedAvailability};
+    let Some(store) = orch.get_credential_store() else {
+        return RouteRefusal::Refused(text);
+    };
+    let now = chrono::Utc::now().timestamp();
+    // Accounts the policy does not select say nothing about this launch. One
+    // it selects and rejects for no stated cause is a reading this cannot
+    // explain, and waiting on it is harmless.
+    let supply = store
+        .routed_account_diagnostics(
+            provider,
+            project_id,
+            explicit_account,
+            None,
+            requested_model,
+            now,
+        )
+        .iter()
+        .filter(|account| {
+            !matches!(
+                account.cause,
+                Some(RejectionCause::OutOfScope | RejectionCause::OtherAccountSelected)
+            )
         })
-        .and_then(|overrides| match provider {
-            crate::credentials::RoutedProvider::Claude => overrides.anthropic_account_id,
-            crate::credentials::RoutedProvider::Codex => overrides.openai_account_id,
-        })
+        .any(|account| account.cause.is_none_or(RejectionCause::is_supply));
+    if !supply {
+        return RouteRefusal::Refused(text);
+    }
+    // `Now` disagrees with the refusal just met; trusting it would release
+    // the hold into the same refusal at once, so it waits for the re-check.
+    let (retry_at, retry_account) = match store.routed_availability(
+        provider,
+        project_id,
+        explicit_account,
+        requested_model,
+        now,
+    ) {
+        RoutedAvailability::At(at, account) => (Some(at), Some(account)),
+        _ => (None, None),
+    };
+    RouteRefusal::NoSupply(cairn_models::supply::CapacityRefusal {
+        subject: format!(
+            "{}/{}",
+            provider.backend(),
+            requested_model.unwrap_or("its model")
+        ),
+        reason: text,
+        retry_at,
+        retry_account,
+    })
 }
 
 /// Routing's answer before any provider auth is required of it: a project
@@ -157,7 +246,7 @@ fn route(
     project_override: Option<&str>,
     requested_model: Option<&str>,
     mode: SelectionMode,
-) -> Result<Option<RoutedSelection>, String> {
+) -> Result<Option<RoutedSelection>, RouteRefusal> {
     let selected = match mode {
         SelectionMode::Serve => orch.select_routed_identity(
             provider,
@@ -246,7 +335,7 @@ fn route_session(
     requested_model: Option<&str>,
     snapshot_account_id: Option<&str>,
     mode: SelectionMode,
-) -> Result<SessionRoute, String> {
+) -> Result<SessionRoute, RouteRefusal> {
     // An existing session authenticates as its pin while that account can still
     // serve: its conversation and prompt cache live there. Account policy — the
     // snapshot's, then the project's — chooses only for sessions with no usable
@@ -308,7 +397,7 @@ pub(crate) fn resolve_routed_session_identity(
     project_id: Option<&str>,
     requested_model: Option<&str>,
     snapshot_account_id: Option<&str>,
-) -> Result<Option<crate::identity::UserIdentity>, String> {
+) -> Result<Option<crate::identity::UserIdentity>, RouteRefusal> {
     let session = crate::storage::run_db_blocking({
         let db = orch.db.local.clone();
         let session_id = session_id.to_string();
@@ -329,7 +418,7 @@ pub(crate) fn resolve_routed_session_identity(
                 requested_model,
             ) {
                 Some(identity) => {
-                    return persist_routed_account_and_resolve_identity(
+                    return Ok(persist_routed_account_and_resolve_identity(
                         orch,
                         provider,
                         session_id,
@@ -338,7 +427,7 @@ pub(crate) fn resolve_routed_session_identity(
                         None,
                         account.id,
                         identity,
-                    )
+                    )?)
                 }
                 None => unavailable = Some((job_id, record, account)),
             }
@@ -386,7 +475,7 @@ pub(crate) fn resolve_routed_session_identity(
     else {
         return Ok(Some(selection.identity));
     };
-    persist_routed_account_and_resolve_identity(
+    Ok(persist_routed_account_and_resolve_identity(
         orch,
         provider,
         session_id,
@@ -395,7 +484,7 @@ pub(crate) fn resolve_routed_session_identity(
         session.account_id,
         account_id,
         selection.identity,
-    )
+    )?)
 }
 
 /// The account `session`'s job selection named, when that selection chose a
@@ -606,7 +695,7 @@ fn resolve_routed_fallback(
     project_id: Option<&str>,
     project_override: Option<&str>,
     requested_model: Option<&str>,
-) -> Result<Option<RoutedSelection>, String> {
+) -> Result<Option<RoutedSelection>, RouteRefusal> {
     let provider_name = match provider {
         crate::credentials::RoutedProvider::Claude => "Claude",
         crate::credentials::RoutedProvider::Codex => "Codex",
@@ -618,8 +707,15 @@ fn resolve_routed_fallback(
         .unwrap_or_default();
 
     if project_override.is_some() {
-        return Err(format!(
-            "The {provider_name} account selected for this project is unavailable for {model_name}.{reason}"
+        return Err(routing_refusal(
+            orch,
+            provider,
+            project_id,
+            project_override,
+            requested_model,
+            format!(
+                "The {provider_name} account selected for this project is unavailable for {model_name}.{reason}"
+            ),
         ));
     }
 
@@ -636,8 +732,15 @@ fn resolve_routed_fallback(
     }
 
     if store.is_some_and(|store| store.has_routed_accounts(provider, project_id)) {
-        return Err(format!(
-            "{provider_name} accounts are configured, but none is currently available for {model_name}.{reason} Try again after resolving the reported account condition."
+        return Err(routing_refusal(
+            orch,
+            provider,
+            project_id,
+            None,
+            requested_model,
+            format!(
+                "{provider_name} accounts are configured, but none is currently available for {model_name}.{reason} Try again after resolving the reported account condition."
+            ),
         ));
     }
 

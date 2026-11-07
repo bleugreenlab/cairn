@@ -416,12 +416,62 @@ fn a_named_model_is_never_substituted() {
     )
     .unwrap_err();
     assert!(
-        refused.message.contains("openrouter is not installed"),
+        matches!(&refused, SelectionRefusal::Misconfigured { message } if message.contains("openrouter is not installed")),
         "{refused}"
     );
     let alone = run(&["claude/opus"], &ResolvedConstraints::default(), &windows).unwrap();
     assert_eq!(chosen(&alone), "claude/opus");
     assert_eq!(alone.extras.reasoning_effort.as_deref(), Some("xhigh"));
+}
+
+/// Every provider spent, each resetting at its own hour: Codex soonest.
+fn exhausted(key: &str) -> Option<(Vec<ProviderUsageWindow>, i64)> {
+    let hours = match key {
+        "codex" => 14,
+        "claude" => 120,
+        _ => 50,
+    };
+    Some((
+        vec![ProviderUsageWindow {
+            id: "week".into(),
+            label: "Weekly".into(),
+            scope: ProviderUsageScope::Weekly,
+            scope_target: None,
+            used_percent: 100.0,
+            remaining_percent: 0.0,
+            resets_at: Some(NOW + hours * 3600),
+            reset_at_text: None,
+            window_duration_mins: Some(7 * 24 * 60),
+        }],
+        NOW,
+    ))
+}
+
+#[test]
+fn a_named_model_out_of_usage_waits_for_its_reset() {
+    let refused = run(
+        &["claude/opus"],
+        &ResolvedConstraints::default(),
+        &exhausted,
+    )
+    .unwrap_err();
+    let SelectionRefusal::NoSupply(refusal) = refused else {
+        panic!("out of usage is a supply refusal, not configuration: {refused}");
+    };
+    assert_eq!(refusal.subject, "claude/opus");
+    assert_eq!(refusal.retry_at, Some(NOW + 120 * 3600));
+    assert!(refusal.reason.contains("out of usage"), "{refusal}");
+}
+
+#[test]
+fn an_allotment_with_every_candidate_out_waits_for_the_soonest_reset() {
+    let refused = run(&["lg"], &ResolvedConstraints::default(), &exhausted).unwrap_err();
+    let SelectionRefusal::NoSupply(refusal) = refused else {
+        panic!("a band with every candidate out is a supply refusal: {refused}");
+    };
+    assert_eq!(refusal.subject, "[lg]");
+    assert_eq!(refusal.retry_at, Some(NOW + 14 * 3600));
+    assert!(refusal.reason.contains("can run now"), "{refusal}");
 }
 
 fn builder(model: &str, band: Option<&str>, maker: Option<&str>) -> SelectionRecord {

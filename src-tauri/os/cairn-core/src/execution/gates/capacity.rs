@@ -206,15 +206,20 @@ pub enum AdmissionSite {
     /// (`reorder::move_held_execution`), which may renumber keys in several
     /// databases: no decision may read a half-renumbered line.
     QueueMove,
+    /// Work held for want of supply asking for a fleet slot back
+    /// (`orchestrator::wakes::provider_limits`). Not a start, and no gate row:
+    /// the hold waits on the same count a queued execution does.
+    HoldRelease,
 }
 
 impl AdmissionSite {
-    const ALL: [AdmissionSite; 5] = [
+    const ALL: [AdmissionSite; 6] = [
         AdmissionSite::Filing,
         AdmissionSite::SweepPass,
         AdmissionSite::Release,
         AdmissionSite::GatePatch,
         AdmissionSite::QueueMove,
+        AdmissionSite::HoldRelease,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -224,6 +229,7 @@ impl AdmissionSite {
             AdmissionSite::Release => "release",
             AdmissionSite::GatePatch => "gate_patch",
             AdmissionSite::QueueMove => "queue_move",
+            AdmissionSite::HoldRelease => "hold_release",
         }
     }
 
@@ -235,7 +241,7 @@ impl AdmissionSite {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL_FOR_TESTS: [AdmissionSite; 5] = Self::ALL;
+    pub(crate) const ALL_FOR_TESTS: [AdmissionSite; 6] = Self::ALL;
 }
 
 impl std::fmt::Display for AdmissionSite {
@@ -325,7 +331,7 @@ pub struct AdmissionLock {
     mutex: Arc<tokio::sync::Mutex<()>>,
     holder: HolderSlot,
     wait_bound_ms: AtomicU64,
-    acquisitions: [AtomicU64; 5],
+    acquisitions: [AtomicU64; 6],
 }
 
 impl Default for AdmissionLock {
@@ -668,6 +674,78 @@ pub struct FleetLoad {
 
 /// Count executions in progress across every open database.
 pub async fn fleet_load(orch: &Orchestrator) -> Result<FleetLoad, String> {
+    let working = fleet_working(orch).await?;
+    Ok(FleetLoad {
+        in_progress: working.len(),
+        waiting_for_machine: working.values().filter(|placing| **placing).count(),
+    })
+}
+
+/// Whether work held for want of supply on `execution_id` may run now that
+/// supply can serve it, decided under the [`AdmissionLock`] the caller holds.
+///
+/// It fits when its execution already counts (another of its jobs is
+/// working), since running it takes no further slot. Otherwise it needs a free
+/// slot under the fleet cap, so a burst of releases after an outage fills the
+/// fleet once and waits, rather than running past it. A launch hold is new work
+/// on its node, so it also waits behind any execution of its own lane queued
+/// for a fleet slot, keeping the order the lane's owner set; a resume or yield
+/// hold is interrupted work and does not.
+pub async fn held_work_fits(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution_id: &str,
+    behind_its_lane: bool,
+) -> Result<bool, String> {
+    let working = fleet_working(orch).await?;
+    if working.contains_key(execution_id) {
+        return Ok(true);
+    }
+    let limit = orch.get_settings().max_concurrent_executions.max(1) as usize;
+    if working.len() >= limit {
+        return Ok(false);
+    }
+    if !behind_its_lane {
+        return Ok(true);
+    }
+    let execution = execution_id.to_string();
+    let lane_queued = db
+        .read(move |conn| {
+            let execution = execution.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(LANE_QUEUED_SQL, params![execution.as_str()])
+                    .await?;
+                Ok(match rows.next().await? {
+                    Some(row) => row.i64(0)? != 0,
+                    None => false,
+                })
+            })
+        })
+        .await
+        .map_err(|error| format!("failed to read the fleet queue: {error}"))?;
+    Ok(!lane_queued)
+}
+
+/// Whether an execution of `?1`'s lane is in line for a fleet slot.
+const LANE_QUEUED_SQL: &str = concat!(
+    "SELECT EXISTS (SELECT 1 FROM execution_gates g
+       JOIN executions e ON e.id = g.execution_id
+       LEFT JOIN issues i ON i.id = e.issue_id
+      WHERE g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence'
+        AND json_extract(g.predicate_json, '$.fact') = 'fleet_slot'
+        AND e.id <> ?1 AND ",
+    cairn_db::awaiting_release_sql!(),
+    " AND ",
+    cairn_db::queue_lane_sql!(),
+    " = (SELECT ",
+    cairn_db::queue_lane_sql!(),
+    " FROM executions e LEFT JOIN issues i ON i.id = e.issue_id WHERE e.id = ?1))"
+);
+
+/// Every execution in progress on this runner's fleet, and whether one of its
+/// working jobs is still waiting for a machine.
+async fn fleet_working(orch: &Orchestrator) -> Result<HashMap<String, bool>, String> {
     let device = orch.anon_device_manager.device_id();
     let waiting_jobs = orch.fleet.jobs_waiting_for_a_machine();
     let mut working: HashMap<String, bool> = HashMap::new();
@@ -701,10 +779,7 @@ pub async fn fleet_load(orch: &Orchestrator) -> Result<FleetLoad, String> {
             }
         }
     }
-    Ok(FleetLoad {
-        in_progress: working.len(),
-        waiting_for_machine: working.values().filter(|placing| **placing).count(),
-    })
+    Ok(working)
 }
 
 const THREAD_OF_ISSUE_SQL: &str = "SELECT t.id, t.name, i.number
@@ -2397,6 +2472,112 @@ pub(crate) mod tests {
             .await
             .unwrap();
         execution.id
+    }
+
+    // -- work held for want of supply ---------------------------------------
+
+    /// A started execution whose one job `sj{number}` is pending under an
+    /// active launch hold `h{number}`, armed at `{number}`.
+    async fn held_launch(env: &Env, number: i32) {
+        add_started(env, number, None, "pending").await;
+        env.db
+            .execute_script(format!(
+                "INSERT INTO provider_limit_holds(id, job_id, backend, boundary_source,
+                                                  created_at, updated_at, kind)
+                   VALUES('h{number}', 'sj{number}', 'claude', 'recheck', {number}, {number},
+                          'launch');"
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn fits(env: &Env, number: i32, behind_its_lane: bool) -> bool {
+        held_work_fits(&env.orch, &env.db, &format!("se{number}"), behind_its_lane)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn held_work_released_after_an_outage_takes_free_slots_one_at_a_time() {
+        let env = env("cap-held-release.db").await;
+        let baseline = fleet(&env).await;
+        caps(&env, baseline as i32 + 1, 50);
+        for number in [101, 102, 103] {
+            held_launch(&env, number).await;
+        }
+        assert_eq!(fleet(&env).await, baseline, "held work holds no slot");
+
+        // One supply change asks all three, oldest first, under one count.
+        assert!(fits(&env, 101, true).await, "the one free slot");
+        env.db
+            .execute(
+                "UPDATE provider_limit_holds SET state = 'resolved' WHERE id = 'h101'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet(&env).await,
+            baseline + 1,
+            "a released hold counts before the next is decided"
+        );
+        assert!(!fits(&env, 102, true).await, "the fleet is full now");
+        assert!(!fits(&env, 103, false).await, "for interrupted work too");
+
+        // More held work on an execution that already counts takes no slot.
+        env.db
+            .execute_script(
+                "INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
+                                  created_at, updated_at)
+                   VALUES('sj101b', 'se101', 'p', 'si101', 'reviewer', 'pending', 1, 1);
+                 INSERT INTO provider_limit_holds(id, job_id, backend, boundary_source,
+                                                  created_at, updated_at, kind)
+                   VALUES('h101b', 'sj101b', 'claude', 'recheck', 1, 1, 'launch');",
+            )
+            .await
+            .unwrap();
+        assert!(fits(&env, 101, true).await);
+    }
+
+    #[tokio::test]
+    async fn a_launch_hold_waits_behind_its_lanes_queue_and_interrupted_work_does_not() {
+        let env = env("cap-held-lane.db").await;
+        full_fleet(&env).await;
+        file(&env, 1, json!([])).await.unwrap();
+        assert!(is_held(&env, 1).await, "queued for a fleet slot");
+        // A slot frees; the sweep has not yet run.
+        env.db
+            .execute("UPDATE jobs SET status = 'complete' WHERE id = 'sj100'", ())
+            .await
+            .unwrap();
+        held_launch(&env, 101).await;
+        env.db
+            .execute_script(
+                "UPDATE issues SET
+                   parent_issue_id = (SELECT parent_issue_id FROM issues WHERE id = 'si1'),
+                   parent_thread_id = (SELECT parent_thread_id FROM issues WHERE id = 'si1')
+                 WHERE id = 'si101';",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !fits(&env, 101, true).await,
+            "new work keeps the order its lane's owner set"
+        );
+        assert!(fits(&env, 101, false).await, "interrupted work goes ahead");
+
+        add_issue(&env, 200, None).await;
+        env.db
+            .execute_script(
+                "UPDATE issues SET parent_issue_id = 'si200', parent_thread_id = NULL
+                 WHERE id = 'si101';",
+            )
+            .await
+            .unwrap();
+        assert!(
+            fits(&env, 101, true).await,
+            "another lane's queue is not its own"
+        );
     }
 
     // -- one test per acceptance rule ---------------------------------------

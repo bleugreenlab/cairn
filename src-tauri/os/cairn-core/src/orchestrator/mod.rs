@@ -794,6 +794,13 @@ impl OrchestratorBuilder {
         });
         let credential_store =
             CredentialStoreHandle::new(self.config_dir.clone(), self.credential_store);
+        // Supply is read from the credential store, so every write to it is
+        // a reason for held work to ask again (see `supply_changed`).
+        let supply_changed = Arc::new(tokio::sync::Notify::new());
+        credential_store.set_change_listener({
+            let supply_changed = supply_changed.clone();
+            Arc::new(move || supply_changed.notify_one())
+        });
         let orchestrator = Orchestrator {
             db: self.db,
             services: self.services,
@@ -851,6 +858,7 @@ impl OrchestratorBuilder {
             embed_tx: Arc::new(Mutex::new(None)),
             era_summary_tx: crate::threads::era_worker::sender_slot(),
             tenet_evidence_hint: Arc::new(tokio::sync::Notify::new()),
+            supply_changed,
             embed_gate: Arc::new(EmbedGate::default()),
             embed_space: Arc::new(SpaceState::default()),
             semantic_search: std::sync::OnceLock::new(),
@@ -1764,6 +1772,12 @@ pub struct Orchestrator {
     /// Wakes the tenet evidence worker after a conclusion commits. Pending
     /// event rows are the source of truth; this only shortens the wait.
     tenet_evidence_hint: Arc<tokio::sync::Notify>,
+    /// Wakes the scheduler when the credential store changes: an account added
+    /// or signed in, a block set or cleared, a usage reading, a credit top-up.
+    /// Work held for want of supply asks again then, without waiting for its
+    /// reset or its re-check. A permit, so a change while the scheduler is busy
+    /// is not lost.
+    supply_changed: Arc<tokio::sync::Notify>,
     /// The embedding health gate every consumer shares, so one outage pauses
     /// all of them and is logged once. See `embeddings::embedder`.
     embed_gate: Arc<EmbedGate>,
@@ -2133,6 +2147,11 @@ impl Orchestrator {
 
     pub(crate) fn tenet_evidence_hint(&self) -> Arc<tokio::sync::Notify> {
         self.tenet_evidence_hint.clone()
+    }
+
+    /// Resolves once the credential store has changed since the last wait.
+    pub(crate) fn supply_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.supply_changed.clone()
     }
 
     pub fn invalidate_sidebar_active_issues(&self) {

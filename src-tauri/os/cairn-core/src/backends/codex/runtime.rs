@@ -175,6 +175,9 @@ fn handle_selected_model_capacity_failure(
     };
     let next_attempt = completed_retries + 1;
     if next_attempt > CAPACITY_RETRY_DELAYS.len() as u32 {
+        if hold_at_capacity(orch, run_db, run_id, session_id, &target) {
+            return true;
+        }
         insert_error_event(
             orch,
             run_id,
@@ -281,6 +284,82 @@ fn handle_selected_model_capacity_failure(
                 retry_turn_id,
                 cleanup_error
             );
+        }
+    }
+    true
+}
+
+/// Hold a turn whose model stayed at capacity through every in-session retry,
+/// rather than failing it: at capacity is a want of supply, which waiting
+/// cures. The turn yields as a provider limit with no reset time, because
+/// Codex declares none and none is inferred, so the hold re-checks on its
+/// bounded clock and any change to the accounts asks sooner. The process stays
+/// warm for the resume. Switching an open session to another offer is its own
+/// lifecycle operation (cairn/4693), so the hold waits for this model.
+///
+/// Returns `false` when the hold could not be armed; the caller then fails the
+/// turn as before.
+fn hold_at_capacity(
+    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
+    run_id: &str,
+    session_id: Option<&str>,
+    target: &CapacityRetryTarget,
+) -> bool {
+    let refusal = cairn_models::supply::CapacityRefusal {
+        subject: "the selected Codex model".to_string(),
+        reason: "The selected Codex model remained at capacity after three automatic retries"
+            .to_string(),
+        retry_at: None,
+        retry_account: None,
+    };
+    let observation = crate::orchestrator::wakes::ProviderLimitObservation {
+        job_id: target.job_id.clone(),
+        run_id: run_id.to_string(),
+        turn_id: target.cairn_turn_id.clone(),
+        backend: super::CODEX_BACKEND_NAME.to_string(),
+        account_id: orch.process_state.get_account_id(run_id),
+        retry_not_before: refusal.retry_at,
+        boundary_source: "unknown".to_string(),
+        observed_text: Some(refusal.reason.clone()),
+        resume_gate: None,
+        boundary_account_id: None,
+        now: chrono::Utc::now().timestamp(),
+    };
+    let armed = crate::storage::run_db_blocking({
+        let db = run_db.clone();
+        move || async move {
+            crate::orchestrator::wakes::yield_and_arm_provider_limit_hold(&db, observation).await
+        }
+    });
+    let hold = match armed {
+        Ok(hold) => hold,
+        Err(error) => {
+            log::warn!("Could not hold run {run_id} at Codex capacity: {error}");
+            return false;
+        }
+    };
+    crate::orchestrator::lifecycle::warm_provider_held_run(orch, run_id);
+    crate::backends::codex::emit_codex_run_turn_completed(&orch.services.emitter, run_id);
+    if hold.observed_count == 1 {
+        let note = format!(
+            "{}. The node holds and re-checks every {} minutes, or sooner if an account changes; continue it to retry now.",
+            refusal.reason,
+            crate::orchestrator::wakes::SUPPLY_RECHECK_SECS / 60
+        );
+        if let Err(error) = crate::messages::transcript::insert_system_message_sync(
+            orch,
+            run_id,
+            session_id,
+            Some(&target.cairn_turn_id),
+            &note,
+            serde_json::json!({
+                "provider": "codex",
+                "kind": "selected_model_capacity_hold",
+                "holdId": hold.id,
+            }),
+        ) {
+            log::warn!("Failed to record the Codex capacity hold for run {run_id}: {error}");
         }
     }
     true

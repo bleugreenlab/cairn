@@ -10,8 +10,9 @@
 //! the account a provenance line names is the account the session runs on.
 
 use std::cmp::Ordering;
+use std::fmt;
 
-use cairn_credentials::{CredentialStore, RoutedProvider};
+use cairn_credentials::{CredentialStore, RoutedAvailability, RoutedProvider};
 use cairn_models_types::supply::{account_cost, metered_cost, Cost};
 use cairn_models_types::usage::ProviderUsageWindow;
 use serde::{Deserialize, Serialize};
@@ -48,13 +49,74 @@ pub struct SupplyInputs<'a> {
     pub now: i64,
 }
 
+/// Why no account of a provider can serve a model now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shortfall {
+    /// The sentence a refusal or a hold shows.
+    pub reason: String,
+    /// Whether the model is only out of supply (a usage window, a provider
+    /// block, depleted credits), which waiting or a change to the accounts
+    /// cures. `false` is configuration: every account is signed out, scoped
+    /// elsewhere, or cannot serve this backend.
+    pub supply: bool,
+    /// The soonest instant an account declares it can serve again.
+    pub resets_at: Option<i64>,
+    /// The account `resets_at` belongs to, when one does.
+    pub reset_account: Option<String>,
+}
+
+impl fmt::Display for Shortfall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// A launch refused only because nothing can serve it now. One type for the
+/// fact wherever it is met: model selection, session routing, or a provider
+/// reporting the model at capacity mid-session. It never carries a reset
+/// nobody declared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapacityRefusal {
+    /// What waits for supply: a `provider/model`, or an allotment as
+    /// `[sm, md, lg]`.
+    pub subject: String,
+    /// The refusal's text, which a held node shows and its run records.
+    pub reason: String,
+    /// The soonest declared reset among the accounts that could serve it.
+    pub retry_at: Option<i64>,
+    /// The account whose reset `retry_at` is.
+    pub retry_account: Option<String>,
+}
+
+impl fmt::Display for CapacityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl CapacityRefusal {
+    /// The refusal of `subject` for want of `shortfall`.
+    pub fn of(
+        subject: impl Into<String>,
+        reason: impl Into<String>,
+        shortfall: &Shortfall,
+    ) -> Self {
+        Self {
+            subject: subject.into(),
+            reason: reason.into(),
+            retry_at: shortfall.resets_at,
+            retry_account: shortfall.reset_account.clone(),
+        }
+    }
+}
+
 /// What running `model` on `provider` costs now, on its cheapest account, or
 /// why no account of it can serve the model.
 pub fn supply_for(
     provider: &CatalogProvider,
     model: &str,
     inputs: &SupplyInputs<'_>,
-) -> Result<Supply, String> {
+) -> Result<Supply, Shortfall> {
     let key = provider.descriptor.key.as_ref();
     let name = provider.descriptor.display_name.as_ref();
     if let (Some(routed), Some(store)) = (RoutedProvider::for_backend(key), inputs.store) {
@@ -67,19 +129,44 @@ pub fn supply_for(
                 inputs.assignments,
                 inputs.now,
             );
+            // Routing's own fallback: with no subscription account able to
+            // serve, a configured API key serves, billed per token, unless the
+            // project names its own account. Routing picks the key itself, so
+            // the supply names no account.
+            if ranked.is_empty()
+                && store
+                    .routed_project_override(routed, inputs.project_id)
+                    .is_none()
+                && store
+                    .routed_api_key_fallback(routed, inputs.project_id)
+                    .is_some()
+            {
+                return Ok(Supply {
+                    cost: metered_cost(provider.pricing(model)),
+                    account: None,
+                });
+            }
             let first = ranked.into_iter().next().ok_or_else(|| {
                 // Each account's own reason, so a hold says what releases it
                 // (accepting new terms, signing back in) rather than only
                 // that nothing is free.
-                let reasons: Vec<String> = store
-                    .routed_account_diagnostics(
-                        routed,
-                        inputs.project_id,
-                        None,
-                        None,
-                        Some(model),
-                        inputs.now,
-                    )
+                let diagnostics = store.routed_account_diagnostics(
+                    routed,
+                    inputs.project_id,
+                    None,
+                    None,
+                    Some(model),
+                    inputs.now,
+                );
+                // An in-scope account routing set aside for no stated cause
+                // is one this reading cannot explain, and waiting on it is
+                // harmless; only configuration everywhere refuses outright.
+                let supply = diagnostics.iter().any(|account| {
+                    account
+                        .cause
+                        .is_none_or(cairn_credentials::RejectionCause::is_supply)
+                });
+                let reasons: Vec<String> = diagnostics
                     .into_iter()
                     .filter_map(|account| {
                         account
@@ -92,7 +179,22 @@ pub fn supply_for(
                 if !reasons.is_empty() {
                     refusal.push_str(&format!(" ({})", reasons.join("; ")));
                 }
-                refusal
+                let (resets_at, reset_account) = match store.routed_availability(
+                    routed,
+                    inputs.project_id,
+                    None,
+                    Some(model),
+                    inputs.now,
+                ) {
+                    RoutedAvailability::At(at, account) => (Some(at), Some(account)),
+                    _ => (None, None),
+                };
+                Shortfall {
+                    reason: refusal,
+                    supply,
+                    resets_at,
+                    reset_account,
+                }
             })?;
             return Ok(Supply {
                 cost: first.cost,
@@ -105,7 +207,22 @@ pub fn supply_for(
     }
     if let Some((windows, captured_at)) = (inputs.provider_windows)(key) {
         let cost = account_cost(Some((&windows, captured_at)), Some(model), inputs.now)
-            .ok_or_else(|| format!("{name} is out of usage for {model}"))?;
+            .ok_or_else(|| Shortfall {
+                reason: format!("{name} is out of usage for {model}"),
+                supply: true,
+                // Every empty window must reset before the provider serves.
+                resets_at: windows
+                    .iter()
+                    .filter(|window| window.is_live_at(captured_at, inputs.now))
+                    .filter(|window| window.matches_model(Some(model)))
+                    .filter(|window| window.remaining_percent <= 0.0)
+                    .map(|window| window.resets_at)
+                    .try_fold(None::<i64>, |latest, at| {
+                        at.map(|at| Some(latest.map_or(at, |latest| latest.max(at))))
+                    })
+                    .flatten(),
+                reset_account: None,
+            })?;
         return Ok(Supply {
             cost,
             account: None,

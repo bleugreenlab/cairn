@@ -1,5 +1,5 @@
 use super::{run_db, start_ordinary_session, PreparedJob};
-use crate::models::{AgentConfig, Model, OutputSchemaInfo};
+use crate::models::{AgentConfig, Model, OutputSchemaInfo, TurnStartReason};
 use crate::orchestrator::attention_push::TurnDelivery;
 use crate::orchestrator::Orchestrator;
 use crate::runtime_admission::RuntimeAdmissionClient;
@@ -479,6 +479,53 @@ async fn recover_team_on_startup(orch: &Orchestrator) {
     }
 }
 
+/// Hold a prepared launch that no account can serve now, before it errors.
+///
+/// A cold start of a recipe node holds as a launch: release makes it placeable
+/// again and its launch selects anew. A continuation (anything but a cold
+/// start) holds as a resume on the turn it prepared, which the refusal leaves
+/// at the head. A cold start of a job no advancement places (a direct child
+/// task) has nothing to release it into, so it is refused as before.
+fn hold_unserved_launch(
+    orch: &Orchestrator,
+    job_id: &str,
+    run_id: &str,
+    turn_id: &str,
+    start_reason: &TurnStartReason,
+    refusal: &cairn_models::supply::CapacityRefusal,
+) -> Result<(), String> {
+    let owning = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })?;
+    let kind = if *start_reason != TurnStartReason::Initial {
+        crate::orchestrator::wakes::HoldKind::Resume
+    } else {
+        let db = owning.clone();
+        let job_id = job_id.to_string();
+        let placed = run_db(async move {
+            db.query_opt(
+                "SELECT 1 FROM jobs WHERE id = ?1 AND recipe_node_id IS NOT NULL AND execution_id IS NOT NULL",
+                (job_id,),
+                |_| Ok(()),
+            )
+            .await
+            .map(|row| row.is_some())
+            .map_err(|error| error.to_string())
+        })?;
+        if !placed {
+            return Ok(());
+        }
+        crate::orchestrator::wakes::HoldKind::Launch
+    };
+    super::hold_refused_launch(&owning, job_id, kind, Some(run_id), Some(turn_id), refusal)
+}
+
 pub(super) fn enqueue_or_start(
     orch: &Orchestrator,
     prepared: &mut PreparedJob,
@@ -541,7 +588,7 @@ pub(super) fn enqueue_or_start(
             // in-memory credential, this writes the non-secret account id onto
             // the session so queued and restarted promotion cannot silently
             // select a different account.
-            crate::orchestrator::session::resolve_routed_session_identity(
+            let routed = crate::orchestrator::session::resolve_routed_session_identity(
                 orch,
                 provider,
                 &prepared.session_id,
@@ -549,7 +596,22 @@ pub(super) fn enqueue_or_start(
                 prepared.job_model.as_ref().map(Model::as_str),
                 crate::orchestrator::session::snapshot_account_override(orch, &prepared.run_id)?
                     .as_deref(),
-            )?;
+            );
+            match routed {
+                Ok(_) => {}
+                Err(crate::orchestrator::session::RouteRefusal::NoSupply(refusal)) => {
+                    hold_unserved_launch(
+                        orch,
+                        &prepared.job_id,
+                        &prepared.run_id,
+                        &prepared.turn_id,
+                        &prepared.start_reason,
+                        &refusal,
+                    )?;
+                    return Err(refusal.reason);
+                }
+                Err(refusal) => return Err(refusal.into()),
+            }
         }
     }
     let provider_account_id = run_db({
@@ -1314,19 +1376,56 @@ fn start_leased_inner(
     let routed_provider =
         crate::credentials::RoutedProvider::for_backend(&backend_name.to_ascii_lowercase());
     let mut identity_override = match (snapshot.provider_account_id.as_deref(), routed_provider) {
-        (Some(account_id), Some(provider)) => Some(
-            orch.resolve_available_routed_account(
+        (Some(account_id), Some(provider)) => {
+            let requested_model = model.as_ref().map(Model::as_str);
+            match orch.resolve_available_routed_account(
                 provider,
                 Some(&project_id),
                 account_id,
-                model.as_ref().map(Model::as_str),
-            )
-            .ok_or_else(|| {
-                format!(
-                    "prepared ordinary launch account {account_id} is no longer available for {backend_name}"
-                )
-            })?,
-        ),
+                requested_model,
+            ) {
+                Some(identity) => Some(identity),
+                None => {
+                    // The account went out while the launch waited in line.
+                    // Its hold re-routes on release, so it asks the whole
+                    // policy whether supply is all that is missing.
+                    let text = format!(
+                        "prepared ordinary launch account {account_id} is no longer available for {backend_name}"
+                    );
+                    let explicit = crate::orchestrator::session::snapshot_account_override(
+                        orch,
+                        &snapshot.run_id,
+                    )?
+                    .or_else(|| {
+                        crate::orchestrator::session::routed_project_override(
+                            orch,
+                            provider,
+                            Some(&project_id),
+                        )
+                    });
+                    if let crate::orchestrator::session::RouteRefusal::NoSupply(refusal) =
+                        crate::orchestrator::session::routing_refusal(
+                            orch,
+                            provider,
+                            Some(&project_id),
+                            explicit.as_deref(),
+                            requested_model,
+                            text.clone(),
+                        )
+                    {
+                        hold_unserved_launch(
+                            orch,
+                            &snapshot.job_id,
+                            &snapshot.run_id,
+                            &snapshot.turn_id,
+                            &snapshot.reason,
+                            &refusal,
+                        )?;
+                    }
+                    return Err(text);
+                }
+            }
+        }
         (Some(account_id), None) => {
             return Err(format!(
                 "prepared ordinary launch account {account_id} has no routed provider for {backend_name}"

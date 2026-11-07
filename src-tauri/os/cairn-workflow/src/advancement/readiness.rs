@@ -351,7 +351,38 @@ pub(super) async fn dependency_failure_analysis_conn(
     })
 }
 
+/// Whether `job` is claimable: DAG-ready ([`is_job_dag_ready_conn`]) and not
+/// held for want of supply. A held job waits for its hold to release it, and
+/// claiming it would only launch it into the refusal that held it.
 pub async fn is_job_ready_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job: &DbJob,
+) -> DbResult<bool> {
+    if job_supply_held_conn(conn, &job.id).await? {
+        return Ok(false);
+    }
+    is_job_dag_ready_conn(conn, job).await
+}
+
+/// Whether `job_id` waits on an active supply hold.
+pub async fn job_supply_held_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            concat!(
+                "SELECT 1 FROM jobs j WHERE j.id = ?1 AND ",
+                cairn_db::job_supply_held_sql!()
+            ),
+            (job_id,),
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
+/// Whether `job`'s DAG would let it run now, held or not.
+pub async fn is_job_dag_ready_conn(
     conn: &cairn_db::storage::TrackedConnection,
     job: &DbJob,
 ) -> DbResult<bool> {
@@ -398,8 +429,9 @@ pub async fn is_job_ready_conn(
 ///   turn reads live), and
 /// - no job is Pending **and** DAG-ready — a claimable job is imminent work; this
 ///   is what covers the builder-end → review-start gap once the pr node fires its
-///   open port and the review job becomes ready. A Pending job whose control-deps
-///   are unmet counts as settled (it may never run), and
+///   open port and the review job becomes ready. A job held for want of supply is
+///   imminent too: its hold releases it on its own. A Pending job whose
+///   control-deps are unmet counts as settled (it may never run), and
 /// - no `action_run` is in a transient state (`pending`/`running`) — this covers
 ///   the pr action itself over its seed → GitHub-open → open-port window.
 ///
@@ -467,7 +499,7 @@ async fn issue_settled_conn(
         if super::recompute::turn_facts(conn, &job.id).await?.live() {
             return Ok(false);
         }
-        if job.status == "pending" && is_job_ready_conn(conn, job).await? {
+        if job.status == "pending" && is_job_dag_ready_conn(conn, job).await? {
             return Ok(false);
         }
     }

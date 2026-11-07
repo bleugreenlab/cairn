@@ -194,8 +194,41 @@ macro_rules! fleet_working_job_sql {
             "(j.status = 'running' OR (j.status = 'pending' AND j.execution_id NOT IN (SELECT j.execution_id FROM jobs j WHERE j.execution_id IS NOT NULL AND j.status IN ('blocked', 'pending', 'running') AND (j.status = 'blocked' OR ",
             $crate::job_awaits_operator_sql!(),
             ")))) AND NOT ",
-            $crate::job_awaits_operator_sql!()
+            $crate::job_awaits_operator_sql!(),
+            " AND NOT ",
+            $crate::job_supply_held_sql!()
         )
+    };
+}
+
+/// True when job `j` waits for supply: its launch or continuation was refused
+/// because no account can serve its model now, and an active hold will release
+/// it (`orchestrator::wakes::provider_limits`). Such a job is not working, so it
+/// holds no fleet slot, and it is not placeable, so advancement does not launch
+/// it into the same refusal. It has not ended either ([`nonterminal_job_sql!`]
+/// still covers it), so its execution stays live. Expects a `jobs` row aliased
+/// `j`.
+#[macro_export]
+macro_rules! job_supply_held_sql {
+    () => {
+        concat!(
+            "EXISTS (SELECT 1 FROM provider_limit_holds supply_hold WHERE supply_hold.job_id = j.id AND ",
+            $crate::supply_hold_owns_job_sql!(),
+            ")"
+        )
+    };
+}
+
+/// True when hold `supply_hold` is an active launch or resume hold that still
+/// owns job `j`: a launch hold's job is still `pending`, a resume hold's job
+/// still rests on the refused head. A hold whose node moved on (an operator's
+/// start or continue) holds nothing, even before the scheduler retires it.
+/// Expects a `provider_limit_holds` row aliased `supply_hold` and a `jobs`
+/// row aliased `j`.
+#[macro_export]
+macro_rules! supply_hold_owns_job_sql {
+    () => {
+        "supply_hold.state = 'active' AND ((supply_hold.kind = 'launch' AND j.status = 'pending') OR (supply_hold.kind = 'resume' AND j.current_turn_id = supply_hold.turn_id))"
     };
 }
 

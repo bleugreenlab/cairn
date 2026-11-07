@@ -8,10 +8,11 @@
 
 use super::*;
 use crate::execution::model_selection::{
-    effective_allotment, ResolvedConstraints, SelectionRecord, SelectionSubject,
+    effective_allotment, ResolvedConstraints, SelectionRecord, SelectionRefusal, SelectionSubject,
 };
 use crate::models::ModelSelection;
 use cairn_config::allotment::NodeConstraints;
+use cairn_models::supply::CapacityRefusal;
 use cairn_models::types::catalog::VerbKind;
 
 /// Choose and store this job's model, unless it already has one.
@@ -21,19 +22,78 @@ use cairn_models::types::catalog::VerbKind;
 /// carries a model already (a launch pin written at job creation, an
 /// operator's edit) or a stored selection keeps it. A recipe node selects
 /// within its node's allotment under its constraints; a job outside any
-/// recipe node (a thread's session job) selects within its agent's. A
-/// refusal fails the launch with the refusal's text.
+/// recipe node (a thread's session job) selects within its agent's. A refusal
+/// refuses the launch: [`SelectionRefusal::NoSupply`] holds it, and anything
+/// else fails it with the refusal's text.
 pub(super) fn select_job_model(
     orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
     job: &DbJob,
     project_path: Option<&std::path::Path>,
-) -> Result<(), String> {
+) -> Result<(), SelectionRefusal> {
+    match choose_job_model(orch, owning_db, job, project_path)? {
+        None => {}
+        Some(Choice::Pinned(record)) => {
+            log::info!("[select] job {}: {}", job.id, record.provenance);
+            orch.store_job_selection(&job.id, &record)?;
+        }
+        Some(Choice::Selected(record)) => {
+            log::info!("[select] job {}: {}", job.id, record.provenance);
+            store_node_model(owning_db, &job.id, &record)?;
+        }
+    }
+    Ok(())
+}
+
+/// What a launch would store as its model. A pin stores its record beside the
+/// model it already carries; a selection writes the chosen model too.
+enum Choice {
+    Pinned(SelectionRecord),
+    Selected(SelectionRecord),
+}
+
+/// Why `job_id`'s launch would wait for supply if it launched now, or `None`
+/// when it would launch (or fail, which is its launch's to report). Nothing is
+/// stored: this is how a held launch asks whether its time has come.
+pub(crate) fn probe_launch_supply(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<Option<CapacityRefusal>, String> {
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })?;
+    let job = run_db(load_job(
+        owning_db.clone(),
+        job_id.to_string(),
+        "Job not found",
+    ))?;
+    let (repo_path, _) = run_db(load_project_repo_and_key(
+        orch.db.clone(),
+        job.project_id.clone(),
+    ))?;
+    match choose_job_model(orch, &owning_db, &job, Some(Path::new(&repo_path))) {
+        Err(SelectionRefusal::NoSupply(refusal)) => Ok(Some(refusal)),
+        Ok(_) | Err(SelectionRefusal::Misconfigured { .. }) => Ok(None),
+    }
+}
+
+fn choose_job_model(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    project_path: Option<&std::path::Path>,
+) -> Result<Option<Choice>, SelectionRefusal> {
     let Some(agent_id) = job.agent_config_id.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     if orch.job_selection(&job.id)?.is_some() {
-        return Ok(());
+        return Ok(None);
     }
     let snapshot = match job.execution_id.as_deref() {
         Some(execution_id) => load_snapshot(owning_db, execution_id)?,
@@ -55,21 +115,23 @@ pub(super) fn select_job_model(
         job.model.as_deref(),
         agent.and_then(|agent| agent.selection.as_ref()),
     ) {
-        let record = orch.pinned_selection(Some(&job.project_id), &pin, subject)?;
-        log::info!("[select] job {}: {}", job.id, record.provenance);
-        return orch.store_job_selection(&job.id, &record);
+        return orch
+            .pinned_selection(Some(&job.project_id), &pin, subject)
+            .map(|record| Some(Choice::Pinned(record)));
     }
 
     match (snapshot.as_ref(), job.recipe_node_id.as_deref()) {
         (Some(snapshot), Some(node_id)) => {
             select_node_model(orch, owning_db, job, snapshot, agent, node_id, subject)
+                .map(|record| Some(Choice::Selected(record)))
         }
         (_, None) => {
             select_host_model(orch, owning_db, job, agent_id, agent, project_path, subject)
+                .map(|record| record.map(Choice::Selected))
         }
         (None, Some(_)) => match job.execution_id.as_deref() {
-            Some(execution_id) => Err(format!("Execution {execution_id} has no snapshot")),
-            None => Ok(()),
+            Some(execution_id) => Err(format!("Execution {execution_id} has no snapshot").into()),
+            None => Ok(None),
         },
     }
 }
@@ -123,9 +185,9 @@ fn select_host_model(
     agent: Option<&AgentSnapshot>,
     project_path: Option<&std::path::Path>,
     subject: SelectionSubject,
-) -> Result<(), String> {
+) -> Result<Option<SelectionRecord>, SelectionRefusal> {
     if has_run_on_a_provider(owning_db, &job.id)? {
-        return Ok(());
+        return Ok(None);
     }
     let models = match agent {
         Some(agent) => agent.models.clone(),
@@ -136,11 +198,17 @@ fn select_host_model(
                 .models
         }
     };
-    let record = orch
-        .select_for_agent(&job.project_id, None, &models, subject)
-        .map_err(|refusal| format!("{agent_id} cannot launch: {refusal}"))?;
-    log::info!("[select] job {}: {}", job.id, record.provenance);
-    store_node_model(owning_db, &job.id, &record)
+    let defaults = orch.effective_models(Some(&job.project_id))?.default_models;
+    let allotment = effective_allotment(None, &models, &defaults);
+    orch.select_models(
+        Some(&job.project_id),
+        &allotment,
+        VerbKind::Session,
+        &ResolvedConstraints::default(),
+        subject,
+    )
+    .map(Some)
+    .map_err(|refusal| refusal.context(format!("{agent_id} cannot launch")))
 }
 
 /// The provider of the session `job_id` is prepared to fork, when its current
@@ -213,7 +281,7 @@ fn select_node_model(
     agent: Option<&AgentSnapshot>,
     node_id: &str,
     subject: SelectionSubject,
-) -> Result<(), String> {
+) -> Result<SelectionRecord, SelectionRefusal> {
     let execution_id = job.execution_id.as_deref().unwrap_or_default();
     let node = snapshot.recipe.nodes.iter().find(|node| node.id == node_id);
     let node_config = node.and_then(|node| node.agent_config.as_ref());
@@ -229,17 +297,14 @@ fn select_node_model(
         None => ResolvedConstraints::default(),
     };
     constraints.fork_provider = forked_provider(owning_db, &job.id)?;
-    let record = orch
-        .select_models(
-            Some(&job.project_id),
-            &allotment,
-            VerbKind::Session,
-            &constraints,
-            subject,
-        )
-        .map_err(|refusal| format!("{label} cannot launch: {refusal}"))?;
-    log::info!("[select] job {}: {}", job.id, record.provenance);
-    store_node_model(owning_db, &job.id, &record)
+    orch.select_models(
+        Some(&job.project_id),
+        &allotment,
+        VerbKind::Session,
+        &constraints,
+        subject,
+    )
+    .map_err(|refusal| refusal.context(format!("{label} cannot launch")))
 }
 
 /// The stored selections a node's constraints name, refusing a reference

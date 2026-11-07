@@ -16,7 +16,8 @@ use cairn_core::internal::execution::jobs::{
 use cairn_core::internal::orchestrator::lifecycle::{finalize_run, stop_job};
 use cairn_core::internal::orchestrator::wakes::{
     load_active_provider_limit_holds, resolve_provider_limit_hold,
-    supersede_orphaned_provider_limit_holds, ProviderLimitHold,
+    supersede_orphaned_provider_limit_holds, ProviderLimitHold, RESUME_GATE_LAUNCH_FAILED,
+    SUPPLY_RECHECK_SECS,
 };
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::{
@@ -955,19 +956,23 @@ async fn duplicate_results_coalesce_and_keep_the_later_reset() {
 }
 
 #[tokio::test]
-async fn unknown_reset_is_unfinished_work_without_a_guessed_timer() {
+async fn unknown_reset_guesses_no_reset_and_rechecks_on_a_bounded_clock() {
     let (_temp, db, orch, recorder) = fixture().await;
     let hold = hold(&orch, &db, "Usage limit reached").await;
-    assert_eq!(hold.retry_not_before, None);
+    assert_eq!(hold.retry_not_before, None, "no reset is ever guessed");
     assert_eq!(hold.boundary_source, "unknown");
-    assert_eq!(hold.next_due_at(), None);
+    // cairn/5378: it is not left waiting forever on an event that may never
+    // come; it asks again a bounded interval after it last learned anything.
+    let recheck = hold.updated_at + SUPPLY_RECHECK_SECS;
+    assert_eq!(hold.next_due_at(), Some(recheck));
     assert_held(&db).await;
-    for now in [OBSERVED_AT, RESET_AT, RESET_AT + 604800, i64::MAX] {
+    for now in [hold.updated_at, recheck - 1] {
         assert_eq!(hold.due_at(now), None);
         assert!(!resolve_provider_limit_hold(&orch, &hold, now)
             .await
             .unwrap());
     }
+    assert_eq!(hold.due_at(recheck), Some(recheck));
     assert_eq!(turns(&db).await, 1);
     assert_eq!(recorder.spawn_count(), 0);
 }
@@ -1045,8 +1050,14 @@ async fn failed_launches_restore_the_held_head_then_stop_retrying_after_three_at
         if attempt < 3 {
             assert!((before + 300..=after + 300).contains(&current.retry_not_before.unwrap()));
         } else {
-            assert_eq!(current.retry_not_before, None);
+            // A third failed launch is not a supply question a re-check could
+            // answer, so the hold stays visibly gated on the operator.
+            assert_eq!(
+                current.resume_gate.as_deref(),
+                Some(RESUME_GATE_LAUNCH_FAILED)
+            );
             assert_eq!(current.next_due_at(), None);
+            assert!(!current.releasable(), "nor released by a supply change");
         }
     }
     assert!(!resolve_provider_limit_hold(&orch, &current, i64::MAX)

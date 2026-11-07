@@ -602,15 +602,27 @@ impl Orchestrator {
         constraints: &ResolvedConstraints,
         subject: SelectionSubject,
     ) -> Result<SelectionRecord, SelectionRefusal> {
-        let refuse = |message: String| SelectionRefusal { message };
-        let catalog = self
-            .catalog(&ModelScope {
-                project_id: project_id.map(str::to_string),
-            })
-            .map_err(refuse)?;
-        let models = self
-            .effective_models_in(project_id, &catalog)
-            .map_err(refuse)?;
+        let catalog = self.catalog(&ModelScope {
+            project_id: project_id.map(str::to_string),
+        })?;
+        let models = self.effective_models_in(project_id, &catalog)?;
+        let mut record = self.with_supply(project_id, |supply| {
+            let ctx = SelectionContext {
+                models: &models,
+                catalog: &catalog,
+                supply,
+            };
+            select(&ctx, allotment, verb, constraints, &TopOfAllotment)
+        })?;
+        record.subject = subject;
+        Ok(record)
+    }
+
+    /// Run `f` over what supply reads in `project_id` now: the credential
+    /// store's accounts with the same recent-assignment evidence session
+    /// routing spreads by, and usage windows the book holds for providers the
+    /// credential store does not route (OpenCode Go).
+    fn with_supply<T>(&self, project_id: Option<&str>, f: impl FnOnce(SupplyInputs<'_>) -> T) -> T {
         let store = self.get_credential_store();
         let assignments = run_db_blocking({
             let db = self.db.local.clone();
@@ -631,20 +643,13 @@ impl Orchestrator {
                 .max_by_key(|snapshot| snapshot.captured_at)
                 .map(|snapshot| (snapshot.windows.clone(), snapshot.captured_at))
         };
-        let ctx = SelectionContext {
-            models: &models,
-            catalog: &catalog,
-            supply: SupplyInputs {
-                store: store.as_ref(),
-                project_id,
-                assignments: &assignments,
-                provider_windows: &provider_windows,
-                now: chrono::Utc::now().timestamp(),
-            },
-        };
-        let mut record = select(&ctx, allotment, verb, constraints, &TopOfAllotment)?;
-        record.subject = subject;
-        Ok(record)
+        f(SupplyInputs {
+            store: store.as_ref(),
+            project_id,
+            assignments: &assignments,
+            provider_windows: &provider_windows,
+            now: chrono::Utc::now().timestamp(),
+        })
     }
 
     /// The session model a job outside any recipe node runs on: a call, a
@@ -671,16 +676,42 @@ impl Orchestrator {
     }
 
     /// The record a job pinned to `pin` stores in place of a selection.
+    ///
+    /// A pin is never replaced, but it is asked the same supply question a
+    /// selection asks of its candidates: a pin whose every account is out of
+    /// usage, blocked or out of credits is refused with
+    /// [`SelectionRefusal::NoSupply`], so its launch holds instead of dying at
+    /// session routing. Anything else about the pin (a provider not installed,
+    /// no credential at all) is the launch's own error to report.
     pub(crate) fn pinned_selection(
         &self,
         project_id: Option<&str>,
         pin: &crate::models::ModelSelection,
         subject: SelectionSubject,
-    ) -> Result<SelectionRecord, String> {
+    ) -> Result<SelectionRecord, SelectionRefusal> {
         let catalog = self.catalog(&ModelScope {
             project_id: project_id.map(str::to_string),
         })?;
         let models = self.effective_models_in(project_id, &catalog)?;
+        let reference = cairn_config::allotment::model_ref(pin);
+        if let Some(provider) = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.installed && provider.descriptor.key == pin.backend.as_str())
+        {
+            let shortfall = self.with_supply(project_id, |supply| {
+                cairn_models::supply::supply_for(provider, pin.model.as_str(), &supply).err()
+            });
+            if let Some(why) = shortfall.filter(|why| why.supply) {
+                return Err(SelectionRefusal::NoSupply(
+                    cairn_models::supply::CapacityRefusal::of(
+                        &reference,
+                        format!("pinned {reference} cannot run now: {why}"),
+                        &why,
+                    ),
+                ));
+            }
+        }
         let mut record = crate::execution::model_selection::pinned(&models, &catalog, pin);
         record.subject = subject;
         Ok(record)
