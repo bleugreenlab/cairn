@@ -928,7 +928,7 @@ fn read_branch_commit(repo: &Path, branch: &str) -> Option<String> {
 /// with no subprocess: `packed-refs` first, then loose refs, which override it.
 /// An unreadable layout (a reftable, an unparseable ref, no backing checkout) is
 /// an error, never an empty map.
-pub(crate) fn backing_branch_heads(
+pub fn backing_branch_heads(
     store: &Path,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
     let repo = resolve_backing_checkout(store)

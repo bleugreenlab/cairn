@@ -651,10 +651,14 @@ pub enum RepairVerdict {
 /// failed or pre-attempt state, a scoped export of exactly those names, then
 /// verification that the recorded bookmarks and heads are at their targets and
 /// that every other bookmark and head is where it was before this repair.
+/// `merged_missing` identifies host-attested merged, unheld branches whose
+/// recorded Git heads have disappeared. Recreate those heads at their saved
+/// targets, rather than requiring ancestry that squash merges do not preserve.
 pub fn repair_branch_recovery(
     store: &Path,
     coordinates: &RecoveryCoordinates,
     recovery_id: &str,
+    merged_missing: &BTreeSet<String>,
 ) -> RepairVerdict {
     if coordinates.scope != RecoveryScope::Branch || coordinates.bookmarks.is_empty() {
         return RepairVerdict::Refused(
@@ -676,6 +680,17 @@ pub fn repair_branch_recovery(
             return RepairVerdict::Refused(format!("read the current git heads: {error}"))
         }
     };
+    for bookmark in &coordinates.bookmarks {
+        if merged_missing.contains(&bookmark.bookmark)
+            && (bookmark.pre.commit().is_none()
+                || bookmark.pre_git.as_deref() != bookmark.pre.commit())
+        {
+            return RepairVerdict::Refused(format!(
+                "cannot recreate `{}`: its recorded Git head differs from its saved bookmark",
+                bookmark.bookmark
+            ));
+        }
+    }
     let restores: Vec<RecordedBookmarkRestore> = coordinates
         .bookmarks
         .iter()
@@ -683,6 +698,7 @@ pub fn repair_branch_recovery(
             bookmark: bookmark.bookmark.clone(),
             target: bookmark.pre.clone(),
             replaceable: vec![bookmark.failed.clone()],
+            recreate_missing_git_head: merged_missing.contains(&bookmark.bookmark),
         })
         .collect();
     let outcome = match crate::restore_recorded_bookmarks(
@@ -832,7 +848,12 @@ pub fn validate_store_recovery(store: &Path, coordinates: &RecoveryCoordinates) 
         ));
     }
     let pre_git = coordinates.pre_git.clone().unwrap_or_default();
-    let mut affected: BTreeSet<String> = moved.clone().unwrap_or_default().into_iter().collect();
+    let mut affected: BTreeSet<String> = moved
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(coordinates.affected().map(str::to_string))
+        .collect();
     if restored {
         affected.retain(|name| git.get(name).map(String::as_str) != pre_view.state(name).commit());
         for (name, state) in pre {
@@ -902,19 +923,15 @@ pub fn interrupted_repair_coordinates(
     ) {
         (Ok(view), Ok(git)) => {
             let mut pre = view.bookmarks.clone();
-            let mut failed = view.bookmarks;
+            let failed = view.bookmarks.clone();
             let mut pre_git = git;
-            for bookmark in &branch.bookmarks {
+            for bookmark in &mut coordinates.bookmarks {
+                bookmark.failed = view.state(&bookmark.bookmark);
                 let name = bookmark.bookmark.clone();
                 if bookmark.pre.is_absent() {
                     pre.remove(&name);
                 } else {
                     pre.insert(name.clone(), bookmark.pre.clone());
-                }
-                if bookmark.failed.is_absent() {
-                    failed.remove(&name);
-                } else {
-                    failed.insert(name.clone(), bookmark.failed.clone());
                 }
                 match bookmark.pre.commit() {
                     Some(commit) => {
@@ -950,36 +967,6 @@ pub fn interrupted_repair_coordinates(
             .into(),
     );
     coordinates
-}
-
-/// The bookmarks among `names` that a `jj git import` would move: those whose
-/// backing `refs/heads/*` no longer equals the value jj last recorded for it.
-/// An import moves a local bookmark only to follow such a change, so a fenced
-/// bookmark outside this answer is untouched by one.
-pub fn bookmarks_an_import_would_move(
-    store: &Path,
-    names: &[String],
-) -> Result<Vec<String>, String> {
-    let git = backing_branch_heads(store)?;
-    futures::executor::block_on(async {
-        let repo = crate::load_repo_at_head(store)
-            .await
-            .map_err(|error| format!("load the store view: {error}"))?;
-        Ok(names
-            .iter()
-            .filter(|name| {
-                let recorded = BookmarkState::of(repo.view().get_git_ref(
-                    jj_lib::ref_name::GitRefName::new(&format!("refs/heads/{name}")),
-                ));
-                let actual = git
-                    .get(name.as_str())
-                    .map(|commit| BookmarkState::normal(commit))
-                    .unwrap_or_default();
-                recorded != actual
-            })
-            .cloned()
-            .collect())
-    })
 }
 
 /// Why a recorded survivor is not proven gone, or `None` when it is.
@@ -1157,7 +1144,8 @@ mod tests {
             Some(fx.main.clone())
         );
 
-        let verdict = repair_branch_recovery(&fx.store, &recovery, "test-recovery");
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
         assert!(
             matches!(verdict, RepairVerdict::Verified { .. }),
             "{verdict:?}"
@@ -1168,7 +1156,7 @@ mod tests {
         );
         assert_eq!(fx.git_head(FEATURE), Some(fx.feature.clone()));
         // Repeating a verified repair changes nothing and verifies again.
-        let again = repair_branch_recovery(&fx.store, &recovery, "test-recovery");
+        let again = repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
         assert!(matches!(again, RepairVerdict::Verified { .. }), "{again:?}");
     }
 
@@ -1215,10 +1203,12 @@ mod tests {
         assert_eq!(fx.git_head(OTHER).as_deref(), Some(other.as_str()));
 
         // The repair is refused while Git still refuses the ref, and retried.
-        let refused = repair_branch_recovery(&fx.store, &recovery, "test-recovery");
+        let refused =
+            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
         assert!(matches!(refused, RepairVerdict::Refused(_)), "{refused:?}");
         std::fs::remove_file(&lock).unwrap();
-        let verdict = repair_branch_recovery(&fx.store, &recovery, "test-recovery");
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
         assert!(
             matches!(verdict, RepairVerdict::Verified { .. }),
             "{verdict:?}"
@@ -1254,12 +1244,140 @@ mod tests {
         let new_work = bookmark_commit(&fx.jj, &fx.store, OTHER).unwrap();
         fx.move_and_export(&fx.jj, FEATURE, &new_work);
 
-        let verdict = repair_branch_recovery(&fx.store, &recovery, "test-recovery");
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
         let RepairVerdict::Refused(reason) = verdict else {
             panic!("a moved bookmark must refuse the repair: {verdict:?}");
         };
         assert!(reason.contains("did not record"), "{reason}");
         assert_eq!(bookmark_commit(&fx.jj, &fx.store, FEATURE), Some(new_work));
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_two_bookmark_recovery_recreates_a_merged_deleted_head() {
+        let Some(fx) = fixture() else { return };
+        // The feature tip is not an ancestor of main, as with a squash landing.
+        fx.move_and_export(&fx.jj, OTHER, &fx.feature);
+        let jj = fx.budgeted();
+        let op = operation_id(&jj, &fx.store).unwrap();
+        fx.move_and_export(&jj, FEATURE, &fx.main);
+        jj.expire_cleanup_for_test();
+        restore_operation(&jj.cleanup_env(), &fx.store, &op).unwrap_err();
+        let mut recovery = only_recovery(&jj);
+        recovery.phase = RollbackFailurePhase::ExportUnverified;
+        recovery.bookmarks.push(BookmarkRecovery {
+            bookmark: OTHER.into(),
+            pre: BookmarkState::normal(&fx.feature),
+            pre_git: Some(fx.feature.clone()),
+            failed: BookmarkState::normal(&fx.feature),
+        });
+        git(
+            fx.proj.path(),
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{OTHER}"),
+                &fx.feature,
+            ],
+        );
+        let merged_missing = BTreeSet::from([OTHER.to_string()]);
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "merged-retirement", &merged_missing);
+        assert!(
+            matches!(verdict, RepairVerdict::Verified { .. }),
+            "{verdict:?}"
+        );
+        for name in [FEATURE, OTHER] {
+            assert_eq!(fx.git_head(name), Some(fx.feature.clone()));
+            assert_eq!(
+                bookmark_commit(&fx.jj, &fx.store, name),
+                Some(fx.feature.clone())
+            );
+        }
+        let interrupted = interrupted_repair_coordinates(&fx.store, &recovery);
+        assert_eq!(
+            validate_store_recovery(&fx.store, &interrupted),
+            StoreValidation::Resolved
+        );
+        // A subsequent foreign Git movement cannot disappear into the baseline.
+        git(
+            fx.proj.path(),
+            &["update-ref", &format!("refs/heads/{OTHER}"), &fx.main],
+        );
+        assert!(matches!(
+            validate_store_recovery(&fx.store, &interrupted),
+            StoreValidation::Downgrade(_)
+        ));
+        let verdict = repair_branch_recovery(&fx.store, &recovery, "foreign-head", &merged_missing);
+        assert!(matches!(verdict, RepairVerdict::Refused(_)), "{verdict:?}");
+        assert_eq!(fx.git_head(OTHER), Some(fx.main.clone()));
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_absent_head_requires_merge_evidence_and_an_unchanged_saved_bookmark() {
+        let Some(fx) = fixture() else { return };
+        let mut recovery = RecoveryCoordinates {
+            scope: RecoveryScope::Branch,
+            phase: RollbackFailurePhase::ExportUnverified,
+            pre_op: None,
+            pre_view: None,
+            pre_git: None,
+            failed_view: None,
+            bookmarks: vec![BookmarkRecovery {
+                bookmark: FEATURE.into(),
+                pre: BookmarkState::normal(&fx.feature),
+                pre_git: Some(fx.feature.clone()),
+                failed: BookmarkState::normal(&fx.main),
+            }],
+            survivors: vec![],
+            evidence: vec![],
+        };
+        git(
+            fx.proj.path(),
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{FEATURE}"),
+                &fx.feature,
+            ],
+        );
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "missing-head", &BTreeSet::new());
+        assert!(matches!(verdict, RepairVerdict::Refused(_)), "{verdict:?}");
+        let merged_missing = BTreeSet::from([FEATURE.to_string()]);
+        recovery.bookmarks[0].pre_git = Some(fx.main.clone());
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "inconsistent-head", &merged_missing);
+        assert!(matches!(verdict, RepairVerdict::Refused(_)), "{verdict:?}");
+        recovery.bookmarks[0].pre_git = Some(fx.feature.clone());
+        let verdict = repair_branch_recovery(&fx.store, &recovery, "merged-head", &merged_missing);
+        assert!(
+            matches!(verdict, RepairVerdict::Verified { .. }),
+            "{verdict:?}"
+        );
+        assert_eq!(fx.git_head(FEATURE), Some(fx.feature.clone()));
+        // Even a recorded failed target is not proof that a deleted merged
+        // branch's saved local bookmark is still held.
+        fx.move_and_export(&fx.jj, FEATURE, &fx.main);
+        git(
+            fx.proj.path(),
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{FEATURE}"),
+                &fx.main,
+            ],
+        );
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "moved-bookmark", &merged_missing);
+        assert!(matches!(verdict, RepairVerdict::Refused(_)), "{verdict:?}");
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, FEATURE),
+            Some(fx.main.clone())
+        );
+        assert_eq!(fx.git_head(FEATURE), None);
     }
 
     /// A bookmark the attempt created is put back to absent, ref and all.
@@ -1276,7 +1394,8 @@ mod tests {
         let recovery = only_recovery(&jj);
         assert_eq!(recovery.bookmarks[0].pre, BookmarkState::default());
 
-        let verdict = repair_branch_recovery(&fx.store, &recovery, "test-recovery");
+        let verdict =
+            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
         assert!(
             matches!(verdict, RepairVerdict::Verified { .. }),
             "{verdict:?}"
@@ -1337,7 +1456,7 @@ mod tests {
         };
         assert_eq!(branch.scope, RecoveryScope::Branch);
         assert_eq!(branch.affected().collect::<Vec<_>>(), vec![FEATURE]);
-        let verdict = repair_branch_recovery(&fx.store, &branch, "test-recovery");
+        let verdict = repair_branch_recovery(&fx.store, &branch, "test-recovery", &BTreeSet::new());
         assert!(
             matches!(verdict, RepairVerdict::Verified { .. }),
             "{verdict:?}"
@@ -1396,31 +1515,12 @@ mod tests {
         forced.survivors[0].pid = std::process::id();
         forced.survivors[0].start_token =
             cairn_common::process_identity::process_start_token(std::process::id());
-        let verdict = repair_branch_recovery(&fx.store, &forced, "test-recovery");
+        let verdict = repair_branch_recovery(&fx.store, &forced, "test-recovery", &BTreeSet::new());
         assert!(matches!(verdict, RepairVerdict::Refused(_)), "{verdict:?}");
         assert_eq!(
             bookmark_commit(&fx.jj, &fx.store, FEATURE),
             Some(fx.main.clone()),
             "nothing was repaired while the writer may run"
-        );
-    }
-
-    /// An import moves a fenced bookmark only when Git changed it behind jj.
-    #[test]
-    #[serial_test::serial(jj)]
-    fn an_import_would_move_only_a_bookmark_git_changed_behind_jj() {
-        let Some(fx) = fixture() else { return };
-        let names = vec![FEATURE.to_string()];
-        assert!(bookmarks_an_import_would_move(&fx.store, &names)
-            .unwrap()
-            .is_empty());
-        git(
-            fx.proj.path(),
-            &["update-ref", &format!("refs/heads/{FEATURE}"), &fx.main],
-        );
-        assert_eq!(
-            bookmarks_an_import_would_move(&fx.store, &names).unwrap(),
-            names
         );
     }
 

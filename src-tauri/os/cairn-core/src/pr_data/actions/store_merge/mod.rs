@@ -807,14 +807,14 @@ async fn store_merge_child_mutation(
         // commits, when the two have diverged. The caller holds the store lock;
         // the fetch lock is only ever taken inside it.
         if has_remote {
-            let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, &store).await;
-            crate::orchestrator::branch_recovery::refuse_import_if_fenced(
-                &fence_db,
+            let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
+                orch,
                 &store,
                 &[target_branch, source_branch],
                 &format!("Taking origin's `{target_branch}` before this merge"),
             )
             .await?;
+            let jj = jj.preserving_import_bookmarks(preserved);
             let observed =
                 crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
                     crate::jj::fetch_origin_observation(&store, target_branch)

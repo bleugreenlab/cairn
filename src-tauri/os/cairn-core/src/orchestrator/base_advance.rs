@@ -2238,13 +2238,14 @@ async fn reconcile_store_default_bookmark(
         .await;
     let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
     let _phase = guard.phase("default bookmark reconcile");
-    crate::orchestrator::branch_recovery::refuse_import_if_fenced(
-        db,
+    let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
+        orch,
         &store,
         &[branch],
         &format!("Reconciling `{branch}` onto origin"),
     )
     .await?;
+    let jj = jj.preserving_import_bookmarks(preserved);
     if let Err(error) = crate::jj::ensure_store_initialized(&jj, &store, repo_path) {
         log::warn!("{ctx}: ensure jj store failed; skipping default bookmark reconcile: {error}");
         return Err(format!("ensure jj store failed: {error}"));
@@ -2347,13 +2348,14 @@ pub(crate) async fn reconcile_default_advance(
             .await;
         let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = store_guard.phase("git ref import");
-        crate::orchestrator::branch_recovery::refuse_import_if_fenced(
-            &db,
+        let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
+            orch,
             &store,
             &[default_branch],
             &format!("Importing origin's `{default_branch}`"),
         )
         .await?;
+        let jj = jj.preserving_import_bookmarks(preserved);
         // Origin is the authority for the branch just fetched, so its import
         // observes it wherever it went, backwards included. Every other
         // tracked branch stays guarded.
@@ -2457,14 +2459,14 @@ pub(crate) async fn reconcile_base_branch_advance(
             .await;
         let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = guard.phase("fast-forward from origin");
-        let fence_db = recovery_fence_db(orch, &store).await;
-        crate::orchestrator::branch_recovery::refuse_import_if_fenced(
-            &fence_db,
+        let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
+            orch,
             &store,
             &[branch],
             &format!("Fast-forwarding `{branch}` from origin"),
         )
         .await?;
+        let jj = jj.preserving_import_bookmarks(preserved);
         crate::jj::ensure_store_initialized(&jj, &store, repo).and_then(|()| {
             crate::jj::fast_forward_branch_from_origin(&jj, &store, branch, &observed)
         })?
@@ -17181,6 +17183,470 @@ mod real_store_collision_tests {
         (own, lock)
     }
 
+    async fn merged_missing_recovery_fixture(name: &str) -> (Replay, String) {
+        use crate::orchestrator::branch_recovery;
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for retirement recovery");
+        let r = replay_harness(&bin, name, &[]).await;
+        let own = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("own.txt", "own\n")],
+            "original work",
+        );
+        let squash = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("own.txt", "own\n")],
+            "squash merged work",
+        );
+        set_main(&r.fx, &squash);
+        r.fx.jj
+            .run(
+                &r.fx.store,
+                &["bookmark", "set", "agent/retired", "-r", &own],
+                "retirement fixture",
+            )
+            .unwrap();
+        crate::jj::export_git_verified(&r.fx.jj, &r.fx.store, true, "fixture export", &[]).unwrap();
+        // The squash has the source tree but not its commit in its ancestry.
+        let ancestor = crate::env::git()
+            .args(["merge-base", "--is-ancestor", &own, &squash])
+            .current_dir(&r.fx.repo)
+            .output()
+            .unwrap();
+        assert_eq!(ancestor.status.code(), Some(1), "{ancestor:?}");
+        let tree = |commit: &str| {
+            let out = crate::env::git()
+                .args(["rev-parse", &format!("{commit}^{{tree}}")])
+                .current_dir(&r.fx.repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            out.stdout
+        };
+        assert_eq!(tree(&own), tree(&squash));
+        r.fx.jj
+            .run(
+                &r.fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    BRANCH,
+                    "-r",
+                    &squash,
+                    "--allow-backwards",
+                ],
+                "failed forward move",
+            )
+            .unwrap();
+        crate::jj::export_git_verified(&r.fx.jj, &r.fx.store, true, "failed export", &[]).unwrap();
+        let deleted = crate::env::git()
+            .args(["update-ref", "-d", "refs/heads/agent/retired"])
+            .current_dir(&r.fx.repo)
+            .output()
+            .unwrap();
+        assert!(deleted.status.success(), "{deleted:?}");
+        let coordinates = crate::jj::RecoveryCoordinates {
+            scope: crate::jj::RecoveryScope::Branch,
+            phase: crate::jj::RollbackFailurePhase::ExportUnverified,
+            pre_op: Some(crate::jj::operation_id(&r.fx.jj, &r.fx.store).unwrap()),
+            pre_view: None,
+            pre_git: None,
+            failed_view: None,
+            bookmarks: vec![
+                crate::jj::BookmarkRecovery {
+                    bookmark: BRANCH.into(),
+                    pre: cairn_vcs::BookmarkState::normal(&own),
+                    pre_git: Some(own.clone()),
+                    failed: cairn_vcs::BookmarkState::normal(&squash),
+                },
+                crate::jj::BookmarkRecovery {
+                    bookmark: "agent/retired".into(),
+                    pre: cairn_vcs::BookmarkState::normal(&own),
+                    pre_git: Some(own.clone()),
+                    failed: cairn_vcs::BookmarkState::normal(&own),
+                },
+            ],
+            survivors: vec![],
+            evidence: vec!["two-bookmark rollback export failed".into()],
+        };
+        branch_recovery::record_recoveries(
+            &r.db,
+            "proj-1",
+            &r.fx.store,
+            Some(BRANCH),
+            branch_recovery::BUDGET_AUTOMATIC,
+            "fixture",
+            vec![coordinates],
+        )
+        .await
+        .unwrap();
+        (r, own)
+    }
+
+    async fn record_retired_owner(r: &Replay, issue_status: &str) {
+        r.db.execute_script(format!(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('retired-issue', 'proj-1', 2, 'Retired', '{issue_status}', 1, 1);
+             INSERT INTO jobs (id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('retired-job', 'retired-issue', 'proj-1', 'complete', 'agent/retired', 'main', 1, 1);
+             INSERT INTO merge_requests (id, job_id, issue_id, project_id, title, status, source_branch, target_branch, opened_at, updated_at)
+             VALUES ('retired-pr', 'retired-job', 'retired-issue', 'proj-1', 'Retired', 'merged', 'agent/retired', 'main', 1, 1);"
+        )).await.unwrap();
+    }
+
+    async fn sweep_retirement_recovery(r: &Replay) {
+        r.db.execute("UPDATE jj_branch_recoveries SET next_repair_at = 0", ())
+            .await
+            .unwrap();
+        crate::orchestrator::branch_recovery::run_due_recoveries(&r.orch, &r.db).await;
+    }
+
+    async fn assert_merged_missing_fenced(r: &Replay) {
+        let fences = crate::orchestrator::branch_recovery::fences(&r.db, &r.fx.store)
+            .await
+            .unwrap();
+        assert_eq!(fences.len(), 1, "{fences:?}");
+        assert!(git_head(r, "agent/retired").is_empty());
+    }
+
+    fn assert_merged_missing_restored(r: &Replay, own: &str) {
+        assert_eq!(git_head(r, BRANCH), own);
+        assert_eq!(branch_tip(r), own);
+        assert_eq!(git_head(r, "agent/retired"), own);
+        assert_eq!(
+            cairn_vcs::read_local_bookmark_view(&r.fx.store)
+                .unwrap()
+                .bookmarks["agent/retired"]
+                .commit(),
+            Some(own)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_recreates_a_squash_merged_head_and_restores_the_other_bookmark() {
+        let (r, own) = merged_missing_recovery_fixture("recovery-squash-merged.db").await;
+        record_retired_owner(&r, "merged").await;
+        sweep_retirement_recovery(&r).await;
+        assert!(
+            crate::orchestrator::branch_recovery::fences(&r.db, &r.fx.store)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_merged_missing_restored(&r, &own);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_restores_a_merged_head_that_is_still_present() {
+        let (r, own) = merged_missing_recovery_fixture("recovery-merged-present.db").await;
+        record_retired_owner(&r, "merged").await;
+        let restored = crate::env::git()
+            .args(["update-ref", "refs/heads/agent/retired", &own])
+            .current_dir(&r.fx.repo)
+            .output()
+            .unwrap();
+        assert!(restored.status.success(), "{restored:?}");
+        sweep_retirement_recovery(&r).await;
+        assert!(
+            crate::orchestrator::branch_recovery::fences(&r.db, &r.fx.store)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_merged_missing_restored(&r, &own);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_refuses_recreation_after_the_merged_bookmark_moved() {
+        use crate::orchestrator::branch_recovery;
+        let (r, _own) = merged_missing_recovery_fixture("recovery-merged-jj-moved.db").await;
+        record_retired_owner(&r, "merged").await;
+        let squash = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, "main").unwrap();
+        let foreign = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("foreign.txt", "new work\n")],
+            "foreign work",
+        );
+        let mut record = branch_recovery::fences(&r.db, &r.fx.store)
+            .await
+            .unwrap()
+            .remove(0);
+        record
+            .coordinates
+            .bookmarks
+            .iter_mut()
+            .find(|b| b.bookmark == "agent/retired")
+            .unwrap()
+            .failed = cairn_vcs::BookmarkState::normal(&squash);
+        r.db.execute(
+            "UPDATE jj_branch_recoveries SET coordinates = ?1",
+            cairn_db::turso::params![serde_json::to_string(&record.coordinates).unwrap()],
+        )
+        .await
+        .unwrap();
+        // Neither a recorded failed target nor a later foreign target may
+        // authorize recreation: the store must still hold the exact saved pre.
+        for current in [&squash, &foreign] {
+            r.fx.jj
+                .run(
+                    &r.fx.store,
+                    &[
+                        "bookmark",
+                        "set",
+                        "agent/retired",
+                        "-r",
+                        current,
+                        "--allow-backwards",
+                    ],
+                    "move merged bookmark",
+                )
+                .unwrap();
+            sweep_retirement_recovery(&r).await;
+            assert_merged_missing_fenced(&r).await;
+            assert_eq!(
+                cairn_vcs::read_local_bookmark_view(&r.fx.store)
+                    .unwrap()
+                    .bookmarks["agent/retired"]
+                    .commit(),
+                Some(current.as_str())
+            );
+        }
+        r.fx.jj
+            .run(
+                &r.fx.store,
+                &["bookmark", "delete", "agent/retired"],
+                "delete merged bookmark",
+            )
+            .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        assert!(!cairn_vcs::read_local_bookmark_view(&r.fx.store)
+            .unwrap()
+            .bookmarks
+            .contains_key("agent/retired"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_does_not_overwrite_a_foreign_git_head() {
+        let (r, own) = merged_missing_recovery_fixture("recovery-merged-foreign-git.db").await;
+        record_retired_owner(&r, "merged").await;
+        let foreign = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, "main").unwrap();
+        let changed = crate::env::git()
+            .args(["update-ref", "refs/heads/agent/retired", &foreign])
+            .current_dir(&r.fx.repo)
+            .output()
+            .unwrap();
+        assert!(changed.status.success(), "{changed:?}");
+        sweep_retirement_recovery(&r).await;
+        assert_eq!(
+            crate::orchestrator::branch_recovery::fences(&r.db, &r.fx.store)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(git_head(&r, "agent/retired"), foreign);
+        assert_eq!(
+            cairn_vcs::read_local_bookmark_view(&r.fx.store)
+                .unwrap()
+                .bookmarks["agent/retired"]
+                .commit(),
+            Some(own.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_requires_a_matching_recorded_git_pre_for_recreation() {
+        use crate::orchestrator::branch_recovery;
+        let (r, _own) = merged_missing_recovery_fixture("recovery-merged-pre-mismatch.db").await;
+        record_retired_owner(&r, "merged").await;
+        let mut record = branch_recovery::fences(&r.db, &r.fx.store)
+            .await
+            .unwrap()
+            .remove(0);
+        record
+            .coordinates
+            .bookmarks
+            .iter_mut()
+            .find(|b| b.bookmark == "agent/retired")
+            .unwrap()
+            .pre_git = None;
+        r.db.execute(
+            "UPDATE jj_branch_recoveries SET coordinates = ?1",
+            cairn_db::turso::params![serde_json::to_string(&record.coordinates).unwrap()],
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_keeps_unknown_unmerged_unresolved_and_live_missing_heads_fenced() {
+        let (r, own) = merged_missing_recovery_fixture("recovery-merged-held.db").await;
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        record_retired_owner(&r, "closed").await;
+        r.db.execute(
+            "UPDATE merge_requests SET status = 'closed' WHERE id = 'retired-pr'",
+            (),
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        r.db.execute_script(
+            "UPDATE issues SET status = 'active' WHERE id = 'retired-issue';
+             UPDATE merge_requests SET status = 'merged' WHERE id = 'retired-pr';",
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        r.db.execute_script(
+            "UPDATE issues SET status = 'merged' WHERE id = 'retired-issue';
+             UPDATE jobs SET status = 'running' WHERE id = 'retired-job';",
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        r.db.execute_script(
+            "UPDATE jobs SET status = 'complete' WHERE id = 'retired-job';
+             UPDATE merge_requests SET status = 'open' WHERE id = 'retired-pr';",
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        r.db.execute_script(
+            "UPDATE merge_requests SET status = 'merged' WHERE id = 'retired-pr';
+             INSERT INTO runs(id, job_id, project_id, status, created_at, updated_at)
+             VALUES ('retired-run', 'retired-job', 'proj-1', 'live', 1, 1);",
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        r.db.execute(
+            "UPDATE runs SET status = 'starting' WHERE id = 'retired-run'",
+            (),
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert_merged_missing_fenced(&r).await;
+        r.db.execute(
+            "UPDATE runs SET status = 'exited' WHERE id = 'retired-run'",
+            (),
+        )
+        .await
+        .unwrap();
+        sweep_retirement_recovery(&r).await;
+        assert!(
+            crate::orchestrator::branch_recovery::fences(&r.db, &r.fx.store)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_merged_missing_restored(&r, &own);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_recreation_timeout_preserves_recorded_targets() {
+        recreation_timeout_preserves_targets(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn automatic_recovery_narrowed_store_recreation_timeout_preserves_recorded_targets() {
+        recreation_timeout_preserves_targets(true).await;
+    }
+
+    async fn recreation_timeout_preserves_targets(store_scope: bool) {
+        use crate::orchestrator::branch_recovery;
+        let name = if store_scope {
+            "recovery-recreation-store-timeout.db"
+        } else {
+            "recovery-recreation-timeout.db"
+        };
+        let (r, own) = merged_missing_recovery_fixture(name).await;
+        record_retired_owner(&r, "merged").await;
+        if store_scope {
+            let record = branch_recovery::fences(&r.db, &r.fx.store)
+                .await
+                .unwrap()
+                .remove(0);
+            let coordinates =
+                cairn_vcs::jj::interrupted_repair_coordinates(&r.fx.store, &record.coordinates);
+            r.db.execute(
+                "UPDATE jj_branch_recoveries SET scope = 'store', coordinates = ?1",
+                cairn_db::turso::params![serde_json::to_string(&coordinates).unwrap()],
+            )
+            .await
+            .unwrap();
+        }
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let hook = branch_recovery::test_support::pause_repairs_after_write_admission(
+            std::time::Duration::from_millis(500),
+            move || {
+                let _ = release_rx.lock().unwrap().recv();
+            },
+        );
+        sweep_retirement_recovery(&r).await;
+        let fences = branch_recovery::fences(&r.db, &r.fx.store).await.unwrap();
+        release_tx.send(()).unwrap();
+        drop(hook);
+        let escalated = &fences[0];
+        assert_eq!(escalated.scope, crate::jj::RecoveryScope::Store);
+        let retired = escalated
+            .coordinates
+            .bookmarks
+            .iter()
+            .find(|bookmark| bookmark.bookmark == "agent/retired")
+            .unwrap();
+        assert_eq!(retired.pre.commit(), Some(own.as_str()), "{escalated:?}");
+        assert_eq!(
+            escalated
+                .coordinates
+                .pre_git
+                .as_ref()
+                .unwrap()
+                .get("agent/retired"),
+            Some(&own)
+        );
+        let started = std::time::Instant::now();
+        loop {
+            sweep_retirement_recovery(&r).await;
+            if branch_recovery::fences(&r.db, &r.fx.store)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "recreation escalation did not clear"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_merged_missing_restored(&r, &own);
+    }
+
     /// Review finding 1: a repair that outlives its allowance must neither
     /// hold the store lock until it finishes nor be left writing unfenced. The
     /// worker is paused after it is admitted to write. The attempt escalates
@@ -17297,7 +17763,7 @@ mod real_store_collision_tests {
 
     /// Review finding 3: managed origin imports honour fences. A store fence
     /// refuses any import; a branch fence refuses one that names the fenced
-    /// bookmark or would carry it off its position, and admits the rest. The
+    /// bookmark and otherwise preserves that bookmark's import inputs. The
     /// scheduled default-bookmark reconcile is refused at its own boundary.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial(jj)]
@@ -17346,15 +17812,18 @@ mod real_store_collision_tests {
             &format!("{main}^{{tree}}"),
         ]);
         git_out(&["update-ref", &format!("refs/heads/{BRANCH}"), &foreign]);
-        let refused = branch_recovery::refuse_import_if_fenced(
+        let preserved = branch_recovery::refuse_import_if_fenced(
             &r.db,
             &r.fx.store,
             &["main"],
             "Importing main",
         )
         .await
-        .unwrap_err();
-        assert!(refused.contains("behind jj"), "{refused}");
+        .expect("unrelated imports preserve the fenced input");
+        crate::jj::import_git(&r.fx.jj.preserving_import_bookmarks(preserved), &r.fx.store)
+            .unwrap();
+        assert_eq!(git_head(&r, BRANCH), foreign);
+        assert_eq!(branch_tip(&r), _own);
         git_out(&["update-ref", &format!("refs/heads/{BRANCH}"), &before]);
 
         // A store fence refuses every import, the scheduled default-bookmark

@@ -154,6 +154,34 @@ pub(crate) async fn cleanup_issue_jobs(
 
     let mut branches_by_repo: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for target in targets {
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&target.repo_path));
+        let _guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("retire issue branch {}", target.branch),
+            )
+            .await;
+        // The same guard serializes recording a recovery and deleting its head.
+        // Preserve fenced heads rather than changing a repair's coordinates.
+        let mut admitted = true;
+        for owner_db in orch.db.all_dbs().await {
+            if let Err(error) = crate::orchestrator::branch_recovery::refuse_if_fenced(
+                &owner_db,
+                &store,
+                &[target.branch.as_str()],
+                "Retiring this branch",
+            )
+            .await
+            {
+                log::warn!("Teardown: preserving branch {}: {error}", target.branch);
+                admitted = false;
+                break;
+            }
+        }
+        if !admitted {
+            continue;
+        }
         let delete_branch = match reason {
             TeardownReason::Discarded => true,
             TeardownReason::Merged => {
@@ -845,7 +873,7 @@ mod tests {
         let sealed = crate::jj::head_commit(&jj, &node).unwrap();
 
         let db = crate::storage::migrated_test_db("teardown-archival.db").await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
                VALUES ('proj','ws','P','p','{repo}','main',1,1);
@@ -922,6 +950,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tip, sealed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_preserves_a_head_held_by_a_recovery_fence() {
+        use crate::orchestrator::branch_recovery;
+        let home = tempfile::tempdir().unwrap();
+        let db = crate::storage::migrated_test_db("teardown-recovery-fence.db").await;
+        let repo = home.path().join("repo");
+        db.execute_script(format!(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('proj', 'default', 'P', 'p', '{}', 'main', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue', 'proj', 1, 'T', 'merged', 1, 1);
+             INSERT INTO jobs(id, project_id, issue_id, branch, status, created_at, updated_at)
+             VALUES ('job', 'proj', 'issue', 'agent/fenced', 'complete', 1, 1);",
+            repo.to_string_lossy().replace('\'', "''"),
+        )).await.unwrap();
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(home.path().join("search")).unwrap(),
+        );
+        let mut git = crate::services::testing::MockGitClient::new();
+        git.expect_branch_exists().times(0);
+        let orch = crate::orchestrator::OrchestratorBuilder::new(
+            std::sync::Arc::new(crate::db::DbState::new(std::sync::Arc::new(db), search)),
+            std::sync::Arc::new(
+                crate::services::testing::TestServicesBuilder::new()
+                    .with_git(git)
+                    .build(),
+            ),
+            home.path().to_path_buf(),
+        )
+        .build();
+        let store = crate::jj::project_store_dir(home.path(), &repo);
+        let state = cairn_vcs::BookmarkState::normal(&"a".repeat(40));
+        let coordinates = crate::jj::RecoveryCoordinates {
+            scope: crate::jj::RecoveryScope::Branch,
+            phase: crate::jj::RollbackFailurePhase::ExportUnverified,
+            pre_op: None,
+            pre_view: None,
+            pre_git: None,
+            failed_view: None,
+            bookmarks: vec![crate::jj::BookmarkRecovery {
+                bookmark: "agent/fenced".into(),
+                pre: state.clone(),
+                pre_git: Some("a".repeat(40)),
+                failed: state,
+            }],
+            survivors: vec![],
+            evidence: vec!["fixture".into()],
+        };
+        branch_recovery::record_recoveries(
+            &orch.db.local,
+            "proj",
+            &store,
+            Some("agent/fenced"),
+            branch_recovery::BUDGET_AUTOMATIC,
+            "fixture",
+            vec![coordinates],
+        )
+        .await
+        .unwrap();
+        cleanup_issue_jobs(
+            &orch,
+            TeardownScope::DeletedIssue("issue".into()),
+            TeardownReason::Discarded,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            branch_recovery::fences(&orch.db.local, &store)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Deleting an issue deletes its events with it, so teardown skips archival.

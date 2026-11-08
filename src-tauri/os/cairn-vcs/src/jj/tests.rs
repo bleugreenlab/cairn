@@ -8818,6 +8818,312 @@ fn push_branch_through_child(
     (r, c)
 }
 
+fn scoped_import_settings(jj: &JjEnv, store: &Path) -> String {
+    jj.run(
+        store,
+        &[
+            "config",
+            "list",
+            "--include-defaults",
+            "--ignore-working-copy",
+        ],
+        "read import settings",
+    )
+    .unwrap()
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn timed_out_scoped_import_worker_cannot_publish_after_the_caller_returns() {
+    let bin = jj_bin().expect("real jj required");
+    let fx = setup_tracked_origin(&bin);
+    let scoped = fx.jj.preserving_import_bookmarks(vec!["main".into()]);
+    git(
+        fx.proj.path(),
+        &["update-ref", "refs/heads/arrived", &fx.base],
+    );
+    let source = operation_id(&fx.jj, &fx.store).unwrap();
+    let config = scoped_import_settings(&fx.jj, &fx.store);
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let (finished, done) = std::sync::mpsc::channel();
+    super::env::during_next_native_import(
+        move || {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        },
+        move || {
+            finished.send(()).unwrap();
+        },
+    );
+    let error = super::env::publish_scoped_import_candidate(
+        &scoped,
+        &fx.store,
+        config.clone(),
+        source.clone(),
+        std::time::Instant::now() + Duration::from_millis(200),
+    )
+    .unwrap_err();
+    assert!(is_jj_timeout_error(&error), "{error}");
+    entry.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), source);
+    let refused = super::env::publish_scoped_import_candidate(
+        &scoped,
+        &fx.store,
+        config,
+        source.clone(),
+        std::time::Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(refused.contains("still preparing"), "{refused}");
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(60)).unwrap();
+    assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), source);
+    assert!(bookmark_commit(&fx.jj, &fx.store, "arrived").is_none());
+    import_git(&scoped, &fx.store).unwrap();
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "arrived").as_deref(),
+        Some(fx.base.as_str())
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn scoped_import_candidate_refuses_a_changed_source_operation() {
+    let bin = jj_bin().expect("real jj required");
+    let fx = setup_tracked_origin(&bin);
+    let scoped = fx.jj.preserving_import_bookmarks(vec!["main".into()]);
+    git(
+        fx.proj.path(),
+        &["update-ref", "refs/heads/arrived", &fx.base],
+    );
+    let source = operation_id(&fx.jj, &fx.store).unwrap();
+    let config = scoped_import_settings(&fx.jj, &fx.store);
+    let jj = fx.jj.clone();
+    let store = fx.store.clone();
+    let base = fx.base.clone();
+    super::env::during_next_native_import(
+        move || {
+            create_bookmark_at(&jj, &store, "concurrent", &base).unwrap();
+        },
+        || {},
+    );
+    let error = super::env::publish_scoped_import_candidate(
+        &scoped,
+        &fx.store,
+        config,
+        source,
+        std::time::Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap_err();
+    assert!(error.contains("source operation changed"), "{error}");
+    assert!(bookmark_commit(&fx.jj, &fx.store, "arrived").is_none());
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "concurrent").as_deref(),
+        Some(fx.base.as_str())
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn scoped_import_observes_detached_head_without_moving_fenced_bookmarks() {
+    let bin = jj_bin().expect("real jj required");
+    let fx = setup_tracked_origin(&bin);
+    let tip = git_commit_on(
+        &fx,
+        &fx.base,
+        "head-only.txt",
+        "head only\n",
+        "detached HEAD only",
+    );
+    let scoped = fx.jj.preserving_import_bookmarks(vec!["main".into()]);
+    import_git(&scoped, &fx.store).unwrap();
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &tip).as_deref(),
+        Some(tip.as_str())
+    );
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(fx.base.as_str())
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn scoped_import_handles_unrelated_deleted_heads_with_both_abandon_policies() {
+    let bin = jj_bin().expect("real jj required");
+    for abandon in [true, false] {
+        let fx = setup_tracked_origin(&bin);
+        let tip = git_commit_on(
+            &fx,
+            &fx.base,
+            "gone.txt",
+            "gone\n",
+            "unrelated disappearing head",
+        );
+        point_branch_from_git(&fx, "gone", &tip);
+        git(fx.proj.path(), &["checkout", "--detach", "-q", &fx.base]);
+        let source = operation_id(&fx.jj, &fx.store).unwrap();
+        git(fx.proj.path(), &["update-ref", "-d", "refs/heads/gone"]);
+        let scoped = fx.jj.preserving_import_bookmarks(vec!["main".into()]);
+        let mut config = scoped_import_settings(&fx.jj, &fx.store);
+        // Last assignment wins only after removing the effective existing value.
+        config = config
+            .lines()
+            .filter(|line| !line.starts_with("git.abandon-unreachable-commits"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        config.push_str(&format!("\ngit.abandon-unreachable-commits = {abandon}\n"));
+        super::env::publish_scoped_import_candidate(
+            &scoped,
+            &fx.store,
+            config,
+            source,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(bookmark_commit(&fx.jj, &fx.store, "gone").is_none());
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
+            Some(fx.base.as_str())
+        );
+        assert_eq!(
+            revset_commit(&fx.jj, &fx.store, &format!("visible_heads() & {tip}")).is_some(),
+            !abandon
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn scoped_import_preserves_fenced_heads_and_all_remote_inputs() {
+    let bin = jj_bin().expect("real jj required");
+    let fx = setup_tracked_origin(&bin);
+    let fenced = "agent/fenced";
+    let other = "agent/unrelated";
+    let (old, tip) = push_branch_through_child(&fx, fenced, &fx.base, ("c.txt", "c\n"));
+    let (_, other_tip) = push_branch_through_child(&fx, other, &fx.base, ("other.txt", "other\n"));
+    let preserved = fx.jj.preserving_import_bookmarks(vec![fenced.to_string()]);
+    let observed = || {
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "list",
+                    "--all-remotes",
+                    "--ignore-working-copy",
+                    "-T",
+                    "name ++ \"@\" ++ remote ++ \" \" ++ normal_target.commit_id() ++ \"\\n\"",
+                ],
+                "read recorded bookmark inputs",
+            )
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with(&format!("{fenced}@")))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let before = observed();
+    let git_view = || {
+        futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fx.store).await.unwrap();
+            repo.view()
+                .git_refs()
+                .iter()
+                .filter(|(name, _)| {
+                    jj_lib::git::parse_git_ref(name).is_some_and(|(kind, symbol)| {
+                        kind == jj_lib::git::GitRefKind::Bookmark && symbol.name.as_str() == fenced
+                    })
+                })
+                .map(|(name, target)| (name.clone(), target.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+    };
+    let before_git = git_view();
+
+    for deleted in [false, true] {
+        if deleted {
+            git(
+                fx.proj.path(),
+                &["update-ref", "-d", &format!("refs/heads/{fenced}")],
+            );
+        } else {
+            git(
+                fx.proj.path(),
+                &["update-ref", &format!("refs/heads/{fenced}"), &old],
+            );
+        }
+        // A fenced origin regression must not even be restored in backing Git.
+        git(
+            fx.proj.path(),
+            &["update-ref", &format!("refs/remotes/origin/{fenced}"), &old],
+        );
+        git(
+            fx.proj.path(),
+            &["update-ref", &format!("refs/remotes/second/{fenced}"), &old],
+        );
+        // Non-fenced refs still receive the existing regression protection.
+        git(
+            fx.proj.path(),
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{other}"),
+                &fx.base,
+            ],
+        );
+        git(fx.proj.path(), &["update-ref", "refs/heads/arrived", &tip]);
+        let unrelated = if deleted { &old } else { &tip };
+        git(
+            fx.proj.path(),
+            &[
+                "update-ref",
+                &format!("refs/heads/nested/{fenced}"),
+                unrelated,
+            ],
+        );
+        git(
+            fx.proj.path(),
+            &["update-ref", &format!("refs/tags/{fenced}"), unrelated],
+        );
+        import_git(&preserved, &fx.store).unwrap();
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, &format!("nested/{fenced}")).as_deref(),
+            Some(unrelated.as_str())
+        );
+        assert_eq!(
+            revset_commit(&fx.jj, &fx.store, &format!("tags(exact:{fenced:?})")).as_deref(),
+            Some(unrelated.as_str())
+        );
+        assert_eq!(observed(), before);
+        assert_eq!(git_view(), before_git);
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, fenced).as_deref(),
+            Some(tip.as_str())
+        );
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, "arrived").as_deref(),
+            Some(tip.as_str())
+        );
+        assert_eq!(tracking_ref(&fx, fenced), old);
+        assert_eq!(tracking_ref(&fx, other), other_tip);
+        let present = cairn_platform::env::git()
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{fenced}"),
+            ])
+            .current_dir(fx.proj.path())
+            .output()
+            .unwrap();
+        assert_eq!(present.status.success(), !deleted);
+        if !deleted {
+            assert_eq!(String::from_utf8_lossy(&present.stdout).trim(), old);
+        }
+    }
+}
+
 /// Acceptance #1: the 20:50:48 write — origin's tracking ref for an agent branch
 /// rewritten back to a commit the store had already pushed past — no longer
 /// moves the branch.

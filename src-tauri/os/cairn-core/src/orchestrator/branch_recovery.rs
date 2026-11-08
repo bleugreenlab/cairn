@@ -22,6 +22,7 @@
 //! mutation and this record, publishers already running when the fence is
 //! written, and writers that bypass Cairn's managed boundaries.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -552,23 +553,46 @@ async fn standing_fences(
     })
 }
 
+/// Store admission is the union of every open database's live fences. A
+/// historical row in one database must not hide another database's obligation.
+pub(crate) async fn preserved_import_bookmarks(
+    orch: &Orchestrator,
+    store: &Path,
+    moving: &[&str],
+    action: &str,
+) -> Result<Vec<String>, String> {
+    let mut preserved = std::collections::BTreeSet::new();
+    for db in orch.db.all_dbs().await {
+        preserved.extend(refuse_import_if_fenced(&db, store, moving, action).await?);
+    }
+    Ok(preserved.into_iter().collect())
+}
+
+pub(crate) async fn refuse_coordinate_if_fenced(
+    orch: &Orchestrator,
+    store: &Path,
+    bookmarks: &[&str],
+    action: &str,
+) -> Result<(), String> {
+    for db in orch.db.all_dbs().await {
+        refuse_if_fenced(&db, store, bookmarks, action).await?;
+    }
+    Ok(())
+}
+
 /// Refuse an import of Git refs into `store` (an origin fast-forward, a
 /// default-branch import, job preparation's import) that a fence forbids.
 ///
-/// A store fence refuses every import. A branch fence refuses one that moves a
-/// fenced bookmark by name (`moving`), or that would move one by following a
-/// Git ref changed behind jj; any other import leaves the fenced bookmarks
-/// exactly where their recorded repair expects them.
+/// A store fence refuses every import. Explicitly moving a fenced branch also
+/// refuses. Other branch fences become an import scope: their local and remote
+/// Git inputs must remain unobserved until recovery settles them.
 pub(crate) async fn refuse_import_if_fenced(
     db: &LocalDb,
     store: &Path,
     moving: &[&str],
     action: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let fences = standing_fences(db, store, action).await?;
-    if fences.is_empty() {
-        return Ok(());
-    }
     if let Some(fence) = fences
         .iter()
         .find(|fence| fence.scope == RecoveryScope::Store || fence.fences(moving))
@@ -579,34 +603,12 @@ pub(crate) async fn refuse_import_if_fenced(
             .copied();
         return Err(fence.refusal(bookmark, action));
     }
-    let fenced: Vec<String> = fences
+    Ok(fences
         .iter()
         .flat_map(|fence| fence.affected.iter().cloned())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .collect();
-    let probe_store = store.to_path_buf();
-    let moved = tokio::task::spawn_blocking(move || {
-        cairn_vcs::jj::bookmarks_an_import_would_move(&probe_store, &fenced)
-    })
-    .await
-    .map_err(|error| format!("{action} refused: the fence probe failed: {error}"))?
-    .map_err(|error| {
-        format!("{action} refused: the fence probe could not read the store: {error}")
-    })?;
-    match moved.first().and_then(|bookmark| {
-        fences
-            .iter()
-            .find(|fence| fence.affected.iter().any(|fenced| fenced == bookmark))
-            .map(|fence| (bookmark, fence))
-    }) {
-        Some((bookmark, fence)) => Err(format!(
-            "{} Git moved `{bookmark}` behind jj, so this import would carry it off its recorded \
-             position.",
-            fence.refusal(Some(bookmark), action)
-        )),
-        None => Ok(()),
-    }
+        .collect())
 }
 
 /// Record every recovery a marker holds, removing each from the marker only
@@ -752,6 +754,108 @@ pub(crate) async fn repair_now(
     Ok(lines.join("\n"))
 }
 
+/// Affirmative lifecycle evidence for recreating a recorded, merged head.
+/// Absence alone is not permission to export a branch again. No landing graph
+/// proof is needed: squash merges need not contain the recorded commit, and
+/// repair preserves that commit rather than deleting the bookmark.
+async fn merged_missing_heads(
+    orch: &Orchestrator,
+    store: &Path,
+    record: &RecoveryRecord,
+) -> Result<BTreeSet<String>, String> {
+    let mut merged_branches = BTreeSet::new();
+    for bookmark in &record.coordinates.bookmarks {
+        let Some(pre) = bookmark.pre.commit() else {
+            continue;
+        };
+        if bookmark.pre_git.as_deref() != Some(pre) {
+            continue;
+        }
+        let branch = &bookmark.bookmark;
+        let mut lifecycle = crate::vcs_maintenance::BranchLifecycle::default();
+        let mut merged = false;
+        for db in orch.db.all_dbs().await {
+            let jobs = db.query_all(
+                "SELECT p.repo_path, j.status, i.status,
+                        COALESCE(i.merged_at, i.closed_at, i.updated_at),
+                        j.branch = p.default_branch,
+                        EXISTS(SELECT 1 FROM runs r WHERE r.job_id = j.id AND r.status IN ('starting', 'live'))
+                 FROM jobs j JOIN projects p ON p.id = j.project_id
+                 LEFT JOIN issues i ON i.id = j.issue_id WHERE j.branch = ?1",
+                params![branch.as_str()],
+                |row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?,
+                    row.opt_i64(3)?, row.i64(4)? != 0, row.i64(5)? != 0)),
+            ).await.map_err(|error| error.to_string())?;
+            for (repo, status, issue_status, at, base, live_run) in jobs {
+                if crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo)) != store {
+                    continue;
+                }
+                lifecycle.job(
+                    &status,
+                    issue_status.as_deref().map(|s| (s, at.unwrap_or(0))),
+                );
+                lifecycle.held |= base || live_run;
+                merged |= issue_status.as_deref() == Some("merged");
+            }
+            let prs = db
+                .query_all(
+                    "SELECT p.repo_path, m.status, m.github_state,
+                        i.status, COALESCE(i.merged_at, i.closed_at, i.updated_at),
+                        COALESCE(m.merged_at, m.closed_at, m.updated_at),
+                        m.source_branch = p.default_branch
+                 FROM merge_requests m JOIN projects p ON p.id = m.project_id
+                 LEFT JOIN issues i ON i.id = m.issue_id WHERE m.source_branch = ?1",
+                    params![branch.as_str()],
+                    |row| {
+                        Ok((
+                            row.text(0)?,
+                            row.text(1)?,
+                            row.opt_text(2)?,
+                            row.opt_text(3)?,
+                            row.opt_i64(4)?,
+                            row.i64(5)?,
+                            row.i64(6)? != 0,
+                        ))
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            for (repo, status, github, issue, at, settled, base) in prs {
+                if crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo)) != store {
+                    continue;
+                }
+                // Even an unpublished open PR holds the branch here.
+                lifecycle.pull_request(
+                    &status,
+                    github.as_deref(),
+                    true,
+                    settled,
+                    issue.as_deref().map(|s| (s, at.unwrap_or(0))),
+                );
+                lifecycle.held |= base;
+                merged |= status == "merged"
+                    || github
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("merged"));
+            }
+        }
+        if merged && !lifecycle.held {
+            merged_branches.insert(branch.clone());
+        }
+    }
+    if merged_branches.is_empty() {
+        return Ok(merged_branches);
+    }
+    let store = store.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let heads = cairn_vcs::jj::backing_branch_heads(&store)?;
+        merged_branches.retain(|branch| !heads.contains_key(branch));
+        Ok(merged_branches)
+    })
+    .await
+    .map_err(|error| format!("read merged missing heads: {error}"))?
+}
+
 enum Attempt {
     Cleared(String),
     Downgraded(RecoveryCoordinates, String),
@@ -770,7 +874,11 @@ enum Attempt {
 /// exclusion intact. No attempt runs while an earlier worker for the same
 /// record is still alive, so nothing validates or clears a fence it might
 /// still be changing.
-async fn run_one_attempt(store: &Path, record: &RecoveryRecord) -> Attempt {
+async fn run_one_attempt(
+    store: &Path,
+    record: &RecoveryRecord,
+    merged_missing: BTreeSet<String>,
+) -> Attempt {
     if repair_worker_active(&record.id) {
         return Attempt::Kept(
             "an earlier repair worker for this recovery is still running; nothing is validated \
@@ -788,8 +896,17 @@ async fn run_one_attempt(store: &Path, record: &RecoveryRecord) -> Attempt {
     let task_store = store.to_path_buf();
     let task_record = record.clone();
     let worker_finished = std::sync::Arc::clone(&finished);
+    let task_merged_missing = merged_missing.clone();
+    let admitted = std::sync::Arc::new(Mutex::new(None));
+    let task_admitted = std::sync::Arc::clone(&admitted);
     let worker = tokio::task::spawn_blocking(move || {
-        let outcome = attempt(&task_store, &task_record, deadline);
+        let outcome = attempt(
+            &task_store,
+            &task_record,
+            deadline,
+            &task_merged_missing,
+            &task_admitted,
+        );
         worker_finished.store(true, std::sync::atomic::Ordering::SeqCst);
         outcome
     });
@@ -805,7 +922,19 @@ async fn run_one_attempt(store: &Path, record: &RecoveryRecord) -> Attempt {
                  whole until it has finished and the view is validated",
                 allowance.as_secs_f64()
             );
-            let coordinates = escalation_coordinates(store, record).await;
+            // Validation may have narrowed a store fence before admitting the
+            // repair. Escalate its actual admitted coordinates, not a broader
+            // snapshot with a different set of targets.
+            let mut repairing = record.clone();
+            if let Some(coordinates) = admitted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                repairing.scope = RecoveryScope::Branch;
+                repairing.coordinates = coordinates;
+            }
+            let coordinates = escalation_coordinates(store, &repairing).await;
             Attempt::Escalated(coordinates, detail)
         }
     }
@@ -849,7 +978,13 @@ async fn escalation_coordinates(store: &Path, record: &RecoveryRecord) -> Recove
     }
 }
 
-fn attempt(store: &Path, record: &RecoveryRecord, deadline: std::time::Instant) -> Attempt {
+fn attempt(
+    store: &Path,
+    record: &RecoveryRecord,
+    deadline: std::time::Instant,
+    merged_missing: &BTreeSet<String>,
+    admitted: &Mutex<Option<RecoveryCoordinates>>,
+) -> Attempt {
     let mut coordinates = record.coordinates.clone();
     let mut downgraded = false;
     if coordinates.scope == RecoveryScope::Store {
@@ -872,10 +1007,16 @@ fn attempt(store: &Path, record: &RecoveryRecord, deadline: std::time::Instant) 
     }
     // Admission to write: an allowance already spent by validation is not
     // spent again on a write that may then outlive the lock.
-    if std::time::Instant::now() >= deadline {
-        return Attempt::Kept(
-            "the repair allowance was spent before the repair could start writing".into(),
-        );
+    {
+        let mut admitted = admitted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if std::time::Instant::now() >= deadline {
+            return Attempt::Kept(
+                "the repair allowance was spent before the repair could start writing".into(),
+            );
+        }
+        *admitted = Some(coordinates.clone());
     }
     #[cfg(test)]
     if let Some(hook) = TEST_REPAIR_HOOK
@@ -885,7 +1026,7 @@ fn attempt(store: &Path, record: &RecoveryRecord, deadline: std::time::Instant) 
     {
         hook();
     }
-    match cairn_vcs::jj::repair_branch_recovery(store, &coordinates, &record.id) {
+    match cairn_vcs::jj::repair_branch_recovery(store, &coordinates, &record.id, merged_missing) {
         RepairVerdict::Verified { operation_id } => Attempt::Cleared(format!(
             "targeted repair verified at operation {}",
             operation_id.as_deref().unwrap_or("<unknown>")
@@ -947,7 +1088,20 @@ pub(crate) async fn run_due_recoveries(orch: &Orchestrator, db: &LocalDb) {
                 record.scope.as_str(),
                 record.repair_attempts + 1
             ));
-            run_one_attempt(&store, &record).await
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                merged_missing_heads(orch, &store, &record),
+            )
+            .await
+            {
+                Ok(Ok(merged_missing)) => run_one_attempt(&store, &record, merged_missing).await,
+                Ok(Err(error)) => Attempt::Kept(format!(
+                    "merged-head recreation evidence unavailable: {error}"
+                )),
+                Err(_) => Attempt::Kept(
+                    "merged-head recreation evidence exceeded its 5s allowance".into(),
+                ),
+            }
         };
         let persisted = persist_attempt(db, &record, &outcome).await;
         drop(guard);

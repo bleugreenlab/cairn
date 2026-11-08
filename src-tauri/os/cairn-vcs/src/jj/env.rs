@@ -50,6 +50,7 @@ pub struct JjEnv {
     /// What this budgeted transaction has done that its rollback must know:
     /// shared by every clone, fresh for each [`JjEnv::with_operation_budget`].
     ledger: Arc<Mutex<super::recovery::OperationLedger>>,
+    preserved_import_bookmarks: std::collections::BTreeSet<String>,
     bin: String,
     config_path: PathBuf,
     pub(super) checkout_repair_policy: crate::checkout::CheckoutRepairPolicy,
@@ -62,6 +63,14 @@ fn jj_subprocess_lock() -> &'static Mutex<()> {
 }
 
 impl JjEnv {
+    /// Preserve recovery-fenced bookmark names through every nested import.
+    /// Callers hold the store lock from fence admission through the mutation.
+    pub fn preserving_import_bookmarks(&self, names: Vec<String>) -> Self {
+        let mut scoped = self.clone();
+        scoped.preserved_import_bookmarks.extend(names);
+        scoped
+    }
+
     /// Clone this environment with a deadline shared by every subsequent command.
     ///
     /// Create it after acquiring the store lock. Cloning the returned environment
@@ -348,6 +357,7 @@ impl JjEnv {
             is_cleanup: false,
             operation_phases: None,
             ledger: Default::default(),
+            preserved_import_bookmarks: Default::default(),
             checkout_repair_policy: Default::default(),
         }
     }
@@ -367,6 +377,7 @@ impl JjEnv {
             is_cleanup: false,
             operation_phases: None,
             ledger: Default::default(),
+            preserved_import_bookmarks: Default::default(),
             checkout_repair_policy: Default::default(),
         }
     }
@@ -794,12 +805,164 @@ pub(crate) fn between_next_guard_and_import(write: impl FnOnce() + Send + 'stati
     *BETWEEN_GUARD_AND_IMPORT.lock().unwrap() = Some(Box::new(write));
 }
 
+fn scoped_import_operation(jj: &JjEnv, store: &Path) -> Result<String, String> {
+    jj.run(
+        store,
+        &[
+            "op",
+            "log",
+            "--no-graph",
+            "-n",
+            "1",
+            "-T",
+            "id",
+            "--ignore-working-copy",
+        ],
+        "read scoped import source operation",
+    )
+}
+
+fn native_import_workers() -> &'static Mutex<std::collections::BTreeSet<PathBuf>> {
+    static WORKERS: OnceLock<Mutex<std::collections::BTreeSet<PathBuf>>> = OnceLock::new();
+    WORKERS.get_or_init(Default::default)
+}
+
+struct NativeImportPermit(PathBuf);
+
+impl Drop for NativeImportPermit {
+    fn drop(&mut self) {
+        native_import_workers()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+type NativeImportHook = (Box<dyn FnOnce() + Send>, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static NATIVE_IMPORT_HOOK: Mutex<Option<NativeImportHook>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn during_next_native_import(
+    before: impl FnOnce() + Send + 'static,
+    after: impl FnOnce() + Send + 'static,
+) {
+    *NATIVE_IMPORT_HOOK.lock().unwrap() = Some((Box::new(before), Box::new(after)));
+}
+
+/// Only this deadline-bound caller can publish. The worker owns immutable
+/// candidate creation, never operation heads, even after the receiver goes away.
+pub(super) fn publish_scoped_import_candidate(
+    jj: &JjEnv,
+    store: &Path,
+    config: String,
+    source: String,
+    deadline: Instant,
+) -> Result<(), String> {
+    if deadline <= Instant::now() {
+        return Err(
+            "scoped git import timed out: operation budget exhausted before starting candidate preparation".to_string(),
+        );
+    }
+    {
+        let mut workers = native_import_workers()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !workers.insert(store.to_path_buf()) {
+            return Err("scoped git import refused: a previous unpublished candidate is still preparing for this store".to_string());
+        }
+    }
+    let permit = NativeImportPermit(store.to_path_buf());
+    let preserved = jj.preserved_import_bookmarks.clone();
+    let worker_source = source.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    #[cfg(test)]
+    let hook = NATIVE_IMPORT_HOOK.lock().unwrap().take();
+    std::thread::Builder::new()
+        .name("jj-import-candidate".into())
+        .spawn(move || {
+            #[cfg(test)]
+            let after = hook.map(|(before, after)| {
+                before();
+                after
+            });
+            let candidate = crate::prepare_git_import_preserving_bookmarks(
+                &permit.0,
+                &preserved,
+                &config,
+                &worker_source,
+            );
+            drop(permit);
+            let _ = sender.send(candidate);
+            #[cfg(test)]
+            if let Some(after) = after {
+                after();
+            }
+        })
+        .map_err(|error| format!("start scoped import candidate worker: {error}"))?;
+    let candidate = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout =>
+                "scoped git import timed out: operation budget exhausted; unpublished candidate discarded; no view was published".to_string(),
+            std::sync::mpsc::RecvTimeoutError::Disconnected =>
+                "scoped git import candidate worker stopped without returning a candidate".to_string(),
+        })??;
+    jj.check_operation_budget("publish scoped git import")?;
+    if deadline <= Instant::now() {
+        return Err(
+            "scoped git import timed out: operation budget exhausted before publishing candidate"
+                .to_string(),
+        );
+    }
+    if scoped_import_operation(jj, store)? != source {
+        return Err(
+            "scoped git import refused: source operation changed before candidate publication"
+                .to_string(),
+        );
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining < JJ_FORWARD_SUBPROCESS_MINIMUM {
+        return Err(
+            "scoped git import timed out: operation budget exhausted before publishing candidate"
+                .to_string(),
+        );
+    }
+    jj.run_with_timeout(
+        store,
+        &["op", "integrate", &candidate, "--ignore-working-copy"],
+        "publish scoped git import",
+        remaining,
+    )
+    .map(|_| ())
+}
+
 fn import_holding_tracking_refs(
     jj: &JjEnv,
     store_dir: &Path,
     origin_authoritative: Option<&str>,
 ) -> Result<(), String> {
     let import = || {
+        if !jj.preserved_import_bookmarks.is_empty() {
+            jj.check_operation_budget("scoped git import")?;
+            let config = jj.run(
+                store_dir,
+                &[
+                    "config",
+                    "list",
+                    "--include-defaults",
+                    "--ignore-working-copy",
+                ],
+                "read effective import settings",
+            )?;
+            jj.check_operation_budget("scoped git import")?;
+            let deadline = jj
+                .operation_deadline
+                .unwrap_or_else(|| Instant::now() + JJ_DEFAULT_TIMEOUT);
+            let source = scoped_import_operation(jj, store_dir)?;
+            jj.check_operation_budget("scoped git import")?;
+            return publish_scoped_import_candidate(jj, store_dir, config, source, deadline);
+        }
         jj.run(
             store_dir,
             &["git", "import", "--ignore-working-copy"],
@@ -821,7 +984,9 @@ fn import_holding_tracking_refs(
     exempt.extend(origin_authoritative.map(ToOwned::to_owned));
     let recorded = recorded_origin_tracking_targets(jj, store_dir)?
         .into_iter()
-        .filter(|(branch, _)| !exempt.contains(branch))
+        .filter(|(branch, _)| {
+            !exempt.contains(branch) && !jj.preserved_import_bookmarks.contains(branch)
+        })
         .collect::<Vec<_>>();
 
     // Before: restore what the git refs say now, so the common case never
@@ -1178,6 +1343,7 @@ mod tests {
             is_cleanup: false,
             operation_phases: None,
             ledger: Default::default(),
+            preserved_import_bookmarks: Default::default(),
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -1232,6 +1398,7 @@ mod tests {
             is_cleanup: false,
             operation_phases: None,
             ledger: Default::default(),
+            preserved_import_bookmarks: Default::default(),
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -1275,6 +1442,7 @@ mod tests {
             is_cleanup: false,
             operation_phases: None,
             ledger: Default::default(),
+            preserved_import_bookmarks: Default::default(),
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),

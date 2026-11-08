@@ -59,9 +59,9 @@ pub use publish::*;
 pub use rebuild::{rebuild_flagged_branch, RebuildOutcome};
 pub use reconcile::*;
 pub use recovery::{
-    bookmarks_an_import_would_move, interrupted_repair_coordinates, repair_branch_recovery,
-    validate_store_recovery, BookmarkRecovery, RecoveryCoordinates, RecoveryScope, RepairVerdict,
-    RollbackFailurePhase, StoreValidation, SurvivorRecord,
+    interrupted_repair_coordinates, repair_branch_recovery, validate_store_recovery,
+    BookmarkRecovery, RecoveryCoordinates, RecoveryScope, RepairVerdict, RollbackFailurePhase,
+    StoreValidation, SurvivorRecord,
 };
 pub use seal::*;
 pub use three_way::*;

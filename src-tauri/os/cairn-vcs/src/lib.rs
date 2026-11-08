@@ -860,6 +860,10 @@ pub struct RecordedBookmarkRestore {
     /// The only states the repair may replace. Anything else is a movement
     /// nobody recorded, and belongs to whoever made it.
     pub replaceable: Vec<BookmarkState>,
+    /// The host has established that this branch was merged, is no longer held,
+    /// and its recorded Git head is now absent. Observe that deletion before
+    /// restoring the saved head with an expected-absent Git update.
+    pub recreate_missing_git_head: bool,
 }
 
 /// What [`restore_recorded_bookmarks`] committed.
@@ -878,7 +882,10 @@ pub struct ScopedRestoreOutcome {
 /// no commit is rebased or abandoned, and remote-tracking bookmarks are left
 /// alone. The whole repair is refused before writing anything when any recorded
 /// bookmark holds a state outside its `replaceable` set, so work committed
-/// after the failure is never overwritten.
+/// after the failure is never overwritten. For host-attested merged branches
+/// whose Git heads were retired, observe only their @git deletions before
+/// restoring the original targets. This needs no ancestry claim about squash
+/// merges, and a Git head that reappears cannot be overwritten.
 ///
 /// The export is jj's own, filtered to the recorded names: each Git ref moves
 /// only from the value jj last exported for it (an expected-old-value update),
@@ -917,6 +924,18 @@ pub fn restore_recorded_bookmarks(
                 repo.view()
                     .get_local_bookmark(RefName::new(&restore.bookmark)),
             );
+            if restore.recreate_missing_git_head && restore.target.commit().is_none() {
+                return Err(format!(
+                    "cannot recreate `{}` without a normal saved target",
+                    restore.bookmark
+                ));
+            }
+            if restore.recreate_missing_git_head && current != restore.target {
+                return Err(format!(
+                    "cannot recreate `{}`: its local bookmark no longer holds the saved target",
+                    restore.bookmark
+                ));
+            }
             if current != restore.target && !restore.replaceable.contains(&current) {
                 moved.push(format!(
                     "`{}` is at {current}, which this recovery did not record",
@@ -930,7 +949,40 @@ pub fn restore_recorded_bookmarks(
                 moved.join("; ")
             ));
         }
+        let retired: std::collections::BTreeSet<&str> = restores
+            .iter()
+            .filter(|restore| restore.recreate_missing_git_head)
+            .map(|restore| restore.bookmark.as_str())
+            .collect();
+        let heads = jj::backing_branch_heads(repository_path)?;
+        if let Some(name) = retired.iter().find(|name| heads.contains_key(**name)) {
+            return Err(format!(
+                "retirement of `{name}` refused: its Git head is present"
+            ));
+        }
         let mut tx = repo.start_transaction();
+        if !retired.is_empty() {
+            // Observe only the attested missing heads, including their @git state.
+            // Never import another recovery's refs or abandon historical work.
+            let options = jj_lib::git::GitImportOptions {
+                abandon_unreachable_commits: false,
+                record_synthetic_predecessors: false,
+                remote_auto_track_bookmarks: HashMap::new(),
+            };
+            jj_lib::git::import_some_refs(tx.repo_mut(), &options, |kind, symbol| {
+                matches!(kind, jj_lib::git::GitRefKind::Bookmark)
+                    && symbol.remote == jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                    && retired.contains(symbol.name.as_str())
+            })
+            .await
+            .map_err(|error| format!("observe retired Git heads: {error}"))?;
+            let heads = jj::backing_branch_heads(repository_path)?;
+            if let Some(name) = retired.iter().find(|name| heads.contains_key(**name)) {
+                return Err(format!(
+                    "retirement of `{name}` refused: its Git head reappeared"
+                ));
+            }
+        }
         for restore in restores {
             let target = match restore.target.commit() {
                 Some(commit) => {
@@ -1195,6 +1247,129 @@ pub(crate) fn load_workspace(repository_path: &Path) -> Result<Workspace, String
             "load the jj store at {}: {error}",
             repository_path.display()
         )
+    })
+}
+
+/// Build an immutable, unpublished import candidate at an exact source operation.
+/// This worker must never load/merge operation heads or publish a view: its
+/// caller may stop waiting at the deadline while immutable object work finishes.
+pub(crate) fn prepare_git_import_preserving_bookmarks(
+    repository_path: &Path,
+    preserved: &std::collections::BTreeSet<String>,
+    config: &str,
+    source_operation: &str,
+) -> Result<String, String> {
+    futures::executor::block_on(async {
+        let layer = ConfigLayer::parse(ConfigSource::Repo, config)
+            .map_err(|error| format!("load effective import settings: {error}"))?;
+        let mut stacked = StackedConfig::with_defaults();
+        stacked.add_layer(layer);
+        let settings = UserSettings::from_config(stacked)
+            .map_err(|error| format!("load effective import settings: {error}"))?;
+        let git_settings = jj_lib::git::GitSettings::from_settings(&settings)
+            .map_err(|error| error.to_string())?;
+        let remotes = settings
+            .remote_settings()
+            .map_err(|error| error.to_string())?;
+        let mut remote_auto_track_bookmarks = HashMap::new();
+        for (name, remote) in remotes {
+            if let Some(pattern) = remote.auto_track_bookmarks {
+                let expression = jj_lib::revset::parse_string_expression(
+                    &mut jj_lib::revset::RevsetDiagnostics::new(),
+                    &pattern,
+                )
+                .map_err(|error| {
+                    format!("remote {} auto-track-bookmarks: {error}", name.as_str())
+                })?;
+                remote_auto_track_bookmarks.insert(name, expression.to_matcher());
+            }
+        }
+        let stores = StoreFactories::default();
+        let mut working_copies: WorkingCopyFactories = HashMap::new();
+        working_copies.insert(
+            LocalWorkingCopy::name().to_string(),
+            Box::new(LocalWorkingCopyFactory {}),
+        );
+        let workspace = Workspace::load(&settings, repository_path, &stores, &working_copies)
+            .map_err(|error| error.to_string())?;
+        let loader = workspace.repo_loader();
+        let source_id = jj_lib::op_store::OperationId::try_from_hex(source_operation)
+            .ok_or_else(|| "invalid scoped import source operation".to_string())?;
+        let source_data = loader
+            .op_store()
+            .read_operation(&source_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let source =
+            jj_lib::operation::Operation::new(loader.op_store().clone(), source_id, source_data);
+        let repo = loader
+            .load_at(&source)
+            .await
+            .map_err(|error| error.to_string())?;
+        let preserved_state = |view: &jj_lib::view::View| {
+            let local = preserved
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        view.get_local_bookmark(RefName::new(name)).clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let remotes = view
+                .all_remote_bookmarks()
+                .filter(|(symbol, _)| preserved.contains(symbol.name.as_str()))
+                .map(|(symbol, target)| (symbol.to_owned(), target.clone()))
+                .collect::<Vec<_>>();
+            let git = view
+                .git_refs()
+                .iter()
+                .filter(|(name, _)| {
+                    jj_lib::git::parse_git_ref(name).is_some_and(|(kind, symbol)| {
+                        kind == jj_lib::git::GitRefKind::Bookmark
+                            && preserved.contains(symbol.name.as_str())
+                    })
+                })
+                .map(|(name, target)| (name.clone(), target.clone()))
+                .collect::<Vec<_>>();
+            (local, remotes, git)
+        };
+        let before = preserved_state(repo.view());
+        let mut tx = repo.start_transaction();
+        jj_lib::git::import_head(tx.repo_mut())
+            .await
+            .map_err(|error| format!("import Git HEAD: {error}"))?;
+        jj_lib::git::import_some_refs(
+            tx.repo_mut(),
+            &jj_lib::git::GitImportOptions {
+                abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
+                record_synthetic_predecessors: git_settings.record_synthetic_predecessors,
+                remote_auto_track_bookmarks,
+            },
+            |kind, symbol| {
+                kind != jj_lib::git::GitRefKind::Bookmark
+                    || !preserved.contains(symbol.name.as_str())
+            },
+        )
+        .await
+        .map_err(|error| format!("scoped git import: {error}"))?;
+        tx.repo_mut()
+            .rebase_descendants()
+            .await
+            .map_err(|error| format!("rebase imported descendants: {error}"))?;
+        if preserved_state(tx.repo_mut().view()) != before {
+            return Err(
+                "scoped git import would change a recovery-fenced bookmark or recorded input"
+                    .to_string(),
+            );
+        }
+        let candidate = tx
+            .write("import git refs preserving recovery fences")
+            .await
+            .map_err(|error| format!("write unpublished scoped git import: {error}"))?;
+        let operation_id = candidate.operation().id().hex();
+        candidate.leave_unpublished();
+        Ok(operation_id)
     })
 }
 

@@ -1359,10 +1359,16 @@ where
             )
             .await)
     })?;
-    refuse_fenced_import(orch, store, "Preparing this job's branch")?;
+    let preserved = refuse_fenced_import(orch, store, "Preparing this job's branch")?;
+    if let Some(branch) = job.branch.as_deref() {
+        refuse_fenced_coordinate(orch, store, branch)?;
+    }
+    let scoped = jj.preserving_import_bookmarks(preserved);
+    let jj = &scoped;
     crate::jj::ensure_project_store(jj, store, repo_path)?;
 
     let base_ref = job.base_branch.as_deref().unwrap_or("HEAD");
+    refuse_fenced_coordinate(orch, store, base_ref)?;
 
     // Only a job about to MINT a branch has a continuity question: an inheriting
     // child already continues a live branch, and a job that carries a branch on
@@ -1374,6 +1380,9 @@ where
     };
     if let Some(refusal) = continuation.refusal() {
         return Err(refusal);
+    }
+    if let crate::execution::continuity::Continuation::Adopt { adopted, .. } = &continuation {
+        refuse_fenced_coordinate(orch, store, &adopted.branch)?;
     }
 
     if let Some(adopt_head) = continuation.adopt_head() {
@@ -1397,10 +1406,23 @@ where
         },
         jj,
         store,
-        load_parent,
-        mint_name,
+        |parent_id| {
+            let parent = load_parent(parent_id)?;
+            if let Some(branch) = parent.branch.as_deref() {
+                refuse_fenced_coordinate(orch, store, branch)?;
+            }
+            Ok(parent)
+        },
+        || {
+            let branch = mint_name()?;
+            refuse_fenced_coordinate(orch, store, &branch)?;
+            Ok(branch)
+        },
         git_rev_parse,
     )?;
+    if let Some(branch) = branch.as_deref() {
+        refuse_fenced_coordinate(orch, store, branch)?;
+    }
     Ok(StoreCoordinate {
         branch,
         base_commit,
@@ -1431,20 +1453,35 @@ pub(crate) fn import_project_store_locked(
             )
             .await)
     })?;
-    refuse_fenced_import(
+    let preserved = refuse_fenced_import(
         orch,
         store,
         &format!("Importing the project store ({operation})"),
     )?;
-    crate::jj::ensure_project_store(jj, store, repo_path)
+    crate::jj::ensure_project_store(&jj.preserving_import_bookmarks(preserved), store, repo_path)
 }
 
-/// The import every job preparation runs is a store write: a store fence
-/// refuses it, and so does a branch fence it would carry off its position.
-fn refuse_fenced_import(orch: &Orchestrator, store: &Path, action: &str) -> Result<(), String> {
+fn refuse_fenced_coordinate(orch: &Orchestrator, store: &Path, branch: &str) -> Result<(), String> {
     run_db_borrowed(async {
-        let db = crate::orchestrator::base_advance::recovery_fence_db(orch, store).await;
-        crate::orchestrator::branch_recovery::refuse_import_if_fenced(&db, store, &[], action).await
+        crate::orchestrator::branch_recovery::refuse_coordinate_if_fenced(
+            orch,
+            store,
+            &[branch],
+            "Preparing this job's branch",
+        )
+        .await
+    })
+}
+
+/// Admit a store import, preserving every branch fence's recorded inputs.
+fn refuse_fenced_import(
+    orch: &Orchestrator,
+    store: &Path,
+    action: &str,
+) -> Result<Vec<String>, String> {
+    run_db_borrowed(async {
+        crate::orchestrator::branch_recovery::preserved_import_bookmarks(orch, store, &[], action)
+            .await
     })
 }
 
@@ -11109,6 +11146,201 @@ mod tests {
             head, "root()",
             "the ladder degrades to jj's root commit rather than failing the spawn"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn unrelated_preparation_preserves_a_fenced_branch_after_git_changes() {
+        use crate::orchestrator::branch_recovery;
+        let fx = successor_fixture().expect("real jj required");
+        let orch = test_orchestrator(migrated_test_db("prepare-fenced-import.db").await);
+        let mut job = seed_successor(
+            &orch,
+            &fx.project.path().to_string_lossy(),
+            Continuity::Clean,
+            false,
+        )
+        .await;
+        let target = cairn_vcs::read_local_bookmark_view(&fx.store)
+            .unwrap()
+            .bookmarks[DEAD_BRANCH]
+            .clone();
+        branch_recovery::record_recoveries(
+            &orch.db.local,
+            "proj-1",
+            &fx.store,
+            Some(DEAD_BRANCH),
+            branch_recovery::BUDGET_AUTOMATIC,
+            "fixture",
+            vec![crate::jj::RecoveryCoordinates {
+                scope: crate::jj::RecoveryScope::Branch,
+                phase: crate::jj::RollbackFailurePhase::ExportUnverified,
+                pre_op: None,
+                pre_view: None,
+                pre_git: None,
+                failed_view: None,
+                bookmarks: vec![crate::jj::BookmarkRecovery {
+                    bookmark: DEAD_BRANCH.to_string(),
+                    pre: target.clone(),
+                    failed: target,
+                    pre_git: Some(fx.dead_head.clone()),
+                }],
+                survivors: vec![],
+                evidence: vec!["fixture branch fence".into()],
+            }],
+        )
+        .await
+        .unwrap();
+        // A local historical row must not hide the live fence in a team DB.
+        let team_orch = test_orchestrator(migrated_test_db("prepare-fenced-team.db").await);
+        seed_successor(
+            &team_orch,
+            &fx.project.path().to_string_lossy(),
+            Continuity::Clean,
+            false,
+        )
+        .await;
+        let coordinates = branch_recovery::fences(&orch.db.local, &fx.store)
+            .await
+            .unwrap()[0]
+            .coordinates
+            .clone();
+        branch_recovery::record_recoveries(
+            &team_orch.db.local,
+            "proj-1",
+            &fx.store,
+            Some(DEAD_BRANCH),
+            branch_recovery::BUDGET_AUTOMATIC,
+            "fixture team fence",
+            vec![coordinates],
+        )
+        .await
+        .unwrap();
+        orch.db
+            .local
+            .execute("UPDATE jj_branch_recoveries SET status = 'repaired'", ())
+            .await
+            .unwrap();
+        orch.db
+            .register_team_db_for_test("team".into(), team_orch.db.local.clone())
+            .await;
+        job.branch = Some("agent/unrelated".into());
+        job.base_commit = Some(fx.base.clone());
+        crate::jj::create_bookmark_at(&fx.jj, &fx.store, "agent/unrelated", &fx.base).unwrap();
+        let prepare = |job: &DbJob| {
+            prepare_store_coordinate(
+                &orch,
+                &fx.jj,
+                &fx.store,
+                fx.project.path(),
+                job,
+                &mints(),
+                |_| Some(fx.base.clone()),
+                |_| unreachable!(),
+                || unreachable!(),
+            )
+        };
+        for deleted in [false, true] {
+            if deleted {
+                git(
+                    fx.project.path(),
+                    &["update-ref", "-d", &format!("refs/heads/{DEAD_BRANCH}")],
+                );
+            } else {
+                git(
+                    fx.project.path(),
+                    &["update-ref", &format!("refs/heads/{DEAD_BRANCH}"), &fx.base],
+                );
+            }
+            let prepared = prepare(&job).expect("unrelated preparation must succeed");
+            assert_eq!(prepared.branch.as_deref(), Some("agent/unrelated"));
+            assert_eq!(
+                crate::jj::bookmark_commit(&fx.jj, &fx.store, DEAD_BRANCH).as_deref(),
+                Some(fx.dead_head.as_str())
+            );
+        }
+        job.branch = None;
+        job.base_branch = Some("main".into());
+        job.parent_job_id = Some("job-dead".into());
+        let inherited = prepare_store_coordinate(
+            &orch,
+            &fx.jj,
+            &fx.store,
+            fx.project.path(),
+            &job,
+            &inherits(),
+            |_| Some(fx.base.clone()),
+            |_| {
+                Ok(ParentCoordinate {
+                    branch: Some(DEAD_BRANCH.into()),
+                    recorded_base: Some(fx.base.clone()),
+                })
+            },
+            || unreachable!(),
+        );
+        assert!(inherited
+            .err()
+            .expect("fenced inheritance must refuse")
+            .contains("fenced"));
+        job.parent_job_id = None;
+        for mode in [Continuity::Auto, Continuity::From(DEAD_BRANCH.into())] {
+            let snapshot = orch
+                .db
+                .local
+                .query_opt_text("SELECT snapshot FROM executions WHERE id = 'exec-2'", ())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            snapshot["continuity"] = serde_json::to_value(mode).unwrap();
+            orch.db
+                .local
+                .execute(
+                    "UPDATE executions SET snapshot = ?1",
+                    params![serde_json::to_string(&snapshot).unwrap()],
+                )
+                .await
+                .unwrap();
+            assert!(prepare(&job)
+                .err()
+                .expect("fenced continuity must refuse before minting")
+                .contains("fenced"));
+        }
+        job.base_branch = Some(DEAD_BRANCH.into());
+        assert!(prepare(&job)
+            .err()
+            .expect("a fenced base must refuse before minting")
+            .contains("fenced"));
+        job.base_branch = Some("main".into());
+        job.branch = Some(DEAD_BRANCH.into());
+        assert!(prepare(&job)
+            .err()
+            .expect("fenced preparation must refuse")
+            .contains("fenced"));
+        job.branch = Some("agent/unrelated".into());
+        team_orch
+            .db
+            .local
+            .execute("UPDATE jj_branch_recoveries SET scope = 'store'", ())
+            .await
+            .unwrap();
+        assert!(prepare(&job)
+            .err()
+            .expect("fenced preparation must refuse")
+            .contains("store scope"));
+        team_orch
+            .db
+            .local
+            .execute(
+                "ALTER TABLE jj_branch_recoveries RENAME TO unreadable_recoveries",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(prepare(&job)
+            .err()
+            .expect("unreadable team fences must refuse")
+            .contains("could not be read"));
     }
 
     // ---- The mint and a locked writer's rollback ------------------------
