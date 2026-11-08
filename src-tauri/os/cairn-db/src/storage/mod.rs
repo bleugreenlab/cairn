@@ -1,4 +1,5 @@
 mod blocking;
+pub mod camps;
 mod commit_watch;
 mod context_tokens;
 mod error;
@@ -49,7 +50,7 @@ pub use fact_log::{
     latest_for_source, latest_per_source, list_facts, list_facts_after, prune as prune_facts,
     prune_wakes as prune_fact_wakes, recover_on_start as recover_fact_log, route_state,
     set_index_outcome, FactFilter, FactRow, FactScope, FactWake, LogDedupe, NewFact, PruneSelector,
-    Recovery, WakeMatch, WakeWindow,
+    Recovery, WakeMatch, WakeWindow, PASSIVE_FACT_REF_PREFIX,
 };
 pub use failed_dependencies::{failed_dependency_candidates, failed_dependency_candidates_conn};
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};

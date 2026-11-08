@@ -2545,6 +2545,8 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("session_skyline_cache", TableScope::ProjectScoped),
     ("sessions", TableScope::ProjectScoped),
     ("skill_configs", TableScope::ProjectScoped),
+    ("camps", TableScope::ProjectScoped),
+    ("camp_events", TableScope::ProjectScoped),
     ("suppressed_wakes", TableScope::ProjectScoped),
     // Where THIS operator has read up to in each thread's transcript. The thread
     // is shared; the reading of it is not. Replicating this would let a
@@ -2789,10 +2791,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // notices describe this operator installation, never shared project state.
     (
         "app_boot_state",
-        TableScope::Private(PrivateReason::RunnerTransient),
-    ),
-    (
-        "build_change_notifications",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
@@ -3368,6 +3366,7 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
             "parent_issue_id",
             "parent_job_id",
             "parent_thread_id",
+            "camp_id",
         ],
     },
     RekeyTableManifest {
@@ -3620,7 +3619,15 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "wake_subscriptions",
-        id_columns: &["id", "job_id"],
+        id_columns: &["id", "job_id", "camp_id", "subject_key"],
+    },
+    RekeyTableManifest {
+        table: "camps",
+        id_columns: &["id", "project_id", "lead_thread_id"],
+    },
+    RekeyTableManifest {
+        table: "camp_events",
+        id_columns: &["camp_id", "subject_key"],
     },
     // workflow_progress.id is the composite `{job_id}:{seq}` (a non-uuid, so
     // rekey_to_team leaves it as-is); job_id is the routable column that gets
@@ -9473,6 +9480,86 @@ mod tests {
             1
         );
         assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM search_outbox WHERE source_table IN ('posts', 'post_comments')").await.unwrap(), 2);
+    }
+
+    /// The camps rebuild relaxes `wake_subscriptions.job_id` to make room for
+    /// camp-subject rows. Every existing row must come through with its id,
+    /// state, one-shot and phrase intact; the `suppressed_wakes` row pointing at
+    /// it must still resolve; and deleting the job must still cascade.
+    #[tokio::test]
+    async fn the_camps_rebuild_conserves_every_job_subscription_and_its_dependents() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("camps-rebuild.turso.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "camps")
+            .copied()
+            .collect::<Vec<_>>();
+        let camps = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == "camps")
+            .copied()
+            .expect("the camps migration is in the private lineage");
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            r#"
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','default','Cairn','cairn','/tmp/cairn',1,1);
+            INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+              VALUES('t','p','general','active','none',1,1);
+            INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('j','t','p','idle','thread','Thread',1,1);
+            INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, fact_kinds_json, state,
+                mute_until_kind, mute_until_ref, created_by, created_at, updated_at, one_shot, match_phrase)
+              VALUES('s-muted','j','issue','cairn://p/cairn/7','["pr_merged"]','muted',
+                     'issue_resolution','cairn://p/cairn/7','user',3,4,0,NULL),
+                    ('s-phrase','j','process','cairn://p/cairn/terminal/dev',NULL,'active',
+                     NULL,NULL,'agent',5,6,1,'ready');
+            INSERT INTO suppressed_wakes(id, subscription_id, job_id, source_kind, source_ref, fact_kind,
+                occurrences, content, created_at, updated_at)
+              VALUES('w','s-muted','j','issue','cairn://p/cairn/7','pr_merged',3,'merged',7,8);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![camps]).run(&db).await.unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(id || '|' || job_id || '|' || source_kind || '|' || COALESCE(source_ref, '-')
+                        || '|' || COALESCE(fact_kinds_json, '-') || '|' || state || '|' || COALESCE(mute_until_kind, '-')
+                        || '|' || created_by || '|' || created_at || '|' || updated_at || '|' || one_shot
+                        || '|' || COALESCE(match_phrase, '-') || '|' || COALESCE(camp_id, '-'), ';')
+                   FROM (SELECT * FROM wake_subscriptions ORDER BY id)"
+            )
+            .await
+            .unwrap(),
+            "s-muted|j|issue|cairn://p/cairn/7|[\"pr_merged\"]|muted|issue_resolution|user|3|4|0|-|-;\
+             s-phrase|j|process|cairn://p/cairn/terminal/dev|-|active|-|agent|5|6|1|ready|-"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT s.id FROM suppressed_wakes w JOIN wake_subscriptions s ON s.id = w.subscription_id"
+            )
+            .await
+            .unwrap(),
+            "s-muted"
+        );
+        db.execute("DELETE FROM jobs WHERE id = 'j'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM wake_subscriptions")
+                .await
+                .unwrap(),
+            0,
+            "deleting the job still cascades to its subscriptions"
+        );
     }
 
     #[tokio::test]

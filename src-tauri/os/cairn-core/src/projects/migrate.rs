@@ -364,6 +364,8 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     owned("thread_services", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
     owned("wake_schedules", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     owned("wake_conditions", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
+    spec("camps", "project_id = ?1"),
+    spec("camp_events", "camp_id IN (SELECT id FROM camps WHERE project_id = ?1)"),
     spec("issues", "project_id = ?1"),
     spec("main_incident_budget", "project_id = ?1"),
     spec("main_incidents", "project_id = ?1"),
@@ -386,11 +388,6 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("recipe_resolutions", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("execution_agent_edits", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("jobs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
-    // Runner-local rebuild notices, addressed through their recipient jobs.
-    // Their private cross-scope foreign key is why the private half must run
-    // before the shared half deletes those jobs; the two-half ordering is what
-    // guarantees that, so no pre-sweep special case is needed.
-    owned("build_change_notifications", &[owner(OwnerSet::Jobs, "recipient IN {ids}")]),
     owned("feed_cursors", &[owner(OwnerSet::Threads, "(home_kind = 'thread' AND home_id IN {ids})"), owner(OwnerSet::Jobs, "(home_kind = 'job' AND home_id IN {ids})")]),
     spec("turn_end_check_attempts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifact_content", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
@@ -442,7 +439,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("action_runs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1) OR parent_job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("pr_publish_attempts", "action_run_id IN (SELECT id FROM action_runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1) OR parent_job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("pr_node_port_fires", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
-    spec("wake_subscriptions", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("wake_subscriptions", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR camp_id IN (SELECT id FROM camps WHERE project_id = ?1)"),
     spec("suppressed_wakes", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR subscription_id IN (SELECT id FROM wake_subscriptions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("todos", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("workflow_progress", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
@@ -1676,8 +1673,14 @@ pub(super) mod tests {
               VALUES ('skill-config-delete', 'skill', 'prompt', 'project-delete', 1, 1);
             INSERT INTO threads(id, project_id, name, created_at, updated_at)
               VALUES ('thread-delete', 'project-delete', 'thread', 1, 1);
-            INSERT INTO issues(id, project_id, number, title, created_at, updated_at, parent_thread_id)
-              VALUES ('issue-delete', 'project-delete', 1, 'Issue', 1, 1, 'thread-delete');
+            INSERT INTO camps(id, project_id, slug, title, kind, lead_thread_id, created_at, updated_at)
+              VALUES ('camp-delete', 'project-delete', 'base', 'Base camp', 'base', 'thread-delete', 1, 1);
+            INSERT INTO camp_events(camp_id, policy_epoch, kind, subject_key, created_at)
+              VALUES ('camp-delete', 0, 'pitched', 'thread-delete', 1);
+            INSERT INTO wake_subscriptions(id, job_id, source_kind, created_at, updated_at, camp_id, subject_key, subject_json, camp_level, reason)
+              VALUES ('camp-subscription-delete', NULL, 'camp', 1, 1, 'camp-delete', 'thread-delete', '{}', 'watch', 'member');
+            INSERT INTO issues(id, project_id, number, title, created_at, updated_at, parent_thread_id, camp_id)
+              VALUES ('issue-delete', 'project-delete', 1, 'Issue', 1, 1, 'thread-delete', 'camp-delete');
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
               VALUES ('execution-delete', 'recipe', 'issue-delete', 'project-delete', 'completed', 1, 1);
             INSERT INTO jobs(id, execution_id, issue_id, project_id, thread_id, status, created_at, updated_at)
@@ -3117,15 +3120,6 @@ pub(super) mod tests {
             .unwrap();
         local
             .execute(
-                "INSERT INTO build_change_notifications(
-                    id, recipient, from_version, from_build_id, to_version, to_build_id, booted_at
-                 ) VALUES ('build-note', ?1, '1', 'old', '2', 'new', 1)",
-                (job_id,),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
                 "INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
                  VALUES (?1, ?2, 'plan', '{}', 1, 1)",
                 (artifact_id, job_id),
@@ -3270,17 +3264,6 @@ pub(super) mod tests {
                 .await
                 .unwrap(),
             None
-        );
-        assert_eq!(
-            local
-                .query_opt_text(
-                    "SELECT id FROM build_change_notifications WHERE id = 'build-note'",
-                    ()
-                )
-                .await
-                .unwrap(),
-            None,
-            "runner-local build notifications are discarded with their swept recipient"
         );
         assert_eq!(
             local

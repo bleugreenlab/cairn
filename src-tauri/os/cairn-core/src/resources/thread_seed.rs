@@ -210,9 +210,12 @@ pub(crate) async fn compose_thread_seed_with_policy(
     let children = load_children(db, thread_id.as_deref())
         .await
         .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
+    // The camps this thread takes part in ride with the store census: both are
+    // short generated lines, and both collapse with the census under budget.
+    let camps = camp_lines(db, thread_id.as_deref(), &coordinates.project_key).await;
     // The thread's own store is a second database, opened and counted after
     // every main read has released.
-    let store = thread_store_census(thread_id, now).await;
+    let store = format!("{camps}{}", thread_store_census(thread_id, now).await);
     let chat_uri = format!("{}/chat", coordinates.base_uri);
 
     let marks = compaction::unconsumed_marks(db, job_id, &source_session_id)
@@ -893,6 +896,68 @@ async fn thread_store_census(thread_id: Option<String>, now: i64) -> String {
 }
 
 /// The thread a session job belongs to. Statements only.
+/// The most camps a seed names one by one; the rest are counted.
+const SEED_CAMPS: usize = 8;
+
+/// One generated line per camp this thread takes part in: its role and the
+/// camp's live size, read from the camp's rows as the seed is composed. A
+/// camp's authored description is never copied here; its URI reads it.
+async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) -> String {
+    let Some(thread_id) = thread_id else {
+        return String::new();
+    };
+    let thread_id = thread_id.to_string();
+    let rows = db
+        .read(move |conn| {
+            let thread_id = thread_id.clone();
+            Box::pin(async move {
+                let camps =
+                    cairn_db::storage::camps::camps_for_thread_conn(conn, &thread_id).await?;
+                let mut rows = Vec::with_capacity(camps.len());
+                for (camp, role) in camps.into_iter().filter(|(camp, _)| !camp.is_struck()) {
+                    let participants =
+                        cairn_db::storage::camps::camp_participants_conn(conn, &camp)
+                            .await?
+                            .len();
+                    let open = cairn_db::storage::camps::camp_issues_conn(conn, &camp.id)
+                        .await?
+                        .into_iter()
+                        .filter(|issue| !TERMINAL_ISSUE_STATUSES.contains(&issue.status.as_str()))
+                        .count();
+                    rows.push((camp, role, participants, open));
+                }
+                Ok(rows)
+            })
+        })
+        .await;
+    let rows = match rows {
+        Ok(rows) if rows.is_empty() => return String::new(),
+        Ok(rows) => rows,
+        Err(error) => return format!("_Your camps could not be read: {error}_\n\n"),
+    };
+    let mut out = String::from("## Camps\n\n");
+    for (camp, role, participants, open) in rows.iter().take(SEED_CAMPS) {
+        out.push_str(&format!(
+            "- `{}` {} — your role: {} · {participants} participant{} · {open} open issue{} → {}\n",
+            camp.slug,
+            one_line(&camp.title),
+            role.as_str(),
+            if *participants == 1 { "" } else { "s" },
+            if *open == 1 { "" } else { "s" },
+            cairn_uri::build_project_camp_uri(project_key, &camp.slug),
+        ));
+    }
+    if rows.len() > SEED_CAMPS {
+        out.push_str(&format!(
+            "- … {} more at {}\n",
+            rows.len() - SEED_CAMPS,
+            cairn_uri::build_project_camps_uri(project_key)
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 async fn job_thread_id(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,

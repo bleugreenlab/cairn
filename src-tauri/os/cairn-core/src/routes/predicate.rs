@@ -616,6 +616,27 @@ impl Default for FactRegistry {
                 ("detailUri", Scalar, STORED),
             ]),
         };
+        // A notice addressed to a camp rather than to a list of threads: one
+        // row, which the index lane expands to the camp's participants by
+        // role. Its writer is Cairn itself (a rebuild, a drain), so the
+        // summary is trusted, and a participant at `watch` is told passively.
+        let camp_notice = SourceSpec {
+            dedupe: LogDedupe::Unique,
+            audience: Audience::AllProviders,
+            max_stored_chars: None,
+            addressees: &["camp"],
+            actor_home: None,
+            whole_lists: false,
+            muted: MutedDelivery::RideAlong,
+            untrusted: None,
+            fields: fields(&[
+                ("project", Scalar, STORED),
+                ("camp", Scalar, STORED),
+                ("kind", Scalar, STORED),
+                ("detailUri", Scalar, STORED),
+                ("text", Scalar, STORED),
+            ]),
+        };
         let triggers = [
             ("attention", attention),
             ("thread_stream", thread),
@@ -625,6 +646,7 @@ impl Default for FactRegistry {
             ("post_commented", post_commented),
             ("ingress", ingress),
             ("channel_message", channel_message),
+            (crate::camps::CAMP_NOTICE, camp_notice),
             (
                 crate::fleet::unreturned::EXECUTOR_UPDATE_UNRETURNED,
                 executor_update_unreturned,
@@ -1099,6 +1121,7 @@ mod tests {
             described.iter().map(|s| s.fact).collect::<Vec<_>>(),
             vec![
                 "attention",
+                "camp_notice",
                 "channel_message",
                 "executor_update_unreturned",
                 "file_changed",
@@ -1280,6 +1303,7 @@ mod tests {
         assert_eq!(
             addressed,
             vec![
+                "camp_notice.camp",
                 "post_commented.postAuthor",
                 "post_commented.mentions",
                 "post_created.mentions"
@@ -1307,9 +1331,10 @@ mod tests {
         }
     }
 
-    /// Every source declares what a muted recipient gets. Only the post
-    /// sources ride along; the rest keep the drop that standing triggers
-    /// have always had.
+    /// Every source declares what a muted recipient gets. Camp notices and
+    /// the post sources ride along (a camp's `watch` participant is told
+    /// passively); the rest keep the drop that standing triggers have always
+    /// had.
     #[test]
     fn every_source_declares_its_muted_delivery() {
         let registry = FactRegistry::default();
@@ -1318,7 +1343,10 @@ mod tests {
             .into_iter()
             .filter(|name| registry.source(name).unwrap().muted == MutedDelivery::RideAlong)
             .collect();
-        assert_eq!(riding, vec!["post_commented", "post_created"]);
+        assert_eq!(
+            riding,
+            vec!["camp_notice", "post_commented", "post_created"]
+        );
     }
 
     #[test]
@@ -1565,6 +1593,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "attention",
+                "camp_notice",
                 "channel_message",
                 "executor_update_unreturned",
                 "file_changed",
@@ -1591,6 +1620,7 @@ mod tests {
                 "post_commented",
                 "ingress",
                 "channel_message",
+                "camp_notice",
                 "executor_update_unreturned"
             ]
         );

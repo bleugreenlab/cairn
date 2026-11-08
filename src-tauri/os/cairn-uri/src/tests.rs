@@ -2020,6 +2020,43 @@ fn tenet_uris_parse_build_and_keep_a_slug_alias_as_written() {
 }
 
 #[test]
+fn camp_uris_parse_build_route_by_project_and_reserve_their_segment() {
+    let collection = parse_uri("cairn://p/CAIRN/camps").unwrap();
+    assert_eq!(
+        collection,
+        CairnResource::ProjectCamps {
+            project: "cairn".into()
+        }
+    );
+    assert_eq!(collection.to_uri(), "cairn://p/cairn/camps");
+    let base = parse_uri("cairn://p/cairn/camps/base").unwrap();
+    assert_eq!(base.kind(), ResourceKind::ProjectCamp);
+    assert_eq!(
+        base.project_key(),
+        Some("cairn"),
+        "a camp routes to the database that owns its project"
+    );
+    let participants = parse_uri("cairn://p/cairn/camps/rebuild/participants").unwrap();
+    assert_eq!(
+        participants,
+        CairnResource::ProjectCampParticipants {
+            project: "cairn".into(),
+            slug: "rebuild".into()
+        }
+    );
+    assert_eq!(
+        participants.to_uri(),
+        "cairn://p/cairn/camps/rebuild/participants"
+    );
+    assert_eq!(participants.issue_number(), None);
+    assert_eq!(parse_uri("cairn://p/cairn/camps/Not_A_Slug"), None);
+    assert!(
+        crate::thread_name::validate_thread_name("camps").is_err(),
+        "a thread named `camps` would shadow the project's camps"
+    );
+}
+
+#[test]
 fn page_uris_parse_build_and_reserve_their_segment() {
     let index = parse_uri("cairn://p/CAIRN/pages").unwrap();
     assert_eq!(

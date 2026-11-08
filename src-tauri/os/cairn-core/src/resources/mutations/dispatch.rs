@@ -43,6 +43,7 @@ mod queue;
 pub(crate) use queue::{asking_thread_id, authorize_start_now, queue_authority};
 mod rebase;
 pub(crate) use rebase::rebase_authority;
+mod camps;
 mod recipes;
 mod repls;
 mod requests;
@@ -58,6 +59,8 @@ mod threads;
 mod todos;
 mod wakes;
 
+#[cfg(test)]
+mod camp_mutation_tests;
 #[cfg(test)]
 mod issue_mutation_tests;
 #[cfg(test)]
@@ -395,6 +398,10 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         off_frame(|| feed::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
+        off_frame(|| camps::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) = {

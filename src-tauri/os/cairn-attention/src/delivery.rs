@@ -1372,16 +1372,6 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
         push.wake.as_str(),
         push.content_ref
     );
-    if push.key == "build-change" {
-        return match runtime
-            .host
-            .render_content(ContentRequest::BuildChange(&push.content_ref))
-            .await
-        {
-            Some(content) => content,
-            _ => header,
-        };
-    }
     // A schedule wake's content is the reason its recipient wrote for itself.
     // Name that reason in the headline: naming only the referent tells the reader
     // nothing they did not already know.

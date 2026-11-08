@@ -167,7 +167,8 @@ async fn subscriptions_for_event(
             Ok(persisted
                 .or_else(|| match &event.source {
                     WakeSource::Fact { clause_ref }
-                        if clause_ref.starts_with(ADDRESSED_FACT_REF_PREFIX) =>
+                        if clause_ref.starts_with(ADDRESSED_FACT_REF_PREFIX)
+                            || clause_ref.starts_with(CAMP_WATCH_FACT_REF_PREFIX) =>
                     {
                         Some(addressed_fact_subscription(
                             subscriber_job_id,

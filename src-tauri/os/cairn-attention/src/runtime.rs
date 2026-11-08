@@ -83,7 +83,6 @@ impl AttentionRuntime {
 
 /// Application-owned content included in an attention card.
 pub enum ContentRequest<'a> {
-    BuildChange(&'a str),
     Checks(&'a str),
     ChildStall {
         recipient: &'a str,

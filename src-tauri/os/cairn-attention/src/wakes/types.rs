@@ -20,6 +20,12 @@ pub const SOURCE_KIND_FACT: &str = "fact";
 /// ([`addressed_fact_subscription`]), so a persisted row on the ref is how a
 /// node mutes or refuses one addressee field.
 pub const ADDRESSED_FACT_REF_PREFIX: &str = "addressed:";
+/// A fact a camp delivered to a participant at `watch`: addressed, but
+/// passively. Its synthesized subscription is muted, so a source that rides
+/// along lands with the recipient's next run instead of waking it. A camp
+/// participant at `wake` or above is addressed under
+/// [`ADDRESSED_FACT_REF_PREFIX`] like any direct addressee.
+pub const CAMP_WATCH_FACT_REF_PREFIX: &str = cairn_db::storage::PASSIVE_FACT_REF_PREFIX;
 pub const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 pub const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
 /// A `run` batch that outlived its call reported to its job. The row's
@@ -120,7 +126,11 @@ pub fn addressed_fact_subscription(
         source_kind: SOURCE_KIND_FACT.to_string(),
         source_ref: Some(clause_ref.to_string()),
         fact_kinds: Some(vec![fact_kind.to_string()]),
-        state: WakeSubscriptionState::Active,
+        state: if clause_ref.starts_with(CAMP_WATCH_FACT_REF_PREFIX) {
+            WakeSubscriptionState::Muted
+        } else {
+            WakeSubscriptionState::Active
+        },
         mute_until_kind: None,
         mute_until_ref: None,
         created_by: CREATED_BY_DERIVED.to_string(),

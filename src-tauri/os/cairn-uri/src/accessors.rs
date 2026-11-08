@@ -22,6 +22,9 @@ impl CairnResource {
             | ProjectPosts { project, .. }
             | ProjectTenets { project, .. }
             | ProjectTenet { project, .. }
+            | ProjectCamps { project, .. }
+            | ProjectCamp { project, .. }
+            | ProjectCampParticipants { project, .. }
             | ProjectPages { project, .. }
             | ProjectCodemap { project, .. }
             | ProjectQueue { project, .. }
@@ -477,7 +480,12 @@ impl CairnResource {
             | Self::ProjectResponses { .. }
             | Self::ProjectResponse { .. }
             | Self::ProjectResponseHistory { .. }
-            | Self::ProjectResponseHistoryEntry { .. } => None,
+            | Self::ProjectResponseHistoryEntry { .. }
+            // The camp page is not built yet; until it is, a camp opens as
+            // its resource rather than at a route that does not exist.
+            | Self::ProjectCamps { .. }
+            | Self::ProjectCamp { .. }
+            | Self::ProjectCampParticipants { .. } => None,
         }
     }
 
@@ -494,6 +502,9 @@ impl CairnResource {
             | Self::ProjectPosts { project }
             | Self::ProjectTenets { project }
             | Self::ProjectTenet { project, .. }
+            | Self::ProjectCamps { project }
+            | Self::ProjectCamp { project, .. }
+            | Self::ProjectCampParticipants { project, .. }
             | Self::ProjectPages { project }
             | Self::ProjectCodemap { project }
             | Self::ProjectQueue { project }
@@ -772,6 +783,9 @@ impl CairnResource {
             | Self::ProjectPosts { .. }
             | Self::ProjectTenets { .. }
             | Self::ProjectTenet { .. }
+            | Self::ProjectCamps { .. }
+            | Self::ProjectCamp { .. }
+            | Self::ProjectCampParticipants { .. }
             | Self::ProjectPages { .. }
             | Self::ProjectCodemap { .. }
             | Self::ProjectQueue { .. }

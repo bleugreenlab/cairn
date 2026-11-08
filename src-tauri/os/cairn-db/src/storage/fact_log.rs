@@ -544,6 +544,12 @@ pub struct WakeWindow {
     pub max_window_ms: i64,
 }
 
+/// The clause-ref prefix of a passive route: a camp participant at `watch`.
+/// Its synthesized subscription is muted, so a wake that keeps this clause is
+/// delivered passively; any other route folding into the same pending wake
+/// takes the clause over, so a passive route never quiets a louder one.
+pub const PASSIVE_FACT_REF_PREFIX: &str = "camp-watch:";
+
 /// Fold one matched row into its (job, source) pending wake, opening one when
 /// none is still open, and return the wake's id. A wake is open while its
 /// `deliver_after` lies beyond the row's time; each joining row pushes
@@ -566,7 +572,7 @@ pub async fn coalesce_wake(db: &LocalDb, matched: WakeMatch, window: WakeWindow)
             };
             if let Some(id) = open {
                 conn.execute(
-                    "UPDATE fact_log_wakes SET count=count+1, first_row_id=MIN(first_row_id,?2), last_row_id=MAX(last_row_id,?2), deliver_after=MIN(MAX(deliver_after,?3+?4),opened_at+?5), project_id=CASE WHEN project_id=?6 THEN project_id ELSE NULL END, clause_ref=CASE WHEN ?7 THEN ?8 ELSE clause_ref END WHERE id=?1",
+                    "UPDATE fact_log_wakes SET count=count+1, first_row_id=MIN(first_row_id,?2), last_row_id=MAX(last_row_id,?2), deliver_after=MIN(MAX(deliver_after,?3+?4),opened_at+?5), project_id=CASE WHEN project_id=?6 THEN project_id ELSE NULL END, clause_ref=CASE WHEN ?7 THEN ?8 WHEN substr(clause_ref,1,?9)=?10 AND substr(?8,1,?9)<>?10 THEN ?8 ELSE clause_ref END WHERE id=?1",
                     params![
                         id,
                         matched.row_id,
@@ -575,7 +581,9 @@ pub async fn coalesce_wake(db: &LocalDb, matched: WakeMatch, window: WakeWindow)
                         window.max_window_ms,
                         matched.project_id.clone(),
                         i64::from(matched.addressed),
-                        matched.clause_ref.clone()
+                        matched.clause_ref.clone(),
+                        PASSIVE_FACT_REF_PREFIX.len() as i64,
+                        PASSIVE_FACT_REF_PREFIX
                     ],
                 )
                 .await?;
@@ -1060,6 +1068,46 @@ mod tests {
             clause_ref(id).await,
             "addressed:s.mentions",
             "a later trigger match does not take the addressed reason back"
+        );
+    }
+
+    /// A passive camp-watch route never quiets a louder one sharing its
+    /// pending wake, in either order.
+    #[tokio::test]
+    async fn a_passive_camp_route_yields_its_pending_wake_to_any_other_route() {
+        let db = crate::storage::migrated_test_db("fact-log-coalesce-passive.db").await;
+        let passive = |row: i64, at: i64| {
+            let mut m = matched("j", "s", row, at);
+            m.clause_ref = format!("{PASSIVE_FACT_REF_PREFIX}s.mentions@watch");
+            m
+        };
+        let clause_ref = |id: i64| {
+            let db = &db;
+            async move { get_wakes(db, &[id]).await.unwrap()[0].clause_ref.clone() }
+        };
+        let id = coalesce_wake(&db, passive(1, 0), WINDOW).await.unwrap();
+        assert_eq!(
+            coalesce_wake(&db, matched("j", "s", 2, 10), WINDOW)
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            clause_ref(id).await,
+            "{\"fact\":\"s\"}",
+            "a trigger after a watch wakes"
+        );
+
+        let other = coalesce_wake(&db, matched("k", "s", 3, 0), WINDOW)
+            .await
+            .unwrap();
+        let mut later = passive(4, 10);
+        later.job_id = "k".into();
+        assert_eq!(coalesce_wake(&db, later, WINDOW).await.unwrap(), other);
+        assert_eq!(
+            clause_ref(other).await,
+            "{\"fact\":\"s\"}",
+            "a watch after a trigger does not quiet it"
         );
     }
 

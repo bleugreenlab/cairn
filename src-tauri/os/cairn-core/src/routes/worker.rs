@@ -12,10 +12,10 @@
 //! recipients by the sink's destination or the source's [`Audience`].
 //!
 //! A source may also declare **addressee** fields: URIs naming who a row is
-//! for (a post's mentions, a commented post's author). The index lane expands
-//! them to the jobs they reach now and wakes those first, with no standing
-//! trigger, then runs the clause consumers against the same set of jobs
-//! already woken, so each recipient is woken at most once per row.
+//! for (a post's mentions, a commented post's author, a camp). The index lane
+//! expands them to the jobs they reach now, a camp to its participants by
+//! role, then runs the clause consumers, and folds each recipient in once per
+//! row at the highest level any of those routes reached it at.
 //!
 //! Thread wakes are **coalesced**: the index lane folds each matching row into
 //! the thread's pending wake for that source (`fact_log_wakes`), and the
@@ -38,6 +38,7 @@ use super::{matches, Audience, Fact, FactRegistry, RouteContext};
 use crate::models::DeliveryUrgency;
 use crate::orchestrator::wakes::{
     MutedDelivery, WakeDelivery, WakeEvent, WakeRouteAction, WakeSource, ADDRESSED_FACT_REF_PREFIX,
+    CAMP_WATCH_FACT_REF_PREFIX,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{route_state, FactRow, FactWake, WakeMatch, WakeWindow};
@@ -376,10 +377,13 @@ async fn index_row(
 
     let actors = actor_jobs(orch, &row, spec, &stored.fields).await;
     // One pending wake per (job, source): a job a row reaches by several
-    // routes (two addressee fields, an addressee and a clause, two clauses) is
-    // folded in once, under the first, which is the most specific.
+    // routes (two addressee fields, an addressee and a clause, a camp and a
+    // clause) is folded in once, at the highest level any route reaches it at
+    // and, among equals, under the first, which is the most specific. A camp
+    // participant at `watch` is the one passive route, so a direct addressee,
+    // a standing trigger or a higher camp role always outranks it.
     let window = policy.wake_window(&row.source);
-    let mut woken: Vec<String> = Vec::new();
+    let mut candidates = Recipients::default();
     let mut wakes = Vec::new();
     let mut unresolved = Vec::new();
     {
@@ -390,26 +394,53 @@ async fn index_row(
         };
         for field in spec.addressees {
             for uri in addressee_uris(stored.fields, field) {
-                let jobs =
-                    match crate::orchestrator::wakes::addressed_jobs(&orch.db.local, &uri).await {
-                        Ok(jobs) => jobs,
+                // A camp recipient carries its owning project, read from the
+                // camp's own database; any other recipient is resolved here.
+                type Reached = (
+                    String,
+                    Option<crate::models::CampRole>,
+                    Option<(String, String)>,
+                );
+                let reached: Vec<Reached> =
+                    match crate::orchestrator::wakes::camp_recipients(&orch.db, &uri).await {
+                        Ok(Some(participants)) => participants
+                            .into_iter()
+                            .map(|p| (p.job_id, Some(p.role), Some((p.project_id, p.project_key))))
+                            .collect(),
+                        Ok(None) => {
+                            match crate::orchestrator::wakes::addressed_jobs(&orch.db.local, &uri)
+                                .await
+                            {
+                                Ok(jobs) => jobs.into_iter().map(|job| (job, None, None)).collect(),
+                                Err(error) => {
+                                    unresolved.push(format!("{field} {uri}: {error}"));
+                                    continue;
+                                }
+                            }
+                        }
                         Err(error) => {
                             unresolved.push(format!("{field} {uri}: {error}"));
                             continue;
                         }
                     };
-                for job in jobs {
-                    if actors.contains(&job) || woken.contains(&job) {
+                for (job, camp_role, home) in reached {
+                    if actors.contains(&job) {
                         continue;
                     }
-                    let (home_project_id, home_project_key) =
-                        match crate::orchestrator::wakes::job_project(&orch.db.local, &job).await {
-                            Ok(project) => project,
-                            Err(error) => {
-                                unresolved.push(format!("{field} {uri}: {error}"));
-                                continue;
+                    let (home_project_id, home_project_key) = match home {
+                        Some((id, key)) => (Some(id), Some(key)),
+                        None => {
+                            match crate::orchestrator::wakes::job_project(&orch.db.local, &job)
+                                .await
+                            {
+                                Ok(project) => project,
+                                Err(error) => {
+                                    unresolved.push(format!("{field} {uri}: {error}"));
+                                    continue;
+                                }
                             }
-                        };
+                        }
+                    };
                     let scope = ThreadScope {
                         home_project_id: home_project_id.as_deref(),
                         home_project_key: home_project_key.as_deref(),
@@ -418,26 +449,28 @@ async fn index_row(
                     if scope_exclusion(None, &stored, &scope).is_some() {
                         continue;
                     }
-                    woken.push(job.clone());
-                    fold_wake(
-                        orch,
-                        &mut wakes,
-                        WakeMatch {
+                    let passive = camp_role == Some(crate::models::CampRole::Watch);
+                    let prefix = if passive {
+                        CAMP_WATCH_FACT_REF_PREFIX
+                    } else {
+                        ADDRESSED_FACT_REF_PREFIX
+                    };
+                    let role = camp_role
+                        .map(|role| format!("{CAMP_ROLE_SEPARATOR}{}", role.as_str()))
+                        .unwrap_or_default();
+                    candidates.offer(Candidate {
+                        level: if passive { Level::Passive } else { Level::Wake },
+                        matched: WakeMatch {
                             job_id: job,
                             source: row.source.clone(),
-                            clause_ref: format!(
-                                "{ADDRESSED_FACT_REF_PREFIX}{}.{field}",
-                                row.source
-                            ),
+                            clause_ref: format!("{prefix}{}.{field}{role}", row.source),
                             project_id: row.project_id.clone(),
                             row_id: row.id,
                             at_ms: row.minted_at,
-                            addressed: true,
+                            addressed: !passive,
                         },
-                        window,
-                        Some(field),
-                    )
-                    .await;
+                        via: Some(field),
+                    });
                 }
             }
         }
@@ -474,16 +507,13 @@ async fn index_row(
 
     for consumer in &threads {
         if actors.contains(&consumer.job_id)
-            || woken.contains(&consumer.job_id)
             || !matches(std::slice::from_ref(&consumer.clause), &candidate)
         {
             continue;
         }
-        woken.push(consumer.job_id.clone());
-        fold_wake(
-            orch,
-            &mut wakes,
-            WakeMatch {
+        candidates.offer(Candidate {
+            level: Level::Wake,
+            matched: WakeMatch {
                 job_id: consumer.job_id.clone(),
                 source: row.source.clone(),
                 clause_ref: consumer.clause_ref.clone(),
@@ -492,10 +522,11 @@ async fn index_row(
                 at_ms: row.minted_at,
                 addressed: false,
             },
-            window,
-            None,
-        )
-        .await;
+            via: None,
+        });
+    }
+    for recipient in candidates.into_vec() {
+        fold_wake(orch, &mut wakes, recipient.matched, window, recipient.via).await;
     }
 
     let state = if fact.is_route_generated() {
@@ -525,6 +556,65 @@ async fn index_row(
         orch.fact_log.route_notify.notify_one();
     }
     Ok(())
+}
+
+/// Separates a camp-delivered clause ref from the role its recipient was
+/// reached at, so the delivered line can say which camp it came from and why.
+const CAMP_ROLE_SEPARATOR: &str = "@";
+
+/// How loudly a route reaches its recipient. Only rises when routes merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Level {
+    /// A camp participant at `watch`: told with its next run.
+    Passive,
+    /// Every other route: woken, under its own subscription's rules.
+    Wake,
+}
+
+struct Candidate {
+    level: Level,
+    matched: WakeMatch,
+    via: Option<&'static str>,
+}
+
+/// One row's recipients, one per job, in the order they were first reached.
+#[derive(Default)]
+struct Recipients(Vec<Candidate>);
+
+impl Recipients {
+    /// Keep the higher level for a job already reached, the earlier route on
+    /// a tie.
+    fn offer(&mut self, candidate: Candidate) {
+        match self
+            .0
+            .iter_mut()
+            .find(|known| known.matched.job_id == candidate.matched.job_id)
+        {
+            Some(known) if candidate.level > known.level => *known = candidate,
+            Some(_) => {}
+            None => self.0.push(candidate),
+        }
+    }
+
+    fn into_vec(self) -> Vec<Candidate> {
+        self.0
+    }
+}
+
+/// The camp a delivered wake came through and the role it reached its
+/// recipient at, read back from the clause ref the index lane wrote.
+fn camp_delivery<'a>(clause_ref: &'a str, row: &FactRow) -> Option<(String, &'a str)> {
+    let rest = clause_ref
+        .strip_prefix(ADDRESSED_FACT_REF_PREFIX)
+        .or_else(|| clause_ref.strip_prefix(CAMP_WATCH_FACT_REF_PREFIX))?;
+    let (path, role) = rest.rsplit_once(CAMP_ROLE_SEPARATOR)?;
+    let field = path.rsplit_once('.')?.1;
+    let fields: HashMap<String, Value> = serde_json::from_str(&row.fields_json).ok()?;
+    let camp = fields.get(field)?.as_str()?;
+    match cairn_uri::parse_uri(camp)? {
+        cairn_uri::CairnResource::ProjectCamp { slug, .. } => Some((slug, role)),
+        _ => None,
+    }
 }
 
 /// The jobs whose own write a row is: the job that minted it, and the job the
@@ -692,6 +782,12 @@ async fn wake_header(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
         if let Ok(Some(row)) = crate::storage::get_fact(&orch.db.local, wake.first_row_id).await {
             let uri = fact_row_uri(project_key(orch, &row).await.as_deref(), row.id);
             let summary = row.summary.as_deref().unwrap_or(row.identity.as_str());
+            if let Some((camp, role)) = camp_delivery(&wake.clause_ref, &row) {
+                return (
+                    format!("From camp {camp} (your role: {role}): {summary} — {uri}"),
+                    uri,
+                );
+            }
             return (format!("[Event] {summary} ({}): {uri}", row.source), uri);
         }
     }

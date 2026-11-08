@@ -7,6 +7,7 @@ mod action;
 mod agent;
 pub mod allotment;
 mod artifact;
+mod camp;
 mod common;
 mod context_tokens;
 mod docs;
@@ -73,6 +74,12 @@ pub use post::{CreatePost, CreatePostComment, Post, PostComment};
 
 // Thread types
 pub use thread::{CreateThread, Thread, ThreadStatus, UpdateThread};
+
+// Camp types
+pub use camp::{
+    validate_camp_slug, Camp, CampKind, CampLevel, CampParticipant, CampRole, CampStatus,
+    CampSubject, BASE_CAMP_SLUG, CAMP_SLUG_MAX_LEN,
+};
 
 // Job types (replaces timeline_nodes)
 pub use job::{Job, JobStatus};

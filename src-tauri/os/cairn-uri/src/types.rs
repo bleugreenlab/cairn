@@ -162,6 +162,23 @@ pub enum CairnResource {
         project: String,
         key: String,
     },
+    /// A project's camps: base camp first, then every pitched camp, then the
+    /// struck ones, which stay readable.
+    ProjectCamps {
+        project: String,
+    },
+    /// One camp by slug (`base` is the project's base camp): its lead, status,
+    /// participants and the issues joined to it.
+    ProjectCamp {
+        project: String,
+        slug: String,
+    },
+    /// A camp's participant census, where a thread joins, changes its level,
+    /// or leaves.
+    ProjectCampParticipants {
+        project: String,
+        slug: String,
+    },
     /// A project's promoted pages: the latest version of each thread-owned page
     /// whose owning thread set `promoted`.
     ProjectPages {
@@ -1197,6 +1214,9 @@ impl CairnResource {
             Self::ProjectPosts { .. } => ResourceKind::ProjectPosts,
             Self::ProjectTenets { .. } => ResourceKind::ProjectTenets,
             Self::ProjectTenet { .. } => ResourceKind::ProjectTenet,
+            Self::ProjectCamps { .. } => ResourceKind::ProjectCamps,
+            Self::ProjectCamp { .. } => ResourceKind::ProjectCamp,
+            Self::ProjectCampParticipants { .. } => ResourceKind::ProjectCampParticipants,
             Self::ProjectPages { .. } => ResourceKind::ProjectPages,
             Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,

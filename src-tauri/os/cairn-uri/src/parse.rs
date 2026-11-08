@@ -561,6 +561,23 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 key: (*key).to_string(),
             })
         }
+        // Must precede the thread and issue arms: `camps` is a reserved
+        // segment, so these name the project's camps, never a thread.
+        [PROJECT_SCOPE, project, "camps"] => Some(CairnResource::ProjectCamps {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "camps", slug] if is_camp_slug(slug) => {
+            Some(CairnResource::ProjectCamp {
+                project: canonical_project(project),
+                slug: (*slug).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "camps", slug, "participants"] if is_camp_slug(slug) => {
+            Some(CairnResource::ProjectCampParticipants {
+                project: canonical_project(project),
+                slug: (*slug).to_string(),
+            })
+        }
         // Must precede the thread arm below: a literal `pages` segment names
         // the project's page index, not a thread of that name.
         [PROJECT_SCOPE, project, "pages"] => Some(CairnResource::ProjectPages {
@@ -1203,4 +1220,14 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }
         _ => None,
     }
+}
+
+/// Whether a segment can be a camp slug: lowercase ASCII letters, digits and
+/// hyphens. Which slugs a camp may take is the camp store's rule; the parser
+/// only refuses what can never be one.
+fn is_camp_slug(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }

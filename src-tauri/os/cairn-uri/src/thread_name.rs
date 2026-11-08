@@ -8,6 +8,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "agents",
     "attachments",
     "browser",
+    "camps",
     "chat",
     "check-observations",
     "check-results",

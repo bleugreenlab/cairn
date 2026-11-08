@@ -36,6 +36,80 @@ pub(crate) async fn addressed_jobs(db: &LocalDb, uri: &str) -> Result<Vec<String
     }
 }
 
+/// One job a camp reaches, with the role and the owning project it is reached
+/// in. The project comes from the camp's own database, so a team camp's
+/// recipients are judged against their team project, never looked up in the
+/// private database where their jobs do not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CampRecipient {
+    pub job_id: String,
+    pub role: crate::models::CampRole,
+    pub project_id: String,
+    pub project_key: String,
+}
+
+/// The jobs a camp URI reaches now, each with the role it is reached at, or
+/// `None` when `uri` names no camp.
+///
+/// A camp is a destination like a thread: its participants are resolved from
+/// the camp's own rows each time a fact is indexed, never copied onto a
+/// session job, so a thread that rotated sessions receives on its newest one
+/// and a role changed since the notice was minted is the role it is told at.
+/// A struck camp reaches nobody. A participant with no session (a human, or a
+/// thread whose session is gone) is skipped; the fact stays readable.
+pub(crate) async fn camp_recipients(
+    dbs: &crate::db::DbState,
+    uri: &str,
+) -> Result<Option<Vec<CampRecipient>>, String> {
+    let Some(CairnResource::ProjectCamp { project, slug }) = cairn_uri::parse_uri(uri) else {
+        return Ok(None);
+    };
+    let db = dbs.for_project(&project).await;
+    let project_id = crate::mcp::handlers::run_context::project_id_by_key(&db, &project).await?;
+    db.read(move |conn| {
+        let (project_id, slug, project_key) = (project_id.clone(), slug.clone(), project.clone());
+        Box::pin(async move {
+            let Some(camp) =
+                cairn_db::storage::camps::camp_by_slug_conn(conn, &project_id, &slug).await?
+            else {
+                return Ok(Vec::new());
+            };
+            if camp.is_struck() {
+                return Ok(Vec::new());
+            }
+            let mut recipients = Vec::new();
+            for participant in cairn_db::storage::camps::camp_participants_conn(conn, &camp).await?
+            {
+                let Some(thread_id) = participant.subject.thread_id() else {
+                    continue;
+                };
+                let mut rows = conn
+                    .query(
+                        format!(
+                            "SELECT j.id FROM jobs j WHERE j.thread_id = ?1 AND {}
+                             ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1",
+                            crate::threads::SESSION_JOB_SHAPE
+                        ),
+                        cairn_db::turso::params![thread_id],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    recipients.push(CampRecipient {
+                        job_id: row.get::<String>(0)?,
+                        role: participant.role,
+                        project_id: project_id.clone(),
+                        project_key: project_key.clone(),
+                    });
+                }
+            }
+            Ok(recipients)
+        })
+    })
+    .await
+    .map(Some)
+    .map_err(|error| format!("Failed to resolve camp participants of {uri}: {error}"))
+}
+
 /// The project a job's home belongs to, as `(projects.id, projects.key)`. An
 /// issue job takes its issue's project; a thread session (which has no issue)
 /// carries its own: the same COALESCE that names a job's home.

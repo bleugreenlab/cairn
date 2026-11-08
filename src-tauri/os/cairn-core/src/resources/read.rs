@@ -2656,6 +2656,15 @@ async fn render_resource_body(
         CairnResource::ProjectTenet { project, key } => {
             super::tenets::read_entity(db, &project, &key, &params).await
         }
+        CairnResource::ProjectCamps { project } => {
+            super::camps::read_camps(db, &project, &params).await
+        }
+        CairnResource::ProjectCamp { project, slug } => {
+            super::camps::read_camp(db, &project, &slug, &params).await
+        }
+        CairnResource::ProjectCampParticipants { project, slug } => {
+            super::camps::read_participants(db, &project, &slug, &params).await
+        }
         CairnResource::ProjectCodemap { project } => {
             super::codemap::read_codemap(orch, db, &project, &params).await
         }

@@ -993,3 +993,60 @@ async fn a_rotated_author_home_is_not_woken_by_its_own_post() {
     assert_eq!(woke(&db, &post_uri(&own)).await, vec![job("reader", None)]);
     assert!(events_received(&db, "watcher-b-run").await.is_empty());
 }
+
+/// A post that names base camp reaches each participant by role, and a
+/// participant it also names directly is woken: base camp's passive `watch`
+/// never lowers what a direct mention gives it.
+#[tokio::test]
+async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outranks_watch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (orch, db) = orchestrator(temp.path(), &[]).await;
+    homes(&db).await;
+    // `other` (watcher2) leads; `ui` (watcher) and `feed` (reader) are at watch.
+    db.ensure_base_camp("p", "t2", 1).await.unwrap();
+
+    post(
+        &orch,
+        Some("p"),
+        "Rebuild interface",
+        "For cairn://p/cairn/camps/base, and cairn://p/cairn/ui specifically.",
+        agent(WRITER_HOME),
+        Some("writer"),
+    )
+    .await;
+    drain_fact_log(&orch).await;
+
+    let mut clauses = db
+        .query_all(
+            "SELECT job_id, clause_ref FROM fact_log_wakes WHERE source = 'post_created'",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap();
+    clauses.sort();
+    assert_eq!(
+        clauses,
+        vec![
+            (
+                "reader".to_string(),
+                "camp-watch:post_created.mentions@watch".to_string()
+            ),
+            (
+                "watcher".to_string(),
+                "addressed:post_created.mentions".to_string()
+            ),
+            (
+                "watcher2".to_string(),
+                "addressed:post_created.mentions@lead".to_string()
+            ),
+        ],
+        "one wake per participant, at the highest level any route reached it"
+    );
+    assert!(
+        !clauses
+            .iter()
+            .any(|(job, _)| job == "outsider" || job == "writer"),
+        "another project's thread and the writer itself are never reached"
+    );
+}

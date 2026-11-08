@@ -117,13 +117,6 @@ impl AttentionHost for CoreAttentionHost {
     ) -> Option<String> {
         use cairn_attention::runtime::ContentRequest;
         match request {
-            ContentRequest::BuildChange(reference) => {
-                crate::orchestrator::build_change::resolve(&self.0.db.local, reference)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|change| crate::orchestrator::build_change::render(&change))
-            }
             ContentRequest::Checks(job_id) => {
                 crate::execution::checks_status::check_wake_body(&self.0, job_id).await
             }

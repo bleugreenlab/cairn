@@ -198,6 +198,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("sessions", SKELETON),
     keep("turns", SKELETON),
     keep("threads", SKELETON),
+    keep("camps", SKELETON),
     keep("merge_requests", SKELETON),
     keep("pack_catalog", SKELETON),
     keep(
@@ -398,7 +399,6 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     // Deleted with their parent.
     owned("attention_pushes", "jobs"),
     owned("attention_read_cursors", "jobs"),
-    owned("build_change_notifications", "jobs"),
     owned("checkpoint_command_cache", "jobs"),
     owned("checkpoint_runs", "jobs"),
     owned("file_changes", "jobs"),
@@ -413,6 +413,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("todos", "jobs"),
     owned("turn_end_check_attempts", "jobs"),
     owned("wake_subscriptions", "jobs"),
+    owned("camp_events", "camps"),
     owned("thread_compaction_entries", "jobs"),
     owned("thread_compaction_marks", "jobs"),
     owned("thread_compactions", "jobs"),

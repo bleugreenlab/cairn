@@ -201,6 +201,18 @@ pub fn build_project_tenet_uri(project: &str, key: &str) -> String {
 }
 
 /// A project's page index: every promoted thread-owned page.
+pub fn build_project_camps_uri(project: &str) -> String {
+    format!("{}/camps", build_project_uri(project))
+}
+
+pub fn build_project_camp_uri(project: &str, slug: &str) -> String {
+    format!("{}/{slug}", build_project_camps_uri(project))
+}
+
+pub fn build_project_camp_participants_uri(project: &str, slug: &str) -> String {
+    format!("{}/participants", build_project_camp_uri(project, slug))
+}
+
 pub fn build_project_pages_uri(project: &str) -> String {
     format!("{}/pages", build_project_uri(project))
 }
@@ -1150,6 +1162,11 @@ impl CairnResource {
             Self::ProjectPosts { project } => build_project_posts_uri(project),
             Self::ProjectTenets { project } => build_project_tenets_uri(project),
             Self::ProjectTenet { project, key } => build_project_tenet_uri(project, key),
+            Self::ProjectCamps { project } => build_project_camps_uri(project),
+            Self::ProjectCamp { project, slug } => build_project_camp_uri(project, slug),
+            Self::ProjectCampParticipants { project, slug } => {
+                build_project_camp_participants_uri(project, slug)
+            }
             Self::ProjectPages { project } => build_project_pages_uri(project),
             Self::ProjectCodemap { project } => build_project_codemap_uri(project),
             Self::ProjectQueue { project } => build_project_queue_uri(project),

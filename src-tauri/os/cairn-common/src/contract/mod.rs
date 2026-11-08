@@ -13,6 +13,7 @@
 //! together so neither can drift without failing CI — it must live there, not
 //! here, because `cairn-common` cannot see `CairnResource` or the dispatcher.
 
+mod camps;
 mod events;
 mod globals;
 mod inference;
@@ -147,6 +148,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     posts::PROJECT_POSTS_CONTRACT,
     tenets::PROJECT_TENETS_CONTRACT,
     tenets::PROJECT_TENET_CONTRACT,
+    camps::PROJECT_CAMPS_CONTRACT,
+    camps::PROJECT_CAMP_CONTRACT,
+    camps::PROJECT_CAMP_PARTICIPANTS_CONTRACT,
     pages::PROJECT_PAGES_CONTRACT,
     pages::NODE_PAGES_CONTRACT,
     pages::NODE_PAGE_CONTRACT,

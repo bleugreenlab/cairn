@@ -16,6 +16,7 @@ pub mod attachments;
 pub mod authorization;
 pub mod browser_network;
 pub mod browsers;
+pub mod camps;
 pub mod channels;
 pub mod companion_projection;
 pub mod config_disables;

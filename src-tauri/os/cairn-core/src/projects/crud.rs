@@ -133,6 +133,22 @@ pub async fn create(
         }
     }
 
+    // A project is born with its general thread and base camp, or not at all:
+    // a usable project without base camp would have nowhere to deliver a
+    // notice owed to all of its threads.
+    if let Err(error) = crate::camps::ensure_project_base_camp(db, &db_project.id).await {
+        if let Err(rollback_error) = delete_db(db, &db_project.id).await {
+            return Err(CairnError::Internal(format!(
+                "failed to establish base camp for project {}: {error}; additionally failed to roll back project row: {rollback_error}",
+                db_project.key
+            )));
+        }
+        return Err(CairnError::Internal(format!(
+            "failed to establish base camp for project {}: {error}. The project row was rolled back; retrying is safe",
+            db_project.key
+        )));
+    }
+
     Ok(db_project)
 }
 
