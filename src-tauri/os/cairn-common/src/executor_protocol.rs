@@ -5641,6 +5641,13 @@ pub struct LearnedResourceEstimate {
 /// variant or field changes, and a runner talking to an older executor gets
 /// nothing wrong: every name either side folds folds to the same string.
 ///
+/// cairn/6454 does not move the number. The credentials an executor keeps from
+/// its children are read from one shared list (`auth::FORBIDDEN_LAUNCH_ENV`),
+/// naming the same variables it already removed, and the executor binary's
+/// batch relay environment moves into its library unchanged. Both are local
+/// to one process's spawns: no frame, variant or field changes, so a runner
+/// talking to an older executor gets nothing wrong.
+///
 /// cairn/6382 does not move the number. Placement checks a residency pin
 /// mismatch ahead of the drain and update holds, records a waiting decision
 /// for work held by a machine's self-update, and waits for a named machine

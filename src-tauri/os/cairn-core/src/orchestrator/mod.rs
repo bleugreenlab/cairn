@@ -4704,6 +4704,8 @@ mod detach_tests;
 
 #[cfg(test)]
 pub(crate) mod launch_coverage_tests;
+#[cfg(all(test, unix))]
+mod launch_env_tests;
 #[cfg(test)]
 mod typesafe_tests;
 

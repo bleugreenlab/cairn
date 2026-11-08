@@ -431,8 +431,9 @@ pub fn forget_lost_claim(pool: &ExecutorPool, entry_id: &str) {
 /// with a relay grant calls `/resident/<relay id>/api/mcp`, and the call is
 /// authorized by the runner's own `authorize_resident_relay` before dispatch.
 ///
-/// Unlike a real executor it rewrites `CAIRN_CALLBACK_URL` on every batch, not
-/// only those with a context. A colocated test executor's children inherit the
+/// A batch with a context is composed by the executor binary's own
+/// `configure_relay_environment`. Unlike a real executor it also rewrites
+/// `CAIRN_CALLBACK_URL` on a batch with none. A colocated test executor's children inherit the
 /// test process's environment, and a test run from an agent shell carries the
 /// LIVE host's callback URL and secret there; without the rewrite, a child that
 /// called the SDK or the CLI would act on that host.
@@ -520,27 +521,19 @@ impl TestMcpRelay {
     ) -> Option<LiveContext> {
         let batch = batch?;
         let context = batch.runner_context_id.clone();
-        for item in &mut batch.items {
-            item.env.retain(|(name, _)| {
-                name != "CAIRN_CALLBACK_URL"
-                    && name != "CAIRN_CALLBACK_SOCKET"
-                    && (context.is_none() || name != "CAIRN_MCP_SECRET")
-            });
-            item.env
-                .push(("CAIRN_CALLBACK_URL".into(), self.url.clone()));
-            // As the executor binary does: on Unix an item reaches this
-            // relay's lineage socket and carries no capability; elsewhere it
-            // carries its batch's context as one.
-            #[cfg(unix)]
-            if let Some(socket) = cairn_exec::callback_roots::socket() {
-                item.env.push((
-                    "CAIRN_CALLBACK_SOCKET".into(),
-                    socket.to_string_lossy().into_owned(),
-                ));
+        match &context {
+            // The executor binary's own composition: on Unix an item reaches
+            // this relay's lineage socket and carries no capability; elsewhere
+            // it carries its batch's context as one.
+            Some(context) => {
+                cairn_exec::callback_roots::configure_relay_environment(batch, &self.url, context)
             }
-            #[cfg(not(unix))]
-            if let Some(context) = &context {
-                item.env.push(("CAIRN_MCP_SECRET".into(), context.clone()));
+            None => {
+                for item in &mut batch.items {
+                    item.env.retain(|(name, _)| name != "CAIRN_CALLBACK_URL");
+                    item.env
+                        .push(("CAIRN_CALLBACK_URL".into(), self.url.clone()));
+                }
             }
         }
         let id = context?;

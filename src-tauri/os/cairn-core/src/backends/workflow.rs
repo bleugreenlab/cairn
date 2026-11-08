@@ -486,3 +486,157 @@ fn finalize_workflow_run(
         processes.remove(run_id);
     }
 }
+
+/// No callback credential reaches a workflow runtime's launch environment on
+/// macOS and Linux (tenet #1381): its capability is held by the executor that
+/// relays it, the colocated machine included. A canary for every credential is
+/// planted in this process's own environment, which the colocated executor's
+/// children inherit.
+#[cfg(all(test, unix))]
+mod launch_env_tests {
+    use super::*;
+    use cairn_common::auth::launch_canary;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// Whether this host can confine the runtime, which starts under the
+    /// credential floor's profile. On macOS the only cause it cannot is a test
+    /// process already inside a Seatbelt profile, the declared
+    /// `nested-sandbox-exec` gap, recorded as a skip.
+    fn workflow_confines_here(test: &str) -> bool {
+        match cairn_sandbox::IsolatedChild::availability() {
+            Ok(()) => true,
+            Err(why) if cfg!(target_os = "macos") => {
+                eprintln!("skipping {test}: {why}");
+                cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
+                false
+            }
+            Err(why) => panic!("{test} needs a host that can confine a workflow runtime: {why}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_workflow_runtime_carries_no_callback_credential() {
+        if !workflow_confines_here("a_workflow_runtime_carries_no_callback_credential") {
+            return;
+        }
+        if !launch_canary::in_planted_child(
+            module_path!(),
+            "a_workflow_runtime_carries_no_callback_credential",
+        ) {
+            return;
+        }
+        let socket = crate::fleet::service_placement::tests::name_callback_socket();
+        let (orch, config) = crate::fleet::service_placement::tests::attached_orchestrator().await;
+        let repo = config.path().join("repository");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "probe@example.com"]);
+        git(&repo, &["config", "user.name", "Probe"]);
+        std::fs::write(repo.join("README.md"), "probe\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
+        crate::jj::ensure_project_store(&jj, &store, &repo).unwrap();
+        let repo_path = repo.to_string_lossy().into_owned();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES('p', 'default', 'Probe', 'probe', ?1, 1, 1)",
+                cairn_db::turso::params![repo_path.as_str()],
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO runs(id, project_id, status, created_at, updated_at)
+                 VALUES('workflow-probe','p','starting',1,1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let observed = config.path().join("workflow-env.json");
+        let package = config.path().join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        let script = package.join("main.ts");
+        std::fs::write(
+            &script,
+            format!(
+                // Held until the test has read it, so its capability is
+                // still registered while it is searched for.
+                "const fs = require('fs');\nawait Bun.write({part:?}, JSON.stringify(process.env));\nfs.renameSync({part:?}, {path:?});\nwhile (!fs.existsSync({release:?})) await Bun.sleep(100);\n",
+                part = format!("{}.part", observed.display()),
+                path = observed.display().to_string(),
+                release = format!("{}.release", observed.display()),
+            ),
+        )
+        .unwrap();
+        spawn_workflow_process(
+            &orch,
+            WorkflowSpawnParams {
+                run_id: "workflow-probe".into(),
+                workflow_id: "probe".into(),
+                project_id: "p".into(),
+                repository_path: repo,
+                anchor_branch: "main".into(),
+                branch_mode: "inherit".into(),
+                package_path: package,
+                script_path: script,
+                args_json: "{}".into(),
+                turn_id: "unused-turn".into(),
+                session_id: None,
+                output_name: "return".into(),
+                replace_existing: false,
+            },
+        )
+        .await
+        .expect("the workflow starts");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !observed.is_file() {
+            if std::time::Instant::now() >= deadline {
+                let run = orch
+                    .db
+                    .local
+                    .read(|conn| {
+                        Box::pin(async move {
+                            let mut rows = conn
+                                .query(
+                                    "SELECT COALESCE(r.status, '') || ' ' || COALESCE(r.error_message, '') || ' ' ||
+                                            COALESCE((SELECT group_concat(data, ' | ') FROM events WHERE run_id = r.id), '')
+                                     FROM runs r WHERE r.id = 'workflow-probe'",
+                                    (),
+                                )
+                                .await?;
+                            Ok(match rows.next().await? {
+                                Some(row) => row.get::<String>(0)?,
+                                None => String::new(),
+                            })
+                        })
+                    })
+                    .await;
+                panic!("the workflow never wrote its environment; its run: {run:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let env = std::fs::read_to_string(&observed).unwrap();
+        let leaks = launch_canary::leaks(&env, &[]);
+        std::fs::write(format!("{}.release", observed.display()), "").unwrap();
+        assert!(
+            leaks.is_empty(),
+            "a workflow runtime's launch environment carries a credential: {leaks:?}\n{env}"
+        );
+        launch_canary::assert_names_socket("a workflow runtime", &env, &socket);
+    }
+}

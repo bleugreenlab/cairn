@@ -1,7 +1,7 @@
 //! Shared secret utilities for the two credentials a Cairn install holds.
 //!
-//! `mcp_auth_secret` authenticates MCP callbacks and is deliberately handed to
-//! every agent process. `operator_auth_secret` authenticates a desktop operator
+//! `mcp_auth_secret` authenticates MCP callbacks from outside any run, and
+//! reaches no process Cairn spawns ([`FORBIDDEN_LAUNCH_ENV`]). `operator_auth_secret` authenticates a desktop operator
 //! answering an authority prompt and is deliberately handed to nothing but the
 //! native desktop shell. They are the same shape and must never be the same
 //! value, which is why the two file names live here beside each other.
@@ -160,6 +160,244 @@ pub fn callback_token(
             None
         }
         None => load_local(),
+    }
+}
+
+/// The variable a callback credential travels in where one still sits in a
+/// launch environment: Windows, which has no lineage socket. `cairn-cmd` and
+/// the SDKs read it there.
+pub const CALLBACK_CREDENTIAL_ENV: &str = "CAIRN_MCP_SECRET";
+
+/// The credentials an executor is launched with: its runner token (the machine
+/// credential, on a colocated executor), its enrollment token, and the nonce its
+/// supervisor admits it by. They are the executor's alone, on every platform.
+pub const EXECUTOR_LAUNCH_CREDENTIAL_ENV: [&str; 3] = [
+    crate::executor_protocol::EXECUTOR_AUTH_TOKEN_ENV,
+    crate::executor_protocol::EXECUTOR_ENROLLMENT_TOKEN_ENV,
+    crate::executor_protocol::EXECUTOR_SUPERVISION_NONCE_ENV,
+];
+
+/// Every credential that never reaches the launch environment of a process
+/// Cairn spawns, whatever the spawning process's own environment holds (tenet
+/// #1381: credentials travel by inherited descriptor or broker). On macOS and
+/// Linux that includes the callback credential, because a caller there is
+/// identified by its lineage on the callback socket. Windows has no socket, so
+/// each process there still carries its run-bound callback credential, the
+/// residual `docs/identity.md` names.
+#[cfg(unix)]
+pub const FORBIDDEN_LAUNCH_ENV: [&str; 4] = [
+    CALLBACK_CREDENTIAL_ENV,
+    EXECUTOR_LAUNCH_CREDENTIAL_ENV[0],
+    EXECUTOR_LAUNCH_CREDENTIAL_ENV[1],
+    EXECUTOR_LAUNCH_CREDENTIAL_ENV[2],
+];
+#[cfg(not(unix))]
+pub const FORBIDDEN_LAUNCH_ENV: [&str; 3] = EXECUTOR_LAUNCH_CREDENTIAL_ENV;
+
+/// Dummy credentials for the tests that pin [`FORBIDDEN_LAUNCH_ENV`], one per
+/// process class: a value for each credential, planted wherever a launch could
+/// pick it up, and a check that finds any of them in what a spawned process
+/// saw, by name or by value, so a credential moved under a new name is found
+/// too.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod launch_canary {
+    use super::{CALLBACK_CREDENTIAL_ENV, EXECUTOR_LAUNCH_CREDENTIAL_ENV, FORBIDDEN_LAUNCH_ENV};
+
+    /// One dummy value per credential name.
+    pub const CANARIES: [(&str, &str); 4] = [
+        (CALLBACK_CREDENTIAL_ENV, "canary-callback-credential-6454"),
+        (
+            EXECUTOR_LAUNCH_CREDENTIAL_ENV[0],
+            "canary-runner-token-6454",
+        ),
+        (
+            EXECUTOR_LAUNCH_CREDENTIAL_ENV[1],
+            "canary-enrollment-token-6454",
+        ),
+        (
+            EXECUTOR_LAUNCH_CREDENTIAL_ENV[2],
+            "canary-supervision-nonce-6454",
+        ),
+    ];
+
+    /// Set only in the child [`in_planted_child`] starts.
+    const CHILD_ENV: &str = "CAIRN_LAUNCH_CANARY_CHILD";
+
+    /// Whether this is the planted child of `test`, which should now run its
+    /// body.
+    ///
+    /// Called first in the test's own process, it runs `test` again in a child
+    /// of this test binary whose own environment holds every canary, as a
+    /// runner's or an executor's environment could, panics unless that child
+    /// ran it and passed, and answers `false`, so the caller returns. In the
+    /// child it answers `true`. The canaries never enter the shared test
+    /// process's environment. `module` is the caller's `module_path!()`, and
+    /// `test` its function's name.
+    pub fn in_planted_child(module: &str, test: &str) -> bool {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return true;
+        }
+        // A libtest name omits the crate, the first segment of a module path.
+        let name = match module.split_once("::") {
+            Some((_, path)) => format!("{path}::{test}"),
+            None => test.to_owned(),
+        };
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("the running test binary"))
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD_ENV, "1")
+                .envs(CANARIES)
+                .output()
+                .expect("run the test binary again");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{name} failed with every canary planted:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(" 1 passed"),
+            "the planted child did not run {name}:\n{stdout}\n{stderr}"
+        );
+        false
+    }
+
+    /// Every credential `observed` shows: a name in [`FORBIDDEN_LAUNCH_ENV`]
+    /// set to anything; a canary or one of `composed` (a credential the test
+    /// knows was minted for this launch) under any name; or, under any name,
+    /// any credential registered in this process for output scrubbing
+    /// (`security::registry`), which every batch context, resident capability
+    /// and run bearer is while it lives. A test that runs the runner and its
+    /// executors in one process therefore catches a credential it never learns
+    /// the value of, provided it looks while the process still holds it.
+    /// `observed` is a process's environment as `NAME=value` lines (what `env`
+    /// prints), as JSON, or as any text derived from it, such as its argv.
+    pub fn leaks(observed: &str, composed: &[&str]) -> Vec<String> {
+        let mut found = Vec::new();
+        for name in FORBIDDEN_LAUNCH_ENV {
+            let assignment = format!("{name}=");
+            if observed.lines().any(|line| line.starts_with(&assignment))
+                || observed.contains(&format!("\"{name}\""))
+            {
+                found.push(format!("`{name}` is set"));
+            }
+        }
+        for value in CANARIES
+            .iter()
+            .map(|(_, value)| *value)
+            .chain(composed.iter().copied())
+            .filter(|value| !value.is_empty())
+        {
+            if observed.contains(value) {
+                found.push(format!("the credential `{value}` appears"));
+            }
+        }
+        let mut registered = crate::security::sanitize::Sanitizer::exact();
+        let _ = registered.text(observed);
+        for detection in registered.detections().entries() {
+            if detection.rule.is_exact() {
+                found.push(format!(
+                    "the registered credential {:?} ({:?}) appears",
+                    detection.secret_id, detection.category
+                ));
+            }
+        }
+        found
+    }
+
+    /// Panic, naming `class`, if `observed` shows any credential.
+    pub fn assert_no_credential(class: &str, observed: &str, composed: &[&str]) {
+        let leaks = leaks(observed, composed);
+        assert!(
+            leaks.is_empty(),
+            "{class}'s launch environment carries a credential: {leaks:?}\n{observed}"
+        );
+    }
+
+    /// Panic, naming `class`, unless `observed` names the callback socket
+    /// `socket` under `CAIRN_CALLBACK_SOCKET`, as an `env` line or within a
+    /// rendered MCP server entry.
+    #[cfg(unix)]
+    pub fn assert_names_socket(class: &str, observed: &str, socket: &str) {
+        let name = crate::lineage::CALLBACK_SOCKET_ENV;
+        let named = observed
+            .lines()
+            .any(|line| line == format!("{name}={socket}"))
+            || observed.lines().any(|line| {
+                line.find(name)
+                    .is_some_and(|at| line[at..].contains(&format!("\"{socket}\"")))
+            });
+        assert!(
+            named,
+            "{class} is not named its callback socket `{socket}`:\n{observed}"
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The executor's own credentials reach no child anywhere. The callback
+        /// credential is forbidden on macOS and Linux only: Windows has no
+        /// lineage socket, so each seam there carries a run-bound one in
+        /// `CAIRN_MCP_SECRET`, the residual `docs/identity.md` names and the
+        /// seams' own Windows tests assert (`configure_relay_environment`'s in
+        /// `cairn-exec`, `CAIRN_STDIO_INHERITED_ENV`'s in `cairn-models`).
+        #[test]
+        fn the_callback_credential_is_a_named_residual_on_windows_alone() {
+            for name in EXECUTOR_LAUNCH_CREDENTIAL_ENV {
+                assert!(FORBIDDEN_LAUNCH_ENV.contains(&name), "{name}");
+            }
+            assert_eq!(
+                FORBIDDEN_LAUNCH_ENV.contains(&CALLBACK_CREDENTIAL_ENV),
+                cfg!(unix)
+            );
+        }
+
+        #[test]
+        fn a_credential_is_found_by_its_name_or_by_its_value() {
+            assert!(leaks("PATH=/bin\nHOME=/h\n", &["minted"]).is_empty());
+            for (name, value) in CANARIES {
+                if FORBIDDEN_LAUNCH_ENV.contains(&name) {
+                    // A name is matched whole, not as a prefix.
+                    assert!(leaks(&format!("{name}_HINT=x"), &[]).is_empty());
+                    assert_eq!(
+                        leaks(&format!("{name}=x"), &[]),
+                        [format!("`{name}` is set")]
+                    );
+                    assert_eq!(leaks(&format!("{{\"{name}\":\"x\"}}"), &[]).len(), 1);
+                }
+                assert_eq!(
+                    leaks(&format!("RENAMED={value}"), &[]),
+                    [format!("the credential `{value}` appears")]
+                );
+            }
+            assert_eq!(leaks("--flag minted", &["minted"]).len(), 1);
+        }
+
+        /// A credential this process registered for scrubbing is found under
+        /// any name, though the test never learned its value.
+        #[test]
+        fn a_registered_credential_is_found_under_any_name() {
+            use crate::security::{registry, SecretCategory, SecretId, SecretMaterial};
+            const MINTED: &str = "canary-registered-capability-6454-Qz8";
+            assert!(leaks(&format!("RENAMED={MINTED}"), &[]).is_empty());
+            let _held = registry()
+                .register(
+                    SecretId::new("launch-canary:registered"),
+                    SecretCategory::CallbackCredential,
+                    "unit test",
+                    SecretMaterial::from_bytes(MINTED.as_bytes()),
+                )
+                .expect("registerable");
+            let found = leaks(&format!("RENAMED={MINTED}"), &[]);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].contains("launch-canary:registered"), "{found:?}");
+            assert!(
+                !found[0].contains(MINTED),
+                "a finding never repeats the value"
+            );
+        }
     }
 }
 

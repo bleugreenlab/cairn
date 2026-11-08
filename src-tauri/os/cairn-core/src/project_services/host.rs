@@ -572,6 +572,124 @@ mod tests {
             .await;
     }
 
+    /// A service is always relayed, the colocated machine included, so the run
+    /// bearer the supervisor composes into its environment is held by its
+    /// executor and never reaches the process on macOS and Linux (tenet #1381).
+    /// The bearer is planted as the supervisor composes it, and a canary for
+    /// every other credential in this process's own environment, which the
+    /// colocated executor's children inherit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_relayed_service_carries_no_callback_credential() {
+        use cairn_common::auth::launch_canary;
+        const BEARER: &str = "canary-service-run-bearer-6454";
+        if !launch_canary::in_planted_child(
+            module_path!(),
+            "a_relayed_service_carries_no_callback_credential",
+        ) {
+            return;
+        }
+        let socket = crate::fleet::service_placement::tests::name_callback_socket();
+        let (orch, _config) = crate::fleet::service_placement::tests::attached_orchestrator().await;
+        let package = crate::project_services::declaration::package_from_files(
+            "probe",
+            vec![
+                ("service.yaml".into(), b"name: Probe\n".to_vec()),
+                (
+                    "main.ts".into(),
+                    b"console.error(JSON.stringify(process.env));\nawait new Promise(() => {});\n"
+                        .to_vec(),
+                ),
+            ],
+        )
+        .unwrap();
+        let spec = LaunchSpec {
+            project_id: "p".into(),
+            project_key: "cairn".into(),
+            owner: ServiceOwner::Project,
+            service: "probe".into(),
+            generation: 1,
+            declaration: package.declaration,
+            files: package.files,
+            env: vec![
+                ("CAIRN_RUN_ID".into(), "run-probe".into()),
+                ("CAIRN_MCP_SECRET".into(), BEARER.into()),
+                ("CAIRN_SERVICE".into(), "probe".into()),
+            ],
+            native: None,
+        };
+        let host = LeaseHost::default();
+        let mut process = host
+            .launch(&orch, &spec)
+            .await
+            .expect("the service launches");
+        let mut stderr = String::new();
+        let env = loop {
+            let event = tokio::time::timeout(Duration::from_secs(60), process.events.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no environment within 60s; stderr: {stderr}"))
+                .unwrap_or_else(|| panic!("events closed; stderr: {stderr}"));
+            match event {
+                HostEvent::Stderr(bytes) => {
+                    stderr.push_str(&String::from_utf8_lossy(&bytes));
+                    if let Some(line) = stderr.lines().find(|line| line.contains("CAIRN_SERVICE")) {
+                        break line.to_owned();
+                    }
+                }
+                HostEvent::Exited { code, detail, .. } => {
+                    panic!("exited ({code:?}, {detail}); stderr: {stderr}")
+                }
+                _ => {}
+            }
+        };
+        launch_canary::assert_no_credential("a relayed project service", &env, &[BEARER]);
+        launch_canary::assert_names_socket("a relayed project service", &env, &socket);
+        host.release(&orch, "p", &ServiceOwner::Project, "probe")
+            .await;
+    }
+
+    /// A service that no executor routes is refused before anything starts,
+    /// rather than launched with its bearer in its environment.
+    #[tokio::test]
+    async fn a_service_with_no_executor_route_is_refused_and_never_launched() {
+        let config = tempfile::tempdir().unwrap();
+        let db =
+            crate::storage::LocalDb::open_migrated_for_test(config.path().join("cairn.turso.db"))
+                .await
+                .unwrap();
+        let index =
+            crate::storage::SearchIndex::open_or_create(config.path().join("search-index.db"))
+                .unwrap();
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(Arc::new(db), Arc::new(index))),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            config.path().to_path_buf(),
+        )
+        .build();
+        let mut spec = echo_spec();
+        // Named, so the start does not wait for a colocated machine to attach.
+        spec.declaration.executor = Some(cairn_common::executor_protocol::ExecutorSelector {
+            name: Some("absent".into()),
+            ..Default::default()
+        });
+        spec.env
+            .push(("CAIRN_MCP_SECRET".into(), "a run bearer".into()));
+        let refused = tokio::time::timeout(
+            Duration::from_secs(120),
+            LeaseHost::default().launch(&orch, &spec),
+        )
+        .await
+        .expect("the start is answered");
+        assert!(
+            matches!(refused, Err(LaunchError::Unplaced(_))),
+            "a start with no route is refused as unplaced"
+        );
+        assert!(
+            orch.fleet.resident_relays().len() == 0,
+            "no relay was registered for a process that never started"
+        );
+    }
+
     /// The service protocol is scrubbed line by line. With a registered value
     /// that begins with a newline, a byte-stream pass withholds the `ready`
     /// frame's terminator and the service sends nothing more to release it.

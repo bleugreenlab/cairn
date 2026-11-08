@@ -51,7 +51,7 @@ pub(crate) const MACHINE_A: &str = "scratch-a";
 pub(crate) const MACHINE_B: &str = "scratch-b";
 /// Attached only by the tests that need a machine neither of the others is.
 const MACHINE_C: &str = "scratch-c";
-const OWNER: &str = "cairn://p/nsc/1/1/builder";
+pub(crate) const OWNER: &str = "cairn://p/nsc/1/1/builder";
 const BRANCH: &str = "agent/NSC-1-builder-0";
 
 #[derive(Clone)]
@@ -356,7 +356,7 @@ fn agent_snapshot() -> AgentSnapshot {
 /// provisioned the way production provisions one.
 pub(crate) struct Node {
     pub(crate) machines: TwoMachines,
-    cwd: String,
+    pub(crate) cwd: String,
 }
 
 pub(crate) async fn node() -> Node {
@@ -446,7 +446,7 @@ async fn seed_session(db: &LocalDb, suffix: &str, job_id: &str, project_id: &str
 }
 
 impl Node {
-    fn orch(&self) -> &Orchestrator {
+    pub(crate) fn orch(&self) -> &Orchestrator {
         &self.machines.orch
     }
 
@@ -467,7 +467,7 @@ impl Node {
         format!("r-{name}")
     }
 
-    async fn run(&self, run_id: &str, payload: Value) -> String {
+    pub(crate) async fn run(&self, run_id: &str, payload: Value) -> String {
         let result = handle_run(
             self.orch(),
             &McpCallbackRequest {
@@ -545,7 +545,7 @@ impl Node {
 
     /// A terminal of the job behind `run_id`, whose node is `node_uri`, on
     /// `machine` when one is named.
-    async fn start_terminal_of(
+    pub(crate) async fn start_terminal_of(
         &self,
         run_id: &str,
         node_uri: &str,
@@ -587,7 +587,7 @@ impl Node {
 
     /// Attach the runner's own machine, named `local`, beside the node's two.
     /// It is what a job with no route is guessed to found its home on.
-    async fn attach_colocated(&self) {
+    pub(crate) async fn attach_colocated(&self) {
         let orch = self.orch().clone();
         cairn_exec::blocking::offload(move || common::attach_test_executor(&orch)).await;
     }

@@ -103,6 +103,16 @@ struct CodexReasoningEffortEntry {
     description: Option<String>,
 }
 
+/// `command` without any credential it would inherit from this runner's
+/// environment (`cairn_common::auth::FORBIDDEN_LAUNCH_ENV`). Discovery spawns
+/// Codex itself, outside the session host, so it removes them itself.
+fn without_launch_credentials(mut command: Command) -> Command {
+    for name in cairn_common::auth::FORBIDDEN_LAUNCH_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// Ask the Codex CLI at `codex_path` for its models. A cache Codex writes
 /// while answering is published into `codex_home` for
 /// [`super::home::write_codex_config`] to harden. `login` is the
@@ -131,7 +141,7 @@ pub fn discover_codex_models(
     )
     .map_err(|error| format!("Failed to write Codex discovery config: {error}"))?;
     let mut child = DiscoveryChild(
-        Command::new(codex_path)
+        without_launch_credentials(Command::new(codex_path))
             .arg("app-server")
             .env("CODEX_HOME", &discovery_home.0)
             .envs(extra_env)

@@ -92,6 +92,15 @@ pub fn tools_with_claude(dir: &Path, script: &str) -> ManagedTools {
     }
 }
 
+/// The managed CLIs with both Claude and Codex planted under `dir` by
+/// [`installed_release`], running `claude` and `codex` respectively.
+pub fn tools_planted(dir: &Path, claude: &str, codex: &str) -> ManagedTools {
+    ManagedTools {
+        codex: Arc::new(installed_release(&CODEX, &dir.join("codex"), codex)),
+        claude: Arc::new(installed_release(&CLAUDE, &dir.join("claude"), claude)),
+    }
+}
+
 /// Lay out an active release of `spec`'s embedded pin under
 /// `dir/tools/<name>`, as an install would leave it, whose entrypoint is the
 /// `/bin/sh` script `script`, and return the [`ManagedTool`] that resolves

@@ -945,6 +945,20 @@ pub(crate) mod tests {
     /// blocking guard sees what it sees in production. What it does not
     /// reproduce is the skew between an executor's two streams: in process,
     /// every callback is synchronous and in order.
+    /// Tell this process's executor runtimes that their lineage callback socket
+    /// is served, as the executor binary does once it binds one, and answer its
+    /// path. Nothing listens there: a launch only needs to be named it. Set
+    /// once per process, so a test that needs it runs in a process of its own.
+    #[cfg(unix)]
+    pub(crate) fn name_callback_socket() -> String {
+        let path = PathBuf::from(format!("/tmp/cairn-test-cb-{}.sock", std::process::id()));
+        cairn_exec::callback_roots::set_socket(path);
+        cairn_exec::callback_roots::socket()
+            .expect("the socket is named")
+            .display()
+            .to_string()
+    }
+
     pub(crate) async fn attached_orchestrator() -> (Orchestrator, tempfile::TempDir) {
         let (orch, config, _link) = attached_orchestrator_with_link().await;
         (orch, config)

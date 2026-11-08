@@ -54,6 +54,8 @@ mod operator_compact;
 #[cfg(target_os = "linux")]
 mod keychain_runtime;
 mod lane_capabilities;
+#[cfg(unix)]
+mod launch_credentials;
 mod lifecycle_stop;
 mod mcp_attachment_resources;
 mod mcp_change_parity;
