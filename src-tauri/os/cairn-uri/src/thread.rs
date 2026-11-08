@@ -427,7 +427,6 @@ mod tests {
         assert_eq!(resource.kind(), ResourceKind::ThreadDb);
         assert_eq!(resource.to_uri(), "cairn://p/cairn/design-review/db");
         assert_eq!(resource.project(), Some("cairn"));
-        assert_eq!(resource.to_route(), None);
     }
 
     #[test]
@@ -436,7 +435,6 @@ mod tests {
         assert_eq!(resource.kind(), ResourceKind::ThreadDbSchema);
         assert_eq!(resource.to_uri(), "cairn://p/cairn/design-review/db/schema");
         assert_eq!(resource.project(), Some("cairn"));
-        assert_eq!(resource.to_route(), None);
     }
 
     #[test]

@@ -286,6 +286,26 @@ pub async fn ancestry(
     .await
 }
 
+/// Whether `descendant` contains `ancestor`: it is that commit or one of its
+/// descendants. The same answer [`ancestry`] reports as `from_in_to`, without
+/// the fork-point and ahead/behind walks a yes/no question has no use for.
+pub async fn contains(
+    repository_path: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, HistoryError> {
+    let ancestor = ancestor.to_string();
+    let descendant = descendant.to_string();
+    with_repo(repository_path, move |repo| async move {
+        let ancestor = indexed_commit(&repo, &ancestor)?;
+        let descendant = indexed_commit(&repo, &descendant)?;
+        repo.index()
+            .is_ancestor(&ancestor, &descendant)
+            .map_err(repository_error)
+    })
+    .await
+}
+
 /// Count `::include ~ ::exclude`, stopping at `cap`.
 async fn count_exclusive(
     repo: &ReadonlyRepo,

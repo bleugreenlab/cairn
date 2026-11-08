@@ -751,6 +751,11 @@ pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_i
     } else {
         out.push_str("## Subscriptions\n\n");
         for sub in &subscriptions {
+            if let Some(line) = crate::orchestrator::wakes::describe_rebuild_subscription(sub) {
+                out.push_str(&line);
+                out.push('\n');
+                continue;
+            }
             let facts = sub
                 .fact_kinds
                 .as_ref()
@@ -784,7 +789,7 @@ pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_i
         ));
         out.push('\n');
     }
-    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{schedule:{every:\"6h\",reason:\"…\"}}` (thread homes only)\n- append `{condition:{sql:\"SELECT …\",reason:\"…\",once?:true}}` (thread homes only; evaluated after committed `cairn:~/db` writes)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- append `{mute:{kind:\"checks\",ref?}}` — mute this node's checks by default, or the referenced node's checks; verdicts become passive ride-alongs rather than being discarded\n- patch `{unmute:{kind,ref?}}` (including `kind:\"checks\"`)\n- delete `{unsubscribe:{kind,ref?}}`\n");
+    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{schedule:{every:\"6h\",reason:\"…\"}}` (thread homes only)\n- append `{condition:{sql:\"SELECT …\",reason:\"…\",once?:true}}` (thread homes only; evaluated after committed `cairn:~/db` writes)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{subscribe:{kind:\"rebuild\", contains:\"<40-hex commit> | cairn://p/<project>/<issue>\"}}` — one-shot: resume when the runner boots with a build whose source commit contains the target by store ancestry (an issue resolves to its merge commit, waiting for it to merge); fires at once if the current boot already contains it; a build with no recorded source commit never satisfies it\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- append `{mute:{kind:\"checks\",ref?}}` — mute this node's checks by default, or the referenced node's checks; verdicts become passive ride-alongs rather than being discarded\n- patch `{unmute:{kind,ref?}}` (including `kind:\"checks\"`)\n- delete `{unsubscribe:{kind,ref?}}`\n");
     out
 }
 

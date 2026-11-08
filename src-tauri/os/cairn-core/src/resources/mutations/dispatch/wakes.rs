@@ -159,6 +159,11 @@ pub(super) async fn dispatch(
                         *exec_seq, node_id,
                     )
                     .await?
+                } else if filter.kind == "rebuild" {
+                    subscribe_rebuild_wake(
+                        orch, index, item, &job_id, &filter, created_by, dry_run, project,
+                    )
+                    .await?
                 } else if dry_run {
                     format!(
                         "Would subscribe wake: {} {:?}",
@@ -224,7 +229,12 @@ pub(super) async fn dispatch(
                         normalize_posts_filter(
                             index,
                             item,
-                            parse_wake_filter(index, item, value, "mute")?,
+                            normalize_rebuild_filter(
+                                index,
+                                item,
+                                parse_wake_filter(index, item, value, "mute")?,
+                                project,
+                            )?,
                         )?,
                         project,
                         *number,
@@ -355,7 +365,12 @@ pub(super) async fn dispatch(
                     normalize_posts_filter(
                         index,
                         item,
-                        parse_wake_filter(index, item, value, "unmute")?,
+                        normalize_rebuild_filter(
+                            index,
+                            item,
+                            parse_wake_filter(index, item, value, "unmute")?,
+                            project,
+                        )?,
                     )?,
                     project,
                     *number,
@@ -447,7 +462,12 @@ pub(super) async fn dispatch(
                 let filter = normalize_posts_filter(
                     index,
                     item,
-                    parse_wake_filter(index, item, value, "unsubscribe")?,
+                    normalize_rebuild_filter(
+                        index,
+                        item,
+                        parse_wake_filter(index, item, value, "unsubscribe")?,
+                        project,
+                    )?,
                 )?;
                 if dry_run {
                     format!(
@@ -567,6 +587,91 @@ pub(super) fn normalize_posts_filter(
     Ok(filter)
 }
 
+/// Compile the agent-facing `kind:"rebuild"` watch to the `fact` subscription
+/// it is stored as, `{fact: runner_booted, contains, project}`, so mute,
+/// unmute, and unsubscribe address the row subscribe wrote. The target rides in
+/// `contains`; a `ref` is refused rather than read as one.
+fn normalize_rebuild_filter(
+    index: usize,
+    item: &ChangeItem,
+    mut filter: WakeFilterPayload,
+    project: &str,
+) -> ResourceMutationResult<WakeFilterPayload> {
+    if filter.kind != "rebuild" {
+        return Ok(filter);
+    }
+    let clause = rebuild_clause(index, item, &filter, project)?;
+    filter.kind = crate::orchestrator::wakes::SOURCE_KIND_FACT.to_string();
+    filter.reference = Some(
+        clause
+            .clause_ref()
+            .map_err(|error| build_failure(index, item, error))?,
+    );
+    filter.fact_kinds = Some(vec![crate::orchestrator::wakes::RUNNER_BOOTED.to_string()]);
+    Ok(filter)
+}
+
+fn rebuild_clause(
+    index: usize,
+    item: &ChangeItem,
+    filter: &WakeFilterPayload,
+    project: &str,
+) -> ResourceMutationResult<crate::orchestrator::wakes::RebuildClause> {
+    if filter.reference.is_some() {
+        return Err(build_failure(
+            index,
+            item,
+            "a rebuild wake names its target with contains, not ref: {subscribe:{kind:\"rebuild\",contains:\"<40-hex commit> | cairn://p/<project>/<issue>\"}}",
+        ));
+    }
+    let raw = filter.contains.as_deref().ok_or_else(|| {
+        build_failure(
+            index,
+            item,
+            "a rebuild wake requires contains: a full 40-character commit id or an issue URI (cairn://p/<project>/<issue>)",
+        )
+    })?;
+    let target = crate::orchestrator::wakes::RebuildTarget::parse(raw)
+        .map_err(|error| build_failure(index, item, error))?;
+    Ok(crate::orchestrator::wakes::RebuildClause::new(
+        target, project,
+    ))
+}
+
+/// Subscribe a one-shot `kind:"rebuild"` wake: resume this node at the first
+/// runner boot whose source commit contains the target, or now when the
+/// current boot already does.
+#[allow(clippy::too_many_arguments)]
+async fn subscribe_rebuild_wake(
+    orch: &Orchestrator,
+    index: usize,
+    item: &ChangeItem,
+    job_id: &str,
+    filter: &WakeFilterPayload,
+    created_by: &str,
+    dry_run: bool,
+    project: &str,
+) -> ResourceMutationResult<String> {
+    let clause = rebuild_clause(index, item, filter, project)?;
+    if dry_run {
+        return Ok(format!(
+            "Would subscribe rebuild wake: fires once when the runner boots with a build containing {}",
+            clause.target
+        ));
+    }
+    let outcome = crate::orchestrator::wakes::subscribe_rebuild_once(
+        orch,
+        job_id,
+        &clause,
+        created_by,
+        crate::orchestrator::wakes::current_boot(),
+        &crate::orchestrator::wakes::StoreContainment::new(orch),
+    )
+    .await
+    .map_err(|error| build_failure(index, item, error))?;
+    Ok(outcome.describe(&clause))
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct WakeFilterPayload {
     pub(super) kind: String,
@@ -580,6 +685,8 @@ pub(super) struct WakeFilterPayload {
     /// accepting a suite silently would subscribe to something other than what
     /// was asked for.
     pub(super) suite: Option<String>,
+    /// Rebuild subscriptions only: the commit or issue a boot must contain.
+    pub(super) contains: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -775,6 +882,11 @@ pub(super) fn parse_wake_filter(
         .get("suite")
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
+    let contains = obj
+        .get("contains")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
     Ok(WakeFilterPayload {
         kind,
         reference,
@@ -782,6 +894,7 @@ pub(super) fn parse_wake_filter(
         on,
         phrase,
         suite,
+        contains,
     })
 }
 

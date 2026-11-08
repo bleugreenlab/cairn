@@ -254,6 +254,15 @@ const FIXTURES: &[(&str, &[&str])] = &[
         &["range-past-blob on events.turn_id"],
     ),
     (CHAT_TURNS_AFTER_4664, &[]),
+    // The resource-embedding sweep's artifact walk (cairn/6131), byte-for-byte
+    // `embeddings::resources::ARTIFACT_VERSIONS_SQL`: every version, read from
+    // its covering index rather than the wide rows.
+    (
+        "SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at, rowid
+       FROM artifacts INDEXED BY idx_artifacts_embedding_scan
+      WHERE job_id IS NOT NULL",
+        &[],
+    ),
     // Point reads of the widest row in the database.
     ("SELECT snapshot FROM executions WHERE rowid = ?", &[]),
     ("SELECT snapshot FROM executions WHERE id = ?", &[]),

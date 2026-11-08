@@ -41,16 +41,6 @@ kind = "debt"
 issue = "cairn://p/cairn/6130"
 reason = "The rollup's needing-fold read walks every event, inside its write transaction on the second run."
 
-# SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at FRO
-[[allow]]
-file = "os/cairn-core/src/embeddings/resources.rs"
-rule = "wide-scan"
-table = "artifacts"
-statement = "89a3c6a9d16e96e9"
-kind = "debt"
-issue = "cairn://p/cairn/6131"
-reason = "The embedding pass reads every artifact to keep those newer than a bound it applies in Rust."
-
 # SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_jso
 [[allow]]
 file = "os/cairn-core/src/mcp/handlers/durable_suspend.rs"

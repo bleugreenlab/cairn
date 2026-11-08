@@ -2265,3 +2265,337 @@ async fn mute_downgrade_lowers_wake_for_muted_source_only() {
         Wake::Passive
     );
 }
+
+/// The rebuild wake, judged against synthetic boots. Ancestry is answered from
+/// a table here; `cairn_vcs::history::contains` has its own store tests.
+mod rebuild {
+    use super::*;
+    use futures_util::future::BoxFuture;
+    use std::time::Duration;
+
+    const TARGET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const CONTAINING: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const OLDER: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    /// `CONTAINING` contains `TARGET`; nothing else contains anything.
+    struct Graph;
+
+    impl Containment for Graph {
+        fn contains<'a>(
+            &'a self,
+            _project: &'a str,
+            target_commit: &'a str,
+            boot_commit: &'a str,
+        ) -> BoxFuture<'a, Result<bool, String>> {
+            let answer = target_commit == boot_commit
+                || (target_commit == TARGET && boot_commit == CONTAINING);
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    fn boot(source_commit: Option<&str>) -> RunnerBoot {
+        RunnerBoot {
+            booted_at: 1_800_000_000,
+            version: "0.13.9".to_string(),
+            build_id: "content-v2:test".to_string(),
+            source_commit: source_commit.map(str::to_string),
+        }
+    }
+
+    fn commit_clause() -> RebuildClause {
+        RebuildClause::new(RebuildTarget::parse(TARGET).unwrap(), "p")
+    }
+
+    async fn pass(orch: &Orchestrator, commit: Option<&str>) -> RebuildPass {
+        evaluate_rebuild_wakes(orch, &boot(commit), &Graph, Duration::ZERO)
+            .await
+            .unwrap()
+    }
+
+    async fn armed(orch: &Orchestrator, job_id: &str) -> usize {
+        list_subscriptions_for_job(&orch.db.local, job_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|subscription| RebuildClause::from_subscription(subscription).is_some())
+            .count()
+    }
+
+    async fn delivered(orch: &Orchestrator, run_id: &str) -> Vec<String> {
+        orch.db
+            .local
+            .query_all(
+                "SELECT content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+                params![run_id],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn queueable_orchestrator(db: LocalDb) -> Orchestrator {
+        test_orchestrator_with_services(
+            db,
+            TestServicesBuilder::new()
+                .with_process(RecordingProcessSpawner::new())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn a_target_is_a_full_commit_or_an_issue_and_nothing_else() {
+        assert_eq!(
+            RebuildTarget::parse(&TARGET.to_ascii_uppercase()).unwrap(),
+            RebuildTarget::Commit(TARGET.to_string()),
+            "a commit id is stored lowercase"
+        );
+        assert_eq!(
+            RebuildTarget::parse("cairn://p/cairn/6158").unwrap(),
+            RebuildTarget::Issue {
+                project: "cairn".to_string(),
+                number: 6158
+            }
+        );
+        for refused in ["abc123", "main", "cairn://p/cairn/6158/1/builder", ""] {
+            assert!(
+                RebuildTarget::parse(refused).is_err(),
+                "{refused:?} is not a target"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_stored_clause_reads_back_and_renders_with_its_target() {
+        let db = migrated_db().await;
+        let fixture = seed_queueable_node(&db).await;
+        let orch = queueable_orchestrator(db);
+        subscribe_rebuild_once(
+            &orch,
+            fixture.job_id,
+            &commit_clause(),
+            "agent",
+            None,
+            &Graph,
+        )
+        .await
+        .unwrap();
+        let subscriptions = list_subscriptions_for_job(&orch.db.local, fixture.job_id)
+            .await
+            .unwrap();
+        let row = subscriptions
+            .iter()
+            .find(|subscription| subscription.source_kind == SOURCE_KIND_FACT)
+            .expect("a rebuild wake is a fact subscription");
+        assert!(row.one_shot);
+        assert_eq!(RebuildClause::from_subscription(row), Some(commit_clause()));
+        let line = describe_rebuild_subscription(row).unwrap();
+        assert!(
+            line.contains(&format!("rebuild contains `{TARGET}`")),
+            "{line}"
+        );
+        assert!(line.contains("waiting"), "{line}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fires_once_on_the_first_boot_that_contains_the_target_and_never_on_unknown() {
+        let db = migrated_db().await;
+        let fixture = seed_queueable_node(&db).await;
+        let orch = queueable_orchestrator(db);
+        let outcome = subscribe_rebuild_once(
+            &orch,
+            fixture.job_id,
+            &commit_clause(),
+            "agent",
+            Some(&boot(Some(OLDER))),
+            &Graph,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            RebuildSubscribeOutcome::Waiting(RebuildWait::NotContained {
+                boot_commit: OLDER.to_string()
+            })
+        );
+
+        assert_eq!(
+            pass(&orch, None).await,
+            RebuildPass {
+                waiting: 1,
+                ..RebuildPass::default()
+            },
+            "a boot whose commit is unknown satisfies nothing"
+        );
+        assert_eq!(
+            pass(&orch, Some(OLDER)).await,
+            RebuildPass {
+                waiting: 1,
+                ..RebuildPass::default()
+            },
+            "a boot that does not contain the target leaves it waiting"
+        );
+        assert!(delivered(&orch, fixture.run_id).await.is_empty());
+        assert_eq!(armed(&orch, fixture.job_id).await, 1);
+
+        assert_eq!(
+            pass(&orch, Some(CONTAINING)).await,
+            RebuildPass {
+                delivered: 1,
+                ..RebuildPass::default()
+            }
+        );
+        let messages = delivered(&orch, fixture.run_id).await;
+        assert_eq!(messages.len(), 1);
+        for fact in [
+            "booted with a build that contains",
+            TARGET,
+            CONTAINING,
+            "0.13.9",
+            "content-v2:test",
+        ] {
+            assert!(
+                messages[0].contains(fact),
+                "{fact} missing: {}",
+                messages[0]
+            );
+        }
+        assert_eq!(armed(&orch, fixture.job_id).await, 0, "firing spends it");
+
+        assert_eq!(pass(&orch, Some(CONTAINING)).await, RebuildPass::default());
+        assert_eq!(
+            delivered(&orch, fixture.run_id).await.len(),
+            1,
+            "a later containing boot does not fire it again"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fires_at_once_when_the_current_boot_already_contains_the_target() {
+        let db = migrated_db().await;
+        let fixture = seed_queueable_node(&db).await;
+        let orch = queueable_orchestrator(db);
+        let outcome = subscribe_rebuild_once(
+            &orch,
+            fixture.job_id,
+            &commit_clause(),
+            "agent",
+            Some(&boot(Some(CONTAINING))),
+            &Graph,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, RebuildSubscribeOutcome::FiredNow);
+        let messages = delivered(&orch, fixture.run_id).await;
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].contains("current boot already contains")
+                && messages[0].contains("fired at once"),
+            "the wake says why it fired without a rebuild: {}",
+            messages[0]
+        );
+        assert_eq!(armed(&orch, fixture.job_id).await, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_issue_target_waits_for_its_merge_then_resolves_through_the_merge_commit() {
+        let db = migrated_db().await;
+        let fixture = seed_queueable_node(&db).await;
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES('i2','p',2,'Target','active','active','none',1,1);",
+        )
+        .await
+        .unwrap();
+        let orch = queueable_orchestrator(db);
+
+        let missing = RebuildClause::new(RebuildTarget::parse("cairn://p/p/99").unwrap(), "p");
+        assert!(
+            subscribe_rebuild_once(&orch, fixture.job_id, &missing, "agent", None, &Graph)
+                .await
+                .is_err(),
+            "an issue that does not exist is refused, not waited on forever"
+        );
+
+        let clause = RebuildClause::new(RebuildTarget::parse("cairn://p/p/2").unwrap(), "other");
+        assert_eq!(clause.project, "p", "an issue's own project answers");
+        let outcome = subscribe_rebuild_once(
+            &orch,
+            fixture.job_id,
+            &clause,
+            "agent",
+            Some(&boot(Some(CONTAINING))),
+            &Graph,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            RebuildSubscribeOutcome::Waiting(RebuildWait::IssueNotMerged),
+            "a not-yet-merged issue is accepted and waits"
+        );
+
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                                            target_branch, status, opened_at, updated_at,
+                                            merged_commit, merged_at)
+                 VALUES ('mr', 'j', 'p', 'i2', 'Target', 'agent/b', 'main', 'merged', 1, 5, ?1, 5)",
+                params![TARGET],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pass(&orch, Some(OLDER)).await.waiting,
+            1,
+            "merged, but this boot does not contain the merge commit"
+        );
+        assert_eq!(pass(&orch, Some(CONTAINING)).await.delivered, 1);
+        let messages = delivered(&orch, fixture.run_id).await;
+        assert!(
+            messages[0].contains(&format!("cairn://p/p/2 (merged as `{TARGET}`)")),
+            "{}",
+            messages[0]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_thread_takes_none_and_keeps_its_wake_armed() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','P','P','/tmp',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES('thread','p','general','active','none',1,1);",
+        )
+        .await
+        .unwrap();
+        let job_id = crate::threads::ensure_thread_session(&db, "thread")
+            .await
+            .unwrap();
+        let orch = queueable_orchestrator(db);
+        subscribe_rebuild_once(&orch, &job_id, &commit_clause(), "agent", None, &Graph)
+            .await
+            .unwrap();
+
+        set_thread_status(&orch.db.local, "closed").await;
+        assert_eq!(
+            pass(&orch, Some(CONTAINING)).await,
+            RebuildPass {
+                held: 1,
+                ..RebuildPass::default()
+            },
+            "a closed thread is not a deliverable recipient"
+        );
+        assert_eq!(
+            armed(&orch, &job_id).await,
+            1,
+            "and the drop spends nothing"
+        );
+
+        set_thread_status(&orch.db.local, "active").await;
+        assert_eq!(pass(&orch, Some(CONTAINING)).await.delivered, 1);
+        assert_eq!(armed(&orch, &job_id).await, 0);
+    }
+}

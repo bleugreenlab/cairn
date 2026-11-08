@@ -3758,6 +3758,10 @@ impl Orchestrator {
             // services started at boot (`spawn_services_boot`).
             crate::project_services::supervisor::start_project_launch_services(&orch).await;
             crate::orchestrator::base_branch_sync::spawn_base_branch_poll(&orch);
+            // After the catch-up, so the store holds the commit this build came
+            // from and the ancestry read can answer. Last, and paced, because
+            // each delivery can launch a thread's turn.
+            crate::orchestrator::wakes::evaluate_pending_rebuild_wakes(&orch).await;
         });
     }
 

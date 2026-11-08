@@ -141,6 +141,20 @@ async fn ancestry_reports_fork_point_containment_and_both_counts() {
 }
 
 #[tokio::test]
+async fn contains_agrees_with_ancestry_and_refuses_an_unknown_commit() {
+    let f = fixture().await;
+    assert!(contains(f.dir.path(), &f.f2, &f.merge).await.unwrap());
+    assert!(contains(f.dir.path(), &f.merge, &f.merge).await.unwrap());
+    assert!(!contains(f.dir.path(), &f.merge, &f.f2).await.unwrap());
+    assert!(!contains(f.dir.path(), &f.c2, &f.f2).await.unwrap());
+    let unknown = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(
+        contains(f.dir.path(), unknown, &f.merge).await,
+        Err(HistoryError::UnknownCommit(unknown.to_string()))
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_commit_is_an_error_not_a_panic() {
     let f = fixture().await;
     let unknown = "0123456789abcdef0123456789abcdef01234567";

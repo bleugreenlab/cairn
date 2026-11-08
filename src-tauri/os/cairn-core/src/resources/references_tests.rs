@@ -185,7 +185,7 @@ async fn previews_name_the_issue_node_thread_and_comment_in_one_line() {
             ReferenceEntry::Preview {
                 uri: "cairn://p/proj/execution".into(),
                 resource: "thread".into(),
-                title: "execution".into(),
+                title: "proj/execution".into(),
                 status: Some("active".into()),
                 line: Some("Where work physically runs.".into()),
                 at: Some(80),

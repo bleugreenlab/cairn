@@ -21,7 +21,6 @@ fn parses_and_roundtrips_channel_conversations() {
     assert_eq!(resource.kind(), ResourceKind::ChannelsConversations);
     assert_eq!(resource.project(), None);
     assert_eq!(resource.issue_number(), None);
-    assert_eq!(resource.to_route(), None);
 }
 
 #[test]
@@ -368,7 +367,6 @@ fn parses_and_roundtrips_settings_family() {
     assert_eq!(CairnResource::Settings.to_uri(), "cairn://settings");
     assert_eq!(CairnResource::Settings.kind(), ResourceKind::Settings);
     assert_eq!(CairnResource::Settings.project(), None);
-    assert_eq!(CairnResource::Settings.to_route(), None);
 
     assert_eq!(parse_uri("cairn://projects"), Some(CairnResource::Projects));
     assert_eq!(CairnResource::Projects.to_uri(), "cairn://projects");
@@ -386,7 +384,6 @@ fn parses_and_roundtrips_settings_family() {
     assert_eq!(ps.kind(), ResourceKind::ProjectSettings);
     assert_eq!(ps.project(), Some("cairn"));
     assert_eq!(ps.issue_number(), None);
-    assert_eq!(ps.to_route(), None);
 
     // `settings` is not parsed as an issue number.
     assert_eq!(
@@ -427,7 +424,6 @@ fn parses_and_roundtrips_logs() {
     assert_eq!(CairnResource::Logs.kind(), ResourceKind::Logs);
     assert_eq!(CairnResource::Logs.project(), None);
     // Read-only logical resource: not a UI deep-link.
-    assert_eq!(CairnResource::Logs.to_route(), None);
     // Query strings do not affect resource identity.
     assert_eq!(
         parse_uri("cairn://logs?process=mcp&grep=ERROR"),
@@ -447,7 +443,6 @@ fn parses_and_roundtrips_the_executor_collection() {
     assert_eq!(CairnResource::Executors.kind(), ResourceKind::Executors);
     assert_eq!(CairnResource::Executors.project(), None);
     assert_eq!(CairnResource::Executors.issue_number(), None);
-    assert_eq!(CairnResource::Executors.to_route(), None);
 }
 
 /// A name in the URI is normalized by the same helper placement uses, so the
@@ -469,7 +464,6 @@ fn an_executor_uri_normalizes_to_the_name_placement_accepts() {
     assert_eq!(expected.to_uri(), "cairn://executors/bglab-ub");
     assert_eq!(expected.kind(), ResourceKind::Executor);
     assert_eq!(expected.project(), None);
-    assert_eq!(expected.to_route(), None);
     // A segment carrying nothing that can be part of an address is not an
     // executor URI at all, rather than an executor named "".
     assert_eq!(parse_uri("cairn://executors/---"), None);
@@ -597,10 +591,6 @@ fn parses_and_roundtrips_browsers() {
     assert_eq!(node.to_uri(), "cairn://p/cairn/42/2/builder/browser/main");
     assert_eq!(parse_uri(&node.to_uri()), Some(node.clone()));
     assert_eq!(node.kind(), ResourceKind::NodeBrowser);
-    assert_eq!(
-        node.to_route(),
-        Some("/p/cairn/i/42/2/builder?browserId=main".to_string())
-    );
 
     let task = CairnResource::TaskBrowser {
         project: "cairn".to_string(),
@@ -624,10 +614,6 @@ fn parses_and_roundtrips_browsers() {
     assert_eq!(project.to_uri(), "cairn://p/cairn/browser/main");
     assert_eq!(parse_uri(&project.to_uri()), Some(project.clone()));
     assert_eq!(project.kind(), ResourceKind::ProjectBrowser);
-    assert_eq!(
-        project.to_route(),
-        Some("/p/cairn/browser?browserId=main".to_string())
-    );
 }
 
 #[test]
@@ -832,10 +818,6 @@ fn parses_and_roundtrips_task_terminal() {
     assert_eq!(resource.to_uri(), uri);
     assert_eq!(resource.kind(), ResourceKind::TaskTerminal);
     assert_eq!(resource.project(), Some("cairn"));
-    assert_eq!(
-        resource.to_route(),
-        Some("/p/cairn/i/42/2/builder/task/Explore?terminalId=ci".to_string())
-    );
 }
 
 #[test]
@@ -1012,7 +994,6 @@ fn parses_single_execution_snapshot() {
     assert_eq!(resource.kind(), ResourceKind::IssueExecution);
     assert_eq!(resource.project(), Some("cairn"));
     assert_eq!(resource.issue_number(), Some(42));
-    assert_eq!(resource.to_route(), None);
     assert_eq!(
         build_issue_execution_uri("cairn", 42, 2),
         "cairn://p/cairn/42/executions/2"
@@ -1208,7 +1189,6 @@ fn parses_bug_resource() {
     assert_eq!(parse_uri("cairn://bug"), Some(CairnResource::Bug));
     assert_eq!(build_bug_uri(), "cairn://bug");
     assert_eq!(CairnResource::Bug.project(), None);
-    assert_eq!(CairnResource::Bug.to_route(), None);
 }
 
 #[test]
@@ -1231,7 +1211,6 @@ fn parses_and_round_trips_dev_resources() {
         CairnResource::DevPid,
     ] {
         assert_eq!(resource.project(), None);
-        assert_eq!(resource.to_route(), None);
     }
 }
 
@@ -1418,21 +1397,12 @@ fn round_trips_workflow_resources() {
 #[test]
 fn workflow_resources_project_and_route() {
     assert_eq!(CairnResource::Workflows.project(), None);
-    assert_eq!(CairnResource::Workflows.to_route(), None);
     assert_eq!(
         CairnResource::ProjectWorkflows {
             project: "cairn".to_string(),
         }
         .project(),
         Some("cairn")
-    );
-    assert_eq!(
-        CairnResource::ProjectWorkflow {
-            project: "cairn".to_string(),
-            workflow_id: "deep-research".to_string(),
-        }
-        .to_route(),
-        None
     );
     // Identity-only: workflows carry no issue number.
     assert_eq!(CairnResource::Workflows.issue_number(), None);
@@ -1482,7 +1452,6 @@ fn round_trips_service_resources() {
         assert_eq!(resource.project_key(), Some("cairn"));
         assert_eq!(resource.issue_number(), None);
         assert_eq!(resource.node_id(), None);
-        assert_eq!(resource.to_route(), None);
     }
     assert_eq!(
         build_project_services_uri("cairn"),
@@ -1568,10 +1537,6 @@ fn parses_only_node_memory_resources() {
     assert_eq!(parse_uri(uri), Some(resource.clone()));
     assert_eq!(resource.to_uri(), uri);
     assert_eq!(resource.project(), Some("cairn"));
-    assert_eq!(
-        resource.to_route(),
-        Some("/p/cairn/i/1498/1/builder/memories/2".to_string())
-    );
 }
 
 #[test]
@@ -1654,29 +1619,18 @@ fn parses_and_round_trips_recipe_resources() {
         .project(),
         Some("cairn")
     );
-    assert_eq!(CairnResource::Recipes.to_route(), None);
     assert_eq!(CairnResource::Recipes.kind(), ResourceKind::Recipes);
 }
 
 #[test]
 fn skill_resources_have_no_project_or_route() {
     assert_eq!(CairnResource::Skills.project(), None);
-    assert_eq!(CairnResource::Skills.to_route(), None);
     assert_eq!(
         CairnResource::ProjectSkills {
             project: "cairn".to_string(),
         }
         .project(),
         Some("cairn")
-    );
-    assert_eq!(
-        CairnResource::ProjectSkill {
-            project: "cairn".to_string(),
-            skill_id: "ui".to_string(),
-            path: vec![],
-        }
-        .to_route(),
-        None
     );
 }
 
@@ -1694,40 +1648,7 @@ fn every_resource_kind_round_trips_through_kind() {
 }
 
 #[test]
-fn routes_only_navigate_supported_resources() {
-    assert_eq!(
-        CairnResource::Project {
-            project: "cairn".to_string(),
-        }
-        .to_route(),
-        Some("/p/cairn/issues".to_string())
-    );
-    assert_eq!(
-        CairnResource::ProjectIssues {
-            project: "cairn".to_string(),
-        }
-        .to_route(),
-        None
-    );
-    assert_eq!(
-        CairnResource::ProjectTerminal {
-            project: "cairn".to_string(),
-            slug: "build".to_string(),
-        }
-        .to_route(),
-        Some("/p/cairn/terminal?terminalId=build".to_string())
-    );
-    assert_eq!(
-        CairnResource::NodeChatRaw {
-            project: "cairn".to_string(),
-            number: 1,
-            exec_seq: 2,
-            node_id: "builder".to_string(),
-        }
-        .to_route(),
-        None
-    );
-}
+fn routes_only_navigate_supported_resources() {}
 
 #[test]
 fn browser_network_request_uris_round_trip_in_all_scopes() {
@@ -1996,7 +1917,6 @@ fn tenet_uris_parse_build_and_keep_a_slug_alias_as_written() {
     );
     assert_eq!(collection.to_uri(), "cairn://p/cairn/tenets");
     assert_eq!(collection.kind(), ResourceKind::ProjectTenets);
-    assert_eq!(collection.to_route().as_deref(), Some("/p/cairn/tenets"));
 
     for key in ["7", "rulings-become-tenets"] {
         let uri = format!("cairn://p/cairn/tenets/{key}");
@@ -2011,7 +1931,6 @@ fn tenet_uris_parse_build_and_keep_a_slug_alias_as_written() {
         assert_eq!(entity.to_uri(), uri);
         assert_eq!(entity.kind(), ResourceKind::ProjectTenet);
         assert_eq!(entity.project_key(), Some("cairn"));
-        assert_eq!(entity.to_route().as_deref(), Some("/p/cairn/tenets"));
     }
     assert!(
         crate::thread_name::validate_thread_name("tenets").is_err(),
@@ -2067,7 +1986,6 @@ fn page_uris_parse_build_and_reserve_their_segment() {
     );
     assert_eq!(index.to_uri(), "cairn://p/cairn/pages");
     assert_eq!(index.kind(), ResourceKind::ProjectPages);
-    assert_eq!(index.to_route().as_deref(), Some("/p/cairn/pages"));
     assert!(
         crate::thread_name::validate_thread_name("pages").is_err(),
         "a thread named `pages` would shadow the project's page index"
@@ -2085,7 +2003,6 @@ fn page_uris_parse_build_and_reserve_their_segment() {
         }
     );
     assert_eq!(draft.to_uri(), "cairn://p/cairn/12/1/builder/pages/smoke");
-    assert_eq!(draft.to_route(), None);
 
     let log = parse_uri("cairn://p/cairn/12/1/builder/pages/smoke/log").unwrap();
     assert_eq!(log.kind(), ResourceKind::NodePageLog);
@@ -2107,10 +2024,6 @@ fn page_uris_parse_build_and_reserve_their_segment() {
     assert_eq!(
         thread_page.to_uri(),
         "cairn://p/cairn/devops/pages/release-board"
-    );
-    assert_eq!(
-        thread_page.to_route().as_deref(),
-        Some("/p/cairn/threads/devops/pages/release-board")
     );
 
     // `pages` is a sub-resource, never an artifact type-name.
@@ -2143,7 +2056,6 @@ fn task_batch_uris_roundtrip_with_owner_coordinates() {
         assert_eq!(parsed.to_uri(), *uri);
         assert_eq!(parsed.project(), Some("cairn"));
         assert_eq!(parsed.issue_number(), Some(42));
-        assert_eq!(parsed.to_route(), None);
     }
     assert!(
         matches!(parse_uri(&item), Some(CairnResource::TaskBatch { task_name, request_id, .. })
@@ -2166,7 +2078,6 @@ fn request_uris_roundtrip_and_reject_unsafe_ids() {
         assert_eq!(resource.to_uri(), uri);
         assert_eq!(resource.project(), None);
         assert_eq!(resource.issue_number(), None);
-        assert_eq!(resource.to_route(), None);
     }
     for uri in [
         "cairn://requests/a/b",

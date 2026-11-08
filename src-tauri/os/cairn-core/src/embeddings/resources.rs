@@ -413,40 +413,60 @@ impl Walk {
     }
 }
 
-/// The latest version of every artifact created at or after `since`, newest
-/// first. Selected here rather than in SQL: `artifacts` has no index that
-/// would let a correlated "latest" test run per row cheaply, and the columns
-/// read are small.
+/// Every job-bound artifact version, read wholly from the covering index
+/// `idx_artifacts_embedding_scan` (named, so a plan that reads the wide table
+/// rows cannot return silently). `storage::migrations` pins this text's plan
+/// and bytecode on both lineages, and the `latest_artifacts_*` tests here pin
+/// it on the private one.
+const ARTIFACT_VERSIONS_SQL: &str =
+    "SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at, rowid
+       FROM artifacts INDEXED BY idx_artifacts_embedding_scan
+      WHERE job_id IS NOT NULL";
+
+/// The head of every artifact chain, keyed by job and
+/// `COALESCE(output_name, artifact_type)`, that was created at or after
+/// `since`, newest first.
+///
+/// The head is chosen over all history and only then tested against `since`:
+/// a chain whose highest version predates the boundary contributes nothing,
+/// even if a lower version was written after it. Picking heads in Rust over
+/// one index-only walk is cheaper on this engine than a correlated "no higher
+/// version" probe per row, which fetches table columns for each outer row.
+/// Equal versions go to the lower rowid whatever order the index yields them
+/// in; rowid is only this database's tie-break, not an artifact identity.
 async fn latest_artifacts(db: &LocalDb, since: i64) -> DbResult<Vec<String>> {
     let rows = db
-        .query_all(
-            "SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at
-               FROM artifacts WHERE job_id IS NOT NULL",
-            (),
-            |row| {
-                Ok((
-                    row.text(0)?,
-                    row.text(1)?,
-                    row.text(2)?,
-                    row.i64(3)?,
-                    row.i64(4)?,
-                ))
-            },
-        )
+        .query_all(ARTIFACT_VERSIONS_SQL, (), |row| {
+            Ok((
+                row.text(0)?,
+                row.text(1)?,
+                row.text(2)?,
+                row.i64(3)?,
+                row.i64(4)?,
+                row.i64(5)?,
+            ))
+        })
         .await?;
-    let mut latest: HashMap<(String, String), (i64, i64, String)> = HashMap::new();
-    for (id, job_id, name, version, created_at) in rows {
-        let entry = latest
-            .entry((job_id, name))
-            .or_insert((version, created_at, id.clone()));
-        if version > entry.0 {
-            *entry = (version, created_at, id);
+    // (version, rowid, created_at, id) of each chain's head so far.
+    let mut latest: HashMap<(String, String), (i64, i64, i64, String)> = HashMap::new();
+    for (id, job_id, name, version, created_at, rowid) in rows {
+        let candidate = (version, rowid, created_at, id);
+        match latest.entry((job_id, name)) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let head = slot.get();
+                if (version, std::cmp::Reverse(rowid)) > (head.0, std::cmp::Reverse(head.1)) {
+                    slot.insert(candidate);
+                }
+            }
         }
     }
     let mut kept: Vec<(i64, String)> = latest
         .into_values()
-        .filter(|(_, created_at, _)| *created_at >= since)
-        .map(|(_, created_at, id)| (created_at, id))
+        .filter(|(_, _, created_at, _)| *created_at >= since)
+        .map(|(_, _, created_at, id)| (created_at, id))
         .collect();
     kept.sort_by(|a, b| b.cmp(a));
     Ok(kept.into_iter().map(|(_, id)| id).collect())
@@ -1069,6 +1089,131 @@ mod tests {
         assert_eq!(
             keeper.resource_progress().map(|p| (p.embedded, p.eligible)),
             Some((6, 6))
+        );
+    }
+
+    /// `corpus` plus a second job and the chains `latest_artifacts` has to
+    /// tell apart. Rows are inserted in this order, so each later row has a
+    /// larger rowid.
+    async fn chains(name: &str) -> Arc<LocalDb> {
+        let db = corpus(name).await;
+        db.execute_script(
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+               VALUES ('job-b', 'exec-main', 'issue-main', 'project-1', 'running', 'other', 'other', 1, 1);
+             INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, created_at, updated_at)
+               VALUES
+                 -- An old higher version suppresses a recent lower one.
+                 ('doc-v3', 'job-main', 'doc', '{}', 3, 'doc', 100, 100),
+                 ('doc-v1', 'job-main', 'doc', '{}', 1, 'doc', 400, 400),
+                 -- Exactly at the bound.
+                 ('edge', 'job-main', 'edge', '{}', 1, 'edge', 300, 300),
+                 -- A NULL name falls back to the type and joins the chain of
+                 -- that name on another type; an empty name is its own chain.
+                 ('note-null', 'job-main', 'note', '{}', 1, NULL, 310, 310),
+                 ('note-other-type', 'job-main', 'other', '{}', 2, 'note', 305, 305),
+                 ('note-empty', 'job-main', 'note', '{}', 1, '', 320, 320),
+                 -- The same name on another job is another chain.
+                 ('b-plan', 'job-b', 'plan', '{}', 1, 'plan', 330, 330),
+                 -- Two heads at one instant order by id, descending.
+                 ('tie-1', 'job-b', 'tie', '{}', 1, 'tie-a', 340, 340),
+                 ('tie-2', 'job-b', 'tie', '{}', 1, 'tie-b', 340, 340),
+                 -- Two rows hold the highest version. The first inserted
+                 -- (lower rowid) is the newer, so the index, which leads
+                 -- with created_at, yields it last.
+                 ('dup-first', 'job-b', 'dup', '{}', 2, 'dup', 600, 600),
+                 ('dup-second', 'job-b', 'dup', '{}', 2, 'dup', 350, 350),
+                 ('dup-old', 'job-b', 'dup', '{}', 1, 'dup', 700, 700),
+                 -- Not job-bound: never a target.
+                 ('orphan', NULL, 'plan', '{}', 9, 'plan', 800, 800);",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn latest_artifacts_picks_each_chains_head_before_applying_the_bound() {
+        let db = chains("resources-latest-unbounded.db").await;
+        assert_eq!(
+            latest_artifacts(&db, i64::MIN).await.unwrap(),
+            [
+                "dup-first",
+                "tie-2",
+                "tie-1",
+                "b-plan",
+                "note-empty",
+                "note-other-type",
+                "edge",
+                "a3",
+                "a2",
+                "doc-v3",
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn latest_artifacts_bounds_heads_inclusively_and_never_promotes_a_lower_version() {
+        let db = chains("resources-latest-bounded.db").await;
+        assert_eq!(
+            latest_artifacts(&db, 300).await.unwrap(),
+            [
+                "dup-first",
+                "tie-2",
+                "tie-1",
+                "b-plan",
+                "note-empty",
+                "note-other-type",
+                "edge",
+            ],
+            "doc-v1 is after the bound but doc-v3 heads its chain; dup-second \
+             ties dup-first's version and loses on rowid"
+        );
+        assert_eq!(
+            latest_artifacts(&db, 500).await.unwrap(),
+            ["dup-first"],
+            "the duplicate head kept is the lower rowid, created at 600, not \
+             dup-second at 350 that the index yields first"
+        );
+    }
+
+    /// The walk reads index entries only: no cursor on the `artifacts` table,
+    /// no seek from an index entry into it, no sorter.
+    #[tokio::test(flavor = "current_thread")]
+    async fn latest_artifacts_reads_only_its_covering_index() {
+        let db = corpus("resources-latest-plan.db").await;
+        let plan = db
+            .query_all(
+                format!("EXPLAIN QUERY PLAN {ARTIFACT_VERSIONS_SQL}"),
+                (),
+                |row| row.text(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            plan,
+            ["SCAN artifacts USING COVERING INDEX idx_artifacts_embedding_scan"]
+        );
+        let program = db
+            .query_all(format!("EXPLAIN {ARTIFACT_VERSIONS_SQL}"), (), |row| {
+                Ok((row.text(1)?, row.text(7)?))
+            })
+            .await
+            .unwrap();
+        let opens: Vec<&str> = program
+            .iter()
+            .filter(|(opcode, _)| opcode == "OpenRead")
+            .map(|(_, comment)| comment.as_str())
+            .collect();
+        assert!(
+            opens.len() == 1 && opens[0].starts_with("index=idx_artifacts_embedding_scan"),
+            "only the covering index is opened: {program:#?}"
+        );
+        assert!(
+            !program.iter().any(|(opcode, _)| matches!(
+                opcode.as_str(),
+                "DeferredSeek" | "SeekRowid" | "NotExists" | "SorterOpen"
+            )),
+            "no table seek and no sort: {program:#?}"
         );
     }
 

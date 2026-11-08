@@ -5586,6 +5586,84 @@ mod tests {
         );
     }
 
+    /// The resource-embedding sweep's artifact walk reads only
+    /// `idx_artifacts_embedding_scan`, on both lineages and on a database
+    /// upgraded to it. The statement is byte-for-byte
+    /// `embeddings::resources::ARTIFACT_VERSIONS_SQL`. A plan line saying
+    /// `COVERING INDEX` is not enough on its own: the bytecode must open no
+    /// cursor on `artifacts` and never seek from an index entry into the table.
+    #[tokio::test]
+    async fn the_artifact_embedding_walk_reads_only_its_covering_index() {
+        const ARTIFACT_VERSIONS: &str =
+            "SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at, rowid
+       FROM artifacts INDEXED BY idx_artifacts_embedding_scan
+      WHERE job_id IS NOT NULL";
+        const INDEX: &str = "idx_artifacts_embedding_scan";
+        const MIGRATION: &str = "index_artifacts_embedding_scan";
+
+        async fn assert_index_only(db: &LocalDb, lineage: &str) {
+            assert_eq!(
+                explain_plan(db, ARTIFACT_VERSIONS).await,
+                [format!("SCAN artifacts USING COVERING INDEX {INDEX}")],
+                "{lineage}"
+            );
+            let program = db
+                .query_all(format!("EXPLAIN {ARTIFACT_VERSIONS}"), (), |row| {
+                    Ok((row.text(1)?, row.text(7)?))
+                })
+                .await
+                .unwrap();
+            let opens: Vec<&str> = program
+                .iter()
+                .filter(|(opcode, _)| opcode == "OpenRead")
+                .map(|(_, comment)| comment.as_str())
+                .collect();
+            assert!(
+                opens.len() == 1 && opens[0].starts_with(&format!("index={INDEX}")),
+                "{lineage}: only the covering index is opened: {program:#?}"
+            );
+            assert!(
+                !program.iter().any(|(opcode, _)| matches!(
+                    opcode.as_str(),
+                    "DeferredSeek" | "SeekRowid" | "NotExists" | "SorterOpen"
+                )),
+                "{lineage}: no table seek and no sort: {program:#?}"
+            );
+            // And it runs: the index answers the statement it was named for.
+            db.query_all(ARTIFACT_VERSIONS, (), |row| row.text(0))
+                .await
+                .unwrap();
+        }
+
+        let private = migrated_db().await.unwrap();
+        assert_index_only(&private, "private").await;
+        let (_team_temp, team) = migrated_team_db().await;
+        assert_index_only(&team, "team").await;
+
+        for (lineage, migrations) in [
+            ("private", TURSO_MIGRATIONS.to_vec()),
+            ("team", TEAM_MIGRATIONS.to_vec()),
+        ] {
+            let temp = tempdir().unwrap();
+            let db = LocalDb::open(temp.path().join("artifact-embedding-scan.turso.db"))
+                .await
+                .unwrap();
+            let before = migrations
+                .iter()
+                .take_while(|migration| migration.name() != MIGRATION)
+                .copied()
+                .collect::<Vec<_>>();
+            assert!(
+                before.len() < migrations.len(),
+                "{lineage} carries {MIGRATION}"
+            );
+            MigrationRunner::new(before).run(&db).await.unwrap();
+            assert_eq!(index_sql(&db, INDEX).await, None, "{lineage}");
+            MigrationRunner::new(migrations).run(&db).await.unwrap();
+            assert_index_only(&db, &format!("{lineage} upgraded")).await;
+        }
+    }
+
     /// Deleting an event runs the `message_streams.final_event_id` foreign-key
     /// action (`ON DELETE SET NULL`), which Turso compiles into a subprogram.
     /// `EXPLAIN` lists every subprogram's opcodes after the delete's own, so the

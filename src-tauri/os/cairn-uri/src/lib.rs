@@ -9,7 +9,11 @@
 //! - `types`: the `CairnResource` enum, the scheme constants, and `kind()`.
 //! - `kind`: [`ResourceKind`], the data-free discriminant, and its slug.
 //! - `accessors`: the field projections (`project`, `issue_number`, `node_id`,
-//!   `project_key`, `to_route`).
+//!   `project_key`).
+//! - `label`: [`CairnResource::label`], the condensed text an address renders
+//!   as wherever it is cited.
+//! - `surface`: [`CairnResource::surface`], the kind of view an address opens
+//!   in the app ([`Surface`]); the frontend owns the routes.
 //! - `build`: the `build_*` constructors and `to_uri()`.
 //! - `parse`: [`parse_uri`].
 //! - `thread`: [`delegate_thread_descendant`], the one reader of thread
@@ -28,11 +32,13 @@ mod accessors;
 mod build;
 mod executor_name;
 mod kind;
+mod label;
 mod parse;
 pub mod percent;
 mod relative;
 pub mod samples;
 mod scan;
+mod surface;
 mod thread;
 pub mod thread_name;
 mod types;
@@ -40,9 +46,11 @@ mod types;
 pub use build::*;
 pub use executor_name::normalize_executor_name;
 pub use kind::ResourceKind;
+pub use label::LabelContext;
 pub use parse::*;
 pub use relative::*;
 pub use scan::*;
+pub use surface::Surface;
 pub use thread::*;
 pub use types::*;
 

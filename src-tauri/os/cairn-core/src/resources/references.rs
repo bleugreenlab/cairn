@@ -21,7 +21,7 @@ use cairn_common::references::{
     without_references_block, ReferenceEntry, References, MAX_REFERENCE_ENTRIES,
 };
 use cairn_db::turso::params;
-use cairn_uri::{canonical_project, parse_uri, CairnResource};
+use cairn_uri::{canonical_project, parse_uri, CairnResource, LabelContext};
 use futures_util::{stream, StreamExt};
 
 use super::common::{
@@ -95,6 +95,7 @@ pub async fn resolve_reference(orch: &Orchestrator, uri: &str) -> Option<Referen
     let cite = Cite {
         uri: uri.to_string(),
         resource: resource.kind().slug(),
+        label: resource.label(&LabelContext::default()),
     };
     match resource {
         CairnResource::Issue { project, number } => {
@@ -198,9 +199,14 @@ fn unresolved(uri: &str, error: &str) {
 /// The URI being resolved and its resource kind's slug, which every entry
 /// carries so each reader names the kind from the one registry: the transcript
 /// through its URI chip, an agent through the kind's contract name.
+///
+/// `label` is the address's condensed label, the title of an entry whose
+/// resource has no title of its own (a thread, an executor) or lacks one (an
+/// untitled post, a node of an untitled issue).
 struct Cite {
     uri: String,
     resource: String,
+    label: String,
 }
 
 /// A node or task coordinate, as every node-family arm needs it. Owned, so a
@@ -361,7 +367,7 @@ async fn thread_preview(
     Some(ReferenceEntry::Preview {
         uri: cite.uri.clone(),
         resource: cite.resource.clone(),
-        title: name.to_string(),
+        title: cite.label.clone(),
         status: Some(status),
         line: jurisdiction.as_deref().and_then(first_prose_line),
         at: updated_at,
@@ -409,7 +415,7 @@ async fn node_preview(orch: &Orchestrator, cite: &Cite, node: &NodeRef) -> Optio
     // The URI already says which node this is; the title says what it is for.
     let title = issue_title
         .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| node.task.clone().unwrap_or_else(|| node.node_id.clone()));
+        .unwrap_or_else(|| cite.label.clone());
     Some(ReferenceEntry::Preview {
         uri: cite.uri.clone(),
         resource: cite.resource.clone(),
@@ -652,7 +658,7 @@ async fn post_preview(orch: &Orchestrator, cite: &Cite, id: i64) -> Option<Refer
             .title
             .clone()
             .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| "Untitled".into()),
+            .unwrap_or_else(|| cite.label.clone()),
         status: None,
         line: first_prose_line(&post.content),
         at: Some(post.created_at),
@@ -747,7 +753,7 @@ fn executor_preview(orch: &Orchestrator, cite: &Cite, name: &str) -> Option<Refe
     Some(ReferenceEntry::Preview {
         uri: cite.uri.clone(),
         resource: cite.resource.clone(),
-        title: executor.name.clone(),
+        title: cite.label.clone(),
         status: Some("attached".into()),
         line: Some(format!(
             "{} / {}, {}",
