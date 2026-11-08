@@ -1,0 +1,23 @@
+-- lineage: shared
+-- Index the live-job lookups that bind a job's own branch (cairn/6431).
+--
+-- Every one of them binds the project too: the base-advance durable-retry
+-- sweep's live-job EXISTS (base_advance::released_deferral_candidates_sql),
+-- the per-branch owner lookup (base_advance::jobs_on_branch_sql), and the job
+-- persistence and run-hold reads. With no index leading with `branch`, Turso,
+-- which keeps no statistics, seeks idx_jobs_project_base_branch instead. For
+-- the sweep that is every job cut from the project's base (most of a
+-- project's jobs, each fetched whole, overflow pages included) once per
+-- candidate: about 20 M row fetches and 9-13 s of runtime-worker CPU a pass on
+-- production. The owner lookup seeks project_id alone and reads every job in
+-- the project.
+--
+-- (project_id, branch) rather than (branch): with only (branch) the planner
+-- still prefers idx_jobs_project_base_branch for the sweep, because that index
+-- matches two of its equality terms and (branch) matches one. The two
+-- statements that bind branch alone (held-descendant routing across
+-- databases, branch recovery) are not served by this index.
+--
+-- base_advance::tests::live_job_lookups_by_branch_seek_project_and_branch pins
+-- both plans.
+CREATE INDEX idx_jobs_project_branch ON jobs(project_id, branch);

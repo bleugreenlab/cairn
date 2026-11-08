@@ -3027,25 +3027,7 @@ async fn execute_durable_reconcile_work(
 /// Only the newest intent that visited a branch on a base owns its debt; an
 /// older one is superseded by it and is not revisited.
 async fn reopen_released_deferrals(db: &LocalDb) -> Result<(), String> {
-    let sql = format!(
-        "SELECT intent.id, intent.project_id, intent.target_branch, item.bookmark
-           FROM jj_reconcile_intents intent
-           JOIN jj_reconcile_items item ON item.intent_id = intent.id
-          WHERE intent.status = 'completed'
-            AND item.status = 'pending' AND item.outcome_kind = 'deferred'
-            AND item.failure_kind IS NULL
-            AND EXISTS (
-              SELECT 1 FROM jobs j
-               WHERE j.project_id = intent.project_id AND j.branch = item.bookmark
-                 AND j.base_branch = intent.target_branch AND {LIVE_JOB_PREDICATE})
-            AND NOT EXISTS (
-              SELECT 1 FROM jj_reconcile_intents newer
-                JOIN jj_reconcile_items newer_item ON newer_item.intent_id = newer.id
-               WHERE newer.store_path = intent.store_path
-                 AND newer.target_branch = intent.target_branch
-                 AND newer.created_at > intent.created_at
-                 AND newer_item.bookmark = item.bookmark)"
-    );
+    let sql = released_deferral_candidates_sql();
     let candidates = db
         .read(|conn| {
             let sql = sql.clone();
@@ -8094,6 +8076,44 @@ async fn repoint_children_of_merged_branch(
     }).await.map_err(|error| format!("retarget children of `{merged_branch}`: {error}"))
 }
 
+/// The deferred items [`reopen_released_deferrals`] may reopen.
+///
+/// The live-job probe runs once per candidate, so its plan is pinned by
+/// `live_job_lookups_by_branch_seek_project_and_branch` (migration
+/// `0403_index_jobs_project_branch`). Seeking jobs on project and base branch
+/// instead walked most of a project's jobs per candidate: 9-13 s of runtime
+/// CPU a sweep on production.
+fn released_deferral_candidates_sql() -> String {
+    format!(
+        "SELECT intent.id, intent.project_id, intent.target_branch, item.bookmark
+           FROM jj_reconcile_intents intent
+           JOIN jj_reconcile_items item ON item.intent_id = intent.id
+          WHERE intent.status = 'completed'
+            AND item.status = 'pending' AND item.outcome_kind = 'deferred'
+            AND item.failure_kind IS NULL
+            AND EXISTS (
+              SELECT 1 FROM jobs j
+               WHERE j.project_id = intent.project_id AND j.branch = item.bookmark
+                 AND j.base_branch = intent.target_branch AND {LIVE_JOB_PREDICATE})
+            AND NOT EXISTS (
+              SELECT 1 FROM jj_reconcile_intents newer
+                JOIN jj_reconcile_items newer_item ON newer_item.intent_id = newer.id
+               WHERE newer.store_path = intent.store_path
+                 AND newer.target_branch = intent.target_branch
+                 AND newer.created_at > intent.created_at
+                 AND newer_item.bookmark = item.bookmark)"
+    )
+}
+
+/// The live jobs on branch `?2` in project `?1`; plan pinned with the sweep's
+/// in `live_job_lookups_by_branch_seek_project_and_branch`.
+fn jobs_on_branch_sql() -> String {
+    format!(
+        "SELECT j.id, j.branch, j.base_commit FROM jobs j
+         WHERE j.project_id = ?1 AND j.branch = ?2 AND {LIVE_JOB_PREDICATE}"
+    )
+}
+
 /// The live jobs cut from base `?2` in project `?1`, other than job `?3`.
 ///
 /// Runs on every base advance, so its plan is pinned by
@@ -8119,10 +8139,7 @@ async fn load_jobs_on_branch(
 ) -> Result<Vec<SiblingJob>, String> {
     let project_id = project_id.to_string();
     let branch = branch.to_string();
-    let sql = format!(
-        "SELECT j.id, j.branch, j.base_commit FROM jobs j
-         WHERE j.project_id = ?1 AND j.branch = ?2 AND {LIVE_JOB_PREDICATE}"
-    );
+    let sql = jobs_on_branch_sql();
     db.read(|conn| {
         Box::pin(async move {
             let mut rows = conn
@@ -10106,6 +10123,39 @@ mod tests {
             !plan.iter().any(|step| step.starts_with("SCAN ")),
             "no table in the sibling lookup may be scanned, got {plan:?}"
         );
+    }
+
+    /// Both statements bind the job's project and branch. Without an index
+    /// leading with both, Turso seeks `idx_jobs_project_base_branch` and reads
+    /// every job cut from the base (the sweep, once per candidate) or every job
+    /// in the project (the owner lookup). Results are identical either way, so
+    /// only the plan witnesses the regression.
+    #[tokio::test]
+    async fn live_job_lookups_by_branch_seek_project_and_branch() {
+        let db = migrated_db().await;
+        for (name, sql, binds) in [
+            (
+                "released deferrals",
+                released_deferral_candidates_sql(),
+                vec![],
+            ),
+            (
+                "jobs on branch",
+                jobs_on_branch_sql(),
+                vec!["p".into(), "agent/x".into()],
+            ),
+        ] {
+            let plan = crate::storage::query_plan(&db, &sql, binds).await;
+            assert!(
+                plan.lines().any(|step| step
+                    == "SEARCH j USING INDEX idx_jobs_project_branch (project_id=? AND branch=?)"),
+                "{name}: jobs must be sought on project and branch, got\n{plan}"
+            );
+            assert!(
+                !plan.lines().any(|step| step.starts_with("SCAN ")),
+                "{name}: no table may be scanned, got\n{plan}"
+            );
+        }
     }
 
     fn test_orchestrator(db: LocalDb, git: MockGitClient) -> Orchestrator {
