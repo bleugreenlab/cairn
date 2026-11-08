@@ -112,6 +112,165 @@ async fn insert_fixture(db: &LocalDb, opts: &Fixture) {
     .unwrap();
 }
 
+/// Persist the answering run as a strict ancestor, not the requesting job itself.
+async fn seed_answering_parent(db: &LocalDb) {
+    let project_id = db
+        .query_text("SELECT project_id FROM jobs WHERE id = 'job-1'", ())
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot: cairn_core::models::ExecutionSnapshot =
+        serde_json::from_value(serde_json::json!({
+            "recipe": {
+                "id": "recipe-1",
+                "name": "Resume test",
+                "trigger": "manual",
+                "nodes": [],
+                "edges": []
+            },
+            "agents": {
+                "parent-agent": {
+                    "id": "parent-agent",
+                    "name": "Parent",
+                    "description": "",
+                    "prompt": "",
+                    "tools": [],
+                    "models": [],
+                    "fence": "ask"
+                }
+            },
+            "skills": {},
+            "triggerContext": {
+                "projectId": project_id,
+                "issueId": "issue-1",
+                "triggerType": "manual"
+            },
+            "createdAt": 1
+        }))
+        .unwrap();
+    db.execute(
+        "UPDATE executions SET snapshot = ?1 WHERE id = 'exec-1'",
+        (snapshot.to_json().unwrap(),),
+    )
+    .await
+    .unwrap();
+    db.execute_script(
+        "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, uri_segment,
+                           status, created_at, updated_at)
+         SELECT 'job-parent', execution_id, issue_id, project_id, 'Parent', 'parent',
+                'running', 1, 1 FROM jobs WHERE id = 'job-1';
+         INSERT INTO sessions (id, job_id, backend, status, created_at, updated_at)
+         VALUES ('session-parent', 'job-parent', 'codex', 'active', 1, 1);
+         INSERT INTO runs (id, issue_id, project_id, job_id, session_id, status, created_at, updated_at)
+         SELECT 'run-parent', issue_id, project_id, 'job-parent', 'session-parent', 'live', 1, 1
+         FROM jobs WHERE id = 'job-parent';
+         UPDATE jobs SET agent_config_id = 'parent-agent' WHERE id = 'job-parent';
+         UPDATE jobs SET parent_job_id = 'job-parent' WHERE id = 'job-1';",
+    )
+    .await
+    .unwrap();
+}
+
+/// Native Codex approval names are not configurable MCP tools. Establish their
+/// reusable authority through a real operator session approval for the parent.
+async fn grant_parent_codex_tool(orch: &cairn_core::internal::orchestrator::Orchestrator) {
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, CredentialRef,
+        PrincipalRef, VerificationMethod, VerificationRecord, VerificationStatus,
+        VerificationStrength,
+    };
+    use cairn_core::internal::mcp::handlers::permission::{
+        resolve_permission_request, OperatorApproval, PermissionAnswer, PermissionDecision,
+        PermissionScope,
+    };
+
+    let actor = PrincipalRef::Machine {
+        device_id: "test-device".to_string(),
+    };
+    let verification = VerificationRecord::new(
+        VerificationMethod::DesktopCredential,
+        VerificationStatus::Verified,
+        None,
+        None,
+        None,
+        Some(CredentialRef::new("desktop_operator_credential").unwrap()),
+        VerificationStrength::new("local_shared_secret").unwrap(),
+        1,
+    )
+    .unwrap();
+    let evidence = AppearanceEvidence::new(
+        AppearanceTransport::AuthenticatedDesktop,
+        Address::Desktop {
+            device_id: "test-device".to_string(),
+        },
+        verification,
+        1,
+        None,
+    )
+    .unwrap();
+    let appearance = AppearanceSnapshot::new(actor.clone(), evidence, vec![], None).unwrap();
+    let approval = OperatorApproval::authenticated(actor, appearance).unwrap();
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO permission_requests
+             (id, run_id, job_id, tool_use_id, tool_name, tool_input, status, created_at, uri_segment)
+             VALUES ('parent-perm', 'run-parent', 'job-parent', 'parent-tool',
+                     'codex/commandExecution', '{}', 'pending', 1, 'perm-1')",
+            (),
+        )
+        .await
+        .unwrap();
+    resolve_permission_request(
+        orch,
+        "parent-perm",
+        PermissionAnswer::from_operator(PermissionDecision::Allow, approval)
+            .with_containment_scope(PermissionScope::Session),
+    )
+    .await
+    .expect("the parent has an operator-approved native Codex tool grant");
+}
+
+fn parent_answer(
+    project: &str,
+    decision: cairn_core::internal::mcp::handlers::permission::PermissionDecision,
+) -> cairn_core::internal::mcp::handlers::permission::PermissionAnswer {
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
+        VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+    };
+    use cairn_core::internal::mcp::handlers::permission::{AnswerSurface, PermissionAnswer};
+
+    let home = format!("cairn://p/{project}/1/1/parent");
+    let actor = PrincipalRef::Agent {
+        node: home.clone(),
+        run_id: Some("run-parent".to_string()),
+    };
+    let verification = VerificationRecord::new(
+        VerificationMethod::NodeSession,
+        VerificationStatus::Verified,
+        None,
+        None,
+        Some("run-parent".to_string()),
+        None,
+        VerificationStrength::new("session-bound").unwrap(),
+        1,
+    )
+    .unwrap();
+    let evidence = AppearanceEvidence::new(
+        AppearanceTransport::ResourcePatch,
+        Address::Resource { node: home },
+        verification,
+        1,
+        None,
+    )
+    .unwrap();
+    let appearance = AppearanceSnapshot::new(actor.clone(), evidence, vec![], None).unwrap();
+    PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
+        .with_authenticated_appearance(actor, appearance)
+        .unwrap()
+}
+
 /// The production permission suspension establishes the inner owner and retires
 /// the correlated outer run-batch owner without manufacturing a continuation or
 /// model-facing result. The eventual answer remains the sole continuation owner.
@@ -349,7 +508,7 @@ async fn null_turn_request_recovers_predecessor_and_mints_pending_successor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_answer_with_open_provider_turn_broadcasts_and_mints_nothing() {
     use cairn_core::internal::mcp::handlers::permission::{
-        resolve_permission_request, AnswerSurface, PermissionAnswer, PermissionDecision,
+        resolve_permission_request, PermissionDecision,
     };
 
     let (temp, db) = common::migrated_db().await;
@@ -377,14 +536,15 @@ async fn codex_answer_with_open_provider_turn_broadcasts_and_mints_nothing() {
     )
     .await
     .unwrap();
+    seed_answering_parent(&db).await;
     let (orch, responses) = common::orchestrator_with_permission_responses(&temp, db.clone());
+    grant_parent_codex_tool(&orch).await;
     let mut responses = responses.subscribe();
 
     resolve_permission_request(
         &orch,
         "perm-row-1",
-        PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch)
-            .with_actor("cairn://p/trs/1/1/builder"),
+        parent_answer("trs", PermissionDecision::Allow),
     )
     .await
     .expect("a Codex approval with an open provider turn resolves");
@@ -480,6 +640,7 @@ async fn seed_suspended_at_budget(db: &LocalDb, requests: &[(&str, &str, &str)])
     ] {
         db.execute(sql, ()).await.unwrap();
     }
+    seed_answering_parent(db).await;
     for (id, tool_use_id, segment) in requests {
         db.execute(
             "INSERT INTO permission_requests (id, run_id, job_id, tool_use_id, tool_name, tool_input,
@@ -518,14 +679,28 @@ async fn answer_late(
     scope: cairn_core::internal::mcp::handlers::permission::PermissionScope,
 ) {
     use cairn_core::internal::mcp::handlers::permission::{
-        resolve_permission_request, AnswerSurface, PermissionAnswer,
+        resolve_permission_request, PermissionDecision,
     };
+    if matches!(decision, PermissionDecision::Allow) {
+        let tool_use_id = orch
+            .db
+            .local
+            .query_text(
+                "SELECT tool_use_id FROM permission_requests WHERE id = ?1",
+                (request_id.to_string(),),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        orch.session_allowed_crossings
+            .lock()
+            .unwrap()
+            .insert(format!("/host/secret-{tool_use_id}"));
+    }
     resolve_permission_request(
         orch,
         request_id,
-        PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
-            .with_actor("cairn://p/late/1/1/builder")
-            .with_containment_scope(scope),
+        parent_answer("late", decision).with_containment_scope(scope),
     )
     .await
     .expect("a late answer resolves");
@@ -659,7 +834,7 @@ async fn assert_late_answer_resumes(
     );
     if matches!(decision, PermissionDecision::Deny) {
         assert!(
-            prompt.contains("Denied by cairn://p/late/1/1/builder"),
+            prompt.contains("Denied by cairn://p/late/1/1/parent"),
             "{label}: the deny reaches the agent: {prompt}"
         );
     }
@@ -684,9 +859,9 @@ async fn late_fence_deny_once_resumes_the_job_into_its_successor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parents_deny_with_a_message_resumes_the_child_once_with_the_workaround() {
     use cairn_core::internal::mcp::handlers::permission::{
-        resolve_permission_request, AnswerSurface, PermissionAnswer, PermissionDecision,
+        resolve_permission_request, PermissionDecision,
     };
-    const PARENT: &str = "cairn://p/late/thread";
+    const PARENT: &str = "cairn://p/late/1/1/parent";
     const WORKAROUND: &str = "write it under $TMPDIR instead";
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
@@ -702,9 +877,7 @@ async fn a_parents_deny_with_a_message_resumes_the_child_once_with_the_workaroun
     let outcome = resolve_permission_request(
         &orch,
         "perm-a",
-        PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch)
-            .with_actor(PARENT)
-            .with_note(WORKAROUND),
+        parent_answer("late", PermissionDecision::Deny).with_note(WORKAROUND),
     )
     .await
     .expect("a parent may deny its child's escape");
@@ -749,7 +922,13 @@ async fn a_parents_deny_with_a_message_resumes_the_child_once_with_the_workaroun
         .unwrap();
     assert_eq!(status, "denied");
     assert_eq!(surface.as_deref(), Some("resource_patch"));
-    assert_eq!(actor.as_deref(), Some(PARENT));
+    assert_eq!(
+        serde_json::from_str::<cairn_common::identity::PrincipalRef>(&actor.unwrap()).unwrap(),
+        cairn_common::identity::PrincipalRef::Agent {
+            node: PARENT.to_string(),
+            run_id: Some("run-parent".to_string()),
+        }
+    );
     let response: serde_json::Value = serde_json::from_str(&response.unwrap()).unwrap();
     assert_eq!(response["message"], WORKAROUND);
     assert_eq!(response["deniedBy"], PARENT);
@@ -835,7 +1014,7 @@ async fn two_late_answers_for_one_turn_share_one_successor_and_queue_the_second(
         "both answers land their synthetic results"
     );
     assert!(
-        delivered_text(&delivered).contains("Denied by cairn://p/late/1/1/builder"),
+        delivered_text(&delivered).contains("Denied by cairn://p/late/1/1/parent"),
         "the first answer drove the warm process"
     );
     assert!(
@@ -879,7 +1058,7 @@ async fn assert_second_answer_queues_after_sibling_delivered(
         "{window}: the first answer drove it"
     );
     assert!(
-        delivered_text(&delivered).contains("Denied by cairn://p/late/1/1/builder"),
+        delivered_text(&delivered).contains("Denied by cairn://p/late/1/1/parent"),
         "{window}: the successor's prompt was delivered"
     );
     leave_serving(&orch);

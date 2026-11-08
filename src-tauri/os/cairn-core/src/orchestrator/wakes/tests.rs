@@ -103,6 +103,73 @@ async fn a_thread_child_establishes_and_reaches_its_thread_session() {
     assert_eq!(pushes[0].wake, Wake::Wake);
 }
 
+/// A thread child's recorded filer (`issues.parent_job_id`) never steers its
+/// attention. Here the filer is a live, resumable root job on another issue,
+/// exactly what would win were the spawner layer consulted on the thread axis;
+/// the thread's own session is still the coordinator, watcher and inverse
+/// projection owner. Re-parenting the child under an issue moves it to that
+/// issue's coordinator, and a thread-session filer, sitting on no issue, is
+/// passed over there too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_thread_childs_recorded_filer_never_steers_its_attention() {
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    db.execute_script(
+        "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+           VALUES('thread','p','general','active','none',1,1);
+         INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_thread_id, created_at, updated_at)
+           VALUES('child','p',2,'Child','active','active','none','thread',2,2);",
+    )
+    .await
+    .unwrap();
+    let session = crate::threads::ensure_thread_session(&db, "thread")
+        .await
+        .unwrap();
+
+    for filer in ["j", session.as_str()] {
+        stamp_spawning_node(&db, filer).await;
+        assert_eq!(
+            coordinating_job_for_child_issue(&db, CHILD_URI)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(session.as_str()),
+            "filer {filer}: the thread session coordinates its child"
+        );
+        assert_eq!(
+            watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+            vec![session.clone()],
+            "filer {filer}"
+        );
+        assert_eq!(
+            coordinated_child_issue_uris_for_job(&db, &session)
+                .await
+                .unwrap(),
+            vec![CHILD_URI.to_string()],
+            "filer {filer}"
+        );
+        assert!(coordinated_child_issue_uris_for_job(&db, "j")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    db.execute(
+        "UPDATE issues SET parent_issue_id = 'i', parent_thread_id = NULL WHERE id = 'child'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        coordinating_job_for_child_issue(&db, CHILD_URI)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("j"),
+        "re-parented, the child follows the issue's coordinator, not its thread filer"
+    );
+}
+
 /// Closing a thread quiets the RECIPIENT, never the child's fact.
 ///
 /// The distinction is the whole design: the child issue keeps producing

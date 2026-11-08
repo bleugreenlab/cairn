@@ -471,25 +471,15 @@ async fn pack(path: &str, archive: &str, n: &str) -> Res<Json> {
         sampled_peak.fetch_max(report.fold.log_peak_bytes, Ordering::Relaxed);
         if report.hold_max > hold_max {
             hold_max = report.hold_max;
-            hold_max_execution = report.hold_max_execution.clone();
+            hold_max_execution = report.hold_max_scope.clone();
         }
         if let Some((execution, bytes)) = &report.largest {
             if largest.as_ref().is_none_or(|(_, max)| bytes > max) {
                 largest = Some((execution.clone(), *bytes));
             }
         }
-        skipped.extend(
-            report
-                .skipped
-                .iter()
-                .map(|p| json!([p.execution_id, p.reason])),
-        );
-        failed.extend(
-            report
-                .failed
-                .iter()
-                .map(|p| json!([p.execution_id, p.reason])),
-        );
+        skipped.extend(report.skipped.iter().map(|p| json!([p.scope_id, p.reason])));
+        failed.extend(report.failed.iter().map(|p| json!([p.scope_id, p.reason])));
         if report.halted || report.packed == 0 {
             break;
         }
@@ -539,7 +529,8 @@ async fn identity(path: &str, archive: &str, n: &str) -> Res<Json> {
     let started = Instant::now();
     let executions = db
         .query_all(
-            "SELECT execution_id FROM history_tier ORDER BY resolved_at, execution_id LIMIT ?1",
+            "SELECT scope_id FROM history_tier WHERE kind = 'execution'
+             ORDER BY resolved_at, scope_id LIMIT ?1",
             (n,),
             |row| row.text(0),
         )
@@ -648,7 +639,7 @@ async fn report(path: &str) -> Res<Json> {
     let (db, _) = open(path, None).await?;
     let rows: Vec<(String, i64, i64, String)> = db
         .query_all(
-            "SELECT execution_id, bytes, hot_bytes_estimate, row_counts FROM history_tier",
+            "SELECT scope_id, bytes, hot_bytes_estimate, row_counts FROM history_tier",
             (),
             |row| Ok((row.text(0)?, row.i64(1)?, row.i64(2)?, row.text(3)?)),
         )

@@ -455,7 +455,12 @@ pub(crate) async fn create_conn(
         },
         None => (None, context.inferred_parent_thread_id),
     };
-    let parent_job_id = if parent_issue_id.is_some() {
+    // The authenticated filing job is creator provenance, recorded on every
+    // parented child and never rewritten afterwards. Attention, coordination and
+    // branch readers honour it only beside a parent issue that job itself sits
+    // on, so on a thread child it steers none of them; thread routing stays with
+    // the thread's own session.
+    let parent_job_id = if parent_issue_id.is_some() || parent_thread_id.is_some() {
         context.parent_job_id
     } else {
         None
@@ -1126,6 +1131,100 @@ mod tests {
             .appearance,
         )
         .is_err());
+    }
+
+    /// Canonical create keeps the authenticated filing job as creator provenance
+    /// on thread children, whether the thread was named explicitly or inferred
+    /// from the filing run, exactly as it always has on issue children. Every
+    /// edge here is established by the canonical insert itself, never by a later
+    /// parent UPDATE, so each filing edge starts unrevoked. A child with no
+    /// parent edge records no filer.
+    #[tokio::test]
+    async fn canonical_create_retains_the_authenticated_filer_on_thread_children() {
+        let db = crate::storage::migrated_test_db("issue-create-thread-filer.db").await;
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
+            VALUES('p', 'default', 'P', 'prj', '/tmp/prj', 2, 1, 1);
+            INSERT INTO threads(id, project_id, name, created_at, updated_at)
+            VALUES('t', 'p', 'topic', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
+            VALUES('parent', 'p', 1, 'Parent', 1, 1);
+            INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+            VALUES('session', 't', 'p', 'running', 'thread', 'Thread', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        async fn file(
+            db: &LocalDb,
+            parent_uri: Option<&str>,
+            inferred_thread: Option<&str>,
+        ) -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
+            let context = IssueCreationContext {
+                parent_uri: parent_uri.map(str::to_string),
+                inferred_parent_thread_id: inferred_thread.map(str::to_string),
+                parent_job_id: Some("session".into()),
+            };
+            {
+                let (issue, _) = create_with_context(
+                    db,
+                    &crate::services::RealClock,
+                    CreateIssue {
+                        project_id: "p".into(),
+                        title: "Filed".into(),
+                        description: None,
+                        backend_override: None,
+                        label_ids: None,
+                    },
+                    authorship(PrincipalRef::Agent {
+                        node: "cairn://p/prj/topic".into(),
+                        run_id: Some("run-1".into()),
+                    }),
+                    context,
+                )
+                .await
+                .unwrap();
+                db.query_one(
+                    "SELECT parent_issue_id, parent_thread_id, parent_job_id, filing_parent_revoked_at
+                     FROM issues WHERE id = ?1",
+                    params![issue.id.as_str()],
+                    |row| {
+                        Ok((
+                            row.opt_text(0)?,
+                            row.opt_text(1)?,
+                            row.opt_text(2)?,
+                            row.opt_i64(3)?,
+                        ))
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        }
+        let some = |value: &str| Some(value.to_string());
+
+        assert_eq!(
+            file(&db, Some("cairn://p/prj/topic"), None).await,
+            (None, some("t"), some("session"), None),
+            "an explicitly thread-parented child keeps its filer, unrevoked"
+        );
+        assert_eq!(
+            file(&db, None, Some("t")).await,
+            (None, some("t"), some("session"), None),
+            "a child inferred onto the filing run's thread keeps its filer, unrevoked"
+        );
+        assert_eq!(
+            file(&db, Some("cairn://p/prj/1"), None).await,
+            (some("parent"), None, some("session"), None),
+            "an issue-parented child keeps its filer, unrevoked"
+        );
+        assert_eq!(
+            file(&db, None, None).await,
+            (None, None, None, None),
+            "an unparented child records no filer"
+        );
     }
 
     #[tokio::test]

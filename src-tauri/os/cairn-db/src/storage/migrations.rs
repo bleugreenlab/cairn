@@ -2806,14 +2806,19 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "archival_progress",
         TableScope::Private(PrivateReason::HostArchive),
     ),
-    // The catalog of history packs in this machine's archive, and the runs each
-    // covers. The store cannot be enumerated, so these rows are the only list.
+    // The catalog of history packs in this machine's archive, and the runs and
+    // sessions each covers. The store cannot be enumerated, so these rows are
+    // the only list.
     (
         "history_tier",
         TableScope::Private(PrivateReason::HostArchive),
     ),
     (
         "history_tier_runs",
+        TableScope::Private(PrivateReason::HostArchive),
+    ),
+    (
+        "history_tier_sessions",
         TableScope::Private(PrivateReason::HostArchive),
     ),
     (

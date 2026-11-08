@@ -26,7 +26,7 @@
 //!    teardown waits behind at most one execution.
 //! 3. Skips the execution if any of its runs is still live.
 //! 4. Reads it a keyset page at a time, each page its own short read
-//!    (`ExecutionPacker::read_next`), and does the CPU work of each page
+//!    (`HistoryPacker::read_next`), and does the CPU work of each page
 //!    (reconstruction, the quarantine gate, encoding, compression) on the
 //!    blocking pool inside an `archival/pack` runtime region. An execution
 //!    whose pack grows past [`PackBudget::max_pack_bytes`], or with one row
@@ -52,7 +52,7 @@ use super::pacing::{acquire_gate, fold_if_due, FoldTally};
 use super::progress::{self, Progress};
 use crate::storage::content_store::ContentStore;
 use crate::storage::history_pack::catalog::{publish_to, PublishError, PublishFacts};
-use crate::storage::history_pack::write::{BuiltPack, ExecutionPacker, PackBuildError};
+use crate::storage::history_pack::write::{BuiltPack, HistoryPacker, PackBuildError, PackUnit};
 use crate::storage::history_pack::{PackError, FRAME_RAW_BYTES};
 use crate::storage::{DbResult, LocalDb, RowExt, FOLD_AT_LOG_BYTES};
 
@@ -126,10 +126,11 @@ pub struct PackPolicy {
     pub bytes_per_row: Option<u64>,
 }
 
-/// One execution passed over, and why.
+/// One scope passed over, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Passed {
-    pub execution_id: String,
+    /// The catalog scope: an execution's id is its scope id.
+    pub scope_id: String,
     pub reason: String,
 }
 
@@ -155,10 +156,10 @@ pub struct PackReport {
     pub write_ms: Vec<u64>,
     pub gate_wait: Duration,
     pub gate_wait_max: Duration,
-    /// The longest the pass held the archival permit, and for which execution.
+    /// The longest the pass held the archival permit, and for which scope.
     pub hold_max: Duration,
-    pub hold_max_execution: Option<String>,
-    /// The largest pack written, and for which execution.
+    pub hold_max_scope: Option<String>,
+    /// The largest pack written, and for which scope.
     pub largest: Option<(String, u64)>,
     pub fold: FoldTally,
     pub remaining: Option<usize>,
@@ -178,7 +179,7 @@ fn names(passed: &[Passed]) -> String {
     let mut out = passed
         .iter()
         .take(NAMES_REPORTED)
-        .map(|p| format!("{} ({})", p.execution_id, p.reason))
+        .map(|p| format!("{} ({})", p.scope_id, p.reason))
         .collect::<Vec<_>>()
         .join(", ");
     if passed.len() > NAMES_REPORTED {
@@ -220,11 +221,11 @@ impl fmt::Display for PackReport {
             self.gate_wait_max.as_millis(),
             self.hold_max.as_millis(),
         )?;
-        if let Some(execution) = &self.hold_max_execution {
-            write!(f, " ({execution})")?;
+        if let Some(scope) = &self.hold_max_scope {
+            write!(f, " ({scope})")?;
         }
-        if let Some((execution, bytes)) = &self.largest {
-            write!(f, "; largest {} ({execution})", mib(*bytes))?;
+        if let Some((scope, bytes)) = &self.largest {
+            write!(f, "; largest {} ({scope})", mib(*bytes))?;
         }
         write!(
             f,
@@ -259,10 +260,10 @@ impl fmt::Display for PackReport {
 static PASS_LOCKS: LazyLock<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Default::default);
 
-/// Executions whose skip will recur until they change: a pack over the size
-/// bound, a row too large for a frame. Keyed by database and execution, with
-/// the resolution the skip was for, so a later resolution is tried again. Kept
-/// for the life of the process: a restart tries each once more.
+/// Scopes whose skip will recur until they change: a pack over the size bound,
+/// a row too large for a frame. Keyed by database and scope id, with the
+/// resolution the skip was for, so a later resolution is tried again. Kept for
+/// the life of the process: a restart tries each once more.
 static STANDING_SKIPS: LazyLock<std::sync::Mutex<HashMap<(u64, String), (i64, String)>>> =
     LazyLock::new(Default::default);
 
@@ -275,22 +276,22 @@ fn pass_lock(db: &LocalDb) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-fn standing_skip(db: &LocalDb, candidate: &Candidate) -> Option<String> {
+fn standing_skip(db: &LocalDb, scope_id: &str, resolved_at: i64) -> Option<String> {
     STANDING_SKIPS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&(db.instance(), candidate.execution_id.clone()))
-        .filter(|(completed_at, _)| *completed_at == candidate.completed_at)
+        .get(&(db.instance(), scope_id.to_string()))
+        .filter(|(skipped_at, _)| *skipped_at == resolved_at)
         .map(|(_, reason)| reason.clone())
 }
 
-fn remember_skip(db: &LocalDb, candidate: &Candidate, reason: &str) {
+fn remember_skip(db: &LocalDb, scope_id: &str, resolved_at: i64, reason: &str) {
     STANDING_SKIPS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(
-            (db.instance(), candidate.execution_id.clone()),
-            (candidate.completed_at, reason.to_string()),
+            (db.instance(), scope_id.to_string()),
+            (resolved_at, reason.to_string()),
         );
 }
 
@@ -464,10 +465,11 @@ async fn pack_candidate(
     candidate: &Candidate,
     report: &mut PackReport,
 ) -> Result<(), Stop> {
+    // An execution's scope id is its own id.
     let execution_id = candidate.execution_id.clone();
-    if let Some(reason) = standing_skip(db, candidate) {
+    if let Some(reason) = standing_skip(db, &execution_id, candidate.completed_at) {
         report.skipped.push(Passed {
-            execution_id,
+            scope_id: execution_id,
             reason,
         });
         return Ok(());
@@ -482,7 +484,7 @@ async fn pack_candidate(
     report.gate_wait_max = report.gate_wait_max.max(gate_wait);
     if held > report.hold_max {
         report.hold_max = held;
-        report.hold_max_execution = Some(execution_id.clone());
+        report.hold_max_scope = Some(execution_id.clone());
     }
     match outcome {
         Ok(packed) => {
@@ -516,10 +518,10 @@ async fn pack_candidate(
         Err(ExecutionError::Skip { reason, standing }) => {
             log::info!("history pack: {execution_id} skipped: {reason}");
             if standing {
-                remember_skip(db, candidate, &reason);
+                remember_skip(db, &execution_id, candidate.completed_at, &reason);
             }
             report.skipped.push(Passed {
-                execution_id,
+                scope_id: execution_id,
                 reason,
             });
             Ok(())
@@ -527,7 +529,7 @@ async fn pack_candidate(
         Err(ExecutionError::Fail(reason)) => {
             log::warn!("history pack: {execution_id} not packed: {reason}");
             report.failed.push(Passed {
-                execution_id,
+                scope_id: execution_id,
                 reason,
             });
             Ok(())
@@ -569,7 +571,8 @@ async fn pack_execution(
         });
     }
     ensure_online(store).await?;
-    let mut packer = match ExecutionPacker::start(db, execution_id).await {
+    let unit = PackUnit::Execution(execution_id.to_string());
+    let mut packer = match HistoryPacker::start(db, &unit).await {
         Ok(packer) => packer,
         Err(PackBuildError::NotFound(_)) => {
             return Err(ExecutionError::Skip {
@@ -684,7 +687,7 @@ fn pack_error(error: PackError) -> ExecutionError {
 
 fn publish_error(error: PublishError) -> ExecutionError {
     match error {
-        PublishError::Evicted { .. } => ExecutionError::Skip {
+        PublishError::Evicted { .. } | PublishError::Claimed { .. } => ExecutionError::Skip {
             reason: error.to_string(),
             standing: false,
         },
@@ -757,7 +760,9 @@ async fn save_cursor(db: &LocalDb, at: Option<&Candidate>) -> Result<(), Stop> {
 /// Executions resolved before `cutoff` with no catalog row from this
 /// resolution. `issues` is scanned and sorted (it is small, and this is the
 /// archival sweep's shape), then each issue's jobs are found through
-/// `idx_jobs_issue_id` and the catalog is probed by primary key.
+/// `idx_jobs_issue_id` and the catalog is probed by primary key: an execution
+/// scope's id is the execution's, and a thread range's (`<job>/<n>-<m>`) can
+/// never equal one.
 pub(crate) const CANDIDATES_SQL: &str = "SELECT DISTINCT i.completed_at, j.execution_id
      FROM issues i JOIN jobs j ON j.issue_id = i.id
      WHERE i.status IN ('merged', 'closed')
@@ -767,7 +772,7 @@ pub(crate) const CANDIDATES_SQL: &str = "SELECT DISTINCT i.completed_at, j.execu
        AND j.execution_id IS NOT NULL
        AND NOT EXISTS (
            SELECT 1 FROM history_tier t
-           WHERE t.execution_id = j.execution_id
+           WHERE t.scope_id = j.execution_id
              AND (t.resolved_at >= i.completed_at OR t.evicted_at IS NOT NULL))
      ORDER BY i.completed_at ASC, j.execution_id ASC
      LIMIT ?4";

@@ -1,12 +1,18 @@
-//! History packs: one execution's transcript history as a single
+//! History packs: one scope's transcript history as a single
 //! content-addressed object in the archive's file store.
 //!
-//! A pack is what lets an execution's rows leave `cairn.db` (cairn/5545): it is
+//! A pack is what lets a scope's rows leave `cairn.db` (cairn/5545): it is
 //! written while the hot rows are still authoritative, verified against them,
 //! and catalogued in `history_tier`, and from then on the read seam
 //! ([`crate::storage::events::history`]) can answer every transcript read from
 //! it instead. Writing one never changes a hot row, and nothing reads a pack
 //! in production until an eviction sets `history_tier.evicted_at`.
+//!
+//! A scope ([`ScopeKind`]) is one resolved execution, or one thread range: a
+//! run of whole closed sessions of a thread's session job, with the task jobs
+//! that ran in them (cairn/5587). The catalog maps each packed run and session
+//! to its scope explicitly, so a read never reaches a pack through
+//! `jobs.execution_id`.
 //!
 //! # Format v1
 //!
@@ -45,7 +51,7 @@
 //!   carries no timestamp (`packed_at` lives only in the catalog), the zstd
 //!   level and the column order are fixed, so the same history always packs to
 //!   the same bytes and a re-pack is idempotent.
-//! - The **manifest** names the scope, the execution's jobs, runs (with each
+//! - The **manifest** names the scope, the scope's jobs, runs (with each
 //!   run's sessions, turns, event count and highest event rowid), sessions and
 //!   turns, so a turn or session read resolves to runs inside the pack, and
 //!   every candidate table's section: packed (with its row count, the sha256
@@ -175,11 +181,46 @@ pub struct IndexEntry {
     pub raw_len: u64,
 }
 
-/// What a pack covers.
+/// The kinds of history a pack can cover. Serialized as `history_tier.kind`
+/// spells it, so the catalog and the manifest agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKind {
+    /// One execution, resolved: every job, run, session and turn it hosts.
+    Execution,
+    /// Whole closed sessions of one thread session job, up to a compaction
+    /// boundary, with the task jobs that ran in them.
+    ThreadRange,
+}
+
+impl ScopeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeKind::Execution => "execution",
+            ScopeKind::ThreadRange => "thread_range",
+        }
+    }
+
+    /// The kind `history_tier.kind` names; the column's CHECK admits no other.
+    pub fn parse(kind: &str) -> Option<ScopeKind> {
+        match kind {
+            "execution" => Some(ScopeKind::Execution),
+            "thread_range" => Some(ScopeKind::ThreadRange),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ScopeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a pack covers: its catalog key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
-    /// `execution` in format 1; cairn/5587 adds a thread-range kind.
-    pub kind: String,
+    pub kind: ScopeKind,
     pub id: String,
 }
 
@@ -250,7 +291,10 @@ pub struct Manifest {
     pub scope: Scope,
     pub project_id: Option<String>,
     pub issue_id: Option<String>,
-    pub execution_id: String,
+    /// The execution the scope's jobs belong to. An execution scope's own id;
+    /// a thread range's execution when the thread has one, which it can lack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     pub jobs: Vec<ManifestJob>,
     pub runs: Vec<ManifestRun>,
     pub sessions: Vec<ManifestSession>,
@@ -327,7 +371,7 @@ impl std::fmt::Debug for HistoryPack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HistoryPack")
             .field("bytes", &self.bytes.len())
-            .field("execution_id", &self.manifest.execution_id)
+            .field("scope", &self.manifest.scope)
             .field("frames", &self.index.len())
             .finish()
     }

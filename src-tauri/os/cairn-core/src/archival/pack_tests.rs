@@ -105,7 +105,7 @@ async fn count(db: &LocalDb, sql: &str) -> i64 {
 
 async fn catalogued(db: &LocalDb) -> Vec<String> {
     db.query_all(
-        "SELECT execution_id FROM history_tier ORDER BY execution_id",
+        "SELECT scope_id FROM history_tier ORDER BY scope_id",
         (),
         |row| row.text(0),
     )
@@ -117,7 +117,7 @@ fn skipped(report: &PackReport) -> Vec<(&str, &str)> {
     report
         .skipped
         .iter()
-        .map(|p| (p.execution_id.as_str(), p.reason.as_str()))
+        .map(|p| (p.scope_id.as_str(), p.reason.as_str()))
         .collect()
 }
 
@@ -297,7 +297,7 @@ async fn a_pack_that_does_not_verify_is_named_and_never_catalogued() {
     assert_eq!(report.stopped, None, "{report}");
     assert_eq!(report.packed, 0);
     assert_eq!(report.failed.len(), 1, "{report}");
-    assert_eq!(report.failed[0].execution_id, "x1");
+    assert_eq!(report.failed[0].scope_id, "x1");
     assert!(catalogued(&db).await.is_empty());
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM history_tier_runs").await,
@@ -381,7 +381,7 @@ async fn an_oversized_execution_is_skipped_by_name_and_not_reread() {
 
     let report = run_pack_pass_at(&db, NOW, policy(), tiny).await;
     assert_eq!(report.skipped.len(), 1, "{report}");
-    assert_eq!(report.skipped[0].execution_id, "x1");
+    assert_eq!(report.skipped[0].scope_id, "x1");
     assert!(report.skipped[0].reason.contains("pack bound"), "{report}");
     assert!(catalogued(&db).await.is_empty());
 
@@ -480,13 +480,13 @@ fn the_report_names_skips_and_why_it_stopped() {
         bytes_per_row: 2_323,
         skipped: (0..22)
             .map(|n| Passed {
-                execution_id: format!("x{n}"),
+                scope_id: format!("x{n}"),
                 reason: "a run is still live".into(),
             })
             .collect(),
         largest: Some(("x9".into(), 2 * 1024 * 1024)),
         hold_max: Duration::from_millis(40),
-        hold_max_execution: Some("x9".into()),
+        hold_max_scope: Some("x9".into()),
         remaining: Some(1_001),
         stopped: Some("archive volume under its floor".into()),
         ..PackReport::default()
@@ -533,8 +533,7 @@ async fn the_pass_statements_stay_on_their_indexes() {
         "{candidates}"
     );
     assert!(
-        candidates
-            .contains("SEARCH t USING INDEX sqlite_autoindex_history_tier_1 (execution_id=?)"),
+        candidates.contains("SEARCH t USING INDEX sqlite_autoindex_history_tier_1 (scope_id=?)"),
         "{candidates}"
     );
     assert!(!candidates.contains("SCAN j"), "{candidates}");

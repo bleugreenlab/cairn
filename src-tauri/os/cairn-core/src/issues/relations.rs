@@ -209,6 +209,42 @@ mod parent_tests {
         assert!(branch.is_none());
     }
 
+    /// A thread child's recorded filer is provenance, not a branch source: while
+    /// the child hangs from a thread it inherits no branch even when the filer
+    /// carries one, and once re-parented under an issue the filer (a thread
+    /// session, on no issue) is passed over for that issue's own live job.
+    #[tokio::test]
+    async fn resolve_parent_branch_ignores_a_thread_childs_recorded_filer() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','proj','/tmp/p',1,1);
+             INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('thread','p','topic','active','none',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,branch,created_at,updated_at) VALUES('session','thread','p','running','thread','agent/thread',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('parent','p',1,'Parent','backlog','backlog','none',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,branch,created_at,updated_at) VALUES('parent-job','p','parent','blocked','agent/parent',2,2);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,parent_thread_id,parent_job_id,created_at,updated_at) VALUES('child','p',2,'Child','backlog','backlog','none','thread','session',3,3);"
+        ).await.unwrap();
+        let resolve = || async {
+            db.read(|conn| Box::pin(async move { resolve_parent_branch(conn, "child").await }))
+                .await
+                .unwrap()
+        };
+        assert_eq!(resolve().await, None, "a thread child inherits no branch");
+
+        db.execute(
+            "UPDATE issues SET parent_issue_id = 'parent', parent_thread_id = NULL WHERE id = 'child'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve().await.as_deref(),
+            Some("agent/parent"),
+            "after re-parenting, the issue's own job wins over the thread filer"
+        );
+    }
+
     #[tokio::test]
     async fn list_children_returns_children_for_parent() {
         let db = migrated_db().await;

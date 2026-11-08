@@ -120,13 +120,6 @@ struct StoredQuestion {
     multi_select: bool,
 }
 
-fn permission_answer_token(decision: PermissionDecision) -> &'static str {
-    match decision {
-        PermissionDecision::Allow => "allow",
-        PermissionDecision::Deny => "deny",
-    }
-}
-
 /// The conversation a directed route's gate is keyed and sent under.
 ///
 /// Discord takes the canonical `discord:<guild>/<channel>` address: its provider
@@ -4238,23 +4231,24 @@ impl ChannelRouter {
                 }
             }
             "permission" => {
-                let answer = permission_answer_token(parse_permission(text)?);
-                let claim = ledger::claim_ask_resolution(
-                    self.ledger(),
-                    &record.binding_ref,
-                    answer,
-                    cairn_common::identity::AppearanceTransport::ChannelReply,
-                    Some(self.provider_id),
-                    Some(&record.conversation),
-                    Some(sender),
-                    "permission",
-                    &record.binding_ref,
-                    chrono::Utc::now().timestamp_millis(),
+                use crate::mcp::handlers::permission::{
+                    resolve_permission_request, AnswerSurface, PermissionAnswer,
+                };
+
+                let answer = PermissionAnswer::from_surface(
+                    parse_permission(text)?,
+                    AnswerSurface::ChannelReply,
                 )
-                .await?;
-                self.sweep_pending_domain_actions().await?;
+                .with_actor(sender)
+                .with_channel(self.provider_id, &record.conversation);
+                let outcome =
+                    resolve_permission_request(&self.orch, &record.binding_ref, answer).await?;
                 self.sweep_pending_cleanup().await?;
-                if let ledger::AskClaim::Existing(winner) = claim {
+                if let Some(winner) = if outcome.duplicate {
+                    ledger::resolution_for_action(self.ledger(), &record.binding_ref).await?
+                } else {
+                    None
+                } {
                     self.send_notice(
                         &record.conversation,
                         &format!(
@@ -9930,8 +9924,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_poll_vote_and_numbered_reply_resolve_once_with_channel_provenance() {
+    async fn permission_poll_vote_and_numbered_reply_are_refused_before_claiming() {
         let (orch, db) = route_test_orchestrator("channel-permission-poll-race.db").await;
+        seed_run(&db).await;
+        db.execute(
+            "INSERT INTO permission_requests (id, run_id, tool_use_id, tool_name, tool_input, status, created_at) VALUES ('permission-request', 'run-1', 'tool-1', 'Bash', '{}', 'pending', 500)",
+            (),
+        )
+        .await
+        .unwrap();
         let (router, _) = test_router(orch);
         let intent = ledger::NewOutbound {
             id: "permission-intent",
@@ -9951,7 +9952,7 @@ mod tests {
                 .unwrap()
         );
 
-        let _ = tokio::join!(
+        let (allow, deny) = tokio::join!(
             router.handle_inbound(InboundEvent::Selection {
                 conversation: "imessage:+15551234567".into(),
                 bound_guid: "permission-poll".into(),
@@ -9968,17 +9969,132 @@ mod tests {
             })
         );
 
-        assert_eq!(db.query_one("SELECT COUNT(*) FROM channel_ask_resolution WHERE binding_ref = 'permission-request'", (), |row| row.i64(0)).await.unwrap(), 1);
-        let winner = ledger::resolution_for_action(&db, "permission-request")
+        for result in [allow, deny] {
+            let error = result.unwrap_err();
+            assert!(error.contains("ancestor"), "{error}");
+        }
+        assert_eq!(db.query_one("SELECT COUNT(*) FROM channel_ask_resolution WHERE binding_ref = 'permission-request'", (), |row| row.i64(0)).await.unwrap(), 0);
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT status FROM permission_requests WHERE id = 'permission-request'",
+                ()
+            )
             .await
             .unwrap()
+            .as_deref(),
+            Some("pending")
+        );
+        assert_eq!(db.query_one("SELECT COUNT(*) FROM authorization_events WHERE request_uri = 'permission-request' AND outcome = 'forbidden' AND reason = 'permission_answer_authority'", (), |row| row.i64(0)).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn permission_record_foreign_answers_leave_the_operator_free_to_answer() {
+        use crate::mcp::handlers::permission::{
+            resolve_permission_request, tests::desktop_approval, PermissionAnswer,
+        };
+
+        for text in ["allow", "deny"] {
+            let (orch, db) = route_test_orchestrator("channel-permission-foreign.db").await;
+            seed_run(&db).await;
+            db.execute(
+                "INSERT INTO permission_requests (id, run_id, tool_use_id, tool_name, tool_input, status, created_at) VALUES ('foreign-request', 'run-1', 'tool-1', 'Bash', '{}', 'pending', 500)",
+                (),
+            )
+            .await
             .unwrap();
-        assert!(matches!(winner.answer.as_str(), "allow" | "deny"));
-        assert_eq!(winner.winner_surface, "channel_reply");
-        assert_eq!(winner.winner_provider, "imessage");
-        assert_eq!(winner.winner_conversation, "imessage:+15551234567");
-        assert_eq!(winner.winner_actor, "+15551234567");
-        assert!(db.query_one("SELECT resolved_at FROM channel_ask_resolution WHERE binding_ref = 'permission-request'", (), |row| row.i64(0)).await.unwrap() > 0);
+            let (router, _) = test_router(orch);
+            ledger::insert_intent(
+                &db,
+                &ledger::NewOutbound {
+                    id: "foreign-intent",
+                    channel: CHANNEL,
+                    kind: "permission",
+                    binding_ref: "foreign-request",
+                    conversation: "imessage:+15551234567",
+                    job_id: None,
+                    rendered_text: "Allow this command?",
+                    rendering: "text",
+                    created_at: 10,
+                },
+            )
+            .await
+            .unwrap();
+            ledger::mark_sent(&db, "foreign-intent", "foreign-guid", None, None, 11)
+                .await
+                .unwrap();
+            let record = ledger::get_by_id(&db, "foreign-intent")
+                .await
+                .unwrap()
+                .unwrap();
+            let error = router
+                .resolve_record(record, "foreign-sender", text)
+                .await
+                .unwrap_err();
+            assert!(error.contains("ancestor"), "{error}");
+            assert_eq!(
+                db.query_opt_text(
+                    "SELECT status FROM permission_requests WHERE id = 'foreign-request'",
+                    ()
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some("pending")
+            );
+            assert!(ledger::resolution_for_action(&db, "foreign-request")
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                db.query_one(
+                    "SELECT COUNT(*) FROM channel_ask_action WHERE action_ref = 'foreign-request'",
+                    (),
+                    |row| row.i64(0)
+                )
+                .await
+                .unwrap(),
+                0
+            );
+            let events = cairn_db::storage::authority::list_events(
+                &db,
+                crate::authorization::WORKSPACE_ID,
+                10,
+            )
+            .await
+            .unwrap();
+            let refusal = events
+                .iter()
+                .find(|event| event.request_uri.as_deref() == Some("foreign-request"))
+                .unwrap();
+            assert_eq!(refusal.outcome, "forbidden");
+            assert_eq!(refusal.reason, "permission_answer_authority");
+            assert!(refusal.summary.contains("foreign-sender"));
+
+            let outcome = resolve_permission_request(
+                &router.orch,
+                "foreign-request",
+                PermissionAnswer::from_operator(PermissionDecision::Deny, desktop_approval()),
+            )
+            .await
+            .unwrap();
+            assert!(!outcome.duplicate);
+            assert_eq!(
+                db.query_opt_text(
+                    "SELECT status FROM permission_requests WHERE id = 'foreign-request'",
+                    ()
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some("denied")
+            );
+            let winner = ledger::resolution_for_action(&db, "foreign-request")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(winner.winner_surface, "authenticated_desktop");
+            router.sweep_pending_cleanup().await.unwrap();
+        }
     }
 
     /// A domain effect refused because only an operator may approve it is
@@ -10080,7 +10196,8 @@ mod tests {
             panic!("expected a notice back to the answering conversation")
         };
         assert!(
-            text.contains("still pending for the operator"),
+            text.contains("Only the requester's ancestor lineage or the operator")
+                && text.contains("request remains pending and answerable"),
             "unexpected notice: {text}"
         );
     }
@@ -10089,14 +10206,14 @@ mod tests {
     fn permission_words_are_strict() {
         for spelling in ["1", "yes", "y", "approve", "allow", "Approve"] {
             assert_eq!(
-                permission_answer_token(parse_permission(spelling).unwrap()),
-                "allow"
+                parse_permission(spelling).unwrap(),
+                PermissionDecision::Allow
             );
         }
         for spelling in ["2", "no", "n", "deny", "denied", "Deny"] {
             assert_eq!(
-                permission_answer_token(parse_permission(spelling).unwrap()),
-                "deny"
+                parse_permission(spelling).unwrap(),
+                PermissionDecision::Deny
             );
         }
         assert!(parse_permission("maybe").is_err());

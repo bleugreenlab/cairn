@@ -12,10 +12,13 @@
 //! # Source
 //!
 //! A run is pack-sourced only when `history_tier_runs` joined to `history_tier`
-//! has `evicted_at` set. A turn or a session resolves the same way through its
-//! job's execution: its events live in that execution (`turns.job_id` or
-//! `sessions.job_id`, then `jobs.execution_id`). A team replica has no catalog
-//! and reads hot. Tests and the clone harness force a source through
+//! has `evicted_at` set, and a session the same way through
+//! `history_tier_sessions`. A turn resolves through its run's mapping, or its
+//! session's when it has no run. Every resolution goes through a mapping the
+//! publication wrote, never through `jobs.execution_id`: a thread's execution
+//! holds many scopes, or none, so a run or session no pack maps reads hot
+//! whatever its execution's catalog says. A team replica has no catalog and
+//! reads hot. Tests and the clone harness force a source through
 //! `LocalDb::set_history_source_override`, compiled only under `test-utils`.
 //!
 //! # The gate
@@ -78,7 +81,7 @@ use turso::Value;
 use super::columns::{event_from_row, event_from_row_at, EVENT_COLUMNS, EVENT_COLUMN_COUNT};
 use super::reconstruct::{reconstruct_events_reporting, Reconstruction, RECONSTRUCT_BATCH_ROWS};
 use crate::models::Event;
-use crate::storage::history_pack::{decode_event_row, HistoryPack, PackError, Section};
+use crate::storage::history_pack::{decode_event_row, HistoryPack, PackError, ScopeKind, Section};
 use crate::storage::quarantine::withhold_pack_rows_reporting;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
 
@@ -109,14 +112,19 @@ pub struct HistoryRow {
     pub extras: EventExtras,
 }
 
+/// The pack a read is answered from: its catalog scope and its object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackRef {
+    pub scope_id: String,
+    pub kind: ScopeKind,
+    pub content_hash: String,
+}
+
 /// Where a page's rows came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provenance {
     Hot,
-    Pack {
-        execution_id: String,
-        content_hash: String,
-    },
+    Pack(PackRef),
 }
 
 /// A forced source, for tests and the clone harness.
@@ -307,10 +315,24 @@ impl From<HistoryError> for DbError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
     Hot,
-    Pack {
-        execution_id: String,
-        content_hash: String,
-    },
+    Pack(PackRef),
+}
+
+/// A catalog row as the source statements select it, from column `at`:
+/// `scope_id, kind, content_hash, evicted_at`.
+fn catalog_row_at(row: &turso::Row, at: usize) -> DbResult<(PackRef, Option<i64>)> {
+    let kind = row.text(at + 1)?;
+    let kind = ScopeKind::parse(&kind).ok_or_else(|| {
+        DbError::internal(format!("history_tier names an unknown scope kind {kind:?}"))
+    })?;
+    Ok((
+        PackRef {
+            scope_id: row.text(at)?,
+            kind,
+            content_hash: row.text(at + 2)?,
+        },
+        row.opt_i64(at + 3)?,
+    ))
 }
 
 /// Identity and ordering only, without fetching or reconstructing a body.
@@ -488,13 +510,13 @@ pub mod statements {
         "SELECT MIN(sequence) FROM events WHERE turn_id = ?1 AND run_id = ?2";
     /// A session's newest event rowid.
     pub const SESSION_MAX_ROWID: &str = "SELECT MAX(rowid) FROM events WHERE session_id = ?1";
-    /// Resolve a batch of runs by their primary keys, ignoring orphan mappings.
+    /// Resolve a batch of runs by their mappings, ignoring orphan mappings.
     pub fn run_sources(count: usize) -> String {
         let placeholders = vec!["?"; count].join(", ");
         format!(
-            "SELECT r.run_id, h.execution_id, h.content_hash, h.evicted_at
+            "SELECT r.run_id, h.scope_id, h.kind, h.content_hash, h.evicted_at
              FROM history_tier_runs r
-             JOIN history_tier h ON h.execution_id = r.execution_id
+             JOIN history_tier h ON h.scope_id = r.scope_id
              WHERE r.run_id IN ({placeholders})"
         )
     }
@@ -505,35 +527,40 @@ pub mod statements {
         if run_count > 0 {
             let placeholders = vec!["?"; run_count].join(", ");
             parts.push(format!(
-                "SELECT 'run', r.run_id, h.execution_id, h.content_hash, h.evicted_at
-                 FROM history_tier_runs r JOIN history_tier h ON h.execution_id = r.execution_id
+                "SELECT 'run', r.run_id, h.scope_id, h.kind, h.content_hash, h.evicted_at
+                 FROM history_tier_runs r JOIN history_tier h ON h.scope_id = r.scope_id
                  WHERE r.run_id IN ({placeholders})"
             ));
         }
         if session_count > 0 {
             let placeholders = vec!["?"; session_count].join(", ");
             parts.push(format!(
-                "SELECT 'session', s.id, h.execution_id, h.content_hash, h.evicted_at
-                 FROM sessions s JOIN jobs j ON j.id = s.job_id
-                 JOIN history_tier h ON h.execution_id = j.execution_id
-                 WHERE s.id IN ({placeholders})"
+                "SELECT 'session', s.session_id, h.scope_id, h.kind, h.content_hash, h.evicted_at
+                 FROM history_tier_sessions s JOIN history_tier h ON h.scope_id = s.scope_id
+                 WHERE s.session_id IN ({placeholders})"
             ));
         }
         parts.join(" UNION ALL ")
     }
 
-    /// The catalog row behind a turn.
-    pub const SOURCE_OF_TURN: &str = "SELECT h.execution_id, h.content_hash, h.evicted_at
+    /// The catalog row behind a turn: its run's mapping, or, for a turn with
+    /// no run, its session's. At most one arm can match.
+    pub const SOURCE_OF_TURN: &str = "SELECT h.scope_id, h.kind, h.content_hash, h.evicted_at
          FROM turns t
-         JOIN jobs j ON j.id = t.job_id
-         JOIN history_tier h ON h.execution_id = j.execution_id
-         WHERE t.id = ?1";
-    /// The catalog row behind a session.
-    pub const SOURCE_OF_SESSION: &str = "SELECT h.execution_id, h.content_hash, h.evicted_at
-         FROM sessions s
-         JOIN jobs j ON j.id = s.job_id
-         JOIN history_tier h ON h.execution_id = j.execution_id
-         WHERE s.id = ?1";
+         JOIN history_tier_runs m ON m.run_id = t.run_id
+         JOIN history_tier h ON h.scope_id = m.scope_id
+         WHERE t.id = ?1
+         UNION ALL
+         SELECT h.scope_id, h.kind, h.content_hash, h.evicted_at
+         FROM turns t
+         JOIN history_tier_sessions m ON m.session_id = t.session_id
+         JOIN history_tier h ON h.scope_id = m.scope_id
+         WHERE t.id = ?1 AND t.run_id IS NULL";
+    /// The catalog row behind a session, through its mapping.
+    pub const SOURCE_OF_SESSION: &str = "SELECT h.scope_id, h.kind, h.content_hash, h.evicted_at
+         FROM history_tier_sessions m
+         JOIN history_tier h ON h.scope_id = m.scope_id
+         WHERE m.session_id = ?1";
 }
 
 /// Reads transcript history for one logical read. Caches resolved run sources
@@ -607,19 +634,13 @@ impl<'db> HistoryReader<'db> {
                 .query_all(
                     statements::run_sources(chunk.len()),
                     chunk.iter().cloned().map(Value::Text).collect::<Vec<_>>(),
-                    |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.opt_i64(3)?)),
+                    |row| Ok((row.text(0)?, catalog_row_at(row, 1)?)),
                 )
                 .await?;
             let mut resolved: HashMap<String, Source> = HashMap::new();
-            for (run, execution_id, content_hash, evicted_at) in rows {
+            for (run, (source, evicted_at)) in rows {
                 if self.pack_sourced(evicted_at) {
-                    resolved.insert(
-                        run,
-                        Source::Pack {
-                            execution_id,
-                            content_hash,
-                        },
-                    );
+                    resolved.insert(run, Source::Pack(source));
                 }
             }
             for run in chunk {
@@ -674,28 +695,17 @@ impl<'db> HistoryReader<'db> {
                 .query_all(
                     statements::scope_sources(run_chunk.len(), session_chunk.len()),
                     binds,
-                    |row| {
-                        Ok((
-                            row.text(0)?,
-                            row.text(1)?,
-                            row.text(2)?,
-                            row.text(3)?,
-                            row.opt_i64(4)?,
-                        ))
-                    },
+                    |row| Ok((row.text(0)?, row.text(1)?, catalog_row_at(row, 2)?)),
                 )
                 .await?;
             self.sessions
                 .extend(session_chunk.iter().cloned().map(|id| (id, Source::Hot)));
             self.runs
                 .extend(run_chunk.iter().cloned().map(|id| (id, Source::Hot)));
-            for (kind, id, execution_id, content_hash, evicted_at) in rows {
+            for (arm, id, (source, evicted_at)) in rows {
                 if self.pack_sourced(evicted_at) {
-                    let source = Source::Pack {
-                        execution_id,
-                        content_hash,
-                    };
-                    if kind == "session" {
+                    let source = Source::Pack(source);
+                    if arm == "session" {
                         self.sessions.insert(id, source);
                     } else {
                         self.runs.insert(id, source);
@@ -721,16 +731,11 @@ impl<'db> HistoryReader<'db> {
         let row = self
             .db
             .query_opt(sql.to_string(), (id.to_string(),), |row| {
-                Ok((row.text(0)?, row.text(1)?, row.opt_i64(2)?))
+                catalog_row_at(row, 0)
             })
             .await?;
         Ok(match row {
-            Some((execution_id, content_hash, evicted_at)) if self.pack_sourced(evicted_at) => {
-                Source::Pack {
-                    execution_id,
-                    content_hash,
-                }
-            }
+            Some((source, evicted_at)) if self.pack_sourced(evicted_at) => Source::Pack(source),
             _ => Source::Hot,
         })
     }
@@ -807,18 +812,13 @@ impl<'db> HistoryReader<'db> {
                     selected.push((index, None));
                     hot.push(row);
                 }
-                Source::Pack {
-                    execution_id,
-                    content_hash,
-                } => {
+                Source::Pack(source) => {
                     let found = self
                         .run_event_by_rowid(&row.event.run_id, row.rowid)
                         .await?
                         .filter(|found| found.event.id == row.event.id);
                     if let Some(found) = found {
-                        let found = pack_page(vec![found], filter, execution_id, content_hash)
-                            .rows
-                            .pop();
+                        let found = pack_page(vec![found], filter, source).rows.pop();
                         selected.push((index, found));
                     }
                 }
@@ -858,11 +858,8 @@ impl<'db> HistoryReader<'db> {
                     }
                 }
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let mut best: Option<HistoryRow> = None;
                 for row in pack_rows(&pack, run_id, i64::MIN) {
                     let row = row?;
@@ -876,15 +873,10 @@ impl<'db> HistoryReader<'db> {
                     {
                         continue;
                     }
-                    let row = pack_page(
-                        vec![row],
-                        filter,
-                        execution_id.clone(),
-                        content_hash.clone(),
-                    )
-                    .rows
-                    .pop()
-                    .expect("one selected pack row");
+                    let row = pack_page(vec![row], filter, source.clone())
+                        .rows
+                        .pop()
+                        .expect("one selected pack row");
                     if matches(&row) {
                         best = Some(row);
                     }
@@ -917,11 +909,8 @@ impl<'db> HistoryReader<'db> {
                 self.hot_page(statements::run_chat_page(&filter), binds, filter)
                     .await
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 // The pack indexes rowid, not time. Inspect every frame for
                 // chronological selection, retaining only the requested top-k.
                 let mut selected = BTreeMap::new();
@@ -938,12 +927,7 @@ impl<'db> HistoryReader<'db> {
                         selected.pop_last();
                     }
                 }
-                Ok(pack_page(
-                    selected.into_values().collect(),
-                    filter,
-                    execution_id,
-                    content_hash,
-                ))
+                Ok(pack_page(selected.into_values().collect(), filter, source))
             }
         }
     }
@@ -970,11 +954,8 @@ impl<'db> HistoryReader<'db> {
                 self.hot_page(statements::run_page(&filter), binds, filter)
                     .await
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let mut rows = Vec::new();
                 for row in pack_rows(&pack, run_id, after_rowid) {
                     let row = row?;
@@ -985,7 +966,7 @@ impl<'db> HistoryReader<'db> {
                         }
                     }
                 }
-                Ok(pack_page(rows, filter, execution_id, content_hash))
+                Ok(pack_page(rows, filter, source))
             }
         }
     }
@@ -1061,11 +1042,8 @@ impl<'db> HistoryReader<'db> {
                 self.hot_page(statements::run_window(&filter), binds, filter)
                     .await
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let mut rows = pack.run_events(run_id)?;
                 rows.retain(|row| {
                     let sequence = i64::from(row.event.sequence);
@@ -1075,7 +1053,7 @@ impl<'db> HistoryReader<'db> {
                 });
                 rows.sort_by_key(|row| std::cmp::Reverse(row.event.sequence));
                 rows.truncate(limit);
-                Ok(pack_page(rows, filter, execution_id, content_hash))
+                Ok(pack_page(rows, filter, source))
             }
         }
     }
@@ -1095,11 +1073,8 @@ impl<'db> HistoryReader<'db> {
                 self.hot_page(statements::run_rowid(), binds, filter)
                     .await?
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let frame = pack
                     .index()
                     .iter()
@@ -1124,7 +1099,7 @@ impl<'db> HistoryReader<'db> {
                         }
                     }
                 }
-                pack_page(rows, filter, execution_id, content_hash)
+                pack_page(rows, filter, source)
             }
         };
         Ok(page.rows.into_iter().next())
@@ -1143,15 +1118,12 @@ impl<'db> HistoryReader<'db> {
                 self.hot_page(statements::run_sequence(), binds, filter)
                     .await?
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let mut rows = pack.run_events(run_id)?;
                 rows.retain(|row| i64::from(row.event.sequence) == sequence);
                 rows.truncate(1);
-                pack_page(rows, filter, execution_id, content_hash)
+                pack_page(rows, filter, source)
             }
         };
         Ok(page.rows.into_iter().next())
@@ -1180,11 +1152,8 @@ impl<'db> HistoryReader<'db> {
                 )
                 .await
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let mut rows = pack.run_events(run_id)?;
                 rows.sort_by_key(|row| (row.event.sequence, row.rowid));
                 let take = if limit < 0 {
@@ -1197,7 +1166,7 @@ impl<'db> HistoryReader<'db> {
                     .skip(usize::try_from(offset.max(0)).unwrap_or(usize::MAX))
                     .take(take)
                     .collect();
-                Ok(pack_page(rows, filter, execution_id, content_hash))
+                Ok(pack_page(rows, filter, source))
             }
         }
     }
@@ -1282,8 +1251,8 @@ impl<'db> HistoryReader<'db> {
                 }
                 Ok(all)
             }
-            Source::Pack { content_hash, .. } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let mut keys = Vec::new();
                 for run in pack.manifest().runs_of_session(session_id) {
                     for row in pack.run_events(&run.id)? {
@@ -1325,15 +1294,12 @@ impl<'db> HistoryReader<'db> {
                 }
                 rows
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
+            Source::Pack(source) => {
                 let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
-                let pack = self.pack(&content_hash).await?;
+                let pack = self.pack(&source.content_hash).await?;
                 let mut rows = pack.run_events(run_id)?;
                 rows.retain(|row| wanted.contains(row.event.id.as_str()));
-                pack_page(rows, filter, execution_id, content_hash).rows
+                pack_page(rows, filter, source).rows
             }
         };
         rows.sort_by_key(|row| row.rowid);
@@ -1354,8 +1320,8 @@ impl<'db> HistoryReader<'db> {
         for run_id in run_ids {
             match self.runs.get(run_id).cloned().unwrap_or(Source::Hot) {
                 Source::Hot => any_hot = true,
-                Source::Pack { content_hash, .. } => {
-                    let pack = self.pack(&content_hash).await?;
+                Source::Pack(source) => {
+                    let pack = self.pack(&source.content_hash).await?;
                     for row in pack.rows(Section::Events, run_id) {
                         let row = row?;
                         if row.get("id").and_then(Json::as_str) == Some(event_id) {
@@ -1401,11 +1367,8 @@ impl<'db> HistoryReader<'db> {
                 )
                 .await?
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let run_ids: Vec<String> = pack
                     .manifest()
                     .runs_of_turn(turn_id)
@@ -1419,7 +1382,7 @@ impl<'db> HistoryReader<'db> {
                             .filter(|row| row.event.turn_id.as_deref() == Some(turn_id)),
                     );
                 }
-                pack_page(rows, filter, execution_id, content_hash)
+                pack_page(rows, filter, source)
             }
         };
         page.rows.sort_by_key(|row| (row.event.sequence, row.rowid));
@@ -1442,8 +1405,8 @@ impl<'db> HistoryReader<'db> {
                     |row| row.opt_i64(0),
                 )
                 .await?),
-            Source::Pack { content_hash, .. } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 Ok(pack
                     .run_events(run_id)?
                     .iter()
@@ -1484,14 +1447,11 @@ impl<'db> HistoryReader<'db> {
                 )
                 .await
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let rows =
                     pack_session_page(&pack, session_id, except_run, after_rowid, limit, filter)?;
-                Ok(pack_page(rows, filter, execution_id, content_hash))
+                Ok(pack_page(rows, filter, source))
             }
         }
     }
@@ -1587,15 +1547,12 @@ impl<'db> HistoryReader<'db> {
                 self.hot_page(statements::session_tail(), binds, filter)
                     .await?
             }
-            Source::Pack {
-                execution_id,
-                content_hash,
-            } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 let mut rows = pack_session_rows(&pack, session_id, None)?;
                 let skip = rows.len().saturating_sub(limit);
                 rows.drain(..skip);
-                pack_page(rows, filter, execution_id, content_hash)
+                pack_page(rows, filter, source)
             }
         };
         page.rows.sort_by_key(|row| row.rowid);
@@ -1616,8 +1573,8 @@ impl<'db> HistoryReader<'db> {
                     |row| row.opt_i64(0),
                 )
                 .await?),
-            Source::Pack { content_hash, .. } => {
-                let pack = self.pack(&content_hash).await?;
+            Source::Pack(source) => {
+                let pack = self.pack(&source.content_hash).await?;
                 Ok(pack
                     .manifest()
                     .sessions
@@ -1650,10 +1607,10 @@ impl<'db> HistoryReader<'db> {
         for (run, event) in events {
             match self.runs.get(run).cloned().unwrap_or(Source::Hot) {
                 Source::Hot => hot_ids.push(event.clone()),
-                Source::Pack { content_hash, .. } => {
+                Source::Pack(source) => {
                     pack_wanted
                         .entry(run.clone())
-                        .or_insert_with(|| (content_hash, HashSet::new()))
+                        .or_insert_with(|| (source.content_hash, HashSet::new()))
                         .1
                         .insert(event.as_str());
                 }
@@ -1975,12 +1932,7 @@ fn pack_session_rows(
 /// Finish rows decoded from a pack: apply the body projection, then the
 /// quarantine gate, last, on both of the row's keys. A projected body reads as
 /// stored plain, because a hot read never reconstructs one.
-fn pack_page(
-    mut rows: Vec<HistoryRow>,
-    filter: EventFilter<'_>,
-    execution_id: String,
-    content_hash: String,
-) -> Page {
+fn pack_page(mut rows: Vec<HistoryRow>, filter: EventFilter<'_>, source: PackRef) -> Page {
     if let Some(bodies) = filter.bodies {
         for row in rows.iter_mut() {
             if (bodies.is_unread)(&row.event.event_type) {
@@ -2006,10 +1958,7 @@ fn pack_page(
         .max();
     Page {
         rows,
-        provenance: Provenance::Pack {
-            execution_id,
-            content_hash,
-        },
+        provenance: Provenance::Pack(source),
         fetched,
         last_rowid,
         last_chat_key,

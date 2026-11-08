@@ -6,7 +6,7 @@ use std::sync::Arc;
 use turso::params;
 
 use super::catalog::{publish, PublishFacts};
-use super::write::{pack_execution, BuiltPack};
+use super::write::{pack_unit, BuiltPack, PackUnit};
 use crate::storage::content_store::InMemoryContentStore;
 use crate::storage::events::compress;
 use crate::storage::events::history::{HistoryRow, HistorySource};
@@ -17,10 +17,15 @@ use crate::storage::LocalDb;
 /// database has none. Hot rows and `evicted_at` are left alone, so reads stay
 /// hot until the source is forced.
 pub async fn publish_for_test(db: &LocalDb, execution_id: &str) -> BuiltPack {
+    publish_unit_for_test(db, &PackUnit::Execution(execution_id.to_string())).await
+}
+
+/// [`publish_for_test`] for any unit, a thread range included.
+pub async fn publish_unit_for_test(db: &LocalDb, unit: &PackUnit) -> BuiltPack {
     if db.content_store().is_none() {
         let _ = db.set_private_content_store(Arc::new(InMemoryContentStore::new()));
     }
-    let built = pack_execution(db, execution_id).await.unwrap();
+    let built = pack_unit(db, unit).await.unwrap();
     publish(
         db,
         &built,
@@ -337,6 +342,67 @@ pub async fn seed_fixture_execution(db: &LocalDb, prefix: &str) -> FixtureEvents
     .await
     .unwrap();
     names
+}
+
+/// Insert one plain `assistant` event whose content is its id.
+pub async fn insert_event(
+    db: &LocalDb,
+    id: &str,
+    run: &str,
+    session: &str,
+    turn: Option<&str>,
+    sequence: i64,
+    created_at: i64,
+) {
+    let data =
+        serde_json::json!({"eventType": "assistant", "isError": false, "content": id}).to_string();
+    db.execute(
+        "INSERT INTO events(id, run_id, session_id, turn_id, sequence, timestamp, event_type,
+                            data, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'assistant', ?7, ?6)",
+        params![id, run, session, turn, sequence, created_at, data],
+    )
+    .await
+    .unwrap();
+}
+
+/// A third session of the fixture's `job-1`, after its two: `sess-3`, with
+/// `run-3` and its turn `turn-3`, and `turn-runless`, a turn with no run, each
+/// with one event. What a thread's live tail looks like beside its packed
+/// sessions.
+pub async fn seed_hot_tail(db: &LocalDb, prefix: &str) {
+    db.execute_script(
+        "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+           VALUES('sess-3','job-1','active',3,3);
+         INSERT INTO runs(id, project_id, job_id, session_id, status, created_at, updated_at)
+           VALUES('run-3','p','job-1','sess-3','exited',30,30);
+         INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+           VALUES('turn-3','sess-3','run-3','job-1',1,'complete',30,30);
+         INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+           VALUES('turn-runless','sess-3',NULL,'job-1',2,'complete',31,31);",
+    )
+    .await
+    .unwrap();
+    insert_event(
+        db,
+        &format!("{prefix}-tail"),
+        "run-3",
+        "sess-3",
+        Some("turn-3"),
+        1,
+        30,
+    )
+    .await;
+    insert_event(
+        db,
+        &format!("{prefix}-tail-runless"),
+        "run-3",
+        "sess-3",
+        Some("turn-runless"),
+        2,
+        31,
+    )
+    .await;
 }
 
 /// A store wrapper that counts actual object fetches in bounded-work tests.

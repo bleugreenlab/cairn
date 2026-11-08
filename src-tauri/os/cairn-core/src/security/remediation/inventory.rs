@@ -482,9 +482,10 @@ async fn scan_archival_segments(
 /// `history_tier` rows read per page while scanning history packs.
 const PACK_PAGE_ROWS: i64 = 100;
 
-/// Scan the `events` rows of every catalogued history pack.
+/// Scan the `events` rows of every catalogued history pack, of every scope
+/// kind: executions and thread ranges alike.
 ///
-/// A pack is a second copy of its execution's transcript, so a credential in a
+/// A pack is a second copy of its scope's transcript, so a credential in a
 /// packed event is reported twice: once under [`SinkKind::TranscriptEvent`] for
 /// the hot row, once under [`SinkKind::HistoryPack`] for the packed one, both by
 /// event id. Packs are visited a catalog page at a time and decoded one frame
@@ -509,27 +510,27 @@ async fn scan_history_packs(
     loop {
         let page: Vec<(String, String)> = db
             .query_all(
-                "SELECT execution_id, content_hash FROM history_tier WHERE execution_id > ?1
-                 ORDER BY execution_id LIMIT ?2",
+                "SELECT scope_id, content_hash FROM history_tier WHERE scope_id > ?1
+                 ORDER BY scope_id LIMIT ?2",
                 (after.clone(), PACK_PAGE_ROWS),
                 |row| Ok((row.text(0)?, row.text(1)?)),
             )
             .await?;
-        let Some(last) = page.last().map(|(execution, _)| execution.clone()) else {
+        let Some(last) = page.last().map(|(scope, _)| scope.clone()) else {
             break;
         };
-        for (execution_id, hash) in page {
+        for (scope_id, hash) in page {
             let bytes = match store.get(&hash).await {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => {
                     log::warn!(
-                        "remediation: history pack {hash} of {execution_id} is catalogued but not in the archive"
+                        "remediation: history pack {hash} of {scope_id} is catalogued but not in the archive"
                     );
                     continue;
                 }
                 Err(error) => {
                     return Err(cairn_db::storage::DbError::internal(format!(
-                        "history pack {hash} of {execution_id} could not be scanned: {error}"
+                        "history pack {hash} of {scope_id} could not be scanned: {error}"
                     )))
                 }
             };
@@ -543,7 +544,7 @@ async fn scan_history_packs(
                 })?
                 .map_err(|error| {
                     cairn_db::storage::DbError::internal(format!(
-                        "history pack {hash} of {execution_id} could not be scanned: {error}"
+                        "history pack {hash} of {scope_id} could not be scanned: {error}"
                     ))
                 })?;
             out.extend(found);
@@ -1035,6 +1036,18 @@ mod tests {
             None,
             "the pack was made while the event was withheld, so it must be rebuilt"
         );
+        for table in ["history_tier_runs", "history_tier_sessions"] {
+            assert_eq!(
+                db.query_opt_i64(
+                    format!("SELECT COUNT(*) FROM {table} WHERE scope_id = 'exec-1'"),
+                    ()
+                )
+                .await
+                .unwrap(),
+                Some(0),
+                "{table}: the dropped scope's mappings go with its row"
+            );
+        }
 
         // An evicted execution's catalog is never dropped: its hot row is gone.
         cairn_db::storage::history_pack::testing::publish_for_test(&db, "exec-1").await;

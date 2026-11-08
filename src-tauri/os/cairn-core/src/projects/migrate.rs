@@ -3288,6 +3288,347 @@ pub(super) mod tests {
         }
     }
 
+    /// A child genuinely filed by an issue node, whose filer answers its prompts
+    /// before the project moves to a team. The move rebuilds the issue graph in
+    /// another database under rekeyed ids, and it does not carry the filing
+    /// edge's answering authority across: the former parent is still an
+    /// authenticated agent of the moved project, yet its deny and its allow
+    /// (within a crossing grant it holds) are both refused and journaled, and
+    /// the prompt stays pending and unattributed.
+    /// How the revocation arrives is deliberately not pinned here. The operator
+    /// half is blocked by the inherited team claim-ledger outage (cairn/6489),
+    /// not by answer authority, and is outside this pin.
+    #[tokio::test]
+    async fn a_moved_childs_former_filing_parent_cannot_answer_its_permission_prompt() {
+        use crate::mcp::handlers::permission::{
+            resolve_permission_request, AnswerSurface, PermissionAnswer, PermissionDecision,
+        };
+        use crate::mcp::handlers::write::handle_write;
+        use crate::mcp::types::McpCallbackRequest;
+        use serde_json::json;
+
+        const TEAM: &str = "teamanswer";
+        let project_id = "a1a1a1a1-1111-4111-8111-111111111111";
+        let parent_issue = "a1a1a1a1-2222-4222-8222-222222222222";
+        let parent_exec = "a1a1a1a1-3333-4333-8333-333333333333";
+        let parent_job = "a1a1a1a1-4444-4444-8444-444444444444";
+        let parent_session = "a1a1a1a1-5555-4555-8555-555555555555";
+        let parent_run = "a1a1a1a1-6666-4666-8666-666666666666";
+        let child_exec = "a1a1a1a1-7777-4777-8777-777777777777";
+        let child_job = "a1a1a1a1-8888-4888-8888-888888888888";
+        let child_session = "a1a1a1a1-9999-4999-8999-999999999999";
+        let child_run = "a1a1a1a1-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let prompts = [
+            ("a1a1a1a1-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "perm-a"),
+            ("a1a1a1a1-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "perm-b"),
+            ("a1a1a1a1-bbbb-4bbb-8bbb-bbbbbbbbbbb3", "perm-c"),
+        ];
+
+        // An `ask` fence: only an exact session grant lets an ancestor allow.
+        let snapshot = |issue_id: &str| {
+            let snapshot: crate::models::ExecutionSnapshot = serde_json::from_value(json!({
+                "recipe": {"id": "recipe-1", "name": "Moved answer", "trigger": "manual", "nodes": [], "edges": []},
+                "agents": {"permission-agent": {
+                    "id": "permission-agent", "name": "Permission agent", "description": "",
+                    "prompt": "", "tools": [], "models": [], "fence": "ask"
+                }},
+                "skills": {},
+                "triggerContext": {"projectId": project_id, "issueId": issue_id, "triggerType": "manual"},
+                "createdAt": 1
+            }))
+            .unwrap();
+            snapshot.to_json().unwrap()
+        };
+        let crossing = json!({
+            "kind": "shell_path_crossing",
+            "verb": "read",
+            "descriptor": "/etc/hosts",
+            "summary": "the sandbox refused a write to /etc/hosts",
+            "request": {
+                "cwd": "/wt", "run_id": child_run, "tool": "read",
+                "payload": {"path": "file:/etc/hosts"}, "tool_use_id": "toolu-perm"
+            }
+        })
+        .to_string();
+
+        /// A running `builder` node on `issue_id`: execution, job, session, run.
+        async fn seed_builder(
+            db: &LocalDb,
+            project_id: &str,
+            issue_id: &str,
+            [exec, job, session, run]: [&str; 4],
+            snapshot: String,
+        ) {
+            db.execute(
+                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot, triggered_by)
+                 VALUES (?1, 'recipe-1', ?2, ?3, 'running', 1, 1, ?4, 'manual')",
+                (exec, issue_id, project_id, snapshot),
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "INSERT INTO jobs(id, execution_id, issue_id, project_id, agent_config_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'permission-agent', 'builder', 'running', ?5, 'builder', 1, 1)",
+                (job, exec, issue_id, project_id, session),
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES (?1, ?2, 'active', 1, 1)",
+                (session, job),
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES (?1, ?2, ?3, ?4, 'live', ?5, 1, 1, 'resume')",
+                (run, project_id, issue_id, job, session),
+            )
+            .await
+            .unwrap();
+        }
+
+        let local = Arc::new(migrated_db("answer-move-local.db", TURSO_MIGRATIONS.to_vec()).await);
+        let team = Arc::new(migrated_db("answer-move-team.db", TEAM_MIGRATIONS.to_vec()).await);
+        team.execute(
+            "INSERT INTO teams(id, name, created_at, updated_at) VALUES (?1, 'Answer', 1, 1)",
+            (TEAM,),
+        )
+        .await
+        .unwrap();
+        local
+            .execute(
+                "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
+                 VALUES (?1, 'Answer', 'http://localhost', '/tmp/team.db', 1)",
+                (TEAM,),
+            )
+            .await
+            .unwrap();
+        local
+            .execute(
+                "INSERT INTO workspaces(id, name, created_at, updated_at)
+                 VALUES ('workspace-1', 'Workspace', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        local
+            .execute(
+                "INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
+                 VALUES (?1, 'workspace-1', 'Answer Move', 'pmove', '/tmp/pmove', 3, 1, 1)",
+                (project_id,),
+            )
+            .await
+            .unwrap();
+        local
+            .execute(
+                "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
+                 VALUES (?1, ?2, 2, 'Filing parent', 'active', 'idle', 1, 1)",
+                (parent_issue, project_id),
+            )
+            .await
+            .unwrap();
+        seed_builder(
+            &local,
+            project_id,
+            parent_issue,
+            [parent_exec, parent_job, parent_session, parent_run],
+            snapshot(parent_issue),
+        )
+        .await;
+
+        let config = tempdir().unwrap();
+        let dbs = Arc::new(DbState::new(
+            local.clone(),
+            Arc::new(SearchIndex::open_or_create(config.path().join("search")).unwrap()),
+        ));
+        dbs.insert_team_db_for_test(TEAM, team.clone()).await;
+        let orch = crate::orchestrator::Orchestrator::builder(
+            dbs,
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            config.path().join("config"),
+        )
+        .build();
+        // The filer holds the crossing grant throughout, so a refused allow is
+        // about lineage, never about a missing effect grant.
+        orch.session_allowed_crossings
+            .lock()
+            .unwrap()
+            .insert("/etc/hosts".to_string());
+        async fn write_as(
+            orch: &crate::orchestrator::Orchestrator,
+            run_id: &str,
+            change: serde_json::Value,
+        ) -> String {
+            handle_write(
+                orch,
+                &McpCallbackRequest {
+                    answer_bound_ms: None,
+                    thread_id: None,
+                    cwd: String::new(),
+                    run_id: Some(run_id.to_string()),
+                    tool: "write".to_string(),
+                    payload: json!({ "changes": [change] }),
+                    tool_use_id: None,
+                    origin: None,
+                },
+            )
+            .await
+        }
+
+        // The parent's own run files the child through the real issues append,
+        // which records the authenticated filing job as creator proof.
+        let filed = write_as(
+            &orch,
+            parent_run,
+            json!({"target": "cairn://p/pmove/issues", "mode": "append",
+                   "payload": {"title": "Filed child", "parent": "cairn://p/pmove/2"}}),
+        )
+        .await;
+        assert!(filed.contains("Created issue pmove/"), "{filed}");
+        let (child_issue, child_number) = local
+            .query_one(
+                "SELECT id, number FROM issues WHERE title = 'Filed child'",
+                (),
+                |row| Ok((row.text(0)?, row.i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            local
+                .query_one(
+                    "SELECT parent_issue_id, parent_job_id FROM issues WHERE id = ?1",
+                    (child_issue.clone(),),
+                    |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
+                )
+                .await
+                .unwrap(),
+            (Some(parent_issue.to_string()), Some(parent_job.to_string())),
+            "the child is filed under its parent with the filer's creator proof"
+        );
+        seed_builder(
+            &local,
+            project_id,
+            &child_issue,
+            [child_exec, child_job, child_session, child_run],
+            snapshot(&child_issue),
+        )
+        .await;
+        for (id, segment) in prompts {
+            local
+                .execute(
+                    "INSERT INTO permission_requests(id, run_id, job_id, tool_use_id, tool_name, tool_input, status, created_at, uri_segment)
+                     VALUES (?1, ?2, ?3, ?4, 'read', ?5, 'pending', 1, ?6)",
+                    (id, child_run, child_job, format!("toolu-{segment}"), crossing.clone(), segment),
+                )
+                .await
+                .unwrap();
+        }
+        let prompt_target = |segment: &str| {
+            format!("cairn://p/pmove/{child_number}/1/builder/permissions/{segment}")
+        };
+        let answer = |segment: &str, decision: &str| json!({"target": prompt_target(segment), "mode": "patch", "payload": {"decision": decision}});
+
+        // Positive controls: before the move the filer genuinely answers both
+        // ways, so what follows is the move's doing, not a fixture gap.
+        for ((id, segment), decision, status) in [
+            (prompts[0], "deny", "denied"),
+            (prompts[1], "allow", "allowed"),
+        ] {
+            let result = write_as(&orch, parent_run, answer(segment, decision)).await;
+            assert!(
+                result.contains(&format!("Answered permission {segment}")),
+                "pre-move {decision}: {result}"
+            );
+            assert_eq!(
+                local
+                    .query_opt_text(
+                        "SELECT status FROM permission_requests WHERE id = ?1",
+                        (id,)
+                    )
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(status)
+            );
+        }
+
+        move_project_to_team(&orch.db, &FixedClock, project_id, TEAM, &HashSet::new())
+            .await
+            .unwrap();
+
+        let moved_parent_run = rekey_to_team(parent_run, TEAM).unwrap();
+        let moved_parent_job = rekey_to_team(parent_job, TEAM).unwrap();
+        let moved_prompt = rekey_to_team(prompts[2].0, TEAM).unwrap();
+        // The former parent survives the move as a real agent of the moved
+        // project, under its rekeyed identity.
+        assert_eq!(
+            crate::jobs::queries::home_uri_for_job(&team, &moved_parent_job)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cairn://p/pmove/2/1/builder")
+        );
+
+        // The answer is built exactly as the permission resource patch builds
+        // it, from the former parent's authenticated rekeyed run, and handed to
+        // the canonical resolver by request id. The node-coordinate lookup in
+        // front of that resolver reads only the private database, so it cannot
+        // address a team project's prompt by URI.
+        let mut refusals = 0;
+        for decision in [PermissionDecision::Deny, PermissionDecision::Allow] {
+            let agent = crate::mcp::handlers::run_context::authenticated_agent_for_run(
+                &orch.db,
+                &moved_parent_run,
+            )
+            .await
+            .expect("the former parent authenticates as its moved run");
+            let (actor, appearance) = agent.appearance(chrono::Utc::now().timestamp()).unwrap();
+            let agent_answer =
+                PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
+                    .with_authenticated_appearance(actor, appearance)
+                    .unwrap();
+            let decision = format!("{decision:?}");
+            let result = resolve_permission_request(&orch, &moved_prompt, agent_answer)
+                .await
+                .map(|_| "accepted".to_string())
+                .unwrap_or_else(|refusal| refusal);
+            // `not an ancestor` is reached only after the answering run
+            // authenticated and its home matched its stored run, and before
+            // the first-answer claim, so a refusal here never claims.
+            assert!(
+                result.contains("not an ancestor"),
+                "post-move {decision}: {result}"
+            );
+            assert_eq!(
+                team.query_one(
+                    "SELECT status, resolution_actor FROM permission_requests WHERE id = ?1",
+                    (moved_prompt.clone(),),
+                    |row| Ok((row.text(0)?, row.opt_text(1)?)),
+                )
+                .await
+                .unwrap(),
+                ("pending".to_string(), None),
+                "post-move {decision}: the prompt stays pending and unattributed"
+            );
+            refusals += 1;
+            assert_eq!(
+                count(
+                    &local,
+                    &format!(
+                        "SELECT COUNT(*) FROM authorization_events
+                         WHERE request_uri = '{moved_prompt}' AND reason = 'permission_answer_authority'
+                           AND outcome = 'forbidden'"
+                    ),
+                )
+                .await,
+                refusals,
+                "post-move {decision}: the refusal is journaled"
+            );
+        }
+    }
+
     // === Quiesce-gate (`blocking_work`) tests ===
 
     /// A migrated local db seeded with one project (`proj`, key `GATE`).

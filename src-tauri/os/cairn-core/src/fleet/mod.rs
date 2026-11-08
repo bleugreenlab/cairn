@@ -45989,6 +45989,19 @@ mod handoff_tests {
         orch
     }
 
+    fn parent_answer(decision: PermissionDecision) -> PermissionAnswer {
+        let (actor, appearance) = crate::mcp::handlers::run_context::AuthenticatedAgent {
+            home: "cairn://p/prj/1/1/parent".to_string(),
+            run_id: "run-parent".to_string(),
+            job_id: "job-parent".to_string(),
+        }
+        .appearance(1)
+        .unwrap();
+        PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
+            .with_authenticated_appearance(actor, appearance)
+            .unwrap()
+    }
+
     fn no_path_rerun() -> CrossingRerun {
         CrossingRerun::Refused {
             reason: cairn_sandbox::NO_PATH_RECOVERED.into(),
@@ -46160,8 +46173,7 @@ mod handoff_tests {
         let refusal = resolve_permission_request(
             &orch,
             &request_id,
-            PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch)
-                .with_actor("cairn://p/prj/1/1/agent")
+            parent_answer(PermissionDecision::Allow)
                 .with_containment_scope(PermissionScope::Session),
         )
         .await
@@ -46794,8 +46806,7 @@ mod handoff_tests {
         let outcome = resolve_permission_request(
             &orch,
             &request_id,
-            PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch)
-                .with_actor("cairn://p/prj/1/1/agent")
+            parent_answer(PermissionDecision::Allow)
                 .with_containment_scope(PermissionScope::Session),
         )
         .await;

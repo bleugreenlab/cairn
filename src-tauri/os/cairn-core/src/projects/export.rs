@@ -236,6 +236,10 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
         "this machine's archive catalog, by run: it names pack objects in the local file store; history travels as event rows",
     ),
     (
+        "history_tier_sessions",
+        "this machine's archive catalog, by session: it names pack objects in the local file store; history travels as event rows",
+    ),
+    (
         "search_outbox",
         "the search indexer's work queue: each row is (source_table, source_id, op, status), no content, naming a row exported in its own table; selecting it costs hours, because source_id is unindexed and checked against every event id the project has",
     ),

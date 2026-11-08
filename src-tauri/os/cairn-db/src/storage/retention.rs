@@ -587,6 +587,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "history_tier_runs",
         "the catalog of history packs, by run: the read seam's source lookup",
     ),
+    keep(
+        "history_tier_sessions",
+        "the catalog of history packs, by session: the read seam's source lookup for sessions and run-less turns",
+    ),
     keep("delegated_packet_backfill_state", MARKER),
     keep("attention_push_retirement_backfill", MARKER),
     keep("embedding_state", MARKER),

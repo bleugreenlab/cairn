@@ -3,21 +3,27 @@
 //! Two halves. [`PackWriter`] is pure and synchronous: it takes rows section by
 //! section, cuts them into frames ([`super::FRAME_ROWS`] rows or
 //! [`super::FRAME_RAW_BYTES`] of JSONL, never across keys), and assembles the
-//! object. [`ExecutionPacker`] reads one execution out of the database for it,
+//! object. [`HistoryPacker`] reads one [`PackUnit`] out of the database for it,
 //! one keyset page at a time:
 //!
-//! - [`ExecutionPacker::start`] reads the manifest skeleton (jobs, runs,
-//!   sessions, turns) and the live column lists, in one short read.
-//! - [`ExecutionPacker::read_next`] reads the next page in its own short read
+//! - [`HistoryPacker::start`] reads the manifest skeleton (jobs, runs,
+//!   sessions, turns) and the live column lists, in one short read. Only this
+//!   differs by unit: an execution's skeleton is everything its jobs hold, and
+//!   a thread range's is the explicit jobs, sessions and runs it names, with
+//!   the turns of those sessions and runs.
+//! - [`HistoryPacker::read_next`] reads the next page in its own short read
 //!   and, for an `events` page, gathers what reconstruction needs (its own
 //!   short read, then any store fetch). It holds nothing open when it returns.
-//! - [`ExecutionPacker::absorb`] does the CPU work for that page: reconstruct,
+//! - [`HistoryPacker::absorb`] does the CPU work for that page: reconstruct,
 //!   apply the quarantine gate, encode each row as the export does, compress
 //!   the frames it fills. It is synchronous and touches no database, so a
 //!   caller can run it on a blocking thread.
-//! - [`ExecutionPacker::finish`] completes the manifest and the object.
+//! - [`HistoryPacker::finish`] completes the manifest and the object.
 //!
-//! No statement here writes. [`pack_execution`] drives the loop with no pacing
+//! Turn embeddings stay keyed by job and are read for the skeleton's turns
+//! only, so two thread ranges can each hold a frame for the same job.
+//!
+//! No statement here writes. [`pack_unit`] drives the loop with no pacing
 //! between pages, for tests and tools; the maintenance pass drives it itself.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -26,11 +32,12 @@ use serde_json::{Map, Value as Json};
 use sha2::{Digest, Sha256};
 use turso::Value;
 
+use super::catalog::TierScope;
 use super::encode::{event_columns_object, finish_event_object, json_value};
 use super::{
     hex, ColumnDecl, IndexEntry, Manifest, ManifestJob, ManifestRun, ManifestSession, ManifestTurn,
-    PackError, Scope, Section, SectionEntry, FOOTER_MAGIC, FORMAT, FRAME_RAW_BYTES, FRAME_ROWS,
-    MAGIC, NOT_PACKED, TOKEN_ROLLUP_NOTE,
+    PackError, Scope, ScopeKind, Section, SectionEntry, FOOTER_MAGIC, FORMAT, FRAME_RAW_BYTES,
+    FRAME_ROWS, MAGIC, NOT_PACKED, TOKEN_ROLLUP_NOTE,
 };
 use crate::models::Event;
 use crate::storage::content_store::content_hash;
@@ -46,7 +53,73 @@ pub struct BuiltPack {
     /// The object's key: the sha256 of `bytes`.
     pub content_hash: String,
     pub manifest: Manifest,
+    /// The catalog row this pack is published under, from the unit it was
+    /// built for, so a pack cannot be catalogued as some other scope.
+    pub scope: TierScope,
     pub stats: PackStats,
+}
+
+/// Whole closed sessions of one thread session job, with the task jobs that
+/// ran in them: one thread-range pack.
+///
+/// The caller states the range; nothing here decides eligibility. It must be
+/// closed: every run naming one of `sessions` is in `runs`, and every session a
+/// run in `runs` names is in `sessions`, so a session read from the pack is
+/// whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRange {
+    /// The thread's session job, which owns the range.
+    pub owner_job_id: String,
+    /// The `sessions.sequence` of the range's first and last session.
+    pub first_sequence: i64,
+    pub last_sequence: i64,
+    /// The compaction generation the range was cut at.
+    pub through_generation: i64,
+    /// The session job, then the task jobs packed with it.
+    pub jobs: Vec<String>,
+    pub sessions: Vec<String>,
+    pub runs: Vec<String>,
+}
+
+impl ThreadRange {
+    /// `history_tier.scope_id`: deterministic, so a rebuilt range replaces its
+    /// own row.
+    pub fn scope_id(&self) -> String {
+        format!(
+            "{}/{}-{}",
+            self.owner_job_id, self.first_sequence, self.last_sequence
+        )
+    }
+}
+
+/// What one pack covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackUnit {
+    Execution(String),
+    ThreadRange(ThreadRange),
+}
+
+impl PackUnit {
+    /// The catalog row the unit is published under.
+    pub fn scope(&self) -> TierScope {
+        match self {
+            PackUnit::Execution(id) => TierScope::execution(id),
+            PackUnit::ThreadRange(range) => TierScope {
+                kind: ScopeKind::ThreadRange,
+                id: range.scope_id(),
+                owner_id: range.owner_job_id.clone(),
+                through_generation: Some(range.through_generation),
+            },
+        }
+    }
+
+    /// What the unit is, for messages.
+    fn describe(&self) -> String {
+        match self {
+            PackUnit::Execution(id) => format!("execution {id}"),
+            PackUnit::ThreadRange(range) => format!("thread job {}", range.owner_job_id),
+        }
+    }
 }
 
 /// Counts gathered while packing.
@@ -298,6 +371,7 @@ async fn table_columns(conn: &TrackedConnection, table: &str) -> DbResult<Vec<Co
 struct Skeleton {
     project_id: Option<String>,
     issue_id: Option<String>,
+    execution_id: Option<String>,
     migration_high_water: Option<String>,
     jobs: Vec<String>,
     /// `(run_id, job_id, run's own session_id)`, in job order then creation
@@ -321,17 +395,11 @@ async fn read_skeleton(conn: &TrackedConnection, execution_id: &str) -> DbResult
     let mut skeleton = Skeleton {
         project_id: row.opt_text(0)?,
         issue_id: row.opt_text(1)?,
+        execution_id: Some(execution_id.to_string()),
         ..Skeleton::default()
     };
     drop(rows);
-
-    let mut rows = conn
-        .query("SELECT MAX(version) FROM cairn_schema_migrations", ())
-        .await?;
-    if let Some(row) = rows.next().await? {
-        skeleton.migration_high_water = row.opt_text(0)?;
-    }
-    drop(rows);
+    skeleton.migration_high_water = read_high_water(conn).await?;
 
     let mut rows = conn
         .query(
@@ -383,7 +451,123 @@ async fn read_skeleton(conn: &TrackedConnection, execution_id: &str) -> DbResult
             });
         }
     }
+    skeleton.columns = read_columns(conn).await?;
+    Ok(Some(skeleton))
+}
 
+/// A thread range's skeleton: its owner's project, issue and execution, and
+/// exactly the jobs, sessions and runs it names, with the turns of those
+/// sessions and runs. Runs and sessions are ordered as an execution's are: by
+/// their job's place in `range.jobs`, then creation. Each is read by its own
+/// key, so no bound id list reaches the planner. Rows that are gone are left
+/// out.
+async fn read_range_skeleton(
+    conn: &TrackedConnection,
+    range: &ThreadRange,
+) -> DbResult<Option<Skeleton>> {
+    let mut rows = conn
+        .query(
+            "SELECT project_id, issue_id, execution_id FROM jobs WHERE id = ?1",
+            (range.owner_job_id.as_str(),),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let mut skeleton = Skeleton {
+        project_id: row.opt_text(0)?,
+        issue_id: row.opt_text(1)?,
+        execution_id: row.opt_text(2)?,
+        jobs: range.jobs.clone(),
+        ..Skeleton::default()
+    };
+    drop(rows);
+    skeleton.migration_high_water = read_high_water(conn).await?;
+
+    let job_position: HashMap<&str, usize> = range
+        .jobs
+        .iter()
+        .enumerate()
+        .map(|(position, job)| (job.as_str(), position))
+        .collect();
+    let place = |job: &Option<String>| {
+        job.as_deref()
+            .and_then(|job| job_position.get(job).copied())
+            .unwrap_or(usize::MAX)
+    };
+
+    let mut runs = Vec::new();
+    for run in &range.runs {
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, session_id, created_at, rowid FROM runs WHERE id = ?1",
+                (run.as_str(),),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let job = row.opt_text(1)?;
+            runs.push((
+                (place(&job), row.i64(3)?, row.i64(4)?),
+                (row.text(0)?, job, row.opt_text(2)?),
+            ));
+        }
+    }
+    runs.sort_by_key(|(key, _)| *key);
+    skeleton.runs = runs.into_iter().map(|(_, run)| run).collect();
+
+    let mut sessions = Vec::new();
+    for session in &range.sessions {
+        let mut rows = conn
+            .query(
+                "SELECT id, job_id, created_at, rowid FROM sessions WHERE id = ?1",
+                (session.as_str(),),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let job = row.opt_text(1)?;
+            sessions.push(((place(&job), row.i64(2)?, row.i64(3)?), (row.text(0)?, job)));
+        }
+    }
+    sessions.sort_by_key(|(key, _)| *key);
+    skeleton.sessions = sessions.into_iter().map(|(_, session)| session).collect();
+
+    let mut turns: BTreeMap<i64, ManifestTurn> = BTreeMap::new();
+    let by_owner = [("session_id", &range.sessions), ("run_id", &range.runs)];
+    for (column, owners) in by_owner {
+        let sql = format!(
+            "SELECT id, session_id, run_id, sequence, job_id, rowid FROM turns WHERE {column} = ?1"
+        );
+        for owner in owners.iter() {
+            let mut rows = conn.query(&sql, (owner.as_str(),)).await?;
+            while let Some(row) = rows.next().await? {
+                turns.entry(row.i64(5)?).or_insert(ManifestTurn {
+                    id: row.text(0)?,
+                    job_id: row.opt_text(4)?,
+                    session_id: row.opt_text(1)?,
+                    run_id: row.opt_text(2)?,
+                    sequence: row.opt_i64(3)?,
+                });
+            }
+        }
+    }
+    skeleton.turns = turns.into_values().collect();
+    skeleton.columns = read_columns(conn).await?;
+    Ok(Some(skeleton))
+}
+
+async fn read_high_water(conn: &TrackedConnection) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query("SELECT MAX(version) FROM cairn_schema_migrations", ())
+        .await?;
+    Ok(match rows.next().await? {
+        Some(row) => row.opt_text(0)?,
+        None => None,
+    })
+}
+
+/// Every section's live columns, `events` in [`event_column_order`].
+async fn read_columns(conn: &TrackedConnection) -> DbResult<BTreeMap<Section, Vec<ColumnDecl>>> {
+    let mut all = BTreeMap::new();
     for section in Section::ALL {
         let mut columns = table_columns(conn, section.table()).await?;
         if section == Section::Events {
@@ -395,9 +579,9 @@ async fn read_skeleton(conn: &TrackedConnection, execution_id: &str) -> DbResult
                     .unwrap_or(usize::MAX)
             });
         }
-        skeleton.columns.insert(section, columns);
+        all.insert(section, columns);
     }
-    Ok(Some(skeleton))
+    Ok(all)
 }
 
 /// One `events` row as read: its output object (less `data`), the stored
@@ -459,9 +643,9 @@ struct RunTally {
     max_rowid: Option<i64>,
 }
 
-/// Packs one execution, a page at a time. See the module docs.
-pub struct ExecutionPacker {
-    execution_id: String,
+/// Packs one unit, a page at a time. See the module docs.
+pub struct HistoryPacker {
+    scope: TierScope,
     skeleton: Skeleton,
     writer: PackWriter,
     step: Step,
@@ -470,10 +654,11 @@ pub struct ExecutionPacker {
     stats: PackStats,
 }
 
-/// Why packing an execution failed.
+/// Why packing a unit failed.
 #[derive(Debug, thiserror::Error)]
 pub enum PackBuildError {
-    #[error("execution {0} not found")]
+    /// The unit's execution, or a thread range's owning job, is gone.
+    #[error("{0} not found")]
     NotFound(String),
     #[error(transparent)]
     Db(#[from] DbError),
@@ -481,23 +666,25 @@ pub enum PackBuildError {
     Pack(#[from] PackError),
 }
 
-impl ExecutionPacker {
-    /// Read the execution's manifest skeleton and live columns.
-    pub async fn start(
-        db: &LocalDb,
-        execution_id: &str,
-    ) -> Result<ExecutionPacker, PackBuildError> {
-        let id = execution_id.to_string();
+impl HistoryPacker {
+    /// Read the unit's manifest skeleton and live columns.
+    pub async fn start(db: &LocalDb, unit: &PackUnit) -> Result<HistoryPacker, PackBuildError> {
+        let read = unit.clone();
         let skeleton = db
             .read(move |conn| {
-                let id = id.clone();
-                Box::pin(async move { read_skeleton(conn, &id).await })
+                let unit = read.clone();
+                Box::pin(async move {
+                    match &unit {
+                        PackUnit::Execution(id) => read_skeleton(conn, id).await,
+                        PackUnit::ThreadRange(range) => read_range_skeleton(conn, range).await,
+                    }
+                })
             })
             .await?
-            .ok_or_else(|| PackBuildError::NotFound(execution_id.to_string()))?;
+            .ok_or_else(|| PackBuildError::NotFound(unit.describe()))?;
         let writer = PackWriter::new(skeleton.columns.clone());
-        Ok(ExecutionPacker {
-            execution_id: execution_id.to_string(),
+        Ok(HistoryPacker {
+            scope: unit.scope(),
             writer,
             step: Step::Events {
                 run: 0,
@@ -510,8 +697,9 @@ impl ExecutionPacker {
         })
     }
 
-    pub fn execution_id(&self) -> &str {
-        &self.execution_id
+    /// The catalog row the pack will be published under.
+    pub fn scope(&self) -> &TierScope {
+        &self.scope
     }
 
     pub fn stats(&self) -> &PackStats {
@@ -525,7 +713,7 @@ impl ExecutionPacker {
 
     /// What the object holds so far; see [`PackWriter::held_bytes`]. A caller
     /// bounding a pack's size checks this between pages, so an oversized
-    /// execution stops before it is assembled.
+    /// unit stops before it is assembled.
     pub fn held_bytes(&self) -> u64 {
         self.writer.held_bytes()
     }
@@ -751,8 +939,8 @@ impl ExecutionPacker {
 
     /// Complete the manifest and assemble the object.
     pub fn finish(self) -> Result<BuiltPack, PackError> {
-        let ExecutionPacker {
-            execution_id,
+        let HistoryPacker {
+            scope,
             skeleton,
             writer,
             mut run_tally,
@@ -804,12 +992,12 @@ impl ExecutionPacker {
             format: FORMAT,
             migration_high_water: skeleton.migration_high_water.clone(),
             scope: Scope {
-                kind: "execution".to_string(),
-                id: execution_id.clone(),
+                kind: scope.kind,
+                id: scope.id.clone(),
             },
             project_id: skeleton.project_id.clone(),
             issue_id: skeleton.issue_id.clone(),
-            execution_id,
+            execution_id: skeleton.execution_id.clone(),
             jobs: skeleton
                 .jobs
                 .iter()
@@ -827,18 +1015,24 @@ impl ExecutionPacker {
             content_hash: content_hash(&bytes),
             bytes,
             manifest,
+            scope,
             stats,
         })
     }
 }
 
-/// Pack one execution with no pacing between pages.
-pub async fn pack_execution(db: &LocalDb, execution_id: &str) -> Result<BuiltPack, PackBuildError> {
-    let mut packer = ExecutionPacker::start(db, execution_id).await?;
+/// Pack one unit with no pacing between pages.
+pub async fn pack_unit(db: &LocalDb, unit: &PackUnit) -> Result<BuiltPack, PackBuildError> {
+    let mut packer = HistoryPacker::start(db, unit).await?;
     while let Some(page) = packer.read_next(db).await? {
         packer.absorb(page)?;
     }
     Ok(packer.finish()?)
+}
+
+/// Pack one execution with no pacing between pages.
+pub async fn pack_execution(db: &LocalDb, execution_id: &str) -> Result<BuiltPack, PackBuildError> {
+    pack_unit(db, &PackUnit::Execution(execution_id.to_string())).await
 }
 
 fn placeholders(count: usize) -> String {

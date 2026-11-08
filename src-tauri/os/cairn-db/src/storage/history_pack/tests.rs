@@ -24,12 +24,12 @@ fn manifest() -> Manifest {
         format: FORMAT,
         migration_high_water: None,
         scope: Scope {
-            kind: "execution".to_string(),
+            kind: ScopeKind::Execution,
             id: "e".to_string(),
         },
         project_id: None,
         issue_id: None,
-        execution_id: "e".to_string(),
+        execution_id: Some("e".to_string()),
         jobs: Vec::new(),
         runs: Vec::new(),
         sessions: Vec::new(),
@@ -378,8 +378,9 @@ async fn a_pack_states_every_section_and_counts_what_it_read() {
     let pack = HistoryPack::open(built.bytes.clone()).unwrap();
     pack.verify().unwrap();
     let manifest = pack.manifest();
-    assert_eq!(manifest.scope.kind, "execution");
-    assert_eq!(manifest.execution_id, "exec-1");
+    assert_eq!(manifest.scope.kind, ScopeKind::Execution);
+    assert_eq!(manifest.scope.id, "exec-1");
+    assert_eq!(manifest.execution_id.as_deref(), Some("exec-1"));
     assert_eq!(manifest.project_id.as_deref(), Some("p"));
     assert!(manifest.migration_high_water.is_some());
 
@@ -591,6 +592,7 @@ async fn publish_refuses_valid_pack_bytes_under_the_wrong_content_hash() {
 
 #[tokio::test]
 async fn publish_writes_the_catalog_and_changes_no_hot_row() {
+    use crate::storage::RowExt;
     let db = crate::storage::migrated_test_db("pack-publish.db").await;
     seed_fixture_execution(&db, "publish").await;
     let count = "SELECT COUNT(*) FROM events";
@@ -604,11 +606,28 @@ async fn publish_writes_the_catalog_and_changes_no_hot_row() {
     assert_eq!(entry.bytes, built.bytes.len() as i64);
     assert_eq!(entry.row_counts["events"], 8);
     assert_eq!(entry.evicted_at, None);
+    assert_eq!(entry.kind, ScopeKind::Execution);
+    assert_eq!(entry.owner_id, "exec-1");
+    assert_eq!(entry.through_generation, None);
     assert_eq!(
         db.query_opt_i64("SELECT COUNT(*) FROM history_tier_runs", ())
             .await
             .unwrap(),
         Some(2)
+    );
+    assert_eq!(
+        db.query_all(
+            "SELECT session_id, scope_id FROM history_tier_sessions ORDER BY session_id",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap(),
+        [
+            ("sess-1".to_string(), "exec-1".to_string()),
+            ("sess-2".to_string(), "exec-1".to_string())
+        ],
+        "the execution's own sessions are mapped to it"
     );
 
     // Packing again replaces the catalog rows rather than adding to them.
@@ -623,7 +642,7 @@ async fn publish_writes_the_catalog_and_changes_no_hot_row() {
 }
 
 async fn assert_evicted_republication(evict_during_publish: bool) {
-    use crate::storage::events::history::{EventFilter, HistoryReader, Provenance};
+    use crate::storage::events::history::{EventFilter, HistoryReader, PackRef, Provenance};
     use crate::storage::history_pack::testing::{evict_all, fingerprint};
     use crate::storage::RowExt;
 
@@ -632,7 +651,7 @@ async fn assert_evicted_republication(evict_during_publish: bool) {
     let original = publish_for_test(&db, "exec-1").await;
     let mut expected_entry = catalog::tier_entry(&db, "exec-1").await.unwrap().unwrap();
     expected_entry.evicted_at = Some(5);
-    let mappings_sql = "SELECT run_id, execution_id FROM history_tier_runs ORDER BY run_id";
+    let mappings_sql = "SELECT run_id, scope_id FROM history_tier_runs ORDER BY run_id";
     let mappings = db
         .query_all(mappings_sql, (), |row| Ok((row.text(0)?, row.text(1)?)))
         .await
@@ -655,7 +674,7 @@ async fn assert_evicted_republication(evict_during_publish: bool) {
             "CREATE TRIGGER evict_during_publish AFTER INSERT ON history_tier_runs
              WHEN NEW.run_id = 'run-1'
              BEGIN
-                 UPDATE history_tier SET evicted_at = 5 WHERE execution_id = 'exec-1';
+                 UPDATE history_tier SET evicted_at = 5 WHERE scope_id = 'exec-1';
              END;",
         )
         .await
@@ -685,7 +704,7 @@ async fn assert_evicted_republication(evict_during_publish: bool) {
             db.mark_history_evicted();
         }
         assert!(
-            matches!(error, catalog::PublishError::Evicted { ref execution_id } if execution_id == "exec-1"),
+            matches!(error, catalog::PublishError::Evicted { kind: ScopeKind::Execution, ref scope_id } if scope_id == "exec-1"),
             "{error}"
         );
         assert_eq!(
@@ -705,10 +724,11 @@ async fn assert_evicted_republication(evict_during_publish: bool) {
                 .unwrap();
             assert_eq!(
                 page.provenance,
-                Provenance::Pack {
-                    execution_id: "exec-1".to_string(),
+                Provenance::Pack(PackRef {
+                    scope_id: "exec-1".to_string(),
+                    kind: ScopeKind::Execution,
                     content_hash: original.content_hash.clone(),
-                }
+                })
             );
             assert_eq!(&fingerprint(&page.rows), expected);
         }
@@ -734,7 +754,7 @@ async fn publish_final_write_refuses_an_eviction_after_the_early_check() {
 
 #[tokio::test]
 async fn publish_run_mapping_write_refuses_an_eviction_during_store_read_back() {
-    use crate::storage::events::history::{EventFilter, HistoryReader, Provenance};
+    use crate::storage::events::history::{EventFilter, HistoryReader, PackRef, Provenance};
     use crate::storage::history_pack::testing::{evict_all, fingerprint};
     use crate::storage::{ContentStoreError, LocalDb, RowExt};
 
@@ -763,7 +783,7 @@ async fn publish_run_mapping_write_refuses_an_eviction_during_store_read_back() 
     let original = publish_for_test(&db, "exec-1").await;
     let mut expected_entry = catalog::tier_entry(&db, "exec-1").await.unwrap().unwrap();
     expected_entry.evicted_at = Some(5);
-    let mappings_sql = "SELECT run_id, execution_id FROM history_tier_runs ORDER BY run_id";
+    let mappings_sql = "SELECT run_id, scope_id FROM history_tier_runs ORDER BY run_id";
     let expected_mappings = db
         .query_all(mappings_sql, (), |row| Ok((row.text(0)?, row.text(1)?)))
         .await
@@ -809,7 +829,7 @@ async fn publish_run_mapping_write_refuses_an_eviction_during_store_read_back() 
     .await
     .unwrap_err();
     assert!(
-        matches!(error, catalog::PublishError::Evicted { ref execution_id } if execution_id == "exec-1"),
+        matches!(error, catalog::PublishError::Evicted { kind: ScopeKind::Execution, ref scope_id } if scope_id == "exec-1"),
         "{error}"
     );
     assert_eq!(
@@ -839,10 +859,11 @@ async fn publish_run_mapping_write_refuses_an_eviction_during_store_read_back() 
             .unwrap();
         assert_eq!(
             page.provenance,
-            Provenance::Pack {
-                execution_id: "exec-1".to_string(),
+            Provenance::Pack(PackRef {
+                scope_id: "exec-1".to_string(),
+                kind: ScopeKind::Execution,
                 content_hash: original.content_hash.clone(),
-            }
+            })
         );
         assert_eq!(fingerprint(&page.rows), expected);
     }
@@ -852,4 +873,286 @@ async fn publish_run_mapping_write_refuses_an_eviction_during_store_read_back() 
             .unwrap(),
         Some(0)
     );
+}
+
+/// The scope migration on a catalog that already holds packs, as a dev
+/// instance's does: every row becomes an execution scope with its facts and
+/// eviction marker intact, run mappings keep their scope, orphans included,
+/// and each catalogued execution's sessions are mapped to it.
+#[tokio::test]
+async fn the_scope_migration_keeps_a_populated_catalog() {
+    use crate::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+
+    let temp = tempfile::tempdir().unwrap();
+    let db = LocalDb::open(temp.path().join("scopes.db")).await.unwrap();
+    let before: Vec<_> = TURSO_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.name() != "history_tier_scopes")
+        .copied()
+        .collect();
+    assert!(before.len() < TURSO_MIGRATIONS.len());
+    MigrationRunner::new(before).run(&db).await.unwrap();
+    seed_fixture_execution(&db, "scopes").await;
+    db.execute_script(
+        "INSERT INTO history_tier(execution_id, content_hash, format, bytes, hot_bytes_estimate,
+                                  row_counts, resolved_at, packed_at, evicted_at)
+           VALUES('exec-1', 'hash-1', 1, 100, 1000, '{\"events\":8}', 10, 20, 5);
+         INSERT INTO history_tier(execution_id, content_hash, format, bytes, hot_bytes_estimate,
+                                  row_counts, resolved_at, packed_at, evicted_at)
+           VALUES('exec-2', 'hash-2', 1, 7, 70, '{}', 11, 21, NULL);
+         INSERT INTO history_tier_runs(run_id, execution_id) VALUES('run-1', 'exec-1');
+         INSERT INTO history_tier_runs(run_id, execution_id) VALUES('run-2', 'exec-1');
+         INSERT INTO history_tier_runs(run_id, execution_id) VALUES('orphan-run', 'exec-gone');",
+    )
+    .await
+    .unwrap();
+
+    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+        .run(&db)
+        .await
+        .unwrap();
+
+    let entry = catalog::tier_entry(&db, "exec-1").await.unwrap().unwrap();
+    assert_eq!(
+        entry,
+        catalog::TierEntry {
+            scope_id: "exec-1".into(),
+            kind: ScopeKind::Execution,
+            owner_id: "exec-1".into(),
+            content_hash: "hash-1".into(),
+            format: 1,
+            bytes: 100,
+            hot_bytes_estimate: 1000,
+            row_counts: BTreeMap::from([("events".to_string(), 8)]),
+            resolved_at: 10,
+            packed_at: 20,
+            evicted_at: Some(5),
+            through_generation: None,
+        }
+    );
+    let second = catalog::tier_entry(&db, "exec-2").await.unwrap().unwrap();
+    assert_eq!(
+        (second.kind, second.owner_id.as_str(), second.evicted_at),
+        (ScopeKind::Execution, "exec-2", None)
+    );
+    let pairs = |sql: &'static str| {
+        let db = &db;
+        async move {
+            db.query_all(sql, (), |row| Ok((row.text(0)?, row.text(1)?)))
+                .await
+                .unwrap()
+        }
+    };
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+    assert_eq!(
+        pairs("SELECT run_id, scope_id FROM history_tier_runs ORDER BY run_id").await,
+        [
+            pair("orphan-run", "exec-gone"),
+            pair("run-1", "exec-1"),
+            pair("run-2", "exec-1")
+        ]
+    );
+    assert_eq!(
+        pairs("SELECT session_id, scope_id FROM history_tier_sessions ORDER BY session_id").await,
+        [pair("sess-1", "exec-1"), pair("sess-2", "exec-1")],
+        "the sessions the execution join reached are mapped explicitly"
+    );
+    let indexes = db
+        .query_all(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_history_tier%'
+             ORDER BY name",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        indexes,
+        [
+            "idx_history_tier_owner",
+            "idx_history_tier_runs_scope",
+            "idx_history_tier_sessions_scope"
+        ]
+    );
+    let refused = db
+        .execute(
+            "INSERT INTO history_tier(scope_id, kind, owner_id, content_hash, format, bytes,
+                                      hot_bytes_estimate, row_counts, resolved_at, packed_at)
+             VALUES('x', 'issue', 'x', 'h', 1, 1, 1, '{}', 1, 1)",
+            (),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "the kind CHECK admits only the two scopes"
+    );
+
+    // The migrated catalog serves reads by its mappings.
+    db.mark_history_evicted();
+    let page = crate::storage::events::history::HistoryReader::new(&db)
+        .run_events(
+            "run-2",
+            crate::storage::events::history::EventFilter::default(),
+        )
+        .await;
+    assert!(
+        matches!(page, Err(crate::storage::events::history::HistoryError::NoStore { ref content_hash }) if content_hash == "hash-1"),
+        "an evicted, migrated scope is read from its pack: {page:?}"
+    );
+}
+
+/// One run or session belongs to one live scope. Once a thread range is
+/// catalogued, and above all once it is evicted, no other publication can
+/// take its runs or sessions: repointing them would send their reads hot to
+/// rows eviction deleted.
+#[tokio::test]
+async fn a_publication_cannot_take_another_scopes_runs_or_sessions() {
+    use crate::storage::events::history::{EventFilter, HistoryReader, PackRef, Provenance};
+    use crate::storage::history_pack::testing::{fingerprint, publish_unit_for_test};
+    use crate::storage::history_pack::write::{pack_unit, PackUnit, ThreadRange};
+    use crate::storage::RowExt;
+
+    let db = crate::storage::migrated_test_db("pack-claimed.db").await;
+    seed_fixture_execution(&db, "claimed").await;
+    let range = |last: i64, sessions: &[&str], runs: &[&str]| {
+        PackUnit::ThreadRange(ThreadRange {
+            owner_job_id: "job-1".into(),
+            first_sequence: 1,
+            last_sequence: last,
+            through_generation: last,
+            jobs: vec!["job-1".into()],
+            sessions: sessions.iter().map(|id| id.to_string()).collect(),
+            runs: runs.iter().map(|id| id.to_string()).collect(),
+        })
+    };
+    let first = publish_unit_for_test(&db, &range(1, &["sess-1"], &["run-1"])).await;
+    let hot = HistoryReader::new(&db)
+        .run_events("run-1", EventFilter::default())
+        .await
+        .unwrap();
+    db.execute_script(
+        "UPDATE history_tier SET evicted_at = 5;
+         DELETE FROM events WHERE run_id = 'run-1';",
+    )
+    .await
+    .unwrap();
+    db.mark_history_evicted();
+    let mappings = "SELECT run_id || ':' || scope_id FROM history_tier_runs
+                    UNION ALL SELECT session_id || ':' || scope_id FROM history_tier_sessions";
+    let before = db.query_all(mappings, (), |row| row.text(0)).await.unwrap();
+
+    let overlapping = [
+        range(2, &["sess-1", "sess-2"], &["run-1", "run-2"]),
+        range(2, &["sess-2"], &["run-1", "run-2"]),
+        PackUnit::Execution("exec-1".into()),
+    ];
+    for unit in overlapping {
+        let built = pack_unit(&db, &unit).await.unwrap();
+        let error = catalog::publish(
+            &db,
+            &built,
+            catalog::PublishFacts {
+                hot_bytes_estimate: 0,
+                resolved_at: 10,
+                packed_at: 20,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, catalog::PublishError::Claimed { what: "run", ref scope_id, .. } if *scope_id == unit.scope().id),
+            "{error}"
+        );
+        assert!(catalog::tier_entry(&db, &unit.scope().id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.query_all(mappings, (), |row| row.text(0)).await.unwrap(),
+            before,
+            "the evicted range keeps every mapping"
+        );
+    }
+    let page = HistoryReader::new(&db)
+        .run_events("run-1", EventFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        page.provenance,
+        Provenance::Pack(PackRef {
+            scope_id: "job-1/1-1".into(),
+            kind: ScopeKind::ThreadRange,
+            content_hash: first.content_hash.clone(),
+        })
+    );
+    assert_eq!(fingerprint(&page.rows), fingerprint(&hot.rows));
+
+    // A session claimed with no run in common is refused the same way.
+    let built = pack_unit(&db, &range(2, &["sess-1"], &[])).await.unwrap();
+    let error = catalog::publish(
+        &db,
+        &built,
+        catalog::PublishFacts {
+            hot_bytes_estimate: 0,
+            resolved_at: 10,
+            packed_at: 20,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            catalog::PublishError::Claimed {
+                what: "session",
+                ..
+            }
+        ),
+        "{error}"
+    );
+
+    // An orphan mapping, whose scope has no catalog row, is not a claim.
+    db.execute(
+        "INSERT INTO history_tier_runs(run_id, scope_id) VALUES('run-2', 'gone/1-1')",
+        (),
+    )
+    .await
+    .unwrap();
+    let taken = publish_unit_for_test(&db, &range(2, &["sess-2"], &["run-2"])).await;
+    assert_eq!(taken.scope.id, "job-1/1-2");
+    assert_eq!(
+        db.query_opt(
+            "SELECT scope_id FROM history_tier_runs WHERE run_id = 'run-2'",
+            (),
+            |row| row.text(0)
+        )
+        .await
+        .unwrap()
+        .as_deref(),
+        Some("job-1/1-2")
+    );
+}
+
+/// The mapping guard seeks each held mapping by its key, at a full chunk.
+#[tokio::test]
+async fn the_mapping_guard_seeks_each_id_at_a_full_chunk() {
+    let db = crate::storage::migrated_test_db("pack-mapping-plan.db").await;
+    for (table, key) in [
+        ("history_tier_runs", "run_id"),
+        ("history_tier_sessions", "session_id"),
+    ] {
+        let mut binds = vec![turso::Value::Text("scope".into())];
+        binds.extend((0..500).map(|n| turso::Value::Text(format!("id-{n}"))));
+        let plan =
+            crate::storage::query_plan(&db, &catalog::mapping_sql(table, key, 500), binds).await;
+        assert!(
+            plan.contains(&format!("sqlite_autoindex_{table}_1 ({key}=?)")),
+            "{table}: {plan}"
+        );
+        assert!(
+            !plan.contains(&format!("SCAN {table}")) && !plan.contains("SCAN held"),
+            "{table}: {plan}"
+        );
+        assert!(!plan.contains("SCAN owner"), "{table}: {plan}");
+    }
 }

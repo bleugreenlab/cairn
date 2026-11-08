@@ -25,7 +25,8 @@ use cairn_uri::CairnResource;
 /// nonsense value is a payload error whoever sent it — but on an authority
 /// prompt the resolver refuses the allow outright, whichever lifetime was
 /// asked for. An agent approving its own escalation is the thing this whole
-/// path exists to prevent; denying and cancelling stay available.
+/// path exists to prevent. The resolver separately checks authenticated
+/// ancestor lineage before accepting any non-operator answer.
 ///
 /// `message` is a deny's reason or workaround, delivered to the requesting
 /// agent with its refusal. An allow has nothing to explain to the agent the
@@ -217,25 +218,18 @@ pub(super) async fn dispatch(
                     segment, project, number, exec_seq, node_id
                 )
             } else {
-                let actor = crate::authorization::resolve_actor(orch, request)
-                    .await
-                    .and_then(|actor| actor.principal.node_uri)
-                    .ok_or_else(|| {
-                        build_failure(
-                            index,
-                            item,
-                            "permission resolution requires an authenticated run",
-                        )
-                    })?;
+                let agent =
+                    crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                let (actor, appearance) = agent
+                    .appearance(chrono::Utc::now().timestamp())
+                    .map_err(|error| build_failure(index, item, error))?;
+                let answer = answer
+                    .with_authenticated_appearance(actor, appearance)
+                    .map_err(|error| build_failure(index, item, error))?;
                 let outcome = crate::mcp::handlers::permission::answer_node_permission(
-                    orch,
-                    project,
-                    *number,
-                    *exec_seq,
-                    node_id,
-                    None,
-                    segment,
-                    answer.with_actor(actor),
+                    orch, project, *number, *exec_seq, node_id, None, segment, answer,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -265,16 +259,16 @@ pub(super) async fn dispatch(
                     segment, project, number, exec_seq, node_id, task_name
                 )
             } else {
-                let actor = crate::authorization::resolve_actor(orch, request)
-                    .await
-                    .and_then(|actor| actor.principal.node_uri)
-                    .ok_or_else(|| {
-                        build_failure(
-                            index,
-                            item,
-                            "permission resolution requires an authenticated run",
-                        )
-                    })?;
+                let agent =
+                    crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                let (actor, appearance) = agent
+                    .appearance(chrono::Utc::now().timestamp())
+                    .map_err(|error| build_failure(index, item, error))?;
+                let answer = answer
+                    .with_authenticated_appearance(actor, appearance)
+                    .map_err(|error| build_failure(index, item, error))?;
                 let outcome = crate::mcp::handlers::permission::answer_node_permission(
                     orch,
                     project,
@@ -283,7 +277,7 @@ pub(super) async fn dispatch(
                     node_id,
                     Some(task_name),
                     segment,
-                    answer.with_actor(actor),
+                    answer,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;

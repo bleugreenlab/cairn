@@ -6,6 +6,7 @@ use crate::storage::history_pack::catalog;
 use crate::storage::history_pack::testing::{
     fingerprint, publish_for_test, read_both, seed_fixture_execution, FixtureEvents,
 };
+use crate::storage::history_pack::ScopeKind;
 use crate::storage::quarantine::{
     quarantine, QuarantineSet, HISTORY_PACK_SINK, TRANSCRIPT_EVENT_SINK, WITHHELD_PREFIX,
 };
@@ -572,7 +573,7 @@ async fn orphan_run_rows_are_ignored() {
     seed_fixture_execution(&db, "seam-orphans").await;
     // A crash between the run rows and the commit point leaves these.
     db.execute(
-        "INSERT INTO history_tier_runs(run_id, execution_id) VALUES ('run-1', 'exec-1')",
+        "INSERT INTO history_tier_runs(run_id, scope_id) VALUES ('run-1', 'exec-1')",
         (),
     )
     .await
@@ -773,6 +774,7 @@ async fn the_hot_statements_stay_on_their_indexes() {
         scopes.extend((0..count).map(|id| text(&format!("session-{id}"))));
         let scopes = query_plan(&db, &statements::scope_sources(count, count), scopes).await;
         plan_uses(&scopes, "history_tier_runs");
+        plan_uses(&scopes, "history_tier_sessions");
         plan_uses(&scopes, "history_tier");
     }
     let locate = query_plan(&db, statements::LOCATE_EVENT, vec![text("event")]).await;
@@ -781,14 +783,282 @@ async fn the_hot_statements_stay_on_their_indexes() {
         "{locate}"
     );
 
-    plan_uses(
-        &query_plan(&db, statements::SOURCE_OF_TURN, vec![text("t")]).await,
-        "history_tier",
+    let turn = query_plan(&db, statements::SOURCE_OF_TURN, vec![text("t")]).await;
+    plan_uses(&turn, "history_tier_runs");
+    plan_uses(&turn, "history_tier_sessions");
+    assert!(!turn.contains("jobs"), "no execution join: {turn}");
+    let session = query_plan(&db, statements::SOURCE_OF_SESSION, vec![text("s")]).await;
+    plan_uses(&session, "history_tier_sessions");
+    assert!(!session.contains("jobs"), "no execution join: {session}");
+}
+
+const RANGE_SCOPE: &str = "job-1/1-2";
+
+/// The fixture's two sessions as one thread range, with `run-1` straddling
+/// into `sess-2`, and a hot third session beside it.
+async fn thread_range_db(name: &str) -> (LocalDb, crate::storage::history_pack::write::BuiltPack) {
+    use crate::storage::history_pack::testing::{
+        insert_event, publish_unit_for_test, seed_hot_tail,
+    };
+    use crate::storage::history_pack::write::{PackUnit, ThreadRange};
+
+    let db = crate::storage::migrated_test_db(name).await;
+    seed_fixture_execution(&db, name).await;
+    // A turn of sess-2 whose run belongs to sess-1: the straddle a rotation
+    // can leave. It joins the two sessions into one range.
+    db.execute_script(
+        "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+         VALUES('turn-straddle','sess-2','run-1','job-1',2,'complete',21,21);",
+    )
+    .await
+    .unwrap();
+    insert_event(
+        &db,
+        &format!("{name}-straddle"),
+        "run-1",
+        "sess-2",
+        Some("turn-straddle"),
+        7,
+        21,
+    )
+    .await;
+    seed_hot_tail(&db, name).await;
+    let range = ThreadRange {
+        owner_job_id: "job-1".into(),
+        first_sequence: 1,
+        last_sequence: 2,
+        through_generation: 4,
+        jobs: vec!["job-1".into()],
+        sessions: vec!["sess-1".into(), "sess-2".into()],
+        runs: vec!["run-1".into(), "run-2".into()],
+    };
+    assert_eq!(range.scope_id(), RANGE_SCOPE);
+    let built = publish_unit_for_test(&db, &PackUnit::ThreadRange(range)).await;
+    (db, built)
+}
+
+/// Every read a transcript makes of one job, in a fixed order: each run, each
+/// turn, and each session's whole read, tail and after-cursor read, then the
+/// lineage path (keys, then bodies by id) and each session's newest rowid.
+async fn every_job_read(db: &LocalDb) -> (Vec<Page>, Vec<String>, Vec<Option<i64>>) {
+    let mut reader = HistoryReader::new(db);
+    let mut pages = Vec::new();
+    for run in ["run-1", "run-2", "run-3"] {
+        pages.push(
+            reader
+                .run_events(run, EventFilter::default())
+                .await
+                .unwrap(),
+        );
+    }
+    for turn in [
+        "turn-1",
+        "turn-2",
+        "turn-straddle",
+        "turn-3",
+        "turn-runless",
+    ] {
+        pages.push(reader.turn_events(turn).await.unwrap());
+    }
+    let mut lineage = Vec::new();
+    let mut max_rowids = Vec::new();
+    for session in ["sess-1", "sess-2", "sess-3"] {
+        pages.push(
+            reader
+                .session_events(session, None, EventFilter::default())
+                .await
+                .unwrap(),
+        );
+        pages.push(reader.session_tail(session, 2).await.unwrap());
+        pages.push(
+            reader
+                .session_events_after(session, None, i64::MIN, EventFilter::default())
+                .await
+                .unwrap(),
+        );
+        let mut by_run: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for key in reader.session_event_keys(session).await.unwrap() {
+            by_run.entry(key.run_id).or_default().push(key.id);
+        }
+        for (run, ids) in by_run {
+            lineage.extend(reader.run_events_by_id(&run, &ids).await.unwrap());
+        }
+        max_rowids.push(reader.session_max_rowid(session).await.unwrap());
+    }
+    (pages, fingerprint(&lineage), max_rowids)
+}
+
+#[tokio::test]
+async fn a_thread_range_serves_its_sessions_and_leaves_the_rest_of_the_job_hot() {
+    let (db, built) = thread_range_db("seam-thread-range").await;
+    let manifest = &built.manifest;
+    assert_eq!(
+        (manifest.scope.kind, manifest.scope.id.as_str()),
+        (ScopeKind::ThreadRange, RANGE_SCOPE)
     );
-    plan_uses(
-        &query_plan(&db, statements::SOURCE_OF_SESSION, vec![text("s")]).await,
-        "history_tier",
+    assert_eq!(manifest.execution_id.as_deref(), Some("exec-1"));
+    let sessions: Vec<&str> = manifest.sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(sessions, ["sess-1", "sess-2"]);
+    for run in &manifest.runs {
+        for session in &run.session_ids {
+            assert!(sessions.contains(&session.as_str()), "closed: {run:?}");
+        }
+    }
+    let turns: Vec<&str> = manifest.turns.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(turns, ["turn-1", "turn-2", "turn-straddle"]);
+    let entry = catalog::tier_entry(&db, RANGE_SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            entry.kind,
+            entry.owner_id.as_str(),
+            entry.through_generation
+        ),
+        (ScopeKind::ThreadRange, "job-1", Some(4))
     );
+    assert!(
+        catalog::tier_entry(&db, "exec-1").await.unwrap().is_none(),
+        "the range is catalogued under its own scope, not the thread's execution"
+    );
+
+    let (hot, pack) = read_both(&db, || every_job_read(&db)).await;
+    let packed = Provenance::Pack(PackRef {
+        scope_id: RANGE_SCOPE.to_string(),
+        kind: ScopeKind::ThreadRange,
+        content_hash: built.content_hash.clone(),
+    });
+    // Three runs, five turns, then three reads for each of three sessions.
+    let mut expected = vec![packed.clone(), packed.clone(), Provenance::Hot];
+    expected.extend([packed.clone(), packed.clone(), packed.clone()]);
+    expected.extend([Provenance::Hot, Provenance::Hot]);
+    expected.extend(std::iter::repeat_n(packed.clone(), 6));
+    expected.extend(std::iter::repeat_n(Provenance::Hot, 3));
+    let provenance: Vec<_> = pack.0.iter().map(|page| page.provenance.clone()).collect();
+    assert_eq!(provenance, expected);
+    assert!(hot.0.iter().all(|page| page.provenance == Provenance::Hot));
+    for (index, (hot, pack)) in hot.0.iter().zip(&pack.0).enumerate() {
+        assert!(!hot.rows.is_empty(), "read {index} is empty");
+        assert_eq!(
+            fingerprint(&hot.rows),
+            fingerprint(&pack.rows),
+            "read {index}"
+        );
+    }
+    assert_eq!(hot.1, pack.1);
+    assert_eq!(hot.2, pack.2);
+    let sess_2 = &hot.0[11];
+    assert!(
+        sess_2
+            .rows
+            .iter()
+            .any(|row| row.event.run_id == "run-1"
+                && row.event.session_id.as_deref() == Some("sess-2")),
+        "sess-2 holds the straddling run's event"
+    );
+
+    // Evict the range as C2 will and delete its hot rows: the same reads still
+    // answer, from the pack, and the tail from hot.
+    db.execute_script(
+        "UPDATE history_tier SET evicted_at = 5;
+         DELETE FROM events WHERE run_id IN ('run-1', 'run-2');",
+    )
+    .await
+    .unwrap();
+    db.mark_history_evicted();
+    let evicted = every_job_read(&db).await;
+    for (index, (hot, evicted)) in hot.0.iter().zip(&evicted.0).enumerate() {
+        assert_eq!(
+            fingerprint(&hot.rows),
+            fingerprint(&evicted.rows),
+            "read {index}"
+        );
+    }
+    assert_eq!(hot.1, evicted.1);
+    assert_eq!(hot.2, evicted.2);
+}
+
+#[tokio::test]
+async fn a_turn_or_session_no_pack_maps_reads_hot_whatever_its_execution_catalog_says() {
+    use crate::storage::history_pack::testing::{insert_event, seed_hot_tail};
+
+    let db = crate::storage::migrated_test_db("seam-unmapped").await;
+    seed_fixture_execution(&db, "seam-unmapped").await;
+    // A run-less turn of a packed session resolves through the session.
+    db.execute_script(
+        "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+         VALUES('turn-runless-packed','sess-1',NULL,'job-1',2,'complete',14,14);",
+    )
+    .await
+    .unwrap();
+    insert_event(
+        &db,
+        "seam-unmapped-runless",
+        "run-1",
+        "sess-1",
+        Some("turn-runless-packed"),
+        7,
+        14,
+    )
+    .await;
+    let built = publish_for_test(&db, "exec-1").await;
+    // History its execution gained after the pack: exec-1 has a catalog row,
+    // and nothing maps any of this.
+    seed_hot_tail(&db, "seam-unmapped").await;
+
+    db.set_history_source_override(Some(HistorySource::Pack));
+    let packed = Source::Pack(PackRef {
+        scope_id: "exec-1".to_string(),
+        kind: ScopeKind::Execution,
+        content_hash: built.content_hash.clone(),
+    });
+    let mut reader = HistoryReader::new(&db);
+    assert_eq!(
+        reader.source_of_session("sess-3").await.unwrap(),
+        Source::Hot
+    );
+    assert_eq!(reader.source_of_turn("turn-3").await.unwrap(), Source::Hot);
+    assert_eq!(
+        reader.source_of_turn("turn-runless").await.unwrap(),
+        Source::Hot
+    );
+    assert_eq!(reader.source_of_run("run-3").await.unwrap(), Source::Hot);
+    assert_eq!(reader.source_of_session("sess-1").await.unwrap(), packed);
+    assert_eq!(reader.source_of_turn("turn-1").await.unwrap(), packed);
+    assert_eq!(
+        reader.source_of_turn("turn-runless-packed").await.unwrap(),
+        packed
+    );
+    let mut primed = HistoryReader::new(&db);
+    primed
+        .prime_sessions_and_runs(&["sess-3".into(), "sess-1".into()], &["run-3".into()])
+        .await
+        .unwrap();
+    assert_eq!(primed.sessions["sess-3"], Source::Hot);
+    assert_eq!(primed.runs["run-3"], Source::Hot);
+    assert_eq!(primed.sessions["sess-1"], packed);
+
+    let tail = reader
+        .session_events("sess-3", None, EventFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(tail.provenance, Provenance::Hot);
+    assert_eq!(
+        tail.rows.len(),
+        2,
+        "the unmapped session is read whole, hot"
+    );
+    let runless = reader.turn_events("turn-runless-packed").await.unwrap();
+    assert_pack(&runless);
+    db.set_history_source_override(Some(HistorySource::Hot));
+    let hot = HistoryReader::new(&db)
+        .turn_events("turn-runless-packed")
+        .await
+        .unwrap();
+    db.set_history_source_override(None);
+    assert_eq!(hot.rows.len(), 1);
+    assert_eq!(fingerprint(&hot.rows), fingerprint(&runless.rows));
 }
 
 async fn all_event_reads(db: &LocalDb, ids: &[String]) -> Vec<Vec<String>> {

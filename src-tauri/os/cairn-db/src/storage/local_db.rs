@@ -1421,9 +1421,7 @@ impl LocalDb {
         };
         if kind == HolderKind::PooledRead {
             #[cfg(any(test, feature = "test-utils"))]
-            self.gate
-                .read_checkout_count
-                .fetch_add(1, Ordering::Relaxed);
+            self.gate.count_read_checkout();
             conn.set_query_timeout(self.read_bound_for(holder))?;
             holder.arm(conn.clone());
         } else {
@@ -1525,6 +1523,26 @@ impl LocalDb {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn read_statement_count(&self) -> usize {
         self.gate.read_statement_count.load(Ordering::Relaxed)
+    }
+
+    /// Await `body`, counting only the read statements and checkouts it issues
+    /// itself against this database. The handle-wide counters also count
+    /// whatever else reads the database meanwhile, such as an orchestrator's
+    /// background tasks, so a pin on one path's cost measures it here. Reads
+    /// on another task, even one `body` spawns, are not counted.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn own_reads<T>(&self, body: impl Future<Output = T>) -> (T, OwnReads) {
+        let tally = Arc::new(OwnReadTally {
+            gate: Arc::as_ptr(&self.gate) as usize,
+            statements: AtomicUsize::new(0),
+            checkouts: AtomicUsize::new(0),
+        });
+        let out = OWN_READS.scope(tally.clone(), body).await;
+        let reads = OwnReads {
+            statements: tally.statements.load(Ordering::Relaxed),
+            checkouts: tally.checkouts.load(Ordering::Relaxed),
+        };
+        (out, reads)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1656,12 +1674,7 @@ impl LocalDb {
                         audit.await;
                     }
                     #[cfg(any(test, feature = "test-utils"))]
-                    {
-                        self.gate.statement_count.fetch_add(1, Ordering::Relaxed);
-                        self.gate
-                            .read_statement_count
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.gate.count_read_statement();
                     let mut rows = conn_ref.conn.query(sql, params).await?;
                     let mut out = Vec::new();
                     while let Some(row) = rows.next().await? {
@@ -1735,12 +1748,7 @@ impl LocalDb {
                         audit.await;
                     }
                     #[cfg(any(test, feature = "test-utils"))]
-                    {
-                        self.gate.statement_count.fetch_add(1, Ordering::Relaxed);
-                        self.gate
-                            .read_statement_count
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.gate.count_read_statement();
                     let mut rows = conn_ref.conn.query(sql, params).await?;
                     rows.next().await?.map(|row| map(&row)).transpose()
                 }
@@ -2360,7 +2368,63 @@ struct LiveConnection {
     interrupted: bool,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+tokio::task_local! {
+    /// The tally [`LocalDb::own_reads`] is counting into, for the future it
+    /// scopes. Task-local, so another task's reads of the same database never
+    /// reach it.
+    static OWN_READS: Arc<OwnReadTally>;
+}
+
+/// What one [`LocalDb::own_reads`] scope has counted, and for which gate.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+struct OwnReadTally {
+    /// The address of the counted database's gate: a scope counts only its own
+    /// database's reads.
+    gate: usize,
+    statements: AtomicUsize,
+    checkouts: AtomicUsize,
+}
+
+/// The reads one future issued itself against one database.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnReads {
+    /// As [`LocalDb::read_statement_count`] counts them.
+    pub statements: usize,
+    /// As [`LocalDb::read_checkout_count`] counts them.
+    pub checkouts: usize,
+}
+
 impl ConnectionGate {
+    #[cfg(any(test, feature = "test-utils"))]
+    fn own_tally(&self, count: impl FnOnce(&OwnReadTally)) {
+        let gate = self as *const ConnectionGate as usize;
+        let _ = OWN_READS.try_with(|tally| {
+            if tally.gate == gate {
+                count(tally);
+            }
+        });
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn count_read_statement(&self) {
+        self.statement_count.fetch_add(1, Ordering::Relaxed);
+        self.read_statement_count.fetch_add(1, Ordering::Relaxed);
+        self.own_tally(|tally| {
+            tally.statements.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn count_read_checkout(&self) {
+        self.read_checkout_count.fetch_add(1, Ordering::Relaxed);
+        self.own_tally(|tally| {
+            tally.checkouts.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
     fn new() -> Self {
         Self {
             plan_audit: PlanAudit::new(),
@@ -2634,15 +2698,7 @@ impl TrackedConnection {
         params: impl IntoParams,
     ) -> impl Future<Output = turso::Result<TrackedRows>> + Captures<&'_ ()> {
         #[cfg(any(test, feature = "test-utils"))]
-        self.slot
-            .gate
-            .statement_count
-            .fetch_add(1, Ordering::Relaxed);
-        #[cfg(any(test, feature = "test-utils"))]
-        self.slot
-            .gate
-            .read_statement_count
-            .fetch_add(1, Ordering::Relaxed);
+        self.slot.gate.count_read_statement();
         let at = Location::caller();
         self.slot.holder.set_statement(at, sql.as_ref());
         let audit = self.plan_audit(at, sql.as_ref());
@@ -2702,15 +2758,7 @@ impl TrackedConnection {
         sql: impl AsRef<str>,
     ) -> impl Future<Output = turso::Result<turso::Statement>> + Captures<&'_ ()> {
         #[cfg(any(test, feature = "test-utils"))]
-        self.slot
-            .gate
-            .statement_count
-            .fetch_add(1, Ordering::Relaxed);
-        #[cfg(any(test, feature = "test-utils"))]
-        self.slot
-            .gate
-            .read_statement_count
-            .fetch_add(1, Ordering::Relaxed);
+        self.slot.gate.count_read_statement();
         let at = Location::caller();
         self.slot.holder.set_statement(at, sql.as_ref());
         let audit = self.plan_audit(at, sql.as_ref());

@@ -1,56 +1,54 @@
-//! The order executions leave the hot tier in.
+//! The order scopes leave the hot tier in.
 //!
 //! Pure: no database, no clock. The pack pass packs every resolved execution
-//! past the hot window; eviction (C2) then removes hot rows in the order this
-//! function gives, which is the whole policy:
+//! and every thread range past the hot window; eviction (C2) then removes hot
+//! rows in the order this function gives, which is the whole policy, applied
+//! to both kinds of scope together:
 //!
 //! 1. Everything resolved longer ago than the window, oldest first.
 //! 2. Then, while the estimated hot bytes left would still exceed the budget,
 //!    the oldest of what remains.
 //!
-//! Ties on `completed_at` go by `execution_id`, the same keyset the pack pass
-//! walks, so the two agree on what "oldest" means.
+//! A scope's resolution is its catalog row's `resolved_at`: an execution's
+//! issue resolution, or the closing of a thread range's last session. Ties go
+//! by `scope_id`, so the order is total.
 
-/// One execution eligible to leave the hot tier.
+/// One scope eligible to leave the hot tier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TierCandidate {
-    pub execution_id: String,
-    /// When its issue resolved, epoch seconds.
-    pub completed_at: i64,
-    /// Its `events` rows still hot.
-    pub event_rows: u64,
+    pub scope_id: String,
+    /// When it stopped changing, epoch seconds.
+    pub resolved_at: i64,
+    /// Its catalog row's `hot_bytes_estimate`: what eviction frees.
+    pub hot_bytes_estimate: u64,
 }
 
 /// The window and budget eviction is held to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HotPolicy {
-    /// How long a resolved execution stays hot, in seconds.
+    /// How long a resolved scope stays hot, in seconds.
     pub window_secs: i64,
     /// The hot bytes the database should hold at most.
     pub budget_bytes: u64,
-    /// The estimated bytes one `events` row costs.
-    pub bytes_per_row: u64,
     /// The estimated hot bytes the database holds now.
     pub hot_total_bytes: u64,
 }
 
-/// The executions to evict, in eviction order.
+/// The scopes to evict, in eviction order.
 pub fn eviction_order(candidates: &[TierCandidate], now: i64, policy: &HotPolicy) -> Vec<String> {
     let mut ordered: Vec<&TierCandidate> = candidates.iter().collect();
     ordered.sort_by(|a, b| {
-        (a.completed_at, a.execution_id.as_str()).cmp(&(b.completed_at, b.execution_id.as_str()))
+        (a.resolved_at, a.scope_id.as_str()).cmp(&(b.resolved_at, b.scope_id.as_str()))
     });
     let cutoff = now.saturating_sub(policy.window_secs);
-    let estimate =
-        |candidate: &TierCandidate| candidate.event_rows.saturating_mul(policy.bytes_per_row);
 
     let mut remaining = policy.hot_total_bytes;
     let mut picked = Vec::new();
     let mut rest = Vec::new();
     for candidate in ordered {
-        if candidate.completed_at < cutoff {
-            remaining = remaining.saturating_sub(estimate(candidate));
-            picked.push(candidate.execution_id.clone());
+        if candidate.resolved_at < cutoff {
+            remaining = remaining.saturating_sub(candidate.hot_bytes_estimate);
+            picked.push(candidate.scope_id.clone());
         } else {
             rest.push(candidate);
         }
@@ -59,8 +57,8 @@ pub fn eviction_order(candidates: &[TierCandidate], now: i64, policy: &HotPolicy
         if remaining <= policy.budget_bytes {
             break;
         }
-        remaining = remaining.saturating_sub(estimate(candidate));
-        picked.push(candidate.execution_id.clone());
+        remaining = remaining.saturating_sub(candidate.hot_bytes_estimate);
+        picked.push(candidate.scope_id.clone());
     }
     picked
 }
@@ -71,11 +69,12 @@ mod tests {
 
     const DAY: i64 = 86_400;
 
-    fn candidate(id: &str, completed_at: i64, event_rows: u64) -> TierCandidate {
+    /// `rows` at 10 bytes a row, so the arithmetic reads as before.
+    fn candidate(id: &str, resolved_at: i64, rows: u64) -> TierCandidate {
         TierCandidate {
-            execution_id: id.to_string(),
-            completed_at,
-            event_rows,
+            scope_id: id.to_string(),
+            resolved_at,
+            hot_bytes_estimate: rows * 10,
         }
     }
 
@@ -83,7 +82,6 @@ mod tests {
         HotPolicy {
             window_secs: 30 * DAY,
             budget_bytes,
-            bytes_per_row: 10,
             hot_total_bytes,
         }
     }
@@ -119,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn ties_on_completion_go_by_execution_id() {
+    fn ties_on_resolution_go_by_scope_id() {
         let now = 100 * DAY;
         let old = now - 40 * DAY;
         let candidates = [
@@ -130,6 +128,21 @@ mod tests {
         assert_eq!(
             eviction_order(&candidates, now, &policy(0, 0)),
             ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn executions_and_thread_ranges_order_together() {
+        let now = 100 * DAY;
+        let candidates = [
+            candidate("exec-new", now - 2 * DAY, 10),
+            candidate("job-1/3-7", now - 4 * DAY, 10),
+            candidate("exec-old", now - 6 * DAY, 10),
+            candidate("job-1/8-9", now - DAY, 10),
+        ];
+        assert_eq!(
+            eviction_order(&candidates, now, &policy(400, 150)),
+            ["exec-old", "job-1/3-7", "exec-new"]
         );
     }
 

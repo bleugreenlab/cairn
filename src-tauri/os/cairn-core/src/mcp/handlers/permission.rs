@@ -8,6 +8,8 @@
 //! resolve through the same store/respond machinery via
 //! [`resolve_permission_request`].
 
+mod answer_authorization;
+
 use crate::agent_process::process::GoalPauseOwner;
 use crate::backends::{stdin, AgentPermissions};
 use crate::mcp::types::McpCallbackRequest;
@@ -1451,8 +1453,8 @@ impl OperatorApproval {
 enum Answerer {
     /// An authenticated operator. The only answerer that can mint authority.
     Operator(Box<OperatorApproval>),
-    /// Any other surface. May deny or cancel anything, and may allow a
-    /// containment crossing, but never mints an authority grant.
+    /// A non-operator surface. Only a verified ancestor may answer; allowing
+    /// additionally requires its effective grants and never mints authority.
     Surface(AnswerSurface),
 }
 
@@ -2302,6 +2304,8 @@ async fn resolve_permission_request_impl(
         });
     }
 
+    answer_authorization::authorize(orch, &owning_db, &record, &answer, false).await?;
+
     // Turning the fence off is the operator capability that subsumes every
     // other, so it is refused here, at the canonical boundary, for any answer
     // that does not carry one -- even though only an operator constructor sets
@@ -2328,9 +2332,8 @@ async fn resolve_permission_request_impl(
     // Refusing here, ahead of `record_permission_response`, is the whole point.
     // A rejected self-approval must leave the request pending for the operator:
     // it resolves nothing, mints nothing, wakes nothing, and re-dispatches
-    // nothing. Deny and cancel stay open to every surface — an agent recognizing
-    // that it should not be doing something is behavior worth keeping — and so
-    // does allowing a containment crossing, which is a different layer.
+    // nothing. An authenticated ancestor may still deny without holding the
+    // requested capability. Containment delegation is checked separately.
     if let Some(detail) = authority.as_ref() {
         if matches!(decision, PermissionDecision::Allow) && answer.operator_approval().is_none() {
             journal_permission_authority_refusal(orch, &record, detail, &answer).await;
@@ -2352,9 +2355,8 @@ async fn resolve_permission_request_impl(
     // says nothing about what its author meant an allow to do, and this is the
     // gate that fails closed on it.
     //
-    // Path-scoped crossings stay open to every surface. They widen one named
-    // path, the sandbox is still built around the re-execution, and an agent
-    // recognizing that it needs one file outside its worktree is ordinary work.
+    // An ancestor may delegate a path-scoped crossing only within its own
+    // effective grants; the sandbox remains around the re-execution.
     if let Some(detail) = crossing.as_ref() {
         if detail.names_no_path()
             && matches!(decision, PermissionDecision::Allow)
@@ -2405,6 +2407,8 @@ async fn resolve_permission_request_impl(
         }
     }
 
+    answer_authorization::authorize(orch, &owning_db, &record, &answer, true).await?;
+
     let status = match decision {
         PermissionDecision::Allow => "allowed",
         PermissionDecision::Deny => "denied",
@@ -2424,8 +2428,8 @@ async fn resolve_permission_request_impl(
             request_id,
             behavior,
             resolution_transport,
-            None,
-            None,
+            answer.provenance_provider.as_deref(),
+            answer.provenance_conversation.as_deref(),
             resolution_actor.as_deref(),
             "permission",
             request_id,
@@ -3915,6 +3919,16 @@ pub(crate) mod tests {
                     "disallowedTools": null,
                     "skills": null,
                     "fence": "ask"
+                },
+                "agent-parent": {
+                    "id": "agent-parent",
+                    "name": "Parent",
+                    "description": "Parent",
+                    "prompt": "prompt",
+                    "tools": ["read"],
+                    "disallowedTools": null,
+                    "skills": null,
+                    "fence": "allow"
                 }
             },
             "skills": {},
@@ -3943,15 +3957,26 @@ pub(crate) mod tests {
                     id, execution_id, recipe_node_id, issue_id, project_id, status,
                     agent_config_id, node_name, uri_segment, created_at, updated_at
                 ) VALUES (
+                    'job-parent','execution-1','node-parent','issue-1','project-1','running',
+                    'agent-parent','Parent','parent',1,1
+                );
+                INSERT INTO sessions(id, job_id, backend, status, created_at, updated_at)
+                 VALUES ('session-parent','job-parent','claude','active',1,1);
+                INSERT INTO runs(id, issue_id, project_id, job_id, session_id, status, created_at, updated_at)
+                 VALUES ('run-parent','issue-1','project-1','job-parent','session-parent','running',1,1);
+                INSERT INTO jobs(
+                    id, execution_id, recipe_node_id, issue_id, project_id, status,
+                    agent_config_id, node_name, uri_segment, parent_job_id, created_at, updated_at
+                ) VALUES (
                     'job-1','execution-1','node-1','issue-1','project-1','running',
-                    'agent-1','Agent','agent',1,1
+                    'agent-1','Agent','agent','job-parent',1,1
                 );
                 INSERT INTO runs(id, issue_id, project_id, job_id, status, created_at, updated_at)
                  VALUES ('run-1','issue-1','project-1','job-1','running',1,1);
                 INSERT INTO permission_requests(
                     id, run_id, tool_use_id, tool_name, tool_input, status, created_at, job_id, uri_segment
                 ) VALUES (
-                    'perm-request-1','run-1','tool-1','read','{{}}','pending',1,'job-1','perm-1'
+                    'perm-request-1','run-1','tool-1','mcp__cairn__read','{{}}','pending',1,'job-1','perm-1'
                 );
                 "
             ))
@@ -3986,8 +4011,8 @@ pub(crate) mod tests {
 
     /// The property, asserted from the agent's side rather than at a boundary.
     ///
-    /// An agent answers through its own `permissions` resource, which is an
-    /// [`AnswerSurface::ResourcePatch`]. It may allow a path-scoped crossing --
+    /// An authenticated ancestor answers through a `permissions` resource, an
+    /// [`AnswerSurface::ResourcePatch`]. It may delegate a path-scoped crossing --
     /// that widens one named path with the sandbox still built around the
     /// re-execution. It may not allow a stored command-scoped one, which names
     /// no path to widen.
@@ -4029,7 +4054,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn migrated_telegram_winner_is_executed_by_a_desktop_retry() {
+    async fn migrated_telegram_winner_cannot_inherit_desktop_retry_authority() {
         let root = tempfile::tempdir().unwrap().keep();
         let local = LocalDb::open(root.join("test.db")).await.unwrap();
         // A migration's identity is its file stem, `0190_canonicalize_channel_permission_answers`,
@@ -4100,15 +4125,19 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        resolve_permission_request(
+        let refusal = resolve_permission_request(
             &orch,
             "perm-request-1",
             PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
         )
         .await
-        .expect("a later desktop response must execute the canonical channel winner");
+        .expect_err("canonicalizing a channel answer does not authenticate an ancestor");
+        assert!(
+            refusal.contains("no authenticated ancestor run"),
+            "{refusal}"
+        );
 
-        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
         assert_eq!(
             orch.db
                 .local
@@ -4119,7 +4148,8 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("telegram")
+            None,
+            "an unauthenticated migrated winner must not execute under the retrying operator"
         );
     }
 
@@ -4157,7 +4187,13 @@ pub(crate) mod tests {
     async fn persisted_resource_permission_claim_is_executed_once_by_direct_retry() {
         let orch = test_orchestrator().await;
         seed_allow_all_permission(&orch).await;
-        let winner_actor = "cairn://p/PRJ/1/1/builder";
+        let winner_actor = serde_json::to_string(
+            agent_resource_answer(PermissionDecision::Allow)
+                .decision_attribution()
+                .unwrap()
+                .0,
+        )
+        .unwrap();
         crate::channels::ledger::claim_ask_resolution(
             &orch.db.local,
             "perm-request-1",
@@ -4165,7 +4201,7 @@ pub(crate) mod tests {
             AppearanceTransport::ResourcePatch,
             None,
             None,
-            Some(winner_actor),
+            Some(winner_actor.as_str()),
             "permission",
             "perm-request-1",
             10,
@@ -4177,11 +4213,7 @@ pub(crate) mod tests {
             resolve_permission_request(
                 &orch,
                 "perm-request-1",
-                PermissionAnswer::from_surface(
-                    PermissionDecision::Deny,
-                    AnswerSurface::ResourcePatch,
-                )
-                .with_actor("cairn://p/PRJ/1/1/retry"),
+                PermissionAnswer::from_operator(PermissionDecision::Deny, desktop_approval()),
             )
         };
         let (first, second) = tokio::join!(retry(), retry());
@@ -4195,13 +4227,17 @@ pub(crate) mod tests {
             outcomes
                 .iter()
                 .all(|outcome| outcome.prior.as_ref().is_some_and(|prior| {
-                    prior.answer == "allow_session" && prior.answered_by == winner_actor
+                    prior.answer == "allow_session"
+                        && prior.answered_by == "cairn://p/prj/1/1/parent"
                 })),
             "a retry whose own deny was not recorded is told the winner: {outcomes:?}"
         );
         assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
         assert!(
-            orch.session_allowed_tools.lock().unwrap().contains("read"),
+            orch.session_allowed_tools
+                .lock()
+                .unwrap()
+                .contains("mcp__cairn__read"),
             "a retry that executes a persisted session winner must install its session grant"
         );
         assert_eq!(
@@ -4214,7 +4250,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(winner_actor),
+            Some(winner_actor.as_str()),
             "the persisted winner, not the retrying caller, owns provenance"
         );
         assert_eq!(
@@ -4363,8 +4399,16 @@ pub(crate) mod tests {
     }
 
     fn agent_resource_answer(decision: PermissionDecision) -> PermissionAnswer {
+        let (actor, appearance) = super::super::run_context::AuthenticatedAgent {
+            home: "cairn://p/prj/1/1/parent".to_string(),
+            run_id: "run-parent".to_string(),
+            job_id: "job-parent".to_string(),
+        }
+        .appearance(1)
+        .unwrap();
         PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
-            .with_actor("cairn://p/prj/1/1/builder")
+            .with_authenticated_appearance(actor, appearance)
+            .unwrap()
     }
 
     #[tokio::test]
@@ -4532,11 +4576,10 @@ pub(crate) mod tests {
         assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
     }
 
-    /// A path-scoped crossing stays self-approvable. Narrowing that too would
-    /// park ordinary work at the fence for no gain: the sandbox is still built,
-    /// and what is widened is the one path the prompt named.
+    /// An authenticated parent with an allow fence may delegate a bounded path
+    /// crossing to its child without granting an escape from the sandbox.
     #[tokio::test]
-    async fn an_agent_can_still_self_approve_a_path_scoped_crossing() {
+    async fn an_ancestor_with_an_allow_fence_can_approve_a_path_scoped_crossing() {
         let orch = test_orchestrator().await;
         seed_allow_all_permission(&orch).await;
         store_crossing(
@@ -4554,9 +4597,244 @@ pub(crate) mod tests {
             agent_resource_answer(PermissionDecision::Allow),
         )
         .await
-        .expect("a path-scoped crossing stays answerable by the agent");
+        .expect("a parent may delegate a path crossing within its own fence");
 
         assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+    }
+
+    #[tokio::test]
+    async fn an_ancestor_path_allow_requires_its_own_fence_or_exact_session_grant() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE executions SET snapshot = replace(snapshot, ?1, ?2) WHERE id = 'execution-1'",
+                params![r#""fence":"allow""#, r#""fence":"ask""#],
+            )
+            .await
+            .unwrap();
+        let crossing = super::super::fence::Crossing::shell_path(
+            std::path::Path::new("/tmp/outside.txt"),
+            "touch /tmp/outside.txt",
+        );
+        let detail = parse_crossing_detail(&crossing.stored_tool_input_for_test()).unwrap();
+        store_crossing(&orch, crossing).await;
+
+        let refusal = resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            agent_resource_answer(PermissionDecision::Allow),
+        )
+        .await
+        .expect_err("ancestry alone must not create an effective path grant");
+        assert!(refusal.contains("own effective grants"), "{refusal}");
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+        assert!(orch.session_allowed_crossings.lock().unwrap().is_empty());
+
+        orch.session_allowed_crossings
+            .lock()
+            .unwrap()
+            .insert("unrelated-crossing".to_string());
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            agent_resource_answer(PermissionDecision::Allow),
+        )
+        .await
+        .expect_err("a different session crossing does not confer this effect");
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+
+        orch.session_allowed_crossings
+            .lock()
+            .unwrap()
+            .insert(detail.session_key().unwrap().to_string());
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            agent_resource_answer(PermissionDecision::Allow),
+        )
+        .await
+        .expect("an ancestor may delegate its existing exact crossing grant");
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+    }
+
+    #[tokio::test]
+    async fn nonoperator_answers_require_authenticated_strict_ancestor_provenance() {
+        for decision in [PermissionDecision::Allow, PermissionDecision::Deny] {
+            for case in [
+                "unattributed",
+                "raw-uri",
+                "self",
+                "unrelated",
+                "forged-home",
+            ] {
+                let orch = test_orchestrator().await;
+                seed_allow_all_permission(&orch).await;
+                let mut answer =
+                    PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch);
+                match case {
+                    "unattributed" => {}
+                    "raw-uri" => {
+                        answer = answer.with_actor("cairn://p/prj/1/1/parent");
+                    }
+                    "self" => {
+                        let agent = super::super::run_context::authenticated_agent_for_run(
+                            &orch.db, "run-1",
+                        )
+                        .await
+                        .unwrap();
+                        let (actor, appearance) = agent.appearance(1).unwrap();
+                        answer = answer
+                            .with_authenticated_appearance(actor, appearance)
+                            .unwrap();
+                    }
+                    "unrelated" => {
+                        orch.db
+                            .local
+                            .execute(
+                                "UPDATE jobs SET parent_job_id = NULL WHERE id = 'job-1'",
+                                (),
+                            )
+                            .await
+                            .unwrap();
+                        answer = agent_resource_answer(decision);
+                    }
+                    "forged-home" => {
+                        let agent = super::super::run_context::AuthenticatedAgent {
+                            home: "cairn://p/prj/1/1/other".to_string(),
+                            run_id: "run-parent".to_string(),
+                            job_id: "job-parent".to_string(),
+                        };
+                        let (actor, appearance) = agent.appearance(1).unwrap();
+                        answer = answer
+                            .with_authenticated_appearance(actor, appearance)
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let refusal = resolve_permission_request(&orch, "perm-request-1", answer)
+                    .await
+                    .expect_err("a nonoperator must prove strict persisted ancestry");
+                assert!(
+                    refusal.contains("ancestor lineage")
+                        || refusal.contains("requires an authenticated actor"),
+                    "{case}: {refusal}"
+                );
+                assert_eq!(
+                    perm_status(&orch).await.as_deref(),
+                    Some("pending"),
+                    "{case}"
+                );
+                assert!(
+                    orch.session_allowed_tools.lock().unwrap().is_empty(),
+                    "{case}"
+                );
+                assert!(
+                    orch.session_allowed_crossings.lock().unwrap().is_empty(),
+                    "{case}"
+                );
+                assert!(
+                    crate::channels::ledger::resolution_for_action(
+                        &orch.db.local,
+                        "perm-request-1"
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                    "{case}: refused provenance must not claim the first-answer gate"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reusable_codex_approvals_do_not_override_claude_exclusions() {
+        for backend in ["claude", "codex"] {
+            let orch = test_orchestrator().await;
+            seed_allow_all_permission(&orch).await;
+            let snapshot = orch
+                .db
+                .local
+                .query_opt_text(
+                    "SELECT snapshot FROM executions WHERE id = 'execution-1'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let mut snapshot = crate::config::snapshot_migrate::load(&snapshot).unwrap();
+            snapshot
+                .agents
+                .get_mut("agent-parent")
+                .unwrap()
+                .disallowed_tools = Some(vec!["mcp__cairn__read".to_string()]);
+            orch.db
+                .local
+                .execute(
+                    "UPDATE executions SET snapshot = ?1 WHERE id = 'execution-1'",
+                    params![snapshot.to_json().unwrap()],
+                )
+                .await
+                .unwrap();
+            orch.db
+                .local
+                .execute(
+                    "UPDATE sessions SET backend = ?1 WHERE id = 'session-parent'",
+                    params![backend],
+                )
+                .await
+                .unwrap();
+            orch.session_allowed_tools
+                .lock()
+                .unwrap()
+                .insert("mcp__cairn__read".to_string());
+
+            let result = resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                agent_resource_answer(PermissionDecision::Allow),
+            )
+            .await;
+            if backend == "claude" {
+                assert!(result.unwrap_err().contains("own effective grants"));
+                assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+                assert!(crate::channels::ledger::resolution_for_action(
+                    &orch.db.local,
+                    "perm-request-1",
+                )
+                .await
+                .unwrap()
+                .is_none());
+            } else {
+                result.expect("Codex uses its existing reusable tool approval");
+                assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forged_structured_actor_is_refused_without_invalid_journal_attribution() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        let parent = agent_resource_answer(PermissionDecision::Deny);
+        let actor = serde_json::to_string(parent.decision_attribution().unwrap().0).unwrap();
+        let refusal = resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch)
+                .with_actor(actor),
+        )
+        .await
+        .expect_err("serialized actor text is not authenticated provenance");
+        assert!(refusal.contains("ancestor lineage"), "{refusal}");
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+        assert!(
+            crate::channels::ledger::resolution_for_action(&orch.db.local, "perm-request-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// An agent may not give itself the sensitive-read denylist, through a `run`
@@ -4784,7 +5062,7 @@ pub(crate) mod tests {
             agent_resource_answer(PermissionDecision::Deny),
         )
         .await
-        .expect("deny stays open to every surface");
+        .expect("an authenticated ancestor may deny an escape");
 
         assert_eq!(perm_status(&orch).await.as_deref(), Some("denied"));
     }
@@ -4959,8 +5237,8 @@ pub(crate) mod tests {
         assert_eq!(request_id, "perm-request-1");
         assert_eq!(
             denial_text("the blocked command", &broadcast),
-            "Denied by cairn://p/prj/1/1/builder: the blocked command\nMessage from \
-             cairn://p/prj/1/1/builder: write it under $TMPDIR instead"
+            "Denied by cairn://p/prj/1/1/parent: the blocked command\nMessage from \
+             cairn://p/prj/1/1/parent: write it under $TMPDIR instead"
         );
         let stored: serde_json::Value =
             serde_json::from_str(&perm_column(&orch, "response").await.unwrap()).unwrap();
@@ -4969,12 +5247,16 @@ pub(crate) mod tests {
             serde_json::json!({
                 "behavior": "deny",
                 "message": "write it under $TMPDIR instead",
-                "deniedBy": "cairn://p/prj/1/1/builder",
+                "deniedBy": "cairn://p/prj/1/1/parent",
             })
         );
+        let actor = perm_column(&orch, "resolution_actor").await.unwrap();
         assert_eq!(
-            perm_column(&orch, "resolution_actor").await.as_deref(),
-            Some("cairn://p/prj/1/1/builder")
+            serde_json::from_str::<PrincipalRef>(&actor).unwrap(),
+            PrincipalRef::Agent {
+                node: "cairn://p/prj/1/1/parent".to_string(),
+                run_id: Some("run-parent".to_string()),
+            }
         );
     }
 

@@ -558,19 +558,13 @@ mod tests {
             if cataloged {
                 publish_for_test(&orch.db.local, "exec-1").await;
             }
-            let before = (
-                orch.db.local.read_statement_count(),
-                orch.db.local.read_checkout_count(),
-            );
+            // Count the locator's own reads: the database-wide counters also
+            // see the test orchestrator's background tasks reading the same
+            // database, which made this pin intermittently (2, 2) or (1, 2).
+            let (hydrated, reads) = orch.db.local.own_reads(hydrate(&orch, &fact)).await;
+            assert_eq!(hydrated.unwrap().fact.fields["text"], "last run prose");
             assert_eq!(
-                hydrate(&orch, &fact).await.unwrap().fact.fields["text"],
-                "last run prose"
-            );
-            assert_eq!(
-                (
-                    orch.db.local.read_statement_count() - before.0,
-                    orch.db.local.read_checkout_count() - before.1
-                ),
+                (reads.statements, reads.checkouts),
                 (1, 1),
                 "50-run latest event, cataloged={cataloged}"
             );

@@ -814,7 +814,7 @@ mod callback_response_tests {
         db.set_history_source_override(Some(HistorySource::Pack));
         // A lost file is an offline local archive, not a reason to read hot.
         db.execute(
-            "UPDATE history_tier SET content_hash = ?1 WHERE execution_id = 'exec-task'",
+            "UPDATE history_tier SET content_hash = ?1 WHERE scope_id = 'exec-task'",
             ("0".repeat(64),),
         )
         .await
