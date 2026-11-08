@@ -38,6 +38,7 @@ impl TestConsumer {
                     drain_key: cairn_config::fleet::FleetConfig::drain_key("machine").to_string(),
                     owner: "operator".into(),
                     generation: 7,
+                    machine_revision: 9,
                 }),
             }),
             contexts: Mutex::new(Vec::new()),
@@ -69,7 +70,12 @@ impl RequestConsumer for TestConsumer {
     async fn availability(&self, _: &Orchestrator) -> Result<(), String> {
         Ok(())
     }
-    async fn facts(&self, _: &Orchestrator, _: Option<&str>) -> Result<ActorFacts, String> {
+    async fn facts(
+        &self,
+        _: &Orchestrator,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<ActorFacts, String> {
         Ok(self.facts.lock().unwrap().clone())
     }
     async fn validate_snapshot(
@@ -1659,4 +1665,1009 @@ async fn explicit_refresh_replaces_actor_facts_without_join_and_invalidates_old_
     assert_eq!(still_accepted.state, RequestState::Accepted);
     assert_eq!(still_accepted.facts, accepted.facts);
     assert_eq!(still_accepted.attempts, accepted.attempts);
+}
+
+/// The production consumer, installed exactly as the runner installs it, driven
+/// through the real request primitive and a real settings file.
+mod production_lift_drain {
+    use super::*;
+    use crate::fleet::lift_drain::LiftDrainConsumer;
+    use cairn_config::drain::{DrainOwner, LiftApplication};
+    use cairn_config::fleet::{RemoteExecutorConfig, RemotePlatform};
+
+    const URI: &str = "cairn://executors/machine-a";
+    const ID: &str = "machine-id";
+
+    fn human(subject: &str) -> PrincipalRef {
+        PrincipalRef::Human {
+            issuer: "test".into(),
+            subject: subject.into(),
+            organization: None,
+        }
+    }
+
+    fn remote(name: &str) -> RemoteExecutorConfig {
+        RemoteExecutorConfig {
+            host: "machine-a.local".into(),
+            ssh_user: "dev".into(),
+            platform: RemotePlatform::LinuxX86_64,
+            binary_path: "/home/dev/.local/bin/cairn-executor".into(),
+            cairn_home: "/home/dev/.cairn-executor".into(),
+            executor_id: ID.into(),
+            device_id: "machine-device".into(),
+            display_name: name.into(),
+            project_ids: vec![],
+            bootstrapped_at_unix_ms: None,
+            legacy_retired_at_unix_ms: None,
+            legacy_tunnel_port: None,
+            extra_ssh_args: vec![],
+        }
+    }
+
+    async fn installed(with_thread: bool) -> (Orchestrator, Arc<LiftDrainConsumer>) {
+        let orch = fixture().await;
+        let consumer = LiftDrainConsumer::new();
+        orch.operator_requests.register(consumer.clone()).unwrap();
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config
+                .remote_executors
+                .insert(ID.into(), remote("machine-a"));
+            config
+                .drains
+                .impose_operator(ID, &human("operator"), "maintenance", 1)?;
+            if with_thread {
+                config
+                    .drains
+                    .impose_thread(ID, "thread-a", &human("thread"), "hold", 2)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        (orch, consumer)
+    }
+
+    fn standing(orch: &Orchestrator) -> Vec<DrainOwner> {
+        cairn_config::settings::read_fleet_strict(&orch.config_dir)
+            .unwrap()
+            .drains
+            .records(ID)
+            .into_iter()
+            .map(|record| record.owner)
+            .collect()
+    }
+
+    async fn file_lift(orch: &Orchestrator) -> OperatorRequest {
+        file(
+            orch,
+            &callback("run"),
+            input(RequestKind::LiftDrain, Some(URI), "resume"),
+        )
+        .await
+        .unwrap()
+        .request
+    }
+
+    async fn state(orch: &Orchestrator, id: &str) -> OperatorRequest {
+        get(orch, id).await.unwrap().unwrap()
+    }
+
+    fn accepted_attempt(request: &OperatorRequest) -> &cairn_common::requests::RequestAttempt {
+        let id = request
+            .current_attempt
+            .as_ref()
+            .expect("current accepted attempt");
+        let attempt = request
+            .attempts
+            .iter()
+            .find(|attempt| &attempt.id == id)
+            .unwrap();
+        assert_eq!(attempt.state, RequestState::Accepted);
+        attempt
+    }
+
+    /// The claim and effect a crashed runner would have left: claimed, with the
+    /// config application committed but nothing reported.
+    async fn claim(orch: &Orchestrator, accepted: &OperatorRequest) -> LiftApplication {
+        let attempt = &accepted.attempts[0];
+        let drain = attempt.acceptance.drain.clone().unwrap();
+        cairn_db::storage::requests::claim_request(
+            &orch.db.local,
+            &attempt.authorization_event_id,
+            &attempt.acceptance,
+            "claim-crash",
+            now(),
+        )
+        .await
+        .unwrap();
+        LiftApplication {
+            install_id: attempt.acceptance.install_id.clone(),
+            workspace_id: attempt.acceptance.workspace_id.clone(),
+            authorization_event_id: attempt.authorization_event_id.clone(),
+            attempt_id: attempt.acceptance.attempt_id.clone(),
+            claim_id: "claim-crash".into(),
+            actor: "execution.fleet".into(),
+            kind: "lift_drain".into(),
+            executor_id: drain.executor_id,
+            drain_key: drain.drain_key,
+            accepted_owner: DrainOwner::Operator,
+            operator_generation: drain.generation,
+            machine_revision: drain.machine_revision,
+            report_id: format!("lift-drain:{}", attempt.acceptance.attempt_id),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_installed_adapter_makes_lift_drain_live_and_clears_only_the_operator_record() {
+        let (orch, _) = installed(true).await;
+        assert!(orch
+            .operator_requests
+            .unavailable_reason("lift_drain")
+            .is_none());
+        let card = file_lift(&orch).await;
+        let facts = card.facts.as_ref().unwrap();
+        assert_eq!(
+            facts.document["document"]["owners"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            standing(&orch),
+            vec![DrainOwner::Thread {
+                thread_id: "thread-a".into()
+            }]
+        );
+        assert!(
+            orch.fleet.is_drained(ID),
+            "another owner still closes admission"
+        );
+        let done = state(&orch, &card.id).await;
+        assert_eq!(done.state, RequestState::Done);
+        let body = serde_json::to_string(&done).unwrap();
+        assert!(
+            body.contains("CLOSED") && body.contains("thread:thread-a"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn filing_without_an_operator_record_refuses_by_name() {
+        let (orch, _) = installed(false).await;
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config.drains.clear_thread(ID, "none").map(|_| ())?;
+            let revision = config.drains.machine_revision(ID);
+            assert!(revision > 0);
+            Ok(())
+        })
+        .unwrap();
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
+            .await
+            .unwrap();
+        let error = file(
+            &orch,
+            &callback("run"),
+            input(RequestKind::LiftDrain, Some(URI), "again"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no operator-owned drain"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn another_owners_change_spends_the_attempt_and_clears_nothing() {
+        let (orch, _) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config
+                .drains
+                .impose_thread(ID, "thread-b", &human("thread"), "new hold", 5)
+                .map(|_| ())
+        })
+        .unwrap();
+        dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
+            .await
+            .unwrap();
+        assert_eq!(standing(&orch).len(), 2);
+        assert!(standing(&orch).contains(&DrainOwner::Operator));
+        let reopened = state(&orch, &card.id).await;
+        assert_eq!(reopened.state, RequestState::Open);
+        let again = accept_card(&orch, &reopened).await.unwrap();
+        assert_ne!(
+            accepted_attempt(&again).acceptance.attempt_id,
+            accepted.attempts[0].acceptance.attempt_id
+        );
+    }
+
+    #[tokio::test]
+    async fn accepting_a_stale_card_is_refused_before_any_attempt_exists() {
+        let (orch, _) = installed(false).await;
+        let card = file_lift(&orch).await;
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config
+                .drains
+                .impose_thread(ID, "thread-b", &human("thread"), "new hold", 5)
+                .map(|_| ())
+        })
+        .unwrap();
+        let error = accept_card(&orch, &card).await.unwrap_err();
+        assert!(error.contains("drain state changed"), "{error}");
+        assert!(state(&orch, &card.id).await.attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rename_after_acceptance_still_lifts_the_same_machine() {
+        let (orch, _) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config
+                .remote_executors
+                .insert(ID.into(), remote("machine-renamed"));
+            Ok(())
+        })
+        .unwrap();
+        dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
+            .await
+            .unwrap();
+        assert!(standing(&orch).is_empty());
+    }
+
+    #[tokio::test]
+    async fn crash_before_the_claim_leaves_the_drain_and_recovery_is_a_no_op() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Accepted);
+        dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
+            .await
+            .unwrap();
+        assert!(standing(&orch).is_empty());
+    }
+
+    #[tokio::test]
+    async fn crash_after_claim_without_a_receipt_settles_failed_and_clears_nothing() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        claim(&orch, &accepted).await;
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Open);
+        accept_card(&orch, &state(&orch, &card.id).await)
+            .await
+            .expect("fresh acceptance after a no-effect settlement");
+    }
+
+    #[tokio::test]
+    async fn crash_after_atomic_replacement_before_publication_reconciles_the_receipt() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let application = claim(&orch, &accepted).await;
+        // Committed to disk, never published to the live projection.
+        cairn_config::settings::mutate_fleet(
+            &orch.config_dir,
+            |config| config.drains.apply_lift(application.clone()),
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            orch.fleet.is_drained(ID),
+            "live state still shows the old drain"
+        );
+        consumer.recover(&orch).await.unwrap();
+        assert!(
+            !orch.fleet.is_drained(ID),
+            "recovery published the current config"
+        );
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Done);
+    }
+
+    #[tokio::test]
+    async fn crash_after_publication_before_report_never_clears_a_newer_drain() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let application = claim(&orch, &accepted).await;
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config.drains.apply_lift(application.clone()).map(|_| ())
+        })
+        .unwrap();
+        // The operator drains the machine again before the runner recovers.
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config
+                .drains
+                .impose_operator(ID, &human("operator"), "second maintenance", 9)
+                .map(|_| ())
+        })
+        .unwrap();
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Done);
+        // Replaying recovery after the report is a no-op.
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+    }
+
+    #[tokio::test]
+    async fn real_atomic_replace_failure_has_no_effect_and_requires_fresh_acceptance() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let application = claim(&orch, &accepted).await;
+        let path = cairn_config::settings::get_settings_path(&orch.config_dir);
+        let backup = orch.config_dir.join("settings.backup");
+        let bytes = std::fs::read(&path).unwrap();
+        let before = cairn_config::settings::read_fleet_strict(&orch.config_dir).unwrap();
+
+        // Exercise the production config/publication boundary after a real claim,
+        // with a valid read and in-memory clear, but a failing atomic replacement.
+        let result = crate::fleet::management::mutate_fleet(&orch, |config| {
+            let receipt = config.drains.apply_lift(application.clone())?;
+            std::fs::rename(&path, &backup).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            Ok(receipt)
+        });
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("Failed to replace settings file"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            cairn_config::settings::read_fleet_strict(&orch.config_dir)
+                .unwrap()
+                .drains,
+            before.drains
+        );
+        assert!(orch.fleet.is_drained(ID), "failed clear must not publish");
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Acting);
+
+        consumer.recover(&orch).await.unwrap();
+        let reopened = state(&orch, &card.id).await;
+        assert_eq!(reopened.state, RequestState::Open);
+        assert_eq!(
+            reopened.attempts[0].outcome,
+            Some(RequestAttemptOutcome::Failed)
+        );
+        assert!(serde_json::to_string(&reopened.attempts[0].report)
+            .unwrap()
+            .contains("no_effect"));
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+        assert!(cairn_config::settings::read_fleet_strict(&orch.config_dir)
+            .unwrap()
+            .drains
+            .lift_receipts()
+            .is_empty());
+        assert!(
+            dispatch_accepted(&orch, &application.authorization_event_id)
+                .await
+                .is_err()
+        );
+
+        let fresh = accept_card(&orch, &reopened).await.unwrap();
+        let attempt = accepted_attempt(&fresh);
+        assert_ne!(attempt.id, application.attempt_id);
+        dispatch_accepted(&orch, &attempt.authorization_event_id)
+            .await
+            .unwrap();
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Done);
+        let committed = cairn_config::settings::read_fleet_strict(&orch.config_dir).unwrap();
+        assert!(committed.drains.records(ID).is_empty());
+        assert_eq!(committed.drains.lift_receipts().len(), 1);
+        assert!(!committed
+            .drains
+            .lift_receipts()
+            .contains_key(&application.attempt_id));
+        assert!(!orch.fleet.is_drained(ID));
+    }
+
+    #[tokio::test]
+    async fn dispatch_cannot_claim_and_recovery_cannot_settle_while_shared_exclusion_is_held() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let gate = consumer.exclusion().await.unwrap();
+        let event = &accepted.attempts[0].authorization_event_id;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dispatch_accepted(&orch, event)
+        )
+        .await
+        .is_err());
+        let waiting = state(&orch, &card.id).await;
+        assert_eq!(waiting.state, RequestState::Accepted);
+        assert!(waiting.attempts[0].claim_id.is_none());
+
+        // Model an active effect after claim, still holding the same exclusion.
+        claim(&orch, &accepted).await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            consumer.recover(&orch)
+        )
+        .await
+        .is_err());
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Acting);
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+        drop(gate);
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Open);
+    }
+
+    #[tokio::test]
+    async fn a_report_failure_after_committed_clear_remains_recoverable_without_another_effect() {
+        let (orch, consumer) = installed(true).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let attempt = accepted_attempt(&accepted);
+        // Fail the real success-report transaction, but leave the primitive's
+        // dispatch-error report writable so it cannot hide a terminal downgrade.
+        orch.db
+            .local
+            .execute(
+                "CREATE TRIGGER refuse_lift_report BEFORE INSERT ON request_report_receipts \
+             WHEN NEW.id LIKE 'lift-drain:%' BEGIN SELECT RAISE(ABORT, 'report unavailable'); END",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let dispatched = dispatch_accepted(&orch, &attempt.authorization_event_id).await;
+        let committed = cairn_config::settings::read_fleet_strict(&orch.config_dir).unwrap();
+        let receipt = committed.drains.lift_receipts()[&attempt.id].clone();
+        assert_eq!(receipt.outcome, cairn_config::drain::LiftOutcome::Cleared);
+        assert_eq!(
+            standing(&orch),
+            vec![DrainOwner::Thread {
+                thread_id: "thread-a".into()
+            }]
+        );
+        assert_eq!(
+            state(&orch, &card.id).await.state,
+            RequestState::Acting,
+            "a committed effect must remain reconcilable when reporting fails"
+        );
+        dispatched.unwrap();
+        let unresolved = store::unresolved_claims(&orch.db.local, RequestKind::LiftDrain)
+            .await
+            .unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].acceptance.attempt_id, attempt.id);
+        assert_eq!(unresolved[0].state, RequestState::Acting);
+
+        orch.db
+            .local
+            .execute("DROP TRIGGER refuse_lift_report", ())
+            .await
+            .unwrap();
+        crate::fleet::management::mutate_fleet(&orch, |config| {
+            config
+                .drains
+                .impose_operator(ID, &human("operator"), "replacement", 3)?;
+            Ok(())
+        })
+        .unwrap();
+        let replacement = cairn_config::settings::read_fleet_strict(&orch.config_dir)
+            .unwrap()
+            .drains;
+        consumer.recover(&orch).await.unwrap();
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Done);
+        let after = cairn_config::settings::read_fleet_strict(&orch.config_dir).unwrap();
+        assert_eq!(
+            after.drains, replacement,
+            "recovery reports evidence, never repeats the clear"
+        );
+        assert_eq!(after.drains.lift_receipts()[&attempt.id], receipt);
+        assert!(
+            store::unresolved_claims(&orch.db.local, RequestKind::LiftDrain)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reports = orch
+            .db
+            .local
+            .query_all(
+                "SELECT id FROM request_report_receipts WHERE attempt_id=?1".to_string(),
+                (attempt.id.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reports, vec![receipt.application.report_id]);
+        let outbox = store::pending_outbox(&orch.db.local, 200).await.unwrap();
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|item| item.request_id == card.id
+                    && item.kind == "changed"
+                    && item.payload["state"] == "done")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_dispatch_report_and_recovery_create_one_receipt_and_one_terminal_outbox_transition(
+    ) {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let event = &accepted.attempts[0].authorization_event_id;
+        dispatch_accepted(&orch, event).await.unwrap();
+        let context = recover_claimed_request(
+            &orch,
+            event,
+            &accepted.attempts[0].acceptance,
+            consumer.clone(),
+        )
+        .await
+        .unwrap();
+        let receipt = cairn_config::settings::read_fleet_strict(&orch.config_dir)
+            .unwrap()
+            .drains
+            .lift_receipts()[&accepted.attempts[0].id]
+            .clone();
+        let before = store::pending_outbox(&orch.db.local, 200).await.unwrap();
+        let terminal_changes = before
+            .iter()
+            .filter(|item| {
+                item.request_id == card.id
+                    && item.kind == "changed"
+                    && item.payload["state"] == "done"
+            })
+            .count();
+        assert_eq!(terminal_changes, 1);
+        let outbox_ids = before
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+
+        assert!(dispatch_accepted(&orch, event).await.is_err());
+        context
+            .report(
+                &orch,
+                &receipt.application.report_id,
+                report(RequestAttemptOutcome::Done, true, true),
+            )
+            .await
+            .unwrap();
+        consumer.recover(&orch).await.unwrap();
+        consumer.recover(&orch).await.unwrap();
+        let after = store::pending_outbox(&orch.db.local, 200).await.unwrap();
+        assert_eq!(
+            after.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+            outbox_ids
+        );
+        let reports = orch
+            .db
+            .local
+            .query_all(
+                "SELECT id FROM request_report_receipts WHERE attempt_id=?1".to_string(),
+                (accepted.attempts[0].id.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reports, vec![receipt.application.report_id.clone()]);
+        let current = cairn_config::settings::read_fleet_strict(&orch.config_dir).unwrap();
+        assert_eq!(current.drains.lift_receipts().len(), 1);
+        assert_eq!(
+            current.drains.lift_receipts()[&accepted.attempts[0].id],
+            receipt
+        );
+        assert_eq!(current.drains.machine_revision(ID), receipt.after_revision);
+        delivery::drain_once(&orch).await.unwrap();
+        assert!(!dispatch_intent_pending(&orch, event).await);
+        delivery::drain_once(&orch).await.unwrap();
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Done);
+    }
+
+    #[tokio::test]
+    async fn same_second_reconstructed_runner_recovers_receipt_and_no_receipt_claims() {
+        for committed in [false, true] {
+            let (orch, consumer) = installed(false).await;
+            let card = file_lift(&orch).await;
+            let accepted = accept_card(&orch, &card).await.unwrap();
+            let application = claim(&orch, &accepted).await;
+            let claim_second =
+                store::get_attempt_by_event(&orch.db.local, &application.authorization_event_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .updated_at;
+            if committed {
+                // Crash boundary: receipt persisted, publication/report absent.
+                cairn_config::settings::mutate_fleet(
+                    &orch.config_dir,
+                    |config| config.drains.apply_lift(application.clone()),
+                    |_| {},
+                )
+                .unwrap();
+            }
+            let db = orch.db.clone();
+            let config_dir = orch.config_dir.clone();
+            drop(consumer);
+            drop(orch);
+            let restarted = OrchestratorBuilder::new(
+                db,
+                Arc::new(TestServicesBuilder::new().build()),
+                config_dir,
+            )
+            .boot_at(claim_second)
+            .build();
+            assert_eq!(restarted.boot_at, claim_second);
+            let consumer = LiftDrainConsumer::new();
+            restarted
+                .operator_requests
+                .register(consumer.clone())
+                .unwrap();
+            let persisted = store::get_attempt_by_event(
+                &restarted.db.local,
+                &application.authorization_event_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(persisted.updated_at, restarted.boot_at);
+            assert_eq!(persisted.state, RequestState::Acting);
+
+            consumer.recover(&restarted).await.unwrap();
+            let recovered = state(&restarted, &card.id).await;
+            let expected = if committed {
+                RequestState::Done
+            } else {
+                RequestState::Open
+            };
+            assert_eq!(recovered.state, expected);
+            assert_eq!(restarted.fleet.is_drained(ID), !committed);
+            let config = cairn_config::settings::read_fleet_strict(&restarted.config_dir).unwrap();
+            assert_eq!(config.drains.lift_receipts().len(), usize::from(committed));
+            if !committed {
+                assert_eq!(standing(&restarted), vec![DrainOwner::Operator]);
+                assert_eq!(
+                    recovered.attempts[0].outcome,
+                    Some(RequestAttemptOutcome::Failed)
+                );
+                let fresh = accept_card(&restarted, &recovered).await.unwrap();
+                let attempt = accepted_attempt(&fresh);
+                assert_ne!(attempt.id, application.attempt_id);
+                dispatch_accepted(&restarted, &attempt.authorization_event_id)
+                    .await
+                    .unwrap();
+                assert_eq!(state(&restarted, &card.id).await.state, RequestState::Done);
+            }
+            consumer.recover(&restarted).await.unwrap();
+            assert_eq!(state(&restarted, &card.id).await.state, RequestState::Done);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_machine_revision_in_attempt_or_authorization_journal_refuses_before_claim() {
+        for location in ["journal", "attempt", "valid_control"] {
+            let (orch, _) = installed(false).await;
+            let card = file_lift(&orch).await;
+            let accepted = accept_card(&orch, &card).await.unwrap();
+            let original = &accepted.attempts[0];
+            let mut envelope = original.acceptance.clone();
+            envelope.cohort_id = format!("copied-cohort:{location}");
+            envelope.attempt_id = format!("copied-attempt:{location}");
+            let request_id = format!("copied-request:{location}");
+            envelope.request_ids = vec![request_id.clone()];
+            let event = format!("copied-event:{location}");
+            let suffix = format!(":{location}");
+            let valid = serde_json::to_string(&envelope).unwrap();
+            let mut missing = serde_json::to_value(&envelope).unwrap();
+            missing["drain"]
+                .as_object_mut()
+                .unwrap()
+                .remove("machine_revision");
+            let error = serde_json::from_value::<RequestAcceptance>(missing.clone()).unwrap_err();
+            assert!(error.to_string().contains("machine_revision"), "{error}");
+            let path = cairn_config::settings::get_settings_path(&orch.config_dir);
+            let bytes = std::fs::read(&path).unwrap();
+
+            // History is append-only, including attempt inputs and membership.
+            // Copy a complete fixture cohort with coherent new identities; the
+            // valid control must dispatch through the very same seeded shape.
+            orch.db.local.execute(
+                "INSERT INTO request_cohorts(id,workspace_id,coalescing_key,kind,state,revision,created_at,updated_at) \
+                 SELECT ?1,workspace_id,coalescing_key,kind,state,revision,created_at,updated_at FROM request_cohorts WHERE id=?2",
+                (envelope.cohort_id.clone(), original.acceptance.cohort_id.clone()),
+            ).await.unwrap();
+            orch.db.local.execute(
+                "INSERT INTO requests(id,workspace_id,kind,target,target_identity,coalescing_key,cohort_id,state,revision,created_at,updated_at,current_attempt) \
+                 SELECT ?1,workspace_id,kind,target,target_identity,coalescing_key,?2,state,revision,created_at,updated_at,?3 FROM requests WHERE id=?4",
+                (request_id.clone(), envelope.cohort_id.clone(), envelope.attempt_id.clone(), card.id.clone()),
+            ).await.unwrap();
+            orch.db
+                .local
+                .execute(
+                    "INSERT INTO request_cohort_members(cohort_id,request_id) VALUES(?1,?2)",
+                    (envelope.cohort_id.clone(), request_id.clone()),
+                )
+                .await
+                .unwrap();
+            orch.db.local.execute(
+                "INSERT INTO request_facts(cohort_id,version,revision,schema_version,observed_at,document_json) \
+                 SELECT ?1,version,revision,schema_version,observed_at,document_json FROM request_facts WHERE cohort_id=?2",
+                (envelope.cohort_id.clone(), original.acceptance.cohort_id.clone()),
+            ).await.unwrap();
+            orch.db.local.execute(
+                "INSERT INTO request_requesters(id,request_id,origin_uri,run_id,principal_json,wake_destination,rationale,requirements_json,minimum_target,normalized_target_json,filing_key,active,satisfied_by_attempt,created_at) \
+                 SELECT id || ?1,?2,origin_uri,run_id,principal_json,wake_destination,rationale,requirements_json,minimum_target,normalized_target_json,filing_key,active,satisfied_by_attempt,created_at FROM request_requesters WHERE request_id=?3",
+                (suffix.clone(), request_id.clone(), card.id.clone()),
+            ).await.unwrap();
+            orch.db.local.execute(
+                "INSERT INTO request_waiting(contribution_id,uri) SELECT contribution_id || ?1,uri FROM request_waiting \
+                 WHERE contribution_id IN (SELECT id FROM request_requesters WHERE request_id=?2)",
+                (suffix.clone(), card.id.clone()),
+            ).await.unwrap();
+            let uri = format!("cairn://requests/{request_id}");
+            let scope = cairn_common::authorization::AuthorityScope::new(
+                cairn_common::authorization::AuthorityPlace::Resource {
+                    canonical_uri: uri.clone(),
+                },
+                cairn_common::authorization::AuthorityAction::Run,
+            );
+            let journal_json = if location == "journal" {
+                missing.to_string()
+            } else {
+                valid.clone()
+            };
+            orch.db.local.execute(
+                "INSERT INTO authorization_events(id,scope_key,place_kind,action,scope_json,mutation,summary,outcome,reason,principal_json,audience_json,workspace_id,run_id,request_uri,grant_id,decided_at,actor_principal_json,appearance_snapshot_json,request_acceptance_json) \
+                 SELECT ?1,?2,place_kind,action,?3,mutation,summary,outcome,reason,principal_json,audience_json,workspace_id,run_id,?4,grant_id,decided_at,actor_principal_json,appearance_snapshot_json,?5 FROM authorization_events WHERE id=?6",
+                (event.clone(), scope.shorthand(), serde_json::to_string(&scope).unwrap(), uri, journal_json, original.authorization_event_id.clone()),
+            ).await.unwrap();
+            let attempt_json = if location == "attempt" {
+                missing.to_string()
+            } else {
+                valid
+            };
+            orch.db.local.execute(
+                "INSERT INTO request_attempts(id,cohort_id,authorization_event_id,acceptance_json,state,updated_at) VALUES(?1,?2,?3,?4,'accepted',?5)",
+                (envelope.attempt_id.clone(), envelope.cohort_id.clone(), event.clone(), attempt_json, original.updated_at),
+            ).await.unwrap();
+            let mut contributions = accepted.requesters.clone();
+            for contribution in &mut contributions {
+                contribution.id.push_str(&suffix);
+                contribution.request_id = request_id.clone();
+            }
+            orch.db.local.execute(
+                "INSERT INTO request_attempt_members(attempt_id,request_id,contributions_json) VALUES(?1,?2,?3)",
+                (envelope.attempt_id.clone(), request_id.clone(), serde_json::to_string(&contributions).unwrap()),
+            ).await.unwrap();
+
+            let result = dispatch_accepted(&orch, &event).await;
+            if location == "valid_control" {
+                result.unwrap();
+                assert_eq!(state(&orch, &request_id).await.state, RequestState::Done);
+                assert!(standing(&orch).is_empty());
+                continue;
+            }
+            let error = result.unwrap_err();
+            assert!(error.contains("machine_revision"), "{location}: {error}");
+            let unclaimed = orch
+                .db
+                .local
+                .query_one(
+                    "SELECT state,claim_id FROM request_attempts WHERE id=?1".to_string(),
+                    (envelope.attempt_id.clone(),),
+                    |row| Ok((row.text(0)?, row.opt_text(1)?)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unclaimed, ("accepted".into(), None), "{location}");
+            let unchanged =
+                store::get_attempt_by_event(&orch.db.local, &original.authorization_event_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(unchanged.state, RequestState::Accepted);
+            assert!(unchanged.claim_id.is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+            assert!(cairn_config::settings::read_fleet_strict(&orch.config_dir)
+                .unwrap()
+                .drains
+                .lift_receipts()
+                .is_empty());
+            dispatch_accepted(&orch, &original.authorization_event_id)
+                .await
+                .unwrap();
+            assert_eq!(state(&orch, &card.id).await.state, RequestState::Done);
+        }
+    }
+
+    #[tokio::test]
+    async fn production_dispatch_refuses_forged_identity_claim_and_every_frozen_drain_restriction()
+    {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let event = &accepted.attempts[0].authorization_event_id;
+        assert!(
+            recover_claimed_request(
+                &orch,
+                event,
+                &accepted.attempts[0].acceptance,
+                consumer.clone(),
+            )
+            .await
+            .is_err(),
+            "an accepted but unclaimed act is not authority"
+        );
+        claim(&orch, &accepted).await;
+        let context = recover_claimed_request(
+            &orch,
+            event,
+            &accepted.attempts[0].acceptance,
+            consumer.clone(),
+        )
+        .await
+        .unwrap();
+        context.recheck(&orch).await.unwrap();
+        let path = cairn_config::settings::get_settings_path(&orch.config_dir);
+        let bytes = std::fs::read(&path).unwrap();
+        for field in [
+            "event",
+            "claim",
+            "install",
+            "workspace",
+            "actor",
+            "kind",
+            "target",
+            "identity",
+            "executor",
+            "key",
+            "owner",
+            "generation",
+            "revision",
+        ] {
+            let mut forged = context.clone();
+            match field {
+                "event" => forged.event_id = "no-acceptance".into(),
+                "claim" => forged.claim_id = "another-claim".into(),
+                "install" => forged.acceptance.install_id = "another-install".into(),
+                "workspace" => forged.acceptance.workspace_id = "another-workspace".into(),
+                "actor" => forged.acceptance.actor_id = "another.actor".into(),
+                "kind" => forged.acceptance.kind = RequestKind::Rebuild,
+                "target" => forged.acceptance.target = Some("cairn://executors/other".into()),
+                "identity" => forged.acceptance.target_identity = "other".into(),
+                "executor" => {
+                    forged.acceptance.drain.as_mut().unwrap().executor_id = "other".into()
+                }
+                "key" => forged.acceptance.drain.as_mut().unwrap().drain_key = "other".into(),
+                "owner" => forged.acceptance.drain.as_mut().unwrap().owner = "thread:a".into(),
+                "generation" => forged.acceptance.drain.as_mut().unwrap().generation += 1,
+                "revision" => forged.acceptance.drain.as_mut().unwrap().machine_revision += 1,
+                _ => unreachable!(),
+            }
+            assert!(consumer.dispatch(&orch, &forged).await.is_err(), "{field}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{field}");
+            assert_eq!(
+                state(&orch, &card.id).await.state,
+                RequestState::Acting,
+                "{field}"
+            );
+        }
+        assert!(
+            context
+                .report(
+                    &orch,
+                    "forged-success",
+                    report(RequestAttemptOutcome::Done, true, true),
+                )
+                .await
+                .is_err(),
+            "caller JSON cannot replace a missing config receipt"
+        );
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+        assert!(cairn_config::settings::read_fleet_strict(&orch.config_dir)
+            .unwrap()
+            .drains
+            .lift_receipts()
+            .is_empty());
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Open);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_cannot_settle_a_real_dispatch_paused_after_claim_before_effect() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let config_dir = orch.config_dir.clone();
+        let blocker = tokio::task::spawn_blocking(move || {
+            cairn_config::settings::mutate_fleet(
+                &config_dir,
+                |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(15))
+                        .unwrap();
+                    Ok(())
+                },
+                |_| {},
+            )
+        });
+        entered_rx.await.unwrap();
+        let dispatched_orch = orch.clone();
+        let event = accepted.attempts[0].authorization_event_id.clone();
+        let dispatch =
+            tokio::spawn(async move { dispatch_accepted(&dispatched_orch, &event).await });
+        let acting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if state(&orch, &card.id).await.state == RequestState::Acting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let recovery = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            consumer.recover(&orch),
+        )
+        .await;
+        let during = state(&orch, &card.id).await;
+        let still_drained = orch.fleet.is_drained(ID);
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        dispatch.await.unwrap().unwrap();
+        assert!(
+            acting.is_ok(),
+            "the real dispatch must reach its durable claim"
+        );
+        assert!(
+            recovery.is_err(),
+            "recovery cannot settle while the effect is in flight"
+        );
+        assert_eq!(during.state, RequestState::Acting);
+        assert!(still_drained);
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Done);
+        consumer.recover(&orch).await.unwrap();
+        assert!(!orch.fleet.is_drained(ID));
+        let reports = orch
+            .db
+            .local
+            .query_all(
+                "SELECT id FROM request_report_receipts WHERE attempt_id=?1".to_string(),
+                (accepted.attempts[0].id.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_settings_document_retains_the_claim_until_it_can_be_read() {
+        let (orch, consumer) = installed(false).await;
+        let card = file_lift(&orch).await;
+        let accepted = accept_card(&orch, &card).await.unwrap();
+        claim(&orch, &accepted).await;
+        let path = cairn_config::settings::get_settings_path(&orch.config_dir);
+        let good = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, "buildSlots: [").unwrap();
+        assert!(consumer.recover(&orch).await.is_err());
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Acting);
+        std::fs::write(&path, good).unwrap();
+        consumer.recover(&orch).await.unwrap();
+        assert_eq!(state(&orch, &card.id).await.state, RequestState::Open);
+        assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+    }
 }

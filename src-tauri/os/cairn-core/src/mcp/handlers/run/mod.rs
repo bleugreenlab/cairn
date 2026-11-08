@@ -5457,11 +5457,13 @@ impl HostBatch {
 
 /// Run a host batch's items: in order with fail-fast, or each on its own task.
 /// `interrupt` reaches every response and MCP-tool item, and once it fires a
-/// sequential batch starts nothing further.
+/// sequential batch starts nothing further. `batch_request_id` names the
+/// batch whose durable row an MCP item that suspends takes its call over from.
 async fn run_host_items(
     orch: &Orchestrator,
     batch: HostBatch,
     interrupt: Option<&InvocationInterrupt>,
+    batch_request_id: Option<&str>,
 ) -> Vec<ItemOutcome> {
     let HostBatch {
         request,
@@ -5486,6 +5488,7 @@ async fn run_host_items(
                     &cwd,
                     &stream_id,
                     run_context.as_ref(),
+                    batch_request_id,
                     header,
                     spec,
                     interrupt,
@@ -5515,6 +5518,7 @@ async fn run_host_items(
         let run_context = run_context.clone();
         let request = request.clone();
         let interrupt = interrupt.cloned();
+        let batch_request_id = batch_request_id.map(str::to_owned);
         handles.push(AbortOnDrop(tokio::spawn(async move {
             run_one(
                 &orch,
@@ -5522,6 +5526,7 @@ async fn run_host_items(
                 &cwd,
                 &stream_id,
                 run_context.as_ref(),
+                batch_request_id.as_deref(),
                 header,
                 spec,
                 interrupt.as_ref(),
@@ -5606,9 +5611,10 @@ async fn run_host_batch(
     control.phase_done("prepare");
     let (interrupter, interrupt) = crate::responses::interruption();
     control.set_interrupter(interrupter);
-    let task_orch = orch.clone();
-    let mut handle =
-        tokio::spawn(async move { run_host_items(&task_orch, batch, Some(&interrupt)).await });
+    let (task_orch, request_id) = (orch.clone(), control.request_id.clone());
+    let mut handle = tokio::spawn(async move {
+        run_host_items(&task_orch, batch, Some(&interrupt), Some(&request_id)).await
+    });
     let ceiling = deadlines.arrival + RUN_BATCH_CEILING;
     let joined = match tokio::time::timeout_at(ceiling, &mut handle).await {
         Ok(joined) => joined,
@@ -5640,13 +5646,26 @@ async fn run_suspendable_host_batch(
     batch: HostBatch,
     grace: std::time::Duration,
 ) -> String {
+    run_host_batch_declaring(orch, settlement, batch, grace, None).await
+}
+
+/// The same, for a batch that declared it needs `need`: past grace its call
+/// is held on the socket until then rather than parked at once.
+#[cfg(test)]
+async fn run_host_batch_declaring(
+    orch: &Orchestrator,
+    settlement: RunBatchSettlement,
+    batch: HostBatch,
+    grace: std::time::Duration,
+    need: Option<std::time::Duration>,
+) -> String {
     let request = settlement.request.clone();
     let deadlines = CallDeadlines::new(
         tokio::time::Instant::now(),
         grace,
         answer_reserve(),
         cairn_common::callback_contract::LEGACY_RUN_ANSWER_BOUND,
-        None,
+        need,
     );
     let control = BatchControl::new(settlement.commit_msg.is_some());
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -11557,7 +11576,7 @@ mod decide_door_tests {
         )
         .await;
         assert!(
-            text.contains("{model, input, purpose?, width?, save?}"),
+            text.contains("{model, input, purpose?, width?, save?, requirements?}"),
             "{text}"
         );
     }
@@ -11617,7 +11636,7 @@ mod decide_door_tests {
         )
         .await;
         assert!(
-            text.contains("{model, input, questions, provider?}"),
+            text.contains("{model, input, questions, provider?, requirements?}"),
             "{text}"
         );
     }
@@ -11888,14 +11907,39 @@ pub(crate) mod host_batch_tests {
         (settlement, batch)
     }
 
-    /// A stand-in external server whose one tool answers after `delay`. It
-    /// records the bound the gateway was handed and whether a call was
-    /// abandoned (its future dropped unanswered), which is what cancels the
-    /// request at a real server.
+    /// What a scripted tool's first call answers once its delay has passed.
+    #[derive(Clone)]
+    enum FirstAnswer {
+        Complete,
+        InputRequired {
+            input_requests: serde_json::Value,
+            request_state: Option<String>,
+        },
+        Task {
+            task_id: String,
+            poll_interval_ms: Option<u64>,
+            ttl_ms: Option<u64>,
+        },
+    }
+
+    /// What a continuation round answers with, and what a polled task finishes
+    /// with: the tool's final answer once it has what it asked for.
+    const TOOL_FINISHED: &str = "the tool finished with its input";
+    const TASK_FINISHED: &str = "the task finished its work";
+
+    /// A stand-in external server. A tool named in `scripts` answers its first
+    /// call after that delay with that answer; any other tool answers after
+    /// `delay` with "the tool answered". It records the bound the gateway was
+    /// handed, whether a call was abandoned (its future dropped unanswered,
+    /// which is what cancels the request at a real server), every continuation
+    /// round it was sent, and every task poll.
     struct SlowTool {
         delay: Duration,
+        scripts: std::collections::HashMap<String, (Duration, FirstAnswer)>,
         sent: Mutex<Option<Option<u32>>>,
         abandoned: Arc<std::sync::atomic::AtomicBool>,
+        rounds: Mutex<Vec<(serde_json::Value, Option<String>)>>,
+        polls: Mutex<Vec<String>>,
     }
 
     struct MarkAbandoned(Arc<std::sync::atomic::AtomicBool>, bool);
@@ -11940,22 +11984,86 @@ pub(crate) mod host_batch_tests {
             _: &str,
             _: &str,
             _: &crate::security::BrokeredMcpConfig,
-            _: &str,
+            tool: &str,
             _: serde_json::Value,
-            _: Option<serde_json::Value>,
-            _: Option<String>,
+            input_responses: Option<serde_json::Value>,
+            request_state: Option<String>,
             timeout_ms: Option<u32>,
             _: Option<&str>,
         ) -> Result<crate::mcp::gateway::McpCallOutcome, String> {
+            use crate::mcp::gateway::{McpCallOutcome, McpToolCallResult};
+            if let Some(input) = input_responses {
+                self.rounds.lock().unwrap().push((input, request_state));
+                return Ok(McpCallOutcome::Complete(McpToolCallResult::from_text(
+                    TOOL_FINISHED,
+                )));
+            }
             *self.sent.lock().unwrap() = Some(timeout_ms);
+            let (delay, first) = self
+                .scripts
+                .get(tool)
+                .cloned()
+                .unwrap_or((self.delay, FirstAnswer::Complete));
             let mut pending = MarkAbandoned(self.abandoned.clone(), false);
-            tokio::time::sleep(self.delay).await;
+            tokio::time::sleep(delay).await;
             pending.1 = true;
-            Ok(crate::mcp::gateway::McpCallOutcome::Complete(
-                crate::mcp::gateway::McpToolCallResult::from_text("the tool answered"),
+            Ok(match first {
+                FirstAnswer::Complete => {
+                    McpCallOutcome::Complete(McpToolCallResult::from_text("the tool answered"))
+                }
+                FirstAnswer::InputRequired {
+                    input_requests,
+                    request_state,
+                } => McpCallOutcome::InputRequired {
+                    input_requests,
+                    request_state,
+                },
+                FirstAnswer::Task {
+                    task_id,
+                    poll_interval_ms,
+                    ttl_ms,
+                } => McpCallOutcome::Task {
+                    task_id,
+                    poll_interval_ms,
+                    ttl_ms,
+                },
+            })
+        }
+        async fn get_task(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::security::BrokeredMcpConfig,
+            task_id: &str,
+        ) -> Result<crate::mcp::gateway::McpTaskOutcome, String> {
+            self.polls.lock().unwrap().push(task_id.to_string());
+            Ok(crate::mcp::gateway::McpTaskOutcome::Complete(
+                crate::mcp::gateway::McpToolCallResult::from_text(TASK_FINISHED),
             ))
         }
         async fn close_session(&self, _: &str) {}
+    }
+
+    /// Install a [`SlowTool`] whose tools answer as `scripts` say (any other
+    /// tool answers after `delay`), and hand it back for its records.
+    fn scripted_tool<'a>(
+        orch: &Orchestrator,
+        delay: Duration,
+        scripts: impl IntoIterator<Item = (&'a str, Duration, FirstAnswer)>,
+    ) -> Arc<SlowTool> {
+        let tool = Arc::new(SlowTool {
+            delay,
+            scripts: scripts
+                .into_iter()
+                .map(|(name, delay, first)| (name.to_string(), (delay, first)))
+                .collect(),
+            sent: Mutex::new(None),
+            abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rounds: Mutex::new(Vec::new()),
+            polls: Mutex::new(Vec::new()),
+        });
+        assert!(orch.set_mcp_gateway(tool.clone()).is_ok());
+        tool
     }
 
     /// Install a [`SlowTool`] and hand back its records.
@@ -11966,22 +12074,20 @@ pub(crate) mod host_batch_tests {
         Arc<std::sync::atomic::AtomicBool>,
         impl Fn() -> Option<Option<u32>>,
     ) {
-        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tool = Arc::new(SlowTool {
-            delay,
-            sent: Mutex::new(None),
-            abandoned: abandoned.clone(),
-        });
-        assert!(orch.set_mcp_gateway(tool.clone()).is_ok());
-        (abandoned, move || *tool.sent.lock().unwrap())
+        let tool = scripted_tool(orch, delay, []);
+        (tool.abandoned.clone(), move || *tool.sent.lock().unwrap())
     }
 
     fn mcp_item(timeout: Option<u32>) -> (String, RunSpec) {
+        mcp_item_named("slow", timeout)
+    }
+
+    fn mcp_item_named(tool: &str, timeout: Option<u32>) -> (String, RunSpec) {
         (
-            "cairn://mcp/fake/slow".to_string(),
+            format!("cairn://mcp/fake/{tool}"),
             RunSpec::McpCall(Box::new(super::types::McpCallSpec {
                 server: "fake".into(),
-                tool: "slow".into(),
+                tool: tool.into(),
                 args: json!({}),
                 timeout,
                 route: super::types::McpRoute::Gateway {
@@ -12029,6 +12135,339 @@ pub(crate) mod host_batch_tests {
         assert!(!was(&abandoned));
     }
 
+    /// A tool that asks for an approval 800 ms in, well after a 100 ms grace
+    /// window has parked its batch.
+    fn asks_after_park() -> (&'static str, Duration, FirstAnswer) {
+        (
+            "ask",
+            Duration::from_millis(800),
+            FirstAnswer::InputRequired {
+                input_requests: json!([{"id": "approval"}]),
+                request_state: Some("round-1".into()),
+            },
+        )
+    }
+
+    /// Wait for the batch's own row to leave `pending`, assert it handed its
+    /// call over, and return the one active row that answers `tool-1` now.
+    async fn handed_over(orch: &Orchestrator) -> String {
+        let (id, state, kind, turn, resolution) = eventually(Duration::from_secs(10), || async {
+            let row = orch
+                .db
+                .local
+                .query_one(
+                    "SELECT id, state, kind, predecessor_turn_id, resolution_json FROM agent_waits WHERE run_id='run-1' AND tool_use_id='tool-1'",
+                    (),
+                    |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.text(3)?, row.opt_text(4)?)),
+                )
+                .await
+                .ok()?;
+            (row.1 != "pending" || row.2 != "run_batch").then_some(row)
+        })
+        .await
+        .expect("the batch's row changes");
+        assert_eq!(
+            (state.as_str(), kind.as_str()),
+            ("pending", "mcp_continuation"),
+            "the batch's row becomes the continuation; it settled with {resolution:?}"
+        );
+        assert_eq!(
+            turn, "pred-turn",
+            "the continuation answers the batch's turn"
+        );
+        id
+    }
+
+    /// Drive the global MCP scheduler until `found` yields something.
+    async fn ticking<T, F, Fut>(orch: &Orchestrator, limit: Duration, mut found: F) -> Option<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        eventually(limit, || {
+            let tick = crate::mcp::handlers::mcp_continuation::scheduler_tick(orch);
+            let found = found();
+            async move {
+                tick.await;
+                found.await
+            }
+        })
+        .await
+    }
+
+    /// The prompt continuation `wait_id` asked, once the scheduler drives it
+    /// past its park handoff.
+    async fn continuation_prompt(orch: &Orchestrator, wait_id: &str) -> String {
+        ticking(orch, Duration::from_secs(10), || async {
+            orch.db
+                .local
+                .query_text(
+                    "SELECT id FROM prompts WHERE mcp_wait_id=?1 ORDER BY created_at DESC LIMIT 1",
+                    (wait_id.to_string(),),
+                )
+                .await
+                .ok()
+                .flatten()
+        })
+        .await
+        .expect("the continuation asks its prompt")
+    }
+
+    /// Commit `answer` to `prompt_id` the way an answered prompt lands.
+    async fn answer_prompt(orch: &Orchestrator, prompt_id: &str, answer: serde_json::Value) {
+        let encoded = answer.to_string();
+        let answers = crate::models::question::PromptAnswers::new(
+            1,
+            vec![crate::models::question::QuestionAnswer {
+                index: 0,
+                answer: encoded.clone(),
+            }],
+        )
+        .unwrap();
+        orch.db
+            .local
+            .execute(
+                "UPDATE prompts SET response=?1, answered_at=1 WHERE id=?2",
+                (answers.to_stored(), prompt_id.to_string()),
+            )
+            .await
+            .unwrap();
+        let _ = orch.prompt_responses.send((
+            prompt_id.to_string(),
+            crate::mcp::handlers::planning::AnsweredPrompt {
+                answers,
+                rendered: encoded,
+            },
+        ));
+    }
+
+    async fn tool_results_for_call(orch: &Orchestrator) -> i64 {
+        orch.db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM events WHERE event_type='tool_result' AND json_extract(data,'$.toolUseId')='tool-1'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The defect this handoff exists for: a tool that asks for input only
+    /// after its batch parked used to fail its item as "could not be
+    /// suspended", because the batch's own row already answered for the call.
+    /// It now hands the call to a continuation in the same write that retires
+    /// that row, and the scheduler carries the answer back to the tool and the
+    /// tool's final answer to the same call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_call_that_asks_for_input_after_its_batch_parked_hands_its_call_to_a_continuation(
+    ) {
+        let orch = env().await;
+        let tool = scripted_tool(&orch, Duration::from_secs(30), [asks_after_park()]);
+        let (settlement, batch) = batch_of(&orch, mcp_item_named("ask", Some(5_000)), true).await;
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+
+        let continuation = handed_over(&orch).await;
+        let prompt_id = continuation_prompt(&orch, &continuation).await;
+        answer_prompt(&orch, &prompt_id, json!({"approval": true})).await;
+        let result = ticking(&orch, Duration::from_secs(10), || {
+            tool_result_containing(&orch, TOOL_FINISHED)
+        })
+        .await
+        .expect("the continuation answers the call with the tool's final answer");
+        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(resumed["toolUseId"], "tool-1");
+
+        assert_eq!(
+            *tool.rounds.lock().unwrap(),
+            vec![(json!({"approval": true}), Some("round-1".to_string()))],
+            "the continuation round carries the answer and the server's state"
+        );
+        assert_eq!(
+            tool_results_for_call(&orch).await,
+            1,
+            "answered exactly once"
+        );
+        assert!(tool_result_containing(&orch, "could not be suspended")
+            .await
+            .is_none());
+    }
+
+    /// The same handoff for a tool that opens a task after its batch parked:
+    /// the scheduler polls the task and answers the call with its result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_call_that_opens_a_task_after_its_batch_parked_hands_its_call_to_a_continuation()
+    {
+        let orch = env().await;
+        let tool = scripted_tool(
+            &orch,
+            Duration::from_secs(30),
+            [(
+                "task",
+                Duration::from_millis(800),
+                FirstAnswer::Task {
+                    task_id: "task-1".into(),
+                    poll_interval_ms: Some(100),
+                    ttl_ms: Some(30_000),
+                },
+            )],
+        );
+        let (settlement, batch) = batch_of(&orch, mcp_item_named("task", Some(5_000)), true).await;
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+
+        handed_over(&orch).await;
+        let result = ticking(&orch, Duration::from_secs(10), || {
+            tool_result_containing(&orch, TASK_FINISHED)
+        })
+        .await
+        .expect("the continuation answers the call with the task's result");
+        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(resumed["toolUseId"], "tool-1");
+        assert_eq!(*tool.polls.lock().unwrap(), vec!["task-1".to_string()]);
+        assert_eq!(
+            tool_results_for_call(&orch).await,
+            1,
+            "answered exactly once"
+        );
+    }
+
+    async fn wait_state_of(orch: &Orchestrator, id: &str) -> String {
+        orch.db
+            .local
+            .query_one(
+                "SELECT state FROM agent_waits WHERE id=?1",
+                (id.to_string(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A stop after the handoff ends the continuation the way it ends any:
+    /// its row is cancelled, so an answer that arrives anyway is never carried
+    /// to the tool and nothing answers the call but the stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_the_run_during_a_handed_over_continuation_ends_it_stopped() {
+        let orch = env().await;
+        let tool = scripted_tool(&orch, Duration::from_secs(30), [asks_after_park()]);
+        let (settlement, batch) = batch_of(&orch, mcp_item_named("ask", Some(5_000)), true).await;
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        let continuation = handed_over(&orch).await;
+        let prompt_id = continuation_prompt(&orch, &continuation).await;
+
+        crate::orchestrator::lifecycle::stop_active_turn_for_run(&orch, "run-1", true);
+        assert_eq!(wait_state_of(&orch, &continuation).await, "cancelled");
+        answer_prompt(&orch, &prompt_id, json!({"approval": true})).await;
+        // Long enough past the handoff gate that a pending continuation with a
+        // committed answer would have been driven.
+        let driven = ticking(&orch, Duration::from_millis(1_500), || async {
+            (!tool.rounds.lock().unwrap().is_empty()).then_some(())
+        })
+        .await;
+        assert!(driven.is_none(), "the gateway saw no continuation round");
+        assert_eq!(wait_state_of(&orch, &continuation).await, "cancelled");
+        assert!(tool_result_containing(&orch, TOOL_FINISHED).await.is_none());
+    }
+
+    /// The stop reaches the batch's one interrupter after a handoff too: an
+    /// item still running beside the one that handed its call over is ended
+    /// at once, rather than left to its own bound because the batch's row now
+    /// reads resolved instead of cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_after_a_handoff_still_interrupts_the_rest_of_its_batch() {
+        let orch = env().await;
+        let tool = scripted_tool(&orch, Duration::from_secs(30), [asks_after_park()]);
+        let (settlement, mut batch) =
+            batch_of(&orch, mcp_item_named("ask", Some(60_000)), true).await;
+        let (header, spec) = mcp_item(Some(60_000));
+        batch.resolved.push((header, Ok(spec)));
+
+        let text =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        handed_over(&orch).await;
+        assert!(
+            !was(&tool.abandoned),
+            "the rest of the batch is still running"
+        );
+
+        crate::orchestrator::lifecycle::stop_active_turn_for_run(&orch, "run-1", true);
+        let stopped = Instant::now();
+        eventually(Duration::from_secs(5), || async {
+            was(&tool.abandoned).then_some(())
+        })
+        .await
+        .expect("the stop interrupts the batch's other item");
+        assert!(
+            stopped.elapsed() < Duration::from_millis(2_500),
+            "interrupted {:?} after the stop",
+            stopped.elapsed()
+        );
+    }
+
+    /// A batch still holding its call on the socket when the tool asks is
+    /// parked by the handoff itself: the call answers inline with the item's
+    /// suspension, the turn yields once, and the continuation finishes the
+    /// call as it does for a parked batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_call_that_asks_for_input_while_its_batch_is_held_parks_the_call_and_hands_it_over(
+    ) {
+        let orch = env().await;
+        let tool = scripted_tool(&orch, Duration::from_secs(30), [asks_after_park()]);
+        let (settlement, batch) = batch_of(&orch, mcp_item_named("ask", Some(5_000)), true).await;
+
+        let text = run_host_batch_declaring(
+            &orch,
+            settlement,
+            batch,
+            Duration::from_millis(100),
+            Some(Duration::from_secs(10)),
+        )
+        .await;
+        assert!(
+            text.contains(RUN_ITEM_SUSPENDED_MARKER),
+            "the held call answers on its socket with the item's suspension: {text}"
+        );
+        let continuation = handed_over(&orch).await;
+        let turn = orch
+            .db
+            .local
+            .query_text("SELECT state FROM turns WHERE id='pred-turn'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            turn.as_deref(),
+            Some("yielded"),
+            "the handoff parked the turn"
+        );
+
+        let prompt_id = continuation_prompt(&orch, &continuation).await;
+        answer_prompt(&orch, &prompt_id, json!({"approval": true})).await;
+        ticking(&orch, Duration::from_secs(10), || {
+            tool_result_containing(&orch, TOOL_FINISHED)
+        })
+        .await
+        .expect("the continuation answers the call with the tool's final answer");
+        assert_eq!(
+            *tool.rounds.lock().unwrap(),
+            vec![(json!({"approval": true}), Some("round-1".to_string()))]
+        );
+        assert_eq!(
+            tool_results_for_call(&orch).await,
+            1,
+            "answered exactly once"
+        );
+    }
+
     /// A machine-service call already routed to `machine`, for a test outside
     /// this module (whose fields it cannot name) to run through a batch.
     pub(crate) fn machine_service_spec(
@@ -12065,7 +12504,7 @@ pub(crate) mod host_batch_tests {
 
         tokio::time::pause();
         let started = tokio::time::Instant::now();
-        let outcomes = run_host_items(&orch, batch, None).await;
+        let outcomes = run_host_items(&orch, batch, None, None).await;
         // Paused time advances to the timer wheel's next tick, a hair past.
         let elapsed = started.elapsed();
         assert!(
@@ -12132,10 +12571,13 @@ pub(crate) mod host_batch_tests {
         let (_, batch) = batch_of(&orch, mcp_item(Some(60_000)), true).await;
         let (interrupter, interrupt) = crate::responses::interruption();
 
-        let (outcomes, ()) = tokio::join!(run_host_items(&orch, batch, Some(&interrupt)), async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            interrupter.interrupt(Interruption::Cancelled(RUN_STOPPED_REASON.into()));
-        });
+        let (outcomes, ()) = tokio::join!(
+            run_host_items(&orch, batch, Some(&interrupt), None),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                interrupter.interrupt(Interruption::Cancelled(RUN_STOPPED_REASON.into()));
+            }
+        );
         assert!(!outcomes[0].succeeded);
         assert_eq!(
             outcomes[0].body,

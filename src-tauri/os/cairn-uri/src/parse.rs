@@ -197,8 +197,9 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             cairn_executor_name(name).map(|name| CairnResource::Executor { name })
         }
         ["bug"] => Some(CairnResource::Bug),
-        ["self-rebuild"] => Some(CairnResource::SelfRebuild),
-        ["self-rebuild", id] => Some(CairnResource::SelfRebuildOutcome {
+        // A journal identifier is one opaque segment, never a filesystem path.
+        ["rebuilds"] => Some(CairnResource::Rebuilds),
+        ["rebuilds", id] if valid_opaque_id(id) => Some(CairnResource::Rebuild {
             id: (*id).to_string(),
         }),
         ["help"] => Some(CairnResource::Help),

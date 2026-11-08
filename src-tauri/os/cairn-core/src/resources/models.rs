@@ -16,8 +16,8 @@ use cairn_models::interface::{
     SessionView,
 };
 use cairn_models::types::catalog::{
-    custom_account_id, DiscoveredModel, Modalities, Modality, ModelPricing, ProviderCategory,
-    ProviderDescriptor, ServedVerb, Verb, VerbKind, Wire,
+    custom_account_id, DiscoveredModel, Modalities, Modality, ModelAvailability, ModelPricing,
+    ProviderCategory, ProviderDescriptor, ServedVerb, Verb, VerbKind, Wire,
 };
 use cairn_models::types::embedding::CAIRN_GATEWAY_KEY;
 use cairn_models::types::pool::{
@@ -267,6 +267,64 @@ fn capability(modalities_known: Option<&Modalities>, serves: &[ServedVerb]) -> S
     out
 }
 
+fn availability(value: &ModelAvailability) -> String {
+    let duration = |ms: u64, round_up: bool| {
+        if ms < 1_000 {
+            format!("{ms} ms")
+        } else {
+            crate::fleet::models::settings::duration_label(if round_up {
+                ms.div_ceil(1_000)
+            } else {
+                ms / 1_000
+            })
+        }
+    };
+    let (state, pool, expected, elapsed) = match value {
+        ModelAvailability::Loaded { pool } => return format!("loaded in pool `{pool}`"),
+        ModelAvailability::Loadable {
+            pool,
+            expected_load_ms,
+        } => ("loadable", pool, expected_load_ms, None),
+        ModelAvailability::Loading {
+            pool,
+            expected_load_ms,
+            elapsed_ms,
+        } => ("loading", pool, expected_load_ms, Some(elapsed_ms)),
+    };
+    let estimate = match expected {
+        Some(ms) => format!("expected load {}", duration(*ms, true)),
+        None => "expected load time unknown".to_string(),
+    };
+    let mut text = format!("{state} in pool `{pool}`, {estimate}");
+    if let Some(ms) = elapsed {
+        let _ = write!(
+            text,
+            ", {} elapsed (not remaining time)",
+            duration(*ms, false)
+        );
+    }
+    text
+}
+
+fn availability_facts(
+    aggregate: Option<&ModelAvailability>,
+    by_verb: &std::collections::BTreeMap<VerbKind, ModelAvailability>,
+    serving: Option<VerbKind>,
+) -> Vec<String> {
+    let differs = by_verb
+        .values()
+        .next()
+        .is_some_and(|first| by_verb.values().any(|value| value != first));
+    if serving.is_none() && differs {
+        by_verb
+            .iter()
+            .map(|(verb, value)| format!("{verb}: {}", availability(value)))
+            .collect()
+    } else {
+        aggregate.map(availability).into_iter().collect()
+    }
+}
+
 fn category(category: ProviderCategory) -> &'static str {
     match category {
         ProviderCategory::Subscription => "subscription",
@@ -282,7 +340,11 @@ fn heading(descriptor: &ProviderDescriptor) -> String {
 /// One listed model. Its `serves` is the listing's resolved answer; its maker
 /// and effort scale are what `provider` (the catalog's record of the same
 /// provider) answers, which is what selection reads.
-fn model_line(model: &DiscoveredModel, provider: Option<&CatalogProvider>) -> String {
+fn model_line(
+    model: &DiscoveredModel,
+    provider: Option<&CatalogProvider>,
+    serving: Option<VerbKind>,
+) -> String {
     let mut line = format!("- `{}`", model.model);
     if model.display_name != model.model {
         let _ = write!(line, " {}", model.display_name);
@@ -300,6 +362,11 @@ fn model_line(model: &DiscoveredModel, provider: Option<&CatalogProvider>) -> St
     if let Some(price) = model.pricing.as_ref().and_then(pricing) {
         facts.push(price);
     }
+    facts.extend(availability_facts(
+        model.availability.as_ref(),
+        &model.availability_by_verb,
+        serving,
+    ));
     if model.is_default {
         facts.push("provider default".to_string());
     }
@@ -703,7 +770,7 @@ pub(crate) fn render_index() -> String {
 /// it now.
 pub(crate) fn render_decide(facet: &dyn Models) -> String {
     let mut out = String::from(
-        "# Decide\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/decide\", payload:{args_json:{model, input, questions, provider?}}}]})`. Each question is answered in order with the model's probability over every answer and how it was measured; a declined question comes back as a refusal. The model is never chosen for you.\n\n",
+        "# Decide\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/decide\", payload:{args_json:{model, input, questions, provider?, requirements?}}}]})`. Each question is answered in order with the model's probability over every answer and how it was measured; a declined question comes back as a refusal. The model is never chosen for you.\n\nThe reply carries the call's `cost` and `costSource`: `provider` when the provider reported what it charged, `catalog` when it did not and the cost is the catalog's list price for the tokens it reported. `requirements: {zeroDataRetention: true}` admits only a deployment that keeps none of the input (an OpenRouter model with a zero-retention endpoint, the operator's own hardware, a private custom endpoint, or a provider declared in `zeroDataRetentionProviders`) and refuses anything else before it is sent; the workspace's OpenRouter zero-retention setting requires it of every OpenRouter call. The reply's `zeroDataRetention` says what required it and how it was kept.\n\n",
     );
     let catalog = match facet.catalog(&ModelScope::workspace()) {
         Ok(catalog) => catalog,
@@ -741,7 +808,7 @@ pub(crate) fn render_decide(facet: &dyn Models) -> String {
 /// now, with what each declares.
 pub(crate) fn render_embed(facet: &dyn Models) -> String {
     let mut out = String::from(
-        "# Embed\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/embed\", payload:{args_json:{model, input, purpose?, width?, save?}}}]})`. It embeds each text, in input order, with the exact model and width that produce the vectors. `purpose` is `document` (the default) or `query`; `width` asks for exactly that many dimensions, and is refused when the offer cannot return it. The model is never chosen for you.\n\nThe reply is saved into your node's `$TMPDIR`, and the result is one line (`N × D · model · provider · cost · latency`) and the two files: `embeddings/<stamp>-<id>.json` holds the whole reply (model, dims, provider, usage, cost, and the input texts beside their vectors), and the `.npy` beside it holds the vectors as float32, shape `[N, dims]`. Your next `run` finds them on whatever machine it lands. Load them in Python with `np.load(os.environ[\"TMPDIR\"] + \"/embeddings/<name>.npy\")`, or in Bun with `(await Bun.file(process.env.TMPDIR + \"/embeddings/<name>.json\").json()).vectors`. A script also gets every vector in the item's `data`, with the paths as `saved`. Pass `save: false` when embedding a corpus in many calls, so the copies do not fill the scratch; an unsaved result is the whole reply.\n\n",
+        "# Embed\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/embed\", payload:{args_json:{model, input, purpose?, width?, save?, requirements?}}}]})`. It embeds each text, in input order, with the exact model and width that produce the vectors. `purpose` is `document` (the default) or `query`; `width` asks for exactly that many dimensions, and is refused when the offer cannot return it. `requirements: {zeroDataRetention: true}` admits only a deployment that keeps none of the texts and refuses anything else before it is sent; the reply's `zeroDataRetention` says how it was kept. The reply's `cost` is the provider's figure, or the catalog's list price for the tokens reported (`costSource` says which). The model is never chosen for you.\n\nThe reply is saved into your node's `$TMPDIR`, and the result is one line (`N × D · model · provider · cost · latency`) and the two files: `embeddings/<stamp>-<id>.json` holds the whole reply (model, dims, provider, usage, cost, and the input texts beside their vectors), and the `.npy` beside it holds the vectors as float32, shape `[N, dims]`. Your next `run` finds them on whatever machine it lands. Load them in Python with `np.load(os.environ[\"TMPDIR\"] + \"/embeddings/<name>.npy\")`, or in Bun with `(await Bun.file(process.env.TMPDIR + \"/embeddings/<name>.json\").json()).vectors`. A script also gets every vector in the item's `data`, with the paths as `saved`. Pass `save: false` when embedding a corpus in many calls, so the copies do not fill the scratch; an unsaved result is the whole reply.\n\n",
     );
     let catalog = match facet.catalog(&ModelScope::workspace()) {
         Ok(catalog) => catalog,
@@ -863,7 +930,7 @@ const COMPLETE_MODELS_NAMED: usize = 5;
 /// line with its count and a few names, and the catalog holds the rest.
 pub(crate) fn render_complete(facet: &dyn Models) -> String {
     let mut out = String::from(
-        "# Complete\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/complete\", payload:{args_json:{model, prompt | messages, system?, options?, output?}}}]})`. One tool-free completion, sent and journaled exactly as a named response's is, without writing a definition first. `output` is a JSON Schema the answer must meet; the parsed answer comes back as `structured`. The model is never chosen for you.\n\nThe reply contains `text`, nullable `reasoning`, the selected `model` and `provider`, `usage`, optional `cost` (USD), `latencyMs`, and `history` (the response-history URI). `structured` is present only when an output schema was supplied and satisfied. `usage` contains `inputTokens`, `outputTokens`, `cachedInputTokens`, and `reasoningTokens`: each is null when unreported, preserves an explicit zero, and otherwise carries the provider-reported count. Reasoning tokens are a detail of output tokens, not an additional total. `reasoning` contains only visible plain reasoning or summaries, concatenated in provider order up to 16 KiB of UTF-8 in total; absent, empty, or over-limit reasoning is null, never truncated. Opaque signatures, redacted thinking, and encrypted continuation state are excluded. Chat accepts `reasoning` and `reasoning_content`; visible structured details take precedence, otherwise plain text is used. Messages exposes visible thinking, and Responses exposes summary text. Claude and Codex one-shot CLI replies currently return null reasoning. After a schema retry, reply text, reasoning, and usage describe the accepted attempt.\n\n",
+        "# Complete\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/complete\", payload:{args_json:{model, prompt | messages, system?, options?, output?, requirements?}}}]})`. `requirements: {zeroDataRetention: true}` admits only a deployment that keeps none of the conversation and refuses anything else before it is sent; the reply's `zeroDataRetention` says how it was kept. One tool-free completion, sent and journaled exactly as a named response's is, without writing a definition first. `output` is a JSON Schema the answer must meet; the parsed answer comes back as `structured`. The model is never chosen for you.\n\nThe reply contains `text`, nullable `reasoning`, the selected `model` and `provider`, `usage`, optional `cost` (USD) with `costSource` (`provider`, or `catalog` when it is the list price for the tokens reported), `latencyMs`, and `history` (the response-history URI). `structured` is present only when an output schema was supplied and satisfied. `usage` contains `inputTokens`, `outputTokens`, `cachedInputTokens`, and `reasoningTokens`: each is null when unreported, preserves an explicit zero, and otherwise carries the provider-reported count. Reasoning tokens are a detail of output tokens, not an additional total. `reasoning` contains only visible plain reasoning or summaries, concatenated in provider order up to 16 KiB of UTF-8 in total; absent, empty, or over-limit reasoning is null, never truncated. Opaque signatures, redacted thinking, and encrypted continuation state are excluded. Chat accepts `reasoning` and `reasoning_content`; visible structured details take precedence, otherwise plain text is used. Messages exposes visible thinking, and Responses exposes summary text. Claude and Codex one-shot CLI replies currently return null reasoning. After a schema retry, reply text, reasoning, and usage describe the accepted attempt.\n\n",
     );
     let catalog = match facet.catalog(&ModelScope::workspace()) {
         Ok(catalog) => catalog,
@@ -915,9 +982,20 @@ pub(crate) fn render_complete(facet: &dyn Models) -> String {
 
 pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> String {
     const URI: &str = "cairn://models/catalog";
-    if let Some(error) = unsupported(URI, params, &["view", "provider", "installed", "serves"]) {
+    if let Some(error) = unsupported(
+        URI,
+        params,
+        &["view", "provider", "installed", "serves", "format"],
+    ) {
         return error;
     }
+    let json = match find_query_value(params, "format") {
+        None | Some("markdown") => false,
+        Some("json") => true,
+        Some(other) => {
+            return format!("Unknown format '{other}' for {URI}; expected markdown or json.")
+        }
+    };
     let serving = match find_query_value(params, "serves") {
         None => None,
         Some(value) => match VerbKind::parse(value) {
@@ -941,7 +1019,7 @@ pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> Strin
         // The providers view is the catalog listing, the same answer the app's
         // settings pages read.
         None | Some("providers") => {
-            let listing = match facet.catalog_listing(&scope, serving) {
+            let mut listing = match facet.catalog_listing(&scope, serving) {
                 Ok(listing) => listing,
                 Err(error) => return format!("Could not read the catalog: {error}"),
             };
@@ -951,6 +1029,21 @@ pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> Strin
                 .map(|provider| provider.descriptor.key.as_ref());
             if let Some(refusal) = unknown_provider(only, keys) {
                 return refusal;
+            }
+            if json {
+                listing.providers.retain(|provider| {
+                    (include_uninstalled || provider.installed)
+                        && only.is_none_or(|key| provider.descriptor.key == key)
+                });
+                if listing.selected.as_ref().is_some_and(|offer| {
+                    !listing
+                        .providers
+                        .iter()
+                        .any(|provider| provider.descriptor.key == offer.provider)
+                }) {
+                    listing.selected = None;
+                }
+                return serde_json::to_string_pretty(&listing).expect("catalog listing serializes");
             }
             let accounts = sorted_accounts(facet, &scope).unwrap_or_default();
             let catalog = facet.catalog(&scope).ok();
@@ -975,7 +1068,7 @@ pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> Strin
             if let Some(refusal) = unknown_provider(only, keys) {
                 return refusal;
             }
-            render_models(&catalog, only, serving)
+            render_models(&catalog, only, serving, json)
         }
         Some(other) => format!("Unknown view '{other}' for {URI}; expected providers or models."),
     }
@@ -1073,7 +1166,7 @@ fn render_providers(
                         .find(|known| known.descriptor.key == descriptor.key)
                 });
                 for model in &models.models {
-                    out.push_str(&model_line(model, record));
+                    out.push_str(&model_line(model, record, serving));
                     out.push('\n');
                 }
             }
@@ -1100,7 +1193,12 @@ fn render_providers(
     out
 }
 
-fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind>) -> String {
+fn render_models(
+    catalog: &Catalog,
+    only: Option<&str>,
+    serving: Option<VerbKind>,
+    json: bool,
+) -> String {
     let models: Vec<_> = catalog
         .models()
         .into_iter()
@@ -1108,10 +1206,16 @@ fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind
         .filter_map(|mut model| {
             if let Some(verb) = serving {
                 model.offers.retain(|offer| offer.selected(verb).is_some());
+                for offer in &mut model.offers {
+                    offer.availability = offer.availability_for(verb).cloned();
+                }
             }
             (!model.offers.is_empty()).then_some(model)
         })
         .collect();
+    if json {
+        return serde_json::to_string_pretty(&models).expect("catalog models serialize");
+    }
     let mut out = String::from("# Model catalog — models\n\n");
     let _ = writeln!(
         out,
@@ -1142,6 +1246,11 @@ fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind
             if let Some(price) = offer.pricing.as_ref().and_then(pricing) {
                 facts.push(price);
             }
+            facts.extend(availability_facts(
+                offer.availability.as_ref(),
+                &offer.availability_by_verb,
+                serving,
+            ));
             let _ = write!(out, "  - {} `{}`", offer.provider, offer.model);
             if !facts.is_empty() {
                 let _ = write!(out, " ({})", facts.join(", "));
@@ -2540,6 +2649,257 @@ mod tests {
 
         let bad = read(&orch, "cairn://models/catalog?view=bogus").await;
         assert!(bad.contains("Unknown view 'bogus'"), "{bad}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_availability_renders_each_state_in_both_views() {
+        use cairn_models::interface::{ModelScope, Models};
+        use cairn_models::types::catalog::ModelAvailability;
+        let orch = seeded_orchestrator().await;
+        let mut catalog = orch.catalog(&ModelScope::workspace()).unwrap();
+        let cases = [
+            (Some(ModelAvailability::Loaded { pool: "gpu".into() }), "loaded in pool `gpu`"),
+            (Some(ModelAvailability::Loadable { pool: "gpu".into(), expected_load_ms: Some(1_211_000) }), "loadable in pool `gpu`, expected load 20m 11s"),
+            (Some(ModelAvailability::Loadable { pool: "gpu".into(), expected_load_ms: None }), "loadable in pool `gpu`, expected load time unknown"),
+            (Some(ModelAvailability::Loading { pool: "gpu".into(), expected_load_ms: Some(1_211_000), elapsed_ms: 5100 }), "loading in pool `gpu`, expected load 20m 11s, 5s elapsed (not remaining time)"),
+            (Some(ModelAvailability::Loading { pool: "gpu".into(), expected_load_ms: None, elapsed_ms: 800 }), "loading in pool `gpu`, expected load time unknown, 800 ms elapsed (not remaining time)"),
+            (None, ""),
+        ];
+        for (value, expected) in cases {
+            let provider = catalog
+                .providers
+                .iter_mut()
+                .find(|p| p.descriptor.key == "claude")
+                .unwrap();
+            let model = provider
+                .models
+                .as_mut()
+                .unwrap()
+                .models
+                .iter_mut()
+                .find(|m| m.model == "opus")
+                .unwrap();
+            model.availability = value.clone();
+            let listing = catalog.listing(None);
+            let providers =
+                super::render_providers(&listing, Some(&catalog), &[], Some("claude"), false);
+            let models = super::render_models(&catalog, Some("claude"), None, false);
+            for page in [&providers, &models] {
+                if value.is_some() {
+                    assert!(page.contains(expected), "{page}");
+                } else {
+                    assert!(!page.contains("pool `gpu`"), "{page}");
+                }
+            }
+            let models: serde_json::Value =
+                serde_json::from_str(&super::render_models(&catalog, Some("claude"), None, true))
+                    .unwrap();
+            let offer = models
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|m| m["offers"].as_array().unwrap())
+                .find(|o| o["model"] == "opus")
+                .unwrap();
+            let providers = serde_json::to_value(&listing).unwrap();
+            let discovered = providers["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["descriptor"]["key"] == "claude")
+                .unwrap()["catalog"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["model"] == "opus")
+                .unwrap()
+                .clone();
+            let expected_json = serde_json::to_value(&value).unwrap();
+            assert_eq!(offer["availability"], expected_json);
+            assert_eq!(discovered["availability"], expected_json);
+            if value.is_none() {
+                assert!(offer.get("availability").is_none());
+                assert!(discovered.get("availability").is_none());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_availability_is_specific_to_the_requested_verb_in_both_views() {
+        use cairn_models::interface::{ModelScope, Models};
+        use cairn_models::types::catalog::{ModelAvailability, VerbKind};
+        let orch = seeded_orchestrator().await;
+        let mut catalog = orch.catalog(&ModelScope::workspace()).unwrap();
+        let loaded = ModelAvailability::Loaded {
+            pool: "warm".into(),
+        };
+        let loadable = ModelAvailability::Loadable {
+            pool: "cold".into(),
+            expected_load_ms: Some(1_211_000),
+        };
+        let by_verb = std::collections::BTreeMap::from([
+            (VerbKind::Complete, loaded.clone()),
+            (VerbKind::Session, loadable.clone()),
+        ]);
+        let model = catalog
+            .providers
+            .iter_mut()
+            .find(|p| p.descriptor.key == "claude")
+            .unwrap()
+            .models
+            .as_mut()
+            .unwrap()
+            .models
+            .iter_mut()
+            .find(|m| m.model == "opus")
+            .unwrap();
+        model.availability = Some(loadable.clone());
+        model.availability_by_verb = by_verb.clone();
+
+        for serving in [None, Some(VerbKind::Complete), Some(VerbKind::Session)] {
+            let listing = catalog.listing(serving);
+            let providers =
+                super::render_providers(&listing, Some(&catalog), &[], Some("claude"), false);
+            let models = super::render_models(&catalog, Some("claude"), serving, false);
+            for page in [&providers, &models] {
+                match serving {
+                    None => {
+                        assert!(page.contains("complete: loaded in pool `warm`"), "{page}");
+                        assert!(
+                            page.contains(
+                                "session: loadable in pool `cold`, expected load 20m 11s"
+                            ),
+                            "{page}"
+                        );
+                    }
+                    Some(VerbKind::Complete) => {
+                        assert!(page.contains("loaded in pool `warm`"), "{page}");
+                        assert!(!page.contains("pool `cold`"), "{page}");
+                    }
+                    Some(VerbKind::Session) => {
+                        assert!(
+                            page.contains("loadable in pool `cold`, expected load 20m 11s"),
+                            "{page}"
+                        );
+                        assert!(!page.contains("pool `warm`"), "{page}");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let models: serde_json::Value = serde_json::from_str(&super::render_models(
+                &catalog,
+                Some("claude"),
+                serving,
+                true,
+            ))
+            .unwrap();
+            let offer = models
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|m| m["offers"].as_array().unwrap())
+                .find(|o| o["model"] == "opus")
+                .unwrap();
+            let providers = serde_json::to_value(&listing).unwrap();
+            let discovered = providers["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["descriptor"]["key"] == "claude")
+                .unwrap()["catalog"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["model"] == "opus")
+                .unwrap();
+            let expected = if serving == Some(VerbKind::Complete) {
+                &loaded
+            } else {
+                &loadable
+            };
+            for value in [offer, discovered] {
+                assert_eq!(
+                    value["availability"],
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert_eq!(
+                    value["availabilityByVerb"],
+                    serde_json::to_value(&by_verb).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_json_preserves_view_filters_and_refusals() {
+        use cairn_common::query::parse_query_params;
+        use cairn_models::interface::{ModelScope, Models};
+        use cairn_models::types::catalog::VerbKind;
+        let orch = seeded_orchestrator().await;
+        let render =
+            |query: &str| super::render_catalog(&orch, &parse_query_params(query).unwrap());
+        let json =
+            |query: &str| -> serde_json::Value { serde_json::from_str(&render(query)).unwrap() };
+        let providers = json("format=json");
+        assert!(providers["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["installed"] == true));
+        let all = json("format=json&installed=all");
+        assert!(all["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["installed"] == false));
+        let only = json("format=json&provider=claude&serves=session");
+        assert_eq!(only["providers"].as_array().unwrap().len(), 1);
+        assert_eq!(only["providers"][0]["descriptor"]["key"], "claude");
+        assert_eq!(only["serves"], "session");
+        for verb in VerbKind::ALL {
+            let expected = orch
+                .catalog_listing(&ModelScope::workspace(), Some(verb))
+                .unwrap();
+            let rendered = json(&format!("format=json&serves={verb}&installed=all"));
+            assert_eq!(rendered, serde_json::to_value(expected).unwrap());
+            let models = json(&format!(
+                "format=json&view=models&serves={verb}&provider=claude"
+            ));
+            let catalog = orch.catalog(&ModelScope::workspace()).unwrap();
+            let expected: Vec<_> = catalog
+                .models()
+                .into_iter()
+                .filter(|m| m.offers.iter().any(|o| o.provider == "claude"))
+                .filter_map(|mut m| {
+                    m.offers.retain(|o| o.selected(verb).is_some());
+                    for offer in &mut m.offers {
+                        offer.availability = offer.availability_for(verb).cloned();
+                    }
+                    (!m.offers.is_empty()).then_some(m)
+                })
+                .collect();
+            assert_eq!(models, serde_json::to_value(expected).unwrap());
+        }
+        assert_eq!(
+            json("format=json&view=models"),
+            json("format=json&view=models&installed=all")
+        );
+        for view in ["providers", "models"] {
+            assert!(
+                render(&format!("view={view}&format=yaml")).starts_with("Unknown format 'yaml'")
+            );
+            assert!(
+                render(&format!("view={view}&format=json&provider=not-a-provider"))
+                    .starts_with("No provider")
+            );
+            assert!(
+                render(&format!("view={view}&format=json&serves=not-a-verb"))
+                    .starts_with("Unknown serves=")
+            );
+        }
+        let page = read(&orch, "cairn://models/catalog").await;
+        assert!(page.contains("format=markdown (default) | json"), "{page}");
+        assert!(page.contains("expectedLoadMs"), "{page}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

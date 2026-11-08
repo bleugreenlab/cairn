@@ -28,7 +28,7 @@ pub mod rules;
 pub mod settings;
 pub mod store;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -1227,6 +1227,9 @@ pub struct ModelsView {
     /// detached): held as they are until they stop.
     pub stranded: Vec<ResidentView>,
     pub deployments: Vec<DeploymentPlacement>,
+    /// The deployment an unconstrained request for each model and verb would
+    /// select now, using the same chooser as the request door.
+    pub routes: BTreeMap<String, BTreeMap<cairn_models::types::catalog::VerbKind, DeploymentId>>,
     pub requests: Vec<RequestView>,
     /// Newest first.
     pub departures: Vec<Departure>,
@@ -1329,6 +1332,26 @@ pub(crate) async fn view_with(db: &LocalDb, host: &dyn Host) -> Result<ModelsVie
             refused: a.refused.clone(),
         })
         .collect();
+    let mut routes: BTreeMap<
+        String,
+        BTreeMap<cairn_models::types::catalog::VerbKind, DeploymentId>,
+    > = BTreeMap::new();
+    for candidate in book.catalog.values() {
+        for verb in &candidate.verbs {
+            if let Ok(deployment) = choose_deployment(
+                &book.catalog,
+                &book.state.residents,
+                &candidate.model,
+                Some(*verb),
+                None,
+            ) {
+                routes
+                    .entry(candidate.model.clone())
+                    .or_default()
+                    .insert(*verb, deployment);
+            }
+        }
+    }
     let requests = requests
         .into_iter()
         .map(|request| {
@@ -1352,6 +1375,7 @@ pub(crate) async fn view_with(db: &LocalDb, host: &dyn Host) -> Result<ModelsVie
         pools,
         stranded,
         deployments,
+        routes,
         requests,
         departures: book.departures.iter().rev().cloned().collect(),
     })

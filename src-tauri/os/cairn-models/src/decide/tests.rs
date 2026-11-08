@@ -64,6 +64,7 @@ fn native_route() -> DecisionRoute {
         url: "http://gateway/v1/decisions".into(),
         headers: vec![],
         context_limits: None,
+        extras: Default::default(),
     })
 }
 
@@ -74,6 +75,7 @@ fn systemone_route() -> DecisionRoute {
         url: "https://openrouter.ai/api/alpha/decisions".into(),
         headers: vec![],
         context_limits: None,
+        extras: Default::default(),
     })
 }
 

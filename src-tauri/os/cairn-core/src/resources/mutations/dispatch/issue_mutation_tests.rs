@@ -2863,8 +2863,6 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::TaskPermissions => "cairn://p/cairn/1/1/builder/task/sub/permissions",
         K::Bug => "cairn://bug",
         K::DevLaunchTicket => "cairn://dev/launch-ticket",
-        K::SelfRebuild => "cairn://self-rebuild",
-        K::SelfRebuildOutcome => "cairn://self-rebuild/5d2b7c1e-0000-4000-8000-000000000001",
         K::Skills => "cairn://skills",
         K::Skill => "cairn://skills/testing",
         K::ProjectSkills => "cairn://p/cairn/skills",
@@ -4237,4 +4235,22 @@ async fn a_terminal_wake_subscribes_to_the_scope_its_ref_names() {
         "{}",
         missing.error
     );
+}
+
+#[test]
+fn rebuild_ledger_mutations_are_refused_before_dispatch() {
+    for target in ["cairn://rebuilds", "cairn://rebuilds/rebuild-1"] {
+        let resource = cairn_uri::parse_uri(target).unwrap();
+        for mode in ChangeMode::ALL {
+            let item = ChangeItem {
+                target: target.into(),
+                mode: *mode,
+                payload: Some(serde_json::json!({"content":"forged outcome"})),
+            };
+            assert!(
+                gate_resource_change(0, &item, &resource).is_err(),
+                "{target} {mode:?}"
+            );
+        }
+    }
 }

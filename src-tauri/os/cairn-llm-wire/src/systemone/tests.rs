@@ -452,6 +452,7 @@ fn endpoint(url: String) -> DecisionsEndpoint {
             ("authorization".into(), "Bearer sk-or-test".into()),
         ],
         context_limits: None,
+        extras: Default::default(),
     }
 }
 

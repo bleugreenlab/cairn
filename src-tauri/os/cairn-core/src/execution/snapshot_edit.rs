@@ -490,7 +490,7 @@ mod tests {
     /// run `model`.
     async fn seed(orch: &Orchestrator, model: &str) {
         let db = &orch.db.local;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
                VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1);
              INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
@@ -533,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn a_model_edit_stores_the_catalogs_spelling_and_refuses_what_it_lacks() {
         let orch = orchestrator().await;
-        crate::execution::provider_change::tests::seed_edit_catalog(&orch);
+        crate::execution::provider_change::tests::seed_edit_catalog(&orch).await;
         seed(&orch, "claude-old").await;
         let db = &orch.db.local;
 
@@ -606,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn a_model_edit_lands_on_a_job_that_has_no_session_yet() {
         let orch = orchestrator().await;
-        crate::execution::provider_change::tests::seed_edit_catalog(&orch);
+        crate::execution::provider_change::tests::seed_edit_catalog(&orch).await;
         seed(&orch, "claude-old").await;
         let db = &orch.db.local;
 

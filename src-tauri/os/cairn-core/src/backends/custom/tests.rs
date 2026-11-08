@@ -167,6 +167,7 @@ mod completion {
                     options: preset.to_extras(),
                     output_schema: schema,
                     timeout: std::time::Duration::from_secs(5),
+                    requirements: Default::default(),
                 },
             )
             .unwrap();
@@ -588,6 +589,7 @@ fn a_custom_provider_receives_a_preset_schema_required_first() {
                 options: Default::default(),
                 output_schema: Some(schema),
                 timeout: std::time::Duration::from_secs(5),
+                requirements: Default::default(),
             },
         )
         .unwrap();

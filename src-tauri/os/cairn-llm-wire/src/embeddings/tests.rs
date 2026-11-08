@@ -77,6 +77,7 @@ fn endpoint(url: String) -> EmbeddingsEndpoint {
         backend_key: "custom:acc_hub".into(),
         url,
         headers: vec![("authorization".into(), "Bearer sk-test".into())],
+        extras: Default::default(),
     }
 }
 

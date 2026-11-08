@@ -230,6 +230,7 @@ impl CustomProviderConfig {
                 url: self.decisions_url(),
                 headers,
                 context_limits: None,
+                extras: Default::default(),
             })),
             CustomProtocol::OpenAiImages => Err(format!(
                 "{} speaks the OpenAI Images protocol, which cannot answer a decision",
@@ -387,11 +388,27 @@ impl AgentBackend for CustomBackend {
         orch: &Orchestrator,
         project_id: Option<&str>,
         offer: &cairn_models::interface::SelectedOffer,
+        _admitted: &crate::backends::Admitted,
     ) -> Result<(DecisionRoute, String), String> {
         Ok((
             self.config(orch, project_id)?.decision_route()?,
             offer.model.clone(),
         ))
+    }
+
+    /// A custom endpoint is any OpenAI-compatible base URL, which can as well
+    /// be a third party's hosted API as the operator's own server. One on this
+    /// machine or a private network is the operator's; a public one keeps the
+    /// requirement only when the operator declares it.
+    fn zero_data_retention(
+        &self,
+        orch: &Orchestrator,
+        project_id: Option<&str>,
+        _provider: &str,
+        _model: &str,
+    ) -> Result<crate::backends::retention::ZdrMet, String> {
+        let config = self.config(orch, project_id)?;
+        crate::backends::retention::private_endpoint(&config.display_name, &config.base_url)
     }
 
     fn response_completion_availability(

@@ -61,6 +61,39 @@ pub struct ModelRuntime {
     pub managed: ManagedTools,
     /// Every outside client's request the served API relays.
     pub relay: Arc<dyn cairn_models::interface::relay::Relay>,
+    /// OpenRouter's zero-data-retention list, which admits a call that
+    /// requires zero retention on an OpenRouter model.
+    pub openrouter_zdr: Arc<cairn_models::openrouter::ZdrDirectory>,
+}
+
+impl Orchestrator {
+    /// What a call on `model` at `provider` cost and where that figure came
+    /// from: the provider's own when `usage` carries it, else `usage` priced
+    /// at the catalog's list price for the offer, else nothing.
+    pub(crate) fn call_cost(
+        &self,
+        project_id: Option<&str>,
+        provider: &str,
+        model: &str,
+        usage: &cairn_models::types::usage::MeteredUsage,
+    ) -> (
+        Option<f64>,
+        Option<cairn_models::interface::retention::CostSource>,
+    ) {
+        let catalog = match usage.cost_usd {
+            Some(_) => None,
+            None => self
+                .catalog(&ModelScope {
+                    project_id: project_id.map(str::to_string),
+                })
+                .ok(),
+        };
+        let pricing = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.provider(provider))
+            .and_then(|listed| listed.pricing(model));
+        cairn_models::interface::retention::call_cost(usage, pricing)
+    }
 }
 
 impl ModelRuntime {
@@ -83,6 +116,7 @@ impl ModelRuntime {
             )),
             managed,
             relay: Arc::new(HttpComplete),
+            openrouter_zdr: Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
         }
     }
 }
@@ -431,6 +465,11 @@ impl Orchestrator {
             .read()
             .ok()
             .and_then(|catalog| catalog.get(key).cloned());
+        if key == crate::backends::inference::INFERENCE_BACKEND_KEY {
+            if let Some(catalog) = &mut models {
+                crate::backends::inference::live_catalog(self, catalog);
+            }
+        }
         if !catalog::is_supported(key) {
             return models;
         }

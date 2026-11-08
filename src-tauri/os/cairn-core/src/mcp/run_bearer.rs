@@ -349,9 +349,8 @@ fn is_message_collection(target: &cairn_uri::CairnResource) -> bool {
 }
 
 /// Hold a request that speaks for no run to the run-less allowlist, and mark it
-/// as such. It may claim no run. It reaches [`RUN_LESS_TOOLS`]; the delivery of a
-/// pending self-rebuild outcome, the one write with no run left to make it; and
-/// a message to a `/messages` collection, because a local agent outside Cairn has
+/// as such. It may claim no run. It reaches [`RUN_LESS_TOOLS`] and a message to
+/// a `/messages` collection, because a local agent outside Cairn has
 /// no other way in. That message is labelled as unverified wherever it is stored
 /// or shown, since nothing proves who sent it.
 fn hold_run_less(
@@ -371,7 +370,6 @@ fn hold_run_less(
         ));
     }
     let admitted = RUN_LESS_TOOLS.contains(&request.tool.as_str())
-        || crate::resources::self_rebuild::is_self_rebuild_delivery(request)
         || lone_content_append(request).is_some_and(|target| is_message_collection(&target))
         || also_admits(request);
     if !admitted {
@@ -1397,14 +1395,12 @@ mod tests {
         request
     }
 
-    /// The machine credential's writes: a self-rebuild delivery and a message to
-    /// a `/messages` collection, with `content` only. Nothing else, including
-    /// everything that shares a shape with those two.
+    /// The machine credential writes only a message to a `/messages` collection,
+    /// with `content` only. Similar-looking ledger writes remain refused.
     #[test]
-    fn the_machine_credential_writes_only_a_delivery_or_a_message() {
+    fn the_machine_credential_writes_only_a_message() {
         let content = || serde_json::json!({"content": "hello"});
         for target in [
-            "cairn://self-rebuild/outcome-1",
             "cairn://p/cairn/5949/messages",
             "cairn://p/cairn/5949/1/builder/messages",
             "cairn://p/cairn/5949/1/builder/task/review/messages",
@@ -1416,6 +1412,9 @@ mod tests {
         }
         for target in [
             "cairn://self-rebuild",
+            "cairn://self-rebuild/outcome-1",
+            "cairn://rebuilds",
+            "cairn://rebuilds/rebuild-1",
             "cairn://p/cairn/5949",
             "cairn://p/cairn/5949/comments",
             "cairn://p/cairn/messages",

@@ -637,6 +637,7 @@ fn each_familys_one_shot_usage_journals_as_its_golden() {
             options: Default::default(),
             output_schema: None,
             timeout: std::time::Duration::from_secs(5),
+            requirements: Default::default(),
         }
     }
     // Read the outcome the way the responses journal does.
@@ -840,6 +841,7 @@ fn a_one_shot_maps_the_effort_onto_each_familys_own_knob() {
             },
             output_schema: None,
             timeout: std::time::Duration::from_secs(5),
+            requirements: Default::default(),
         }
     }
     let started = std::time::Instant::now();

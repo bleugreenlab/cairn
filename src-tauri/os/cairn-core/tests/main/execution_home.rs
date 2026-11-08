@@ -225,6 +225,7 @@ async fn fixture() -> Fixture {
             .build(),
     );
     let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    common::load_fleet_settings(&orch);
     common::attach_test_executor(&orch);
 
     let residence = temp.path().join("residence");

@@ -20,6 +20,13 @@
 //! ([`Confinement::for_branch_code`]). They are not a containment decision, so
 //! nothing grants past them.
 //!
+//! The same non-relaxable macOS floor refuses every write beneath a Cairn
+//! home's `rebuilds/`: staged code/specs authorize an offline privileged act,
+//! and its journals/responses are authority evidence. Reads remain allowed.
+//! Linux and Windows have no detached rebuild consumer and no rebuild floor.
+//! Branch code on macOS carries this floor even before credentials or rebuild
+//! state exist, so it cannot preplant staged authority.
+//!
 //! Not yet covered: a dev-instance runtime, which runs the branch's code as a
 //! Cairn install that must create, read, and confine with its own credential.
 //! Until it runs under a separate boundary of its own, agent-authored
@@ -317,6 +324,74 @@ impl OperatorCredentialFloor {
         same_path(parent, os_home) && name_has_prefix(name, HOME_FAMILY_PREFIX)
     }
 
+    /// Whether a path reaches privileged rebuild state. Reads are ordinary;
+    /// writes would forge the staged act or its evidence and are non-grantable.
+    pub fn names_rebuild_state(&self, path: &Path) -> bool {
+        [resolve(path), lexically_normalize(path)]
+            .iter()
+            .any(|candidate| {
+                candidate.ancestors().any(|ancestor| {
+                    ancestor
+                        .file_name()
+                        .is_some_and(|name| same_name(name, "rebuilds"))
+                        && ancestor.parent().is_some_and(|home| {
+                            self.in_home_family(home)
+                                || self
+                                    .homes
+                                    .iter()
+                                    .chain(self.named.iter())
+                                    .any(|known| same_path(known, home))
+                        })
+                }) || self.every_home().iter().any(|home| {
+                    let root = resolve(&home.join("rebuilds"));
+                    candidate
+                        .ancestors()
+                        .any(|ancestor| same_path(ancestor, &root))
+                })
+            })
+    }
+
+    /// Final write-only rules for privileged rebuild state, including absent
+    /// roots and existing roots relocated through a symlink. Home unlink rules
+    /// below keep their ancestors from being renamed out of this boundary.
+    #[cfg(any(test, target_os = "macos"))]
+    fn rebuild_sbpl_rules(&self) -> String {
+        let mut roots = Vec::new();
+        let mut ancestors = Vec::new();
+        if let Some(os_home) = &self.os_home {
+            let base = regex_literal(&os_home.to_string_lossy());
+            roots.push(format!(r#"(regex #"^{base}/\.cairn[^/]*/rebuilds(/|$)")"#));
+        }
+        for home in self.every_home() {
+            let root = resolve(&home.join("rebuilds"));
+            // A pre-existing symlink can relocate this root outside its home.
+            // Refuse renaming any ancestor of that target out of the rule.
+            ancestors.extend(
+                root.ancestors()
+                    .filter(|path| path.parent().is_some())
+                    .map(literal_rule),
+            );
+            roots.push(format!(
+                "(subpath \"{}\")",
+                crate::escape_sbpl(&root.to_string_lossy())
+            ));
+        }
+        roots.sort();
+        roots.dedup();
+        ancestors.sort();
+        ancestors.dedup();
+        if roots.is_empty() {
+            String::new()
+        } else {
+            let unlink = if ancestors.is_empty() {
+                String::new()
+            } else {
+                format!("(deny file-write-unlink {})\n", ancestors.join(" "))
+            };
+            format!(";; rebuild state: non-grantable privileged act and evidence\n(deny file-write* {})\n{unlink}", roots.join(" "))
+        }
+    }
+
     /// The Seatbelt rules that enforce this boundary, or an empty string when
     /// there is no home to protect.
     ///
@@ -374,8 +449,9 @@ impl OperatorCredentialFloor {
             return String::new();
         }
         home_nodes.dedup();
+        let rebuilds = self.rebuild_sbpl_rules();
         format!(
-            ";; operator credential boundary: not a fence rule, never granted\n(deny file-read-data file-write* {})\n(deny file-write-unlink {})\n{planted_links}",
+            ";; operator credential boundary: not a fence rule, never granted\n(deny file-read-data file-write* {})\n(deny file-write-unlink {})\n{planted_links}{rebuilds}",
             credentials.join(" "),
             home_nodes.join(" ")
         )
@@ -422,17 +498,21 @@ impl Confinement {
     /// verification: the check cadences and a project-declared check.
     ///
     /// The command is the project's, but the tests, build scripts, and package
-    /// scripts it runs are the branch's, so on a machine holding an operator
-    /// credential they carry the boundary like any agent process. Elsewhere
-    /// they run with nothing applied, because a suite that starts its own
-    /// `sandbox-exec` cannot run inside a profile and there is no credential
-    /// to protect.
+    /// scripts it runs are the branch's. On macOS they carry the boundary
+    /// whenever a home is known, even without credentials or existing rebuild
+    /// state: otherwise branch code could preplant privileged rebuild inputs.
+    /// Linux/Windows have no rebuild consumer or rebuild floor; the credential
+    /// presence decision there remains unchanged.
     pub fn for_branch_code() -> Self {
         Self::for_branch_code_on(&OperatorCredentialFloor::for_this_machine())
     }
 
     pub fn for_branch_code_on(floor: &OperatorCredentialFloor) -> Self {
-        if floor.holds_a_credential() {
+        // A branch must not preplant rebuild specs or evidence, even before
+        // any credential or rebuild directory exists on this machine.
+        if floor.holds_a_credential()
+            || (cfg!(target_os = "macos") && (floor.os_home.is_some() || !floor.named.is_empty()))
+        {
             Self::CredentialFloor
         } else {
             Self::Unconfined
@@ -741,6 +821,51 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_state_is_protected_before_creation_and_through_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let os_home = dir.path().join("home");
+        std::fs::create_dir(&os_home).unwrap();
+        let external = dir.path().join("override-home");
+        let floor = OperatorCredentialFloor::new(Some(os_home.clone()), [external.clone()]);
+        for home in [
+            os_home.join(".cairn"),
+            os_home.join(".cairn-dev-next"),
+            external,
+        ] {
+            for suffix in [
+                "rebuilds",
+                "rebuilds/spec.json",
+                "rebuilds/id/responses/intent.json",
+            ] {
+                assert!(floor.names_rebuild_state(&home.join(suffix)));
+            }
+            assert!(!floor.names_rebuild_state(&home.join("rebuilds-backup/spec.json")));
+            assert!(!floor.names_rebuild_state(&home.join("scratch/spec.json")));
+        }
+        let root = os_home.join(".cairn/rebuilds");
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert!(floor.names_rebuild_state(&alias.join("not-created.json")));
+            let target = dir.path().join("relocated");
+            std::fs::create_dir(&target).unwrap();
+            let peer = os_home.join(".cairn-peer");
+            std::fs::create_dir(&peer).unwrap();
+            std::os::unix::fs::symlink(&target, peer.join("rebuilds")).unwrap();
+            assert!(floor.names_rebuild_state(&target.join("spec.json")));
+            assert!(floor.sbpl_rules().contains(&format!(
+                "(subpath \"{}\")",
+                target.canonicalize().unwrap().display()
+            )));
+        }
+        if case_insensitive_platform() {
+            assert!(floor.names_rebuild_state(&os_home.join(".CAIRN/REBUILDS/spec.json")));
+        }
+    }
+
+    #[test]
     fn every_cairn_home_in_the_os_home_is_covered() {
         let os_home = tempfile::tempdir().unwrap();
         let floor = floor_at(os_home.path());
@@ -916,7 +1041,9 @@ mod tests {
             [PathBuf::from("/Users/x/.cairn-dev")],
         );
         assert!(floor.homes.is_empty());
-        assert!(!floor.sbpl_rules().contains("literal"));
+        assert!(!floor
+            .sbpl_rules()
+            .contains(r#"(literal "/Users/x/.cairn-dev/operator_auth_secret")"#));
     }
 
     #[cfg(unix)]
@@ -954,17 +1081,18 @@ mod tests {
     }
 
     #[test]
-    fn branch_code_carries_the_floor_only_where_a_credential_exists() {
+    fn branch_code_carries_the_floor_before_rebuild_state_exists() {
         let os_home = tempfile::tempdir().unwrap();
         let home = os_home.path().join(".cairn");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("settings.yaml"), "").unwrap();
         let floor = floor_at(os_home.path());
         assert!(!floor.holds_a_credential());
-        assert!(matches!(
-            Confinement::for_branch_code_on(&floor),
-            Confinement::Unconfined
-        ));
+        assert_eq!(
+            Confinement::for_branch_code_on(&floor).carries_credential_floor(),
+            cfg!(target_os = "macos"),
+            "macOS rebuild state is protected even on a credential-free machine"
+        );
 
         for file in CREDENTIAL_FILES {
             std::fs::write(home.join(file), [0u8; 32]).unwrap();

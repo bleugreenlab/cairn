@@ -36,6 +36,7 @@ mod openai_responses;
 pub mod opencode;
 pub mod openrouter;
 pub mod relay;
+pub(crate) mod retention;
 mod run_state;
 pub(crate) use run_state::is_task_spawned_run;
 pub mod stdin;
@@ -256,13 +257,37 @@ pub trait AgentBackend: Send + Sync {
     /// where that wire is reached, with what credentials, and under what name
     /// (the offer's own, except where an engine answers to its own name). A
     /// backend that serves no `decide` keeps the refusal.
+    ///
+    /// `admitted` is the call's admission ([`launch::admit_route`]): a route
+    /// that can carry a zero-retention routing preference sends it whenever
+    /// [`Admitted::zero_data_retention`] says one was admitted.
     fn decision_route(
         &self,
         _orch: &Orchestrator,
         _project_id: Option<&str>,
         offer: &SelectedOffer,
+        _admitted: &Admitted,
     ) -> Result<(DecisionRoute, String), String> {
         Err(format!("{} cannot answer a decision", offer.provider))
+    }
+
+    /// How `model` on `provider` (this backend's key, which for a custom
+    /// provider names its account) keeps none of a call's text, or why it
+    /// cannot be shown to. Asked only when a call requires zero data
+    /// retention, after the operator's declarations, which are not this
+    /// backend's to read.
+    ///
+    /// Hosted providers keep no guarantee Cairn can check, so the default is
+    /// the refusal; a backend whose deployments the operator runs, or whose
+    /// provider publishes which endpoints retain nothing, answers for itself.
+    fn zero_data_retention(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+        _provider: &str,
+        _model: &str,
+    ) -> Result<retention::ZdrMet, String> {
+        Err(retention::no_guarantee(self.name()))
     }
 
     /// Models Cairn itself declares this backend serves, whatever discovery

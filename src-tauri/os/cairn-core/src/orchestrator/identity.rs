@@ -139,6 +139,13 @@ impl Orchestrator {
         &self.models_runtime
     }
 
+    /// Replace the facet implementations, for a test outside this module
+    /// that scripts a provider.
+    #[cfg(test)]
+    pub(crate) fn set_models_runtime_for_test(&mut self, runtime: super::models::ModelRuntime) {
+        self.models_runtime = runtime;
+    }
+
     /// Get the full identity store.
     pub(crate) fn get_credential_store(&self) -> Option<CredentialStore> {
         self.credential_store.get()

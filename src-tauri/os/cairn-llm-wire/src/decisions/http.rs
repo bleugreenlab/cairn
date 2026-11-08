@@ -24,6 +24,10 @@ pub struct DecisionsEndpoint {
     /// exceeds them is told (what they are, and what lifts them). `None`
     /// when the provider documents none.
     pub context_limits: Option<String>,
+    /// Fields every request body sent here carries beside the wire's own
+    /// (OpenRouter's `provider` routing object), merged by
+    /// [`crate::merge_extras`].
+    pub extras: serde_json::Map<String, Value>,
 }
 
 /// Header values carry bearer keys; only their names are printed.
@@ -42,6 +46,7 @@ impl std::fmt::Debug for DecisionsEndpoint {
                     .collect::<Vec<_>>(),
             )
             .field("context_limits", &self.context_limits)
+            .field("extras", &self.extras)
             .finish()
     }
 }

@@ -726,7 +726,12 @@ pub(crate) const EXECUTOR_RUNTIME_POLICY: KeySpec = KeySpec::with_aliases(
 pub(crate) const EXECUTOR_DRAINING: KeySpec = KeySpec::new(
     "draining",
     KeyType::Bool,
-    "true refuses new admissions without terminating resident work; durable runner-side state, so it needs no generation, works on an unreachable machine, and survives reconnect until cleared",
+    "true imposes the authenticated owning thread\'s record; false clears only that thread\'s record and imported legacy state. Other owners and fences remain; operator lifting requires accepted lift_drain. No live connection generation required",
+);
+pub(crate) const EXECUTOR_DRAIN_REASON: KeySpec = KeySpec::new(
+    "reason",
+    KeyType::Str,
+    "optional drain reason; omission stores exactly no reason supplied",
 );
 pub(crate) const EXECUTOR_ROLE: KeySpec = KeySpec::new(
     "role",
@@ -747,6 +752,10 @@ pub(crate) const EXECUTOR_EXPECTED_GENERATION: KeySpec = KeySpec::with_aliases(
     &["expected_generation"],
     KeyType::Int,
     "the connection generation you read; required with runtimePolicy or memoryDiagnostic",
+);
+pub(crate) const EXECUTOR_REMOVAL_OPERATION_ID: KeySpec = KeySpec::new(
+    "operationId", KeyType::Str,
+    "caller-retained unique removal ID; reuse this and the frozen stable executor ID after an ambiguous failure to reconcile its durable receipt without repeating removal",
 );
 pub(crate) const EXECUTOR_REMOVAL_CONFIRM: KeySpec = KeySpec::new(
     "confirm",

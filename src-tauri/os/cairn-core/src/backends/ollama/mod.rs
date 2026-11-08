@@ -89,6 +89,22 @@ impl AgentBackend for OllamaBackend {
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
         Err("Ollama discovery requires configured hosts".to_string())
     }
+
+    /// An Ollama host is a machine the operator runs: there is no provider
+    /// to retain anything.
+    fn zero_data_retention(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+        _provider: &str,
+        model: &str,
+    ) -> Result<crate::backends::retention::ZdrMet, String> {
+        Ok(crate::backends::retention::ZdrMet {
+            basis: cairn_models::interface::retention::ZdrBasis::OperatorHardware,
+            detail: format!("{model} runs on an Ollama host the operator runs"),
+            exclude: Vec::new(),
+        })
+    }
     fn response_completion_availability(
         &self,
         orch: &Orchestrator,

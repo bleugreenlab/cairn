@@ -28,6 +28,7 @@ pub mod effort;
 pub mod embed;
 pub mod image;
 pub mod relay;
+pub mod retention;
 pub mod session;
 pub mod speak;
 
@@ -180,6 +181,9 @@ impl CatalogProvider {
                 })
                 .map(|model| DiscoveredModel {
                     serves: Some(self.serves_for(&model.model)),
+                    availability: serves
+                        .and_then(|verb| model.availability_by_verb.get(&verb).cloned())
+                        .or_else(|| model.availability.clone()),
                     ..model.clone()
                 })
                 .collect(),
@@ -299,6 +303,12 @@ pub struct CatalogModel {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogOffer {
+    /// Placement's live answer at the time the catalog was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<cairn_models_types::catalog::ModelAvailability>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub availability_by_verb:
+        std::collections::BTreeMap<VerbKind, cairn_models_types::catalog::ModelAvailability>,
     pub provider: String,
     /// The id the provider itself is sent.
     pub model: String,
@@ -325,6 +335,15 @@ pub struct CatalogOffer {
 }
 
 impl CatalogOffer {
+    /// The selected route for this verb, from a freshly acquired catalog.
+    /// An absent value makes no readiness or latency promise.
+    pub fn availability_for(
+        &self,
+        verb: VerbKind,
+    ) -> Option<&cairn_models_types::catalog::ModelAvailability> {
+        self.availability_by_verb.get(&verb)
+    }
+
     /// This offer as the server of `verb`, over its best wire for it, when it
     /// serves it.
     pub fn selected(&self, verb: VerbKind) -> Option<SelectedOffer> {
@@ -659,6 +678,8 @@ impl Catalog {
                     catalog_id,
                     &model.display_name,
                     CatalogOffer {
+                        availability: model.availability.clone(),
+                        availability_by_verb: model.availability_by_verb.clone(),
                         provider: key.to_string(),
                         model: model.model.clone(),
                         context_window: model.context_window,

@@ -91,7 +91,12 @@ pub struct DrainAcceptance {
     pub executor_id: String,
     pub drain_key: String,
     pub owner: String,
+    /// The operator entry's own record generation.
     pub generation: u64,
+    /// The machine's retained monotonic revision when the operator accepted.
+    /// Distinct from `generation`: any other owner's change advances it, so an
+    /// acceptance cannot silently apply to a drain set it never displayed.
+    pub machine_revision: u64,
 }
 /// Mandatory, versioned authority inputs. No field is inferred from prose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

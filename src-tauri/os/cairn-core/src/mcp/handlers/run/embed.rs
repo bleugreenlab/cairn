@@ -94,7 +94,7 @@ pub(super) async fn run_embed(
             return ItemOutcome::failed(
                 header,
                 format!(
-                    "{URI} takes {{model, input, purpose?, width?, save?}} in payload.args_json: {error}. Read {URI} for the shape."
+                    "{URI} takes {{model, input, purpose?, width?, save?, requirements?}} in payload.args_json: {error}. Read {URI} for the shape."
                 ),
             )
         }
@@ -226,9 +226,13 @@ fn describe(outcome: &EmbedOutcome) -> String {
         outcome.dims,
         outcome.model,
         outcome.provider,
-        outcome
-            .cost
-            .map_or_else(|| "cost not reported".to_string(), usd),
+        match (outcome.cost, outcome.cost_source) {
+            (None, _) => "cost not reported".to_string(),
+            (Some(cost), Some(cairn_models::interface::retention::CostSource::Catalog)) => {
+                format!("{} at list price", usd(cost))
+            }
+            (Some(cost), _) => usd(cost),
+        },
         outcome.latency_ms as f64 / 1000.0
     )
 }

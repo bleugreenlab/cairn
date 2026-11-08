@@ -194,6 +194,24 @@ async fn insert_event_at_conn(
     // `event_account_sql`.
     let stamps_account =
         cairn_analytics::queries::stamps_account(&event.event_type, event.cost_usd);
+    // Shutdown removes the process handle before its reader necessarily drains
+    // stdout. The durable run-local turn, never the job's successor, still owns
+    // those late frames and synthetic diagnostics.
+    let shutdown_turn = if event.turn_id.is_none() {
+        let mut rows = conn.query(
+            "SELECT t.id FROM turns t
+             WHERE t.run_id = ?1
+               AND EXISTS (SELECT 1 FROM runs r WHERE r.id = ?1 AND r.exit_reason = 'runner_shutdown')
+             ORDER BY t.sequence DESC LIMIT 1",
+            (event.run_id.as_str(),),
+        ).await?;
+        match rows.next().await? {
+            Some(row) => Some(row.text(0)?),
+            None => None,
+        }
+    } else {
+        None
+    };
     let count = conn
         .execute(
             &format!(
@@ -221,7 +239,7 @@ async fn insert_event_at_conn(
                 event.cache_create_tokens,
                 event.output_tokens,
                 event.thinking_tokens,
-                event.turn_id.as_deref(),
+                event.turn_id.as_deref().or(shutdown_turn.as_deref()),
                 event.cost_usd,
                 reported_model.as_deref(),
                 i64::from(stamps_account),

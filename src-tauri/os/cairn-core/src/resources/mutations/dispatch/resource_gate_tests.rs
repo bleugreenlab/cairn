@@ -653,8 +653,24 @@ fn gate_accepts_enrollment_configuration_and_removal_only() {
         "a role is configured in the same shape as draining"
     );
 
-    let remove = item("cairn://executors/bglab-ub", ChangeMode::Delete, None);
-    assert!(gate(&remove).is_ok());
+    let remove = item(
+        "cairn://executors/bglab-ub",
+        ChangeMode::Delete,
+        Some(serde_json::json!({ "operationId": "remove-bglab-ub-1" })),
+    );
+    assert_eq!(
+        gate(&remove).unwrap().label,
+        "remove a machine and revoke its enrollment"
+    );
+
+    let unidentified = item("cairn://executors/bglab-ub", ChangeMode::Delete, None);
+    let failure = gate(&unidentified).unwrap_err();
+    assert!(
+        failure.error.contains("Missing required payload key")
+            && failure.error.contains("operationId"),
+        "a removal without its operation ID is refused naming the key: {}",
+        failure.error
+    );
 
     let rotate = item(
         "cairn://executors",

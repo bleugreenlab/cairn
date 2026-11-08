@@ -225,8 +225,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     jobs::TASK_PERMISSIONS_CONTRACT,
     jobs::TASK_PERMISSION_CONTRACT,
     workspace::BUG_CONTRACT,
-    workspace::SELF_REBUILD_CONTRACT,
-    workspace::SELF_REBUILD_OUTCOME_CONTRACT,
+    workspace::REBUILDS_CONTRACT,
+    workspace::REBUILD_CONTRACT,
     workspace::PACKS_CONTRACT,
     workspace::PACK_CONTRACT,
     workspace::SKILLS_CONTRACT,
@@ -380,6 +380,7 @@ mod tests {
                 "newName",
                 "runtimePolicy",
                 "draining",
+                "reason",
                 "role",
                 "machineServices",
                 "repaired",
@@ -417,11 +418,54 @@ mod tests {
         let machine = contract_for(ResourceKind::Executor).expect("registered");
         assert!(machine.description.contains("drain first"));
         let remove = mutation_spec(ResourceKind::Executor, ChangeMode::Delete).expect("registered");
-        assert!(remove.required.is_empty());
+        assert_eq!(
+            remove.required.iter().map(|key| key.key).collect::<Vec<_>>(),
+            ["operationId"],
+            "a removal carries a caller-retained operation ID so an ambiguous failure reconciles its receipt instead of repeating removal"
+        );
+        assert!(
+            remove.example.contains("operationId:"),
+            "the copyable example must name the required key: {}",
+            remove.example
+        );
         assert_eq!(
             remove.optional.iter().map(|key| key.key).collect::<Vec<_>>(),
             ["confirm"],
-            "the override is the only thing a removal takes, and it is deliberate rather than a force flag"
+            "the override is the only optional thing a removal takes, and it is deliberate rather than a force flag"
+        );
+        // The override acknowledges stranded occupancy only. It must never be
+        // advertised as a way past another owner's drain: removal clears only
+        // the credential-proven acting operator's own record and imported
+        // legacy state, and every other owner blocks it.
+        assert!(
+            machine
+                .description
+                .contains("Confirmation never bypasses drain ownership"),
+            "{}",
+            machine.description
+        );
+        assert!(
+            machine.description.contains(
+                "removal can clear only a credential-proven acting operator's own record and imported legacy state"
+            ),
+            "{}",
+            machine.description
+        );
+        assert!(
+            machine.description.contains(
+                "refuses another principal's operator record, thread/runtime drains and pre-existing fences"
+            ),
+            "{}",
+            machine.description
+        );
+        let confirm = remove
+            .optional
+            .iter()
+            .find(|key| key.key == "confirm")
+            .expect("confirm is advertised");
+        assert!(
+            !confirm.note().contains("drain"),
+            "confirm must not claim any drain authority: {confirm:?}"
         );
     }
 
@@ -438,7 +482,47 @@ mod tests {
             .iter()
             .find(|key| key.key == "draining")
             .expect("draining is configurable");
-        assert!(draining.note().contains("durable"), "{draining:?}");
+        assert!(
+            draining
+                .note()
+                .contains("No live connection generation required"),
+            "{draining:?}"
+        );
+        // A false write clears only what the caller owns; ordinary operator
+        // lifting stays acceptance-only, with no boolean bypass.
+        assert!(
+            draining
+                .note()
+                .contains("false clears only that thread's record and imported legacy state"),
+            "{draining:?}"
+        );
+        assert!(
+            draining.note().contains("Other owners and fences remain"),
+            "{draining:?}"
+        );
+        assert!(
+            draining
+                .note()
+                .contains("operator lifting requires accepted lift_drain"),
+            "{draining:?}"
+        );
+        let machine = contract_for(ResourceKind::Executor).expect("registered");
+        assert!(
+            machine
+                .description
+                .contains("persists across reconnects and restarts"),
+            "the machine contract must say a drain is durable: {}",
+            machine.description
+        );
+        let reason = configure
+            .optional
+            .iter()
+            .find(|key| key.key == "reason")
+            .expect("a drain reason is configurable");
+        assert!(
+            reason.note().contains("no reason supplied"),
+            "an omitted reason is stored as exactly no reason supplied: {reason:?}"
+        );
         let generation = configure
             .optional
             .iter()

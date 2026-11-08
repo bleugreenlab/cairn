@@ -481,6 +481,7 @@ async fn fixture_from(make_repository: fn(&Path) -> String) -> Fixture {
     let project_id = common::insert_project_with_repo(&db, "cas", &repository).await;
     let repository_id = "acceptance-repository".to_owned();
     let orch = common::orchestrator(&temp, db);
+    common::load_fleet_settings(&orch);
     let executor_home = temp.path().join("isolated-executor-home");
     let state = ObjectServerState {
         orch: orch.clone(),

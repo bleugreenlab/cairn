@@ -340,6 +340,8 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
         serves: Some(serves),
         // Go reports bare ids and no upstream repository, so only the pins'
         // exact (provider, model) pairs can select a tokenizer.
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: tokenizer_for(OPENCODE_BACKEND_KEY, id, None),
     }
 }
@@ -372,6 +374,8 @@ fn unpublished_model(id: &str) -> DiscoveredModel {
         serves: None,
         // Go reports bare ids and no upstream repository, so only the pins'
         // exact (provider, model) pairs can select a tokenizer.
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: tokenizer_for(OPENCODE_BACKEND_KEY, id, None),
     }
 }

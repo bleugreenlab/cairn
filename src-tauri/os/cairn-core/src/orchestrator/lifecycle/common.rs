@@ -284,7 +284,8 @@ pub(crate) fn set_exit_reason(
                         "UPDATE runs
                      SET exit_reason = ?1,
                          updated_at = ?2
-                     WHERE id = ?3",
+                     WHERE id = ?3
+                       AND COALESCE(exit_reason, '') != 'runner_shutdown'",
                         (reason.as_str(), now, run_id.as_str()),
                     )
                     .await?;
@@ -364,6 +365,17 @@ pub(super) fn active_turn_id_for_run(orch: &Orchestrator, run_id: &str) -> Optio
     orch.process_state
         .get_current_turn_id(run_id)
         .or_else(|| current_turn_id_for_run(orch, run_id))
+}
+
+pub(super) fn host_shutdown_in_progress(orch: &Orchestrator, run_id: &str) -> bool {
+    blocking_text_lookup(
+        orch,
+        run_id,
+        "SELECT exit_reason FROM runs WHERE id = ?1",
+        TextColumn::Optional,
+    )
+    .as_deref()
+        == Some(super::stop::RUNNER_SHUTDOWN_EXIT_REASON)
 }
 
 pub(super) fn run_status(orch: &Orchestrator, run_id: &str) -> Option<String> {

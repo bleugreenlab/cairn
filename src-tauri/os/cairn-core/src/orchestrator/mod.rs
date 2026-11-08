@@ -1008,6 +1008,7 @@ impl OrchestratorBuilder {
                 }
             });
         }
+        crate::fleet::initialization::register(&orchestrator);
         orchestrator
     }
 }
@@ -2398,6 +2399,7 @@ impl Orchestrator {
             // inventory, and folding it in would have marked the fleet degraded
             // every time this runner's laptop left the network.
             enrolled_remotes: self.fleet.unattached_enrolled_remotes(),
+            drain_initialization_error: self.fleet.drain_initialization_error(),
         }
     }
 
@@ -2746,6 +2748,9 @@ impl Orchestrator {
     pub fn start_background_workers(&self) {
         crate::threads::era_worker::spawn(self.clone(), &self.era_summary_tx);
         crate::tenets::evidence::spawn(self.clone());
+        if let Err(error) = crate::fleet::lift_drain::install(self) {
+            tracing::error!(%error, "lift_drain adapter registration failed");
+        }
         crate::operator_requests::delivery::spawn(self.clone());
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
@@ -4324,11 +4329,21 @@ impl Orchestrator {
             .insert(catalog.backend.clone(), catalog);
     }
 
+    #[cfg(test)]
+    pub(crate) fn cached_model_catalog_for_test(&self, backend: &str) -> ProviderModelCatalog {
+        self.model_catalog.read().unwrap()[backend].clone()
+    }
+
     pub fn get_model_catalog(&self) -> Vec<ProviderModelCatalog> {
-        let Ok(catalog) = self.model_catalog.read() else {
-            return Vec::new();
+        let mut providers: Vec<_> = match self.model_catalog.read() {
+            Ok(catalog) => catalog.values().cloned().collect(),
+            Err(_) => return Vec::new(),
         };
-        let mut providers: Vec<_> = catalog.values().cloned().collect();
+        for provider in &mut providers {
+            if provider.backend == crate::backends::inference::INFERENCE_BACKEND_KEY {
+                crate::backends::inference::live_catalog(self, provider);
+            }
+        }
         providers.sort_by(|a, b| a.backend.cmp(&b.backend));
         providers
     }
@@ -4628,9 +4643,15 @@ impl Orchestrator {
         }
         let orch = self.clone();
         let name = backend.clone();
-        tokio::task::spawn_blocking(move || orch.refresh_provider_model_catalog_blocking(&name))
-            .await
-            .map_err(|e| format!("model catalog refresh task failed: {e}"))
+        tokio::task::spawn_blocking(move || {
+            let mut catalog = orch.refresh_provider_model_catalog_blocking(&name);
+            if name == crate::backends::inference::INFERENCE_BACKEND_KEY {
+                crate::backends::inference::live_catalog(&orch, &mut catalog);
+            }
+            catalog
+        })
+        .await
+        .map_err(|e| format!("model catalog refresh task failed: {e}"))
     }
 
     /// Rediscover every provider's models on a dedicated thread.
@@ -4811,6 +4832,7 @@ mod tests {
             display_name: "bglab-win".into(),
         };
         ExecutorHealthSnapshot {
+            drain_state: Default::default(),
             build_volume: None,
             model_residents: Vec::new(),
             identity: identity.clone(),
@@ -5516,6 +5538,8 @@ mod tests {
                     router: false,
                     modalities: None,
                     serves: None,
+                    availability: None,
+                    availability_by_verb: Default::default(),
                     tokenizer: None,
                 }],
                 options: Vec::new(),
@@ -5862,6 +5886,8 @@ mod tests {
                     router: false,
                     modalities: None,
                     serves: None,
+                    availability: None,
+                    availability_by_verb: Default::default(),
                     tokenizer: None,
                 }],
                 options: Vec::new(),

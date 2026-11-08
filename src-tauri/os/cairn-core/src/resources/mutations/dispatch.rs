@@ -49,7 +49,6 @@ mod repls;
 mod requests;
 mod responses;
 mod routes;
-mod self_rebuild;
 mod services;
 mod settings;
 mod skills;
@@ -565,15 +564,6 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         off_frame(|| bug::dispatch(orch, request, index, item, dry_run, &resource)).await?
-    {
-        summary
-    } else if let Some(summary) = {
-        let (resource, applied_data) = (&resource, &mut applied_data);
-        off_frame(move || {
-            self_rebuild::dispatch(orch, request, index, item, dry_run, resource, applied_data)
-        })
-    }
-    .await?
     {
         summary
     } else if let Some(summary) = dev_launch_ticket::dispatch(

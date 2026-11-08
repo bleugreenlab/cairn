@@ -68,19 +68,169 @@ async fn process_lifetime_closed_and_cancelled_record_deliberate_exits() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn process_lifetime_unsettled_turns_and_launch_lock_protect_closed_session() {
-    for state in ["pending", "running", "yielded"] {
-        let orch = fixture("lifetime-unsettled", "claude", "closed", "cancelled").await;
-        orch.db.local.execute(
-            "INSERT INTO turns (id, job_id, session_id, run_id, sequence, state, start_reason, created_at, updated_at)
-             VALUES ('turn', 'job', 'session', 'run', 1, ?1, 'initial', 1, 1)", (state,)
-        ).await.unwrap();
-        register(&orch, 7200);
-        sweep_process_lifetimes(&orch);
-        assert!(orch.process_state.is_warm("run"), "{state}");
-        assert_eq!(run_state(&orch).await.0, "live");
+/// A yielded head turn, as a park leaves it, and the owner rows that may stand
+/// behind it. Each owner is seeded beside the same yielded turn so the turn
+/// itself is never what decides.
+const YIELDED_TURN: &str = "INSERT INTO turns (id, job_id, session_id, run_id, sequence, state, yield_reason, start_reason, created_at, updated_at)
+     VALUES ('turn', 'job', 'session', 'run', 1, 'yielded', 'wait', 'initial', 1, 1);";
+
+fn owner_rows(owner: &str) -> &'static str {
+    match owner {
+        "parked_wait" => "INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id, condition_json, state, created_at)
+             VALUES ('wait', 'job', 'run', 'session', 'turn', 'tool', '{}', 'pending', 1);",
+        "resolving_wait" => "INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id, condition_json, state, created_at)
+             VALUES ('wait', 'job', 'run', 'session', 'turn', 'tool', '{}', 'resolving', 1);",
+        "inline_hold" => "INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id, condition_json, state, created_at, hold)
+             VALUES ('wait', 'job', 'run', 'session', 'turn', 'tool', '{}', 'pending', 1, 'inline');",
+        "permission" => "INSERT INTO permission_requests (id, run_id, tool_use_id, tool_name, tool_input, status, created_at, turn_id, job_id)
+             VALUES ('permission', 'run', 'tool', 'Bash', '{}', 'pending', 1, 'turn', 'job');",
+        "question" => "INSERT INTO prompts (id, run_id, questions, created_at, turn_id, job_id)
+             VALUES ('prompt', 'run', '[]', 1, 'turn', 'job');",
+        "child" => "INSERT INTO jobs (id, project_id, status, parent_job_id, created_at, updated_at)
+             VALUES ('child', 'project', 'running', 'job', 1, 1);",
+        "detached_batch" => "INSERT INTO run_batch_detached (request_id, job_id, run_id, state, reason, created_ms)
+             VALUES ('batch', 'job', 'run', 'running', 'test', 1);",
+        "parked_batch" => "INSERT INTO run_batch_detached (request_id, job_id, run_id, state, reason, created_ms, holds_branch)
+             VALUES ('batch', 'job', 'run', 'parked', 'test', 1, 0);",
+        // Settled rows own nothing: they are the history every live job carries.
+        "settled" => "INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id, condition_json, state, created_at)
+             VALUES ('wait', 'job', 'run', 'session', 'turn', 'tool', '{}', 'resolved', 1);
+           INSERT INTO turns (id, job_id, session_id, run_id, sequence, predecessor_id, state, start_reason, created_at, updated_at)
+             VALUES ('successor', 'job', 'session', 'run', 2, 'turn', 'complete', 'wait_resolved', 2, 2);
+           INSERT INTO permission_requests (id, run_id, tool_use_id, tool_name, tool_input, status, created_at, turn_id, job_id)
+             VALUES ('permission', 'run', 'tool', 'Bash', '{}', 'denied', 1, 'turn', 'job');
+           INSERT INTO prompts (id, run_id, questions, created_at, turn_id, job_id, withdrawn_at)
+             VALUES ('prompt', 'run', '[]', 1, 'turn', 'job', 2);
+           INSERT INTO jobs (id, project_id, status, parent_job_id, created_at, updated_at)
+             VALUES ('child', 'project', 'complete', 'job', 1, 1);
+           INSERT INTO run_batch_detached (request_id, job_id, run_id, state, reason, created_ms)
+             VALUES ('batch', 'job', 'run', 'settled', 'test', 1);",
+        _ => "",
     }
+}
+
+async fn seed_yield(orch: &Orchestrator, owner: &str) {
+    orch.db
+        .local
+        .execute_script(format!(
+            "PRAGMA foreign_keys = OFF; {YIELDED_TURN} {} PRAGMA foreign_keys = ON;",
+            owner_rows(owner)
+        ))
+        .await
+        .unwrap();
+}
+
+async fn swept(orch: &Orchestrator) -> Option<String> {
+    sweep_process_lifetimes(orch);
+    if orch.process_state.is_warm("run") {
+        assert_eq!(run_state(orch).await, ("live".into(), None));
+        return None;
+    }
+    let (status, reason) = run_state(orch).await;
+    assert_eq!(status, "exited");
+    reason
+}
+
+/// A yielded turn with nothing behind it (none at all, or only settled rows,
+/// as a resumed predecessor leaves) protects nothing: closure, cancellation
+/// and the horizon reap it exactly as if no turn had yielded.
+#[tokio::test(flavor = "multi_thread")]
+async fn process_lifetime_ownerless_yield_protects_nothing() {
+    for owner in ["none", "settled"] {
+        for (session, job, idle, reaped) in [
+            ("open", "complete", 7200, Some("cache_horizon_idle")),
+            ("closed", "complete", 0, Some("session_closed")),
+            ("closed", "running", 0, Some("session_closed")),
+            ("open", "cancelled", 0, Some("job_cancelled")),
+            ("open", "idle", 7200, Some("cache_horizon_idle")),
+            // The control: an open, idle job inside its horizon keeps its warm
+            // process for the next message, yielded turn or not.
+            ("open", "idle", 0, None),
+            ("open", "complete", 0, None),
+        ] {
+            let orch = fixture("lifetime-ownerless-yield", "claude", session, job).await;
+            seed_yield(&orch, owner).await;
+            register(&orch, idle);
+            assert_eq!(
+                swept(&orch).await.as_deref(),
+                reaped,
+                "{owner}: {session} session, {job} job, idle {idle}s"
+            );
+        }
+    }
+}
+
+/// A wait that continues the job through a new turn does not own the process:
+/// an open session keeps it while the cache is warm, exactly as with no wait,
+/// and a closed session or cancelled job releases it at once, because the
+/// resume never runs through this process.
+#[tokio::test(flavor = "multi_thread")]
+async fn process_lifetime_resuming_waits_never_outrank_closure_or_the_horizon() {
+    for owner in [
+        "parked_wait",
+        "resolving_wait",
+        "permission",
+        "question",
+        "child",
+        "detached_batch",
+        "parked_batch",
+    ] {
+        for (session, job, warm, cold) in [
+            ("open", "running", None, "cache_horizon_idle"),
+            ("open", "complete", None, "cache_horizon_idle"),
+            (
+                "closed",
+                "running",
+                Some("session_closed"),
+                "session_closed",
+            ),
+            ("open", "cancelled", Some("job_cancelled"), "job_cancelled"),
+        ] {
+            let orch = fixture("lifetime-resuming-wait", "claude", session, job).await;
+            seed_yield(&orch, owner).await;
+            register(&orch, 0);
+            assert_eq!(
+                swept(&orch).await.as_deref(),
+                warm,
+                "{owner} inside the horizon: {session} session, {job} job"
+            );
+
+            let orch = fixture("lifetime-resuming-wait-cold", "claude", session, job).await;
+            seed_yield(&orch, owner).await;
+            register(&orch, 7200);
+            assert_eq!(
+                swept(&orch).await.as_deref(),
+                Some(cold),
+                "{owner} past the horizon: {session} session, {job} job"
+            );
+        }
+    }
+}
+
+/// Work held in the process, or about to enter it, keeps the process past the
+/// horizon and against closure and cancellation: a pending turn (a delivery
+/// awaiting launch), a running turn, and a `run` call held open on its socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn process_lifetime_in_process_owners_outrank_closure_and_the_horizon() {
+    for (session, job) in [("closed", "cancelled"), ("open", "running")] {
+        for state in ["pending", "running"] {
+            let orch = fixture("lifetime-live-turn", "claude", session, job).await;
+            orch.db.local.execute(
+                "INSERT INTO turns (id, job_id, session_id, run_id, sequence, state, start_reason, created_at, updated_at)
+                 VALUES ('turn', 'job', 'session', 'run', 1, ?1, 'initial', 1, 1)", (state,)
+            ).await.unwrap();
+            register(&orch, 7200);
+            assert_eq!(swept(&orch).await, None, "{state} turn: {session} session");
+        }
+        let orch = fixture("lifetime-inline-hold", "claude", session, job).await;
+        seed_yield(&orch, "inline_hold").await;
+        register(&orch, 7200);
+        assert_eq!(swept(&orch).await, None, "inline hold: {session} session");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_lifetime_launch_lock_protects_closed_session() {
     let orch = fixture("lifetime-locked", "claude", "closed", "running").await;
     register(&orch, 0);
     let lock = orch.job_launch_lock("job");
@@ -234,7 +384,7 @@ async fn process_lifetime_rechecks_facts_after_candidate_snapshot() {
             crate::storage::run_db_blocking(move || async move {
                 let sql = if change == "turn" {
                     "INSERT INTO turns(id,job_id,session_id,run_id,sequence,state,start_reason,created_at,updated_at)
-                     VALUES('turn','job','session','run',1,'yielded','initial',1,1)"
+                     VALUES('turn','job','session','run',1,'pending','initial',1,1)"
                 } else {
                     "INSERT INTO events(id,run_id,session_id,sequence,timestamp,event_type,data,created_at,input_tokens)
                      VALUES('fresh','run','session',2,10000,'assistant','{}',10000,1)"

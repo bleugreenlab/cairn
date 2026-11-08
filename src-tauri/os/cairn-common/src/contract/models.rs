@@ -87,6 +87,13 @@ const MODELS_SIGN_IN_CODE: KeySpec = KeySpec::new(
     "with submit_code: the code#state string Claude's sign-in page shows on its manual path",
 );
 
+/// The one `requirements` key every model door takes.
+const MODELS_REQUIREMENTS: KeySpec = KeySpec::new(
+    "requirements",
+    KeyType::Object,
+    "{zeroDataRetention?: bool} — true admits only a deployment that keeps none of the call's text: an OpenRouter model with a strictly zero-retention endpoint on OpenRouter's list (the request then carries provider.zdr and ignores its Safety Retention endpoints), Cairn inference or Ollama on the operator's hardware, a custom endpoint on a private host, or a provider listed in zeroDataRetentionProviders; anything else is refused before it is sent, naming the offers that can. The workspace's OpenRouter zero-retention setting requires it of every OpenRouter call whatever the call says. The reply's zeroDataRetention states what required it and how it was kept",
+);
+
 const MODELS_DECIDE_MODEL: KeySpec = KeySpec::new(
     "model",
     KeyType::Str,
@@ -116,7 +123,7 @@ pub(crate) const MODELS_DECIDE_RUN_TARGET: RunTargetSpec = RunTargetSpec {
         MODELS_DECIDE_INPUT,
         MODELS_DECIDE_QUESTIONS,
     ],
-    optional: &[MODELS_DECIDE_PROVIDER],
+    optional: &[MODELS_DECIDE_PROVIDER, MODELS_REQUIREMENTS],
     example: r#"run({commands:[{target:"cairn://models/decide",payload:{args_json:{model:"MODEL",input:"...",questions:[{name:"q",type:"predicate",instructions:"..."}]}}}]})"#,
 };
 
@@ -148,7 +155,11 @@ pub(crate) const MODELS_EMBED_RUN_TARGET: RunTargetSpec = RunTargetSpec {
     kind: ResourceKind::ModelsEmbed,
     label: "embed texts with a named model",
     required: &[MODELS_EMBED_MODEL, MODELS_EMBED_INPUT],
-    optional: &[MODELS_EMBED_PURPOSE, MODELS_EMBED_WIDTH],
+    optional: &[
+        MODELS_EMBED_PURPOSE,
+        MODELS_EMBED_WIDTH,
+        MODELS_REQUIREMENTS,
+    ],
     example: r#"run({commands:[{target:"cairn://models/embed",payload:{args_json:{model:"openai/text-embedding-3-small",input:["first text","second text"]}}}]})"#,
 };
 
@@ -194,6 +205,7 @@ pub(crate) const MODELS_COMPLETE_RUN_TARGET: RunTargetSpec = RunTargetSpec {
         MODELS_COMPLETE_SYSTEM,
         MODELS_COMPLETE_OPTIONS,
         MODELS_COMPLETE_OUTPUT,
+        MODELS_REQUIREMENTS,
     ],
     example: r#"run({commands:[{target:"cairn://models/complete",payload:{args_json:{model:"MODEL",prompt:"..."}}}]})"#,
 };
@@ -343,6 +355,7 @@ pub(crate) const MODELS_CATALOG_CONTRACT: ResourceContract = ResourceContract {
     name: "Model catalog",
     description: "Every provider this workspace installed, in the order Settings → Providers lists them: its category, whether an account or host is configured, what model discovery last found (id, name, context window, pricing where the provider reports it with each price in its own unit, what the model takes in and gives out, and the verbs it serves with the wire each rides; or the discovery error), what the provider serves for any model it routes, and any model observed unable to serve a verb it declares, with why. The same catalog is what selection and context-window lookup read, so a model listed here is one an allotment can select.",
     read_projections: &[
+        ProjectionSpec { key: "format", values: "markdown (default) | json — filtered CatalogListing for providers, or CatalogModel array for models; both include live availability where reported (loaded, loadable with expectedLoadMs, or loading with expectedLoadMs and elapsedMs, in a named pool)" },
         ProjectionSpec { key: "view", values: "providers (default) | models — each model once under its catalog id (the provider's canonical slug, else provider/model), with every provider offering it" },
         ProjectionSpec { key: "provider", values: "KEY — one provider, e.g. claude, codex, openrouter, custom:<account id>" },
         ProjectionSpec { key: "installed", values: "all — also list the supported providers this workspace has not installed (the Add-provider list)" },
@@ -357,7 +370,7 @@ pub(crate) const MODELS_DECIDE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsDecide,
     uri_template: "cairn://models/decide",
     name: "Decide",
-    description: "The decide verb's door, invoked with `run`, not written. Give it a model, the input to judge, and typed questions (choice, predicate, score); it answers each question in order with the model's probability over every answer, how that was measured (`native` from a Decisions model, `logprobs` from a chat model's next-token distribution), and a refusal where the model declined. It returns the decision as the verb produced it, with no thresholds applied, plus the offer that answered and the call's latency. It never chooses a model: an absent one, one that serves no decisions, or one that cannot measure these questions is refused, naming the offers that do serve decide, and nothing else is asked instead. An unconfirmed logprobs offer is probed once first, exactly as a recipe's decision node is. Each provider request is bounded at 30 seconds and a probe at 15; the item's own `timeout` releases the caller sooner, and the call it abandons ends within those bounds. Reading it lists the offers that serve decide now.",
+    description: "The decide verb's door, invoked with `run`, not written. Give it a model, the input to judge, and typed questions (choice, predicate, score); it answers each question in order with the model's probability over every answer, how that was measured (`native` from a Decisions model, `logprobs` from a chat model's next-token distribution), and a refusal where the model declined. It returns the decision as the verb produced it, with no thresholds applied, plus the offer that answered, the call's latency, and its `cost` with `costSource` (the provider's figure, or the catalog's list price for the tokens it reported). `requirements: {zeroDataRetention: true}` admits only a deployment that keeps none of the input, refusing anything else before it is sent; the reply's `zeroDataRetention` says what required it and how it was kept. It never chooses a model: an absent one, one that serves no decisions, or one that cannot measure these questions is refused, naming the offers that do serve decide, and nothing else is asked instead. An unconfirmed logprobs offer is probed once first, exactly as a recipe's decision node is. Each provider request is bounded at 30 seconds and a probe at 15; the item's own `timeout` releases the caller sooner, and the call it abandons ends within those bounds. Reading it lists the offers that serve decide now.",
     read_projections: NO_PROJECTIONS,
     related: &[RelatedSpec { label: "every offer that serves decide", kind: ResourceKind::ModelsCatalog, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
@@ -368,7 +381,7 @@ pub(crate) const MODELS_EMBED_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsEmbed,
     uri_template: "cairn://models/embed",
     name: "Embed",
-    description: "The embed verb's door, invoked with `run`, not written. Give it a model and the texts; it returns one vector per text in input order, the exact model and width that produced them, the provider, input tokens, cost where the provider reports it, and the call's latency. `purpose` says whether the texts are documents or queries, and the facet applies it as the offer declares (a request field, an instruction prefix, or nothing). `width` asks for exactly that many dimensions and is refused, naming the widths the offer can return, when the offer cannot; absent means the native width. A request over the offer's batch limits is split into consecutive requests and joined in order, and a single text longer than one request may carry is refused by its index. It never chooses a model: an absent one, or one that serves no embeddings, is refused naming the offers that do, and nothing else is asked instead. Each provider request is bounded at 60 seconds and the item at the 120-second host-item cap, so embed a large corpus in calls of a few hundred texts; a call its caller abandons sends no further request. An agent reads the reply as text, which omits the vectors when they would not fit in a run result; a script receives them whole through `embed()` in @cairn/sdk or cairn-sdk. Reading it lists the offers that serve embed now, with their widths, purpose handling and batch limits.",
+    description: "The embed verb's door, invoked with `run`, not written. Give it a model and the texts; it returns one vector per text in input order, the exact model and width that produced them, the provider, input tokens, `cost` with `costSource` (the provider's figure, or the catalog's list price for the tokens it reported), and the call's latency. `requirements: {zeroDataRetention: true}` admits only a deployment that keeps none of the texts, refusing anything else before it is sent; the reply's `zeroDataRetention` says what required it and how it was kept. `purpose` says whether the texts are documents or queries, and the facet applies it as the offer declares (a request field, an instruction prefix, or nothing). `width` asks for exactly that many dimensions and is refused, naming the widths the offer can return, when the offer cannot; absent means the native width. A request over the offer's batch limits is split into consecutive requests and joined in order, and a single text longer than one request may carry is refused by its index. It never chooses a model: an absent one, or one that serves no embeddings, is refused naming the offers that do, and nothing else is asked instead. Each provider request is bounded at 60 seconds and the item at the 120-second host-item cap, so embed a large corpus in calls of a few hundred texts; a call its caller abandons sends no further request. An agent reads the reply as text, which omits the vectors when they would not fit in a run result; a script receives them whole through `embed()` in @cairn/sdk or cairn-sdk. Reading it lists the offers that serve embed now, with their widths, purpose handling and batch limits.",
     read_projections: NO_PROJECTIONS,
     related: &[RelatedSpec { label: "every offer that serves embed", kind: ResourceKind::ModelsCatalog, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
@@ -379,7 +392,7 @@ pub(crate) const MODELS_COMPLETE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsComplete,
     uri_template: "cairn://models/complete",
     name: "Complete",
-    description: "The complete verb's door, invoked with `run`, not written: one tool-free completion with a model the caller names, without writing a response definition first. Give it the model and either a `prompt` or `messages` (ending with a user message), and optionally a `system` prompt, per-call `options` (reasoningEffort, serviceTier, fastMode, the keys a response definition takes) and an `output` JSON Schema. It returns the answer's `text`, the parsed answer as `structured` when a schema was given (an answer that violates it is retried once, naming the violation), the model and provider that answered, input and output tokens, cost where the provider reports it, latency, and the `history` entry the call was journaled as. It goes through the same execution and journal a named response does, so through the launch door's verb gate, the provider's account selection and its retry. It never chooses a model: an absent one, or one that serves no completions, is refused naming offers that do. Each provider request is bounded at 10 minutes, and the item runs to its own `timeout` up to the run ceiling, suspending its batch past the 120-second window as a response item does. Response definitions stay the named, reusable layer over the same verb. Reading it lists the providers that serve complete and how many models each offers.",
+    description: "The complete verb's door, invoked with `run`, not written: one tool-free completion with a model the caller names, without writing a response definition first. Give it the model and either a `prompt` or `messages` (ending with a user message), and optionally a `system` prompt, per-call `options` (reasoningEffort, serviceTier, fastMode, the keys a response definition takes) and an `output` JSON Schema. It returns the answer's `text`, the parsed answer as `structured` when a schema was given (an answer that violates it is retried once, naming the violation), the model and provider that answered, input and output tokens, `cost` with `costSource` (the provider's figure, or the catalog's list price for the tokens it reported), latency, and the `history` entry the call was journaled as. `requirements: {zeroDataRetention: true}` admits only a deployment that keeps none of the conversation, refusing anything else before it is sent; the reply's `zeroDataRetention` says what required it and how it was kept. It goes through the same execution and journal a named response does, so through the launch door's verb gate, the provider's account selection and its retry. It never chooses a model: an absent one, or one that serves no completions, is refused naming offers that do. Each provider request is bounded at 10 minutes, and the item runs to its own `timeout` up to the run ceiling, suspending its batch past the 120-second window as a response item does. Response definitions stay the named, reusable layer over the same verb. Reading it lists the providers that serve complete and how many models each offers.",
     read_projections: NO_PROJECTIONS,
     related: &[RelatedSpec { label: "every offer that serves complete", kind: ResourceKind::ModelsCatalog, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,

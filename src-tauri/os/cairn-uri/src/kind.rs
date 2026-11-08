@@ -149,8 +149,10 @@ pub enum ResourceKind {
     InferenceGenerations,
     InferenceGeneration,
     Bug,
-    SelfRebuild,
-    SelfRebuildOutcome,
+    /// Install-local journal ledger, not a rebuild request endpoint.
+    Rebuilds,
+    /// A single ingested rebuild record.
+    Rebuild,
     Skills,
     Skill,
     ProjectSkills,
@@ -366,8 +368,8 @@ impl ResourceKind {
         ResourceKind::InferenceGenerations,
         ResourceKind::InferenceGeneration,
         ResourceKind::Bug,
-        ResourceKind::SelfRebuild,
-        ResourceKind::SelfRebuildOutcome,
+        ResourceKind::Rebuilds,
+        ResourceKind::Rebuild,
         ResourceKind::Skills,
         ResourceKind::Skill,
         ResourceKind::ProjectSkills,

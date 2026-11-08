@@ -11,19 +11,49 @@
 //! installed providers: whether a provider is installed is enforced where it
 //! always was, and is not this gate's question.
 //!
+//! The same gate decides a call's zero-data-retention requirement
+//! ([`super::retention::admit`]), and the proof carries what it admitted, so a
+//! backend that routes by retention (OpenRouter) sends the routing preference
+//! on every request, and a requirement nothing can meet is refused before any
+//! request. Decide and embed choose their offer through the catalog rather
+//! than this door; [`admit_route`] is their half of the same gate.
+//!
 //! [`CatalogProvider::admit`]: cairn_models::interface::CatalogProvider::admit
 
-use cairn_models::interface::NoOffer;
+use cairn_models::interface::retention::Requirements;
+use cairn_models::interface::{NoOffer, SelectedOffer};
 use cairn_models::types::catalog::VerbKind;
 
+use super::retention::ZdrAdmission;
 use super::{AgentBackend, CompletionFailure, CompletionOutcome, CompletionRequest, SessionConfig};
 use crate::orchestrator::Orchestrator;
 
-/// Proof a launch passed the verb gate. Only this module can make one, and
-/// [`AgentBackend::start_session`]/[`AgentBackend::complete`] require it, so no
-/// launch path can skip the gate.
+/// Proof a launch passed the verb gate, and the zero-data-retention
+/// requirement it admitted. Only this module can make one, and
+/// [`AgentBackend::start_session`]/[`AgentBackend::complete`] (and every
+/// decision and embedding route) require it, so no launch path can skip the
+/// gate.
 pub struct Admitted {
     _sealed: (),
+    zero_data_retention: Option<ZdrAdmission>,
+}
+
+impl Admitted {
+    /// How the call's zero-data-retention requirement was met, when one
+    /// applied. A backend that can carry a retention routing preference must
+    /// send it whenever this is set.
+    pub(crate) fn zero_data_retention(&self) -> Option<&ZdrAdmission> {
+        self.zero_data_retention.as_ref()
+    }
+
+    /// A proof for a test that drives a backend or adapter directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(zero_data_retention: Option<ZdrAdmission>) -> Self {
+        Self {
+            _sealed: (),
+            zero_data_retention,
+        }
+    }
 }
 
 /// Why a completion launched through [`complete`] did not answer.
@@ -31,13 +61,17 @@ pub struct Admitted {
 pub(crate) enum LaunchError {
     /// The model does not serve completions; nothing was sent.
     Unserved(NoOffer),
+    /// The call requires zero data retention and the provider cannot keep it;
+    /// nothing was sent. The text names the offers that could.
+    Retention(String),
     /// The backend was asked and failed, on the account it names when it had
     /// chosen one.
     Completion(CompletionFailure),
 }
 
 /// Start `config` on `backend`, which serves `provider`, once its model is
-/// admitted for sessions.
+/// admitted for sessions. A session carries no requirements of its own yet,
+/// so only the workspace's OpenRouter floor can require zero retention of it.
 pub(crate) fn start_session(
     orch: &Orchestrator,
     provider: &str,
@@ -46,20 +80,29 @@ pub(crate) fn start_session(
 ) -> Result<(), String> {
     let project_id = Some(config.project_id.as_str()).filter(|id| !id.is_empty());
     let model = config.model.as_ref().map(|model| model.as_str());
-    let admitted = admit(orch, provider, model, VerbKind::Session, project_id)
+    let mut admitted = admit(orch, provider, model, VerbKind::Session, project_id)
         .map_err(|refusal| refusal.to_string())?;
+    admitted.zero_data_retention = super::retention::admit(
+        orch,
+        provider,
+        backend,
+        model.unwrap_or_default(),
+        &Requirements::default(),
+        project_id,
+        VerbKind::Session,
+    )?;
     backend.start_session(config, orch, admitted)
 }
 
 /// Run `request` on `backend`, which serves `provider`, once its model is
-/// admitted for completions.
+/// admitted for completions and its requirements are met.
 pub(crate) fn complete(
     orch: &Orchestrator,
     provider: &str,
     backend: &dyn AgentBackend,
     request: CompletionRequest,
 ) -> Result<CompletionOutcome, LaunchError> {
-    let admitted = admit(
+    let mut admitted = admit(
         orch,
         provider,
         Some(request.model.as_str()),
@@ -67,9 +110,58 @@ pub(crate) fn complete(
         request.project_id.as_deref(),
     )
     .map_err(LaunchError::Unserved)?;
+    admitted.zero_data_retention = super::retention::admit(
+        orch,
+        provider,
+        backend,
+        &request.model,
+        &request.requirements,
+        request.project_id.as_deref(),
+        VerbKind::Complete,
+    )
+    .map_err(LaunchError::Retention)?;
     backend
         .complete(request, orch, admitted)
         .map_err(LaunchError::Completion)
+}
+
+/// Admit a decision or an embedding on `offer`, which the catalog already
+/// chose as serving `verb`: only its requirements are left to meet. The proof
+/// is what [`AgentBackend::decision_route`] and the embedding routes take.
+pub(crate) fn admit_route(
+    orch: &Orchestrator,
+    offer: &SelectedOffer,
+    requirements: &Requirements,
+    project_id: Option<&str>,
+    verb: VerbKind,
+) -> Result<Admitted, String> {
+    let backend = super::backend_for_name(Some(&offer.provider));
+    Ok(Admitted {
+        _sealed: (),
+        zero_data_retention: super::retention::admit(
+            orch,
+            &offer.provider,
+            backend.as_ref(),
+            &offer.model,
+            requirements,
+            project_id,
+            verb,
+        )?,
+    })
+}
+
+/// The proof for a capability probe: a fixed question Cairn wrote, carrying
+/// none of a caller's text, asked only to learn whether an offer can measure
+/// decisions at all. It is held to the workspace floor like any call, so an
+/// OpenRouter probe still routes only to zero-retention endpoints.
+pub(crate) fn admit_probe(orch: &Orchestrator, offer: &SelectedOffer) -> Result<Admitted, String> {
+    admit_route(
+        orch,
+        offer,
+        &Requirements::default(),
+        None,
+        VerbKind::Decide,
+    )
 }
 
 /// Why a relayed request got no route.
@@ -113,12 +205,16 @@ fn admit(
     verb: VerbKind,
     project_id: Option<&str>,
 ) -> Result<Admitted, NoOffer> {
+    let admitted = Admitted {
+        _sealed: (),
+        zero_data_retention: None,
+    };
     let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
-        return Ok(Admitted { _sealed: () });
+        return Ok(admitted);
     };
     orch.catalog_provider(provider, project_id)
         .admit(model, verb)?;
-    Ok(Admitted { _sealed: () })
+    Ok(admitted)
 }
 
 #[cfg(test)]
@@ -237,7 +333,125 @@ mod tests {
             options: Default::default(),
             output_schema: None,
             timeout: std::time::Duration::from_secs(5),
+            requirements: Default::default(),
         }
+    }
+
+    /// OpenRouter's chat endpoint as a script: answers every completion and
+    /// keeps what was sent.
+    #[derive(Default)]
+    struct Chat(std::sync::Mutex<Vec<serde_json::Value>>);
+
+    impl cairn_models::interface::complete::Complete for Chat {
+        fn complete(
+            &self,
+            call: cairn_models::interface::complete::CompletionCall<'_>,
+        ) -> Result<cairn_models::interface::complete::CompletionReply, CompletionError> {
+            self.0.lock().unwrap().push(call.body);
+            Ok(cairn_models::interface::complete::CompletionReply::Chat(
+                serde_json::from_value(serde_json::json!({
+                    "model": "openai/gpt-5",
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                }))
+                .unwrap(),
+            ))
+        }
+    }
+
+    /// Every OpenRouter completion and session passes the gate's
+    /// zero-retention decision: a required call carries `provider.zdr`, a
+    /// model with no zero-retention endpoint is refused before any request,
+    /// the workspace setting requires it of a call that says nothing, and a
+    /// hosted provider with no checkable guarantee refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_gate_decides_zero_retention_for_every_openrouter_completion_and_session() {
+        use crate::backends::retention::fixtures::{
+            install_openrouter, require_zdr_of_openrouter, zdr_list,
+        };
+        use cairn_models::interface::retention::Requirements;
+        use serde_json::json;
+
+        let mut orch = bare_orchestrator().await;
+        let chat = Arc::new(Chat::default());
+        let runtime = crate::orchestrator::models::ModelRuntime {
+            complete: chat.clone(),
+            ..orch.models_runtime().clone()
+        };
+        orch.set_models_runtime_for_test(runtime);
+        install_openrouter(&orch);
+        orch.seed_model_catalog_for_test(ProviderModelCatalog {
+            backend: "claude".to_string(),
+            models: claude_models(),
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        });
+        zdr_list(&mut orch, &[("openai/gpt-5", "OpenAI", "openai", false)]);
+        tokio::task::spawn_blocking(move || {
+            let openrouter = super::super::openrouter::OpenRouterBackend;
+            let required = |model: &str| CompletionRequest {
+                requirements: Requirements::zero_data_retention(),
+                ..request(model)
+            };
+            complete(&orch, "openrouter", &openrouter, required("openai/gpt-5")).unwrap();
+            assert_eq!(
+                chat.0.lock().unwrap()[0]["provider"],
+                json!({"require_parameters": true, "zdr": true})
+            );
+            match complete(&orch, "openrouter", &openrouter, required("openai/gpt-4o")) {
+                Err(LaunchError::Retention(refusal)) => {
+                    assert!(
+                        refusal.contains("openai/gpt-4o on openrouter cannot keep it"),
+                        "{refusal}"
+                    );
+                    assert!(refusal.contains("Nothing was sent"), "{refusal}");
+                }
+                other => panic!("expected the retention refusal, got {other:?}"),
+            }
+            let claude = super::super::claude::ClaudeBackend;
+            match complete(&orch, "claude", &claude, required("opus")) {
+                Err(LaunchError::Retention(refusal)) => assert!(
+                    refusal.contains("offers no zero-data-retention guarantee"),
+                    "{refusal}"
+                ),
+                other => panic!("expected the retention refusal, got {other:?}"),
+            }
+            assert_eq!(chat.0.lock().unwrap().len(), 1, "no refusal sent anything");
+
+            require_zdr_of_openrouter(&orch);
+            let refusal = start_session(
+                &orch,
+                "openrouter",
+                &openrouter,
+                config("run-or", "session-or", "openai/gpt-4o", false),
+            )
+            .unwrap_err();
+            assert!(
+                refusal.contains("the workspace's OpenRouter setting requires it"),
+                "{refusal}"
+            );
+            complete(&orch, "openrouter", &openrouter, request("openai/gpt-5")).unwrap();
+            assert_eq!(
+                chat.0.lock().unwrap()[1]["provider"]["zdr"],
+                json!(true),
+                "a call that says nothing still carries the workspace's requirement"
+            );
+            // Claude is not OpenRouter: the setting asks nothing of it.
+            assert_eq!(
+                super::super::retention::admit(
+                    &orch,
+                    "claude",
+                    &claude,
+                    "opus",
+                    &Requirements::default(),
+                    None,
+                    VerbKind::Complete,
+                ),
+                Ok(None)
+            );
+        })
+        .await
+        .unwrap();
     }
 
     fn assert_refuses_the_image_model(text: &str) {

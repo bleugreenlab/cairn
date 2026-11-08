@@ -30,6 +30,7 @@ pub mod migration_files;
 pub mod pack_catalog;
 pub mod plan_audit;
 pub mod quarantine;
+pub mod rebuilds;
 pub mod render;
 pub mod requests;
 pub mod served_api;

@@ -38,6 +38,13 @@
 //! `mcp_auth_secret`, which a run could otherwise use to act outside its own
 //! run-bound credential.
 //!
+//! Rebuild state is also structural and NON-GRANTABLE: a staged spec or code
+//! authorizes an offline privileged act, and its journals/responses are evidence.
+//! No permission answer, approved fence crossing or allowAll may open writes to
+//! `rebuilds/`. Ordinary reads remain useful and allowed. The macOS process
+//! floor enforces this below every agent spawn; Linux/Windows have no detached
+//! rebuild consumer and do not claim that kernel protection.
+//!
 //! The refusals here are defense in depth for the structured verbs. The
 //! boundary itself is enforced in the kernel at every agent spawn by
 //! `cairn_sandbox::operator_credential`, whose set of covered paths is the one
@@ -46,6 +53,22 @@
 use std::path::{Component, Path, PathBuf};
 
 use cairn_sandbox::OPERATOR_CREDENTIAL_REFUSAL;
+
+/// Staged code/specs authorize a privileged offline act; journals and responses
+/// are its evidence. Raw writes to any of them would forge that authority.
+/// This is structural, not containment: no grant can make the write safe.
+pub const REBUILD_STATE_REFUSAL: &str = concat!(
+    "Denied: Cairn rebuild state (~/.cairn/rebuilds) is non-grantable. ",
+    "Writing staged code, specs, journals or responses would forge a privileged act or its evidence. ",
+    "No permission answer, approved fence crossing, or allowAll changes this protection. ",
+    "File an operator request for a rebuild instead. Ordinary reads remain allowed."
+);
+
+fn is_rebuild_state_path(candidate: &Path, config_dir: &Path) -> bool {
+    cairn_sandbox::OperatorCredentialFloor::for_this_machine()
+        .with_home(config_dir)
+        .names_rebuild_state(candidate)
+}
 
 /// What an agent is told when it tries to write the configuration document
 /// directly. Names the surface that works, because a refusal an agent cannot
@@ -243,6 +266,9 @@ fn resolves_to(candidate: &Path, protected: &Path) -> bool {
 /// capability set, or the credential that approves changes to it, on the
 /// strength of a question that never mentioned either.
 pub fn denied_path_refusal(config_dir: &Path, path: &Path) -> Option<&'static str> {
+    if is_rebuild_state_path(path, config_dir) {
+        return Some(REBUILD_STATE_REFUSAL);
+    }
     if is_workspace_settings_path(path, config_dir) {
         return Some(BROKERED_ONLY_REFUSAL);
     }
@@ -349,6 +375,58 @@ pub fn structured_change_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuild_writes_are_non_grantable_including_patch_envelopes() {
+        use crate::mcp::types::{ChangeItem, ChangeMode};
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("override-home");
+        let root = config.join("rebuilds");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("id/responses/intent.json");
+        for mode in [
+            ChangeMode::Create,
+            ChangeMode::Replace,
+            ChangeMode::Append,
+            ChangeMode::Patch,
+            ChangeMode::Delete,
+        ] {
+            let item = ChangeItem {
+                target: format!("file:{}", target.display()),
+                mode,
+                payload: Some(serde_json::json!({"content": "forged"})),
+            };
+            assert_eq!(
+                structured_change_refusal(&config, dir.path(), &item).as_deref(),
+                Some(REBUILD_STATE_REFUSAL)
+            );
+        }
+        let item = ChangeItem {
+            target: "file:".into(),
+            mode: ChangeMode::UnifiedPatch,
+            payload: Some(serde_json::json!({"patch": format!(
+                "*** Begin Patch\n*** Add File: {}\n+forged\n*** End Patch\n", target.display()
+            )})),
+        };
+        assert_eq!(
+            structured_change_refusal(&config, dir.path(), &item).as_deref(),
+            Some(REBUILD_STATE_REFUSAL)
+        );
+        assert_eq!(read_refusal(&config, &target), None);
+        assert_eq!(
+            denied_path_refusal(&config, &config.join("rebuilds-other/spec.json")),
+            None
+        );
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(
+                denied_path_refusal(&config, &alias.join("absent.json")),
+                Some(REBUILD_STATE_REFUSAL)
+            );
+        }
+    }
 
     #[test]
     fn nothing_inside_an_installed_pack_is_writable_however_it_is_spelled() {

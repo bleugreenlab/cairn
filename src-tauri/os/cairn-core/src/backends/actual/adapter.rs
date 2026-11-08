@@ -238,6 +238,7 @@ mod tests {
             options: Default::default(),
             output_schema: None,
             timeout: Duration::from_secs(1),
+            requirements: Default::default(),
         }
     }
 

@@ -494,12 +494,13 @@ pub(crate) fn render_executors(
         if executor.health.role != MachineRole::General {
             out.push_str(&machine_role_line(executor.health.role));
         }
-        if executor.health.drain_mode {
+        if executor.drain_state.effective_refusal {
             out.push_str(&format!(
                 "- Draining: yes ({})\n",
                 crate::fleet::DrainResidents::of(&executor.occupancy).headline()
             ));
         }
+        out.push_str(&owned_drain_lines(&executor.drain_state));
         out.push_str(&model_residents_line(&executor.health.model_residents));
         out.push_str(&format!(
             "- Running now: {} (queued {})\n",
@@ -524,9 +525,7 @@ pub(crate) fn render_executors(
             if remote.role != MachineRole::General {
                 out.push_str(&machine_role_line(remote.role));
             }
-            if remote.drained {
-                out.push_str("- Draining: yes (held by the runner)\n");
-            }
+            out.push_str(&owned_drain_lines(&remote.drain_state));
             out.push_str(&format!(
                 "- Last seen: {}\n",
                 last_seen(remote, captured_at_unix_ms)
@@ -687,14 +686,75 @@ fn model_residents_line(
     )
 }
 
-/// The `Draining:` value on one attached machine's page.
-///
-/// The counts are what make it true. A resident job's next batch is new work,
-/// so the drain moves an idle environment off at that batch; only live work (a
-/// terminal, a REPL, a batch in flight) keeps one here, and that is the work
-/// the machine is still waiting on before it is empty.
+pub(crate) fn render_drain_initialization(error: Option<&str>) -> String {
+    match error {
+        Some(error) => format!("\n## Admission initialization closed\n\nNew admission remains refused because the authoritative fleet drain state could not be loaded: {error}\n"),
+        None => String::new(),
+    }
+}
+
+fn owned_drain_lines(state: &cairn_common::executor_protocol::ExecutorDrainState) -> String {
+    use cairn_common::executor_protocol::{
+        ExecutorDrainAdmissionEffect, ExecutorDrainOwner, ExecutorDrainProvenance,
+    };
+    let mut out = format!(
+        "- Effective drain refusal: {}\n",
+        match (state.effective_refusal, state.effective_effect) {
+            (false, _) => "no drain admission refusal",
+            (true, Some(ExecutorDrainAdmissionEffect::RefuseNewEnvironments)) => {
+                "new environments refused; a resident job's pinned batches and terminals are admitted"
+            }
+            (true, _) => "new admission refused",
+        }
+    );
+    out.push_str(&format!(
+        "- Drain machine revision: {}\n",
+        state.machine_revision
+    ));
+    if let Some(error) = &state.startup_error {
+        out.push_str(&format!("- Admission initialization closed: {error}\n"));
+    }
+    for record in &state.records {
+        let (owner, release) = match &record.owner {
+            ExecutorDrainOwner::Operator => ("operator".to_string(), "accepted lift_drain request required; authenticated issue/thread runs file or join it; operators use the shared request card"),
+            ExecutorDrainOwner::Thread { thread_id } => (format!("thread {thread_id}"), "only the owning thread may clear its record"),
+            ExecutorDrainOwner::Runtime { context } => (format!("runtime {}", serde_json::to_string(context).expect("runtime context serializes")), "only the owning runtime operation may release its exact generation"),
+            ExecutorDrainOwner::Legacy => ("legacy".to_string(), "authenticated thread/operator may clear only the imported legacy record"),
+        };
+        let provenance = match &record.provenance {
+            ExecutorDrainProvenance::LegacyUnknown => {
+                "attribution unknown; imposed time unknown".to_string()
+            }
+            ExecutorDrainProvenance::Attributed {
+                imposed_by,
+                imposed_at_unix_ms,
+            } => format!(
+                "imposed by {}; imposed at {}",
+                serde_json::to_string(imposed_by).expect("principal serializes"),
+                crate::clock::stamp_millis_with_seconds(*imposed_at_unix_ms)
+                    .unwrap_or_else(|| format!("{imposed_at_unix_ms} Unix ms"))
+            ),
+        };
+        out.push_str(&format!(
+            "- Drain owner: {owner}; reason: {}; generation: {}; {provenance}; {release}\n",
+            record.reason, record.generation
+        ));
+    }
+    for fence in &state.removal_fences {
+        out.push_str(&format!(
+            "- Removal fence: {}; reason: {}; generation: {}; incarnation: {}\n",
+            fence.owner,
+            fence.reason,
+            fence.generation,
+            fence.incarnation.as_deref().unwrap_or("unknown")
+        ));
+    }
+    out
+}
+
+/// Resident work continues while new admission is refused.
 fn drain_line(executor: &ExecutorInspection) -> String {
-    if !executor.health.drain_mode {
+    if !executor.drain_state.effective_refusal {
         return "no".to_string();
     }
     let residents = crate::fleet::DrainResidents::of(&executor.occupancy);
@@ -703,7 +763,7 @@ fn drain_line(executor: &ExecutorInspection) -> String {
         false => format!(" ({})", residents.holders()),
     };
     format!(
-        "yes — {}{holders}. An idle environment is released at its job's next batch and acquired on a machine that is not draining; one held by live work stays until that work stops. It holds across reconnects and runner restarts until it is cleared",
+        "yes — {}{holders}. Existing work continues; new admission, including pinned batches, is refused while any owned drain or fence stands",
         residents.headline()
     )
 }
@@ -767,9 +827,10 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
     // Draining is runner-side state, so it is one of the few things worth
     // saying about a machine that is reporting nothing: it decides what happens
     // when this one comes back.
-    if remote.drained {
-        out.push_str("- Draining: yes — held by the runner; when this machine attaches it will be told, and no new work is placed here until it is cleared\n");
+    if remote.drain_state.effective_refusal {
+        out.push_str("- Draining: yes — new admission refused by the runner\n");
     }
+    out.push_str(&owned_drain_lines(&remote.drain_state));
     out.push_str(&format!(
         "- Last seen: {}\n",
         last_seen(remote, captured_at_unix_ms)
@@ -1363,6 +1424,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         executor.captured_at_unix_ms,
     ));
     out.push_str(&format!("- Draining: {}\n", drain_line(executor)));
+    out.push_str(&owned_drain_lines(&executor.drain_state));
     out.push_str(&model_residents_line(&executor.health.model_residents));
     out.push_str(&format!("- Build: {}\n", render_build(executor)));
     if let Some(status) = &executor.self_update {
@@ -3241,6 +3303,9 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
                 .map(|reliability| format!(" — Priced: {}", reliability.describe()))
                 .unwrap_or_default()
         ));
+        for blocker in &rejection.drain_blockers {
+            out.push_str(&format!("    - Admission blocker: {}; reason: {}; generation: {}; incarnation: {}; estimate: {}\n", blocker.owner, blocker.reason, blocker.generation, blocker.incarnation.as_deref().unwrap_or("none"), blocker.estimate.as_deref().unwrap_or("not applicable")));
+        }
         // A machine that was actually ranked shows its own numbers here, so
         // "why not that one" is answered by the same record that answered
         // "why this one". A structurally rejected machine was never priced
@@ -7613,11 +7678,13 @@ mod tests {
             display_name: name.into(),
         };
         ExecutorInspection {
+            drain_state: Default::default(),
             name: name.into(),
             link_path: None,
             recent_placements: Vec::new(),
             colocated,
             health: ExecutorHealthSnapshot {
+                drain_state: Default::default(),
                 build_volume: None,
                 model_residents: Vec::new(),
                 identity: identity.clone(),
@@ -8818,6 +8885,7 @@ mod tests {
 
     fn enrolled(name: &str, link: RemoteLinkState) -> EnrolledRemote {
         EnrolledRemote {
+            drain_state: Default::default(),
             executor_id: name.into(),
             name: name.into(),
             os: "linux".into(),
@@ -9245,10 +9313,11 @@ mod tests {
             "a machine under no drain says nothing about one"
         );
         remote.drained = true;
+        remote.drain_state.effective_refusal = true;
         let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
         assert!(rendered.contains("Draining: yes"), "{rendered}");
         assert!(
-            rendered.contains("when this machine attaches"),
+            rendered.contains("new admission refused by the runner"),
             "the drain has to say what it will do, not just that it exists: {rendered}"
         );
     }
@@ -10858,6 +10927,131 @@ mod tests {
         placement_record_assertions(executor);
     }
 
+    fn owned_drain_view_fixture() -> cairn_common::executor_protocol::ExecutorDrainState {
+        let attributed = |owner, reason: &str, generation| {
+            serde_json::json!({
+                "owner": owner, "reason": reason, "generation": generation,
+                "provenance": {"kind":"attributed", "imposed_by":{"kind":"human","issuer":"local","subject":"operator","organization":null}, "imposed_at_unix_ms":1000}
+            })
+        };
+        let records = vec![
+            attributed(
+                serde_json::json!({"kind":"operator"}),
+                "no reason supplied",
+                2,
+            ),
+            attributed(
+                serde_json::json!({"kind":"thread","thread_id":"execution"}),
+                "capacity investigation",
+                3,
+            ),
+            attributed(
+                serde_json::json!({"kind":"runtime","context":{"kind":"self_update","operationId":"op1","turnId":"turn1","runnerBootId":"boot1","admissionEffect":"refuse_new_environments"}}),
+                "updating",
+                4,
+            ),
+            serde_json::json!({"owner":{"kind":"legacy"},"reason":"imposed before ownership was recorded","generation":1,"provenance":{"kind":"legacy_unknown"}}),
+        ];
+        // The read schema must continue to match the canonical config schema.
+        for record in &records {
+            let config: cairn_config::drain::DrainRecord =
+                serde_json::from_value(record.clone()).unwrap();
+            let view: cairn_common::executor_protocol::ExecutorDrainRecord =
+                serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(view).unwrap(), *record);
+        }
+        serde_json::from_value(serde_json::json!({
+            "drainKey":"stable-executor","machineRevision":4,
+            "records":records,"effectiveRefusal":true,
+            "blockers":[{"owner":"runtime:self_update","reason":"updating","generation":4,"incarnation":"boot1","estimate":"unknown"}],
+            "removalFences":[{"owner":"removal","reason":"checking occupancy","generation":7,"incarnation":"fence1"}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn owned_drains_render_attached_and_detached_without_invented_legacy_attribution() {
+        let mut executor = inspection("renamed-attached", false);
+        executor.drain_state = owned_drain_view_fixture();
+        executor.health.identity.executor_id = "stable-executor".into();
+        // Executor-reported health is not the authority for the owned record list.
+        executor.health.drain_mode = false;
+        let mut remote = enrolled(
+            "renamed-detached",
+            RemoteLinkState::Absent {
+                last_beat_unix_ms: None,
+                last_reason: String::new(),
+            },
+        );
+        remote.executor_id = "stable-executor".into();
+        remote.drain_state = executor.drain_state.clone();
+        let collection = render_executors(
+            std::slice::from_ref(&executor),
+            std::slice::from_ref(&remote),
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert_eq!(collection.matches("reason: no reason supplied").count(), 2);
+        for rendered in [
+            render_executor(&executor),
+            render_enrolled_remote(&remote, CAPTURED_AT),
+            collection,
+        ] {
+            assert!(!rendered.contains("stable-executor"), "{rendered}");
+            assert!(rendered.contains("Drain machine revision: 4"), "{rendered}");
+            assert!(rendered.contains("new admission refused"), "{rendered}");
+            assert!(
+                rendered
+                    .contains("Drain owner: operator; reason: no reason supplied; generation: 2"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("Drain owner: thread execution"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("boot1"), "{rendered}");
+            assert!(
+                rendered.contains("attribution unknown; imposed time unknown"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("Removal fence: removal; reason: checking occupancy; generation: 7; incarnation: fence1"), "{rendered}");
+            let legacy = rendered
+                .lines()
+                .find(|line| line.contains("Drain owner: legacy"))
+                .unwrap();
+            assert!(!legacy.contains("imposed by"), "{legacy}");
+            assert!(!legacy.contains("1000"), "{legacy}");
+        }
+    }
+
+    #[test]
+    fn owned_drain_initialization_failure_is_visible_even_with_an_empty_fleet() {
+        let mut rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, false);
+        rendered.push_str(&render_drain_initialization(Some(
+            "unsupported drain schema",
+        )));
+        assert!(rendered.contains("Admission initialization closed"));
+        assert!(rendered.contains("New admission remains refused"));
+        assert!(rendered.contains("unsupported drain schema"));
+        assert!(render_drain_initialization(None).is_empty());
+    }
+
+    #[test]
+    fn owned_drain_blockers_survive_placement_diagnostic_rendering() {
+        let mut decision = sample_placement("batch-owned-drain", "bglab-ub");
+        decision.rejected[0].reason = PlacementRejectionReason::Drained;
+        decision.rejected[0].drain_blockers = owned_drain_view_fixture().blockers;
+        let mut out = String::new();
+        render_placement_detail(&mut out, &decision);
+        assert!(out.contains("runtime:self_update"), "{out}");
+        assert!(
+            out.contains("reason: updating; generation: 4; incarnation: boot1; estimate: unknown"),
+            "{out}"
+        );
+        assert!(out.contains("batch-owned-drain"), "{out}");
+    }
+
     /// A spill-eligible decision that chose `executor_name` for `request_id`
     /// on full readings, passing over a volume-blind local machine.
     fn sample_placement(request_id: &str, executor_name: &str) -> PlacementDecision {
@@ -10939,6 +11133,7 @@ mod tests {
                 observation_reuse: ObservationReuse::UntrustedRemoteEnvironment,
             })),
             rejected: vec![PlacementRejection {
+                drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: "local".into(),
                 executor_id: "colocated".into(),
@@ -11012,6 +11207,7 @@ mod tests {
         executor.recent_placements[0]
             .rejected
             .push(PlacementRejection {
+                drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: "bglab-mac".into(),
                 executor_id: "bglab-mac".into(),

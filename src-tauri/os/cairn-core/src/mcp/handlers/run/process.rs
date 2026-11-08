@@ -187,7 +187,7 @@ async fn run_decide(
             return ItemOutcome::failed(
                 header,
                 format!(
-                    "cairn://models/decide takes {{model, input, questions, provider?}} in payload.args_json: {error}. Read cairn://models/decide for the shape."
+                    "cairn://models/decide takes {{model, input, questions, provider?, requirements?}} in payload.args_json: {error}. Read cairn://models/decide for the shape."
                 ),
             )
         }
@@ -224,6 +224,9 @@ async fn run_decide(
 
 /// Run a single resolved item: execute it, format its body, and (for shell
 /// items only) cache checkpoint results and auto-push on `git commit`.
+///
+/// `batch_request_id` names the batch the item runs in, whose durable row (if
+/// it has one) answers for the call an MCP item may have to suspend.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_one(
     orch: &Orchestrator,
@@ -231,6 +234,7 @@ pub(crate) async fn run_one(
     cwd: &str,
     tool_use_id: &str,
     run_context: Option<&RunContext>,
+    batch_request_id: Option<&str>,
     header: String,
     spec: Result<RunSpec, String>,
     interrupt: Option<&crate::responses::InvocationInterrupt>,
@@ -420,7 +424,17 @@ pub(crate) async fn run_one(
         // MCP calls are proxied RPC through the host gateway, not process
         // exec — handle and return here.
         RunSpec::McpCall(spec) => {
-            return run_mcp_call(orch, request, run_context, cwd, header, *spec, interrupt).await;
+            return run_mcp_call(
+                orch,
+                request,
+                run_context,
+                batch_request_id,
+                cwd,
+                header,
+                *spec,
+                interrupt,
+            )
+            .await;
         }
         // A REPL send writes to a live eval-server's persistent stdin and awaits
         // one framed response — not a process exec.
@@ -611,10 +625,12 @@ pub(crate) async fn run_one(
 /// ends it first: a stopped run, an abandoned call, or a window above it that
 /// closed. Ending early in any way drops the gateway call, which cancels the
 /// request at the server.
+#[allow(clippy::too_many_arguments)]
 async fn run_mcp_call(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     run_context: Option<&RunContext>,
+    batch_request_id: Option<&str>,
     cwd: &str,
     header: String,
     spec: McpCallSpec,
@@ -717,6 +733,7 @@ async fn run_mcp_call(
                 orch,
                 request,
                 run_context,
+                batch_request_id,
                 header,
                 session_key,
                 credential_key,
@@ -982,11 +999,22 @@ fn append_link_affordance(mut body: String, links: &[McpResourceDef], server: &s
     body
 }
 
+/// Suspend an MCP item whose server asked for input or opened a task: its
+/// call is answered by a durable `mcp_continuation` wait from here on.
+///
+/// When the item's batch already has a durable row (it outlived grace and was
+/// held or parked), that row answers for the call, so the continuation takes
+/// the call over from it in one write and inherits its identity
+/// ([`durable_suspend::take_over_run_batch`]). Otherwise the item suspends the
+/// call afresh, binding it the way any suspension does.
+///
+/// [`durable_suspend::take_over_run_batch`]: crate::mcp::handlers::durable_suspend::take_over_run_batch
 #[allow(clippy::too_many_arguments)]
 async fn suspend_mcp_call(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     run_context: Option<&RunContext>,
+    batch_request_id: Option<&str>,
     header: String,
     session_key: String,
     server: String,
@@ -996,41 +1024,54 @@ async fn suspend_mcp_call(
     timeout_ms: Option<u32>,
     outcome: McpCallOutcome,
 ) -> ItemOutcome {
-    use crate::mcp::handlers::durable_suspend::{self, Condition, Record};
-    use crate::mcp::handlers::mcp_continuation::{self, McpContinuationState};
-    use crate::mcp::handlers::tool_use_correlation::Claim;
     let Some(ctx) = run_context else {
         return ItemOutcome::failed(header, "MCP continuation requires an active run");
     };
     let Ok((_, db)) = super::super::run_context::lookup_run_routed(&orch.db, request).await else {
         return ItemOutcome::failed(header, "MCP continuation database is unavailable");
     };
-    let Some(turn_id) = durable_suspend::suspending_turn_id(orch, &db, &ctx.run_id).await else {
-        return ItemOutcome::failed(header, "MCP continuation requires an active turn");
-    };
-    let tool_use_id = match request.tool_use_id.clone() {
-        Some(id) => id,
-        None => match super::claim_batch_tool_use_id(&db, &ctx.run_id, &turn_id, &request.payload)
-            .await
-        {
-            Claim::One(id) => id,
-            Claim::None => {
-                return ItemOutcome::failed(
-                    header,
-                    "Could not correlate MCP continuation with its original run call",
-                )
-            }
-            Claim::Ambiguous(_) => {
-                return ItemOutcome::failed(
-                    header,
-                    "MCP continuation matched several original run calls ambiguously",
-                )
-            }
+    let state = continuation_state(
+        server,
+        session_key,
+        config,
+        tool,
+        arguments,
+        timeout_ms,
+        outcome,
+    );
+    let suspended = match batch_row(&db, batch_request_id).await {
+        Some(outer) => take_over_batch_call(orch, &db, &outer, state).await,
+        None => match suspend_fresh(orch, request, ctx, &db, state.clone()).await {
+            Ok(()) => Ok(()),
+            // The batch's own hold can land between the read above and this
+            // suspension, and then its row is what refused this one.
+            Err(error) => match batch_row(&db, batch_request_id).await {
+                Some(outer) => take_over_batch_call(orch, &db, &outer, state).await,
+                None => Err(error),
+            },
         },
     };
-    let Ok(Some(session_id)) = durable_suspend::run_session(&db, &ctx.run_id).await else {
-        return ItemOutcome::failed(header, "MCP continuation requires an active session");
-    };
+    if let Err(error) = suspended {
+        return ItemOutcome::failed(header, error);
+    }
+    // The global durable scheduler owns the continuation from here. Its
+    // persisted handoff delay prevents a first transition until this suspension
+    // marker has reached the provider, without retaining a per-call task or
+    // receiver in memory.
+    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None, data: None, whole: false }
+}
+
+/// The durable continuation of an MCP call that answered `outcome`.
+fn continuation_state(
+    server: String,
+    session_key: String,
+    config: crate::config::mcp_servers::McpServerConfig,
+    tool: String,
+    arguments: serde_json::Value,
+    timeout_ms: Option<u32>,
+    outcome: McpCallOutcome,
+) -> crate::mcp::handlers::mcp_continuation::McpContinuationState {
+    use crate::mcp::handlers::mcp_continuation::{self, McpContinuationState};
     let mut state = McpContinuationState {
         server,
         session_key,
@@ -1075,6 +1116,78 @@ async fn suspend_mcp_call(
         }
         McpCallOutcome::Complete(_) => unreachable!(),
     }
+    state
+}
+
+/// The pending durable row of the batch `request_id`, when it has one.
+async fn batch_row(
+    db: &crate::storage::LocalDb,
+    request_id: Option<&str>,
+) -> Option<crate::mcp::handlers::durable_suspend::Record> {
+    let request_id = request_id?;
+    crate::mcp::handlers::durable_suspend::pending_run_batch_wait(db, request_id)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("could not read run batch {request_id}'s durable row: {error}");
+            None
+        })
+}
+
+/// Take the call over from its batch's durable row `outer`.
+async fn take_over_batch_call(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    outer: &crate::mcp::handlers::durable_suspend::Record,
+    state: crate::mcp::handlers::mcp_continuation::McpContinuationState,
+) -> Result<(), String> {
+    use crate::mcp::handlers::durable_suspend::{self, Condition};
+    let deadline = state.deadline_ms;
+    durable_suspend::take_over_run_batch(
+        orch,
+        db,
+        outer,
+        Condition::McpContinuation { state },
+        deadline,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Suspend a call no durable row answers for yet: bind it to its turn and
+/// tool call, then park it.
+async fn suspend_fresh(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    ctx: &RunContext,
+    db: &crate::storage::LocalDb,
+    state: crate::mcp::handlers::mcp_continuation::McpContinuationState,
+) -> Result<(), String> {
+    use crate::mcp::handlers::durable_suspend::{self, Condition, Record};
+    use crate::mcp::handlers::tool_use_correlation::Claim;
+    let Some(turn_id) = durable_suspend::suspending_turn_id(orch, db, &ctx.run_id).await else {
+        return Err("MCP continuation requires an active turn".into());
+    };
+    let tool_use_id = match request.tool_use_id.clone() {
+        Some(id) => id,
+        None => match super::claim_batch_tool_use_id(db, &ctx.run_id, &turn_id, &request.payload)
+            .await
+        {
+            Claim::One(id) => id,
+            Claim::None => {
+                return Err(
+                    "Could not correlate MCP continuation with its original run call".into(),
+                )
+            }
+            Claim::Ambiguous(_) => {
+                return Err(
+                    "MCP continuation matched several original run calls ambiguously".into(),
+                )
+            }
+        },
+    };
+    let Ok(Some(session_id)) = durable_suspend::run_session(db, &ctx.run_id).await else {
+        return Err("MCP continuation requires an active session".into());
+    };
     let deadline = state.deadline_ms;
     let record = Record {
         id: cairn_common::ids::mint_child(&ctx.run_id),
@@ -1087,14 +1200,9 @@ async fn suspend_mcp_call(
         deadline,
         created: chrono::Utc::now().timestamp_millis(),
     };
-    if let Err(error) = durable_suspend::suspend(orch, &db, &record).await {
-        return ItemOutcome::failed(header, error);
-    }
-    // The global durable scheduler owns the continuation from here. Its
-    // persisted handoff delay prevents a first transition until this suspension
-    // marker has reached the provider, without retaining a per-call task or
-    // receiver in memory.
-    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None, data: None, whole: false }
+    durable_suspend::suspend(orch, db, &record)
+        .await
+        .map(|_| ())
 }
 
 /// Send inline code to a live REPL session and compose its outcome. Fails
@@ -2086,7 +2194,10 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "command": command })).unwrap();
         let (header, spec) =
             super::super::resolve::resolve_run_item(orch, &request, None, &item).await;
-        run_one(orch, &request, &cwd, "tool-use", None, header, spec, None).await
+        run_one(
+            orch, &request, &cwd, "tool-use", None, None, header, spec, None,
+        )
+        .await
     }
 
     /// A command item runs exactly as written: the shell it names runs, a

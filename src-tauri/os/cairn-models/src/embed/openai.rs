@@ -28,6 +28,7 @@ pub fn route_for(
         backend_key: provider_key.to_string(),
         url: format!("{}/embeddings", base_url.trim_end_matches('/')),
         headers: all,
+        extras: Default::default(),
     })
 }
 

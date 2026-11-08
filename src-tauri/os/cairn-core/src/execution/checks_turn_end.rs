@@ -12,11 +12,10 @@
 //!
 //! `when:review` checks (including the `idle` legacy alias) run at every
 //! turn-end; `when:write` never runs here (it is the mid-turn cadence). "Every
-//! turn-end" means every turn that actually ENDS: a turn that yields by
-//! self-suspension (`waitFor`, a durably-suspended `run` batch, a blocking
-//! question or task append) leaves the job mid-work, and the trigger
-//! (`lifecycle::review_push::spawn_turn_end_checks`) skips it — see the gate
-//! there for why, and `docs/checks.md` for the trade it makes.
+//! turn-end" includes a turn that yields on its own pending work, and a late
+//! turn-end acknowledgement after the agent resumes. These arm a wave but yield
+//! to the head turn in the bounded settle loop, so self-suspension cannot leave
+//! an owed review without a polling wave.
 //!
 //! One exception rides beside the wave rather than in it: a head that changes a
 //! pin the target's `pinBumps` declares also gets that spec's checks, whatever
@@ -858,7 +857,7 @@ async fn issue_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
 const WAVE_SETTLE_POLL_MS: u64 = 3_000;
 
 /// The longest a job's review gate defers to its node's own work before a wave
-/// takes admission anyway.
+/// proceeds to request fleet capacity. Capacity and cell waits are separate.
 ///
 /// Deferral must never become suppression. Yielding is safe because a node that
 /// is working reaches another turn-end, which arms another wave — but the review
@@ -877,16 +876,16 @@ const WAVE_SETTLE_CEILING_MS: u64 = 10 * 60 * 1_000;
 /// When each job's review gate began yielding to its node, carried across the
 /// waves that yield.
 ///
-/// The settle ceiling bounds how long a JOB goes without a review wave reaching
-/// admission, not how old one wave is. A wave deferring to a busy node is
+/// The settle ceiling bounds how long a JOB yields to node work before a wave
+/// requests fleet capacity, not how old one wave is. A wave deferring to a busy node is
 /// withdrawn when the node's branch advances, and its successor plans the new
 /// head. Were the clock the wave's own, a node that is always busy and whose
 /// branch moves more often than the ceiling (its own commits, its tasks'
 /// commits, patch-changing base replays) would restart it on every advance and
 /// never be reviewed at all. So the start of the wait is kept here, keyed by
 /// job: the first wave to defer opens it, a wave withdrawn because its branch
-/// advanced leaves it open for its successor, and a wave that takes admission,
-/// or finds nothing owed, closes it.
+/// advanced leaves it open for its successor, and a wave that clears the settle
+/// loop, or finds nothing owed, closes it.
 ///
 /// Runtime-only: a restart starts the clock again, which costs at most one more
 /// ceiling.
@@ -909,7 +908,7 @@ impl ReviewDeferrals {
             .elapsed()
     }
 
-    /// The job's review gate is no longer deferred: a wave took admission, or
+    /// The job's review gate is no longer deferred: a wave cleared settling, or
     /// the job's head turned out to owe no review.
     pub(crate) fn close(&self, job_id: &str) {
         self.since
@@ -918,8 +917,8 @@ impl ReviewDeferrals {
             .remove(job_id);
     }
 
-    /// How long the job has gone without a review wave reaching admission while
-    /// its gate deferred to the node, or `None` when it is not deferring.
+    /// Elapsed node-work deferral debt, including gaps between waves, or `None`
+    /// when no debt remains. This alone does not prove a polling wave exists.
     pub(crate) fn unreviewed_for(&self, job_id: &str) -> Option<std::time::Duration> {
         self.since
             .lock()
@@ -932,7 +931,8 @@ impl ReviewDeferrals {
 /// One node's own work, as the fleet currently reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NodeWorkInFlight {
-    /// How many fleet requests the node's jobs hold right now.
+    /// How many fleet requests the node's jobs hold right now. Zero represents
+    /// a live or self-suspended head turn instead of a fleet request.
     requests: usize,
     /// One representative command, so the record a reader sees names what the
     /// wave yielded to rather than only that it yielded.
@@ -942,6 +942,7 @@ struct NodeWorkInFlight {
 impl NodeWorkInFlight {
     fn describe(&self) -> String {
         match self.requests {
+            0 => self.command.clone(),
             1 => format!("its own `{}`", self.command),
             n => format!("{n} commands of its own, including `{}`", self.command),
         }
@@ -1059,7 +1060,7 @@ fn settle_decision(busy: bool, waited_ms: u64) -> SettleDecision {
 /// attempt row and logged at the moment it happens, where the reason is still in
 /// hand; re-deriving it here would only let the two accounts drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum WaveSettle {
+pub(crate) enum WaveSettle {
     /// Take admission.
     Proceed,
     /// The wave was withdrawn while waiting, having asked for no machine at all.
@@ -1076,7 +1077,7 @@ enum WaveSettle {
 /// A sibling's wave counts as work too, and that is the point: the second wave
 /// waits, and by the time it proceeds the first one's verdicts are in the cache
 /// answering it, instead of both compiling the same tree at once.
-async fn defer_until_node_settles(
+pub(crate) async fn defer_until_node_settles(
     orch: &Orchestrator,
     job_id: &str,
     attempt_id: &str,
@@ -1099,7 +1100,16 @@ async fn defer_until_node_settles(
                     .into_iter()
                     .collect();
             jobs.insert(job_id.to_string());
-            node_work_in_flight(&orch.fleet.snapshot(), &jobs)
+            if let Some(work) = node_work_in_flight(&orch.fleet.snapshot(), &jobs) {
+                return Some(work);
+            }
+            crate::messages::delivery::head_turn_for_job_async(orch, job_id)
+                .await
+                .mid_work_reason()
+                .map(|reason| NodeWorkInFlight {
+                    requests: 0,
+                    command: reason.to_string(),
+                })
         },
         |state, reason| record_settle(orch, job_id, attempt_id, state, reason),
     )
@@ -1155,7 +1165,7 @@ where
                 deferrals.close(job_id);
                 if deferred {
                     let reason = format!(
-                        "the node settled after {}s; taking admission",
+                        "the node settled after {}s; releasing node-work deferral before fleet admission",
                         started.elapsed().as_secs()
                     );
                     record("runtime_started", &reason);
@@ -1167,9 +1177,9 @@ where
                 deferrals.close(job_id);
                 let work = work.map(|work| work.describe()).unwrap_or_default();
                 let reason = format!(
-                    "the node is running {work}, but no review wave has reached admission for \
-                     {}s; running the review lanes anyway rather than letting a deferral become \
-                     a dropped review gate",
+                    "the node remains busy ({work}), and its review has deferred node work for \
+                     {}s; releasing node-work deferral to request fleet capacity rather than \
+                     letting a deferral become a dropped review gate",
                     unreviewed_ms / 1_000
                 );
                 record("runtime_started", &reason);
@@ -1180,9 +1190,9 @@ where
                 if !deferred {
                     let work = work.map(|work| work.describe()).unwrap_or_default();
                     let reason = format!(
-                        "deferring: the node is running {work}, which has right of way over its \
-                         own review wave; no review wave has reached admission for {}s, and one \
-                         takes admission regardless at {}s",
+                        "deferring: the node remains busy ({work}), which has right of way over its \
+                         own review wave; node-work deferral has lasted {}s, and the wave \
+                         leaves node-work deferral at {}s (fleet capacity and cells may still wait)",
                         unreviewed_ms / 1_000,
                         WAVE_SETTLE_CEILING_MS / 1_000
                     );
@@ -2492,19 +2502,9 @@ pub(crate) async fn render_turn_end_checks_section(
         return Some(format_retired_checks_section(&retired, statuses.as_deref()));
     }
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
-    let wave = orch
-        .turn_end_check_runtime_status(job_id)
-        .map(|status| wave_header(&status, now_unix_ms()));
-    let deferral = orch
-        .review_deferrals
-        .unreviewed_for(job_id)
-        .map(|unreviewed| deferral_line(unreviewed.as_millis() as u64));
-    let header = match (wave, deferral) {
-        (Some(wave), Some(deferral)) => Some(format!("{wave}\n\n{deferral}")),
-        (wave, deferral) => wave.or(deferral),
-    };
+    let header = review_progress_header(orch, job_id).await;
     format_checks_section_under(
-        header.as_deref(),
+        Some(&header),
         &statuses,
         crate::execution::checks_status::WaveCadence::of(orch, job_id),
     )
@@ -2529,8 +2529,26 @@ fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64
                 .and_then(CheckStatusBoard::executor)
                 .map(|machine| format!(", on {machine}"))
                 .unwrap_or_default();
+            let waits = status
+                .board
+                .as_ref()
+                .map(|board| {
+                    fleet_waits_line(
+                        board.snapshot().into_iter().filter_map(|entry| {
+                            crate::execution::checks_status::grouped_lane_progress(
+                                board,
+                                &entry.name,
+                                status.request_ids.get(&entry.name),
+                            )
+                        }),
+                        now,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "Fleet dispatch progress has not yet been reported.".to_string()
+                });
             format!(
-                "Review wave for `{head}`: submitted {} ago (attempt `{attempt}`){machine}",
+                "Review wave for `{head}`: submitted {} ago (attempt `{attempt}`){machine}\n\n{waits}",
                 human_duration(now.saturating_sub(at))
             )
         }
@@ -2541,29 +2559,95 @@ fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64
     }
 }
 
-/// Why a job's review lanes are absent while its gate defers to the node's own
-/// work, and when that deferral stops holding them back.
-fn deferral_line(unreviewed_ms: u64) -> String {
+/// Use the lane projection's own dispatch facts, without conflating one placement
+/// group's wait with another group's execution. Equal group reports appear once.
+fn fleet_waits_line(
+    progress: impl IntoIterator<Item = crate::execution::checks_status::LaneProgress>,
+    now: u64,
+) -> String {
+    use crate::execution::checks_status::LaneProgress;
+    let waits: BTreeSet<String> = progress
+        .into_iter()
+        .filter(|progress| matches!(progress, LaneProgress::Dispatching { .. }))
+        .map(|progress| progress.describe(now))
+        .collect();
+    if waits.is_empty() {
+        "No fleet capacity or cell-preparation wait is currently reported; see lane progress below."
+            .to_string()
+    } else {
+        format!(
+            "Fleet/cell waits now: {}.",
+            waits.into_iter().collect::<Vec<_>>().join("; ")
+        )
+    }
+}
+
+/// The wait ledger is elapsed debt, not proof that a wave is still polling it.
+/// Read the active attempt before attributing a wait to the node's own work.
+async fn review_progress_header(orch: &Orchestrator, job_id: &str) -> String {
+    let runtime = orch.turn_end_check_runtime_status(job_id);
+    let mut header = match runtime.as_ref() {
+        Some(status) => wave_header(status, now_unix_ms()),
+        None => latest_attempt_absence(orch, job_id).await,
+    };
+    if let Some(unreviewed) = orch.review_deferrals.unreviewed_for(job_id) {
+        let phase = if !orch.turn_end_checks_in_flight(job_id) {
+            ReviewWaitPhase::NoWave
+        } else {
+            let attempt = match crate::execution::routing::owning_db_for_job(&orch.db, job_id).await
+            {
+                Ok(db) => current_turn_end_attempt(&db, job_id).await.ok().flatten(),
+                Err(_) => None,
+            };
+            match attempt.as_ref().map(|attempt| attempt.state.as_str()) {
+                Some("deferred") => ReviewWaitPhase::NodeWork,
+                Some(_) => ReviewWaitPhase::Preparing,
+                None => ReviewWaitPhase::Unknown,
+            }
+        };
+        header.push_str("\n\n");
+        header.push_str(&deferral_line(unreviewed.as_millis() as u64, phase));
+    }
+    header
+}
+
+#[derive(Clone, Copy)]
+enum ReviewWaitPhase {
+    NodeWork,
+    Preparing,
+    NoWave,
+    Unknown,
+}
+
+fn deferral_line(unreviewed_ms: u64, phase: ReviewWaitPhase) -> String {
     use crate::execution::checks_status::human_duration;
+    let progress = match phase {
+        ReviewWaitPhase::NodeWork => "The active wave is deferring to this node's own work.",
+        ReviewWaitPhase::Preparing => "A wave is active and preparing to request fleet work.",
+        ReviewWaitPhase::Unknown => "A wave is active, but its current wait could not be read.",
+        ReviewWaitPhase::NoWave => "No review wave is spawned; this is not an active node-work deferral or a fleet capacity queue.",
+    };
     format!(
-        "Review is deferring to this node's own work: no review wave has reached admission for \
-         {}. Once that reaches {}, a wave takes admission at the newest head whether or not the \
-         node is still busy.",
+        "Outstanding review wait: {} since node-work deferral began. {progress} \
+         The {} ceiling releases node-work deferral; it does not guarantee fleet admission or \
+         an available cell. Submitted lanes report their capacity and cell waits separately.",
         human_duration(unreviewed_ms),
         human_duration(WAVE_SETTLE_CEILING_MS)
     )
 }
 
-/// Why a node's `/checks` has no section to show: what its latest turn-end
-/// attempt did and how long ago, the head-resolution error that kept the
-/// projection from reading anything, or that no review check applies. A job
-/// whose review gate is deferring says so, and for how long.
+/// The same progress account as the section header when there are no lanes to
+/// render yet.
 pub(crate) async fn turn_end_checks_absence(orch: &Orchestrator, job_id: &str) -> String {
-    let absence = latest_attempt_absence(orch, job_id).await;
-    match orch.review_deferrals.unreviewed_for(job_id) {
-        Some(unreviewed) => format!("{absence} {}", deferral_line(unreviewed.as_millis() as u64)),
-        None => absence,
+    let header = review_progress_header(orch, job_id).await;
+    if orch.turn_end_check_runtime_status(job_id).is_none() {
+        if let Err(error) = crate::execution::cache::resolve_job_logical_head(orch, job_id).await {
+            return format!(
+                "No check results: the node's head could not be resolved ({error}).\n\n{header}"
+            );
+        }
     }
+    header
 }
 
 async fn latest_attempt_absence(orch: &Orchestrator, job_id: &str) -> String {
@@ -2572,9 +2656,6 @@ async fn latest_attempt_absence(orch: &Orchestrator, job_id: &str) -> String {
         if status.plan.applicable_names.is_empty() {
             return "No review checks apply to this tree.".to_string();
         }
-    }
-    if let Err(error) = crate::execution::cache::resolve_job_logical_head(orch, job_id).await {
-        return format!("No check results: the node's head could not be resolved ({error}).");
     }
     let db = match crate::execution::routing::owning_db_for_job(&orch.db, job_id).await {
         Ok(db) => db,
@@ -2599,7 +2680,7 @@ async fn latest_attempt_absence(orch: &Orchestrator, job_id: &str) -> String {
                 )
             } else {
                 format!(
-                    "Last turn-end attempt: {} {age} ago{reason}.",
+                    "No review wave is active. Last turn-end attempt: {} {age} ago{reason}.",
                     attempt.state
                 )
             }
@@ -3933,10 +4014,58 @@ mod tests {
     /// long, and when that stops.
     #[test]
     fn the_deferral_line_names_the_wait_and_its_bound() {
-        let line = deferral_line(7 * 60 * 1_000 + 12_000);
-        assert!(line.contains("deferring to this node's own work"), "{line}");
-        assert!(line.contains("7m 12s"), "{line}");
-        assert!(line.contains("10m 0s"), "{line}");
+        for (phase, expected) in [
+            (ReviewWaitPhase::NodeWork, "active wave is deferring"),
+            (
+                ReviewWaitPhase::Preparing,
+                "preparing to request fleet work",
+            ),
+            (ReviewWaitPhase::NoWave, "No review wave is spawned"),
+            (ReviewWaitPhase::Unknown, "current wait could not be read"),
+        ] {
+            let line = deferral_line(46 * 60 * 1_000 + 41_000, phase);
+            assert!(line.contains(expected), "{line}");
+            assert!(line.contains("46m 41s"), "{line}");
+            assert!(line.contains("10m 0s"), "{line}");
+            assert!(
+                line.contains("does not guarantee fleet admission"),
+                "{line}"
+            );
+            assert!(!line.contains("takes admission"), "{line}");
+        }
+    }
+
+    #[test]
+    fn submitted_header_keeps_capacity_and_cell_waits_separate_from_node_work() {
+        use crate::execution::checks_status::LaneProgress;
+        let queued = LaneProgress::Dispatching {
+            dispatch_phase: "queued".into(),
+            label: Some("queued for fleet admission".into()),
+            diagnostic: Some("waiting for memory capacity".into()),
+            since_unix_ms: Some(1),
+        };
+        let cell = LaneProgress::Dispatching {
+            dispatch_phase: "provisioning".into(),
+            label: Some("preparing cell".into()),
+            diagnostic: Some("waiting for a cell checkout".into()),
+            since_unix_ms: Some(2),
+        };
+        let line = fleet_waits_line([queued.clone(), queued, cell], 3);
+        assert!(line.contains("waiting for memory capacity"), "{line}");
+        assert!(line.contains("waiting for a cell checkout"), "{line}");
+        assert_eq!(line.matches("waiting for memory capacity").count(), 1);
+        assert!(!line.contains("node's own work"), "{line}");
+        assert!(!line.contains("10m"), "{line}");
+        let running = fleet_waits_line(
+            [LaneProgress::Running {
+                since_unix_ms: Some(1),
+            }],
+            3,
+        );
+        assert!(
+            running.contains("No fleet capacity or cell-preparation wait is currently reported"),
+            "{running}"
+        );
     }
 
     /// A deferral nobody can read is indistinguishable from a wave that never
@@ -3996,6 +4125,43 @@ mod tests {
         let services =
             std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build());
         crate::orchestrator::OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// Elapsed debt alone must not paint an orphaned wait as an active deferral.
+    #[tokio::test(start_paused = true)]
+    async fn review_header_distinguishes_orphaned_debt_from_a_polling_wave() {
+        let orch = launchability_orchestrator("active", "complete").await;
+        orch.review_deferrals.open("j-1");
+        tokio::time::advance(std::time::Duration::from_secs(46 * 60 + 41)).await;
+        let header = review_progress_header(&orch, "j-1").await;
+        assert!(header.contains("No review wave is spawned"), "{header}");
+        assert!(header.contains("46m 41s"), "{header}");
+        assert!(!header.contains("active wave is deferring"), "{header}");
+
+        let attempt = request_turn_end_attempt(&orch, "j-1").unwrap();
+        let slot = orch.try_begin_turn_end_checks("j-1", &attempt).unwrap();
+        for (state, expected) in [
+            ("claimed", "preparing to request fleet work"),
+            ("deferred", "active wave is deferring"),
+        ] {
+            transition_turn_end_attempt(&orch, "j-1", &attempt, state, None).unwrap();
+            let header = review_progress_header(&orch, "j-1").await;
+            assert!(header.contains(expected), "{header}");
+            assert!(!header.contains("No review wave is spawned"), "{header}");
+            assert!(
+                header.contains("does not guarantee fleet admission"),
+                "{header}"
+            );
+        }
+        slot.finish("failed", "test wave stopped before submission")
+            .await;
+        let header = review_progress_header(&orch, "j-1").await;
+        assert!(header.contains("No review wave is active"), "{header}");
+        assert!(header.contains("No review wave is spawned"), "{header}");
+        assert!(
+            header.contains("test wave stopped before submission"),
+            "{header}"
+        );
     }
 
     /// The cairn/4873 specimen. A PR owner idle for half an hour has its cell

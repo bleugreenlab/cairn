@@ -298,9 +298,11 @@ fn orchestrator_without_executor(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrat
     // Owns every seeded run, as `common::orchestrator` does: a child's call that
     // the executor relays arrives through `dispatch_tool`, whose ownership fence
     // refuses runs that predate the host's boot.
-    Orchestrator::builder(db_state, services, temp.path().join("config"))
+    let orch = Orchestrator::builder(db_state, services, temp.path().join("config"))
         .boot_at(0)
-        .build()
+        .build();
+    common::load_fleet_settings(&orch);
+    orch
 }
 
 /// Run `work` against the test machine's pool on the blocking pool, where the
@@ -4170,6 +4172,7 @@ async fn setup_with_emitter(
         ..base
     });
     let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    common::load_fleet_settings(&orch);
 
     common::provision_jj_workspace(
         &temp.path().join("config"),

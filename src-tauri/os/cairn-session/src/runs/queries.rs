@@ -2077,6 +2077,20 @@ pub async fn settle_stale_run(
     )
     .await?;
 
+    Ok(Some(
+        settle_stranded_turns(conn, run_id, settlement, now).await?,
+    ))
+}
+
+/// Settle work cut off by a host loss, before signalling a provider on orderly
+/// shutdown or while reconciling its stale run on boot. Held calls retain their
+/// wait owner; terminal turns, including an operator Stop, are never rewritten.
+pub async fn settle_stranded_turns(
+    conn: &TrackedConnection,
+    run_id: &str,
+    settlement: StaleRunSettlement,
+    now: i64,
+) -> DbResult<Vec<SettledTurn>> {
     let mut turn_rows = conn
         .query(
             "SELECT id, state, job_id
@@ -2189,7 +2203,7 @@ pub async fn settle_stale_run(
         }
         settled.push(settled_as(turn_id, outcome));
     }
-    Ok(Some(settled))
+    Ok(settled)
 }
 
 /// Whether `turn_id` owns an active durable row for a `run` call held open on

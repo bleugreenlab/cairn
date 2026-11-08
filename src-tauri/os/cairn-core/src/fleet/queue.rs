@@ -214,6 +214,9 @@ pub(crate) struct QueueEntry {
     pub(crate) declined: HashMap<String, EntryDecline>,
     /// Offer, claim, decline, in order, for the placement record.
     pub(crate) chain: Vec<BindingEvent>,
+    /// The latest journaled decision stays with live work, independent of the
+    /// bounded historical window on the fleet.
+    latest_placement: Option<super::PlacementDecision>,
     /// A re-offer to the machine whose decline is this entry's latest binding
     /// step, not yet journaled. It is journaled when it resolves into anything
     /// other than the same decline again; an identical re-decline folds into
@@ -636,6 +639,130 @@ impl ExecutionQueue {
         *self.journal.lock().unwrap() = Some(sender);
     }
 
+    pub(crate) fn live_placements(&self) -> Vec<super::PlacementDecision> {
+        self.entries
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .filter_map(|entry| entry.latest_placement.clone())
+            .collect()
+    }
+
+    /// Retain admission evidence in the existing transition journal without
+    /// inventing a second queue state or a second persistence stream.
+    pub(crate) fn record_placement(&self, decision: &super::PlacementDecision) {
+        let mut state = self.entries.lock().unwrap();
+        let identity = (decision.request_id.clone(), decision.attempt_id.clone());
+        let Some(id) = state.by_identity.get(&identity).cloned() else {
+            return;
+        };
+        let Some(entry) = state.entries.get_mut(&id) else {
+            return;
+        };
+        entry.latest_placement = Some(decision.clone());
+        let phase = entry.state.name();
+        let binding = match &entry.state {
+            EntryState::Offered {
+                executor_id,
+                generation,
+                ..
+            }
+            | EntryState::Claimed {
+                executor_id,
+                generation,
+                ..
+            } => Some((executor_id.clone(), *generation)),
+            EntryState::Queued => None,
+        };
+        let mut row = journal_row(
+            entry,
+            phase,
+            binding
+                .as_ref()
+                .map(|(id, generation)| (id.as_str(), *generation)),
+            None,
+            decision.decided_at_unix_ms,
+        );
+        row.scoring_json = serde_json::json!({ "placementDecision": decision }).to_string();
+        row.detail = Some(match &decision.outcome {
+            super::PlacementOutcome::Refused { diagnostic }
+            | super::PlacementOutcome::Waiting { diagnostic } => diagnostic.clone(),
+            _ => "placement decision".into(),
+        });
+        drop(state);
+        self.journal(vec![row]);
+    }
+
+    /// Retract an offer refused by the runner before any frame reached the
+    /// machine. This is not evidence of an executor declining the work.
+    pub(crate) fn retract_unsent_offer(
+        &self,
+        id: &str,
+        executor_id: &str,
+        generation: u64,
+        diagnostic: &str,
+        now_unix_ms: u64,
+    ) {
+        let mut state = self.entries.lock().unwrap();
+        let Some(entry) = state.entries.get_mut(id) else {
+            return;
+        };
+        if !matches!(&entry.state, EntryState::Offered { executor_id: held, generation: held_generation, .. }
+            if held == executor_id && *held_generation == generation)
+        {
+            return;
+        }
+        entry.state = EntryState::Queued;
+        entry.reoffer = None;
+        let mut row = journal_row(entry, EntryState::Queued.name(), None, None, now_unix_ms);
+        row.detail = Some(diagnostic.into());
+        drop(state);
+        self.journal(vec![row]);
+    }
+
+    /// Resident operations need no capacity entry, but a refused start still
+    /// owes the same durable admission evidence as queued work.
+    pub(crate) fn record_unqueued_refusal(
+        &self,
+        request: &CellRequest,
+        decision: &super::PlacementDecision,
+    ) {
+        let super::PlacementOutcome::Refused { diagnostic } = &decision.outcome else {
+            return;
+        };
+        let identity = (request.request_id.clone(), request.attempt_id.clone());
+        if self
+            .entries
+            .lock()
+            .unwrap()
+            .by_identity
+            .contains_key(&identity)
+        {
+            return;
+        }
+        self.journal(vec![QueueJournalRow {
+            entry_id: format!("admission-refusal:{}", uuid::Uuid::new_v4()),
+            sequence: 0,
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            project_id: request.project_id.clone(),
+            state: TerminalState::Completed.name().into(),
+            executor_id: decision.rejected.first().map(|row| row.executor_id.clone()),
+            generation: None,
+            decline_reason: None,
+            detail: Some(diagnostic.clone()),
+            constraints_json: serde_json::json!({
+                "selector": request.executor, "pinnedExecutorId": request.pinned_executor_id,
+                "projectId": request.project_id, "repository": request.repository.identity(),
+            })
+            .to_string(),
+            scoring_json: serde_json::json!({ "placementDecision": decision }).to_string(),
+            horizon_unix_ms: request.wait_horizon_unix_ms,
+            created_at: decision.decided_at_unix_ms,
+        }]);
+    }
+
     pub(crate) fn journal_error(&self) -> Option<String> {
         self.journal_error.lock().unwrap().clone()
     }
@@ -675,6 +802,7 @@ impl ExecutionQueue {
             state: EntryState::Queued,
             declined: HashMap::new(),
             chain: Vec::new(),
+            latest_placement: None,
             reoffer: None,
             journaled_rows: 0,
             waiter: Some(waiter),
@@ -1604,7 +1732,10 @@ impl ExecutionQueue {
                     learned_estimate: request.learned_estimate.clone(),
                     subscriber_count: 1,
                     substrate_hold: None,
-                    placement: None,
+                    placement: entry
+                        .latest_placement
+                        .as_ref()
+                        .map(super::queued_placement_evidence),
                 }
             })
             .collect()
@@ -2448,6 +2579,73 @@ pub(super) mod tests {
             IncarnationSweep::default()
         );
         assert_eq!(db.write_transaction_count(), before);
+    }
+
+    #[test]
+    fn retracting_a_runner_vetoed_offer_does_not_invent_a_machine_decline() {
+        let queue = ExecutionQueue::default();
+        let (id, _waiter) = enqueue(&queue, "batch", PlacementMobility::SpillEligible);
+        assert!(queue.offer(&id, "machine", "name", 1, 2));
+        queue.retract_unsent_offer(&id, "machine", 1, "runtime drain", 3);
+        queue
+            .with_entry(&id, |entry| {
+                assert_eq!(entry.state, EntryState::Queued);
+                assert!(entry.declined.is_empty());
+            })
+            .unwrap();
+        assert!(queue.offer(&id, "machine", "name", 1, 4));
+    }
+
+    #[test]
+    fn admission_decision_roundtrips_through_existing_journal_with_stable_identities() {
+        use cairn_common::executor_protocol::{
+            DrainBlocker, PlacementRejection, PlacementRejectionReason,
+        };
+        let queue = ExecutionQueue::default();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        queue.attach_journal(sender);
+        let (_entry, _waiter) = enqueue(&queue, "stable-batch", PlacementMobility::SpillEligible);
+        receiver.try_recv().unwrap();
+        let request = request("stable-batch", PlacementMobility::SpillEligible);
+        for outcome in [
+            super::super::PlacementOutcome::Waiting {
+                diagnostic: "waiting on drain".into(),
+            },
+            super::super::PlacementOutcome::Refused {
+                diagnostic: "drain refuses".into(),
+            },
+        ] {
+            let decision = super::super::placement_decision(
+                &request,
+                42,
+                None,
+                None,
+                outcome,
+                vec![PlacementRejection {
+                    executor_id: "stable-machine".into(),
+                    executor_name: "mutable-name".into(),
+                    reason: PlacementRejectionReason::Drained,
+                    prediction: None,
+                    drain_blockers: vec![DrainBlocker {
+                        owner: "thread:owner".into(),
+                        reason: "maintenance".into(),
+                        generation: 7,
+                        incarnation: Some("fence-token".into()),
+                        estimate: Some("unknown".into()),
+                        admission_effect: Default::default(),
+                    }],
+                }],
+            );
+            queue.record_placement(&decision);
+            let rows = receiver.try_recv().unwrap();
+            assert_eq!(rows[0].request_id, "stable-batch");
+            assert_eq!(rows[0].attempt_id, "attempt");
+            assert_eq!(rows[0].state, "queued");
+            let json: serde_json::Value = serde_json::from_str(&rows[0].scoring_json).unwrap();
+            let restored: super::super::PlacementDecision =
+                serde_json::from_value(json["placementDecision"].clone()).unwrap();
+            assert_eq!(restored, decision);
+        }
     }
 
     pub(crate) fn request(request_id: &str, mobility: PlacementMobility) -> CellRequest {

@@ -15,6 +15,16 @@ use super::settings::{EffectiveSettings, MeasuredLoad, Ms, Setting, SettingOrigi
 use crate::fleet::pools::{Pool, PoolKey, PoolMember};
 use crate::orchestrator::inference_control::LoadRow;
 
+pub(crate) async fn seed_catalog_placement(orch: &crate::orchestrator::Orchestrator, model: &str) {
+    use cairn_models::types::catalog::VerbKind;
+    let mut book = orch.fleet.models.book.lock().await;
+    let mut deployment = acquirable("catalog-edit", model, &["catalog-box"], "catalog-box");
+    deployment.verbs = BTreeSet::from([VerbKind::Complete, VerbKind::Session, VerbKind::Decide]);
+    book.catalog
+        .insert(deployment.deployment.clone(), deployment);
+    book.pools.push(pool(&["catalog-box"]));
+}
+
 const MIN: Ms = 60_000;
 const SPARKS: &str = "sp1+sp2";
 
@@ -1224,6 +1234,201 @@ mod host {
         .unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_availability_comes_from_stored_deployments_and_a_real_placement_pass() {
+        use std::sync::Arc;
+
+        use cairn_common::query::parse_query_params;
+        use cairn_models::interface::{ModelScope, Models};
+        use cairn_models::types::catalog::{ModelAvailability, ProviderModelCatalog, VerbKind};
+
+        use crate::db::DbState;
+        use crate::orchestrator::inference::load_inventory;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+
+        cairn_common::scratch::testing::pin_private_root();
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db = Arc::new(sparks_db("models-host-catalog").await);
+        db.execute(
+            "INSERT INTO inference_deployment_loads
+               (deployment_id, profile_id, requested_at, finished_at, outcome, load_ms)
+             VALUES (?1, ?1, 0, 1211000, 'healthy', 1211000)",
+            params![DSV4F],
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.path().join("search")).unwrap());
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build();
+        let inventory = load_inventory(&db).await.unwrap();
+        let cached = ProviderModelCatalog {
+            backend: "inference".into(),
+            models: cairn_inference::served::served_models(&inventory, &BTreeMap::new())
+                .iter()
+                .map(crate::backends::inference::discovered)
+                .collect(),
+            options: vec![],
+            refreshed_at: Some(42),
+            error: None,
+        };
+        assert_eq!(cached.models.len(), 2);
+        orch.seed_model_catalog_for_test(cached.clone());
+
+        let mut host = sparks();
+        host.heads.attach(SP1, 110, 0);
+        host.heads.attach(SP2, 110, 0);
+        let render = |query: &str| {
+            crate::resources::models::render_catalog(&orch, &parse_query_params(query).unwrap())
+        };
+        let read = || {
+            Models::catalog(&orch, &ModelScope::workspace())
+                .unwrap()
+                .providers
+                .into_iter()
+                .find(|provider| provider.descriptor.key == "inference")
+                .unwrap()
+                .models
+                .unwrap()
+                .models
+        };
+        let now = crate::fleet::unix_time_ms() as i64;
+        let requested = now - 75_000;
+        for (phase, label) in [
+            (Phase::Stopped { since_ms: now }, "loadable"),
+            (
+                Phase::Healthy {
+                    since_ms: now,
+                    load_ms: Some(1_211_000),
+                },
+                "loaded",
+            ),
+            (
+                Phase::Starting {
+                    since_ms: now - 5_000,
+                    requested_ms: requested,
+                },
+                "loading",
+            ),
+        ] {
+            db.execute(
+                "INSERT OR REPLACE INTO inference_deployment_state
+                   (deployment_id, phase_json, command_id, updated_at)
+                 VALUES (?1, ?2, NULL, ?3)",
+                params![DSV4F, serde_json::to_string(&phase).unwrap(), now],
+            )
+            .await
+            .unwrap();
+            pass(&db, &host, now).await.unwrap();
+            let view = super::super::view_with(&db, &host).await.unwrap();
+            assert_eq!(
+                view.routes[DSV4F][&VerbKind::Complete],
+                DeploymentId::from(DSV4F)
+            );
+            // Only the fleet boundary is fake: the pass built this book from
+            // stored inventory, phase, load history and lease records.
+            *orch.fleet.models.book.lock().await = host.models.book.lock().await.clone();
+
+            let before = crate::fleet::unix_time_ms() as i64;
+            let models = read();
+            let model = models.iter().find(|model| model.model == DSV4F).unwrap();
+            let availability = model.availability.as_ref().unwrap();
+            let after = crate::fleet::unix_time_ms() as i64;
+            match (label, availability) {
+                (
+                    "loadable",
+                    ModelAvailability::Loadable {
+                        pool,
+                        expected_load_ms,
+                    },
+                ) => {
+                    assert_eq!(pool, SPARKS);
+                    assert_eq!(*expected_load_ms, Some(1_211_000));
+                }
+                ("loaded", ModelAvailability::Loaded { pool }) => assert_eq!(pool, SPARKS),
+                (
+                    "loading",
+                    ModelAvailability::Loading {
+                        pool,
+                        expected_load_ms,
+                        elapsed_ms,
+                    },
+                ) => {
+                    assert_eq!(pool, SPARKS);
+                    assert_eq!(*expected_load_ms, Some(1_211_000));
+                    assert!((before - requested) as u64 <= *elapsed_ms);
+                    assert!(*elapsed_ms <= (after - requested) as u64);
+                }
+                _ => panic!("expected {label}, got {availability:?}"),
+            }
+            for verb in [VerbKind::Complete, VerbKind::Session, VerbKind::Decide] {
+                assert_eq!(model.availability_by_verb.get(&verb), Some(availability));
+            }
+
+            let markdown = render("provider=inference&serves=complete");
+            let line = markdown.lines().find(|line| line.contains(DSV4F)).unwrap();
+            assert!(
+                line.contains(&format!("{label} in pool `{SPARKS}`")),
+                "{line}"
+            );
+            if label != "loaded" {
+                assert!(line.contains("expected load 20m 11s"), "{line}");
+            }
+            if label == "loading" {
+                assert!(line.contains("elapsed (not remaining time)"), "{line}");
+            }
+            let json: serde_json::Value =
+                serde_json::from_str(&render("provider=inference&serves=complete&format=json"))
+                    .unwrap();
+            let encoded = json["providers"][0]["catalog"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["model"] == DSV4F)
+                .unwrap();
+            assert_eq!(encoded["availability"]["pool"], SPARKS);
+            assert_eq!(encoded["availability"]["state"], label);
+            assert_eq!(
+                encoded["availabilityByVerb"]["complete"],
+                encoded["availability"]
+            );
+            if label != "loaded" {
+                assert_eq!(encoded["availability"]["expectedLoadMs"], 1_211_000);
+            }
+            if label == "loading" {
+                let elapsed = encoded["availability"]["elapsedMs"].as_u64().unwrap();
+                assert!((before - requested) as u64 <= elapsed);
+                assert!(elapsed <= (crate::fleet::unix_time_ms() as i64 - requested) as u64);
+            }
+            assert_eq!(orch.cached_model_catalog_for_test("inference"), cached);
+        }
+
+        host.pools.clear();
+        pass(&db, &host, now).await.unwrap();
+        *orch.fleet.models.book.lock().await = host.models.book.lock().await.clone();
+        assert!(
+            read().is_empty(),
+            "stored deployments without a pool are not offered"
+        );
+        let markdown = render("provider=inference");
+        assert!(!markdown.contains(&format!("`{DSV4F}`")));
+        assert!(!markdown.contains(&format!("`{QWEN}`")));
+        let json = render("provider=inference&format=json");
+        assert!(!json.contains(DSV4F) && !json.contains(QWEN), "{json}");
+        assert_eq!(orch.cached_model_catalog_for_test("inference"), cached);
+        assert!(
+            host.heads.starts().is_empty(),
+            "catalog reads never launch an engine"
+        );
+    }
+
     /// A request acquires the gang in one decision: both Sparks carry the
     /// reservation from the same pass. The start waits while the work on sp1
     /// may finish, then only the check in the way is preempted (never the
@@ -1653,4 +1858,139 @@ mod host {
         assert!(host.heads.preempted.lock().unwrap().is_empty());
         assert!(host.heads.starts().is_empty());
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_catalog_reads_live_placement_and_phase_changes() {
+    use cairn_db::turso::params;
+    use cairn_models::interface::{ModelScope, Models};
+    use cairn_models::types::catalog::{claude_models, ModelAvailability, ProviderModelCatalog};
+
+    let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+    let mut discovered = claude_models().remove(0);
+    discovered.id = "deepseek".into();
+    discovered.model = "deepseek".into();
+    discovered.canonical_slug = None;
+    discovered.serves = Some(vec![cairn_models::types::catalog::ServedVerb {
+        verb: cairn_models::types::catalog::Verb::Complete,
+        wire: cairn_models::types::catalog::Wire::OpenAiChatCompletions,
+    }]);
+    let cached = ProviderModelCatalog {
+        backend: "inference".into(),
+        models: vec![discovered],
+        options: vec![],
+        refreshed_at: Some(42),
+        error: None,
+    };
+    orch.seed_model_catalog_for_test(cached.clone());
+    {
+        let mut book = orch.fleet.models.book.lock().await;
+        book.catalog = catalog();
+        book.catalog.get_mut(&d("dsv4f-tp2")).unwrap().verbs = BTreeSet::from([
+            cairn_models::types::catalog::VerbKind::Complete,
+            cairn_models::types::catalog::VerbKind::Session,
+        ]);
+        book.pools = vec![pool(&["sp1", "sp2"])];
+        book.settings.insert(
+            SPARKS.into(),
+            EffectiveSettings::derive(
+                None,
+                Some(MeasuredLoad {
+                    secs: 1211,
+                    cold: false,
+                }),
+            ),
+        );
+        let resident = super::rules::Resident::chosen(
+            &book.catalog[&d("dsv4f-tp2")],
+            SPARKS.into(),
+            Why::Adopted,
+            1000,
+        );
+        book.state.residents.insert(d("dsv4f-tp2"), resident);
+    }
+    let read = || {
+        let catalog = Models::catalog(&orch, &ModelScope::workspace()).unwrap();
+        let provider = catalog
+            .providers
+            .iter()
+            .find(|p| p.descriptor.key == "inference")
+            .unwrap();
+        assert_eq!(provider.models.as_ref().unwrap().refreshed_at, Some(42));
+        provider.models.as_ref().unwrap().models[0]
+            .availability
+            .clone()
+            .unwrap()
+    };
+    for (phase, expected) in [
+        (
+            Phase::Healthy {
+                since_ms: 1000,
+                load_ms: None,
+            },
+            ModelAvailability::Loaded {
+                pool: SPARKS.into(),
+            },
+        ),
+        (
+            Phase::Stopped { since_ms: 2000 },
+            ModelAvailability::Loadable {
+                pool: SPARKS.into(),
+                expected_load_ms: Some(1211000),
+            },
+        ),
+    ] {
+        orch.db
+            .local
+            .execute(
+                "INSERT OR REPLACE INTO inference_deployment_state
+                (deployment_id, phase_json, command_id, updated_at) VALUES (?1, ?2, NULL, 1)",
+                params!["dsv4f-tp2", serde_json::to_string(&phase).unwrap()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(), expected);
+        let raw = orch.get_model_catalog();
+        assert_eq!(raw[0].models[0].availability, Some(expected));
+    }
+    {
+        let mut book = orch.fleet.models.book.lock().await;
+        book.state.residents.clear();
+        let mut fast = acquirable("z-fast", "deepseek", &["fast"], "fast");
+        fast.verbs = book.catalog[&d("dsv4f-tp2")].verbs.clone();
+        book.catalog.insert(d("z-fast"), fast);
+        book.pools.push(pool(&["fast"]));
+        book.settings.insert(
+            "fast".into(),
+            EffectiveSettings::derive(
+                None,
+                Some(MeasuredLoad {
+                    secs: 10,
+                    cold: false,
+                }),
+            ),
+        );
+    }
+    // Placement chooses the earlier deployment id, not the shortest load estimate.
+    assert_eq!(
+        read(),
+        ModelAvailability::Loadable {
+            pool: SPARKS.into(),
+            expected_load_ms: Some(1211000),
+        }
+    );
+    // A read must not write its availability back to the discovery cache.
+    assert_eq!(orch.cached_model_catalog_for_test("inference"), cached);
+    orch.fleet.models.book.lock().await.pools.clear();
+    let catalog = Models::catalog(&orch, &ModelScope::workspace()).unwrap();
+    assert!(catalog
+        .providers
+        .iter()
+        .find(|p| p.descriptor.key == "inference")
+        .unwrap()
+        .models
+        .as_ref()
+        .unwrap()
+        .models
+        .is_empty());
 }

@@ -158,11 +158,22 @@ pub(crate) struct ConsumerReport {
 pub(crate) trait RequestConsumer: Send + Sync {
     fn kind(&self) -> &'static str;
     fn actor(&self) -> &'static str;
+    /// Held by the primitive from before the DB claim until dispatch (and any
+    /// report it makes) returns, and by the consumer's own reconciliation, so
+    /// recovery can never observe a claim whose effect is still in flight.
+    async fn exclusion(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        None
+    }
     async fn availability(&self, orch: &Orchestrator) -> Result<(), String>;
+    /// `target` is the request target as filed (or stored), so a consumer whose
+    /// facts are per-target (lift_drain's executor) never needs mutable state
+    /// to learn what a filing is about. Consumers with one global fact set
+    /// ignore it.
     async fn facts(
         &self,
         orch: &Orchestrator,
         request_id: Option<&str>,
+        target: Option<&str>,
     ) -> Result<ActorFacts, String>;
     async fn validate_snapshot(
         &self,
@@ -201,7 +212,6 @@ pub struct RequestRegistry {
 }
 
 impl RequestRegistry {
-    #[allow(dead_code)] // Production registration lands with the enforcing consumer.
     pub(crate) fn register(&self, adapter: Arc<dyn RequestConsumer>) -> Result<(), String> {
         let entry = definition(adapter.kind())?;
         if entry.actor != adapter.actor() {

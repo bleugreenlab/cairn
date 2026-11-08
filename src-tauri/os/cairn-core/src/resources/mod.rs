@@ -43,12 +43,12 @@ mod read;
 #[cfg(test)]
 mod read_contract_tests;
 mod rebase;
+mod rebuilds;
 mod recipes;
 pub mod references;
 mod requests;
 mod responses;
 mod routes;
-pub mod self_rebuild;
 mod services;
 mod settings;
 mod spend;

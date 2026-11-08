@@ -5,7 +5,7 @@
 //!   - deny all filesystem writes,
 //!   - re-allow writes under the worktree, temp dirs, granted crossings, /dev,
 //!   - deny reads of the sensitive denylist,
-//!   - and, last, the operator credential boundary, which nothing re-allows.
+//!   - and, last, the operator credential and rebuild-state floor, which nothing re-allows.
 
 use super::{
     escape_sbpl, Confinement, NestedSandboxWriteProbe, OperatorCredentialFloor, SandboxPolicy,
@@ -2372,6 +2372,165 @@ mod tests {
         fn floor_only_profile(&self) -> String {
             format!("(version 1)\n(allow default)\n{}", self.floor.sbpl_rules())
         }
+    }
+
+    #[test]
+    fn rebuild_floor_is_last_after_every_write_allow() {
+        let root = PathBuf::from("/temporary/fixture");
+        let floor = OperatorCredentialFloor::new(Some(root.join("home")), []);
+        let rebuilds = root.join("home/.cairn/rebuilds");
+        let mut policy = SandboxPolicy::for_run(&rebuilds, &[], vec![]);
+        policy.writable_extra.push(root.clone());
+        policy.writable_regex.push("^/temporary/fixture/.*".into());
+        let profile = sbpl_profile(&policy, &floor);
+        let last_allow = profile.rfind("(allow ").unwrap();
+        let floor_start = profile.find(";; rebuild state:").unwrap();
+        assert!(floor_start > last_allow, "{profile}");
+        assert!(profile.ends_with(&floor.sbpl_rules()));
+        assert!(profile[floor_start..].contains("(deny file-write* "));
+        assert!(!profile[floor_start..].contains("file-read"));
+        assert!(profile[floor_start..].contains("rebuilds(/|$)"));
+    }
+
+    /// The same final floor closes both unfenced/allowAll work and a policy
+    /// widened by an executor's approved relayed-crossing rerun.
+    #[test]
+    fn rebuild_floor_refuses_child_writes_even_after_an_approved_crossing_live() {
+        if skip_without_nested_sandbox_exec(
+            "rebuild_floor_refuses_child_writes_even_after_an_approved_crossing_live",
+        ) {
+            return;
+        }
+        // Never use a real Cairn home, rebuild tree, or launchd job.
+        let dir = crate::approved_crossing::outside_cairn_state();
+        let root = dir.path().canonicalize().unwrap();
+        let os_home = root.join("home");
+        let home = os_home.join(".cairn");
+        let rebuilds = home.join("rebuilds");
+        std::fs::create_dir_all(rebuilds.join("attempt/responses")).unwrap();
+        let journal = rebuilds.join("attempt.jsonl");
+        std::fs::write(&journal, "original").unwrap();
+        std::os::unix::fs::symlink(&rebuilds, root.join("alias")).unwrap();
+        let floor = OperatorCredentialFloor::new(Some(os_home.clone()), []);
+        let fixture = CredentialFixture {
+            _dir: dir,
+            root: root.clone(),
+            os_home,
+            floor,
+        };
+        let mut policy = SandboxPolicy::for_run(&root, &[], vec![]);
+        // This is the exact mutator used by the relayed crossing executor.
+        // Its grant is deliberately eligible (the home is a temp fixture),
+        // proving that even a granted write cannot reopen the final floor.
+        policy
+            .grant_crossing(
+                &rebuilds,
+                cairn_common::executor_protocol::CrossingAccess::Write,
+            )
+            .unwrap();
+        assert!(policy.writable_extra.contains(&rebuilds));
+        let profiles = [
+            ("allowAll floor", fixture.floor_only_profile()),
+            (
+                "approved relayed crossing",
+                sbpl_profile(&policy, &fixture.floor),
+            ),
+        ];
+        for (label, profile) in profiles {
+            let control = fixture.run(
+                &profile,
+                &format!(
+                    "echo ok > '{}/ordinary'; cat '{}'",
+                    home.display(),
+                    journal.display()
+                ),
+            );
+            assert!(
+                control.status.success(),
+                "{label} positive control: {control:?}"
+            );
+            assert!(String::from_utf8_lossy(&control.stdout).contains("original"));
+            for script in [
+                format!("/bin/sh -c \"echo forged > '{}'\"", journal.display()),
+                format!("echo forged >> '{}'", journal.display()),
+                format!(
+                    "echo forged > '{}/attempt/responses/new.json'",
+                    rebuilds.display()
+                ),
+                format!("echo forged > '{}/alias/new.json'", root.display()),
+                format!("mkdir '{}/new-dir'", rebuilds.display()),
+                format!("mv '{}' '{}/moved'", journal.display(), root.display()),
+                format!(
+                    "mv '{}' '{}/moved-tree'",
+                    rebuilds.display(),
+                    root.display()
+                ),
+                format!("ln '{}' '{}/hardlink'", journal.display(), root.display()),
+                format!(
+                    "ln -s '{}/ordinary' '{}/planted'",
+                    home.display(),
+                    rebuilds.display()
+                ),
+                format!("rm '{}'", journal.display()),
+                format!(
+                    "mkdir '{}/.cairn-new' && mkdir '{}/.cairn-new/rebuilds'",
+                    fixture.os_home.display(),
+                    fixture.os_home.display()
+                ),
+            ] {
+                let output = fixture.run(&profile, &script);
+                assert!(
+                    !output.status.success(),
+                    "{label} permitted {script}: {output:?}"
+                );
+                assert!(
+                    crate::has_denial_signature(&String::from_utf8_lossy(&output.stderr)),
+                    "{label} failed without a kernel permission denial: {script}: {output:?}"
+                );
+                assert_eq!(std::fs::read_to_string(&journal).unwrap(), "original");
+            }
+            // The parent fixture may create future roots; the child may not.
+            let new_home = fixture.os_home.join(".cairn-new");
+            if new_home.exists() {
+                std::fs::remove_dir(&new_home).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rebuild_floor_protects_relocated_roots_and_their_ancestors_live() {
+        if skip_without_nested_sandbox_exec(
+            "rebuild_floor_protects_relocated_roots_and_their_ancestors_live",
+        ) {
+            return;
+        }
+        let fixture = CredentialFixture::new();
+        let parent = fixture.root.join("relocated-parent");
+        let target = parent.join("rebuild-root");
+        std::fs::create_dir_all(&target).unwrap();
+        let home = fixture.os_home.join(".cairn");
+        std::os::unix::fs::symlink(&target, home.join("rebuilds")).unwrap();
+        std::fs::write(target.join("journal"), "original").unwrap();
+        let profile = fixture.floor_only_profile();
+        for script in [
+            format!("echo forged > '{}/journal'", target.display()),
+            format!(
+                "mv '{}' '{}/moved-parent'",
+                parent.display(),
+                fixture.root.display()
+            ),
+        ] {
+            let output = fixture.run(&profile, &script);
+            assert!(!output.status.success(), "permitted {script}: {output:?}");
+            assert!(
+                crate::has_denial_signature(&String::from_utf8_lossy(&output.stderr)),
+                "{output:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(target.join("journal")).unwrap(),
+            "original"
+        );
     }
 
     fn leaked(out: &std::process::Output) -> bool {

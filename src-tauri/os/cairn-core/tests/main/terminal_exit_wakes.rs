@@ -32,6 +32,7 @@ async fn real_pty_orchestrator_fixture() -> (tempfile::TempDir, Arc<LocalDb>, Or
             .build(),
     );
     let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    common::load_fleet_settings(&orch);
     common::attach_test_executor(&orch);
     (temp, db, orch)
 }

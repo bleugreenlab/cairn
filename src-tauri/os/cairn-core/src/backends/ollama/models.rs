@@ -255,6 +255,8 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
             serves: served(&tag, &entry),
             // A GGUF conversion carries its own vocabulary, not guaranteed
             // identical to the repository's tokenizer.json, so no pin applies.
+            availability: None,
+            availability_by_verb: Default::default(),
             tokenizer: None,
             id: tag.clone(),
             model: tag.clone(),

@@ -616,3 +616,228 @@ fn the_provider_claims_conversation_and_decide_and_embeds_only_a_declared_embedd
         .collect();
     assert_eq!(embedders, [EMBEDDER]);
 }
+
+fn availability_view(
+    phase: Option<cairn_inference::control::Phase>,
+) -> crate::fleet::models::ModelsView {
+    use crate::fleet::models::rules::Why;
+    use crate::fleet::models::settings::{EffectiveSettings, MeasuredLoad};
+    use crate::fleet::models::{DeploymentPlacement, ModelsView, PoolView, ResidentView};
+    let key = crate::fleet::pools::PoolKey::from("sparks");
+    let residents = phase
+        .into_iter()
+        .map(|phase| ResidentView {
+            deployment: "dsv4f-tp2".into(),
+            model: DSV4.to_string(),
+            pool: key.clone(),
+            machines: BTreeSet::from(["sp1".to_string(), "sp2".to_string()]),
+            phase: Some(phase),
+            why: Why::Adopted,
+            why_said: String::new(),
+            chosen_at: 1_000,
+            loading_since: Some(2_000),
+            healthy_since: None,
+            hold: None,
+            pin: None,
+            footprint: BTreeMap::new(),
+            unified: true,
+        })
+        .collect();
+    ModelsView {
+        now: 62_000,
+        routes: BTreeMap::from([(
+            DSV4.to_string(),
+            [VerbKind::Complete, VerbKind::Session, VerbKind::Decide]
+                .into_iter()
+                .map(|verb| (verb, "dsv4f-tp2".into()))
+                .collect(),
+        )]),
+        pools: vec![PoolView {
+            key: key.clone(),
+            members: vec![],
+            rate_gbps: None,
+            settings: EffectiveSettings::derive(
+                Some(600),
+                Some(MeasuredLoad {
+                    secs: 1211,
+                    cold: false,
+                }),
+            ),
+            warm_model: None,
+            idle_override_secs: Some(600),
+            idle_since: None,
+            residents,
+            models: vec![DSV4.to_string()],
+        }],
+        deployments: vec![DeploymentPlacement {
+            deployment: "dsv4f-tp2".into(),
+            model: DSV4.to_string(),
+            pool: Some(key),
+            refused: None,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn catalog_availability_tracks_residents_stops_and_loading_without_discovery_refresh() {
+    use cairn_inference::control::Phase;
+    use cairn_models::types::catalog::ModelAvailability;
+    let discovered = served().iter().map(super::discovered).collect::<Vec<_>>();
+    let mut view = availability_view(None);
+    let states = [
+        (
+            Some(Phase::Healthy {
+                since_ms: 1_000,
+                load_ms: None,
+            }),
+            json!({"state":"loaded", "pool":"sparks"}),
+        ),
+        (
+            Some(Phase::Stopped { since_ms: 1_000 }),
+            json!({"state":"loadable", "pool":"sparks", "expectedLoadMs":1211000}),
+        ),
+        (
+            Some(Phase::Starting {
+                since_ms: 3_000,
+                requested_ms: 2_000,
+            }),
+            json!({"state":"loading", "pool":"sparks", "expectedLoadMs":1211000, "elapsedMs":60000}),
+        ),
+        (
+            Some(Phase::Reserving {
+                since_ms: 2_000,
+                waiting_on: None,
+            }),
+            json!({"state":"loading", "pool":"sparks", "expectedLoadMs":1211000, "elapsedMs":60000}),
+        ),
+        (
+            None,
+            json!({"state":"loadable", "pool":"sparks", "expectedLoadMs":1211000}),
+        ),
+    ];
+    for (phase, expected) in states {
+        view.pools[0].residents = availability_view(phase).pools.remove(0).residents;
+        let mut models = discovered.clone();
+        attach_availability(&mut models, &view);
+        assert_eq!(
+            models.len(),
+            1,
+            "models with no deployable pool are omitted"
+        );
+        assert_eq!(models[0].model, DSV4);
+        assert_eq!(
+            serde_json::to_value(&models[0].availability).unwrap(),
+            expected
+        );
+        let decoded: ModelAvailability = serde_json::from_value(expected).unwrap();
+        assert_eq!(models[0].availability, Some(decoded));
+
+        let mut provider = provider();
+        provider.models.as_mut().unwrap().models = models;
+        let catalog = cairn_models::interface::Catalog {
+            providers: vec![provider],
+        };
+        let offer = catalog.models().remove(0).offers.remove(0);
+        assert_eq!(
+            serde_json::to_value(offer).unwrap()["availability"],
+            serde_json::to_value(
+                &catalog.providers[0].models.as_ref().unwrap().models[0].availability
+            )
+            .unwrap()
+        );
+    }
+    view.deployments[0].refused = Some("no attached pool".into());
+    let mut models = discovered.clone();
+    attach_availability(&mut models, &view);
+    assert!(models.is_empty());
+}
+
+#[test]
+fn catalog_availability_unknown_measurement_and_multiple_pools_are_not_guesses() {
+    use cairn_inference::control::Phase;
+    use cairn_models::types::catalog::ModelAvailability;
+    let mut view = availability_view(None);
+    view.pools[0].settings = Default::default();
+    assert_eq!(
+        availability(&view, DSV4, VerbKind::Decide),
+        Some(ModelAvailability::Loadable {
+            pool: "sparks".into(),
+            expected_load_ms: None,
+        })
+    );
+    let mut ready = availability_view(Some(Phase::Healthy {
+        since_ms: 0,
+        load_ms: None,
+    }));
+    ready.pools[0].key = "other".into();
+    ready.pools[0].residents[0].pool = "other".into();
+    ready.pools[0].residents[0].deployment = "other-deployment".into();
+    ready.deployments[0].deployment = "other-deployment".into();
+    ready.deployments[0].pool = Some("other".into());
+    view.pools.extend(ready.pools);
+    view.deployments.extend(ready.deployments);
+    // A faster or healthy alternative must not overwrite the route the chooser selected.
+    assert!(matches!(
+        availability(&view, DSV4, VerbKind::Decide),
+        Some(ModelAvailability::Loadable { .. })
+    ));
+    view.routes
+        .get_mut(DSV4)
+        .unwrap()
+        .insert(VerbKind::Decide, "other-deployment".into());
+    assert_eq!(
+        availability(&view, DSV4, VerbKind::Decide),
+        Some(ModelAvailability::Loaded {
+            pool: "other".into()
+        })
+    );
+    // A healthy process whose placement is no longer deployable is not warm.
+    view.deployments
+        .retain(|d| d.pool.as_ref().is_some_and(|p| p.as_str() != "other"));
+    assert_eq!(availability(&view, DSV4, VerbKind::Decide), None);
+}
+
+#[test]
+fn catalog_availability_does_not_transfer_warmth_between_verbs() {
+    use cairn_inference::control::Phase;
+    use cairn_models::types::catalog::ModelAvailability;
+    let mut view = availability_view(Some(Phase::Healthy {
+        since_ms: 0,
+        load_ms: None,
+    }));
+    let mut cold = availability_view(None);
+    cold.pools[0].key = "cold".into();
+    cold.deployments[0].deployment = "cold-deployment".into();
+    cold.deployments[0].pool = Some("cold".into());
+    view.pools.extend(cold.pools);
+    view.deployments.extend(cold.deployments);
+    view.routes
+        .get_mut(DSV4)
+        .unwrap()
+        .insert(VerbKind::Decide, "cold-deployment".into());
+    let mut models = served().iter().map(super::discovered).collect();
+    attach_availability(&mut models, &view);
+    let model = &models[0];
+    assert!(matches!(
+        model.availability_by_verb[&VerbKind::Complete],
+        ModelAvailability::Loaded { .. }
+    ));
+    assert!(matches!(
+        model.availability_by_verb[&VerbKind::Decide],
+        ModelAvailability::Loadable { .. }
+    ));
+    assert!(matches!(
+        model.availability,
+        Some(ModelAvailability::Loadable { .. })
+    ));
+    let mut provider = provider();
+    provider.models.as_mut().unwrap().models = models;
+    let catalog = cairn_models::interface::Catalog {
+        providers: vec![provider],
+    };
+    let offer = catalog.models().remove(0).offers.remove(0);
+    assert!(
+        matches!(offer.availability_for(VerbKind::Decide), Some(ModelAvailability::Loadable { pool, .. }) if pool == "cold")
+    );
+}

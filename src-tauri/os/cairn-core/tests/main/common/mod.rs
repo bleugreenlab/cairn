@@ -140,6 +140,20 @@ pub fn orchestrator_booted_at(temp: &TempDir, db: Arc<LocalDb>, boot_at: i64) ->
         .build()
 }
 
+/// Open fleet admission the way host startup does after building the
+/// orchestrator (`fleet::initialization::start` in the transport runtime).
+///
+/// A fleet starts fail-closed until its authoritative settings load, and this
+/// binary links cairn-core without `cfg(test)`, so a directly built fixture
+/// orchestrator refuses every placement until this runs. It is opt-in rather
+/// than part of [`orchestrator`] because the load commits the fleet block to
+/// `settings.yaml`, which tests of settings writes must see untouched; call it
+/// in fixtures that place work, after any settings the load should read.
+pub fn load_fleet_settings(orch: &Orchestrator) {
+    cairn_core::internal::fleet::initialization::load_authoritative(orch)
+        .expect("load the fixture's authoritative fleet settings");
+}
+
 /// [`orchestrator`] wired to a permission-response broadcast the test holds, so
 /// it can observe what an answer delivers to a waiting provider poll.
 pub fn orchestrator_with_permission_responses(
@@ -977,6 +991,18 @@ fn attach_executor(
         attached_generation,
     );
     if !colocated {
+        // Admission readings come from the independent sampler, not liveness.
+        // Carry its frames over the same generation-bound path as a real link.
+        executor_pool.spawn_cpu_pressure_sampler();
+        let sample_pool = core_pool.clone();
+        executor_pool.spawn_machine_sample_publisher(move |sample| {
+            sample_pool.handle_executor_message(
+                executor_id,
+                attached_generation,
+                ExecutorMessage::MachineSampled { sample },
+            );
+            true
+        });
         // What a real machine's liveness pass does on its own cadence: publish
         // fresh telemetry, so placement can see this machine at all.
         let pool = executor_pool.clone();

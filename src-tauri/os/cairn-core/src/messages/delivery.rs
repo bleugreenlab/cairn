@@ -318,10 +318,8 @@ pub(crate) enum HeadTurn {
     /// message to a pure `waitFor` park, which ends the wait through its owner's
     /// resolution path rather than resuming around it
     /// ([`crate::mcp::handlers::durable_suspend::supersede_timed_waits`]). And
-    /// background work must NOT be scheduled
-    /// against it as though its turn had ended — notably the turn-end project
-    /// check cadence, whose heavy lanes would otherwise compete with the very
-    /// tests the agent is suspended waiting on (CAIRN-3154).
+    /// the review-check settle probe yields to this work within its bounded
+    /// ceiling instead of treating a yielded turn as quiet.
     SelfSuspended,
 }
 
@@ -702,21 +700,6 @@ pub(crate) async fn head_turn_for_job_async(orch: &Orchestrator, job_id: &str) -
         return HeadTurn::Idle;
     };
     head_turn(&db, job_id).await.unwrap_or(HeadTurn::Idle)
-}
-
-/// [`head_turn`] for a job id, routed to the job's owning database, for the
-/// synchronous turn-end hooks in `orchestrator::lifecycle`. Fails open to
-/// [`HeadTurn::Idle`] for the same reason as [`head_turn_sync`].
-pub(crate) fn head_turn_for_job(orch: &Orchestrator, job_id: &str) -> HeadTurn {
-    let dbs = orch.db.clone();
-    let job_id = job_id.to_string();
-    run_db_blocking(move || async move {
-        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        head_turn(&db, &job_id).await
-    })
-    .unwrap_or(HeadTurn::Idle)
 }
 
 /// The recipient job's node URI, used as a `direct:` push's wake-card link. The

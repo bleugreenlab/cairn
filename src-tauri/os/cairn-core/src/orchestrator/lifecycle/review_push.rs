@@ -211,10 +211,9 @@ fn job_ships_a_pr(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
 /// turn-end callers (`finalize_run` and `transition_to_warm_state`) so the two
 /// stay mirrored.
 ///
-/// Four guards skip it: a job whose work never ships a PR (the topology gate
-/// below), a trailing memory-review turn (not a work turn), a job still mid-work
-/// rather than at a real turn end (CAIRN-3154, see the gate below), and a run
-/// already in flight for the job (single-flight). A turn end refused by
+/// Topology, memory-review and resolved-issue gates exclude work that owes no
+/// review. A live or self-suspended turn yields inside the bounded settle loop
+/// instead of dropping the wave. A turn end refused by
 /// single-flight is not dropped: the running wave owes the job one successor,
 /// armed when it releases if the head has moved past the commit it checked.
 pub(crate) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
@@ -243,7 +242,7 @@ pub(crate) fn spawn_review_wave_unless_in_flight(orch: &Orchestrator, job_id: &s
 
 /// Which edge asked for a wave, which decides what a refused claim means.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WaveTrigger {
+pub(super) enum WaveTrigger {
     /// A turn end. Refused by single-flight, it leaves the holder owing one
     /// successor.
     TurnEnd,
@@ -269,9 +268,9 @@ pub(crate) fn arm_turn_end_successor_now(orch: &Orchestrator, job_id: &str) {
 /// refused it. A head that cannot be resolved arms one, because skipping it
 /// could drop the review gate on the head the agent actually ended on.
 ///
-/// Every ordinary gate still applies inside the arm: a job that ships no PR, a
-/// memory-review turn, a resolved issue, and a live turn all arm nothing. A live
-/// turn's own end arms its wave. A dormant PR owner has no future turn-end edge,
+/// Topology, memory-review and resolved-issue gates still apply inside the arm.
+/// A live or self-suspended turn keeps its successor and yields in the bounded
+/// settle loop. A dormant PR owner has no future turn-end edge,
 /// so a wave it had in flight is replaced here; a dormant owner with NO wave in
 /// flight is armed when someone waits on its checks
 /// (`checks_settlement::arm_wave_for_waiter`).
@@ -312,13 +311,25 @@ pub(crate) const OWED_SUCCESSOR_REASON: &str =
     "a wave for an earlier head is running; one successor is owed";
 
 fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
+    let Some(slot) = claim_review_wave(orch, job_id, trigger) else {
+        return;
+    };
+    let attempt_id = slot.attempt_id().to_string();
+    launch_review_wave(orch, job_id, attempt_id, slot);
+}
+
+pub(super) fn claim_review_wave(
+    orch: &Orchestrator,
+    job_id: &str,
+    trigger: WaveTrigger,
+) -> Option<crate::orchestrator::TurnEndSlot> {
     let short = &job_id[..job_id.len().min(8)];
     let attempt_id = match crate::execution::checks_turn_end::request_turn_end_attempt(orch, job_id)
     {
         Ok(id) => id,
         Err(error) => {
             log::warn!("turn-end checks for job {short}: could not persist arm intent ({error})");
-            return;
+            return None;
         }
     };
     let terminal = |state: &str, reason: &str| {
@@ -347,7 +358,7 @@ fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
             log::debug!(
                 "turn-end checks for job {short}: skipped, no downstream PR node in the execution topology"
             );
-            return;
+            return None;
         }
         // Unresolvable topology is an infrastructure fault, not a verdict. Running
         // the suite wastes machine time; skipping it would silently drop the
@@ -361,33 +372,11 @@ fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
         log::debug!(
             "turn-end checks for job {short}: skipped, latest turn is a memory-review turn (not a work turn)"
         );
-        return;
+        return None;
     }
-    // Only a turn that actually ENDED earns a review wave. Two ways this hook
-    // fires for a job that is still mid-work (CAIRN-3154):
-    //
-    // - Self-suspended. `waitFor`, a `run` batch that outlived its inline grace
-    //   window, and a blocking question/task append all park the agent by
-    //   YIELDING its turn, and the park reaches this hook looking like an idle.
-    //   It is not one: the agent resumes when its own pending work resolves, and
-    //   launching the heavy review lanes here put them in contention with the
-    //   very tests the agent was suspended waiting on.
-    // - Already resumed. The suspension's interrupt ack is asynchronous, so it
-    //   can land after the wait resolved and the continuation turn started. A
-    //   wave launched there would check the pre-resume tree AND hold the
-    //   single-flight slot against the continuation's own real turn-end.
-    //
-    // A skipped wave is not owed: nothing is queued for replay, and the job's
-    // next real turn-end runs one suite against the tree that exists then. The
-    // classification is the canonical one message delivery already uses to
-    // decline resuming a self-suspended agent, so the two cannot drift.
-    if let Some(reason) =
-        crate::messages::delivery::head_turn_for_job(orch, job_id).mid_work_reason()
-    {
-        terminal("skipped", reason);
-        log::debug!("turn-end checks for job {short}: skipped, {reason}");
-        return;
-    }
+    // A live or self-suspended head turn yields inside the bounded settle loop,
+    // not here. Skipping it would discard a stale wave's owed successor and
+    // leave no timer capable of releasing the inherited deferral.
     // The same launchability decision the runner takes again immediately before
     // submission, asked here so a wave for a resolved issue never claims the
     // single-flight slot or spends minutes planning against a tree nobody will
@@ -397,7 +386,7 @@ fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
     if let Some(withdrawal) = withdrawn_turn_end_wave(orch, job_id) {
         terminal("withdrawn", &withdrawal);
         log::debug!("turn-end checks for job {short}: skipped, {withdrawal}");
-        return;
+        return None;
     }
     // Claim the single-flight slot. The guard is the lever a later merge/close
     // pulls to quit this suite mid-flight (CAIRN-2648), and the only thing that
@@ -415,7 +404,7 @@ fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
                 log::debug!(
                     "turn-end checks for job {short}: a run is already in flight; it owes one successor"
                 );
-                return;
+                return None;
             }
             WaveTrigger::TurnEnd => {
                 claim = orch.try_begin_turn_end_checks(job_id, &attempt_id);
@@ -431,7 +420,7 @@ fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
                 "another turn-end check attempt already owns the slot",
             );
             log::debug!("turn-end checks for job {short}: skipped, a run is already in flight");
-            return;
+            return None;
         }
     };
     if let Err(error) = crate::execution::checks_turn_end::transition_turn_end_attempt(
@@ -444,8 +433,17 @@ fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
         // Dropping the guard records the attempt failed and frees the slot.
         log::error!("turn-end checks for job {short}: failed to persist claim: {error}");
         drop(slot);
-        return;
+        return None;
     }
+    Some(slot)
+}
+
+fn launch_review_wave(
+    orch: &Orchestrator,
+    job_id: &str,
+    attempt_id: String,
+    slot: crate::orchestrator::TurnEndSlot,
+) {
     let orch_clone = orch.clone();
     let job_id_owned = job_id.to_string();
     let orch_for_failure = orch.clone();

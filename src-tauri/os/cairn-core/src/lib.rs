@@ -34,6 +34,10 @@ pub mod pages;
 pub mod pr_data;
 pub mod pressure;
 pub mod projects;
+// The detached rebuild consumer and its kernel trust checks are macOS-only;
+// Unix builds keep the reader available for fixture tests, never dispatch it.
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+pub mod rebuilds;
 pub mod repl_host;
 pub mod runs;
 pub mod runtime;

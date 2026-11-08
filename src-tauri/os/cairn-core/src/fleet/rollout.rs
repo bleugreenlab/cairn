@@ -33,8 +33,9 @@
 //!   for a fixed hold. A command past that bound keeps the drain for as long
 //!   as its own stall stop still sees its tree progressing, because a slow
 //!   command on a stalled disk is busy, not wedged. Since new placement is
-//!   refused, a draining machine's work only shrinks, save the next command
-//!   for something already resident there. A terminal or REPL that never ends
+//!   refused, including new batches for resident jobs, a draining machine's
+//!   work only shrinks. Already-running commands and resident processes keep
+//!   running. A terminal or REPL that never ends
 //!   is work with no expected end: it holds the drain for the fixed hold and
 //!   then defers the machine like any wedged work, so that machine does not
 //!   update past it, and it holds no other machine's update meanwhile.
@@ -316,6 +317,7 @@ struct Turn {
     name: String,
     build_id: String,
     target: &'static str,
+    operation_id: String,
     unexplained_returns: u8,
     phase: TurnPhase,
 }
@@ -411,7 +413,7 @@ enum Slot {
 /// The runner's rolling-update state. In memory: a runner restart begins a
 /// fresh rollout, and what must survive one (a machine's failed update) is the
 /// machine's own durable report, which it carries in every `Hello`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Rollout {
     /// The machine mid-update. Only a machine with nothing in flight takes
     /// it, so no machine's work holds another machine's update.
@@ -430,7 +432,25 @@ pub(crate) struct Rollout {
     excluded: HashMap<String, (String, String)>,
 }
 
+/// The durable admission hold a proposed rollout needs before it can act.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelfUpdateDrain {
+    pub executor_id: String,
+    pub operation_id: String,
+    pub build_id: String,
+}
+
 impl Rollout {
+    pub(crate) fn required_drains(&self) -> Vec<SelfUpdateDrain> {
+        self.turns()
+            .map(|(_, turn)| SelfUpdateDrain {
+                executor_id: turn.executor_id.clone(),
+                operation_id: turn.operation_id.clone(),
+                build_id: turn.build_id.clone(),
+            })
+            .collect()
+    }
+
     /// Whether this machine is being emptied or awaited, in either slot.
     pub(crate) fn holds(&self, executor_id: &str) -> bool {
         self.turns()
@@ -1158,6 +1178,7 @@ fn begin(
         name: candidate.name.clone(),
         build_id,
         target,
+        operation_id: uuid::Uuid::new_v4().to_string(),
         unexplained_returns: 0,
         phase: TurnPhase::draining(
             candidate,

@@ -135,13 +135,17 @@ pub(crate) enum RelinquishOutcome {
     AlreadyClaimed,
 }
 
+/// The resolution a wait records when it hands its call over to an inner
+/// wait. The inner wait answers the call; this row answers nothing.
+pub(crate) const TRANSFERRED_OUTCOME: &str = r#"{"outcome":"transferred_to_inner_wait"}"#;
+
 pub(crate) async fn relinquish_to_inner_wait(
     conn: &cairn_db::storage::TrackedConnection,
     run_id: &str,
     tool_use_id: &str,
 ) -> DbResult<RelinquishOutcome> {
     let now = chrono::Utc::now().timestamp_millis();
-    let resolution = serde_json::json!({"outcome":"transferred_to_inner_wait"}).to_string();
+    let resolution = TRANSFERRED_OUTCOME;
     let changed = conn
         .execute(
             "UPDATE agent_waits SET state='resolved',resolution_json=?3,resolved_at=?4 \
@@ -389,7 +393,7 @@ pub(crate) async fn reclaim_from_inner_wait(
     run_id: &str,
     tool_use_id: &str,
 ) -> DbResult<bool> {
-    let transferred = serde_json::json!({"outcome":"transferred_to_inner_wait"}).to_string();
+    let transferred = TRANSFERRED_OUTCOME;
     let changed = conn
         .execute(
             "UPDATE agent_waits SET state='pending',resolution_json=NULL,resolved_at=NULL \
@@ -818,12 +822,12 @@ fn pause_goal_for_park(
 
 /// Pass an establishing write's outcome through, restoring the native goal's
 /// prior status when the write failed.
-fn settle_goal_pause(
+fn settle_goal_pause<T>(
     orch: &Orchestrator,
     record: &Record,
     goal_pause: Option<crate::backends::codex::DurableGoalPause>,
-    established: Result<bool, String>,
-) -> Result<bool, String> {
+    established: Result<T, String>,
+) -> Result<T, String> {
     match established {
         Ok(yielded) => Ok(yielded),
         Err(error) => {
@@ -971,6 +975,125 @@ pub(crate) async fn convert_hold_to_park(
         });
     let yielded = settle_goal_pause(orch, record, goal_pause, converted)?;
     Ok(finish_park(orch, db, record, yielded).await)
+}
+
+/// Turn the pending wait of a `run` batch (`batch`) into a more specific wait
+/// of the same call under `condition`, in place: an MCP item whose server
+/// asked for input, or opened a task, after its batch was held or parked.
+/// Returns the row as it stands now.
+///
+/// In place because a call has exactly one wait row, ever: `agent_waits` is
+/// unique on `(run_id, tool_use_id)` whatever the row's state. So the row keeps
+/// its id and the batch's identity (job, run, session, turn, tool call, and the
+/// native goal pause staked under that id), and only its condition changes,
+/// through the one condition writer. Its age restarts with the new condition,
+/// so a continuation's scheduler still holds its first transition back until
+/// the item's suspension marker has reached the provider. The batch's resolver
+/// stands down when its batch answers with that marker.
+///
+/// A batch still holding its call on the socket is parked by this, as
+/// [`suspend`] parks a call. One that had already parked keeps the park it
+/// has, so the turn is parked once.
+///
+/// Fails, writing nothing, when the row is no longer the batch's pending
+/// wait: a stop cancelled it, or its own resolver claimed it first.
+pub(crate) async fn take_over_run_batch(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    batch: &Record,
+    condition: Condition,
+    deadline: Option<i64>,
+) -> Result<Record, String> {
+    if !matches!(batch.condition, Condition::RunBatch { .. }) {
+        log::warn!(
+            "refusing to take over wait {} of run {}: it is not a run batch",
+            batch.id,
+            batch.run_id
+        );
+        return Err(SUSPENSION_UNAVAILABLE.to_string());
+    }
+    let record = Record {
+        condition,
+        deadline,
+        created: chrono::Utc::now().timestamp_millis(),
+        ..batch.clone()
+    };
+    let goal_pause = pause_goal_for_park(orch, &record)?;
+    let converted = convert_run_batch(db, &record).await;
+    let (yielded, parks) = settle_goal_pause(orch, &record, goal_pause, converted)?;
+    if parks {
+        // Nothing awaits this park: the continuation's scheduler is what
+        // holds its first transition back.
+        let _ = finish_park(orch, db, &record, yielded).await;
+    }
+    Ok(record)
+}
+
+/// The write half of [`take_over_run_batch`]: rewrite the batch's pending row
+/// as `r`, and yield its turn when the batch was still holding the call.
+/// Reports whether the turn yielded here and whether the call still has its
+/// park to schedule (it does only when it was held).
+async fn convert_run_batch(db: &LocalDb, r: &Record) -> Result<(bool, bool), String> {
+    let run_id = r.run_id.clone();
+    let r = r.clone();
+    db.write(|c| {
+        let r = r.clone();
+        Box::pin(async move {
+            // Closed before the writes below touch the same table.
+            let held = {
+                let mut rows = c
+                    .query(
+                        "SELECT hold FROM agent_waits WHERE id=?1 AND run_id=?2 AND tool_use_id=?3 \
+                         AND predecessor_turn_id=?4 AND kind='run_batch' AND state='pending'",
+                        params![
+                            r.id.as_str(),
+                            r.run_id.as_str(),
+                            r.tool_use_id.as_str(),
+                            r.turn_id.as_str()
+                        ],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Err(DbError::internal(
+                        "the row is no longer this batch's pending wait",
+                    ));
+                };
+                row.opt_text(0)?.is_some()
+            };
+            let columns =
+                ConditionColumns::of(&r.condition, r.deadline).map_err(DbError::internal)?;
+            c.execute(
+                STORE_CONDITION_SQL,
+                params![
+                    r.id.as_str(),
+                    columns.json.as_str(),
+                    r.deadline,
+                    columns.kind,
+                    columns.due_at_ms,
+                    columns.next_poll_at_ms,
+                    columns.pending_prompt_id.as_deref()
+                ],
+            )
+            .await?;
+            c.execute(
+                "UPDATE agent_waits SET hold=NULL,created_at=?2 WHERE id=?1",
+                params![r.id.as_str(), r.created],
+            )
+            .await?;
+            if !held {
+                return Ok((false, false));
+            }
+            let yielded = yield_turn_for_host(c, &r.turn_id, TurnYieldReason::Wait)
+                .await
+                .map_err(|e| DbError::internal(e.to_string()))?;
+            Ok((yielded, true))
+        })
+    })
+    .await
+    .map_err(|error| {
+        log::warn!("converting run batch wait for run {run_id} failed: {error}");
+        SUSPENSION_UNAVAILABLE.to_string()
+    })
 }
 
 /// The tail every park shares once its row is pending and its turn yielded:
@@ -1888,11 +2011,18 @@ async fn resume_prompt_for_turn(db: &LocalDb, r: &Record, driver_result: &str) -
 /// cannot happen in practice -- a row only leaves the active set with its
 /// resolution written, and an active sibling would have won the election -- and
 /// if it somehow did, degrading to this call's own result beats emitting a
-/// section that answers nothing.
+/// section that answers nothing. So is a row whose resolution answers nothing
+/// on resume: a held call that already answered on its own socket
+/// ([`DELIVERED_INLINE_OUTCOME`]), and a row that handed its call over to an
+/// inner wait ([`TRANSFERRED_OUTCOME`]), whose own row answers that call.
 fn compose_resume_prompt(calls: &[ParkedCall], driver_result: &str) -> String {
     let answered: Vec<&ParkedCall> = calls
         .iter()
-        .filter(|call| call.resolution.is_some())
+        .filter(|call| {
+            call.resolution.as_deref().is_some_and(|resolution| {
+                resolution != TRANSFERRED_OUTCOME && resolution != DELIVERED_INLINE_OUTCOME
+            })
+        })
         .collect();
     if answered.len() < 2 {
         return driver_result.to_string();
@@ -7517,6 +7647,157 @@ mod tests {
                 "missing {expected} in:\n{prompt}"
             );
         }
+    }
+
+    /// A batch row whose call a permission request took over answers nothing
+    /// itself, so a sibling's result resumes the turn verbatim rather than as
+    /// one of two labeled sections.
+    #[test]
+    fn a_call_handed_over_to_an_inner_wait_is_left_out_of_the_prompt() {
+        let calls = vec![
+            parked(
+                run_batch_condition(false, None),
+                "tool-1",
+                Some(TRANSFERRED_OUTCOME),
+            ),
+            parked(Condition::Duration, "tool-2", Some(ELAPSED)),
+        ];
+        assert_eq!(compose_resume_prompt(&calls, ELAPSED), ELAPSED);
+    }
+
+    /// A held call that answered on its own socket earlier in the turn has
+    /// already been read by the agent, so it is no section of the resume.
+    #[test]
+    fn a_call_that_answered_inline_is_left_out_of_the_prompt() {
+        let calls = vec![
+            parked(
+                run_batch_condition(false, Some("cargo test")),
+                "tool-1",
+                Some(DELIVERED_INLINE_OUTCOME),
+            ),
+            parked(
+                run_batch_condition(false, Some("cargo build")),
+                "tool-2",
+                Some(DELIVERED_INLINE_OUTCOME),
+            ),
+            parked(Condition::Duration, "tool-3", Some(ELAPSED)),
+        ];
+        assert_eq!(compose_resume_prompt(&calls, ELAPSED), ELAPSED);
+    }
+
+    /// The row a batch's call is parked or held on, as it stands now.
+    async fn wait_shape(orch: &Orchestrator) -> Vec<(String, String, String, Option<String>, i64)> {
+        orch.db
+            .local
+            .query_all(
+                "SELECT id, state, kind, hold, created_at FROM agent_waits WHERE run_id='run-1' AND tool_use_id='tool-1'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.opt_text(3)?, row.i64(4)?)),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A takeover turns the batch's own row into the continuation: still the
+    /// call's one row, under the same id, now pending as an MCP continuation
+    /// with its hold cleared and its age restarted. From a parked batch it
+    /// keeps the park the call already has; from a held one it is what parks
+    /// the call.
+    #[tokio::test]
+    async fn a_takeover_turns_the_batch_row_into_the_continuation_and_parks_it_once() {
+        for held in [false, true] {
+            let (orch, base, emitter) = durable_env_capturing().await;
+            let batch = Record {
+                created: base.created - 60_000,
+                ..run_batch_record(&base, false)
+            };
+            if held {
+                insert_as(&orch.db.local, &batch, Establish::Hold)
+                    .await
+                    .unwrap();
+            } else {
+                insert(&orch.db.local, &batch).await.unwrap();
+            }
+            assert_eq!(
+                turn_state_of(&orch, "pred-turn").await,
+                if held { "running" } else { "yielded" }
+            );
+            let announced = turn_changes(&emitter).len();
+
+            let record = take_over_run_batch(
+                &orch,
+                &orch.db.local,
+                &batch,
+                Condition::McpContinuation { state: mcp_state() },
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(record.id, batch.id);
+            let rows = wait_shape(&orch).await;
+            assert_eq!(rows.len(), 1, "the call still has one row: {rows:?}");
+            let (id, state, kind, hold, created) = rows.into_iter().next().unwrap();
+            assert_eq!(
+                (id.as_str(), state.as_str(), kind.as_str(), hold),
+                (batch.id.as_str(), "pending", "mcp_continuation", None)
+            );
+            assert_eq!(
+                created, record.created,
+                "its age restarts with the condition"
+            );
+            assert!(created > batch.created);
+            assert!(
+                super::super::mcp_continuation::load(&orch.db.local, &batch.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(turn_state_of(&orch, "pred-turn").await, "yielded");
+            assert_eq!(
+                turn_changes(&emitter).len(),
+                announced + usize::from(held),
+                "only a held call's turn yields in the takeover (held: {held})"
+            );
+        }
+    }
+
+    /// A takeover lands only while the row is still the batch's pending wait.
+    /// Once a stop has cancelled it nothing is converted and nothing written.
+    #[tokio::test]
+    async fn a_takeover_of_a_cancelled_batch_row_writes_nothing() {
+        let (orch, base, _) = durable_env().await;
+        let batch = run_batch_record(&base, false);
+        insert(&orch.db.local, &batch).await.unwrap();
+        orch.db
+            .local
+            .execute(
+                "UPDATE agent_waits SET state='cancelled' WHERE id='wait-1'",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let Err(error) = take_over_run_batch(
+            &orch,
+            &orch.db.local,
+            &batch,
+            Condition::McpContinuation { state: mcp_state() },
+            None,
+        )
+        .await
+        else {
+            panic!("a cancelled batch row handed its call over");
+        };
+
+        assert_eq!(error, SUSPENSION_UNAVAILABLE);
+        let rows = wait_shape(&orch).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].1.as_str(), rows[0].2.as_str()),
+            ("cancelled", "run_batch"),
+            "the cancelled row is untouched"
+        );
     }
 
     /// A row with no recorded result answers nothing, so it must not become a

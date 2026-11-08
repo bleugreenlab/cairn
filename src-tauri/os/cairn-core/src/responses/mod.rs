@@ -991,6 +991,9 @@ fn completion_executor(orch: &Orchestrator) -> CompletionExecutor {
                 crate::backends::launch::LaunchError::Unserved(refusal) => {
                     ResponseError::Unserved(refusal.to_string()).into()
                 }
+                crate::backends::launch::LaunchError::Retention(refusal) => {
+                    ResponseError::Unserved(refusal).into()
+                }
                 crate::backends::launch::LaunchError::Completion(failure) => AttemptFailure {
                     error: map_completion_error(failure.error),
                     account_id: failure.account_id,
@@ -1084,6 +1087,9 @@ async fn complete_definition_with_executor(
         options: extras,
         output_schema: output_schema.clone(),
         timeout: definition.timeout,
+        // A named response states no requirements of its own; the workspace's
+        // OpenRouter floor still applies at the launch gate.
+        requirements: Default::default(),
     };
     Ok(execute_completion(
         orch,

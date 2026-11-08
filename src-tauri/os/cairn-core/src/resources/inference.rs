@@ -1322,6 +1322,7 @@ machines:
         view.models = ModelsView {
             now: NOW,
             passed_at: NOW,
+            routes: BTreeMap::new(),
             pools: vec![PoolView {
                 key: "sp1+sp2".into(),
                 members: vec![member("sp1"), member("sp2")],

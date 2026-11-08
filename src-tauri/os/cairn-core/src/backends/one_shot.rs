@@ -100,6 +100,7 @@ mod tests {
             options: Default::default(),
             output_schema: None,
             timeout: Duration::from_secs(secs),
+            requirements: Default::default(),
         };
         assert_eq!(one_shot_timeout(&request(15)), Duration::from_secs(30));
         assert_eq!(one_shot_timeout(&request(90)), Duration::from_secs(90));

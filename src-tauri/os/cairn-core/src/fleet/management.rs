@@ -29,13 +29,9 @@
 //!   reach the host is — so a removal that cannot obtain that verdict refuses
 //!   rather than assuming the machine it cannot see is not there.
 //!
-//! Authorization belongs to each caller's own boundary, not to this module.
-//! `/api/invoke` carries a person, so it requires an owner or admin. The MCP
-//! callback carries a machine: it authenticates with the runner's own local
-//! secret, and anything holding that secret can already run arbitrary commands
-//! on this host through `run` — strictly more than enrolling an SSH executor.
-//! A second gate there would refuse nothing it has not already granted, so
-//! there isn't one.
+//! Credential verification belongs to each caller's boundary. Drain ownership
+//! and removal exceptions additionally require the typed actors derived here;
+//! an anonymous installation's fleet-management gate grants neither authority.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -43,6 +39,8 @@ use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use cairn_common::executor_protocol::{executor_names_match, ExecutorRuntimePolicy};
+pub use cairn_config::drain::RemovalApplication;
+use cairn_db::storage::RowExt;
 use cairn_uri::normalize_executor_name;
 use serde::{Deserialize, Serialize};
 
@@ -172,6 +170,7 @@ pub trait RemoteExecutorLifecycle: Send + Sync {
         &self,
         executor_id: &str,
         acknowledged: bool,
+        removal: &cairn_config::drain::RemovalApplication,
     ) -> Result<RemoteExecutorMutationResult, String>;
 
     /// Give an enrolled machine a different public address.
@@ -1089,13 +1088,54 @@ pub async fn remove(
     orch: &Orchestrator,
     reference: &str,
     acknowledged: bool,
-) -> Result<RemoteExecutorMutationResult, String> {
+    actor: &RemovalActor,
+    operation_id: Option<&str>,
+) -> Result<RemovalOutcome, String> {
+    let operation_id = operation_id.filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "removal requires a caller-retained operationId; reuse it with the stable executor ID after an ambiguous failure".to_string())?
+        .to_owned();
+    let install_id = orch.anon_device_manager.device_id().to_string();
+    // Read a receipt before resolving inventory: the machine may no longer be
+    // enrolled, or its former public name may now name a different machine.
+    let replay = mutate_fleet(orch, |config| {
+        if let Some(receipt) = config.drains.removal_receipts().get(&operation_id) {
+            if receipt.application.install_id != install_id
+                || receipt.application.frozen.acting_principal != actor.principal
+                || (!actor.operator && !receipt.application.frozen.removed.is_empty())
+            {
+                return Err("removal operation identity collision or unproven replay".into());
+            }
+            if reference != receipt.application.frozen.executor_id {
+                return Err(
+                    "replay removal with its frozen stable executor ID, not a mutable public name"
+                        .into(),
+                );
+            }
+            return Ok(Some(receipt.clone()));
+        }
+        Ok(None)
+    })?;
+    if let Some(receipt) = replay {
+        return Ok(RemovalOutcome {
+            result: RemoteExecutorMutationResult {
+                config: None,
+                display_name: reference.into(),
+                os: None,
+                arch: None,
+                attach_state:
+                    "removed (reconciled from durable removal receipt; no effect repeated)".into(),
+                left_on_host: None,
+            },
+            receipt: Some(receipt),
+            replayed: true,
+        });
+    }
     let executor_id = resolve_executor_reference(orch, reference)?;
     let name = public_name(orch, &executor_id);
     refuse_removal_while_occupied(orch, &executor_id, &name, acknowledged)?;
-    let configured = crate::config::settings::load_fleet(&orch.config_dir)
-        .remote_executors
-        .contains_key(&executor_id);
+    let configured = mutate_fleet(orch, |config| {
+        Ok(config.remote_executors.contains_key(&executor_id))
+    })?;
     let attached = orch
         .fleet
         .inspect_executors(unix_time_ms())
@@ -1143,7 +1183,7 @@ pub async fn remove(
         )
         .await;
         let _ = orch.services.emitter.emit_empty(ENROLLMENT_CHANGED_EVENT);
-        return Ok(RemoteExecutorMutationResult {
+        return Ok(RemovalOutcome { result: RemoteExecutorMutationResult {
             config: None,
             display_name: operation.name,
             os: None,
@@ -1155,13 +1195,24 @@ pub async fn remove(
             }
             .into(),
             left_on_host: None,
-        });
+        }, receipt: None, replayed: false });
     }
+    let removal = mutate_fleet(orch, |config| {
+        if !actor.operator && !config.drains.records(&executor_id).is_empty() {
+            return Err("removal without a credential-proven operator cannot clear drains; clear each thread entry through its owner, release runtime tokens exactly, and use accepted lift_drain, the operator's legacy clear, or credential-proven same-principal removal for operator records".into());
+        }
+        Ok(RemovalApplication {
+            install_id,
+            operation_id,
+            provenance: actor.provenance.clone(),
+            frozen: config.prepare_removal(&executor_id, &actor.principal)?,
+        })
+    })?;
     let result = orch
         .fleet
         .management()
         .lifecycle()?
-        .remove(&executor_id, acknowledged)
+        .remove(&executor_id, acknowledged, &removal)
         .await?;
     orch.fleet
         .management()
@@ -1177,7 +1228,29 @@ pub async fn remove(
     )
     .await;
     let _ = orch.services.emitter.emit_empty(ENROLLMENT_CHANGED_EVENT);
-    Ok(result)
+    let receipt = mutate_fleet(orch, |config| {
+        config
+            .drains
+            .removal_receipts()
+            .get(&removal.operation_id)
+            .cloned()
+            .ok_or_else(|| "removal completed without a durable application receipt".to_string())
+    })?;
+    Ok(RemovalOutcome {
+        result,
+        receipt: Some(receipt),
+        replayed: false,
+    })
+}
+
+/// A removal's durable evidence is distinct from accepted-request evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovalOutcome {
+    #[serde(flatten)]
+    pub result: RemoteExecutorMutationResult,
+    pub receipt: Option<cairn_config::drain::RemovalReceipt>,
+    pub replayed: bool,
 }
 
 /// Apply a runtime policy to a machine, persisting it and applying it live.
@@ -1381,42 +1454,338 @@ pub async fn set_runtime_policy(
     }
 }
 
-/// Turn draining on or off. This is what disabling a machine means: the runner
-/// refuses to place new work there and leaves what is already on it alone.
-///
-/// Durable and unfenced, and both properties are the point. It is persisted, so
-/// a reconnect or a runner restart keeps it and the machine is not re-admitted
-/// the moment it comes back. It takes no expected generation and does not
-/// require a live link, because a drain is this runner's own refusal rather
-/// than a setting on the machine — and the moment an operator reaches for it is
-/// the moment the machine has usually stopped answering (CAIRN-4360).
-///
-/// The settings write happens first, so what survives a restart is what the
-/// operator asked for. Telling the machine is best effort and reported.
-pub async fn set_drain_mode(
+/// Credential-proven operator attribution, constructed only at a verified door.
+/// A session token, page, or agent appearance is not operator authority.
+#[derive(Debug, Clone)]
+pub struct ProvenOperator {
+    principal: cairn_common::identity::PrincipalRef,
+    provenance: String,
+}
+
+impl ProvenOperator {
+    pub fn from_appearance(
+        appearance: cairn_common::identity::AppearanceSnapshot,
+    ) -> Result<Self, String> {
+        use cairn_common::identity::{AppearanceTransport, VerificationMethod, VerificationStatus};
+        appearance.validate().map_err(|error| error.to_string())?;
+        let evidence = appearance.evidence();
+        let verification = &evidence.verification;
+        let proven = verification.status() == VerificationStatus::Verified
+            && match evidence.transport {
+                AppearanceTransport::AuthenticatedOperator => {
+                    verification.method() == VerificationMethod::JwtOperator
+                }
+                AppearanceTransport::AuthenticatedDesktop => {
+                    verification.method() == VerificationMethod::DesktopCredential
+                        && verification.credential_ref().map(|value| value.as_str())
+                            == Some("desktop_operator_credential")
+                }
+                _ => false,
+            };
+        if !proven {
+            return Err("drain management requires a credential-proven operator; an ordinary runner session is not operator authority".into());
+        }
+        Ok(Self {
+            principal: appearance.principal().clone(),
+            provenance: serde_json::to_string(&appearance).map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+/// Removal authority cannot be supplied as JSON or inferred from a missing run.
+pub struct RemovalActor {
+    principal: cairn_common::identity::PrincipalRef,
+    provenance: String,
+    operator: bool,
+}
+impl From<&ProvenOperator> for RemovalActor {
+    fn from(actor: &ProvenOperator) -> Self {
+        Self {
+            principal: actor.principal.clone(),
+            provenance: actor.provenance.clone(),
+            operator: true,
+        }
+    }
+}
+impl RemovalActor {
+    /// A caller the fleet gate admits but that proves no operator credential:
+    /// on a no-JWT install, the runner's ordinary session token or any local
+    /// process that can reach the invoke route, agents included. Removing an
+    /// undrained machine is fleet management and stays open to it; clearing a
+    /// drain is not, so this actor never takes the same-principal exception and
+    /// never replays a receipt that cleared one. The appearance is recorded as
+    /// presented, so its receipt cannot later read as operator proof.
+    pub fn unproven(
+        appearance: cairn_common::identity::AppearanceSnapshot,
+    ) -> Result<Self, String> {
+        appearance.validate().map_err(|error| error.to_string())?;
+        Ok(Self {
+            principal: appearance.principal().clone(),
+            provenance: serde_json::to_string(&appearance).map_err(|error| error.to_string())?,
+            operator: false,
+        })
+    }
+}
+impl From<&ThreadDrainActor> for RemovalActor {
+    fn from(actor: &ThreadDrainActor) -> Self {
+        Self {
+            principal: actor.principal.clone(),
+            provenance: "authenticated thread run; no operator clear authority".into(),
+            operator: false,
+        }
+    }
+}
+
+/// A run's authenticated ancestry, not an owner supplied in a write payload.
+pub struct ThreadDrainActor {
+    thread_id: String,
+    principal: cairn_common::identity::PrincipalRef,
+}
+
+pub async fn thread_drain_actor(
+    orch: &Orchestrator,
+    request: &crate::mcp::types::McpCallbackRequest,
+) -> Result<ThreadDrainActor, String> {
+    if request.origin.is_some()
+        || request.run_id.as_deref().is_none_or(str::is_empty)
+        || request
+            .run_id
+            .as_deref()
+            .is_some_and(|run| orch.project_services.runs.get(run).is_some())
+    {
+        return Err("drain writes require an authenticated thread run; page, service and runless calls cannot own a drain".into());
+    }
+    let (context, db) =
+        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
+    let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request).await?;
+    let thread_id = owning_drain_thread(&db, &context.job_id).await?;
+    let (principal, _) = agent.appearance(drain_timestamp_ms(orch.services.clock.now())?)?;
+    Ok(ThreadDrainActor {
+        thread_id,
+        principal,
+    })
+}
+
+async fn owning_drain_thread(
+    db: &cairn_db::storage::LocalDb,
+    job_id: &str,
+) -> Result<String, String> {
+    // Walk in nearest-parent order and refuse cycles rather than selecting an
+    // arbitrary thread from an invalid ancestry graph.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor = Some(job_id.to_owned());
+    let mut nearest_issue = None;
+    while let Some(id) = cursor {
+        if !seen.insert(id.clone()) {
+            return Err("cyclic job ancestry cannot establish a drain owner".into());
+        }
+        let row = db
+            .query_opt(
+                "SELECT thread_id,parent_job_id,issue_id,agent_config_id FROM jobs WHERE id=?1",
+                (id,),
+                |row| {
+                    Ok((
+                        row.opt_text(0)?,
+                        row.opt_text(1)?,
+                        row.opt_text(2)?,
+                        row.opt_text(3)?,
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "job ancestry is missing; no drain owner can be established".to_string()
+            })?;
+        if matches!(row.3.as_deref(), Some("service" | "action")) {
+            return Err("a service or its delegated jobs cannot own a thread drain".into());
+        }
+        if let Some(thread) = row.0 {
+            return Ok(thread);
+        }
+        if nearest_issue.is_none() {
+            nearest_issue = row.2;
+        }
+        cursor = row.1;
+    }
+    // Issue-backed runs do not necessarily carry jobs.thread_id. As with
+    // operator-request attribution, use the nearest job's issue ancestry only
+    // when no job in the delegation chain directly owns a thread.
+    let mut seen_issues = std::collections::BTreeSet::new();
+    let mut issue = nearest_issue;
+    while let Some(id) = issue {
+        if !seen_issues.insert(id.clone()) {
+            return Err("cyclic issue ancestry cannot establish a drain owner".into());
+        }
+        let (thread, parent) = db
+            .query_opt(
+                "SELECT parent_thread_id,parent_issue_id FROM issues WHERE id=?1",
+                (id,),
+                |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "issue ancestry is missing; no drain owner can be established".to_string()
+            })?;
+        if let Some(thread) = thread {
+            return Ok(thread);
+        }
+        issue = parent;
+    }
+    Err("this authenticated run has no owning thread; no drain changed".into())
+}
+
+fn drain_timestamp_ms(seconds: i64) -> Result<i64, String> {
+    seconds
+        .checked_mul(1_000)
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| "drain timestamp is outside the supported Unix millisecond range".into())
+}
+
+fn drain_reason(reason: Option<&str>) -> Result<&str, String> {
+    match reason {
+        None => Ok("no reason supplied"),
+        Some(reason) if reason.trim().is_empty() => {
+            Err("a supplied drain reason must not be empty".into())
+        }
+        Some(reason) => Ok(reason),
+    }
+}
+
+pub async fn set_thread_drain(
     orch: &Orchestrator,
     reference: &str,
     enabled: bool,
+    reason: Option<&str>,
+    request: &crate::mcp::types::McpCallbackRequest,
+) -> Result<DrainOutcome, String> {
+    let actor = thread_drain_actor(orch, request).await?;
+    let executor_id = resolve_executor_reference(orch, reference)?;
+    let reason = drain_reason(reason)?;
+    let (before, remaining) = mutate_fleet(orch, |config| {
+        let before = config.drains.records(&executor_id);
+        if enabled {
+            config.drains.impose_thread(
+                &executor_id,
+                &actor.thread_id,
+                &actor.principal,
+                reason,
+                drain_timestamp_ms(orch.services.clock.now())?,
+            )?;
+        } else {
+            config.drains.clear_thread(&executor_id, &actor.thread_id)?;
+        }
+        Ok((before, config.drains.records(&executor_id)))
+    })?;
+    Ok(drain_outcome(orch, &executor_id, before, remaining))
+}
+
+pub async fn set_operator_drain(
+    orch: &Orchestrator,
+    reference: &str,
+    enabled: bool,
+    reason: Option<&str>,
+    actor: &ProvenOperator,
 ) -> Result<DrainOutcome, String> {
     let executor_id = resolve_executor_reference(orch, reference)?;
-    let mut config = crate::config::settings::load_fleet(&orch.config_dir);
-    if config.set_machine_drained(&executor_id, enabled) {
-        crate::config::settings::set_fleet(&orch.config_dir, &config)?;
-    }
-    let application = orch
-        .fleet
-        .set_executor_drain_mode(&executor_id, enabled)
-        .await;
-    Ok(DrainOutcome {
-        name: public_name(orch, &executor_id),
-        enabled,
-        application,
-        residents: if enabled {
-            orch.fleet.drain_residents(&executor_id)
+    let reason = drain_reason(reason)?;
+    let (before, remaining) = mutate_fleet(orch, |config| {
+        let before = config.drains.records(&executor_id);
+        if enabled {
+            config.drains.impose_operator(
+                &executor_id,
+                &actor.principal,
+                reason,
+                drain_timestamp_ms(orch.services.clock.now())?,
+            )?;
         } else {
-            None
-        },
+            if before
+                .iter()
+                .any(|record| record.owner == cairn_config::drain::DrainOwner::Operator)
+            {
+                return Err("the operator drain requires an accepted lift_drain request; file and accept lift_drain rather than enabled:false".into());
+            }
+            config.drains.clear_legacy_operator(&executor_id)?;
+        }
+        Ok((before, config.drains.records(&executor_id)))
+    })?;
+    Ok(drain_outcome(orch, &executor_id, before, remaining))
+}
+
+/// Clear only imported legacy provenance, never a standing attributed owner.
+pub fn clear_operator_legacy_drain(
+    orch: &Orchestrator,
+    reference: &str,
+    _actor: &ProvenOperator,
+) -> Result<DrainOutcome, String> {
+    let executor_id = resolve_executor_reference(orch, reference)?;
+    let (before, remaining) = mutate_fleet(orch, |config| {
+        let before = config.drains.records(&executor_id);
+        config.drains.clear_legacy_operator(&executor_id)?;
+        Ok((before, config.drains.records(&executor_id)))
+    })?;
+    Ok(drain_outcome(orch, &executor_id, before, remaining))
+}
+
+/// Persist a runtime hold before the caller directs an executor to change build.
+pub fn impose_runtime_drain(
+    orch: &Orchestrator,
+    reference: &str,
+    context: cairn_config::drain::RuntimeDrainContext,
+    reason: Option<&str>,
+) -> Result<cairn_config::drain::RuntimeDrainToken, String> {
+    let executor_id = resolve_executor_reference(orch, reference)?;
+    let reason = drain_reason(reason)?;
+    let principal = cairn_common::identity::PrincipalRef::Machine {
+        device_id: orch.anon_device_manager.device_id().to_string(),
+    };
+    mutate_fleet(orch, |config| {
+        config.drains.impose_runtime(
+            &executor_id,
+            context,
+            &principal,
+            reason,
+            drain_timestamp_ms(orch.services.clock.now())?,
+        )
     })
+}
+
+/// A runtime's exact generation can be released despite another owner's edits.
+pub fn release_runtime_drain(
+    orch: &Orchestrator,
+    token: &cairn_config::drain::RuntimeDrainToken,
+) -> Result<bool, String> {
+    mutate_fleet(orch, |config| config.drains.release_runtime(token))
+}
+
+fn drain_outcome(
+    orch: &Orchestrator,
+    executor_id: &str,
+    before: Vec<cairn_config::drain::DrainRecord>,
+    remaining: Vec<cairn_config::drain::DrainRecord>,
+) -> DrainOutcome {
+    let blockers = orch.fleet.drain_blockers(executor_id);
+    let enabled = !blockers.is_empty();
+    let changed_records = before
+        .iter()
+        .filter(|record| !remaining.contains(record))
+        .chain(remaining.iter().filter(|record| !before.contains(record)))
+        .cloned()
+        .collect();
+    DrainOutcome {
+        name: public_name(orch, executor_id),
+        enabled,
+        effective_effect: crate::fleet::drain_projection::effective_effect(&blockers),
+        changed_records,
+        remaining_records: remaining,
+        // Publication enqueues the effective wire state synchronously. It does
+        // not wait for a network acknowledgement under the settings lock.
+        application: crate::fleet::DrainApplication::Published,
+        residents: enabled
+            .then(|| orch.fleet.drain_residents(executor_id))
+            .flatten(),
+    }
 }
 
 /// What a drain write did: the durable state it recorded, and whether the
@@ -1426,6 +1795,12 @@ pub async fn set_drain_mode(
 pub struct DrainOutcome {
     pub name: String,
     pub enabled: bool,
+    /// The strictest effect among every standing hold, other owners and
+    /// fences included; absent when nothing stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_effect: Option<cairn_common::executor_protocol::ExecutorDrainAdmissionEffect>,
+    pub changed_records: Vec<cairn_config::drain::DrainRecord>,
+    pub remaining_records: Vec<cairn_config::drain::DrainRecord>,
     #[serde(flatten)]
     pub application: crate::fleet::DrainApplication,
     /// What the drain keeps on the machine, from its last snapshot. Present
@@ -1439,24 +1814,41 @@ impl DrainOutcome {
     /// A few sentences for a person or an agent: what now holds, what the
     /// machine knows about it, and what the drain keeps there.
     pub fn summary(&self) -> String {
-        let held = if self.enabled {
-            format!(
-                "{} is draining: new work is refused, including the next batch of a job whose environment is already there, and live resident work is left alone. It stays drained across reconnects and runner restarts until it is cleared",
-                self.name
-            )
-        } else {
+        use cairn_common::executor_protocol::ExecutorDrainAdmissionEffect;
+        // Only holds refusing new environments stand, such as a self-update:
+        // a resident job's next batch is still admitted there.
+        let environments_only =
+            self.effective_effect == Some(ExecutorDrainAdmissionEffect::RefuseNewEnvironments);
+        let held = if !self.enabled {
             format!(
                 "{} is no longer draining; new work is admitted again",
                 self.name
             )
+        } else if environments_only {
+            format!(
+                "{} still refuses new environments: only a runtime hold stands, such as a self-update, so work that needs a new environment there is refused while the next batch of a job whose environment is already there is admitted, and live resident work is left alone. It lifts when its runtime owner releases it",
+                self.name
+            )
+        } else {
+            format!(
+                "{} is draining: new work is refused, including the next batch of a job whose environment is already there, and live resident work is left alone. It stays drained across reconnects and runner restarts until it is cleared",
+                self.name
+            )
         };
         let mut text = match &self.application {
+            crate::fleet::DrainApplication::Published => format!("{held}. Committed state published; machine acknowledgment was not awaited."),
             crate::fleet::DrainApplication::Applied => format!("{held}."),
             crate::fleet::DrainApplication::HeldWithoutMachine { reason } => format!(
                 "{held}. The machine was not told because {reason}; the runner is holding this itself and will tell it when it attaches."
             ),
         };
-        if let Some(residents) = self.residents.as_ref().filter(|_| self.enabled) {
+        // The account says idle environments are released at their job's next
+        // batch, which a hold admitting resident work does not do.
+        if let Some(residents) = self
+            .residents
+            .as_ref()
+            .filter(|_| self.enabled && !environments_only)
+        {
             text.push(' ');
             text.push_str(&residents.account());
         }
@@ -1702,7 +2094,8 @@ pub fn mutate_fleet<T>(
     mutate: impl FnOnce(&mut FleetConfig) -> Result<T, String>,
 ) -> Result<T, String> {
     crate::config::settings::mutate_fleet(&orch.config_dir, mutate, |config| {
-        orch.fleet.hydrate_machine_roles(config.role_executor_ids())
+        orch.fleet.hydrate_machine_roles(config.role_executor_ids());
+        orch.fleet.publish_drain_projection(config);
     })
 }
 
@@ -2009,6 +2402,514 @@ mod tests {
         .build()
     }
 
+    #[test]
+    fn drain_timestamps_are_checked_unix_milliseconds() {
+        assert_eq!(
+            drain_timestamp_ms(1_700_000_001).unwrap(),
+            1_700_000_001_000
+        );
+        assert_eq!(drain_timestamp_ms(0).unwrap(), 0);
+        assert!(drain_timestamp_ms(-1).is_err());
+        assert!(drain_timestamp_ms(i64::MAX).is_err());
+    }
+
+    fn drain_test_operator(device_id: &str, credential: &str) -> Result<ProvenOperator, String> {
+        use cairn_common::identity::*;
+        let principal = PrincipalRef::Machine {
+            device_id: device_id.into(),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::DesktopCredential,
+            VerificationStatus::Verified,
+            None,
+            None,
+            None,
+            Some(CredentialRef::new(credential).unwrap()),
+            VerificationStrength::new("local_shared_secret").unwrap(),
+            1,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::AuthenticatedDesktop,
+            Address::Desktop {
+                device_id: device_id.into(),
+            },
+            verification,
+            1,
+            None,
+        )
+        .unwrap();
+        ProvenOperator::from_appearance(
+            AppearanceSnapshot::new(principal, evidence, vec![], None).unwrap(),
+        )
+    }
+
+    async fn seed_drain_threads(orch: &Orchestrator) {
+        orch.db.local.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('dw','Drain tests',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('dp','dw','Drain tests','drains','/tmp/drains',1,1);
+             INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('ta','dp','alpha','active','none',1,1),('tb','dp','beta','active','none',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,node_name,agent_config_id,status,created_at,updated_at,uri_segment) VALUES('ja','ta','dp','thread','thread','running',1,1,'thread'),('jb','tb','dp','thread','thread','running',1,1,'thread');
+             INSERT INTO jobs(id,parent_job_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES('child','ja','dp','task','running',1,1,'child'),('grandchild','child','dp','task','running',1,1,'grandchild');
+             INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at) VALUES('ra','dp','ja','live',1,1),('rb','dp','jb','live',1,1);"
+        ).await.unwrap();
+    }
+
+    fn drain_request(run: &str) -> crate::mcp::types::McpCallbackRequest {
+        crate::mcp::types::McpCallbackRequest {
+            run_id: Some(run.into()),
+            tool: "write".into(),
+            // Payload identity is deliberately irrelevant.
+            payload: serde_json::json!({"owner":"operator","threadId":"tb"}),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trusted_drains_ordinary_runner_credential_is_not_operator_authority() {
+        assert!(drain_test_operator("desktop", "desktop_operator_credential").is_ok());
+        assert!(drain_test_operator("desktop", "runner_session_token").is_err());
+        assert_eq!(drain_reason(None).unwrap(), "no reason supplied");
+        assert!(drain_reason(Some("  ")).is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_thread_clear_preserves_operator_and_other_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        seed_drain_threads(&orch).await;
+        let (sender, _link) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        let imposed = set_operator_drain(&orch, "local", true, None, &operator)
+            .await
+            .unwrap();
+        assert_eq!(imposed.remaining_records[0].reason, "no reason supplied");
+        set_thread_drain(
+            &orch,
+            "local",
+            true,
+            Some("alpha hold"),
+            &drain_request("ra"),
+        )
+        .await
+        .unwrap();
+        set_thread_drain(
+            &orch,
+            "local",
+            true,
+            Some("beta hold"),
+            &drain_request("rb"),
+        )
+        .await
+        .unwrap();
+        let cleared = set_thread_drain(&orch, "local", false, None, &drain_request("ra"))
+            .await
+            .unwrap();
+        assert!(cleared.enabled);
+        assert_eq!(cleared.remaining_records.len(), 2);
+        assert_eq!(cleared.changed_records.len(), 1);
+        assert!(!cleared.summary().contains("new work is admitted again"));
+        assert!(cleared
+            .remaining_records
+            .iter()
+            .any(|record| record.owner == cairn_config::drain::DrainOwner::Operator));
+        assert!(cleared.remaining_records.iter().any(|record| record.owner
+            == cairn_config::drain::DrainOwner::Thread {
+                thread_id: "tb".into()
+            }));
+        let refusal = set_operator_drain(&orch, "local", false, None, &operator)
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("accepted lift_drain"), "{refusal}");
+        let stranger =
+            drain_test_operator("different-operator", "desktop_operator_credential").unwrap();
+        assert!(
+            set_operator_drain(&orch, "local", true, Some("takeover"), &stranger)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_ancestry_is_nearest_and_unattributed_calls_refuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        seed_drain_threads(&orch).await;
+        assert_eq!(
+            owning_drain_thread(&orch.db.local, "grandchild")
+                .await
+                .unwrap(),
+            "ta"
+        );
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET parent_job_id='grandchild',thread_id=NULL WHERE id='ja'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(owning_drain_thread(&orch.db.local, "grandchild")
+            .await
+            .unwrap_err()
+            .contains("cyclic"));
+        assert!(thread_drain_actor(&orch, &Default::default())
+            .await
+            .is_err());
+        let mut instrument = drain_request("rb");
+        instrument.origin = Some(cairn_common::protocol::DispatchOrigin::UnverifiedLocal);
+        assert!(thread_drain_actor(&orch, &instrument).await.is_err());
+        assert!(thread_drain_actor(&orch, &drain_request("not-a-run"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_issue_ancestry_resolves_delegated_jobs_and_refuses_parentless_or_cycles(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        seed_drain_threads(&orch).await;
+        orch.db.local.execute_script(
+            "INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at) VALUES('parent-issue','dp',1,'Parent','active','ta',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,parent_issue_id,created_at,updated_at) VALUES('nested-issue','dp',2,'Nested','active','parent-issue',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,node_name,status,created_at,updated_at) VALUES('issue-job','dp','nested-issue','builder','running',1,1);
+             INSERT INTO jobs(id,project_id,parent_job_id,node_name,status,created_at,updated_at) VALUES('issue-task','dp','issue-job','task','running',1,1),('ownerless','dp',NULL,'builder','running',1,1);"
+        ).await.unwrap();
+        assert_eq!(
+            owning_drain_thread(&orch.db.local, "issue-task")
+                .await
+                .unwrap(),
+            "ta"
+        );
+        assert!(owning_drain_thread(&orch.db.local, "ownerless")
+            .await
+            .is_err());
+        orch.db.local.execute("UPDATE issues SET parent_thread_id=NULL,parent_issue_id='nested-issue' WHERE id='parent-issue'", ()).await.unwrap();
+        assert!(owning_drain_thread(&orch.db.local, "issue-task")
+            .await
+            .unwrap_err()
+            .contains("cyclic issue"));
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_runtime_release_is_exact_and_does_not_clear_others() {
+        use cairn_config::drain::{AdmissionEffect, RuntimeDrainContext, RuntimeDrainKind};
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _link) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        set_operator_drain(&orch, "local", true, Some("operator hold"), &operator)
+            .await
+            .unwrap();
+        let context = RuntimeDrainContext {
+            kind: RuntimeDrainKind::SelfUpdate,
+            operation_id: "update".into(),
+            turn_id: "turn".into(),
+            runner_boot_id: "boot".into(),
+            admission_effect: AdmissionEffect::RefuseNewEnvironments,
+        };
+        let old = impose_runtime_drain(&orch, "local", context.clone(), Some("old runtime reason"))
+            .unwrap();
+        let current =
+            impose_runtime_drain(&orch, "local", context, Some("replacement runtime reason"))
+                .unwrap();
+        assert!(!release_runtime_drain(&orch, &old).unwrap());
+        mutate_fleet(&orch, |config| {
+            config.drains.impose_thread(
+                super::super::COLOCATED_EXECUTOR_ID,
+                "thread",
+                &operator.principal,
+                "other hold",
+                2,
+            )
+        })
+        .unwrap();
+        assert!(release_runtime_drain(&orch, &current).unwrap());
+        assert!(orch.fleet.is_drained(super::super::COLOCATED_EXECUTOR_ID));
+        assert_eq!(
+            crate::config::settings::load_fleet(temp.path())
+                .drains
+                .records(super::super::COLOCATED_EXECUTOR_ID)
+                .len(),
+            2
+        );
+    }
+
+    fn drain_remote_config() -> RemoteExecutorConfig {
+        RemoteExecutorConfig {
+            host: "remote-test.invalid".into(),
+            ssh_user: "test".into(),
+            platform: super::super::RemotePlatform::LinuxX86_64,
+            binary_path: "/tmp/cairn-exec".into(),
+            cairn_home: "/tmp/cairn-exec-home".into(),
+            executor_id: "remote-stable".into(),
+            device_id: "old-device".into(),
+            display_name: "remote-test".into(),
+            project_ids: Vec::new(),
+            bootstrapped_at_unix_ms: None,
+            legacy_retired_at_unix_ms: None,
+            legacy_tunnel_port: None,
+            extra_ssh_args: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_removal_ingress_replays_receipt_without_touching_reenrollment() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        let actor = RemovalActor::from(&operator);
+        let remote = drain_remote_config();
+        let id = remote.executor_id.clone();
+        let receipt = mutate_fleet(&orch, |config| {
+            config.remote_executors.insert(id.clone(), remote.clone());
+            config
+                .drains
+                .impose_operator(&id, &operator.principal, "old hold", 1)?;
+            let frozen = config.prepare_removal(&id, &operator.principal)?;
+            config.apply_removal(RemovalApplication {
+                install_id: orch.anon_device_manager.device_id().to_string(),
+                operation_id: "exact-removal".into(),
+                provenance: operator.provenance.clone(),
+                frozen,
+            })
+        })
+        .unwrap();
+        mutate_fleet(&orch, |config| {
+            let mut replacement = remote.clone();
+            replacement.device_id = "replacement-device".into();
+            config.remote_executors.insert(id.clone(), replacement);
+            config
+                .drains
+                .impose_operator(&id, &operator.principal, "replacement hold", 2)?;
+            Ok(())
+        })
+        .unwrap();
+        let before = crate::config::settings::load_fleet(temp.path());
+        // This is the same public entry used by invoke/resource callers. It
+        // must not need a lifecycle manager or rerun revocation after a crash.
+        let replay = remove(&orch, &id, true, &actor, Some("exact-removal"))
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.receipt, Some(receipt));
+        let after = crate::config::settings::load_fleet(temp.path());
+        assert_eq!(before.remote_executors, after.remote_executors);
+        assert_eq!(before.drains, after.drains);
+        assert!(
+            remove(&orch, "remote-test", true, &actor, Some("exact-removal"))
+                .await
+                .is_err(),
+            "a mutable public name cannot replay against a replacement"
+        );
+        assert!(remove(&orch, &id, true, &actor, None)
+            .await
+            .unwrap_err()
+            .contains("operationId"));
+        let unproven = RemovalActor {
+            principal: operator.principal.clone(),
+            provenance: "thread".into(),
+            operator: false,
+        };
+        assert!(
+            remove(&orch, &id, true, &unproven, Some("unproven-removal"))
+                .await
+                .unwrap_err()
+                .contains("cannot clear drains")
+        );
+    }
+
+    /// An unverified local call attributed to `device_id`: the same principal
+    /// the desktop operator carries, without its credential.
+    fn unproven_local_actor(device_id: &str) -> RemovalActor {
+        use cairn_common::identity::*;
+        let verification = VerificationRecord::new(
+            VerificationMethod::DesktopCredential,
+            VerificationStatus::None,
+            None,
+            None,
+            None,
+            None,
+            VerificationStrength::new("none").unwrap(),
+            1,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::LocalInvoke,
+            Address::None,
+            verification,
+            1,
+            None,
+        )
+        .unwrap();
+        RemovalActor::unproven(
+            AppearanceSnapshot::new(
+                PrincipalRef::Machine {
+                    device_id: device_id.into(),
+                },
+                evidence,
+                vec![],
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Sharing the operator's principal is not sharing its authority: an
+    /// unproven caller cannot take the same-principal exception, cannot replay
+    /// a receipt that cleared a drain, and still removes an undrained machine.
+    #[tokio::test]
+    async fn trusted_drains_unproven_removal_never_clears_or_replays_a_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        let unproven = unproven_local_actor("operator");
+        assert!(!unproven.operator);
+        assert_eq!(unproven.principal, operator.principal);
+        let remote = drain_remote_config();
+        let id = remote.executor_id.clone();
+        let install_id = orch.anon_device_manager.device_id().to_string();
+        let apply = |config: &mut FleetConfig, operation: &str| {
+            let frozen = config.prepare_removal(&id, &operator.principal)?;
+            config.apply_removal(RemovalApplication {
+                install_id: install_id.clone(),
+                operation_id: operation.into(),
+                provenance: operator.provenance.clone(),
+                frozen,
+            })
+        };
+        mutate_fleet(&orch, |config| {
+            config.remote_executors.insert(id.clone(), remote.clone());
+            config
+                .drains
+                .impose_operator(&id, &operator.principal, "old hold", 1)?;
+            apply(config, "cleared")?;
+            config.remote_executors.insert(id.clone(), remote.clone());
+            apply(config, "plain")?;
+            config.remote_executors.insert(id.clone(), remote.clone());
+            config
+                .drains
+                .impose_operator(&id, &operator.principal, "standing hold", 2)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(remove(&orch, &id, true, &unproven, Some("cleared"))
+            .await
+            .unwrap_err()
+            .contains("unproven replay"));
+        let plain = remove(&orch, &id, true, &unproven, Some("plain"))
+            .await
+            .unwrap();
+        assert!(plain.replayed);
+        assert!(plain.receipt.unwrap().application.frozen.removed.is_empty());
+        assert!(remove(&orch, &id, true, &unproven, Some("fresh"))
+            .await
+            .unwrap_err()
+            .contains("cannot clear drains"));
+        let fleet = crate::config::settings::load_fleet(temp.path());
+        assert_eq!(fleet.drains.records(&id).len(), 1);
+        assert!(!fleet.drains.removal_receipts().contains_key("fresh"));
+
+        // An undrained machine passes the drain gate and reaches the host's
+        // lifecycle, which this test orchestrator does not have.
+        let mut other = remote.clone();
+        other.executor_id = "remote-other".into();
+        other.display_name = "remote-other".into();
+        other.device_id = "other-device".into();
+        mutate_fleet(&orch, |config| {
+            config.remote_executors.insert("remote-other".into(), other);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            remove(&orch, "remote-other", true, &unproven, Some("undrained"))
+                .await
+                .unwrap_err()
+                .contains("remote executors are unavailable on this host")
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_legacy_clear_preserves_overlapping_operator_record() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("settings.yaml"),
+            "buildSlots:\n  drainedMachines: [local]\n",
+        )
+        .unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _link) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        set_operator_drain(&orch, "local", true, Some("operator hold"), &operator)
+            .await
+            .unwrap();
+        let outcome = clear_operator_legacy_drain(&orch, "local", &operator).unwrap();
+        assert!(outcome.enabled);
+        assert_eq!(outcome.remaining_records.len(), 1);
+        assert_eq!(
+            outcome.remaining_records[0].owner,
+            cairn_config::drain::DrainOwner::Operator
+        );
+        assert_eq!(
+            outcome.changed_records[0].owner,
+            cairn_config::drain::DrainOwner::Legacy
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_service_run_cannot_borrow_its_callers_thread() {
+        use crate::project_services::authority::{DelegatedScope, ServiceRun, ServiceRunRole};
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        seed_drain_threads(&orch).await;
+        orch.project_services.runs.insert(
+            "ra",
+            ServiceRun {
+                project_id: "dp".into(),
+                project_key: "drains".into(),
+                owner: crate::project_services::ServiceOwner::Thread {
+                    id: "ta".into(),
+                    name: "alpha".into(),
+                },
+                service: "test".into(),
+                generation: 1,
+                default_branch: "main".into(),
+                role: ServiceRunRole::Delegated {
+                    caller_kind: crate::project_services::protocol::CallerKind::Agent,
+                    acting_for: "cairn://p/drains/alpha".into(),
+                    scope: DelegatedScope::Owner {
+                        thread: "alpha".into(),
+                    },
+                },
+            },
+        );
+        assert!(thread_drain_actor(&orch, &drain_request("ra"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_drains_failed_parse_does_not_publish_a_new_hold() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _link) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        mutate_fleet(&orch, |_| Ok(())).unwrap();
+        assert!(!orch.fleet.is_drained(super::super::COLOCATED_EXECUTOR_ID));
+        std::fs::write(temp.path().join("settings.yaml"), "fleet: [invalid").unwrap();
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        assert!(set_operator_drain(&orch, "local", true, None, &operator)
+            .await
+            .is_err());
+        assert!(!orch.fleet.is_drained(super::super::COLOCATED_EXECUTOR_ID));
+    }
+
     #[tokio::test]
     async fn memory_diagnostic_resolves_only_registered_run_and_local_generation() {
         let temp = tempfile::tempdir().unwrap();
@@ -2110,6 +3011,8 @@ mod tests {
     async fn a_drain_is_persisted_before_the_machine_is_told() {
         let temp = tempfile::tempdir().unwrap();
         let orch = test_orchestrator(temp.path()).await;
+        seed_drain_threads(&orch).await;
+        mutate_fleet(&orch, |_| Ok(())).unwrap();
         let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
         orch.fleet.attach_executor(sender);
         // Attaching states this machine's drain either way, so the message that
@@ -2119,9 +3022,15 @@ mod tests {
             Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
         ));
 
-        let outcome = set_drain_mode(&orch, crate::fleet::LOCAL_EXECUTOR_NAME, true)
-            .await
-            .expect("a drain resolves and records");
+        let outcome = set_thread_drain(
+            &orch,
+            crate::fleet::LOCAL_EXECUTOR_NAME,
+            true,
+            Some("thread maintenance"),
+            &drain_request("ra"),
+        )
+        .await
+        .expect("a drain resolves and records");
 
         assert!(outcome.enabled);
         assert!(
@@ -2135,9 +3044,15 @@ mod tests {
             Some(ExecutorMessage::DrainModeRequest { enabled: true, .. })
         ));
 
-        set_drain_mode(&orch, crate::fleet::LOCAL_EXECUTOR_NAME, false)
-            .await
-            .expect("clearing a drain resolves");
+        set_thread_drain(
+            &orch,
+            crate::fleet::LOCAL_EXECUTOR_NAME,
+            false,
+            None,
+            &drain_request("ra"),
+        )
+        .await
+        .expect("clearing a drain resolves");
         assert!(
             !crate::config::settings::load_fleet(&orch.config_dir)
                 .is_machine_drained(crate::fleet::COLOCATED_EXECUTOR_ID),
@@ -2491,10 +3406,19 @@ mod tests {
             );
         }
 
-        let result = remove(&orch, "Build host", false).await.unwrap();
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        let result = remove(
+            &orch,
+            "Build host",
+            false,
+            &RemovalActor::from(&operator),
+            Some("clear-failed-enrollment"),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(result.display_name, "Build host");
-        assert!(result.config.is_none());
+        assert_eq!(result.result.display_name, "Build host");
+        assert!(result.result.config.is_none());
         assert!(operations.all().is_empty());
         assert!(orch.fleet.unattached_enrolled_remotes().is_empty());
         assert!(resolve_executor_reference(&orch, "Build host").is_err());
@@ -2602,18 +3526,35 @@ mod tests {
         orch.fleet
             .declare_enrolled_remote("sp2-id", "sp2", "linux", "x86_64");
 
-        let refusal = remove(&orch, "sp2", false)
-            .await
-            .expect_err("a live enrollment is not dismissed");
+        let operator = drain_test_operator("operator", "desktop_operator_credential").unwrap();
+        let actor = RemovalActor::from(&operator);
+        let refusal = remove(
+            &orch,
+            "sp2",
+            false,
+            &actor,
+            Some("clear-abandoned-enrollment"),
+        )
+        .await
+        .expect_err("a live enrollment is not dismissed");
         assert!(refusal.contains("still enrolling"), "{refusal}");
         assert!(!operations.all()[0].phase.is_terminal());
         assert_eq!(operations.all()[0].id, operation.id);
 
         after_the_window(&operations);
-        let result = remove(&orch, "sp2", false)
-            .await
-            .expect("an abandoned enrollment is dismissed");
-        assert!(result.attach_state.contains("abandoned"), "{result:?}");
+        let result = remove(
+            &orch,
+            "sp2",
+            false,
+            &actor,
+            Some("clear-abandoned-enrollment"),
+        )
+        .await
+        .expect("an abandoned enrollment is dismissed");
+        assert!(
+            result.result.attach_state.contains("abandoned"),
+            "{result:?}"
+        );
         assert!(operations.all().is_empty());
         assert!(orch.fleet.unattached_enrolled_remotes().is_empty());
     }
@@ -2830,6 +3771,11 @@ mod tests {
         let drained = DrainOutcome {
             name: "fedora".into(),
             enabled: true,
+            effective_effect: Some(
+                cairn_common::executor_protocol::ExecutorDrainAdmissionEffect::RefuseAllNewAdmission,
+            ),
+            changed_records: Vec::new(),
+            remaining_records: Vec::new(),
             application: crate::fleet::DrainApplication::Applied,
             residents: Some(residents.clone()),
         };
@@ -2844,8 +3790,31 @@ mod tests {
             "{summary}"
         );
 
+        // Clearing the last attributed owner while a self-update hold stands
+        // (the runtime-only legacy clear): resident batches are not refused.
+        let update_only = DrainOutcome {
+            effective_effect: Some(
+                cairn_common::executor_protocol::ExecutorDrainAdmissionEffect::RefuseNewEnvironments,
+            ),
+            ..drained.clone()
+        };
+        let summary = update_only.summary();
+        assert!(
+            summary.contains("still refuses new environments"),
+            "{summary}"
+        );
+        assert!(
+            summary
+                .contains("the next batch of a job whose environment is already there is admitted"),
+            "{summary}"
+        );
+        assert!(!summary.contains("including the next batch"), "{summary}");
+        assert!(!summary.contains("until it is cleared"), "{summary}");
+        assert!(!summary.contains("It keeps"), "{summary}");
+
         let cleared = DrainOutcome {
             enabled: false,
+            effective_effect: None,
             residents: Some(residents),
             ..drained
         };

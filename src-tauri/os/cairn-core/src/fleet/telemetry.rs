@@ -253,11 +253,13 @@ mod tests {
         };
         let report = ExecutorSubstrateReport::default();
         ExecutorInspection {
+            drain_state: Default::default(),
             name: name.to_string(),
             link_path: None,
             recent_placements: Vec::new(),
             colocated: false,
             health: ExecutorHealthSnapshot {
+                drain_state: Default::default(),
                 build_volume: None,
                 model_residents: Vec::new(),
                 identity: identity.clone(),

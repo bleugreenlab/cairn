@@ -17,6 +17,7 @@ use cairn_domain::decision::{
 use crate::interface::complete::{Complete, CompletionCall};
 use crate::interface::decide::{DecideError, DecisionCall, DecisionRoute};
 use crate::wire::decisions::http::build_body;
+use crate::wire::merge_extras;
 use crate::wire::systemone::http::build_body as systemone_body;
 
 /// Every question `method` cannot measure, as a sentence naming it. Empty
@@ -79,11 +80,12 @@ pub fn decide(complete: &dyn Complete, call: DecisionCall<'_>) -> Result<Decisio
     }
     match call.route {
         DecisionRoute::Native(endpoint) => {
-            let body = build_body(
+            let mut body = build_body(
                 call.model,
                 call.input,
                 &native::wire_questions(call.questions),
             );
+            merge_extras(&mut body, &endpoint.extras);
             let reply = complete
                 .complete(CompletionCall::whole(
                     call.route.completion_wire(),
@@ -105,11 +107,12 @@ pub fn decide(complete: &dyn Complete, call: DecisionCall<'_>) -> Result<Decisio
             })
         }
         DecisionRoute::SystemOne(endpoint) => {
-            let body = systemone_body(
+            let mut body = systemone_body(
                 call.model,
                 call.input.into(),
                 &native::wire_questions(call.questions),
             );
+            merge_extras(&mut body, &endpoint.extras);
             let reply = complete
                 .complete(CompletionCall::whole(
                     call.route.completion_wire(),

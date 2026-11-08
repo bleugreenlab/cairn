@@ -21,7 +21,21 @@ struct LifetimeFacts {
     backend: String,
     job_id: String,
     job_status: String,
-    has_unsettled_turn: bool,
+    /// Work is in this process or about to enter it: a pending turn (a
+    /// delivery stamped into it awaits launch), a running one, or a `run` call
+    /// held open on its socket (`agent_waits.hold = 'inline'`), which a Codex
+    /// exec cell can keep past the provider turn that opened it. Stopping the
+    /// process would cut that work, so nothing stops it.
+    ///
+    /// Nothing else owns the process. A `yielded` turn is terminal and stays
+    /// so beside the successor that continued it, so its state is no evidence
+    /// (tenet 1421). A parked wait, pending permission, unanswered question,
+    /// live delegated child or detached batch continues the job by minting a
+    /// successor turn or queueing a notice, never through this process: all it
+    /// gains from the process is a warm prefix for native resume, which an open
+    /// session inside its horizon keeps anyway and a closed session or
+    /// cancelled job cannot use (tenets 1252, 920).
+    work_in_process: bool,
     last_provider_request_at: Option<i64>,
 }
 
@@ -43,9 +57,7 @@ impl StopCause {
 }
 
 fn lifetime_verdict(facts: &LifetimeFacts, process_idle_secs: u64, now: i64) -> Option<StopCause> {
-    // A pending delivery or a durable wait owns the turn even when its process
-    // is parked idle. This guard outranks closure and cancellation too.
-    if facts.has_unsettled_turn {
+    if facts.work_in_process {
         return None;
     }
     if facts.session_status != "open" {
@@ -110,7 +122,10 @@ async fn load_lifetime_facts(
              )
              SELECT r.id, s.id, s.status, s.backend, j.id, j.status,
                     EXISTS(SELECT 1 FROM turns t WHERE t.job_id = j.id
-                           AND t.state IN ('pending', 'running', 'yielded')),
+                           AND t.state IN ('pending', 'running'))
+                    OR EXISTS(SELECT 1 FROM agent_waits w WHERE w.job_id = j.id
+                              AND w.state IN ('pending', 'resolving')
+                              AND w.hold = 'inline'),
                     p.requested_at
              FROM candidates r
              JOIN sessions s ON s.id = r.session_id
@@ -126,7 +141,7 @@ async fn load_lifetime_facts(
                             backend: row.text(3)?,
                             job_id: row.text(4)?,
                             job_status: row.text(5)?,
-                            has_unsettled_turn: row.i64(6)? != 0,
+                            work_in_process: row.i64(6)? != 0,
                             last_provider_request_at: row.opt_i64(7)?,
                         },
                     ))
@@ -177,8 +192,8 @@ pub(crate) fn sweep_process_lifetimes(orch: &Orchestrator) {
             continue;
         }
         // A delivery can finish or yield between the batch read and this lock,
-        // leaving the process idle again. Neither its durable turn ownership nor
-        // its cache age may be inferred from the old snapshot.
+        // leaving the process idle again. Neither its owner nor its cache age
+        // may be inferred from the old snapshot.
         let dbs = orch.db.clone();
         let candidate = process.clone();
         let refreshed = run_db_blocking(move || async move {

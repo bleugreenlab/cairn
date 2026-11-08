@@ -4153,7 +4153,7 @@ impl Drop for UndeliveredPushes {
 /// Told to an agent whose last turn a host restart cut off mid-flight. The
 /// restart killed the process between a tool call and its result, so the agent
 /// cannot know from its transcript whether that call took effect.
-pub(crate) const HOST_RESTART_RESUME_NOTE: &str = "Cairn restarted while your previous turn was in progress, and that turn was interrupted. Any tool call that was in flight when it stopped has an unknown outcome: it may or may not have taken effect. Check the worktree, and whatever your last calls touched, before re-running anything. Then continue your work.";
+pub(crate) const HOST_RESTART_RESUME_NOTE: &str = "Cairn restarted while your previous turn was in progress, and that turn was interrupted. Any tool call that was in flight when it stopped has an unknown outcome: it may or may not have taken effect. Any 'the user doesn't want to proceed' or 'interrupted by user' text in that call came from the restart, not from the user. Check the worktree, and whatever your last calls touched, before re-running anything. Then continue your work.";
 
 /// Told to an agent whose queued turn a host restart cancelled before it
 /// started, whether the turn was runless (`orphaned_pending`) or bound to a

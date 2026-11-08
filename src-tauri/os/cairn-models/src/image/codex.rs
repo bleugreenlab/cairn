@@ -100,6 +100,8 @@ pub fn discovered_model() -> DiscoveredModel {
             wire: Wire::CodexAppServer,
         }]),
         // An image offer has no token budget to meter.
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: None,
     }
 }

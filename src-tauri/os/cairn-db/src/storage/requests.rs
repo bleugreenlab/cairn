@@ -599,9 +599,12 @@ fn validate_acceptance(a: &RequestAcceptance) -> DbResult<()> {
                 || !nonblank(&d.drain_key)
                 || !nonblank(&d.owner)
                 || d.generation == 0
+                || d.machine_revision == 0
                 || a.target.as_ref().is_none_or(|s| !nonblank(s))
             {
-                return Err(error("missing stable drain identity/owner/generation"));
+                return Err(error(
+                    "missing stable drain identity/owner/generation/machine revision",
+                ));
             }
         }
     }
@@ -1116,6 +1119,30 @@ pub async fn fail_unclaimed_request(
     }).await
 }
 
+/// Attempts of one kind whose consumer claim exists but whose effect is not
+/// positively settled: acting, or failed without settlement. A consumer
+/// reconciles these after a restart; it never replays them.
+pub async fn unresolved_claims(db: &LocalDb, kind: RequestKind) -> DbResult<Vec<RequestAttempt>> {
+    let kind = kind.as_str().to_string();
+    db.read(move |conn| {
+        let kind = kind.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    format!("SELECT {ATTEMPT_COLUMNS} FROM request_attempts a WHERE (a.state='acting' OR (a.state='failed' AND a.settled=0)) AND a.claim_id IS NOT NULL AND json_extract(a.acceptance_json,'$.kind')=?1 ORDER BY a.updated_at,a.id"),
+                    params![kind.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(attempt_row(&row)?);
+            }
+            Ok(out)
+        })
+    })
+    .await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchDisposition {
     Dispatch,
@@ -1485,7 +1512,7 @@ mod tests {
             ),
             (
                 "drain",
-                json!({"executor_id":"other","drain_key":"other","owner":"operator","generation":1}),
+                json!({"executor_id":"other","drain_key":"other","owner":"operator","generation":1,"machine_revision":1}),
             ),
             ("operator", wrong_operator),
             ("target", json!("other")),
@@ -2135,6 +2162,7 @@ mod tests {
             drain_key: "stable-key".into(),
             owner: "operator".into(),
             generation: 3,
+            machine_revision: 5,
         });
         let accepted = accept_request(&db, &a).await.unwrap();
         let original = serde_json::to_value(&a).unwrap();
@@ -2143,6 +2171,7 @@ mod tests {
             ("drain_key", json!("other")),
             ("owner", json!("other")),
             ("generation", json!(4)),
+            ("machine_revision", json!(6)),
         ] {
             let mut changed = original.clone();
             changed["drain"][field] = value;

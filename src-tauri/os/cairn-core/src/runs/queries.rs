@@ -159,15 +159,18 @@ pub struct RestartResumeSummary {
 ///
 /// The key is durable and needs no in-memory state: the job's latest work turn
 /// ended `host_restart` (the stale-run settlement) or `orphaned_pending` (the
-/// runless-pending sweep), and ended at or after this boot. The boot sweep
-/// already re-derived each such job to Pending (a node) or Idle (a thread
-/// session), so selection also requires that status and no active run.
+/// runless-pending sweep), and ended at or after this boot. An orderly shutdown
+/// records `host_restart` before boot and is also eligible while its turn has no
+/// recorded restart-resume attempt. Settlement re-derives each job to Pending
+/// (a node) or Idle (a thread session); selection requires that status and no
+/// active run.
 ///
 /// It resumes once. A continuation that takes, or is refused after minting, leaves
 /// a follow-up turn at the head, started or cancelled `launch_refused`, so the key
-/// stops matching. One refused before minting writes nothing, and the old turn
-/// stays at the head. No later boot retries any of these, since the turn ended
-/// before that boot. A refused resume leaves the job Pending (wants-to-run) for
+/// stops matching. A boot-sweep turn refused before minting predates later boots.
+/// An orderly shutdown's one attempt is recorded before entering the funnel,
+/// including before a pre-mint refusal, so later boots cannot retry it either.
+/// A refused resume leaves the job Pending (wants-to-run) for
 /// the DAG or a message to pick up, and a child's parent hears about it through
 /// `lifecycle::child_unresumed`.
 ///
@@ -263,7 +266,20 @@ fn select_restart_resumes(
                SELECT 1 FROM turns t
                WHERE t.id = {HEAD_WORK_TURN}
                  AND t.end_reason IN ('host_restart', 'orphaned_pending')
-                 AND t.ended_at >= ?1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM events attempted
+                     WHERE attempted.turn_id = t.id
+                       AND attempted.event_type = 'system:restart_resume_attempt'
+                 )
+                 AND (t.ended_at >= ?1 OR (
+                     t.end_reason = 'host_restart'
+                     AND EXISTS (
+                         SELECT 1 FROM runs stopped
+                         WHERE stopped.id = t.run_id
+                           AND stopped.exit_reason = 'runner_shutdown'
+                           AND stopped.created_at < ?1
+                     )
+                 ))
            )
          ORDER BY j.created_at, j.id"
     );
@@ -284,6 +300,54 @@ fn select_restart_resumes(
     })
 }
 
+/// Orderly shutdown settles before boot, so its timestamp cannot identify the
+/// boot that owes it a resume. Claim that one attempt on the interrupted turn,
+/// in the same transcript ledger as the shutdown, before entering the funnel.
+fn claim_shutdown_restart_resume(
+    orch: &crate::orchestrator::Orchestrator,
+    turn_id: &str,
+) -> Result<bool, String> {
+    use crate::storage::RowExt as _;
+    let db = orch.db.local.clone();
+    let turn_id = turn_id.to_string();
+    crate::storage::run_db_blocking(move || async move {
+        db.write(|conn| {
+            let turn_id = turn_id.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(
+                    "SELECT t.run_id, t.session_id FROM turns t
+                     WHERE t.id = ?1 AND t.end_reason = 'host_restart'
+                       AND EXISTS (SELECT 1 FROM runs r WHERE r.id=t.run_id AND r.exit_reason='runner_shutdown')",
+                    (turn_id.as_str(),),
+                ).await?;
+                let Some(row) = rows.next().await? else { return Ok(true); };
+                let run_id = row.text(0)?;
+                let session_id = row.text(1)?;
+                drop(rows);
+                let mut attempted = conn.query(
+                    "SELECT 1 FROM events WHERE turn_id=?1 AND event_type='system:restart_resume_attempt' LIMIT 1",
+                    (turn_id.as_str(),),
+                ).await?;
+                if attempted.next().await?.is_some() { return Ok(false); }
+                drop(attempted);
+                let now = chrono::Utc::now().timestamp() as i32;
+                crate::transcripts::stream_store::insert_event_conn(conn,
+                    &crate::transcripts::stream_store::EventInsert {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        run_id, session_id: Some(session_id), turn_id: Some(turn_id),
+                        timestamp: now, created_at: now, selected_model: None,
+                        event_type: "system:restart_resume_attempt".into(),
+                        data: serde_json::json!({"eventType":"system:restart_resume_attempt"}).to_string(),
+                        parent_tool_use_id: None, input_tokens: None, cache_read_tokens: None,
+                        cache_create_tokens: None, output_tokens: None, thinking_tokens: None, cost_usd: None,
+                    },
+                ).await?;
+                Ok(true)
+            })
+        }).await.map_err(|error| error.to_string())
+    })
+}
+
 /// Launch one selected job's continuation. `Ok(false)` when something else
 /// reached the job between selection and the lock.
 fn resume_restart_interrupted_job(
@@ -291,11 +355,6 @@ fn resume_restart_interrupted_job(
     job_id: &str,
     turn_id: &str,
 ) -> Result<bool, String> {
-    // The recovery entry skips the funnel's own dormancy gate, so a closed
-    // thread is refused here, before the lock, touching nothing.
-    if crate::threads::is_dormant_thread_session_sync(&orch.db.local, job_id) {
-        return Err(crate::threads::dormant_thread_refusal());
-    }
     let launch_lock = orch.job_launch_lock(job_id);
     let guard = launch_lock
         .lock()
@@ -304,6 +363,14 @@ fn resume_restart_interrupted_job(
         || !restart_head_still_matches(orch, job_id, turn_id)?
     {
         return Ok(false);
+    }
+    if !claim_shutdown_restart_resume(orch, turn_id)? {
+        return Ok(false);
+    }
+    // Record an orderly shutdown's one attempt even when dormancy refuses it
+    // before the funnel can mint a successor. No later boot retries that refusal.
+    if crate::threads::is_dormant_thread_session_sync(&orch.db.local, job_id) {
+        return Err(crate::threads::dormant_thread_refusal());
     }
     let launch =
         crate::execution::jobs::continue_job_launch_locked_for_recovery(orch, job_id, None, guard)?;

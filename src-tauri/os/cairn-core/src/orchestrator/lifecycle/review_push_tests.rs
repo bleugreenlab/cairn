@@ -3315,65 +3315,55 @@ async fn only_the_node_whose_branch_ships_runs_the_review_cadence() {
     }
 }
 
-#[tokio::test]
-async fn a_turn_ended_by_self_suspension_schedules_no_review_wave() {
-    // The agent kicked off its own tests and self-suspended waiting on them.
-    // That yield reaches the turn-end hook looking like an idle, but the job is
-    // mid-work: launching the heavy review lanes here would put them in
-    // contention with the very tests being waited on.
-    let db = test_db().await;
-    seed(&db, "initial").await;
-    // A builder that would otherwise qualify, so the mid-work guard is what is
-    // under test here rather than the topology gate ahead of it.
-    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
-    let orch = test_orchestrator(db);
+/// Drive the same arming gates and settle probe as a turn-end or owed successor.
+/// A resume followed by another self-suspension must keep a polling wave, even
+/// when there is no fleet command whose completion would create another edge.
+#[tokio::test(start_paused = true)]
+async fn self_suspension_and_resume_cannot_drop_the_bounded_review_wait() {
+    use super::review_push::{claim_review_wave, WaveTrigger};
+    use crate::execution::checks_turn_end::{defer_until_node_settles, WaveSettle};
+    use std::time::Duration;
 
-    for reason in ["wait", "dependency_wait", "user_input", "permission"] {
-        set_prod_head_turn(&orch.db.local, "yielded", Some(reason)).await;
-
-        spawn_turn_end_checks(&orch, "j-prod");
-
-        assert!(
-            !wave_scheduled(&orch, "j-prod"),
-            "a turn yielded on the agent's own {reason} is not a turn end"
-        );
+    for trigger in [WaveTrigger::TurnEnd, WaveTrigger::Recovery] {
+        for (state, reason) in [
+            ("running", None),
+            ("yielded", Some("wait")),
+            ("yielded", Some("dependency_wait")),
+            ("yielded", Some("user_input")),
+            ("yielded", Some("permission")),
+        ] {
+            let db = test_db().await;
+            seed(&db, "initial").await;
+            attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+            let orch = test_orchestrator(db);
+            set_prod_head_turn(&orch.db.local, state, reason).await;
+            let slot = claim_review_wave(&orch, "j-prod", trigger)
+                .expect("mid-work arms a bounded wave instead of skipping it");
+            let started = tokio::time::Instant::now();
+            let (settled, ()) = tokio::join!(
+                defer_until_node_settles(&orch, "j-prod", slot.attempt_id(), slot.cancel()),
+                async {
+                    tokio::time::sleep(Duration::from_secs(240)).await;
+                    set_prod_head_turn(&orch.db.local, "running", None).await;
+                    tokio::time::sleep(Duration::from_secs(240)).await;
+                    set_prod_head_turn(&orch.db.local, "yielded", Some("wait")).await;
+                }
+            );
+            assert_eq!(settled, WaveSettle::Proceed);
+            assert!(
+                (Duration::from_secs(600)..=Duration::from_secs(603)).contains(&started.elapsed()),
+                "the actual head-turn probe releases admission within ceiling + poll: {:?}",
+                started.elapsed()
+            );
+            let rows = attempts(&orch.db.local, "j-prod").await;
+            assert_eq!(rows.len(), 1, "resumes do not need another turn-end edge");
+            assert_eq!(rows[0].1, "runtime_started");
+            assert!(rows[0].2.as_deref().unwrap().contains("600s"));
+            assert_eq!(orch.review_deferrals.unreviewed_for("j-prod"), None);
+            slot.finish("completed", "test reached admission boundary")
+                .await;
+        }
     }
-}
-
-#[tokio::test]
-async fn the_review_wave_lands_once_after_the_resume() {
-    let db = test_db().await;
-    seed(&db, "initial").await;
-    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
-    let orch = test_orchestrator(db);
-
-    // Two suspended turn-ends in a row schedule nothing, and leave nothing owed:
-    // there is no make-up wave per skipped turn.
-    for _ in 0..2 {
-        set_prod_head_turn(&orch.db.local, "yielded", Some("wait")).await;
-        spawn_turn_end_checks(&orch, "j-prod");
-        assert!(!wave_scheduled(&orch, "j-prod"));
-    }
-
-    // The wait resolves and the synthetic continuation turn starts. The
-    // suspension's late interrupt ack lands on this hook here; it must not
-    // schedule a wave against the pre-resume tree, nor take the single-flight
-    // slot away from the continuation's own turn-end.
-    set_prod_head_turn(&orch.db.local, "running", None).await;
-    spawn_turn_end_checks(&orch, "j-prod");
-    assert!(
-        !wave_scheduled(&orch, "j-prod"),
-        "the resume boundary must not double-fire ahead of the real turn-end"
-    );
-
-    // The continuation reaches a real turn end: one wave, against the tree that
-    // exists now.
-    set_prod_head_turn(&orch.db.local, "complete", None).await;
-    spawn_turn_end_checks(&orch, "j-prod");
-    assert!(
-        wave_scheduled(&orch, "j-prod"),
-        "the first real turn-end after the resume runs the suite"
-    );
 }
 
 #[tokio::test]
@@ -3983,11 +3973,11 @@ async fn a_turn_end_on_the_head_the_wave_checked_owes_no_successor() {
     assert!(!orch.turn_end_checks_in_flight("j-prod"));
 }
 
-/// The owed successor goes through every ordinary gate: a live turn arms its
-/// own wave when it ends, and a resolved issue arms nothing.
+/// A live turn must not discard the released wave's successor. A resolved
+/// issue, unlike a resumed turn, really does end the review obligation.
 #[tokio::test]
-async fn an_owed_successor_is_suppressed_by_a_live_turn_or_a_resolved_issue() {
-    for (gate, expected) in [("live turn", "skipped"), ("resolved issue", "withdrawn")] {
+async fn an_owed_successor_survives_a_resume_but_not_a_resolved_issue() {
+    for gate in ["live turn", "resolved issue"] {
         let db = test_db().await;
         seed(&db, "initial").await;
         attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
@@ -4010,8 +4000,12 @@ async fn an_owed_successor_is_suppressed_by_a_live_turn_or_a_resolved_issue() {
 
         let rows = attempts(&orch.db.local, "j-prod").await;
         assert_eq!(rows.len(), 3, "{gate}: {rows:?}");
-        assert_eq!(rows[2].1, expected, "{gate}: {rows:?}");
-        assert!(!orch.turn_end_checks_in_flight("j-prod"), "{gate}");
+        if gate == "live turn" {
+            assert_ne!(rows[2].1, "skipped", "{gate}: {rows:?}");
+        } else {
+            assert_eq!(rows[2].1, "withdrawn", "{gate}: {rows:?}");
+            assert!(!orch.turn_end_checks_in_flight("j-prod"), "{gate}");
+        }
     }
 }
 
@@ -5097,8 +5091,8 @@ async fn current_session(db: &LocalDb) -> (String, String) {
     .unwrap()
 }
 
-/// The successor session's first turn ends, which is what arms a turn-end wave
-/// (a live head turn arms nothing).
+/// End the successor session's first turn so its wave does not need to yield
+/// to the head turn in the settle probe.
 async fn end_successor_turn(db: &LocalDb) {
     db.execute(
         "UPDATE turns SET state='complete'
@@ -5124,7 +5118,6 @@ async fn an_operator_compact_leaves_the_wave_running_and_its_verdict_reaches_the
     let db = test_db().await;
     seed(&db, "initial").await;
     attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
-    seed_live_session(&db).await;
     let orch = test_orchestrator(db);
     let repository = tempfile::tempdir().unwrap();
     crate::jj::tests::init_project(repository.path());
@@ -5195,6 +5188,7 @@ async fn an_operator_compact_leaves_the_wave_running_and_its_verdict_reaches_the
     .await
     .expect("the wave's lane reaches the fake machine");
 
+    seed_live_session(&orch.db.local).await;
     let report = cold_compact(&orch).await;
     assert_eq!(report.turns_cancelled, 1, "{report:?}");
     assert_eq!(
@@ -5405,4 +5399,411 @@ async fn after_a_compact_the_successors_turn_end_starts_no_second_wave_on_the_sa
         "the head did not move, so no successor: {rows:?}"
     );
     assert!(!orch.turn_end_checks_in_flight("j-prod"));
+}
+
+/// The review cadence's settle ceiling and poll interval, as
+/// `checks_turn_end` defines them privately (`WAVE_SETTLE_CEILING_MS`,
+/// `WAVE_SETTLE_POLL_MS`).
+const SETTLE_CEILING: std::time::Duration = std::time::Duration::from_secs(600);
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How far the fake machine lets a paused clock run between looks.
+///
+/// A paused runtime that idles jumps straight to its next timer. With one
+/// far-off deadline as the only timer, any idle await outside the blocking pool
+/// would skip the clock to that deadline. Stepping keeps every such jump within
+/// one step, so an arrival time is exact to within this much.
+const FAKE_MACHINE_STEP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `j-prod` on a real agent branch whose sealed head carries one `when: review`
+/// check this platform can run, so a wave plans a resolvable head and its lane
+/// can reach a fake machine. Returns the workspace that advances the branch and
+/// the directories that back it.
+async fn review_branch_with_one_lane(
+    orch: &Orchestrator,
+    branch: &str,
+) -> (std::path::PathBuf, Vec<tempfile::TempDir>) {
+    let bin = crate::jj::tests::jj_bin().expect("this acceptance requires jj");
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    let platform = crate::fleet::ExecutorPlatform::this_process();
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        format!(
+            "checks:\n  only-a:\n    command: \"true\"\n    when: review\n    verdictPlatforms: [{}]\n",
+            platform.os
+        ),
+    )
+    .unwrap();
+    std::fs::write(workspace.join("change.rs"), "the change under review\n").unwrap();
+    crate::jj::seal(&jj, &workspace, "the change under review", None).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+    (workspace, vec![repository, workspaces])
+}
+
+/// Seal a new commit on `j-prod`'s branch and run the branch-advance hook a
+/// sealed commit runs. Returns the head that replaced the one under review.
+async fn advance_review_branch(orch: &Orchestrator, workspace: &std::path::Path) -> String {
+    let before = crate::execution::cache::resolve_job_logical_head(orch, "j-prod")
+        .await
+        .expect("the agent branch resolves");
+    let bin = crate::jj::tests::jj_bin().expect("this acceptance requires jj");
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    std::fs::write(
+        workspace.join("advance.rs"),
+        "a commit landed while review waited\n",
+    )
+    .unwrap();
+    crate::jj::seal(&jj, workspace, "advance the branch under review", None).unwrap();
+    let after = crate::execution::cache::resolve_job_logical_head(orch, "j-prod")
+        .await
+        .expect("the advanced branch resolves");
+    assert_ne!(before, after, "the seal moved the branch head");
+    crate::execution::checks::cancel_stale_review_on_branch_advance(
+        orch,
+        "j-prod",
+        crate::execution::checks::BranchAdvance::Commit,
+    )
+    .await;
+    after
+}
+
+/// Play the fake machine until a batch is granted or `deadline` passes: claim
+/// every offer, and answer every cancel the way an executor does once it has
+/// stopped the process. Returns the granted request and the paused-clock
+/// instant it arrived.
+async fn play_fake_machine_until_granted(
+    orch: &Orchestrator,
+    executor: &mut tokio::sync::mpsc::UnboundedReceiver<
+        cairn_common::executor_protocol::ExecutorMessage,
+    >,
+    generation: u64,
+    deadline: tokio::time::Instant,
+) -> Option<(
+    cairn_common::executor_protocol::CellRequest,
+    tokio::time::Instant,
+)> {
+    use cairn_common::executor_protocol::{CellOutcome, ExecutorMessage};
+    while tokio::time::Instant::now() < deadline {
+        let message = tokio::select! {
+            message = executor.recv() => Some(message.expect("the fake fleet link stays open")),
+            _ = tokio::time::sleep(FAKE_MACHINE_STEP) => None,
+        };
+        match message {
+            Some(ExecutorMessage::Offer { entry_id, .. }) => {
+                orch.fleet.handle_executor_message(
+                    crate::fleet::COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::Claim { entry_id },
+                );
+            }
+            Some(ExecutorMessage::Granted {
+                request,
+                batch: Some(_),
+                ..
+            }) => return Some((request, tokio::time::Instant::now())),
+            Some(ExecutorMessage::Cancel {
+                request_id,
+                attempt_id,
+            }) => {
+                orch.fleet.handle_executor_message(
+                    crate::fleet::COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::Result {
+                        request_id: request_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        outcome: CellOutcome::Cancelled {
+                            request_id,
+                            attempt_id,
+                        },
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The sealed plan an attempt recorded.
+async fn attempt_plan(
+    db: &LocalDb,
+    attempt_id: &str,
+) -> crate::execution::checks_turn_end::WavePlan {
+    let json = db
+        .query_one(
+            "SELECT plan_json FROM turn_end_check_attempts WHERE id=?1",
+            (attempt_id.to_string(),),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+/// The seconds a record names right after `clause`, as in "node-work deferral
+/// has lasted 120s" or "its successor inherits the 120s".
+fn secs_after(reason: &str, clause: &str) -> u64 {
+    let (_, rest) = reason
+        .split_once(clause)
+        .unwrap_or_else(|| panic!("no '{clause}' in: {reason}"));
+    rest.split('s').next().unwrap().parse().unwrap()
+}
+
+/// cairn/6413 end to end, through a deferral. The builder self-suspends on its
+/// own work, so its review wave defers to it. A commit lands mid-deferral and
+/// withdraws the wave, and the builder stays suspended past the ceiling. The
+/// owed successor must not be skipped as mid-work, which is what left
+/// cairn/6407 with no wave for 100 minutes. It plans the newest head, inherits
+/// the job's wait, and its lane reaches a machine within the ceiling plus one
+/// poll of the moment the job's deferral began.
+///
+/// The clock is paused, so the production ceiling costs no wall time. Planning
+/// runs in blocking tasks, which hold a paused clock still, so the real planning
+/// time of either wave is not on the measured clock. What is measured is the
+/// wait the successor inherits and the probe that releases it.
+#[tokio::test(start_paused = true)]
+#[serial_test::serial(jj)]
+async fn a_commit_during_a_self_suspended_deferral_reaches_a_machine_at_the_newest_head_within_the_ceiling(
+) {
+    use cairn_common::executor_protocol::ExecutorMessage;
+    use std::time::Duration;
+
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let (workspace, _dirs) =
+        review_branch_with_one_lane(&orch, "agent/cairn-6413-deferral-0").await;
+    let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_executor(sender);
+    set_prod_head_turn(&orch.db.local, "yielded", Some("wait")).await;
+
+    spawn_turn_end_checks(&orch, "j-prod");
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = attempts(&orch.db.local, "j-prod").await;
+        if rows.first().is_some_and(|row| row.1 == "deferred") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "the wave defers to the self-suspended turn: {rows:?}"
+        );
+        tokio::time::sleep(FAKE_MACHINE_STEP).await;
+    }
+    let opened = tokio::time::Instant::now()
+        - orch
+            .review_deferrals
+            .unreviewed_for("j-prod")
+            .expect("the deferring wave opened the job's deferral");
+
+    tokio::time::sleep_until(opened + Duration::from_secs(120)).await;
+    while let Ok(message) = executor.try_recv() {
+        assert!(
+            !matches!(
+                message,
+                ExecutorMessage::Offer { .. } | ExecutorMessage::Granted { .. }
+            ),
+            "a deferring wave asks no machine for room"
+        );
+    }
+    let newest = advance_review_branch(&orch, &workspace).await;
+
+    // Just short of the ceiling the successor is holding, not skipped, and the
+    // wait it holds is the job's, not its own.
+    let early = play_fake_machine_until_granted(
+        &orch,
+        &mut executor,
+        generation,
+        opened + SETTLE_CEILING - Duration::from_secs(1),
+    )
+    .await;
+    assert!(
+        early.is_none(),
+        "the self-suspended node keeps right of way until the ceiling"
+    );
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(rows.len(), 2, "one stale wave and one successor: {rows:?}");
+    assert_eq!(rows[0].1, "cancelled", "{rows:?}");
+    // The branch advanced 120s in. One poll more is accepted: should the paused
+    // runtime idle while the advance is recorded, its clock jumps to the stale
+    // wave's next poll first.
+    let handed_on = 120..=120 + SETTLE_POLL.as_secs();
+    assert!(
+        handed_on.contains(&secs_after(
+            rows[0].2.as_deref().unwrap(),
+            "its successor inherits the "
+        )),
+        "the stale wave hands its wait on: {rows:?}"
+    );
+    assert_eq!(
+        rows[1].1, "deferred",
+        "the successor of a self-suspended node is held, not skipped: {rows:?}"
+    );
+    assert!(
+        handed_on.contains(&secs_after(
+            rows[1].2.as_deref().unwrap(),
+            "node-work deferral has lasted "
+        )),
+        "the successor starts from the inherited wait, not from zero: {rows:?}"
+    );
+
+    let grant = play_fake_machine_until_granted(
+        &orch,
+        &mut executor,
+        generation,
+        opened + 2 * SETTLE_CEILING,
+    )
+    .await;
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    let Some((request, granted_at)) = grant else {
+        panic!("the successor's lane never reached the machine: {rows:?}");
+    };
+    let waited = granted_at - opened;
+    assert!(
+        (SETTLE_CEILING..=SETTLE_CEILING + SETTLE_POLL + FAKE_MACHINE_STEP).contains(&waited),
+        "the lane reaches a machine within the ceiling plus one poll of the deferral's start, \
+         whatever the node is doing: {waited:?}"
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].1, "submitted", "{rows:?}");
+    assert_eq!(
+        attempt_plan(&orch.db.local, &rows[1].0).await.head,
+        newest,
+        "the successor planned the newest head"
+    );
+    assert_eq!(
+        request.base_commit, newest,
+        "the machine is asked to check the newest head"
+    );
+    assert_eq!(orch.review_deferrals.unreviewed_for("j-prod"), None);
+}
+
+/// cairn/6413 specimen 5 (cairn/6383): the same hole after admission. A wave
+/// that has already reached a machine is cancelled because a commit advanced
+/// its branch, while the builder is self-suspended. Its successor was skipped as
+/// mid-work, and the newest head went unreviewed for 30 minutes. The review
+/// owed for the new head must survive: the successor defers to the suspended
+/// node, then reaches a machine at the newest head within the ceiling plus one
+/// poll of the cancellation, planning included.
+///
+/// The submitted wave took admission, which closes the job's deferral, so the
+/// successor's wait starts at its own first probe. The bound is measured from
+/// the cancellation so the successor's planning counts against it, although a
+/// paused clock gives blocking-pool planning no duration.
+#[tokio::test(start_paused = true)]
+#[serial_test::serial(jj)]
+async fn a_commit_cancelling_a_submitted_wave_while_self_suspended_still_reaches_a_machine_at_the_newest_head(
+) {
+    use std::time::Duration;
+
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let (workspace, _dirs) =
+        review_branch_with_one_lane(&orch, "agent/cairn-6413-submitted-0").await;
+    let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_executor(sender);
+    let reviewed = crate::execution::cache::resolve_job_logical_head(&orch, "j-prod")
+        .await
+        .expect("the agent branch resolves");
+
+    // A plain turn end: nothing defers, and the wave reaches the machine.
+    spawn_turn_end_checks(&orch, "j-prod");
+    let (first, _) = play_fake_machine_until_granted(
+        &orch,
+        &mut executor,
+        generation,
+        tokio::time::Instant::now() + Duration::from_secs(60),
+    )
+    .await
+    .expect("the first wave reaches the machine");
+    assert_eq!(first.base_commit, reviewed);
+    assert_eq!(orch.review_deferrals.unreviewed_for("j-prod"), None);
+
+    // The builder self-suspends waiting on its own work, and a commit lands.
+    set_prod_head_turn(&orch.db.local, "yielded", Some("wait")).await;
+    let newest = advance_review_branch(&orch, &workspace).await;
+    let advanced = tokio::time::Instant::now();
+
+    let early = play_fake_machine_until_granted(
+        &orch,
+        &mut executor,
+        generation,
+        advanced + SETTLE_CEILING - Duration::from_secs(1),
+    )
+    .await;
+    assert!(
+        early.is_none(),
+        "the self-suspended node keeps right of way until the ceiling"
+    );
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "one cancelled wave and one successor: {rows:?}"
+    );
+    assert_eq!(rows[0].1, "cancelled", "{rows:?}");
+    assert!(
+        rows[0].2.as_deref().is_some_and(
+            |reason| reason.contains("cancelled while the check wave was submitted because")
+        ),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[1].1, "deferred",
+        "the owed successor is held, not skipped as mid-work: {rows:?}"
+    );
+
+    let grant = play_fake_machine_until_granted(
+        &orch,
+        &mut executor,
+        generation,
+        advanced + 2 * SETTLE_CEILING,
+    )
+    .await;
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    let Some((request, granted_at)) = grant else {
+        panic!("the successor's lane never reached the machine: {rows:?}");
+    };
+    let waited = granted_at - advanced;
+    assert!(
+        (SETTLE_CEILING..=SETTLE_CEILING + SETTLE_POLL + FAKE_MACHINE_STEP).contains(&waited),
+        "the owed review reaches a machine within the ceiling plus one poll of the \
+         cancellation: {waited:?}"
+    );
+    assert_ne!(request.request_id, first.request_id);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].1, "submitted", "{rows:?}");
+    assert_eq!(
+        attempt_plan(&orch.db.local, &rows[1].0).await.head,
+        newest,
+        "the successor planned the newest head"
+    );
+    assert_eq!(
+        request.base_commit, newest,
+        "the machine is asked to check the newest head"
+    );
+    assert_eq!(orch.review_deferrals.unreviewed_for("j-prod"), None);
 }

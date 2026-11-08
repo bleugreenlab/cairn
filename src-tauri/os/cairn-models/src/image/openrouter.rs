@@ -143,6 +143,8 @@ pub fn discovered_model(
         modalities,
         serves: Some(serves),
         // An image offer's output is not budgeted in text tokens.
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: None,
     }
 }

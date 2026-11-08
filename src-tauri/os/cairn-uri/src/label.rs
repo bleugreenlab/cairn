@@ -258,8 +258,8 @@ impl CairnResource {
             Self::InferenceGenerations => "Inference generations".to_string(),
             Self::InferenceGeneration { id } => workspace("Inference generation", Some(id)),
             Self::Bug => "Bug".to_string(),
-            Self::SelfRebuild => "Self-rebuild".to_string(),
-            Self::SelfRebuildOutcome { id } => workspace("Self-rebuild", Some(id)),
+            Self::Rebuilds => "Rebuild ledger".to_string(),
+            Self::Rebuild { id } => workspace("Rebuild", Some(id)),
             Self::Help => "Help".to_string(),
             Self::WebSearch => "Web search".to_string(),
             Self::Mcp { server, resource } => match (server, resource) {

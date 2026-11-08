@@ -16117,7 +16117,8 @@ cairn-common = { path = "../cairn-common" }
 
         let key_with = |path: &str, version: &str| {
             let fixture = real_workspace()
-                .source("scripts/codex-pin.ts", "v1")
+                .source("scripts/tool-pin.ts", "v1")
+                .source("scripts/lib/managed-tools.ts", "v1")
                 .source("src-tauri/os/cairn-common/src/lib.rs", "v1")
                 .source("src-tauri/cairn-orch/src/executor_supervisor.rs", "v1")
                 .source(path, version);
@@ -16138,7 +16139,8 @@ cairn-common = { path = "../cairn-common" }
             "src-tauri/os/cairn-common/src/lib.rs",
             "src-tauri/os/cairn-models/src/session/codex/pin.rs",
             "src-tauri/os/cairn-models/codex-pin.json",
-            "scripts/codex-pin.ts",
+            "scripts/tool-pin.ts",
+            "scripts/lib/managed-tools.ts",
         ] {
             assert_ne!(base, key_with(input, "v2"), "{input} must re-key codex-pin");
         }
@@ -16394,6 +16396,9 @@ cairn-common = { path = "../cairn-common" }
                 | "external-host"
                 | "codex-pin"
                 | "codex-contract"
+                | "claude-pin"
+                | "claude-contract"
+                | "uri-wasm"
                 | "rust-write-pins"
                 | "tls-sole-loader"
                 | "plan-audit"

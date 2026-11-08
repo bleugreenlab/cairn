@@ -1171,11 +1171,11 @@ pub enum CairnResource {
     },
     /// Global bug report sink.
     Bug,
-    /// Pending self-rebuild outcomes: a run records one before handing the
-    /// install to the detached installer.
-    SelfRebuild,
-    /// One pending self-rebuild outcome, delivered at most once.
-    SelfRebuildOutcome {
+    /// Private per-install rebuild ledger (read-only).
+    Rebuilds,
+    /// One rebuild's ingested phases, facts, outcome and ingestion faults.
+    /// A journal's presence is not proof of request authorization or success.
+    Rebuild {
         id: String,
     },
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
@@ -1348,8 +1348,8 @@ impl CairnResource {
             Self::InferenceGenerations => ResourceKind::InferenceGenerations,
             Self::InferenceGeneration { .. } => ResourceKind::InferenceGeneration,
             Self::Bug => ResourceKind::Bug,
-            Self::SelfRebuild => ResourceKind::SelfRebuild,
-            Self::SelfRebuildOutcome { .. } => ResourceKind::SelfRebuildOutcome,
+            Self::Rebuilds => ResourceKind::Rebuilds,
+            Self::Rebuild { .. } => ResourceKind::Rebuild,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,
             Self::Mcp { .. } => ResourceKind::Mcp,

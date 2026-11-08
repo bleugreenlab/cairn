@@ -222,7 +222,8 @@ pub(crate) mod tests {
 
     /// Claude's aliases, and one chat model OpenRouter offers by its slug and
     /// Cairn inference by its real name, the two merged on that slug.
-    pub(crate) fn seed_edit_catalog(orch: &Orchestrator) {
+    pub(crate) async fn seed_edit_catalog(orch: &Orchestrator) {
+        crate::fleet::models::tests::seed_catalog_placement(orch, QWEN_LOCAL).await;
         for (backend, models) in [
             ("claude", claude_models()),
             ("openrouter", vec![chat(QWEN_SLUG, QWEN_SLUG)]),
@@ -251,7 +252,7 @@ pub(crate) mod tests {
             tempfile::tempdir().unwrap().keep(),
         )
         .build();
-        seed_edit_catalog(&orch);
+        seed_edit_catalog(&orch).await;
         orch
     }
 

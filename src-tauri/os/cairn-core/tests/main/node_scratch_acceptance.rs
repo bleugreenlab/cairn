@@ -52,6 +52,8 @@ pub(crate) const MACHINE_B: &str = "scratch-b";
 /// Attached only by the tests that need a machine neither of the others is.
 const MACHINE_C: &str = "scratch-c";
 pub(crate) const OWNER: &str = "cairn://p/nsc/1/1/builder";
+/// The run [`node`] seeds for [`OWNER`]'s job.
+const OWNER_RUN: &str = "r-1";
 const BRANCH: &str = "agent/NSC-1-builder-0";
 
 #[derive(Clone)]
@@ -127,6 +129,7 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
     )
     .boot_at(0)
     .build();
+    common::load_fleet_settings(&orch);
     let server = ObjectServer {
         orch: orch.clone(),
         repository: repository.clone(),
@@ -153,6 +156,9 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
             )
         })
         .collect();
+    for machine in [MACHINE_A, MACHINE_B] {
+        wait_for_machine_readings(&orch, machine).await;
+    }
     TwoMachines {
         temp,
         orch,
@@ -164,6 +170,27 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
         object_url,
         pools,
     }
+}
+
+// Attach establishes a link, not the first telemetry sample. Unselected
+// placement needs the measured CPU and memory, including on a newly added host.
+async fn wait_for_machine_readings(orch: &Orchestrator, machine: &str) {
+    eventually(&format!("{machine} placement readings"), || {
+        orch.fleet
+            .inspect_executors(common::unix_time_ms())
+            .iter()
+            .any(|executor| {
+                executor.health.identity.executor_id == machine
+                    && executor.health.machine.cpu.value().is_some()
+                    && executor.health.machine.memory.value().is_some()
+                    && executor
+                        .health
+                        .host
+                        .cpu_admission
+                        .fresh(common::unix_time_ms())
+            })
+    })
+    .await;
 }
 
 #[derive(Deserialize)]
@@ -498,10 +525,23 @@ impl Node {
     }
 
     pub(crate) async fn drain(&self, machine: &str, drained: bool) {
-        self.orch()
-            .fleet
-            .set_executor_drain_mode(machine, drained)
-            .await;
+        cairn_core::internal::fleet::management::mutate_fleet(self.orch(), |config| {
+            if drained {
+                config.drains.impose_thread(
+                    machine,
+                    OWNER,
+                    &cairn_common::identity::PrincipalRef::Agent {
+                        node: OWNER.into(),
+                        run_id: Some(OWNER_RUN.into()),
+                    },
+                    "scratch acceptance fixture",
+                    1,
+                )
+            } else {
+                config.drains.clear_thread(machine, OWNER)
+            }
+        })
+        .unwrap();
     }
 
     /// This node's replica roots on one machine.
@@ -585,6 +625,25 @@ impl Node {
         reply
     }
 
+    /// Await one admission step that must answer, not wait. A step placement
+    /// parks instead of answering would otherwise hold the test until its
+    /// runner-level limit and say nothing; this names the step and prints each
+    /// machine's placement journal, which records what the work waits on.
+    async fn bounded<T>(&self, step: &str, work: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(Duration::from_secs(60), work).await {
+            Ok(done) => done,
+            Err(_) => {
+                for executor in self.orch().fleet.inspect_executors(common::unix_time_ms()) {
+                    eprintln!(
+                        "{}: {:#?}",
+                        executor.health.identity.executor_id, executor.recent_placements
+                    );
+                }
+                panic!("{step} did not answer in 60 s; the placement journal is above");
+            }
+        }
+    }
+
     /// Attach the runner's own machine, named `local`, beside the node's two.
     /// It is what a job with no route is guessed to found its home on.
     pub(crate) async fn attach_colocated(&self) {
@@ -620,6 +679,7 @@ impl Node {
             common::attach_isolated_test_executor_as(&orch, MACHINE_C, attached, url, project);
         })
         .await;
+        wait_for_machine_readings(self.orch(), MACHINE_C).await;
         home
     }
 
@@ -1075,6 +1135,98 @@ async fn a_scratch_affinity_guess_places_the_batch_and_never_selects_its_home() 
         None,
         "the home was acquired under no selector"
     );
+}
+
+/// A batch that names a machine and finds no home runs detached and leaves
+/// none. Establish the job's residency with a terminal before imposing the
+/// machine's self-update drain, which refuses only new environments. A job
+/// whose terminal was already running crosses that drain
+/// when the drain began, and a thread drain beside it refuses the same job's
+/// next terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resident_terminal_and_batch_cross_only_the_self_update_drain() {
+    if common::skip_if_fenced("a_resident_terminal_and_batch_cross_only_the_self_update_drain") {
+        return;
+    }
+    use cairn_config::drain::{AdmissionEffect, RuntimeDrainContext, RuntimeDrainKind};
+    let node = node().await;
+    node.start_terminal_of(
+        OWNER_RUN,
+        OWNER,
+        "before-update",
+        Some(MACHINE_A),
+        "sleep 120",
+    )
+    .await;
+    node.home_acquisition_of("job-1");
+    cairn_core::internal::fleet::management::mutate_fleet(node.orch(), |config| {
+        config.drains.impose_runtime(
+            MACHINE_A,
+            RuntimeDrainContext {
+                kind: RuntimeDrainKind::SelfUpdate,
+                operation_id: "fixture-update".into(),
+                turn_id: "fixture-turn".into(),
+                runner_boot_id: "fixture-boot".into(),
+                admission_effect: AdmissionEffect::RefuseNewEnvironments,
+            },
+            &cairn_common::identity::PrincipalRef::Agent {
+                node: OWNER.into(),
+                run_id: Some(OWNER_RUN.into()),
+            },
+            "self-update fixture; completion estimate unknown",
+            1,
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    node.bounded(
+        "a second terminal of the resident job during the self-update drain",
+        node.start_terminal_of(
+            OWNER_RUN,
+            OWNER,
+            "during-update",
+            Some(MACHINE_A),
+            "sleep 120",
+        ),
+    )
+    .await;
+    let resident = node
+        .bounded(
+            "a batch of the resident job during the self-update drain",
+            node.shell(OWNER_RUN, Some(MACHINE_A), "echo still-resident"),
+        )
+        .await;
+    assert!(
+        resident.starts_with(&format!("Ran on **{MACHINE_A}**")),
+        "{resident}"
+    );
+    assert!(resident.contains("still-resident"), "{resident}");
+
+    node.drain(MACHINE_A, true).await;
+    let refused = node
+        .bounded(
+            "a terminal create under a thread drain",
+            handle_write(
+                node.orch(),
+                &McpCallbackRequest {
+                    answer_bound_ms: None,
+                    thread_id: None,
+                    cwd: String::new(),
+                    run_id: Some(OWNER_RUN.into()),
+                    tool: "write".into(),
+                    payload: json!({ "changes": [{
+                        "target": format!("{OWNER}/terminal/blocked-by-thread"),
+                        "mode": "create",
+                        "payload": { "command": "echo forbidden", "executor": { "name": MACHINE_A } }
+                    }] }),
+                    tool_use_id: None,
+                    origin: None,
+                },
+            ),
+        )
+        .await;
+    assert!(!refused.contains("Started terminal"), "{refused}");
+    assert!(refused.contains("scratch acceptance fixture"), "{refused}");
 }
 
 /// cairn/5784: with live terminals on two machines, a batch that names no

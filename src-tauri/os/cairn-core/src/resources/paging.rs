@@ -46,6 +46,7 @@ pub(crate) fn paging(kind: ResourceKind) -> Paging {
     use ResourceKind as K;
     match kind {
         K::Requests
+        | K::Rebuilds
         | K::Db
         | K::DbTable
         | K::DevDb

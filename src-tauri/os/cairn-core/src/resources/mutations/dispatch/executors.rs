@@ -24,6 +24,7 @@ struct ConfigureRequest {
     #[serde(alias = "runtime_policy")]
     runtime_policy: Option<cairn_common::executor_protocol::ExecutorRuntimePolicy>,
     draining: Option<bool>,
+    reason: Option<String>,
     /// What the machine is for, one of [`MachineRole::ALL`]. Runner state like
     /// draining, so it is durable and unfenced.
     ///
@@ -54,6 +55,7 @@ impl ConfigureRequest {
         if self.new_name.is_some()
             || self.runtime_policy.is_some()
             || self.draining.is_some()
+            || self.reason.is_some()
             || self.role.is_some()
             || self.machine_services.is_some()
             || self.repaired.is_some()
@@ -97,7 +99,7 @@ struct ListenerRotationRequest {
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
-    _request: &McpCallbackRequest,
+    callback: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
     dry_run: bool,
@@ -228,13 +230,26 @@ pub(super) async fn dispatch(
                         index,
                         item,
                         format!(
-                            "invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role ({}), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, memoryDiagnostic ({{runId,durationMs}} or null), and expectedGeneration.",
+                            "invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, reason, role ({}), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, memoryDiagnostic ({{runId,durationMs}} or null), and expectedGeneration.",
                             cairn_common::executor_protocol::MachineRole::ALL
                                 .map(cairn_common::executor_protocol::MachineRole::as_str)
                                 .join(", ")
                         ),
                     )
                 })?;
+            if request.reason.is_some() && request.draining.is_none() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "reason requires a draining change",
+                ));
+            }
+            // Authenticate before any other field of a combined patch can act.
+            if request.draining.is_some() {
+                management::thread_drain_actor(orch, callback)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+            }
             if let Some(selection) = &request.memory_diagnostic {
                 let generation = request
                     .diagnostic_generation()
@@ -310,7 +325,8 @@ pub(super) async fn dispatch(
                     planned.push(if draining {
                         "enable draining".to_string()
                     } else {
-                        "stop draining".to_string()
+                        "clear only this thread's drain and imported legacy; other owners remain"
+                            .to_string()
                     });
                 }
                 if let Some(role) = request.role {
@@ -355,9 +371,15 @@ pub(super) async fn dispatch(
                     applied.push("runtime policy applied".to_string());
                 }
                 if let Some(draining) = request.draining {
-                    let outcome = management::set_drain_mode(orch, name, draining)
-                        .await
-                        .map_err(|error| build_failure(index, item, error))?;
+                    let outcome = management::set_thread_drain(
+                        orch,
+                        name,
+                        draining,
+                        request.reason.as_deref(),
+                        callback,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
                     applied.push(outcome.summary());
                 }
                 if let Some(role) = request.role {
@@ -398,8 +420,10 @@ pub(super) async fn dispatch(
             }
         }
         (CairnResource::Executor { name }, ChangeMode::Delete) => {
-            let executor_id = management::resolve_executor_reference(orch, name)
+            let thread_actor = management::thread_drain_actor(orch, callback)
+                .await
                 .map_err(|error| build_failure(index, item, error))?;
+            let actor = management::RemovalActor::from(&thread_actor);
             let acknowledged = item
                 .payload
                 .as_ref()
@@ -407,6 +431,10 @@ pub(super) async fn dispatch(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             if dry_run {
+                let executor_id = management::resolve_executor_reference(orch, name)
+                    .map_err(|error| build_failure(index, item, error))?;
+                preview_removal_drains(&orch.config_dir, &executor_id)
+                    .map_err(|error| build_failure(index, item, error))?;
                 let reading = management::occupancy(orch, &executor_id);
                 if reading.is_empty() || acknowledged {
                     format!("Would remove {name} and revoke its enrollment")
@@ -422,10 +450,23 @@ pub(super) async fn dispatch(
                     )
                 }
             } else {
-                let result = management::remove(orch, name, acknowledged)
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?;
-                if result.config.is_none() {
+                let result = management::remove(
+                    orch,
+                    name,
+                    acknowledged,
+                    &actor,
+                    item.payload
+                        .as_ref()
+                        .and_then(|value| value.get("operationId"))
+                        .and_then(serde_json::Value::as_str),
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                if result.replayed {
+                    format!(
+                        "Removal reconciled from durable receipt; no effect repeated for {name}"
+                    )
+                } else if result.result.config.is_none() {
                     format!(
                         "Removed {name}: cleared the failed enrollment record. Its rollback had already completed, so there was no configuration, supervision, credential, or remote process left to remove."
                     )
@@ -433,7 +474,7 @@ pub(super) async fn dispatch(
                     // Removal is a registry change that never reaches the host,
                     // so the summary says what the host still holds rather than
                     // claiming a teardown.
-                    match result.left_on_host {
+                    match result.result.left_on_host {
                         None => {
                             format!("Removed {name}: enrollment revoked, configuration removed")
                         }
@@ -449,6 +490,51 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+// Preview must not persist a legacy import or publish a live projection. The
+// actual removal rechecks the records under the serialized mutation lock.
+fn preview_removal_drains(config_dir: &std::path::Path, executor_id: &str) -> Result<(), String> {
+    let config = crate::config::settings::read_fleet_strict(config_dir)?;
+    if !config.drains.records(executor_id).is_empty() {
+        return Err(
+            "thread removal cannot clear any standing drain; confirm acknowledges occupancy only"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod removal_preview_tests {
+    use super::preview_removal_drains;
+
+    #[test]
+    fn removal_preview_never_creates_or_rewrites_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::config::settings::get_settings_path(dir.path());
+        preview_removal_drains(dir.path(), "remote").unwrap();
+        assert!(!path.exists(), "preview must not initialize settings");
+
+        let legacy =
+            "# preserve formatting and migration state\nbuildSlots:\n  drainedMachines: [remote]\n";
+        std::fs::write(&path, legacy).unwrap();
+        assert!(preview_removal_drains(dir.path(), "remote")
+            .unwrap_err()
+            .contains("cannot clear any standing drain"));
+        preview_removal_drains(dir.path(), "other").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn removal_preview_fails_closed_without_rewriting_an_undecodable_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::config::settings::get_settings_path(dir.path());
+        let yaml = "buildSlots:\n  drains:\n    version: 99\n";
+        std::fs::write(&path, yaml).unwrap();
+        assert!(preview_removal_drains(dir.path(), "remote").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+    }
 }
 
 #[cfg(test)]

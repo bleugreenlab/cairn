@@ -12,8 +12,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use cairn_models::interface::retention::{CostSource, Requirements, ZeroDataRetention};
 use cairn_models::interface::{Catalog, ModelScope, Models, NoOffer, OfferQuery};
 use cairn_models::types::catalog::VerbKind;
+use cairn_models::types::usage::{Charge, Measure, Meter, MeteredUsage};
 use serde_json::Value;
 
 use super::Orchestrator;
@@ -72,6 +74,9 @@ pub(crate) struct CompleteDoorRequest {
     /// A JSON Schema the answer must meet.
     #[serde(default)]
     pub output: Option<Value>,
+    /// What the deployment that answers must keep to (zero data retention).
+    #[serde(default)]
+    pub requirements: Requirements,
 }
 
 /// Tokens the completion consumed, where the provider reported them.
@@ -96,11 +101,18 @@ pub(crate) struct CompleteOutcome {
     pub model: String,
     pub provider: String,
     pub usage: CompleteUsage,
+    /// USD: the provider's figure, or the catalog's list price for the tokens
+    /// it reported when it gave none (`cost_source` says which).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<CostSource>,
     pub latency_ms: u64,
     /// The response-history entry this call was journaled as.
     pub history: String,
+    /// How a zero-data-retention requirement was met, when one applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_data_retention: Option<ZeroDataRetention>,
 }
 
 /// The offers serving `complete` in scope, named `provider/model`: at most
@@ -121,6 +133,34 @@ fn complete_offers_named(catalog: &Catalog) -> String {
         named.push_str(&format!(" and {} more", all.len() - ALTERNATIVES_NAMED));
     }
     named
+}
+
+/// A journaled completion's tokens back on the meters a price is read from:
+/// the whole prompt less its cache reads as input, the cache reads, and the
+/// output (which counts reasoning). Only reported counts are measured.
+fn metered(
+    prompt_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+) -> MeteredUsage {
+    let input = prompt_tokens.map(|prompt| prompt.saturating_sub(cached_input_tokens.unwrap_or(0)));
+    MeteredUsage {
+        measures: [
+            (Charge::Input, input),
+            (Charge::CacheRead, cached_input_tokens),
+            (Charge::Output, output_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(charge, quantity)| {
+            Some(Measure {
+                meter: Meter::tokens(charge),
+                quantity: quantity?,
+            })
+        })
+        .collect(),
+        cost_usd,
+    }
 }
 
 /// The conversation `request` asks for, or why it cannot be sent.
@@ -182,7 +222,7 @@ impl Orchestrator {
     ) -> Result<CompleteOutcome, String> {
         let request: CompleteDoorRequest = serde_json::from_value(args.clone()).map_err(|error| {
             format!(
-                "cairn://models/complete takes {{model, prompt | messages, system?, options?, output?}} in payload.args_json: {error}. Read cairn://models/complete for the shape."
+                "cairn://models/complete takes {{model, prompt | messages, system?, options?, output?, requirements?}} in payload.args_json: {error}. Read cairn://models/complete for the shape."
             )
         })?;
         let catalog = self
@@ -245,6 +285,20 @@ impl Orchestrator {
                 .map_err(|error| format!("`output` is not a valid JSON Schema: {error}"))?;
         }
 
+        // Decided here as well as at the launch gate, so the reply can say how
+        // it was met and a refusal comes before the call is journaled; the
+        // gate decides it again when the request is sent.
+        let zero_data_retention = crate::backends::retention::admit(
+            self,
+            &offer.provider,
+            crate::backends::backend_for_name(Some(&offer.provider)).as_ref(),
+            &offer.model,
+            &request.requirements,
+            project_id,
+            VerbKind::Complete,
+        )?
+        .map(|admitted| admitted.report);
+
         let timeout = bound.limit.min(REQUEST_TIMEOUT);
         let definition = ResponseDefinition {
             name: "models-complete".to_string(),
@@ -280,6 +334,7 @@ impl Orchestrator {
             .to_extras(),
             output_schema: request.output.clone(),
             timeout,
+            requirements: request.requirements,
         };
         let rendered = match &request.system {
             Some(system) => format!("[system]\n{system}\n\n{}", completion.single_prompt()),
@@ -313,6 +368,17 @@ impl Orchestrator {
                 outcome.seq
             ),
         };
+        let (cost, cost_source) = self.call_cost(
+            project_id,
+            &offer.provider,
+            &offer.model,
+            &metered(
+                outcome.input_tokens,
+                outcome.cached_input_tokens,
+                outcome.output_tokens,
+                outcome.cost,
+            ),
+        );
         Ok(CompleteOutcome {
             text: outcome.text,
             reasoning: outcome.reasoning,
@@ -325,9 +391,11 @@ impl Orchestrator {
                 cached_input_tokens: outcome.cached_input_tokens,
                 reasoning_tokens: outcome.reasoning_tokens,
             },
-            cost: outcome.cost,
+            cost,
+            cost_source,
             latency_ms: outcome.latency_ms,
             history,
+            zero_data_retention,
         })
     }
 
@@ -627,7 +695,7 @@ mod tests {
                 json!({"model": "qwen3", "prompt": "hi", "output": {"type": "nonsense"}}),
                 "not a valid JSON Schema",
             ),
-            (json!({"model": "qwen3", "text": "hi"}), "{model, prompt | messages, system?, options?, output?}"),
+            (json!({"model": "qwen3", "text": "hi"}), "{model, prompt | messages, system?, options?, output?, requirements?}"),
         ] {
             let refusal = complete(&orch, args.clone()).await.unwrap_err();
             assert!(refusal.contains(expected), "{args}: {refusal}");

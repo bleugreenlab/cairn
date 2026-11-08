@@ -104,9 +104,21 @@ where
 pub fn load_fleet(config_dir: &std::path::Path) -> crate::fleet::FleetConfig {
     load_settings_file(config_dir)
         .ok()
-        .and_then(|file| file.fleet)
+        .and_then(|file| file.fleet().ok().flatten())
         .unwrap_or_default()
         .healed()
+}
+
+/// Read the fleet block as decisive evidence. Unlike [`load_fleet`], an
+/// unreadable or malformed document is an error, never an empty fleet: absent
+/// drains must not be inferred from a failed read.
+pub fn read_fleet_strict(
+    config_dir: &std::path::Path,
+) -> Result<crate::fleet::FleetConfig, String> {
+    Ok(load_settings_file(config_dir)?
+        .fleet()?
+        .unwrap_or_default()
+        .healed())
 }
 
 /// Serializes every write of the fleet block, and keeps a role write and the
@@ -123,11 +135,41 @@ fn fleet_mutation_guard() -> std::sync::MutexGuard<'static, ()> {
 const BUILD_SLOTS_KEY: &str = "buildSlots";
 
 fn parse_fleet_block(slots: &serde_yaml::Value) -> Result<crate::fleet::FleetConfig, String> {
-    // Match the settings file's YAML-text read: from_value rejects scalar-to-string
-    // coercions such as the unquoted SSH argument -4 in older fleet files.
-    let yaml = serde_yaml::to_string(slots)
+    let mut slots = slots.clone();
+    let mapping = slots
+        .as_mapping_mut()
+        .ok_or("buildSlots must be a mapping")?;
+    if let Some(legacy) = mapping.remove(serde_yaml::Value::String("drainedMachines".into())) {
+        if mapping.contains_key("drains") {
+            return Err("buildSlots contains conflicting legacy and owned drain state".into());
+        }
+        let keys: Vec<String> = serde_yaml::from_value(legacy)
+            .map_err(|error| format!("Invalid legacy drainedMachines: {error}"))?;
+        let drains = crate::drain::DrainState::import_legacy(keys)?;
+        mapping.insert(
+            serde_yaml::Value::String("drains".into()),
+            serde_yaml::to_value(drains).map_err(|error| error.to_string())?,
+        );
+    }
+    // YAML text preserves legacy scalar-to-string coercions (SSH argument -4).
+    let yaml = serde_yaml::to_string(&slots)
         .map_err(|error| format!("Failed to serialize buildSlots: {error}"))?;
-    serde_yaml::from_str(&yaml).map_err(|error| format!("Failed to parse buildSlots: {error}"))
+    let config: crate::fleet::FleetConfig = serde_yaml::from_str(&yaml)
+        .map_err(|error| format!("Failed to parse buildSlots: {error}"))?;
+    config.drains.validate()?;
+    Ok(config)
+}
+
+/// Keep a present `buildSlots` verbatim, an explicit `null` included: Serde's
+/// `Option` would read `null` as absent, and an absent block is the empty
+/// fleet, which a strict read must never infer from a value it cannot parse.
+fn deserialize_raw_build_slots<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_yaml::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    serde_yaml::Value::deserialize(deserializer).map(Some)
 }
 
 fn insert_fleet(
@@ -174,14 +216,15 @@ pub fn set_fleet(
             .get(BUILD_SLOTS_KEY)
             .and_then(|slots| slots.get("colocatedBuildRoot"))
             .and_then(|build_root| serde_yaml::from_value(build_root.clone()).ok());
-        let held_services = match root.get(BUILD_SLOTS_KEY) {
-            None => Default::default(),
-            Some(slots) => parse_fleet_block(slots)?.healed().machine_services,
+        let held = match root.get(BUILD_SLOTS_KEY) {
+            None => crate::fleet::FleetConfig::default(),
+            Some(slots) => parse_fleet_block(slots)?.healed(),
         };
         let mut next = config.clone();
         next.carry_machine_roles(held_roles);
         next.colocated_build_root = held_build_root;
-        next.machine_services = held_services;
+        next.machine_services = held.machine_services;
+        next.drains = held.drains;
         insert_fleet(root, &next)
     })
 }
@@ -200,19 +243,70 @@ pub fn mutate_fleet<T>(
     mutate: impl FnOnce(&mut crate::fleet::FleetConfig) -> Result<T, String>,
     publish: impl FnOnce(&crate::fleet::FleetConfig),
 ) -> Result<T, String> {
+    let outcome = mutate_fleet_committed(config_dir, mutate, publish)?;
+    if let Some(warning) = outcome.durability_warning {
+        log::error!("Committed fleet settings require durability reconciliation: {warning}");
+    }
+    Ok(outcome.value)
+}
+
+/// A replacement has committed. A later directory-sync diagnostic must never be
+/// interpreted as permission to reapply a drain clear. Inspect the persisted
+/// receipt and reconcile instead. `Err` always means no replacement occurred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome<T> {
+    pub value: T,
+    pub durability_warning: Option<String>,
+}
+
+pub fn mutate_fleet_committed<T>(
+    config_dir: &std::path::Path,
+    mutate: impl FnOnce(&mut crate::fleet::FleetConfig) -> Result<T, String>,
+    publish: impl FnOnce(&crate::fleet::FleetConfig),
+) -> Result<CommitOutcome<T>, String> {
+    mutate_fleet_with_sync(config_dir, mutate, publish, sync_settings_directory)
+}
+
+fn mutate_fleet_with_sync<T>(
+    config_dir: &std::path::Path,
+    mutate: impl FnOnce(&mut crate::fleet::FleetConfig) -> Result<T, String>,
+    publish: impl FnOnce(&crate::fleet::FleetConfig),
+    sync_directory: fn(&std::path::Path) -> Result<(), String>,
+) -> Result<CommitOutcome<T>, String> {
     let _fleet = fleet_mutation_guard();
-    let (result, config) =
-        mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+    let outcome = mutate_workspace_settings_with_sync(
+        config_dir,
+        "cairn: update settings",
+        |root| {
             let mut config = match root.get(BUILD_SLOTS_KEY) {
                 None => crate::fleet::FleetConfig::default(),
                 Some(slots) => parse_fleet_block(slots)?.healed(),
             };
+            config.validate()?;
             let result = mutate(&mut config)?;
             insert_fleet(root, &config)?;
             Ok((result, config))
-        })?;
+        },
+        sync_directory,
+    )?;
+    let (result, config) = outcome.value;
+    // No awaits, I/O or settings re-entry are permitted in this callback.
+    // It runs even after a post-replacement directory-sync error.
     publish(&config);
-    Ok(result)
+    Ok(CommitOutcome {
+        value: result,
+        durability_warning: outcome.durability_warning,
+    })
+}
+
+/// Authoritative startup/recovery path. Admission stays initialization-fenced
+/// until this returns successfully and the caller has inspected durability.
+/// Legacy imports are durably replaced before synchronous publication.
+pub fn load_fleet_authoritative(
+    config_dir: &std::path::Path,
+    publish: impl FnOnce(&crate::fleet::FleetConfig),
+) -> Result<CommitOutcome<crate::fleet::FleetConfig>, String> {
+    mutate_fleet_committed(config_dir, |config| Ok(config.clone()), publish)
 }
 
 /// Persist the conversion of the retired `buildSlots.desktopAutomation` toggles
@@ -399,9 +493,15 @@ pub struct SettingsFile {
     build_services: Option<HashMap<String, crate::build_services::BuildServiceConfig>>,
     /// Runner-owned persistent fleet capability. Project configuration may
     /// request slot routing, but only this workspace-owned section grants it.
+    /// Held opaque so a block this build cannot decode (a newer drain
+    /// version, an unknown field) fails only the fleet readers that parse it
+    /// through [`SettingsFile::fleet`], never the general settings around it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "buildSlots")]
-    pub fleet: Option<crate::fleet::FleetConfig>,
+    #[serde(
+        rename = "buildSlots",
+        deserialize_with = "deserialize_raw_build_slots"
+    )]
+    build_slots: Option<serde_yaml::Value>,
     /// What each inference profile's model serves and takes, as the operator
     /// declares it. Config-only (YAML, not in the Settings DTO); written
     /// through `cairn://settings` and preserved across saves.
@@ -443,6 +543,13 @@ pub struct SettingsFile {
     /// normal routing; omitted from YAML when all-default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     openrouter_routing: Option<OpenRouterRouting>,
+    /// Provider keys the operator declares zero-data-retention (a
+    /// `custom:<account>` key for an Anthropic or OpenAI API account under a
+    /// ZDR agreement, or for an endpoint on a public host they run). A call that requires zero
+    /// retention is admitted on a declared provider without its own check.
+    /// Config-only (YAML, not in the Settings DTO); preserved across saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_data_retention_providers: Option<Vec<String>>,
     /// Opt-in: route tier-based ephemeral calls through OpenRouter's in-process
     /// HTTP loop instead of the native backend. Absent/false = native routing;
     /// omitted from YAML when unset.
@@ -656,6 +763,12 @@ impl LegacyGrid {
 }
 
 impl SettingsFile {
+    /// Decode `buildSlots` with the canonical strict fleet parser: `None` when
+    /// the block is absent, an error when it is present but undecodable.
+    pub fn fleet(&self) -> Result<Option<crate::fleet::FleetConfig>, String> {
+        self.build_slots.as_ref().map(parse_fleet_block).transpose()
+    }
+
     /// Whether this file still carries any of the retired tier grid keys.
     pub fn has_tier_grid(&self) -> bool {
         self.tier_defaults.is_some()
@@ -909,7 +1022,7 @@ impl SettingsFile {
             mcp: None,
             browser_network_sensitive_names: None,
             build_services: None,
-            fleet: None,
+            build_slots: None,
             inference: None,
             served_api: None,
             accepted_fence_commands: None,
@@ -921,6 +1034,7 @@ impl SettingsFile {
             active_web_search: None,
             pdf: None,
             active_pdf: None,
+            zero_data_retention_providers: None,
         }
     }
 }
@@ -957,6 +1071,30 @@ pub fn mutate_workspace_settings<T>(
     commit_message: &str,
     mutate: impl FnOnce(&mut serde_yaml::Mapping) -> Result<T, String>,
 ) -> Result<T, String> {
+    let outcome = mutate_workspace_settings_committed(config_dir, commit_message, mutate)?;
+    if let Some(warning) = outcome.durability_warning {
+        log::error!("Committed settings require durability reconciliation: {warning}");
+    }
+    Ok(outcome.value)
+}
+
+/// The temporary file is synced before atomic replacement. On Unix we also
+/// sync the containing directory. Other platforms provide atomic replacement
+/// and file sync, but no portable directory-sync guarantee through std.
+pub fn mutate_workspace_settings_committed<T>(
+    config_dir: &std::path::Path,
+    commit_message: &str,
+    mutate: impl FnOnce(&mut serde_yaml::Mapping) -> Result<T, String>,
+) -> Result<CommitOutcome<T>, String> {
+    mutate_workspace_settings_with_sync(config_dir, commit_message, mutate, sync_settings_directory)
+}
+
+fn mutate_workspace_settings_with_sync<T>(
+    config_dir: &std::path::Path,
+    commit_message: &str,
+    mutate: impl FnOnce(&mut serde_yaml::Mapping) -> Result<T, String>,
+    sync_directory: fn(&std::path::Path) -> Result<(), String>,
+) -> Result<CommitOutcome<T>, String> {
     let lock = WORKSPACE_SETTINGS_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock
         .lock()
@@ -982,7 +1120,17 @@ pub fn mutate_workspace_settings<T>(
     let result = mutate(&mut root)?;
 
     if root == original {
-        return Ok(result);
+        // A controlled reload must be able to finish directory durability after
+        // an earlier replacement reported a sync error, even without new edits.
+        let durability_warning = if content.is_some() {
+            sync_directory(config_dir).err()
+        } else {
+            None
+        };
+        return Ok(CommitOutcome {
+            value: result,
+            durability_warning,
+        });
     }
 
     std::fs::create_dir_all(config_dir)
@@ -1001,12 +1149,32 @@ pub fn mutate_workspace_settings<T>(
         .persist(&path)
         .map_err(|error| format!("Failed to replace settings file: {}", error.error))?;
 
+    // persist() is the commit point: all subsequent failures carry committed
+    // evidence rather than being returned as pre-commit errors.
+    let durability_warning = sync_directory(config_dir).err();
     super::commit_and_maybe_push(
         std::slice::from_ref(&path),
         commit_message,
         Some(config_dir),
     );
-    Ok(result)
+    Ok(CommitOutcome {
+        value: result,
+        durability_warning,
+    })
+}
+
+#[cfg(unix)]
+fn sync_settings_directory(config_dir: &std::path::Path) -> Result<(), String> {
+    std::fs::File::open(config_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!("settings replacement committed but directory sync failed: {error}")
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_settings_directory(_config_dir: &std::path::Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// The file-log verbosity level (default `Standard`). Read once at process
@@ -1192,6 +1360,15 @@ fn mutate_build_services<T>(
 
 const SERVED_API_KEY: &str = "servedApi";
 
+/// The provider keys the operator declared zero-data-retention
+/// (`zeroDataRetentionProviders`), empty when none are.
+pub fn load_zero_data_retention_providers(config_dir: &std::path::Path) -> Vec<String> {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.zero_data_retention_providers)
+        .unwrap_or_default()
+}
+
 /// The workspace's `servedApi` section, or an empty one (listener off) when
 /// unset.
 pub fn load_served_api(config_dir: &std::path::Path) -> crate::served_api::ServedApiSettings {
@@ -1311,12 +1488,13 @@ fn expand_home(path: &str) -> PathBuf {
 pub fn load_settings_file(config_dir: &std::path::Path) -> Result<SettingsFile, String> {
     let path = get_settings_path(config_dir);
 
-    if !path.exists() {
-        return Ok(SettingsFile::default());
-    }
-
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read settings file: {}", e))?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SettingsFile::default())
+        }
+        Err(error) => return Err(format!("Failed to read settings file: {error}")),
+    };
 
     serde_yaml::from_str(&content).map_err(|e| format!("Failed to parse settings file: {}", e))
 }
@@ -2804,6 +2982,30 @@ buildServices:
     }
 
     #[test]
+    fn zero_retention_declarations_are_read_and_survive_a_general_save() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_zero_data_retention_providers(dir.path()).is_empty());
+        save_settings(dir.path(), &test_settings()).unwrap();
+        let path = get_settings_path(dir.path());
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{text}zeroDataRetentionProviders:\n  - anthropic\n  - custom:acc_1\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_zero_data_retention_providers(dir.path()),
+            ["anthropic", "custom:acc_1"]
+        );
+        save_settings(dir.path(), &test_settings()).unwrap();
+        assert_eq!(
+            load_zero_data_retention_providers(dir.path()),
+            ["anthropic", "custom:acc_1"],
+            "a save from the settings page keeps the operator's declaration"
+        );
+    }
+
+    #[test]
     fn served_api_settings_are_surgical_and_survive_a_general_save() {
         let dir = tempfile::tempdir().unwrap();
         save_settings(dir.path(), &test_settings()).unwrap();
@@ -3578,7 +3780,7 @@ buildSlots:
     clearWindowMs: 10000
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let fleet = file.fleet.as_ref().unwrap();
+        let fleet = &file.fleet().unwrap().unwrap();
         assert_eq!(fleet.capacity_wait_horizon_seconds, 900);
         assert_eq!(fleet.default_timeout_seconds, 1800);
         assert_eq!(fleet.cpu_admission.entry, 0.8);
@@ -3595,7 +3797,7 @@ buildSlots:
         );
         let serialized = serde_yaml::to_string(&file).unwrap();
         let reparsed: SettingsFile = serde_yaml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.fleet, file.fleet);
+        assert_eq!(reparsed.fleet().unwrap(), file.fleet().unwrap());
         assert!(serialized.contains("buildSlots:"));
         assert!(fleet.remote_executors.is_empty());
         assert!(serialized.contains("cpuAdmission:"));
@@ -3623,7 +3825,7 @@ buildSlots:
             "buildSlots:\n  acquisitionDeadlineSeconds: 15\n  defaultTimeoutSeconds: 1800\n",
         )
         .unwrap();
-        let fleet = file.fleet.as_ref().unwrap();
+        let fleet = &file.fleet().unwrap().unwrap();
         assert_eq!(
             fleet.capacity_wait_horizon_seconds, 600,
             "the retired key names a quantity this field is not, so it supplies nothing"
@@ -3633,7 +3835,7 @@ buildSlots:
         // the alias was removed, so only the floor can still catch it.
         let laundered: SettingsFile =
             serde_yaml::from_str("buildSlots:\n  capacityWaitHorizonSeconds: 20\n").unwrap();
-        let laundered = laundered.fleet.unwrap();
+        let laundered = laundered.fleet().unwrap().unwrap();
         assert!(
             laundered.validate().is_err(),
             "no new horizon this short can be written"
@@ -3683,7 +3885,7 @@ buildSlots:
       extraSshArgs: [-4]
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let fleet = file.fleet.as_ref().unwrap();
+        let fleet = &file.fleet().unwrap().unwrap();
         fleet.validate().unwrap();
         let remote = &fleet.remote_executors["linux-builder"];
         assert_eq!(remote.ssh_user, "dev");
@@ -3691,7 +3893,7 @@ buildSlots:
 
         let serialized = serde_yaml::to_string(&file).unwrap();
         let reparsed: SettingsFile = serde_yaml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.fleet, file.fleet);
+        assert_eq!(reparsed.fleet().unwrap(), file.fleet().unwrap());
         let serialized_lower = serialized.to_ascii_lowercase();
         for forbidden in ["token:", "credential:", "grant:", "secret:"] {
             assert!(
@@ -3738,7 +3940,7 @@ buildSlots:
         assert_eq!(remote.extra_ssh_args, vec!["-4".to_string()]);
         assert_eq!(remote.bootstrapped_at_unix_ms, None);
         assert_eq!(remote.legacy_tunnel_port, Some(43_849));
-        assert!(fleet.drained_machines.contains("bglab-mac"));
+        assert!(fleet.is_machine_drained("bglab-mac"));
         assert!(!fleet.machine_services.is_empty());
         let selections = fleet.machine_services.clone();
         super::set_fleet(temp.path(), &fleet).unwrap();
@@ -3746,7 +3948,7 @@ buildSlots:
         assert!(!serialized.contains("tunnelPort"));
         let reopened = super::load_fleet(temp.path());
         assert!(reopened.remote_executors.contains_key("bglab-ub"));
-        assert!(reopened.drained_machines.contains("bglab-mac"));
+        assert!(reopened.is_machine_drained("bglab-mac"));
         assert_eq!(reopened.machine_services, selections);
         assert_eq!(
             reopened.remote_executors["bglab-ub"].legacy_tunnel_port,
@@ -4746,5 +4948,374 @@ routeCallsViaOpenRouter: true
             .all(|rung| rung.model.backend != "codex"));
         assert_eq!(band(&models, "myth"), ["claude/fable"]);
         assert_eq!(converted(temp.path()), models);
+    }
+}
+
+#[cfg(test)]
+mod owned_drain_tests {
+    use super::*;
+    use crate::drain::*;
+    use cairn_common::identity::PrincipalRef;
+
+    fn principal() -> PrincipalRef {
+        PrincipalRef::Human {
+            issuer: "test".into(),
+            subject: "operator".into(),
+            organization: None,
+        }
+    }
+
+    #[test]
+    fn legacy_import_is_durable_before_publication_and_only_at_settings_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "buildSlots:\n  drainedMachines: [local, remote]\n";
+        std::fs::write(get_settings_path(dir.path()), yaml).unwrap();
+        // Plain fleet DTOs do not import legacy authorization.
+        let dto: crate::fleet::FleetConfig =
+            serde_yaml::from_str("drainedMachines: [local]").unwrap();
+        assert!(!dto.is_machine_drained("colocated"));
+        let outcome = load_fleet_authoritative(dir.path(), |fleet| {
+            let persisted = std::fs::read_to_string(get_settings_path(dir.path())).unwrap();
+            assert!(!persisted.contains("drainedMachines"));
+            assert!(persisted.contains("drains:"));
+            assert!(fleet.is_machine_drained("colocated"));
+            assert!(fleet.is_machine_drained("remote"));
+        })
+        .unwrap();
+        assert!(outcome.durability_warning.is_none());
+        let record = &outcome.value.drains.records("colocated")[0];
+        assert_eq!(record.provenance, DrainProvenance::LegacyUnknown);
+        assert_eq!(record.reason, LEGACY_DRAIN_REASON);
+        let before = std::fs::read(get_settings_path(dir.path())).unwrap();
+        let reloaded = load_fleet_authoritative(dir.path(), |_| {}).unwrap().value;
+        assert_eq!(reloaded.drains, outcome.value.drains);
+        assert_eq!(
+            std::fs::read(get_settings_path(dir.path())).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn malformed_and_conflicting_new_state_refuses_load_without_publication_or_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = [
+            "buildSlots: [invalid]",
+            "buildSlots:\n  drains: null",
+            "buildSlots:\n  drains: {version: 2, machines: {}, liftReceipts: {}, removalReceipts: {}}",
+            "buildSlots:\n  drains: {version: 1, machines: {}, liftReceipts: {}}",
+            "buildSlots:\n  drainedMachines: [local]\n  drains: {version: 1, machines: {}, liftReceipts: {}, removalReceipts: {}}",
+            "buildSlots:\n  drainedMachines: [local, local]",
+            "buildSlots:\n  drainedMachines: [null]",
+            "[not-a-mapping]",
+            "buildSlots: [",
+        ];
+        for yaml in invalid {
+            std::fs::write(get_settings_path(dir.path()), yaml).unwrap();
+            let error =
+                load_fleet_authoritative(dir.path(), |_| panic!("invalid state must not publish"))
+                    .unwrap_err();
+            assert!(!error.is_empty());
+            assert_eq!(
+                std::fs::read_to_string(get_settings_path(dir.path())).unwrap(),
+                yaml
+            );
+            assert!(set_fleet(dir.path(), &crate::fleet::FleetConfig::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn stale_and_forged_whole_fleet_snapshots_cannot_erase_or_resurrect_owned_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = crate::fleet::FleetConfig::default();
+        mutate_fleet(
+            dir.path(),
+            |fleet| {
+                fleet
+                    .drains
+                    .impose_operator("machine", &principal(), "repair", 1)
+            },
+            |_| {},
+        )
+        .unwrap();
+        let imposed = load_fleet_authoritative(dir.path(), |_| {}).unwrap().value;
+        set_fleet(dir.path(), &stale).unwrap();
+        assert_eq!(load_fleet(dir.path()).drains, imposed.drains);
+        let frozen = imposed
+            .drains
+            .prepare_removal_records("machine", &principal(), "device")
+            .unwrap();
+        mutate_fleet(
+            dir.path(),
+            |fleet| {
+                fleet.drains.apply_removal(RemovalApplication {
+                    install_id: "install".into(),
+                    operation_id: "removal".into(),
+                    provenance: "proof".into(),
+                    frozen,
+                })
+            },
+            |_| {},
+        )
+        .unwrap();
+        let cleared = load_fleet_authoritative(dir.path(), |_| {}).unwrap().value;
+        set_fleet(dir.path(), &imposed).unwrap();
+        assert_eq!(load_fleet(dir.path()).drains, cleared.drains);
+        assert_eq!(cleared.drains.machine_revision("machine"), 2);
+        assert_eq!(cleared.drains.removal_receipts().len(), 1);
+        let mut forged = stale;
+        forged
+            .drains
+            .impose_operator("other", &principal(), "injected", 1)
+            .unwrap();
+        set_fleet(dir.path(), &forged).unwrap();
+        assert_eq!(load_fleet(dir.path()).drains, cleared.drains);
+    }
+
+    #[test]
+    fn settings_saves_and_desktop_conversion_preserve_owned_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(get_settings_path(dir.path()), "buildSlots:\n  drainedMachines: [local]\n  desktopAutomation:\n    enabled: true\n    machines:\n      local: {enabled: true}\n").unwrap();
+        // Save the unrelated DTO before and after the fleet's durable migration.
+        save_settings(dir.path(), &load_settings(dir.path())).unwrap();
+        let expected = load_fleet_authoritative(dir.path(), |_| {})
+            .unwrap()
+            .value
+            .drains;
+        migrate_desktop_automation(dir.path()).unwrap();
+        save_settings(dir.path(), &load_settings(dir.path())).unwrap();
+        assert_eq!(
+            load_fleet_authoritative(dir.path(), |_| {})
+                .unwrap()
+                .value
+                .drains,
+            expected
+        );
+    }
+
+    /// A fleet block this build cannot decode (a future drain version, an
+    /// unknown field) is the fleet boundary's refusal to make, not every
+    /// settings reader's. General settings keep their values, and general
+    /// writers carry the block through untouched.
+    #[test]
+    fn an_undecodable_fleet_block_neither_defaults_nor_erases_general_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = get_settings_path(dir.path());
+        let yaml = "maxConcurrentExecutions: 2\nbuildSlots:\n  futureFleetField: kept\n  drains:\n    version: 99\n    machines: {local: [{owner: future}]}\n    liftReceipts: {}\n    removalReceipts: {}\n";
+        std::fs::write(&path, yaml).unwrap();
+        let raw_slots = |bytes: &str| {
+            serde_yaml::from_str::<serde_yaml::Value>(bytes).unwrap()["buildSlots"].clone()
+        };
+        let original_slots = raw_slots(yaml);
+
+        // Strict fleet boundaries still fail closed, touching nothing.
+        assert!(read_fleet_strict(dir.path()).is_err());
+        assert!(load_fleet_authoritative(dir.path(), |_| panic!("must not publish")).is_err());
+        assert!(mutate_fleet(dir.path(), |_| Ok(()), |_| panic!("must not publish")).is_err());
+        assert!(set_fleet(dir.path(), &crate::fleet::FleetConfig::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+
+        // General reads see the operator's preferences, not defaults.
+        let mut settings = load_settings(dir.path());
+        assert_eq!(settings.max_concurrent_executions, 2);
+
+        // The first general save writes out the DTO's defaulted keys (a
+        // whole-root rewrite), carrying the block through as a value; saving
+        // the same settings again is then a byte-for-byte no-op.
+        save_settings(dir.path(), &settings).unwrap();
+        let normalized = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw_slots(&normalized), original_slots);
+        save_settings(dir.path(), &load_settings(dir.path())).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), normalized);
+
+        // A real general change rewrites the document; the block survives as
+        // a value (the whole-root rewrite does not promise its formatting).
+        settings.max_open_children_per_thread = 3;
+        save_settings(dir.path(), &settings).unwrap();
+        update_settings(
+            dir.path(),
+            UpdateSettings {
+                bug_reports: Some(false),
+                ..UpdateSettings::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw_slots(&saved), original_slots);
+        let reloaded = load_settings(dir.path());
+        assert_eq!(reloaded.max_concurrent_executions, 2);
+        assert_eq!(reloaded.max_open_children_per_thread, 3);
+        assert!(!reloaded.bug_reports);
+        assert!(read_fleet_strict(dir.path()).is_err());
+
+        // An explicit null is a present, undecodable block, not an empty fleet.
+        std::fs::write(&path, "buildSlots: null\n").unwrap();
+        assert!(read_fleet_strict(dir.path()).is_err());
+    }
+
+    #[test]
+    fn mutation_failure_does_not_change_file_or_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        load_fleet_authoritative(dir.path(), |_| {}).unwrap();
+        let before = std::fs::read(get_settings_path(dir.path())).unwrap();
+        let error = mutate_fleet(
+            dir.path(),
+            |fleet| {
+                fleet
+                    .drains
+                    .impose_operator("machine", &principal(), "repair", 1)?;
+                Err::<(), _>("injected before commit".into())
+            },
+            |_| panic!("failed mutation must not publish"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "injected before commit");
+        assert_eq!(
+            std::fs::read(get_settings_path(dir.path())).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn atomic_replacement_failure_preserves_owned_drain_and_has_no_receipt_or_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        mutate_fleet(
+            dir.path(),
+            |fleet| {
+                fleet
+                    .drains
+                    .impose_operator("machine", &principal(), "repair", 1)
+            },
+            |_| {},
+        )
+        .unwrap();
+        let before = read_fleet_strict(dir.path()).unwrap();
+        let path = get_settings_path(dir.path());
+        let bytes = std::fs::read(&path).unwrap();
+        let backup = dir.path().join("settings.backup");
+        let application = LiftApplication {
+            install_id: "install".into(),
+            workspace_id: "workspace".into(),
+            authorization_event_id: "event".into(),
+            attempt_id: "attempt".into(),
+            claim_id: "claim".into(),
+            actor: "execution.fleet".into(),
+            kind: "lift_drain".into(),
+            executor_id: "machine".into(),
+            drain_key: "machine".into(),
+            accepted_owner: DrainOwner::Operator,
+            operator_generation: before.drains.records("machine")[0].generation,
+            machine_revision: before.drains.machine_revision("machine"),
+            report_id: "lift-drain:attempt".into(),
+        };
+        let result = mutate_fleet_committed(
+            dir.path(),
+            |fleet| {
+                let receipt = fleet.drains.apply_lift(application.clone())?;
+                // The valid document has already been read under the writer lock.
+                // A directory at its destination makes the real atomic replace fail,
+                // independent of permissions (including when tests run as root).
+                std::fs::rename(&path, &backup).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                Ok(receipt)
+            },
+            |_| panic!("a failed atomic replacement must not publish"),
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("Failed to replace settings file"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let unchanged = read_fleet_strict(dir.path()).unwrap();
+        assert_eq!(unchanged.drains, before.drains);
+        assert!(unchanged.drains.lift_receipts().is_empty());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let outcome = mutate_fleet_committed(
+            dir.path(),
+            |fleet| fleet.drains.apply_lift(application),
+            |fleet| assert!(!fleet.is_machine_drained("machine")),
+        )
+        .unwrap();
+        assert_eq!(outcome.value.outcome, LiftOutcome::Cleared);
+        let committed = read_fleet_strict(dir.path()).unwrap();
+        assert_eq!(committed.drains.machine_revision("machine"), 2);
+        assert_eq!(committed.drains.lift_receipts().len(), 1);
+    }
+
+    #[test]
+    fn unreadable_settings_are_errors_not_an_empty_authoritative_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(get_settings_path(dir.path())).unwrap();
+        assert!(
+            load_fleet_authoritative(dir.path(), |_| panic!("unreadable must not publish"))
+                .is_err()
+        );
+        assert!(load_settings_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn post_replacement_sync_error_is_committed_and_published_not_retryable_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut published = None;
+        let outcome = mutate_fleet_with_sync(
+            dir.path(),
+            |fleet| {
+                fleet
+                    .drains
+                    .impose_operator("machine", &principal(), "repair", 1)?;
+                Ok(17)
+            },
+            |fleet| {
+                published = Some(fleet.clone());
+            },
+            |_| Err("injected directory sync failure after replacement".into()),
+        )
+        .unwrap();
+        assert_eq!(outcome.value, 17);
+        assert!(outcome
+            .durability_warning
+            .unwrap()
+            .contains("after replacement"));
+        let persisted = load_fleet_authoritative(dir.path(), |_| {}).unwrap().value;
+        assert_eq!(published.unwrap().drains, persisted.drains);
+        assert!(persisted.is_machine_drained("machine"));
+    }
+
+    #[test]
+    fn concurrent_mutations_publish_every_fresh_revision_in_commit_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let revisions = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let dir = dir.path();
+                let revisions = &revisions;
+                scope.spawn(move || {
+                    mutate_fleet(
+                        dir,
+                        |fleet| {
+                            fleet.drains.impose_thread(
+                                "machine",
+                                &format!("thread-{n}"),
+                                &principal(),
+                                "test",
+                                n,
+                            )
+                        },
+                        |fleet| {
+                            revisions
+                                .lock()
+                                .unwrap()
+                                .push(fleet.drains.machine_revision("machine"))
+                        },
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(*revisions.lock().unwrap(), (1..=8).collect::<Vec<_>>());
+        let fleet = load_fleet_authoritative(dir.path(), |_| {}).unwrap().value;
+        assert_eq!(fleet.drains.records("machine").len(), 8);
+        assert_eq!(fleet.drains.machine_revision("machine"), 8);
     }
 }

@@ -1012,7 +1012,7 @@ mod tests {
             tempfile::tempdir().unwrap().keep(),
         )
         .build();
-        crate::execution::provider_change::tests::seed_edit_catalog(&orch);
+        crate::execution::provider_change::tests::seed_edit_catalog(&orch).await;
         let db = &orch.db.local;
         seed_project(db, "project-a").await;
         let thread = create(db, input("project-a", "roadmap")).await.unwrap();

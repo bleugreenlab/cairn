@@ -36,7 +36,7 @@ use crate::embedding::{EmbeddingCapabilities, CAIRN_GATEWAY_KEY};
 use crate::image::ImageCapabilities;
 use crate::provider_id::ApiProvider;
 use crate::speech::SpeechCapabilities;
-use crate::usage::{BillingUnit, Charge, Meter};
+use crate::usage::{BillingUnit, Charge, Meter, MeteredUsage};
 
 /// How a provider is paid for and reached, which is what a user is actually
 /// choosing between when installing one.
@@ -928,6 +928,40 @@ impl ModelPricing {
             })
             .map(|price| price.usd.as_str())
     }
+
+    /// What `usage` costs at these prices: each measured quantity times its
+    /// meter's price (a modality's own price, else the meter's price for any
+    /// modality). `None` when nothing was measured, or when a measured
+    /// quantity has no price: an unpriced meter is never priced at zero.
+    ///
+    /// Reasoning tokens are skipped because every wire Cairn reads counts them
+    /// inside output, which is already priced.
+    pub fn price(&self, usage: &MeteredUsage) -> Option<f64> {
+        let mut total = 0.0;
+        let mut measured = false;
+        for measure in &usage.measures {
+            let meter = &measure.meter;
+            if meter.charge == Charge::Reasoning {
+                continue;
+            }
+            measured = true;
+            if measure.quantity == 0 {
+                continue;
+            }
+            let usd = self
+                .usd_per(meter.charge, meter.modality.as_ref(), meter.unit)
+                .or_else(|| {
+                    meter
+                        .modality
+                        .as_ref()
+                        .and_then(|_| self.usd_per(meter.charge, None, meter.unit))
+                })?
+                .parse::<f64>()
+                .ok()?;
+            total += usd * measure.quantity as f64;
+        }
+        measured.then_some(total)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -937,9 +971,39 @@ pub struct DiscoveredReasoningEffort {
     pub description: Option<String>,
 }
 
+/// Live placement availability, attached when the catalog is read, never cached
+/// with discovery. An absent measurement is unknown, not a zero-cost load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ModelAvailability {
+    Loaded {
+        pool: String,
+    },
+    Loadable {
+        pool: String,
+        expected_load_ms: Option<u64>,
+    },
+    Loading {
+        pool: String,
+        expected_load_ms: Option<u64>,
+        elapsed_ms: u64,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredModel {
+    /// Live availability for locally placed models; other providers make no claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<ModelAvailability>,
+    /// Availability of the deployment placement would actually choose for each
+    /// verb. The aggregate above is conservative across these routes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub availability_by_verb: std::collections::BTreeMap<VerbKind, ModelAvailability>,
     pub id: String,
     pub model: String,
     pub display_name: String,
@@ -1166,6 +1230,8 @@ pub fn claude_models() -> Vec<DiscoveredModel> {
         router: false,
         modalities: None,
         serves: None,
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: None,
     })
     .collect()

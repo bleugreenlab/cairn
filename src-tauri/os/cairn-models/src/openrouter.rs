@@ -1,6 +1,10 @@
 //! How a request identifies itself to OpenRouter: its key, and the app it is
 //! attributed to on OpenRouter's rankings. Every OpenRouter call the facet or
 //! its hosts make (chat completions, images) sends these headers.
+//!
+//! It also holds OpenRouter's zero-data-retention list ([`ZdrDirectory`]),
+//! which admits a call that requires zero retention only when the model it
+//! names has a strictly zero-retention endpoint.
 
 /// The app a request is attributed to. A host that is not Cairn names
 /// itself.
@@ -29,6 +33,127 @@ pub fn headers(api_key: &str, attribution: &Attribution) -> Vec<(String, String)
         ("http-referer".to_string(), attribution.referer.clone()),
         ("x-openrouter-title".to_string(), attribution.title.clone()),
     ]
+}
+
+/// OpenRouter's public list of every endpoint it routes as zero data
+/// retention, one row per (model, provider, tag).
+pub const ZDR_ENDPOINTS_URL: &str = "https://openrouter.ai/api/v1/endpoints/zdr";
+
+/// How long a fetched ZDR list stands. A call older than this refetches it
+/// before it is admitted, so an endpoint OpenRouter drops from the list stops
+/// admitting calls within ten minutes.
+pub const ZDR_LIST_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Bounds the list's fetch, which runs before a call is admitted.
+const ZDR_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One row of OpenRouter's ZDR list.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ZdrEndpoint {
+    /// The model id OpenRouter is sent (`typesafe/jev-1.14`).
+    pub model_id: String,
+    pub provider_name: String,
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// The endpoint may keep prompts to detect abuse. OpenRouter lists it
+    /// beside the strict ones, and `provider.zdr` routes to it when the
+    /// account allows Safety Retention, so it never counts as zero retention.
+    #[serde(default)]
+    pub safety_retention: bool,
+}
+
+/// OpenRouter's ZDR list as fetched, and when.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZdrList {
+    pub endpoints: Vec<ZdrEndpoint>,
+    /// Unix seconds.
+    pub fetched_at: i64,
+}
+
+impl ZdrList {
+    /// The strictly zero-retention endpoints serving `model`: Safety
+    /// Retention endpoints are left out.
+    pub fn serving(&self, model: &str) -> Vec<&ZdrEndpoint> {
+        self.endpoints
+            .iter()
+            .filter(|endpoint| endpoint.model_id == model && !endpoint.safety_retention)
+            .collect()
+    }
+}
+
+/// Where the ZDR list is read from: OpenRouter itself, or a test's script.
+pub trait ZdrSource: Send + Sync {
+    fn fetch(&self) -> Result<Vec<ZdrEndpoint>, String>;
+}
+
+/// OpenRouter's public endpoint, which takes no key.
+pub struct HttpZdrSource;
+
+impl ZdrSource for HttpZdrSource {
+    fn fetch(&self) -> Result<Vec<ZdrEndpoint>, String> {
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            data: Vec<ZdrEndpoint>,
+        }
+        let client = cairn_tls::blocking_client_builder()
+            .timeout(ZDR_FETCH_TIMEOUT)
+            .build()
+            .map_err(|error| error.to_string())?;
+        let response = client
+            .get(ZDR_ENDPOINTS_URL)
+            .send()
+            .map_err(|error| format!("{ZDR_ENDPOINTS_URL} could not be fetched: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "{ZDR_ENDPOINTS_URL} answered HTTP {}",
+                status.as_u16()
+            ));
+        }
+        response
+            .json::<Listing>()
+            .map(|listing| listing.data)
+            .map_err(|error| format!("{ZDR_ENDPOINTS_URL} answered something unreadable: {error}"))
+    }
+}
+
+/// OpenRouter's ZDR list, fetched when a call needs it and kept for
+/// [`ZDR_LIST_TTL`]. A failed fetch is never cached, and never read as an
+/// empty list: the call it was for is refused naming the failure.
+pub struct ZdrDirectory {
+    source: std::sync::Arc<dyn ZdrSource>,
+    cached: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<ZdrList>)>>,
+}
+
+impl ZdrDirectory {
+    pub fn new(source: std::sync::Arc<dyn ZdrSource>) -> Self {
+        Self {
+            source,
+            cached: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The directory reading OpenRouter's public list.
+    pub fn http() -> Self {
+        Self::new(std::sync::Arc::new(HttpZdrSource))
+    }
+
+    /// The list, fetched afresh when the one held is older than
+    /// [`ZDR_LIST_TTL`]. Blocking: it may make one HTTP request.
+    pub fn list(&self) -> Result<std::sync::Arc<ZdrList>, String> {
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, list)) = cached.as_ref() {
+            if at.elapsed() < ZDR_LIST_TTL {
+                return Ok(list.clone());
+            }
+        }
+        let list = std::sync::Arc::new(ZdrList {
+            endpoints: self.source.fetch()?,
+            fetched_at: chrono::Utc::now().timestamp(),
+        });
+        *cached = Some((std::time::Instant::now(), list.clone()));
+        Ok(list)
+    }
 }
 
 /// A cost-policy cutoff, not a tokenizer claim: below this many text characters
@@ -380,6 +505,66 @@ mod cache_tests {
         let before = body.clone();
         apply_prompt_caching(&mut body, true);
         assert_eq!(body, before);
+    }
+}
+
+#[cfg(test)]
+mod zdr_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Counted(AtomicUsize, Result<Vec<ZdrEndpoint>, String>);
+
+    impl ZdrSource for Counted {
+        fn fetch(&self) -> Result<Vec<ZdrEndpoint>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            self.1.clone()
+        }
+    }
+
+    fn endpoint(model: &str, provider: &str, safety_retention: bool) -> ZdrEndpoint {
+        ZdrEndpoint {
+            model_id: model.into(),
+            provider_name: provider.into(),
+            tag: None,
+            safety_retention,
+        }
+    }
+
+    #[test]
+    fn the_list_is_fetched_once_per_freshness_window_and_safety_retention_never_counts() {
+        let source = Arc::new(Counted(
+            AtomicUsize::new(0),
+            Ok(vec![
+                endpoint("typesafe/jev-1.14", "TypeSafe", false),
+                endpoint("google/gemini-3-pro", "Google Vertex", true),
+            ]),
+        ));
+        let directory = ZdrDirectory::new(source.clone());
+        let list = directory.list().unwrap();
+        directory.list().unwrap();
+        assert_eq!(source.0.load(Ordering::SeqCst), 1, "the cached list stands");
+        assert_eq!(list.serving("typesafe/jev-1.14").len(), 1);
+        assert!(list.serving("google/gemini-3-pro").is_empty());
+        assert!(list.serving("typesafe/jev").is_empty(), "ids match exactly");
+
+        let rows: serde_json::Value = serde_json::json!({"data": [
+            {"model_id": "z-ai/glm-5.3", "provider_name": "Parasail", "tag": "parasail/fast",
+             "pricing": {"prompt": "0.000002"}, "safety_retention": false}
+        ]});
+        let parsed: Vec<ZdrEndpoint> =
+            serde_json::from_value(rows["data"].clone()).expect("OpenRouter's row shape");
+        assert_eq!(parsed[0].tag.as_deref(), Some("parasail/fast"));
+    }
+
+    #[test]
+    fn a_failed_fetch_is_an_error_and_is_not_cached() {
+        let source = Arc::new(Counted(AtomicUsize::new(0), Err("offline".into())));
+        let directory = ZdrDirectory::new(source.clone());
+        assert_eq!(directory.list().unwrap_err(), "offline");
+        assert!(directory.list().is_err());
+        assert_eq!(source.0.load(Ordering::SeqCst), 2);
     }
 }
 

@@ -332,7 +332,7 @@ pub async fn file(
         );
     }
     let waiting = waiting_uris(input.waiting)?;
-    let facts = adapter.facts(orch, None).await?;
+    let facts = adapter.facts(orch, None, input.target.as_deref()).await?;
     let install = orch.anon_device_manager.device_id();
     let mut explicit_requirements = input.requirements.clone();
     explicit_requirements.commits.sort();
@@ -504,7 +504,9 @@ async fn refresh_facts_for(
     request: &OperatorRequest,
     adapter: &dyn RequestConsumer,
 ) -> Result<(), String> {
-    let facts = adapter.facts(orch, Some(&request.id)).await?;
+    let facts = adapter
+        .facts(orch, Some(&request.id), request.target.as_deref())
+        .await?;
     let document = scrub_document(serde_json::to_value(facts).map_err(|error| error.to_string())?);
     store::refresh_facts(
         &orch.db.local,
@@ -640,7 +642,9 @@ async fn check_snapshot(
         }
         RequestKind::BumpVersion => {
             bump_policy(orch, acceptance.policy_project_id.as_deref()).await?;
-            let current = adapter.facts(orch, Some(&request.id)).await?;
+            let current = adapter
+                .facts(orch, Some(&request.id), request.target.as_deref())
+                .await?;
             let running =
                 ReleaseVersion::parse(required_text(&current.running_version, "running version")?)?;
             let effective =
@@ -656,6 +660,15 @@ async fn check_snapshot(
         RequestKind::LiftDrain => {
             if acceptance.drain.is_none() {
                 return Err("lift_drain requires the displayed exact owner and generation".into());
+            }
+            // The card shows facts published earlier. Accepting must pair the
+            // operator's decision with the drain set standing now, or the stale
+            // view is refused here instead of burning an attempt later.
+            let current = adapter
+                .facts(orch, Some(&request.id), request.target.as_deref())
+                .await?;
+            if current.drain != acceptance.drain {
+                return Err("The drain state changed since this card's facts were published (an owner, generation or the machine revision moved); refresh the card before accepting".into());
             }
         }
     }
@@ -700,6 +713,14 @@ pub(crate) struct AcceptedRequestContext {
 }
 
 impl AcceptedRequestContext {
+    pub(crate) fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub(crate) fn claim_id(&self) -> &str {
+        &self.claim_id
+    }
+
     #[allow(dead_code)] // Runner adapter API, not an agent resource.
     pub(crate) fn acceptance(&self) -> &RequestAcceptance {
         &self.acceptance
@@ -902,6 +923,7 @@ pub(crate) async fn dispatch_accepted(orch: &Orchestrator, event_id: &str) -> Re
             return Err(error);
         }
     };
+    let _exclusion = adapter.exclusion().await;
     let claim_id = uuid::Uuid::new_v4().to_string();
     store::claim_request(&orch.db.local, event_id, &expected, &claim_id, now())
         .await

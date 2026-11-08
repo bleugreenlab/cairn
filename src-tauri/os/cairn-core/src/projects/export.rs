@@ -188,10 +188,6 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
         "this runner's own restart-cancelled main-cadence pass: written as the runner stops, read back and deleted by its next boot; it describes the runner, not shared project state, and a deletion sweep has nothing to do because the next boot consumes it",
     ),
     (
-        "self_rebuild_outcomes",
-        "this runner's own self-rebuild bookkeeping: the run_id is the run on this runner that started a rebuild of this runner's app, and the record exists only so the detached installer can report back once; it means nothing to another runner",
-    ),
-    (
         "node_scratches",
         "a node scratch's authority row describes a Git store on this runner and replicas on this runner's executors; neither travels with an export, and the scratch ends with its node",
     ),

@@ -9,7 +9,8 @@ impl CairnResource {
     /// Project-scoped resources route to the database that owns their project
     /// (see `DbState::for_project`); global/workspace resources (skills, labels,
     /// settings, the projects collection, dev/db/logs, etc.) return `None` and
-    /// stay on the private database.
+    /// stay on the private database. The rebuild ledger is install-local even
+    /// when a journal describes work requested by a project.
     pub fn project_key(&self) -> Option<&str> {
         use CairnResource::*;
         match self {
@@ -336,8 +337,8 @@ impl CairnResource {
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
             | Self::Bug
-            | Self::SelfRebuild
-            | Self::SelfRebuildOutcome { .. }
+            | Self::Rebuilds
+            | Self::Rebuild { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,
@@ -546,8 +547,8 @@ impl CairnResource {
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
             | Self::Bug
-            | Self::SelfRebuild
-            | Self::SelfRebuildOutcome { .. }
+            | Self::Rebuilds
+            | Self::Rebuild { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => None,

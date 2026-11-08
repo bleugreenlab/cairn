@@ -334,6 +334,8 @@ fn merge_targets(
             router: false,
             modalities: None,
             serves: None,
+            availability: None,
+            availability_by_verb: Default::default(),
             tokenizer: tokenizer_for_registry_id(&id),
             id,
         })

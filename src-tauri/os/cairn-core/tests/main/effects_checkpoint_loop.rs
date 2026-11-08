@@ -53,6 +53,7 @@ async fn ctx() -> Ctx {
     let db_state = Arc::new(DbState::new(db.clone(), search_index));
     let services = Arc::new(TestServicesBuilder::new().build());
     let orch = Orchestrator::builder(db_state, services, config_dir.clone()).build();
+    common::load_fleet_settings(&orch);
     common::attach_test_executor(&orch);
     Ctx {
         orch,

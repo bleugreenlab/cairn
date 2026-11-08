@@ -2187,7 +2187,7 @@ mod launch_contract_tests {
     use cairn_models::interface::session::{
         ApprovalMode, ClaudeMode, ClaudeSpec, PlacedFile, ProviderSpec, SecretEnv, SessionSpec,
     };
-    use cairn_models::session::claude::ClaudeCli;
+    use cairn_models::session::claude::{ClaudeCli, CLAUDE_HARDENING_ENV};
     use cairn_models::session::mcp::{McpServer, McpServers};
     use std::collections::{BTreeMap, HashMap};
 
@@ -2278,29 +2278,33 @@ mod launch_contract_tests {
     }
 
     /// The environment every Claude launch has spawned with, byte for byte.
+    /// The hardening comes from its one definition, so the contract here is
+    /// that every launch carries it, not a second copy of its contents.
     fn expected_env(credential: &[(&str, &str)]) -> HashMap<String, String> {
         let tool_timeout_ms = cairn_common::callback_contract::AGENT_MCP_TOOL_TIMEOUT
             .as_millis()
             .to_string();
-        [
-            ("CAIRN_RUN_ID", "run-1"),
-            ("CAIRN_MCP_SECRET", "mcp-secret"),
-            ("ENABLE_TOOL_SEARCH", "false"),
-            ("CLAUDE_CODE_ENABLE_TASKS", "false"),
-            ("MCP_TOOL_TIMEOUT", tool_timeout_ms.as_str()),
-            (
-                "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
-                tool_timeout_ms.as_str(),
-            ),
-            ("GIT_AUTHOR_NAME", "Cairn Agent"),
-            ("GIT_AUTHOR_EMAIL", "agent@example.com"),
-            ("GIT_COMMITTER_NAME", "Cairn Agent"),
-            ("GIT_COMMITTER_EMAIL", "agent@example.com"),
-        ]
-        .into_iter()
-        .chain(credential.iter().copied())
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .collect()
+        CLAUDE_HARDENING_ENV
+            .iter()
+            .copied()
+            .chain([
+                ("CAIRN_RUN_ID", "run-1"),
+                ("CAIRN_MCP_SECRET", "mcp-secret"),
+                ("ENABLE_TOOL_SEARCH", "false"),
+                ("CLAUDE_CODE_ENABLE_TASKS", "false"),
+                ("MCP_TOOL_TIMEOUT", tool_timeout_ms.as_str()),
+                (
+                    "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
+                    tool_timeout_ms.as_str(),
+                ),
+                ("GIT_AUTHOR_NAME", "Cairn Agent"),
+                ("GIT_AUTHOR_EMAIL", "agent@example.com"),
+                ("GIT_COMMITTER_NAME", "Cairn Agent"),
+                ("GIT_COMMITTER_EMAIL", "agent@example.com"),
+            ])
+            .chain(credential.iter().copied())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
     }
 
     #[test]

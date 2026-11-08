@@ -18,6 +18,10 @@ pub struct EmbeddingsEndpoint {
     /// The full `{base}/embeddings` URL.
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// Fields every request body sent here carries beside the wire's own
+    /// (OpenRouter's `provider` routing object), merged by
+    /// [`crate::merge_extras`].
+    pub extras: serde_json::Map<String, Value>,
 }
 
 impl std::fmt::Debug for EmbeddingsEndpoint {
@@ -27,6 +31,7 @@ impl std::fmt::Debug for EmbeddingsEndpoint {
             .field("backend_key", &self.backend_key)
             .field("url", &self.url)
             .field("headers", &super::redacted(&self.headers))
+            .field("extras", &self.extras)
             .finish()
     }
 }

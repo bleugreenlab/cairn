@@ -68,6 +68,17 @@ pub fn context_fit_budget(context_window: i64) -> i64 {
     ((context_window as f64) * CONTEXT_FIT_FRACTION) as i64
 }
 
+/// Add a provider's `extras` to a request body its wire built: every field the
+/// body does not already carry. The wire's own fields always win, so an extra
+/// can add to a request but never change what the wire asked.
+pub fn merge_extras(body: &mut Value, extras: &serde_json::Map<String, Value>) {
+    if let Some(fields) = body.as_object_mut() {
+        for (key, value) in extras {
+            fields.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
 /// The sentence a provider wrote inside a JSON error body.
 ///
 /// Most providers nest the message as `{"error": {"message": ...}}`, with or

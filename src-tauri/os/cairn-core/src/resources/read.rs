@@ -1849,6 +1849,7 @@ async fn produce_record_page(
 ) -> Option<Result<RecordPage, String>> {
     Some(match resource {
         CairnResource::Requests => super::requests::list_page(orch, params).await,
+        CairnResource::Rebuilds => super::rebuilds::list_page(&orch.db.local, params).await,
         CairnResource::ProjectVcsLog { project } => {
             super::vcs::read_log_page(orch, request, project, params).await
         }
@@ -2363,6 +2364,9 @@ async fn render_resource_body(
                         captured_at,
                         warming_up,
                     );
+                    rendered.push_str(&crate::resources::executors::render_drain_initialization(
+                        orch.fleet.drain_initialization_error().as_deref(),
+                    ));
                     rendered.push_str(&crate::resources::executors::render_project_requirements(
                         &orch.fleet.declared_project_capabilities(),
                         &orch.fleet.learned_project_requirements(),
@@ -3856,10 +3860,8 @@ async fn render_resource_body(
             "cairn://dev/launch-ticket is write-only; `bun dev:instance` appends to it from a run"
                 .to_string()
         }
-        CairnResource::SelfRebuild => super::self_rebuild::render_collection(),
-        CairnResource::SelfRebuildOutcome { id } => {
-            super::self_rebuild::render_outcome(&orch.db.local, &id).await
-        }
+        CairnResource::Rebuilds => super::rebuilds::read_collection(&orch.db.local, &params).await,
+        CairnResource::Rebuild { id } => super::rebuilds::read_rebuild(&orch.db.local, &id).await,
         CairnResource::Help => render_help(&params),
         // `produce_cairn_resource` runs the search before dispatch so a failure
         // stays a failure; this arm serves only a direct body render.

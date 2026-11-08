@@ -2839,10 +2839,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "main_cadence_interruptions",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
-    // A self-rebuild's pending outcome: this runner's run recording where the
-    // detached installer, replacing this runner's app, reports back once.
+    // This install's rebuild history and idempotent journal receipts.
     (
-        "self_rebuild_outcomes",
+        "rebuilds",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (

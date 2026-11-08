@@ -28,19 +28,88 @@ pub(crate) const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 pub(crate) const OPENROUTER_DECISIONS_BASE: &str = "https://openrouter.ai/api/alpha";
 
 /// The embeddings route on this workspace's OpenRouter key, with the headers
-/// every OpenRouter request carries.
+/// every OpenRouter request carries and the call's routing object.
 pub(crate) fn embed_route(
     orch: &Orchestrator,
+    admitted: &crate::backends::Admitted,
 ) -> Result<cairn_models::interface::embed::EmbedRoute, String> {
+    use cairn_models::interface::embed::EmbedRoute;
     let api_key =
         openrouter_api_key(orch).ok_or_else(|| "needs an OpenRouter API key".to_string())?;
-    Ok(cairn_models::embed::openai::route_for(
+    let mut route = cairn_models::embed::openai::route_for(
         OPENROUTER_BACKEND_KEY,
         OPENROUTER_BACKEND_NAME,
         OPENROUTER_API_BASE,
         None,
         &http::openrouter_headers(&api_key),
-    ))
+    );
+    if let EmbedRoute::OpenAi(endpoint) = &mut route {
+        endpoint.extras = http::provider_extras(
+            &orch.get_settings().openrouter_routing,
+            admitted.zero_data_retention(),
+            http::Request::Whole,
+        );
+    }
+    Ok(route)
+}
+
+/// OpenRouter's answer for a zero-retention call: `model` must have at least
+/// one strictly zero-retention endpoint on OpenRouter's list, and the request
+/// then carries `provider.zdr`, ignoring the model's Safety Retention
+/// endpoints, so OpenRouter routes it only to the endpoints the list admits.
+/// An unreadable list refuses the call rather than letting it through.
+fn zero_data_retention_for(
+    orch: &Orchestrator,
+    model: &str,
+) -> Result<crate::backends::retention::ZdrMet, String> {
+    use cairn_models::interface::retention::ZdrBasis;
+    // A launch that names no model runs OpenRouter's router, which no
+    // endpoint list describes.
+    let model = if model.trim().is_empty() {
+        "openrouter/auto"
+    } else {
+        model.trim()
+    };
+    let list = orch.models_runtime().openrouter_zdr.list().map_err(|error| {
+        format!("OpenRouter's zero-retention list could not be read ({error}), so whether it has a zero-retention endpoint is unknown")
+    })?;
+    let fetched = chrono::DateTime::from_timestamp(list.fetched_at, 0)
+        .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| list.fetched_at.to_string());
+    let serving = list.serving(model);
+    if serving.is_empty() {
+        return Err(format!(
+            "OpenRouter's zero-retention list (fetched {fetched}) has no endpoint for it that retains nothing; Safety Retention endpoints, which may keep prompts to screen for abuse, do not count"
+        ));
+    }
+    let exclude: Vec<String> = list
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.model_id == model && endpoint.safety_retention)
+        .filter_map(|endpoint| endpoint.tag.clone())
+        .collect();
+    let mut providers: Vec<&str> = serving
+        .iter()
+        .map(|endpoint| endpoint.provider_name.as_str())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    let mut detail = format!(
+        "OpenRouter's zero-retention list (fetched {fetched}) has {} endpoint(s) for {model} ({}), and the request carried provider.zdr, which routes only to such endpoints",
+        serving.len(),
+        providers.join(", ")
+    );
+    if !exclude.is_empty() {
+        detail.push_str(&format!(
+            ", ignoring its Safety Retention endpoints ({})",
+            exclude.join(", ")
+        ));
+    }
+    Ok(crate::backends::retention::ZdrMet {
+        basis: ZdrBasis::OpenRouterZdrRouting,
+        detail,
+        exclude,
+    })
 }
 
 use crate::backends::{
@@ -121,7 +190,7 @@ impl AgentBackend for OpenRouterBackend {
         &self,
         request: CompletionRequest,
         orch: &Orchestrator,
-        _admitted: crate::backends::Admitted,
+        admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionFailure> {
         use crate::backends::http_loop::{Connection, WireAdapter};
         use crate::backends::openai_compat::completion_body;
@@ -132,7 +201,7 @@ impl AgentBackend for OpenRouterBackend {
         // The session's family, routing object included: it always carries
         // `require_parameters`, which is also what keeps a schema-constrained
         // completion off providers that would drop the schema.
-        let family = adapter::OpenRouterAdapter::new(orch)
+        let family = adapter::OpenRouterAdapter::new(orch, &admitted)
             .family(&Connection {
                 api_key: Some(api_key),
             })
@@ -199,6 +268,7 @@ impl AgentBackend for OpenRouterBackend {
         orch: &Orchestrator,
         _project_id: Option<&str>,
         offer: &cairn_models::interface::SelectedOffer,
+        admitted: &crate::backends::Admitted,
     ) -> Result<(cairn_models::interface::decide::DecisionRoute, String), String> {
         use cairn_models::interface::decide::DecisionRoute;
         use cairn_models::types::catalog::Wire;
@@ -214,11 +284,26 @@ impl AgentBackend for OpenRouterBackend {
                     url: format!("{OPENROUTER_DECISIONS_BASE}/decisions"),
                     headers: http::openrouter_headers(&api_key),
                     context_limits: None,
+                    extras: http::provider_extras(
+                        &orch.get_settings().openrouter_routing,
+                        admitted.zero_data_retention(),
+                        http::Request::Whole,
+                    ),
                 });
                 Ok((route, offer.model.clone()))
             }
             wire => Err(format!("OpenRouter answers no decision over {wire}")),
         }
+    }
+
+    fn zero_data_retention(
+        &self,
+        orch: &Orchestrator,
+        _project_id: Option<&str>,
+        _provider: &str,
+        model: &str,
+    ) -> Result<crate::backends::retention::ZdrMet, String> {
+        zero_data_retention_for(orch, model)
     }
 
     /// The chat listing with the image and embeddings listings merged in. The
@@ -261,12 +346,12 @@ impl AgentBackend for OpenRouterBackend {
         &self,
         config: SessionConfig,
         orch: &Orchestrator,
-        _admitted: crate::backends::Admitted,
+        admitted: crate::backends::Admitted,
     ) -> Result<(), String> {
         crate::backends::http_loop::start_session(
             config,
             orch,
-            adapter::OpenRouterAdapter::new(orch),
+            adapter::OpenRouterAdapter::new(orch, &admitted),
         )
     }
 

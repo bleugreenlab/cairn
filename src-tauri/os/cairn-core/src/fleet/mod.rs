@@ -5,9 +5,13 @@
 //! mutation sealing exist only in the executor process.
 
 mod coalescing;
+mod drain_projection;
+pub use drain_projection::AdmissionFenceToken;
 pub(crate) mod decline_condition;
 pub(crate) mod inference;
+pub mod initialization;
 pub(crate) mod learned_requirements;
+pub(crate) mod lift_drain;
 pub mod link_clock;
 pub mod load;
 pub mod machine_services;
@@ -29,6 +33,7 @@ mod resource_profiles;
 pub(crate) mod rollout;
 pub use rollout::ArtifactUnavailable;
 pub mod runner_events;
+pub mod self_update;
 pub(crate) mod service_placement;
 pub mod telemetry;
 pub mod unreturned;
@@ -188,6 +193,7 @@ fn queued_placement_evidence(decision: &PlacementDecision) -> QueuedPlacementEvi
             .rejected
             .iter()
             .map(|rejection| QueuedPlacementRejection {
+                drain_blockers: rejection.drain_blockers.clone(),
                 executor_name: rejection.executor_name.clone(),
                 executor_id: rejection.executor_id.clone(),
                 reason: rejection.reason.clone(),
@@ -1460,6 +1466,8 @@ impl ExplorationState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "application")]
 pub enum DrainApplication {
+    /// Committed projection published; no machine acknowledgement was awaited.
+    Published,
     /// The executor acknowledged the change on its own admission path too.
     Applied,
     /// The runner holds the drain and the machine does not know yet.
@@ -1557,13 +1565,8 @@ pub struct Fleet {
     desired_runtime_policies:
         Arc<Mutex<HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>>>,
     pending_drain: Arc<Mutex<HashMap<String, PendingDrainResult>>>,
-    /// Machines this runner is holding drained, by executor identity.
-    ///
-    /// The in-memory face of [`FleetConfig::drained_machines`], hydrated when
-    /// the runner reads its fleet settings and updated by every drain write.
-    /// Placement and attach both consult it, so neither has to read disk and
-    /// neither depends on the machine being reachable enough to be asked.
-    drained: Arc<Mutex<HashSet<String>>>,
+    /// Publication, attach and fence changes share this ordering boundary.
+    drain_projection: Arc<Mutex<drain_projection::DrainProjection>>,
     /// What each machine is for, by executor identity; absent means general.
     ///
     /// A cache of [`FleetConfig::machine_roles`], which is the one authority:
@@ -1711,6 +1714,7 @@ pub struct Fleet {
     /// runner serves (see [`rollout`]). Locked alone or after `connections`,
     /// never before it.
     self_update: Arc<Mutex<rollout::Rollout>>,
+    self_update_runtime: Arc<self_update::SelfUpdateRuntime>,
     /// Machines the rollout concluded did not return from a self-update,
     /// waiting for the holder of their bootstrap (see [`unreturned`]).
     update_recoveries: Arc<unreturned::UpdateRecoveries>,
@@ -3662,6 +3666,8 @@ struct ExecutorConnectionState {
     /// so the placement gate reads one field on the candidate rather than
     /// reaching for fleet state it would have to lock separately.
     drained: bool,
+    drain_blockers: Vec<cairn_common::executor_protocol::DrainBlocker>,
+    drain_state: cairn_common::executor_protocol::ExecutorDrainState,
     /// Whether the self-update rollout is emptying this machine so it can be
     /// replaced. Stamped by every rollout pass and on attach, for the reason
     /// `drained` is, and cleared by the pass that ends its turn.
@@ -3912,6 +3918,7 @@ fn home_cannot_hold(
         winner.executor_name
     );
     let mut rejected = vec![PlacementRejection {
+        drain_blockers: Vec::new(),
         prediction: None,
         executor_name: home_name.clone(),
         executor_id: home_id.to_string(),
@@ -4376,24 +4383,6 @@ impl Fleet {
                 policy,
             });
         }
-        // Attaching is where the two accounts of this machine's drain are
-        // reconciled, so the runner states its own on every connection rather
-        // than only when it holds one. The runner's refusal is what enforces a
-        // drain; this is what keeps the executor's admission from disagreeing
-        // with it in either direction.
-        //
-        // Sending only `true` would be assuming a new connection means a new
-        // process with default state, and drain mode is process state: an
-        // executor that keeps running across a link bounce keeps whatever it
-        // was last told. A drain cleared while the machine was detached — the
-        // path this change exists to allow — would then leave the executor
-        // refusing work the runner believes it is admitting, each side correct
-        // about itself and opposite about the fleet.
-        let drained = self.drained.lock().unwrap().contains(&executor_id);
-        let _ = sender.send(ExecutorMessage::DrainModeRequest {
-            correlation_id: uuid::Uuid::new_v4().to_string(),
-            enabled: drained,
-        });
         // A machine whose turn it is stays held across a link bounce; the pass
         // that ends the turn is what releases it.
         let update_hold = self.self_update.lock().unwrap().holds(&executor_id);
@@ -4428,7 +4417,9 @@ impl Fleet {
             executor_build_id,
             last_update,
             colocated,
-            drained,
+            drained: true,
+            drain_blockers: Vec::new(),
+            drain_state: Default::default(),
             update_hold,
             // Stamped below, under the table lock.
             machine_role: MachineRole::General,
@@ -4444,7 +4435,17 @@ impl Fleet {
         // the environment it was recorded against: a re-attach with the
         // toolchain present is the repair, identical evidence is not.
         let replaced_generation = {
+            let projection = self.drain_projection.lock().unwrap();
             let mut connections = self.lock_connections();
+            connection.drain_state = projection.view(&executor_id);
+            connection.drain_blockers = projection.blockers(&executor_id);
+            connection.drained = !connection.drain_blockers.is_empty();
+            // Enqueue before releasing either boundary: a newer publication can
+            // only enqueue after this frame and sees the inserted connection.
+            let _ = connection.sender.send(ExecutorMessage::DrainModeRequest {
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+                enabled: drain_projection::protocol_refusal(&connection.drain_blockers),
+            });
             // A refusal outlives the link only while the machine still
             // advertises the environment it was recorded against: a re-attach
             // with the toolchain present is the repair, identical evidence is
@@ -5276,7 +5277,7 @@ impl Fleet {
         // Snapshot the attached identities and release that lock before taking
         // the enrollment one, so this read never holds both at once.
         let attached: HashSet<String> = self.lock_connections().keys().cloned().collect();
-        let drained: HashSet<String> = self.drained.lock().unwrap().clone();
+        let projection = self.drain_projection.lock().unwrap();
         let roles = self.machine_roles.lock().unwrap().clone();
         let artifacts = self.executor_artifact_builds.lock().unwrap().clone();
         let mut values: Vec<_> = self
@@ -5286,6 +5287,7 @@ impl Fleet {
             .iter()
             .filter(|(executor_id, _)| !attached.contains(*executor_id))
             .map(|(executor_id, record)| EnrolledRemote {
+                drain_state: projection.view(executor_id),
                 stranded: record.protocol_refusal.and_then(|refusal| {
                     refusal.stranding(
                         enrolled_artifact_target(&record.os, &record.arch)?,
@@ -5293,7 +5295,7 @@ impl Fleet {
                     )
                 }),
                 unreturned_update: record.unreturned_update.clone(),
-                drained: drained.contains(executor_id),
+                drained: !projection.blockers(executor_id).is_empty(),
                 role: roles.get(executor_id).copied().unwrap_or_default(),
                 executor_id: executor_id.clone(),
                 name: record.name.clone(),
@@ -7848,14 +7850,16 @@ impl Fleet {
                 .get(&(queued.request_id.clone(), queued.attempt_id.clone()))
                 .copied()
                 .unwrap_or(1);
-            queued.placement = placements
-                .iter()
-                .rev()
-                .find(|decision| {
-                    decision.request_id == queued.request_id
-                        && decision.attempt_id == queued.attempt_id
-                })
-                .map(queued_placement_evidence);
+            queued.placement = queued.placement.take().or_else(|| {
+                placements
+                    .iter()
+                    .rev()
+                    .find(|decision| {
+                        decision.request_id == queued.request_id
+                            && decision.attempt_id == queued.attempt_id
+                    })
+                    .map(queued_placement_evidence)
+            });
         }
         for completion in &mut aggregate.recent_completions {
             completion.subscriber_count = counts
@@ -7952,7 +7956,12 @@ impl Fleet {
     /// read between two acquisitions of the connection table rather than
     /// under it, and the rollout decides between them, so no lock here is ever
     /// held across another.
-    pub fn advance_self_update_rollout(&self, now_unix_ms: u64) {
+    pub(crate) fn advance_self_update_rollout(
+        &self,
+        now_unix_ms: u64,
+        persist: impl FnOnce(&[rollout::SelfUpdateDrain]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _pass = self.self_update_runtime.pass.lock().unwrap();
         let artifacts = self.executor_artifact_builds.lock().unwrap().clone();
         let mut candidates: Vec<rollout::Candidate> = self
             .lock_connections()
@@ -7982,11 +7991,12 @@ impl Fleet {
                     .unwrap_or_default(),
             );
         }
-        let step = self
-            .self_update
-            .lock()
-            .unwrap()
-            .advance(&candidates, &artifacts, now_unix_ms);
+        let mut proposed = self.self_update.lock().unwrap().clone();
+        let step = proposed.advance(&candidates, &artifacts, now_unix_ms);
+        // No connection or rollout lock crosses persistence. A failed commit
+        // leaves both the applied schedule and its existing holds untouched.
+        persist(&proposed.required_drains())?;
+        *self.self_update.lock().unwrap() = proposed;
         let mut released = false;
         let delivered = {
             let mut connections = self.lock_connections();
@@ -8047,6 +8057,7 @@ impl Fleet {
             );
         }
         self.note_unreturned(step.unreturned, now_unix_ms);
+        Ok(())
     }
 
     fn note_unreturned(&self, unreturned: Vec<rollout::Unreturned>, now_unix_ms: u64) {
@@ -8193,6 +8204,7 @@ impl Fleet {
         let mut values: Vec<_> = connections
             .values()
             .map(|entry| ExecutorInspection {
+                drain_state: entry.drain_state.clone(),
                 name: executor_public_name(entry),
                 link_path: entry.link_path,
                 recent_placements: self.placements_naming(&entry.identity.executor_id),
@@ -8280,6 +8292,7 @@ impl Fleet {
 
     /// Keep one placement decision, evicting the oldest past the bound.
     fn record_placement_decision(&self, decision: PlacementDecision) {
+        self.queue.record_placement(&decision);
         let now = std::time::Instant::now();
         let mut logged = self.placement_rejection_log.lock().unwrap();
         for rejection in &decision.rejected {
@@ -8369,14 +8382,25 @@ impl Fleet {
 
     /// Every placement decision this machine took part in, newest first.
     fn placements_naming(&self, executor_id: &str) -> Vec<PlacementDecision> {
-        self.recent_placements
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
+        let mut values: Vec<_> = self
+            .queue
+            .live_placements()
+            .into_iter()
             .filter(|decision| decision.mentions_executor(executor_id))
-            .cloned()
-            .collect()
+            .collect();
+        for decision in self.recent_placements.lock().unwrap().iter().rev() {
+            // The live entry duplicates its latest history row, not every
+            // earlier outcome for the same attempt (for example wait → refuse).
+            if decision.mentions_executor(executor_id) && !values.contains(decision) {
+                values.push(decision.clone());
+            }
+        }
+        values.sort_by(|a, b| {
+            b.decided_at_unix_ms
+                .cmp(&a.decided_at_unix_ms)
+                .then_with(|| a.request_id.cmp(&b.request_id))
+        });
+        values
     }
 
     /// The public address of an attached executor, by internal identity.
@@ -8493,164 +8517,6 @@ impl Fleet {
                 self.pending_policy.lock().unwrap().remove(&correlation_id);
                 Err("executor runtime-policy update timed out".into())
             }
-        }
-    }
-
-    /// Hold or release a drain on a machine.
-    ///
-    /// Unlike every other executor control, this one is not fenced on the
-    /// connection generation and does not fail when the machine is unreachable.
-    /// A drain is the runner's own refusal to place work, so it needs nothing
-    /// from the machine to be true; the generation fence exists to stop config
-    /// landing on the wrong process incarnation, and a drain is
-    /// incarnation-independent by nature. The moment an operator reaches for
-    /// this lever is, almost by definition, the moment the machine has stopped
-    /// answering (CAIRN-4360).
-    ///
-    /// The live push is therefore best effort and its outcome is reported, not
-    /// returned as failure: the runner has already stopped placing work either
-    /// way, and a machine that is not listening will be told when it attaches.
-    pub async fn set_executor_drain_mode(
-        &self,
-        executor_id: &str,
-        enabled: bool,
-    ) -> DrainApplication {
-        {
-            let mut drained = self.drained.lock().unwrap();
-            if enabled {
-                drained.insert(executor_id.to_string());
-            } else {
-                drained.remove(executor_id);
-            }
-        }
-        let live = {
-            let mut connections = self.lock_connections();
-            connections.get_mut(executor_id).map(|entry| {
-                entry.drained = enabled;
-                (entry.sender.clone(), entry.generation)
-            })
-        };
-        let Some((sender, generation)) = live else {
-            return DrainApplication::HeldWithoutMachine {
-                reason: "it is not attached".into(),
-            };
-        };
-        let correlation_id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel();
-        self.pending_drain.lock().unwrap().insert(
-            correlation_id.clone(),
-            PendingDrainResult {
-                executor_id: executor_id.to_string(),
-                generation,
-                waiter: tx,
-            },
-        );
-        if sender
-            .send(ExecutorMessage::DrainModeRequest {
-                correlation_id: correlation_id.clone(),
-                enabled,
-            })
-            .is_err()
-        {
-            self.pending_drain.lock().unwrap().remove(&correlation_id);
-            return DrainApplication::HeldWithoutMachine {
-                reason: "its link closed before the request was sent".into(),
-            };
-        }
-        match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(Ok(_))) => DrainApplication::Applied,
-            Ok(Ok(Err(error))) => DrainApplication::HeldWithoutMachine { reason: error },
-            Ok(Err(_)) => DrainApplication::HeldWithoutMachine {
-                reason: "it dropped the drain-mode response".into(),
-            },
-            Err(_) => {
-                self.pending_drain.lock().unwrap().remove(&correlation_id);
-                DrainApplication::HeldWithoutMachine {
-                    reason: "it did not answer within ten seconds".into(),
-                }
-            }
-        }
-    }
-
-    /// Stop placing new work on a machine for as long as a removal tears it
-    /// down, without recording a drain anywhere durable.
-    ///
-    /// Placement refuses the machine exactly as it refuses a drained one, so
-    /// an occupancy reading taken after this stays true until the fence is
-    /// lifted. Returns whether this call raised it: a machine an operator has
-    /// already drained is left to that drain, which lifting the fence after a
-    /// failed removal must not clear. The machine is told best effort, as
-    /// attaching tells it, without waiting for an answer: the runner's own
-    /// refusal is what holds.
-    pub fn fence_admission(&self, executor_id: &str) -> bool {
-        let raised = self.drained.lock().unwrap().insert(executor_id.to_string());
-        if raised {
-            self.state_drain(executor_id, true);
-        }
-        raised
-    }
-
-    /// Clear this runner's drain of a machine in memory: the fence a removal
-    /// raised, or the drain of a machine a removal has taken out of the fleet
-    /// settings, which would otherwise outlive it until the runner restarts.
-    pub fn lift_admission_fence(&self, executor_id: &str) {
-        let held = self.drained.lock().unwrap().remove(executor_id);
-        if held {
-            self.state_drain(executor_id, false);
-        }
-    }
-
-    /// Stamp a drain on the machine's live connection, if it has one, and tell
-    /// it without waiting for the answer.
-    fn state_drain(&self, executor_id: &str, drained: bool) {
-        let sender = self.lock_connections().get_mut(executor_id).map(|entry| {
-            entry.drained = drained;
-            entry.sender.clone()
-        });
-        if let Some(sender) = sender {
-            let _ = sender.send(ExecutorMessage::DrainModeRequest {
-                correlation_id: uuid::Uuid::new_v4().to_string(),
-                enabled: drained,
-            });
-        }
-    }
-
-    /// Whether this runner is holding a machine drained.
-    pub fn is_drained(&self, executor_id: &str) -> bool {
-        self.drained.lock().unwrap().contains(executor_id)
-    }
-
-    /// Adopt the durable set of drained machines, stamping any connection that
-    /// is already up.
-    ///
-    /// Called when the runner reads its fleet settings. Stamping live
-    /// connections is what makes the order irrelevant: the colocated executor
-    /// can attach before settings are read, and a drain that only took effect
-    /// on the next attach would leave the fleet placing work on a machine an
-    /// operator has already disabled.
-    pub fn hydrate_drained(&self, executor_ids: impl IntoIterator<Item = String>) {
-        let adopted: HashSet<String> = executor_ids.into_iter().collect();
-        // The durable set first, as `set_executor_drained` orders it, and the
-        // live entries stamped with plain assignments only, so the connection
-        // table is never held across another lock or a fallible call.
-        *self.drained.lock().unwrap() = adopted.clone();
-        let stated: Vec<_> = self
-            .lock_connections()
-            .iter_mut()
-            .map(|(executor_id, entry)| {
-                entry.drained = adopted.contains(executor_id);
-                (entry.sender.clone(), entry.drained)
-            })
-            .collect();
-        // Stated to every live connection, in both directions, for the same
-        // reason attaching states it: an executor process can outlive the
-        // runner that last told it something, so "the settings say clear" is
-        // not evidence that the machine is not still draining itself.
-        for (sender, drained) in stated {
-            let _ = sender.send(ExecutorMessage::DrainModeRequest {
-                correlation_id: uuid::Uuid::new_v4().to_string(),
-                enabled: drained,
-            });
         }
     }
 
@@ -10059,16 +9925,21 @@ impl Fleet {
                 );
             }
             let granted_request = acquisition;
-            if selected
-                .sender
-                .send(ExecutorMessage::ResidencyRequest {
-                    correlation_id,
-                    config: ResidencyRuntimeConfig::Install(prepared.executor_config.clone()),
-                    operation: ResidencyOperation::Acquire {
-                        request: granted_request.clone(),
+            if self
+                .send_new_admission(
+                    &selected,
+                    &placement,
+                    // Ordinary placement materializes a new environment.
+                    false,
+                    ExecutorMessage::ResidencyRequest {
+                        correlation_id,
+                        config: ResidencyRuntimeConfig::Install(prepared.executor_config.clone()),
+                        operation: ResidencyOperation::Acquire {
+                            request: granted_request.clone(),
+                        },
+                        granted_entry_id: Some(entry_id.clone()),
                     },
-                    granted_entry_id: Some(entry_id.clone()),
-                })
+                )
                 .is_err()
             {
                 drop(dispatch);
@@ -10472,6 +10343,7 @@ impl Fleet {
         orch: &Orchestrator,
         mut operation: ResidencyOperation,
     ) -> ResidencyResult {
+        let mut admission_request = None;
         let (selected, executor_config, object_request, object_plane) = match &mut operation {
             ResidencyOperation::Acquire {
                 request: acquisition,
@@ -10488,6 +10360,7 @@ impl Fleet {
                     Err(failure) => return failure,
                 };
                 let mut placement = residency_placement_request(acquisition);
+                admission_request = Some(placement.clone());
                 let prepared = match self.prepare_execution(orch, &mut placement).await {
                     Ok(prepared) => prepared,
                     Err(outcome) => {
@@ -10521,6 +10394,12 @@ impl Fleet {
                     Ok(routed) => routed,
                     Err(refusal) => return refusal,
                 };
+                if let ResidencyOperation::StartProcess { process_key, .. } = &operation {
+                    let mut request = residency_runtime_config_request(&residency);
+                    request.request_id = format!("{}:start:{process_key}", request.request_id);
+                    request.attempt_id = "start-process".into();
+                    admission_request = Some(request);
+                }
                 // Judged before anything is prepared: a refusal costs nothing.
                 if let ResidencyOperation::StartProcess { process, .. } = &operation {
                     if let Some(refusal) = self
@@ -10694,25 +10573,43 @@ impl Fleet {
             }
             _ => None,
         };
-        let sent = selected
-            .sender
-            .send(ExecutorMessage::ResidencyRequest {
-                correlation_id: correlation_id.clone(),
-                config: executor_config,
-                operation,
-                granted_entry_id: None,
+        let new_admission = matches!(
+            &operation,
+            ResidencyOperation::Acquire { .. } | ResidencyOperation::StartProcess { .. }
+        );
+        let message = ExecutorMessage::ResidencyRequest {
+            correlation_id: correlation_id.clone(),
+            config: executor_config,
+            operation,
+            granted_entry_id: None,
+        };
+        let sent = if new_admission {
+            // The refusal's own words reach the caller: a standing drain names
+            // its owner, reason and generation, which "connection closed"
+            // would erase.
+            self.send_new_admission(
+                &selected,
+                admission_request
+                    .as_ref()
+                    .expect("new admissions carry placement identity"),
+                // A start inside, or a reattachment to, an environment whose
+                // live route is this machine: resident work, never a new one.
+                true,
+                message,
+            )
+            .map_err(|refusal| refusal.diagnostic)
+        } else {
+            // Inputs, renewals and cleanup keep already admitted work alive.
+            selected.sender.send(message).map_err(|_| {
+                "executor connection closed while sending residency operation".to_string()
             })
-            .is_ok();
-        if !sent {
+        };
+        if let Err(diagnostic) = sent {
             self.pending_residency
                 .lock()
                 .unwrap()
                 .remove(&correlation_id);
-            return residency_core_failure(
-                ResidencyFailureKind::Admission,
-                "executor connection closed while sending residency operation",
-                None,
-            );
+            return residency_core_failure(ResidencyFailureKind::Admission, diagnostic, None);
         }
         let result = match self
             .await_link_bound_response(rx, &selected.executor_id, selected.generation)
@@ -11962,7 +11859,10 @@ impl Fleet {
             .lock_connections()
             .get(executor_id)
             .is_some_and(|entry| {
-                entry.drained && environment_live_work(entry, &acquisition.holder).is_empty()
+                // Only a hold that refuses resident work moves an idle one off;
+                // the self-update hold leaves it for its job's next batch.
+                drain_projection::entry_refuses(entry, true)
+                    && environment_live_work(entry, &acquisition.holder).is_empty()
             });
         idle_on_drain && self.environment_could_move(acquisition, executor_id)
     }
@@ -13263,13 +13163,13 @@ impl Fleet {
         orch: &Orchestrator,
         request: &mut CellRequest,
     ) -> Result<PreparedExecution, CellOutcome> {
-        let config = crate::config::settings::load_settings_file(&orch.config_dir)
-            .map_err(|error| CellOutcome::Unavailable {
-                reason: CellUnavailableReason::ExecutorUnavailable,
-                diagnostic: format!("load cell settings: {error}"),
-            })?
-            .fleet
-            .unwrap_or_default();
+        let config =
+            crate::config::settings::read_fleet_strict(&orch.config_dir).map_err(|error| {
+                CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::ExecutorUnavailable,
+                    diagnostic: format!("load cell settings: {error}"),
+                }
+            })?;
         if matches!(request.repository, RepositoryLocator::ScratchOnly { .. }) {
             return Ok(PreparedExecution {
                 cell_client_env: Vec::new(),
@@ -13766,15 +13666,19 @@ impl Fleet {
         let setup_identity = request.project_requirements.setup_identity.clone();
         let runs_in_home = request.pinned_executor_id.is_some();
         let granted_at_unix_ms = unix_time_ms();
-        let sent = selected
-            .sender
-            .send(ExecutorMessage::Granted {
+        let admission_request = request.clone();
+        let admission = self.send_new_admission(
+            &selected,
+            &admission_request,
+            drain_projection::resident_work(&admission_request, &selected.executor_id),
+            ExecutorMessage::Granted {
                 entry_id: entry_id.clone(),
                 config: executor_config,
                 request,
                 batch,
-            })
-            .is_ok();
+            },
+        );
+        let sent = admission.is_ok();
         if sent {
             guard.granted_to = Some(selected.executor_id.clone());
             self.purposes.lock().unwrap().dispatched(
@@ -13787,7 +13691,7 @@ impl Fleet {
         // Retirement can still land in the instant between the gate above and
         // this send, so the delivered form remains.
         let cancelled_before_correlation = self.cancelled_leaders.lock().unwrap().remove(&key);
-        if cancelled_before_correlation {
+        if cancelled_before_correlation && sent {
             let _ = self.send_to(
                 &selected.executor_id,
                 selected.generation,
@@ -13798,6 +13702,8 @@ impl Fleet {
             );
         }
         if !sent {
+            let refusal = admission.expect_err("an unsent grant has an admission error");
+            withdraw_claim(&selected, &entry_id);
             self.queue
                 .take(&key, queue::TerminalState::Cancelled, unix_time_ms());
             if !selected.colocated {
@@ -13809,11 +13715,7 @@ impl Fleet {
                 );
             }
             guard.disarm();
-            let mut executed: ExecutedRequest = executor_unavailable(format!(
-                "executor {} (generation {}): connection closed while granting a claimed request",
-                selected.executor_id, selected.generation
-            ))
-            .into();
+            let mut executed: ExecutedRequest = executor_unavailable(refusal.diagnostic).into();
             executed.account.placement = Some(placement);
             return executed;
         }
@@ -14298,15 +14200,46 @@ impl Fleet {
             )
         });
         let reached = summary.is_some_and(|summary| {
-            selected
-                .sender
-                .send(ExecutorMessage::Offer {
+            match self.send_new_admission(
+                selected,
+                attempt_request,
+                drain_projection::resident_work(attempt_request, &selected.executor_id),
+                ExecutorMessage::Offer {
                     entry_id: entry_id.to_owned(),
                     summary,
-                })
-                .is_ok()
+                },
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    if !error.blockers.is_empty() {
+                        decision.outcome = PlacementOutcome::Refused {
+                            diagnostic: error.diagnostic,
+                        };
+                        decision.rejected.push(PlacementRejection {
+                            executor_name: executor_name.clone(),
+                            executor_id: selected.executor_id.clone(),
+                            reason: error.reason,
+                            prediction: None,
+                            drain_blockers: error.blockers,
+                        });
+                    }
+                    false
+                }
+            }
         });
         if !reached {
+            if let PlacementOutcome::Refused { diagnostic } = &decision.outcome {
+                self.queue.retract_unsent_offer(
+                    entry_id,
+                    &selected.executor_id,
+                    selected.generation,
+                    diagnostic,
+                    unix_time_ms(),
+                );
+                self.record_binding_chain(decision, entry_id);
+                self.record_placement_decision(decision.clone());
+                return OfferAnswer::Requeued;
+            }
             self.queue.decline(
                 entry_id,
                 &selected.executor_id,
@@ -14511,6 +14444,7 @@ impl Fleet {
         let mut rows: Vec<PlacementRejection> = declined
             .into_iter()
             .map(|(executor_id, decline)| PlacementRejection {
+                drain_blockers: Vec::new(),
                 executor_name: self
                     .executor_public_name(&executor_id)
                     .unwrap_or_else(|| executor_id.clone()),
@@ -14591,6 +14525,7 @@ impl Fleet {
                         let mut rejected = refused.decision.rejected;
                         rejected.retain(|rejection| rejection.executor_id != executor_id);
                         rejected.push(PlacementRejection {
+                            drain_blockers: Vec::new(),
                             prediction: None,
                             executor_name,
                             executor_id,
@@ -14658,7 +14593,11 @@ impl Fleet {
                     .map(|rejection| {
                         (
                             rejection.executor_id.clone(),
-                            placement_rejection_signature(&rejection.reason),
+                            format!(
+                                "{}:{:?}",
+                                placement_rejection_signature(&rejection.reason),
+                                rejection.drain_blockers
+                            ),
                         )
                     })
                     .collect();
@@ -15042,6 +14981,7 @@ impl Fleet {
                 return true;
             };
             deferred.push(PlacementRejection {
+                drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: executor_public_name(machine),
                 executor_id: machine.identity.executor_id.clone(),
@@ -16174,17 +16114,17 @@ fn candidate_rejection(
         Some(PlacementRejectionReason::PinMismatch {
             pinned_executor_id: scope.pinned_executor_id.unwrap_or_default().to_string(),
         })
-    } else if entry.drained && !pinned_here {
-        // The runner owns this refusal rather than asking the machine. A
-        // residency pin is the exception: a batch reaches a drained home only
-        // when live work holds its environment there (route resolution moves
-        // an idle one off first), and that resident work is left alone.
-        // Selectors and unpinned requests are new placement and remain refused.
-        Some(PlacementRejectionReason::Drained)
-    } else if entry.update_hold && !pinned_here {
-        // The self-update rollout's hold, with a drain's exemption for the same
-        // reason: resident work has to finish for the machine to empty.
-        Some(PlacementRejectionReason::UpdatePending)
+    } else if drain_projection::entry_refuses(
+        entry,
+        drain_projection::resident_scope(pinned_here, scope.work_class),
+    ) {
+        // Operator, thread, legacy, fence and startup holds refuse all new
+        // admission, a residency pin included. The self-update rollout's hold
+        // refuses only new environments: a job resident here runs its next
+        // batch or terminal on the outgoing build and the update waits for it,
+        // as cairn/6382 promised. Running commands, control and cleanup never
+        // pass through placement.
+        Some(drain_projection::rejection(entry))
     } else if let Some(volume) = entry
         .health
         .build_volume
@@ -16371,6 +16311,7 @@ fn survey_candidates<'a>(
         });
         match reason {
             Some(reason) => rejected.push(PlacementRejection {
+                drain_blockers: entry.drain_blockers.clone(),
                 prediction: None,
                 executor_name: executor_public_name(entry),
                 executor_id: entry.identity.executor_id.clone(),
@@ -16394,6 +16335,7 @@ fn survey_candidates<'a>(
     let mut journal: Vec<PlacementRejection> = declined
         .iter()
         .map(|(executor_id, decline)| PlacementRejection {
+            drain_blockers: Vec::new(),
             prediction: None,
             executor_name: connections
                 .get(executor_id)
@@ -16782,6 +16724,40 @@ fn describe_memory_rejections(rejected: &[PlacementRejection]) -> Option<String>
     (!rows.is_empty()).then(|| rows.join("; "))
 }
 
+/// Each drained machine's owned refusals, by public name, with every blocker's
+/// owner, generation, reason and estimate, or `None` when no row is drained.
+fn describe_drain_blockers(rejected: &[PlacementRejection]) -> Option<String> {
+    let rows: Vec<String> = rejected
+        .iter()
+        .filter(|row| {
+            !row.drain_blockers.is_empty()
+                || matches!(row.reason, PlacementRejectionReason::Drained)
+        })
+        .map(|row| {
+            let blockers = row
+                .drain_blockers
+                .iter()
+                .map(|blocker| {
+                    format!(
+                        "{} generation {}: {}{}",
+                        blocker.owner,
+                        blocker.generation,
+                        blocker.reason,
+                        blocker
+                            .estimate
+                            .as_ref()
+                            .map(|estimate| format!("; estimate {estimate}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}: {}", row.executor_name, blockers)
+        })
+        .collect();
+    (!rows.is_empty()).then(|| rows.join("; "))
+}
+
 /// The record of a pass that placed work nowhere for a reason that ends on its
 /// own (machines it cannot run on for memory, or a machine being emptied for
 /// its executor update), so the queue view and each named machine's page show
@@ -16796,19 +16772,26 @@ fn wait_decision(
         .map(|memory| format!("not placed where it cannot run: {memory}."));
     let waiting_on_update =
         (!updates.is_empty()).then(|| format!("waiting on {}.", updates.join("; ")));
-    if memory.is_none() && waiting_on_update.is_none() {
-        return None;
-    }
-    // The update sentences already say what the decline account would.
+    // A self-update drain's record and its decline account say less than the
+    // update sentence already does, so a row it covers is told once.
+    let told_by_update = |rejection: &&PlacementRejection| {
+        waiting_on_update.is_some()
+            && matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
+    };
     let others: Vec<PlacementRejection> = rejected
         .iter()
-        .filter(|rejection| {
-            waiting_on_update.is_none()
-                || !matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
-        })
+        .filter(|rejection| !told_by_update(rejection))
         .cloned()
         .collect();
-    let reasons: Vec<String> = [memory, waiting_on_update].into_iter().flatten().collect();
+    let drains = describe_drain_blockers(&others)
+        .map(|drains| format!("held from new admission: {drains}."));
+    let reasons: Vec<String> = [memory, drains, waiting_on_update]
+        .into_iter()
+        .flatten()
+        .collect();
+    if reasons.is_empty() {
+        return None;
+    }
     Some(placement_decision(
         request,
         unix_time_ms(),
@@ -17522,6 +17505,7 @@ fn rank_survey(
             };
             if free_to_move && !hold.relieves_itself {
                 rejected.push(PlacementRejection {
+                    drain_blockers: entry.drain_blockers.clone(),
                     prediction: None,
                     executor_name: executor_public_name(entry),
                     executor_id: executor_id.clone(),
@@ -18101,6 +18085,7 @@ impl<'a> ScoredCandidate<'a> {
 
     fn rejection(&self) -> PlacementRejection {
         PlacementRejection {
+            drain_blockers: Vec::new(),
             prediction: Some(self.prediction.clone()),
             executor_name: executor_public_name(self.entry),
             executor_id: self.entry.identity.executor_id.clone(),
@@ -18133,6 +18118,7 @@ impl<'a> ScoredCandidate<'a> {
                 executor_name: winner_name.to_string(),
             });
         PlacementRejection {
+            drain_blockers: Vec::new(),
             // A machine that was ranked and lost owes the operator its numbers,
             // not just the name of whoever beat it.
             prediction: Some(self.prediction.clone()),
@@ -20151,6 +20137,7 @@ fn executor_health_snapshot(
     let telemetry_stale =
         liveness_age_ms.is_some_and(|age| age > EXECUTOR_TELEMETRY_STALE_AFTER_MS);
     ExecutorHealthSnapshot {
+        drain_state: entry.drain_state.clone(),
         identity: entry.identity.clone(),
         public_name: executor_public_name(entry),
         colocated: entry.colocated,
@@ -20947,7 +20934,7 @@ fn absent_enrolled_inventory(
         })
         .map(|machine| {
             let cause = if machine.drained {
-                "drained by an operator".to_string()
+                "drained, refusing new work".to_string()
             } else {
                 presence_cause(&machine.link)
             };
@@ -21141,8 +21128,26 @@ fn no_matching_executor_diagnostic(
         matches!(rejection.reason, PlacementRejectionReason::Drained) && would_serve(rejection)
     });
     if let Some(rejection) = drained_target {
+        let blockers = rejection
+            .drain_blockers
+            .iter()
+            .map(|blocker| {
+                format!(
+                    "{} generation {}: {}{}",
+                    blocker.owner,
+                    blocker.generation,
+                    blocker.reason,
+                    blocker
+                        .estimate
+                        .as_ref()
+                        .map(|estimate| format!(" (estimate {estimate})"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         return format!(
-            "{} is drained by an operator, so the runner is refusing new work there. Only an operator can clear the drain; read cairn://executors for live state.{account}",
+            "{} is drained, so the runner is refusing new work there. Blocking records/fences: {blockers}. Read cairn://executors for live state.{account}",
             rejection.executor_name
         );
     }
@@ -27032,6 +27037,53 @@ mod tests {
         assert!(received.try_recv().is_err());
     }
 
+    fn runtime_update_hold_fixture(entry: &mut ExecutorConnectionState, enabled: bool) {
+        published_drains_fixture(entry, enabled, false);
+    }
+
+    /// What the published projection leaves on a machine: the self-update
+    /// rollout's runtime record and, optionally, an operator drain beside it.
+    fn published_drains_fixture(entry: &mut ExecutorConnectionState, update: bool, operator: bool) {
+        use cairn_config::drain::{AdmissionEffect, RuntimeDrainContext, RuntimeDrainKind};
+        let fleet = Fleet::default();
+        let mut config = FleetConfig::default();
+        let principal = cairn_common::identity::PrincipalRef::Human {
+            issuer: "test".into(),
+            subject: "runtime-fixture".into(),
+            organization: None,
+        };
+        if operator {
+            config
+                .drains
+                .impose_operator(&entry.identity.executor_id, &principal, "maintenance", 1)
+                .unwrap();
+        }
+        if update {
+            config
+                .drains
+                .impose_runtime(
+                    &entry.identity.executor_id,
+                    RuntimeDrainContext {
+                        kind: RuntimeDrainKind::SelfUpdate,
+                        operation_id: "update".into(),
+                        turn_id: "turn".into(),
+                        runner_boot_id: "boot".into(),
+                        admission_effect: AdmissionEffect::RefuseNewEnvironments,
+                    },
+                    &principal,
+                    "executor update",
+                    2,
+                )
+                .unwrap();
+        }
+        fleet.publish_drain_projection(&config);
+        let projection = fleet.drain_projection.lock().unwrap();
+        entry.drain_state = projection.view(&entry.identity.executor_id);
+        entry.drain_blockers = projection.blockers(&entry.identity.executor_id);
+        entry.drained = !entry.drain_blockers.is_empty();
+        entry.update_hold = update;
+    }
+
     fn fleet_entry(
         id: &str,
         os: &str,
@@ -27207,6 +27259,8 @@ mod tests {
             id.into(),
             ExecutorConnectionState {
                 drained: false,
+                drain_blockers: Vec::new(),
+                drain_state: Default::default(),
                 update_hold: false,
                 machine_role: MachineRole::General,
                 model_residents: Vec::new(),
@@ -28896,7 +28950,7 @@ mod tests {
         ] {
             let (id, mut entry) = fleet_entry_at(id, os, 0, &[], now);
             entry.advertisement.capabilities.memory_budget_bytes = Some(budget);
-            entry.update_hold = update_hold;
+            runtime_update_hold_fixture(&mut entry, update_hold);
             measured_at(&mut entry, 0.01, budget, 500 * GIB, now);
             resource_profiles::seed_memory_profile_for_test(
                 db.clone(),
@@ -32265,6 +32319,7 @@ mod tests {
     #[test]
     fn the_journal_replaces_readings_but_not_structural_reasons() {
         let row = |id: &str, reason| PlacementRejection {
+            drain_blockers: Vec::new(),
             prediction: None,
             executor_name: id.into(),
             executor_id: id.into(),
@@ -33033,8 +33088,8 @@ mod tests {
         let refusal = place(&connections, &request)
             .expect_err("a fleet whose only matching machine is drained refuses");
         assert!(refusal.contains("bglab-sp1"), "{refusal}");
-        assert!(refusal.contains("drained by an operator"), "{refusal}");
-        assert!(refusal.contains("Only an operator can clear"), "{refusal}");
+        assert!(refusal.contains("drained"), "{refusal}");
+        assert!(refusal.contains("Blocking records/fences"), "{refusal}");
 
         connections.get_mut("bglab-sp1").unwrap().drained = false;
         assert_eq!(
@@ -33647,52 +33702,15 @@ mod tests {
         );
     }
 
-    /// The posts/91 specimen: draining a machine with a live execution home on
-    /// it must not strand that job. A pin is residency established before the
-    /// drain, not a requester choosing the machine for new work. Letting it run
-    /// is what permits the resident work to finish and the machine to empty.
     #[test]
-    fn a_drain_admits_work_pinned_to_the_execution_home_it_already_hosts() {
+    fn a_drain_refuses_new_work_even_when_pinned_to_an_existing_home() {
         let (executor_id, mut resident_home) = fleet_entry("bglab-sp1", "linux", 0, &[]);
         resident_home.drained = true;
         let connections = HashMap::from([(executor_id, resident_home)]);
         let mut request = targeted_request("linux");
         request.pinned_executor_id = Some("bglab-sp1".into());
-
-        let selection = place(&connections, &request)
-            .expect("resident work crosses the drain gate")
-            .selected
-            .expect("the execution home remains the only destination")
-            .0;
-
-        assert_eq!(selection.executor_id, "bglab-sp1");
-        assert_eq!(
-            request.pinned_executor_id.as_deref(),
-            Some(selection.executor_id.as_str()),
-            "admission preserves residency; it does not re-home the job"
-        );
-    }
-
-    /// A matching residency pin bypasses only the drain refusal. It does not
-    /// make a dead link usable, and the diagnostic must preserve that actual
-    /// rejection rather than telling an operator to clear an irrelevant drain.
-    #[test]
-    fn a_pinned_drained_home_with_a_stale_link_reports_liveness_not_drain() {
-        let (executor_id, mut resident_home) = fleet_entry("bglab-sp1", "linux", 0, &[]);
-        resident_home.drained = true;
-        resident_home.last_progress_unix_ms = NOW - EXECUTOR_PROGRESS_FRESHNESS_MS - 1;
-        let connections = HashMap::from([(executor_id, resident_home)]);
-        let mut request = targeted_request("linux");
-        request.pinned_executor_id = Some("bglab-sp1".into());
-
-        let refusal = place(&connections, &request)
-            .expect_err("a residency pin cannot cross a stale connection");
-
-        assert!(refusal.contains("working tree (bglab-sp1)"), "{refusal}");
-        assert!(!refusal.contains("execution home"), "{refusal}");
-        assert!(refusal.contains("liveness bound"), "{refusal}");
-        assert!(!refusal.contains("drained"), "{refusal}");
-        assert!(!refusal.contains("clear the drain"), "{refusal}");
+        let refusal = place(&connections, &request).expect_err("pins do not bypass drains");
+        assert!(refusal.contains("drained"), "{refusal}");
     }
 
     /// Adopting durable state at startup must not depend on winning a race with
@@ -34472,7 +34490,22 @@ mod tests {
             .insert(executor_id.clone(), connection);
         pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
 
-        pool.advance_self_update_rollout(NOW);
+        assert!(pool
+            .advance_self_update_rollout(NOW, |_| Err("injected precommit failure".into()))
+            .is_err());
+        assert!(!pool.self_update.lock().unwrap().holds(&executor_id));
+        assert!(
+            !pool
+                .lock_connections()
+                .get(&executor_id)
+                .unwrap()
+                .update_hold
+        );
+        assert!(
+            executor.try_recv().is_err(),
+            "a failed drain commit sends no directive"
+        );
+        pool.advance_self_update_rollout(NOW, |_| Ok(())).unwrap();
         assert!(
             pool.lock_connections()
                 .get(&executor_id)
@@ -34511,7 +34544,22 @@ mod tests {
             entry.snapshots_received += 2;
             entry.link_clock.stage(0, 0);
         }
-        pool.advance_self_update_rollout(NOW + 30_000);
+        assert!(pool
+            .advance_self_update_rollout(NOW + 30_000, |_| Err("injected precommit failure".into()))
+            .is_err());
+        assert!(pool.self_update.lock().unwrap().holds(&executor_id));
+        assert!(
+            pool.lock_connections()
+                .get(&executor_id)
+                .unwrap()
+                .update_hold
+        );
+        assert!(
+            executor.try_recv().is_err(),
+            "a failed directive transition preserves the hold and sends nothing"
+        );
+        pool.advance_self_update_rollout(NOW + 30_000, |_| Ok(()))
+            .unwrap();
         let directed =
             std::iter::from_fn(|| executor.try_recv().ok()).find_map(|message| match message {
                 ExecutorMessage::UpdateDirected {
@@ -34548,7 +34596,7 @@ mod tests {
             .get_mut(COLOCATED_EXECUTOR_ID)
             .unwrap()
             .colocated = true;
-        connections.get_mut("bbs").unwrap().update_hold = true;
+        runtime_update_hold_fixture(connections.get_mut("bbs").unwrap(), true);
         let mut request = targeted_request("linux");
         request.executor = Some(ExecutorSelector {
             name: Some("bbs".into()),
@@ -34574,7 +34622,7 @@ mod tests {
             describe_declines(&draft.rejected)
         );
 
-        connections.get_mut("bbs").unwrap().update_hold = false;
+        runtime_update_hold_fixture(connections.get_mut("bbs").unwrap(), false);
         assert_eq!(
             place(&connections, &request)
                 .unwrap()
@@ -34593,7 +34641,7 @@ mod tests {
     #[test]
     fn an_update_hold_admits_work_pinned_to_the_execution_home_it_already_hosts() {
         let (executor_id, mut resident_home) = fleet_entry("bbs", "linux", 0, &[]);
-        resident_home.update_hold = true;
+        runtime_update_hold_fixture(&mut resident_home, true);
         let connections = HashMap::from([(executor_id, resident_home)]);
         let mut resident = targeted_request("linux");
         resident.pinned_executor_id = Some("bbs".into());
@@ -34613,6 +34661,52 @@ mod tests {
         assert!(draft.selected.is_none(), "new work is still held");
     }
 
+    /// The resident exception belongs to the self-update effect alone. A check
+    /// lane pinned to the home builds a new cell, so it waits for the update;
+    /// an operator drain beside the update refuses the resident batch too, and
+    /// only then does the executor's own boolean refuse.
+    #[test]
+    fn only_the_update_drain_admits_resident_work_and_only_alone() {
+        let (executor_id, mut resident_home) = fleet_entry("bbs", "linux", 0, &[]);
+        runtime_update_hold_fixture(&mut resident_home, true);
+        assert!(!drain_projection::protocol_refusal(
+            &resident_home.drain_blockers
+        ));
+        let mut resident = targeted_request("linux");
+        resident.pinned_executor_id = Some("bbs".into());
+        let mut check = resident.clone();
+        check.placement_work_class = PlacementWorkClass::WriteChecks;
+        assert_eq!(
+            candidate_rejection(&resident_home, PlacementScope::of(&check), NOW),
+            Some(PlacementRejectionReason::UpdatePending),
+            "a pinned check lane is a new environment"
+        );
+
+        published_drains_fixture(&mut resident_home, true, true);
+        assert!(drain_projection::protocol_refusal(
+            &resident_home.drain_blockers
+        ));
+        assert_eq!(
+            candidate_rejection(&resident_home, PlacementScope::of(&resident), NOW),
+            Some(PlacementRejectionReason::Drained),
+            "an operator drain refuses pinned work whatever stands beside it"
+        );
+        let connections = HashMap::from([(executor_id, resident_home)]);
+        assert!(place(&connections, &resident)
+            .map(|draft| draft.selected.is_none())
+            .unwrap_or(true));
+
+        let (_, mut operator_only) = fleet_entry("bbs", "linux", 0, &[]);
+        published_drains_fixture(&mut operator_only, false, true);
+        assert!(drain_projection::protocol_refusal(
+            &operator_only.drain_blockers
+        ));
+        assert_eq!(
+            candidate_rejection(&operator_only, PlacementScope::of(&resident), NOW),
+            Some(PlacementRejectionReason::Drained)
+        );
+    }
+
     /// cairn/6382's misattribution: a batch pinned to its home on bgsrv-ub,
     /// waiting there for room, was told it waited on bbs being emptied for an
     /// update. A machine the pin excludes says so, never its hold.
@@ -34622,7 +34716,7 @@ mod tests {
             fleet_entry("bbs", "linux", 0, &[]),
             fleet_entry("bgsrv-ub", "linux", 0, &[]),
         ]);
-        connections.get_mut("bbs").unwrap().update_hold = true;
+        runtime_update_hold_fixture(connections.get_mut("bbs").unwrap(), true);
         connections.get_mut("bgsrv-ub").unwrap().drained = true;
         let mut request = targeted_request("linux");
         request.pinned_executor_id = Some("bgsrv-ub".into());
@@ -34676,8 +34770,10 @@ mod tests {
         pool.lock_connections()
             .insert(executor_id.clone(), connection);
         pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
-        pool.advance_self_update_rollout(now);
+        pool.advance_self_update_rollout(now, |_| Ok(())).unwrap();
         assert!(pool.lock_connections()[&executor_id].update_hold);
+        // What publishing the rollout's required drain leaves on the machine.
+        runtime_update_hold_fixture(pool.lock_connections().get_mut(&executor_id).unwrap(), true);
 
         let mut request = targeted_request("linux");
         request.executor = Some(ExecutorSelector {
@@ -34724,12 +34820,13 @@ mod tests {
         pool.lock_connections()
             .insert(executor_id.clone(), connection);
         pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
-        pool.advance_self_update_rollout(now);
+        pool.advance_self_update_rollout(now, |_| Ok(())).unwrap();
         pool.lock_connections()
             .get_mut(&executor_id)
             .unwrap()
             .snapshots_received += 2;
-        pool.advance_self_update_rollout(now + 30_000);
+        pool.advance_self_update_rollout(now + 30_000, |_| Ok(()))
+            .unwrap();
         assert!(
             std::iter::from_fn(|| executor.try_recv().ok())
                 .any(|message| matches!(message, ExecutorMessage::UpdateDirected { .. })),
@@ -34820,7 +34917,7 @@ mod tests {
             .sandbox = Some(floored);
         let mac = connections.get_mut("bgsrv-mac").unwrap();
         mac.advertisement.capabilities.sandbox = Some(capable);
-        mac.update_hold = true;
+        runtime_update_hold_fixture(mac, true);
         let mut request = targeted_request("macos");
         request.executor = Some(ExecutorSelector {
             os: Some("macos".into()),
@@ -34842,18 +34939,12 @@ mod tests {
         );
 
         let mac = connections.get_mut("bgsrv-mac").unwrap();
-        mac.update_hold = false;
+        runtime_update_hold_fixture(mac, false);
         mac.drained = true;
         let refusal = place(&connections, &request)
             .expect_err("no macOS machine can take a nested-Seatbelt check lane now");
-        assert!(
-            refusal.contains("bgsrv-mac is drained by an operator"),
-            "{refusal}"
-        );
-        assert!(
-            refusal.contains("bgsrv-mac: drained by an operator"),
-            "{refusal}"
-        );
+        assert!(refusal.contains("bgsrv-mac is drained"), "{refusal}");
+        assert!(refusal.contains("bgsrv-mac: drained"), "{refusal}");
         assert!(
             refusal.contains(
                 "local: check lanes need a nested Seatbelt write and this machine cannot apply one (outer profile inherited: a confined process cannot apply a second profile; operator credential floor)"
@@ -36276,6 +36367,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_drain_between_claim_and_grant_releases_the_unstarted_machine_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let (sender, mut remote) = mpsc::unbounded_channel();
+        let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
+        let generation = orch
+            .fleet
+            .attach_advertised_executor(advertised.advertisement, sender, false, None, None)
+            .unwrap();
+        let mut request = provenance_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        request.pinned_executor_id = Some("remote".into());
+        let submitting = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.fleet.submit_execution(&orch, request, None).await })
+        };
+        let (offered, summary) = loop {
+            match tokio::time::timeout(Duration::from_secs(30), remote.recv()).await {
+                Ok(Some(ExecutorMessage::DrainModeRequest { .. })) => continue,
+                Ok(Some(ExecutorMessage::Offer { entry_id, summary })) => {
+                    break (entry_id, summary)
+                }
+                other => panic!("expected an offer before the drain, got {other:?}"),
+            }
+        };
+        let (_machine_home, machine) = claiming_machine();
+        machine_claims(&machine, &offered, &summary).await;
+        orch.fleet.handle_executor_message(
+            "remote",
+            generation,
+            ExecutorMessage::Claim {
+                entry_id: offered.clone(),
+            },
+        );
+        // This current-thread test does not yield between accepting Claim and
+        // publication, so the resumed dispatch must encounter the new fence.
+        let fence =
+            orch.fleet
+                .fence_admission_owned("remote", "removal".into(), "claim-race fence".into());
+        let outcome = tokio::time::timeout(Duration::from_secs(30), submitting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(outcome, CellOutcome::Unavailable { ref diagnostic, .. }
+            if diagnostic.contains("claim-race fence") && !diagnostic.contains("connection closed")),
+            "{outcome:?}"
+        );
+        let mut lost = 0;
+        while let Ok(frame) = remote.try_recv() {
+            match frame {
+                frame @ ExecutorMessage::DrainModeRequest { .. } => {
+                    machine_hears(&machine, frame).await
+                }
+                frame @ ExecutorMessage::Lost { .. } => {
+                    assert!(
+                        matches!(&frame, ExecutorMessage::Lost { entry_id } if entry_id == &offered)
+                    );
+                    lost += 1;
+                    machine_hears(&machine, frame).await;
+                }
+                other => panic!("a vetoed claim receives no grant or cancel, got {other:?}"),
+            }
+        }
+        assert_eq!(lost, 1);
+        assert!(orch
+            .fleet
+            .queue
+            .with_entry_by_identity(
+                &(summary.request_id.clone(), summary.attempt_id.clone()),
+                |_| (),
+            )
+            .is_none());
+        assert!(orch.fleet.lift_admission_fence(&fence));
+        match remote.try_recv() {
+            Ok(frame @ ExecutorMessage::DrainModeRequest { enabled: false, .. }) => {
+                machine_hears(&machine, frame).await
+            }
+            other => panic!("the executor receives the committed admission clear, got {other:?}"),
+        }
+        assert!(
+            remote.try_recv().is_err(),
+            "no duplicate Lost follows the clear"
+        );
+        assert_machine_released(&machine, &summary).await;
+    }
+
     /// A real executor pool standing in for the machine on the other end of
     /// the link, so a test observes the machine's own accounting rather than
     /// asserting on the frames a scripted peer happened to receive.
@@ -36309,6 +36490,9 @@ mod tests {
     async fn machine_hears(machine: &cairn_exec::Fleet, frame: ExecutorMessage) {
         let machine = machine.clone();
         cairn_exec::blocking::offload(move || match frame {
+            ExecutorMessage::DrainModeRequest { enabled, .. } => {
+                machine.set_drain_mode(enabled);
+            }
             ExecutorMessage::Lost { entry_id } => {
                 if let Some(request_id) = machine.release_claim(&entry_id) {
                     machine.release_request_identity(&request_id);
@@ -38092,7 +38276,7 @@ mod tests {
         ));
     }
 
-    fn targeted_request(os: &str) -> CellRequest {
+    pub(super) fn targeted_request(os: &str) -> CellRequest {
         CellRequest {
             request_id: "r".into(),
             attempt_id: "a".into(),
@@ -38147,6 +38331,7 @@ mod tests {
             },
             last_attempt: None,
             drained: false,
+            drain_state: Default::default(),
             role: Default::default(),
             last_seen_unix_ms: None,
             retired: Vec::new(),
@@ -38173,6 +38358,7 @@ mod tests {
             },
             last_attempt: None,
             drained: false,
+            drain_state: Default::default(),
             role: Default::default(),
             last_seen_unix_ms: None,
             retired: Vec::new(),
@@ -38205,6 +38391,7 @@ mod tests {
             },
             last_attempt: None,
             drained: false,
+            drain_state: Default::default(),
             role: Default::default(),
             last_seen_unix_ms: None,
             retired: Vec::new(),
@@ -45555,7 +45742,8 @@ mod tests {
             home.sentence(),
             "**fedora** is draining, and this batch was placed there because terminal `dev` holds this job's environment there. Once nothing live holds it, the next batch moves to a machine that is not draining."
         );
-        // The pin it carries is the one exemption a drain makes.
+        // Keeping the resident environment does not admit new work, even when
+        // that work is pinned to the machine holding the terminal.
         let mut pinned = residency_placement_request(&request);
         pinned.pinned_executor_id = Some("fedora".into());
         assert_eq!(
@@ -45564,7 +45752,7 @@ mod tests {
                 PlacementScope::of(&pinned),
                 unix_time_ms()
             ),
-            None
+            Some(PlacementRejectionReason::Drained)
         );
     }
 

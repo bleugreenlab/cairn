@@ -80,7 +80,7 @@ impl LaneContext {
             )
         } else if self.credential_floor_rules.is_some() {
             format!(
-                "{KERNEL_RULE} (this machine holds an operator credential, so its check-lane commands run under the operator credential floor); {}",
+                "{KERNEL_RULE} (check-lane commands carry the non-relaxable operator credential floor, including privileged rebuild state even before credentials exist); {}",
                 probe.detail
             )
         } else if self.outer_profile.is_some() {

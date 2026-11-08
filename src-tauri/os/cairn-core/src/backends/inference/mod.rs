@@ -197,7 +197,7 @@ fn embedding_target(route: inference_route::Route) -> (EmbedRoute, String) {
 }
 
 /// One served model as the catalog lists it, by its real name.
-fn discovered(served: &ServedModel) -> DiscoveredModel {
+pub(crate) fn discovered(served: &ServedModel) -> DiscoveredModel {
     DiscoveredModel {
         maker: None,
         id: served.id.clone(),
@@ -221,6 +221,8 @@ fn discovered(served: &ServedModel) -> DiscoveredModel {
         router: false,
         modalities: Some(served.modalities()),
         serves: Some(serves_for(served)),
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: tokenizer_for(INFERENCE_BACKEND_KEY, &served.id, Some(&served.id)),
     }
 }
@@ -237,6 +239,109 @@ pub(crate) fn discover_catalog_blocking(
         }
         Err(error) => (Vec::new(), Some(error)),
     }
+}
+
+/// Attach placement's current answer after reading cached discovery. Reading
+/// availability neither requests a model nor probes or starts an engine.
+pub(crate) fn live_catalog(
+    orch: &Orchestrator,
+    catalog: &mut cairn_models::types::catalog::ProviderModelCatalog,
+) {
+    match run_db_blocking(|| crate::fleet::models::view(orch)) {
+        Ok(view) => attach_availability(&mut catalog.models, &view),
+        Err(error) => {
+            catalog.models.clear();
+            catalog.error = Some(format!("Could not read live placement: {error}"));
+        }
+    }
+}
+
+fn attach_availability(models: &mut Vec<DiscoveredModel>, view: &crate::fleet::models::ModelsView) {
+    models.retain_mut(|model| {
+        model.availability_by_verb = model
+            .serves
+            .iter()
+            .flatten()
+            .filter_map(|served| {
+                availability(view, &model.model, served.verb.kind())
+                    .map(|availability| (served.verb.kind(), availability))
+            })
+            .collect();
+        if let Some(serves) = &mut model.serves {
+            serves.retain(|served| model.availability_by_verb.contains_key(&served.verb.kind()));
+        }
+        model.availability = model
+            .availability_by_verb
+            .values()
+            .max_by_key(|availability| {
+                use cairn_models::types::catalog::ModelAvailability;
+                match availability {
+                    ModelAvailability::Loaded { .. } => (0, 0),
+                    ModelAvailability::Loadable {
+                        expected_load_ms, ..
+                    }
+                    | ModelAvailability::Loading {
+                        expected_load_ms, ..
+                    } => (1, expected_load_ms.unwrap_or(u64::MAX)),
+                }
+            })
+            .cloned();
+        model.availability.is_some()
+    });
+}
+
+/// The route placement's own chooser selected for this verb, not the fastest
+/// pool or a healthy deployment that serves some other verb.
+fn availability(
+    view: &crate::fleet::models::ModelsView,
+    model: &str,
+    verb: VerbKind,
+) -> Option<cairn_models::types::catalog::ModelAvailability> {
+    use crate::fleet::models::settings::SettingOrigin;
+    use cairn_inference::control::Phase;
+    use cairn_models::types::catalog::ModelAvailability;
+
+    let deployment = view
+        .routes
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(model))?
+        .1
+        .get(&verb)?;
+    let placement = view.placement(deployment)?;
+    if placement.refused.is_some() {
+        return None;
+    }
+    let pool = view
+        .pools
+        .iter()
+        .find(|pool| Some(&pool.key) == placement.pool.as_ref())?;
+    let pool_name = pool.key.to_string();
+    let expected_load_ms = match pool.settings.load_bound.origin {
+        SettingOrigin::Measured(load) => Some(load.secs.saturating_mul(1_000)),
+        _ => None,
+    };
+    if let Some(resident) = pool.residents.iter().find(|r| &r.deployment == deployment) {
+        let since = match resident.phase.as_ref() {
+            Some(Phase::Healthy { .. }) => {
+                return Some(ModelAvailability::Loaded { pool: pool_name })
+            }
+            Some(Phase::Starting { requested_ms, .. }) => Some(*requested_ms),
+            Some(Phase::Reserving { since_ms, .. }) => Some(*since_ms),
+            None => Some(resident.loading_since.unwrap_or(resident.chosen_at)),
+            _ => None,
+        };
+        if let Some(since) = since {
+            return Some(ModelAvailability::Loading {
+                pool: pool_name,
+                expected_load_ms,
+                elapsed_ms: u64::try_from(view.now.saturating_sub(since)).unwrap_or(0),
+            });
+        }
+    }
+    Some(ModelAvailability::Loadable {
+        pool: pool_name,
+        expected_load_ms,
+    })
 }
 
 /// Who a completion's request is made on behalf of, as the queue names it.
@@ -275,11 +380,30 @@ impl AgentBackend for InferenceBackend {
     }
 
     /// The deployment placement chose to decide, sent the engine's own name.
+    /// Cairn's deployments run on machines this workspace enrolled: there is
+    /// no provider to retain anything.
+    fn zero_data_retention(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+        _provider: &str,
+        model: &str,
+    ) -> Result<crate::backends::retention::ZdrMet, String> {
+        Ok(crate::backends::retention::ZdrMet {
+            basis: cairn_models::interface::retention::ZdrBasis::OperatorHardware,
+            detail: format!(
+                "{model} runs on a Cairn inference deployment, on hardware this workspace enrolled"
+            ),
+            exclude: Vec::new(),
+        })
+    }
+
     fn decision_route(
         &self,
         orch: &Orchestrator,
         project_id: Option<&str>,
         offer: &SelectedOffer,
+        _admitted: &crate::backends::Admitted,
     ) -> Result<(DecisionRoute, String), String> {
         let route = ready_blocking(
             orch,

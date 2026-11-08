@@ -3,7 +3,7 @@
 //! (`conversation`), and the chat family configured with OpenRouter's
 //! endpoint, its dialect, and its provider-routing object.
 
-use super::http::{build_provider_object, openrouter_headers, CHAT_URL};
+use super::http::{openrouter_headers, provider_extras, Request, CHAT_URL};
 use super::{openrouter_api_key, OPENROUTER_BACKEND_KEY, OPENROUTER_BACKEND_NAME};
 use crate::backends::http_loop::{Connection, WireAdapter};
 use crate::backends::openai_compat::conversation;
@@ -14,17 +14,22 @@ use crate::orchestrator::Orchestrator;
 use cairn_models::turn::ChatFamily;
 use serde_json::{Map, Value};
 
-/// The OpenRouter wire adapter. Holds the provider-routing object resolved once
-/// per turn at construction (it reads settings.yaml), so the same object rides
-/// every tool-iteration POST without re-reading settings.
+/// The OpenRouter wire adapter. Holds the provider-routing extras resolved
+/// once per turn at construction (it reads settings.yaml, and the call's
+/// admitted retention), so the same object rides every tool-iteration POST
+/// without re-reading settings.
 pub(super) struct OpenRouterAdapter {
-    provider: Value,
+    extras: Map<String, Value>,
 }
 
 impl OpenRouterAdapter {
-    pub(super) fn new(orch: &Orchestrator) -> Self {
+    pub(super) fn new(orch: &Orchestrator, admitted: &crate::backends::Admitted) -> Self {
         Self {
-            provider: build_provider_object(&orch.get_settings().openrouter_routing),
+            extras: provider_extras(
+                &orch.get_settings().openrouter_routing,
+                admitted.zero_data_retention(),
+                Request::Chat,
+            ),
         }
     }
 }
@@ -70,7 +75,7 @@ impl WireAdapter for OpenRouterAdapter {
                 reasoning: ChatReasoning::Object,
                 ..ChatDialect::default()
             },
-            extras: Map::from_iter([("provider".to_string(), self.provider.clone())]),
+            extras: self.extras.clone(),
         })
     }
 
@@ -113,7 +118,7 @@ mod tests {
     #[test]
     fn a_completion_sends_effort_as_the_reasoning_object_beside_the_routing() {
         let family = OpenRouterAdapter {
-            provider: build_provider_object(&OpenRouterRouting::default()),
+            extras: provider_extras(&OpenRouterRouting::default(), None, Request::Chat),
         }
         .family(&Connection {
             api_key: Some("key".to_string()),
@@ -133,6 +138,7 @@ mod tests {
             },
             output_schema: Some(json!({"type": "object"})),
             timeout: std::time::Duration::from_secs(5),
+            requirements: Default::default(),
         };
         let body = completion_body(&request, &family).unwrap();
         assert_eq!(body["reasoning"], json!({"effort": "low"}));

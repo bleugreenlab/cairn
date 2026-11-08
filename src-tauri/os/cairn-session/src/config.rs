@@ -128,6 +128,9 @@ pub struct CompletionRequest {
     pub options: RuntimeExtras,
     pub output_schema: Option<Value>,
     pub timeout: Duration,
+    /// What the call requires of the deployment that serves it (zero data
+    /// retention). The launch gate decides it before the backend is asked.
+    pub requirements: cairn_models::interface::retention::Requirements,
 }
 
 impl CompletionRequest {
@@ -326,6 +329,7 @@ mod tests {
             model: "m".to_string(),
             project_id: None,
             options: RuntimeExtras::default(),
+            requirements: Default::default(),
             output_schema: None,
             timeout: Duration::from_secs(1),
         }

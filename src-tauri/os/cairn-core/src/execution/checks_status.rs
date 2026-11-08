@@ -149,11 +149,25 @@ pub(crate) fn verdict_evidence_from_facts(
     passed: bool,
     parsed: Option<&VerdictFacts<'_>>,
 ) -> VerdictEvidence {
+    verdict_evidence_with_expectation(passed, parsed, None)
+}
+
+/// Only a known non-enumerating command can rely on its exit status alone.
+/// Structured results retain authority, including incomplete or disowned greens.
+fn verdict_evidence_with_expectation(
+    passed: bool,
+    parsed: Option<&VerdictFacts<'_>>,
+    expects_enumeration: Option<bool>,
+) -> VerdictEvidence {
     if !passed {
         return VerdictEvidence::Failed;
     }
     let Some(parsed) = parsed else {
-        return VerdictEvidence::Unverified(UnverifiedReason::NoStructuredResult);
+        return if expects_enumeration == Some(false) {
+            VerdictEvidence::Verified
+        } else {
+            VerdictEvidence::Unverified(UnverifiedReason::NoStructuredResult)
+        };
     };
     if let Some(reason) = &parsed.unverified {
         return VerdictEvidence::Unverified(UnverifiedReason::Declared(reason.to_string()));
@@ -174,16 +188,6 @@ pub(crate) fn verdict_evidence_from_facts(
         return VerdictEvidence::Verified;
     };
     VerdictEvidence::Unverified(reason)
-}
-
-pub(crate) fn check_state_from_evidence(
-    passed: bool,
-    parsed: Option<&ParsedCheckResult>,
-) -> NodeCheckState {
-    check_state_from_facts(
-        passed,
-        parsed.map(ParsedCheckResult::verdict_facts).as_ref(),
-    )
 }
 
 pub(crate) fn check_state_from_facts(
@@ -1708,7 +1712,7 @@ fn assemble_statuses(
                 let mut status = status_from_row(
                     job_id,
                     request_ids.get(&name).cloned(),
-                    &name,
+                    Some(&check.command),
                     check.policy,
                     check.when,
                     row,
@@ -1718,17 +1722,6 @@ fn assemble_statuses(
                 );
                 status.verified_on = verified_on.get(&name).cloned();
                 status.base_attribution = attributions.get(&name).cloned();
-                let parsed = row
-                    .target_results_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str::<ParsedCheckResult>(json).ok());
-                status.evidence = Some(row_evidence(
-                    row,
-                    parsed.as_ref(),
-                    Some(crate::execution::check_parsers::is_test_runner_command(
-                        &check.command,
-                    )),
-                ));
                 status.notice = newer_attempt_note(lane);
                 if let Some(held) = &lane.held {
                     // Held, not red: the breaker's count is the lane's
@@ -1939,7 +1932,7 @@ pub(crate) fn lane_evidence(has_row: bool, not_applicable: bool, started: bool) 
 fn status_from_row(
     job_id: &str,
     request_id: Option<String>,
-    name: &str,
+    command: Option<&str>,
     policy: CheckPolicy,
     when: CheckWhen,
     row: &CheckResultCacheEntry,
@@ -1975,15 +1968,28 @@ fn status_from_row(
     // A lane never offered to placement holds no verdict either way, so it reads
     // as unverified rather than as a red, and it has no run to time.
     let attempted_nothing = failure_kind.is_some_and(CheckFailureKind::attempted_nothing);
+    let expects_enumeration = command.map(crate::execution::check_parsers::is_test_runner_command);
+    let evidence = row_evidence(row, parsed.as_ref(), expects_enumeration);
     NodeCheckStatus {
         observation_id: row.source_observation_id.clone(),
         job_id: job_id.to_string(),
         request_id,
-        name: name.to_string(),
+        name: row.check_name.clone(),
         state: if attempted_nothing {
             NodeCheckState::Unverified
         } else {
-            check_state_from_evidence(row.passed, parsed.as_ref())
+            match verdict_evidence_with_expectation(
+                row.passed,
+                parsed
+                    .as_ref()
+                    .map(ParsedCheckResult::verdict_facts)
+                    .as_ref(),
+                expects_enumeration,
+            ) {
+                VerdictEvidence::Failed => NodeCheckState::Failed,
+                VerdictEvidence::Verified => NodeCheckState::Passed,
+                VerdictEvidence::Unverified(_) => NodeCheckState::Unverified,
+            }
         },
         policy: policy.as_str().to_string(),
         when: when.as_str().to_string(),
@@ -2013,7 +2019,7 @@ fn status_from_row(
         declared_unverified: parsed.and_then(|p| p.unverified),
         progress: None,
         base_attribution: None,
-        evidence: None,
+        evidence: Some(evidence),
     }
 }
 
@@ -2805,7 +2811,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            "rust",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &current,
@@ -3152,7 +3158,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            "rust-tests",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &row,
@@ -3168,7 +3174,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            "rust-tests",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &infra,
@@ -3891,7 +3897,7 @@ mod tests {
             let status = status_from_row(
                 "job",
                 None,
-                "rust-tests",
+                None,
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
                 &row,
@@ -3932,7 +3938,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            "api",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Write,
             &row,
@@ -3990,12 +3996,95 @@ mod tests {
     }
 
     #[test]
+    fn exit_code_only_status_distinguishes_non_test_commands_from_test_runners() {
+        use crate::execution::check_evidence::EvidenceClass;
+
+        for (command, passed, state, class, annotation) in [
+            (
+                "bun run fmt && cargo clippy --workspace --all-targets",
+                true,
+                NodeCheckState::Passed,
+                EvidenceClass::NoEnumerationExpected,
+                Some("1.0s"),
+            ),
+            (
+                "cargo test -p cairn-core --lib",
+                true,
+                NodeCheckState::Unverified,
+                EvidenceClass::NoResultAuthority,
+                Some("unverified — no structured coverage result"),
+            ),
+            (
+                "bun run fmt && cargo clippy --workspace --all-targets",
+                false,
+                NodeCheckState::Failed,
+                EvidenceClass::NoEnumerationExpected,
+                None,
+            ),
+        ] {
+            let row = verdict_row("lane", passed);
+            let status = status_from_row(
+                "job",
+                None,
+                Some(command),
+                CheckPolicy::Advisory,
+                CheckWhen::Review,
+                &row,
+                None,
+            );
+            assert_eq!(status.state, state, "{command}");
+            assert_eq!(status.evidence.as_ref().unwrap().class, class, "{command}");
+            assert_eq!(status.duration_ms, Some(1_000));
+            assert_eq!(format_status_annotation(&status).as_deref(), annotation);
+            assert_eq!(
+                status.passed, None,
+                "exit status must not invent test counts"
+            );
+        }
+    }
+
+    #[test]
+    fn non_test_command_expectation_preserves_structured_warnings_and_unattempted_status() {
+        let mut declared = verdict_row("lint", true);
+        declared.target_results_json = Some(
+            r#"{"parser":"tsc","passed":0,"failed":0,"skipped":0,"failures":[],"unverified":"unfit environment"}"#
+                .to_string(),
+        );
+        let mut incomplete_test = verdict_row("tests", true);
+        let mut parsed: ParsedCheckResult = serde_json::from_str(&parsed_json(3, &[])).unwrap();
+        parsed.complete = false;
+        incomplete_test.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
+        let mut unattempted = verdict_row("lint", false);
+        unattempted.failure_kind = Some(CheckFailureKind::NotPlaceable.as_str().to_string());
+        for row in [
+            rust_lint_row(true, false, &[]),
+            declared,
+            incomplete_test,
+            unattempted,
+        ] {
+            let status = status_from_row(
+                "job",
+                None,
+                Some("cargo clippy"),
+                CheckPolicy::Advisory,
+                CheckWhen::Review,
+                &row,
+                None,
+            );
+            assert_eq!(status.state, NodeCheckState::Unverified, "{status:?}");
+            if row.failure_kind.is_some() {
+                assert_eq!(status.duration_ms, None);
+            }
+        }
+    }
+
+    #[test]
     fn a_success_without_a_canonical_result_is_unverified_but_tsc_is_verified() {
         let row = verdict_row("lint", true);
         let status = status_from_row(
             "job",
             None,
-            "lint",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &row,
@@ -4029,7 +4118,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            "typecheck",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &tsc,
@@ -4077,7 +4166,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            &row.check_name,
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             row,
@@ -4170,7 +4259,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            "rust-lint",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &row,
@@ -4202,7 +4291,7 @@ mod tests {
         let status = status_from_row(
             "job",
             None,
-            "rust-lint",
+            None,
             CheckPolicy::Advisory,
             CheckWhen::Review,
             &row,
@@ -4360,7 +4449,7 @@ mod tests {
             format_status_annotation(&status_from_row(
                 "job",
                 None,
-                &row.check_name,
+                None,
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
                 row,
@@ -4661,7 +4750,7 @@ mod tests {
             status_from_row(
                 "job",
                 None,
-                "rust",
+                None,
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
                 &row,
@@ -4676,7 +4765,7 @@ mod tests {
             status_from_row(
                 "job",
                 None,
-                "rust",
+                None,
                 CheckPolicy::Advisory,
                 CheckWhen::Review,
                 &row,

@@ -123,10 +123,11 @@ fn embed_with(
         let batch = &texts[range];
         let wire = route.completion_wire();
         let reply = match route {
-            EmbedRoute::OpenAi(_) => {
+            EmbedRoute::OpenAi(endpoint) => {
                 let input_type = matches!(capabilities.purpose, PurposeHandling::Native)
                     .then(|| request.purpose.input_type());
-                let body = openai_wire::build_body(model, batch, dimensions, input_type);
+                let mut body = openai_wire::build_body(model, batch, dimensions, input_type);
+                crate::wire::merge_extras(&mut body, &endpoint.extras);
                 let reply = with_retry(sleep, cancel, || {
                     complete.complete(CompletionCall::whole(wire, body.clone(), timeout))
                 })?

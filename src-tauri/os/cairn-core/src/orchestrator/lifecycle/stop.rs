@@ -1114,6 +1114,34 @@ pub fn kill_session_with_reason(
     run_id: &str,
     exit_reason: &str,
 ) -> Result<(), String> {
+    if exit_reason == RUNNER_SHUTDOWN_EXIT_REASON {
+        // Persist the cause and the unfinished work BEFORE the interrupt can
+        // produce a Result or EOF. Those frames describe transport cleanup, not
+        // successful work or an operator Stop.
+        run_db_blocking({
+            let dbs = orch.db.clone();
+            let run_id = run_id.to_string();
+            move || async move {
+                let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                db.write(|conn| {
+                    let run_id = run_id.clone();
+                    Box::pin(async move {
+                        conn.execute(
+                            "UPDATE runs SET exit_reason = ?2 WHERE id = ?1 AND status IN ('starting', 'live')",
+                            (run_id.as_str(), RUNNER_SHUTDOWN_EXIT_REASON),
+                        ).await?;
+                        crate::runs::queries::settle_stranded_turns(
+                            conn, &run_id, crate::runs::queries::StaleRunSettlement::HostRestart,
+                            chrono::Utc::now().timestamp(),
+                        ).await?;
+                        Ok(())
+                    })
+                }).await.map_err(|error| error.to_string())
+            }
+        })?;
+    }
     teardown_process(orch, run_id, TerminalPolicy::Finalize)?;
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
@@ -1170,8 +1198,8 @@ pub struct HostShutdownStops {
 /// Each agent goes through [`kill_session_with_reason`] rather than a raw
 /// `graceful_stop`, so its run and turn get the same bookkeeping any other stop
 /// produces and the row records [`RUNNER_SHUTDOWN_EXIT_REASON`] instead of the
-/// `crash` a later startup sweep would invent. A clean restart should therefore
-/// leave startup reconciliation with nothing to reconcile.
+/// `crash` a later startup sweep would invent. In-flight work is settled
+/// `host_restart` before signalling the provider, for the existing boot resume.
 ///
 /// Latency is bounded because a successor host is waiting to bind the port:
 /// `graceful_stop` alone spends up to ~3s per process on its SIGTERM poll, so the

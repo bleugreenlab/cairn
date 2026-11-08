@@ -7251,6 +7251,18 @@ pub struct LearnedResourceEstimate {
 /// and list every finished attempt as granted, and the machine would never
 /// empty for an update. The handshake refuses mixed versions, so neither
 /// pairing attaches.
+///
+/// cairn/6383 does not move the number. Owned drains, startup fencing and
+/// tokenized removal fences are runner-owned admission state. The executor
+/// still receives the unchanged `DrainModeRequest { enabled }` boolean, in
+/// arrival order. `drainState` and `drainBlockers` extend runner-side inspection
+/// and placement read DTOs with defaulted fields, not executor control frames.
+/// A newer runner talking to an older executor therefore decodes and sends the
+/// same frames; refusing pinned new work is enforced by that runner itself.
+/// The self-update drain's `refuse_new_environments` effect is runner placement
+/// too: it admits a resident job's pinned batch or terminal, and the boolean is
+/// true only while a hold refusing all new admission stands, so a self-update
+/// alone sends `false`, as the memory-only update hold did before owned drains.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -12372,6 +12384,8 @@ pub struct QueuedPlacementTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QueuedPlacementRejection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drain_blockers: Vec<DrainBlocker>,
     pub executor_name: String,
     pub executor_id: String,
     pub reason: PlacementRejectionReason,
@@ -15822,6 +15836,8 @@ pub struct BusyDeclinedCellReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorHealthSnapshot {
+    #[serde(default)]
+    pub drain_state: ExecutorDrainState,
     pub identity: ExecutorIdentity,
     /// Canonical public address used by fleet resources and inspection lookup.
     pub public_name: String,
@@ -15911,6 +15927,8 @@ pub struct ExecutorHealthSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorInspection {
+    #[serde(default)]
+    pub drain_state: ExecutorDrainState,
     /// The public address of this machine, and the only name a placement
     /// request needs.
     pub name: String,
@@ -16267,6 +16285,8 @@ fn split_account(account: String) -> (String, Option<String>) {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrolledRemote {
+    #[serde(default)]
+    pub drain_state: ExecutorDrainState,
     /// The identity a placement pin names, which is not the display name below.
     /// A pin has to be answered about exactly one machine, and only this field
     /// can tell which. Defaulted because an older runner does not send it, and
@@ -17601,9 +17621,114 @@ pub fn describe_prior_decline(decline: PriorDecline) -> String {
     )
 }
 
+/// The runner's owned-drain projection. These are read DTOs, not mutation authority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorDrainState {
+    #[serde(default)]
+    pub drain_key: String,
+    #[serde(default)]
+    pub machine_revision: u64,
+    #[serde(default)]
+    pub records: Vec<ExecutorDrainRecord>,
+    #[serde(default)]
+    pub blockers: Vec<DrainBlocker>,
+    #[serde(default)]
+    pub removal_fences: Vec<DrainBlocker>,
+    /// Whether any hold stands. Which work it still admits is `effective_effect`.
+    pub effective_refusal: bool,
+    /// The strictest effect among the standing holds, absent when none stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_effect: Option<ExecutorDrainAdmissionEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorDrainRecord {
+    pub owner: ExecutorDrainOwner,
+    pub reason: String,
+    pub generation: u64,
+    pub provenance: ExecutorDrainProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutorDrainOwner {
+    Operator,
+    Thread {
+        thread_id: String,
+    },
+    Runtime {
+        context: ExecutorRuntimeDrainContext,
+    },
+    Legacy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorRuntimeDrainContext {
+    pub kind: ExecutorRuntimeDrainKind,
+    pub operation_id: String,
+    pub turn_id: String,
+    pub runner_boot_id: String,
+    pub admission_effect: ExecutorDrainAdmissionEffect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorRuntimeDrainKind {
+    SelfUpdate,
+    Quiesce,
+}
+
+/// What a standing hold refuses; mirrors `cairn_config::drain::AdmissionEffect`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorDrainAdmissionEffect {
+    /// Every new admission, residency-pinned work included.
+    #[default]
+    RefuseAllNewAdmission,
+    /// Only work that would create a new environment on the machine; a batch or
+    /// terminal of a job already resident there is admitted.
+    RefuseNewEnvironments,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutorDrainProvenance {
+    Attributed {
+        imposed_by: crate::identity::PrincipalRef,
+        imposed_at_unix_ms: i64,
+    },
+    LegacyUnknown,
+}
+
+/// Runner-side admission evidence; not an executor protocol control message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainBlocker {
+    pub owner: String,
+    pub reason: String,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    /// Self-update estimates are explicit even when no duration is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<String>,
+    /// Fences, startup holds and evidence recorded before effects existed
+    /// refuse all new admission.
+    #[serde(default)]
+    pub admission_effect: ExecutorDrainAdmissionEffect,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlacementRejection {
+    /// Every standing drain or temporary fence observed at the admission boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drain_blockers: Vec<DrainBlocker>,
     pub executor_name: String,
     pub executor_id: String,
     pub reason: PlacementRejectionReason,
@@ -18472,7 +18597,7 @@ impl PlacementRejectionReason {
                 "runs {os}, and this verdict counts only from {}",
                 trusted.join(", ")
             ),
-            Self::Drained => "drained by an operator, refusing new work".into(),
+            Self::Drained => "drained, refusing new work".into(),
             Self::UpdatePending => {
                 "being emptied for an executor update, refusing new work".into()
             }
@@ -18795,6 +18920,8 @@ impl CompileCacheHealth {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubstrateHealthSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_initialization_error: Option<String>,
     pub schema_version: u32,
     pub captured_at_unix_ms: u64,
     pub status: SubstrateHealthStatus,
@@ -22354,6 +22481,7 @@ mod tests {
                 observation_reuse: ObservationReuse::UntrustedRemoteEnvironment,
             })),
             rejected: vec![PlacementRejection {
+                drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: "local".into(),
                 executor_id: "colocated".into(),
@@ -23612,6 +23740,7 @@ mod tests {
         let detached = dev_instance_cell("slot-3", DEV_INSTANCE_COMMIT, None, &cell);
         let service = service_cell("slot-4", &cell);
         SubstrateHealthSnapshot {
+            drain_initialization_error: None,
             schema_version: SUBSTRATE_HEALTH_SCHEMA_VERSION,
             captured_at_unix_ms: 42,
             // The CAIRN-3356 specimen: three enrolled machines, none attached,
@@ -23621,6 +23750,7 @@ mod tests {
             // tiers cannot quietly start painting like the loud one.
             enrolled_remotes: vec![
                 EnrolledRemote {
+                    drain_state: Default::default(),
                     executor_id: "bglab-mac".into(),
                     name: "bglab-mac".into(),
                     os: "macos".into(),
@@ -23644,6 +23774,7 @@ mod tests {
                     unreturned_update: None,
                 },
                 EnrolledRemote {
+                    drain_state: Default::default(),
                     executor_id: "bglab-ub".into(),
                     name: "bglab-ub".into(),
                     os: "linux".into(),
@@ -23668,6 +23799,7 @@ mod tests {
                     unreturned_update: None,
                 },
                 EnrolledRemote {
+                    drain_state: Default::default(),
                     executor_id: "bglab-win".into(),
                     name: "bglab-win".into(),
                     os: "windows".into(),
@@ -23734,6 +23866,7 @@ mod tests {
                 },
             ],
             executors: vec![ExecutorHealthSnapshot {
+                drain_state: Default::default(),
                 build_volume: None,
                 model_residents: Vec::new(),
                 identity: sample_advertisement().identity,
@@ -24357,6 +24490,7 @@ mod tests {
     #[test]
     fn substrate_health_round_trip_preserves_contract_and_nulls() {
         let snapshot = SubstrateHealthSnapshot {
+            drain_initialization_error: None,
             schema_version: SUBSTRATE_HEALTH_SCHEMA_VERSION,
             captured_at_unix_ms: 42,
             compile_cache: None,
@@ -24364,6 +24498,7 @@ mod tests {
             // honest answer and both have to survive the wire, because a client
             // that read them as zero would render a machine last seen in 1970.
             enrolled_remotes: vec![EnrolledRemote {
+                drain_state: Default::default(),
                 executor_id: "bglab-win".into(),
                 name: "bglab-win".into(),
                 os: "windows".into(),

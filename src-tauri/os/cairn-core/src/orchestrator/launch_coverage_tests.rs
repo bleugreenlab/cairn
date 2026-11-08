@@ -658,6 +658,7 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
         host: Arc::new(InertHost),
         managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
+        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
     };
     for (provider, label, auth) in [
         (
@@ -752,7 +753,34 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
 /// is refreshed, which installs it, so a decision can be offered on it without
 /// the workspace enabling anything.
 async fn seed_inference(orch: &Orchestrator) {
+    use cairn_common::executor_protocol::{
+        GpuDevice, GpuMemory, GpuVendor, HostHealth, Measurement, MeasurementReading,
+    };
     use cairn_db::turso::params;
+
+    orch.fleet.seed_host_for_test(
+        "coverage-box",
+        HostHealth {
+            gpus: Measurement::measured(
+                1,
+                vec![GpuDevice {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    model: "coverage GPU".into(),
+                    uuid: None,
+                    cores: None,
+                    memory: MeasurementReading::Measured {
+                        value: GpuMemory::Discrete {
+                            used_bytes: 0,
+                            total_bytes: 1,
+                        },
+                    },
+                    utilization_millis: MeasurementReading::Measured { value: 0 },
+                }],
+            ),
+            ..HostHealth::default()
+        },
+    );
 
     let inventory = cairn_inference::Inventory::from_yaml(
         r#"
@@ -1056,6 +1084,7 @@ async fn every_catalog_provider_launches_through_the_facet() {
                         options: Default::default(),
                         output_schema: None,
                         timeout: Duration::from_secs(5),
+                        requirements: Default::default(),
                     },
                 )
             })
@@ -1253,6 +1282,7 @@ fn one_shot_request(model: &str, output_schema: Option<Value>) -> CompletionRequ
         options: Default::default(),
         output_schema,
         timeout: Duration::from_secs(5),
+        requirements: Default::default(),
     }
 }
 
@@ -1302,6 +1332,7 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
         host: Arc::new(InertHost),
         managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
+        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -1554,6 +1585,7 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
         host: Arc::new(InertHost),
         managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
+        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -1686,6 +1718,7 @@ async fn a_terms_refused_claude_one_shot_is_served_on_the_next_account() {
         host: Arc::new(InertHost),
         managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
+        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
     };
 
     let served = complete_on(&orch, "claude", one_shot_request("haiku", None))
@@ -1733,6 +1766,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         host: Arc::new(InertHost),
         managed: cairn_models::managed::ManagedTools::for_host(),
         relay: Arc::new(cairn_models::complete::HttpComplete),
+        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -2246,7 +2280,7 @@ async fn wait_for_events(orch: &Orchestrator, run_id: &str, event_type: &str, ne
 async fn seed_claude_session(orch: &Orchestrator, session_id: &str) {
     orch.db
         .local
-        .execute_script(&format!(
+        .execute_script(format!(
             "INSERT OR IGNORE INTO workspaces(id, name, created_at, updated_at)
                VALUES ('ws-5106', 'Workspace', 1, 1);
              INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)

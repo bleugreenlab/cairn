@@ -159,6 +159,8 @@ fn jev(id: &str, name: &str, description: Option<String>, priced: bool) -> Disco
             output: vec![Modality::from("decisions")],
         }),
         serves: Some(decide()),
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: None,
     }
 }
@@ -263,6 +265,7 @@ pub(crate) fn decision_endpoint(api_key: &str) -> DecisionsEndpoint {
             ("authorization".to_string(), format!("Bearer {api_key}")),
         ],
         context_limits: Some(CONTEXT_LIMITS.to_string()),
+        extras: Default::default(),
     }
 }
 
@@ -300,6 +303,7 @@ impl AgentBackend for TypeSafeBackend {
         orch: &Orchestrator,
         _project_id: Option<&str>,
         offer: &SelectedOffer,
+        _admitted: &crate::backends::Admitted,
     ) -> Result<(DecisionRoute, String), String> {
         match offer.served.wire {
             Wire::SystemOne => {

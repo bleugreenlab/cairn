@@ -412,6 +412,8 @@ fn model(
         router: false,
         modalities: None,
         serves,
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer,
     }
 }

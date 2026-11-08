@@ -25,42 +25,29 @@ pub(crate) const BUG_CONTRACT: ResourceContract =
         }],
     };
 
-pub(crate) const SELF_REBUILD_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::SelfRebuild,
-    uri_template: "cairn://self-rebuild",
-    name: "Self-rebuild outcomes",
-    description: "Pending self-rebuild outcomes. The run that starts a self-rebuild records one, naming the issue or thread its outcome reports to; the detached installer, which outlives that run, delivers the outcome to the record it names, once.",
-    read_projections: NO_PROJECTIONS,
+pub(crate) const REBUILDS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Rebuilds,
+    uri_template: "cairn://rebuilds",
+    name: "Rebuild ledger",
+    description: "Private per-install rebuilds, ingested by the runner from credential-free actor journals. Read-only on every platform.",
+    read_projections: &[
+        ProjectionSpec { key: "offset", values: "rebuilds skipped in newest-first order (default 0)" },
+        ProjectionSpec { key: "limit", values: "rebuilds per page, 1–199 (default 25)" },
+    ],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Append,
-        required: &[KeySpec::new(
-            "reportTo",
-            KeyType::Str,
-            "issue (cairn://p/PROJECT/N) or durable thread (cairn://p/PROJECT/<name>) the outcome reports to",
-        )],
-        optional: &[],
-        label: "record a pending self-rebuild outcome (a run only)",
-        example: "write({changes:[{target:\"cairn://self-rebuild\",mode:\"append\",payload:{reportTo:\"cairn://p/cairn/devops\"}}]})",
-    }],
+    mutations: NO_MUTATIONS,
 };
 
-pub(crate) const SELF_REBUILD_OUTCOME_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::SelfRebuildOutcome,
-    uri_template: "cairn://self-rebuild/{id}",
-    name: "Self-rebuild outcome",
-    description: "One pending self-rebuild outcome: where it reports, when it was recorded, and whether it has been delivered. Appending content delivers it as a message to that issue or thread, exactly once.",
+pub(crate) const REBUILD_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Rebuild,
+    uri_template: "cairn://rebuilds/{id}",
+    name: "Rebuild",
+    description: "One rebuild's ingested phases, facts, outcome and named ingestion faults. Read-only; journal emission alone does not certify success.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Append,
-        required: &[CONTENT],
-        optional: &[],
-        label: "deliver the outcome (once)",
-        example: "write({changes:[{target:\"cairn://self-rebuild/ID\",mode:\"append\",payload:{content:\"...\"}}]})",
-    }],
+    mutations: NO_MUTATIONS,
 };
 
 pub(crate) const PACKS_CONTRACT: ResourceContract =

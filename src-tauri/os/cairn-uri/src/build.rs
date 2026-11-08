@@ -801,12 +801,13 @@ pub fn build_bug_uri() -> String {
     "cairn://bug".to_string()
 }
 
-pub fn build_self_rebuild_uri() -> String {
-    "cairn://self-rebuild".to_string()
+/// Address the read-only ledger belonging to this install.
+pub fn build_rebuilds_uri() -> String {
+    "cairn://rebuilds".to_string()
 }
 
-pub fn build_self_rebuild_outcome_uri(id: &str) -> String {
-    format!("cairn://self-rebuild/{id}")
+pub fn build_rebuild_uri(id: &str) -> String {
+    format!("cairn://rebuilds/{id}")
 }
 
 pub fn build_packs_uri() -> String {
@@ -1651,8 +1652,8 @@ impl CairnResource {
             Self::InferenceGeneration { id } => format!("cairn://inference/generations/{id}"),
             Self::Executor { name } => format!("cairn://executors/{name}"),
             Self::Bug => "cairn://bug".to_string(),
-            Self::SelfRebuild => build_self_rebuild_uri(),
-            Self::SelfRebuildOutcome { id } => build_self_rebuild_outcome_uri(id),
+            Self::Rebuilds => build_rebuilds_uri(),
+            Self::Rebuild { id } => build_rebuild_uri(id),
             Self::Help => "cairn://help".to_string(),
             Self::WebSearch => "cairn://websearch".to_string(),
             Self::Mcp { server, resource } => {

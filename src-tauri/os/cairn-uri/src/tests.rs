@@ -2090,3 +2090,44 @@ fn request_uris_roundtrip_and_reject_unsafe_ids() {
         assert!(parse_uri(uri).is_none(), "{uri}");
     }
 }
+
+#[test]
+fn rebuild_ledger_uris_are_portable_and_replace_legacy() {
+    for (uri, expected, kind) in [
+        (
+            "cairn://rebuilds",
+            CairnResource::Rebuilds,
+            ResourceKind::Rebuilds,
+        ),
+        (
+            "cairn://rebuilds/rebuild-1",
+            CairnResource::Rebuild {
+                id: "rebuild-1".into(),
+            },
+            ResourceKind::Rebuild,
+        ),
+    ] {
+        let resource = parse_uri(uri).expect("registered ledger URI");
+        assert_eq!(resource, expected);
+        assert_eq!(resource.kind(), kind);
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.project(), None);
+        assert_eq!(resource.surface(), crate::Surface::Read { uri: uri.into() });
+        let label = match kind {
+            ResourceKind::Rebuilds => "Rebuild ledger",
+            ResourceKind::Rebuild => "Rebuild rebuild-1",
+            _ => unreachable!(),
+        };
+        assert_eq!(resource.label(&crate::LabelContext::default()), label);
+    }
+    assert_eq!(build_rebuilds_uri(), "cairn://rebuilds");
+    assert_eq!(build_rebuild_uri("rebuild-1"), "cairn://rebuilds/rebuild-1");
+    for uri in [
+        "cairn://self-rebuild",
+        "cairn://self-rebuild/old",
+        "cairn://rebuilds/a/b",
+        "cairn://rebuilds/a b",
+    ] {
+        assert_eq!(parse_uri(uri), None, "{uri}");
+    }
+}

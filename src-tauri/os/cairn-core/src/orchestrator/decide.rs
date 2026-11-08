@@ -33,10 +33,14 @@ use crate::models::decision::{
 };
 use crate::models::RecipeNode;
 use cairn_models::interface::decide::{DecisionCall, DecisionRoute};
+use cairn_models::interface::retention::{CostSource, Requirements, ZeroDataRetention};
 use cairn_models::interface::{
     Catalog, ModelScope, Models, NoOffer, OfferQuery, SelectedOffer, Unable,
 };
 use cairn_models::types::catalog::{VerbKind, Wire};
+
+use crate::backends::launch::{admit_probe, admit_route};
+use crate::backends::Admitted;
 
 use super::Orchestrator;
 
@@ -273,6 +277,9 @@ pub(crate) struct DecideRequest {
     pub provider: Option<String>,
     pub input: String,
     pub questions: Vec<DecisionQuestion>,
+    /// What the deployment that answers must keep to (zero data retention).
+    #[serde(default)]
+    pub requirements: Requirements,
 }
 
 /// The offer that answered a named decision.
@@ -286,16 +293,23 @@ pub(crate) struct OfferView {
     pub wire: Wire,
 }
 
-/// What the decide door returns: the facet's [`Decision`] unchanged (its
-/// answers, refusals, and usage), with the offer that answered and how long
-/// the whole call took, a first-time probe included.
+/// What the decide door returns: the facet's [`Decision`] (its answers,
+/// refusals, and usage), with the offer that answered, how long the whole
+/// call took (a first-time probe included), where its `cost` came from, and
+/// how a zero-data-retention requirement was met when one applied.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DecideOutcome {
+    /// Its `cost` is the provider's figure, or the catalog's list price for
+    /// what it reported when it gave none (`cost_source` says which).
     #[serde(flatten)]
     pub decision: Decision,
     pub offer: OfferView,
     pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<CostSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_data_retention: Option<ZeroDataRetention>,
 }
 
 impl Orchestrator {
@@ -307,12 +321,16 @@ impl Orchestrator {
     /// May ask an unconfirmed logprobs offer one probe question, so it
     /// blocks for up to [`PROBE_TIMEOUT`]; the probe runs on its own thread,
     /// so this is safe to call from an async worker.
+    ///
+    /// `requirements` are admitted on the selected offer before it is probed,
+    /// so an offer that cannot keep them is refused before any request.
     pub(crate) fn decision_offer(
         &self,
         project_id: Option<&str>,
         query: OfferQuery<'_>,
         questions: &[DecisionQuestion],
-    ) -> Result<SelectedOffer, DecisionFailure> {
+        requirements: &Requirements,
+    ) -> Result<(SelectedOffer, Admitted), DecisionFailure> {
         let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
@@ -323,11 +341,13 @@ impl Orchestrator {
             let catalog = self.catalog(&scope).map_err(DecisionFailure::Failed)?;
             let offer =
                 select(&catalog, query, questions).map_err(DecisionFailure::Unanswerable)?;
+            let admitted = admit_route(self, &offer, requirements, project_id, VerbKind::Decide)
+                .map_err(DecisionFailure::Unanswerable)?;
             if self
                 .confirm_offer(project_id, &offer)
                 .map_err(DecisionFailure::Failed)?
             {
-                return Ok(offer);
+                return Ok((offer, admitted));
             }
         }
         Err(DecisionFailure::Unanswerable(
@@ -377,7 +397,9 @@ impl Orchestrator {
             project_id,
             decision_query(target.as_deref()),
             &decision.questions,
+            &Requirements::default(),
         )
+        .map(|(offer, _)| offer)
     }
 
     /// Whether `offer` can answer decisions: a native offer by its protocol,
@@ -395,7 +417,8 @@ impl Orchestrator {
         if let Some(unable) = self.decision_observations.get(offer) {
             return Ok(unable.is_none());
         }
-        let (route, model) = self.decision_route(project_id, offer)?;
+        let admitted = admit_probe(self, offer)?;
+        let (route, model) = self.decision_route(project_id, offer, &admitted)?;
         let complete = self.models_runtime.complete.clone();
         let outcome = std::thread::spawn(move || {
             cairn_models::decide::probe(complete.as_ref(), &route, &model, PROBE_TIMEOUT)
@@ -426,9 +449,10 @@ impl Orchestrator {
         &self,
         project_id: Option<&str>,
         offer: &SelectedOffer,
+        admitted: &Admitted,
     ) -> Result<(DecisionRoute, String), String> {
         crate::backends::backend_for_name(Some(&offer.provider))
-            .decision_route(self, project_id, offer)
+            .decision_route(self, project_id, offer, admitted)
     }
 
     /// Where each decision node in `nodes` stands in `project_id`'s scope,
@@ -568,8 +592,9 @@ impl Orchestrator {
                 decision_query(target.as_deref()),
                 &decision.questions,
                 &input,
+                &Requirements::default(),
             )
-            .map(|(decision, _)| decision)
+            .map(|(decision, _, _)| decision)
         })
         .await
         .map_err(|error| DecisionFailure::Failed(format!("the decision task failed: {error}")))?
@@ -591,12 +616,15 @@ impl Orchestrator {
     ) -> Result<DecideOutcome, DecisionFailure> {
         let started = Instant::now();
         let orch = self.clone();
-        let project_id = project_id.map(str::to_string);
-        let (decision, offer) = tokio::task::spawn_blocking(move || {
-            orch.decide_named_blocking(project_id.as_deref(), &request)
+        let scope = project_id.map(str::to_string);
+        let (mut decision, offer, admitted) = tokio::task::spawn_blocking(move || {
+            orch.decide_named_blocking(scope.as_deref(), &request)
         })
         .await
         .map_err(|error| DecisionFailure::Failed(format!("the decision task failed: {error}")))??;
+        let (cost, cost_source) =
+            self.call_cost(project_id, &offer.provider, &offer.model, &decision.usage);
+        decision.usage.cost_usd = cost;
         // `select` admits only an offer that measures, so this always holds.
         let measured_by = offer.measured_by().ok_or_else(|| {
             DecisionFailure::Failed(format!(
@@ -613,6 +641,10 @@ impl Orchestrator {
                 model: offer.model,
             },
             latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            cost_source,
+            zero_data_retention: admitted
+                .zero_data_retention()
+                .map(|admitted| admitted.report.clone()),
         })
     }
 
@@ -620,7 +652,7 @@ impl Orchestrator {
         &self,
         project_id: Option<&str>,
         request: &DecideRequest,
-    ) -> Result<(Decision, SelectedOffer), DecisionFailure> {
+    ) -> Result<(Decision, SelectedOffer, Admitted), DecisionFailure> {
         let named = |value: &Option<String>| {
             value
                 .as_deref()
@@ -650,6 +682,7 @@ impl Orchestrator {
             },
             &request.questions,
             &request.input,
+            &request.requirements,
         )
     }
 
@@ -688,10 +721,11 @@ impl Orchestrator {
         query: OfferQuery<'_>,
         questions: &[DecisionQuestion],
         input: &str,
-    ) -> Result<(Decision, SelectedOffer), DecisionFailure> {
-        let offer = self.decision_offer(project_id, query, questions)?;
+        requirements: &Requirements,
+    ) -> Result<(Decision, SelectedOffer, Admitted), DecisionFailure> {
+        let (offer, admitted) = self.decision_offer(project_id, query, questions, requirements)?;
         let (route, sent) = self
-            .decision_route(project_id, &offer)
+            .decision_route(project_id, &offer, &admitted)
             .map_err(DecisionFailure::Failed)?;
         let result = cairn_models::decide::decide(
             self.models_runtime.complete.as_ref(),
@@ -716,13 +750,15 @@ impl Orchestrator {
             }
             Ok(_) => {}
         }
-        result.map(|decision| (decision, offer)).map_err(|error| {
-            if error.refuses_the_request() {
-                DecisionFailure::Unanswerable(error.to_string())
-            } else {
-                DecisionFailure::Failed(error.to_string())
-            }
-        })
+        result
+            .map(|decision| (decision, offer, admitted))
+            .map_err(|error| {
+                if error.refuses_the_request() {
+                    DecisionFailure::Unanswerable(error.to_string())
+                } else {
+                    DecisionFailure::Failed(error.to_string())
+                }
+            })
     }
 }
 
@@ -748,6 +784,7 @@ pub(crate) mod tests {
     use crate::models::{CreateRecipe, Recipe, RecipeFile, UpdateRecipe, UpdateSettings};
     use crate::orchestrator::models::ModelRuntime;
     use crate::orchestrator::Orchestrator;
+    use cairn_models::interface::retention::Requirements;
     use cairn_models::types::catalog::Wire;
 
     /// A server that answers from a script and counts what it was asked.
@@ -1003,6 +1040,8 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct OpenRouterDecisions {
         sent: Mutex<Vec<SentRequest>>,
+        /// Answer without `usage.cost`, as a provider that reports no cost.
+        omit_cost: std::sync::atomic::AtomicBool,
     }
 
     impl Complete for OpenRouterDecisions {
@@ -1015,6 +1054,11 @@ pub(crate) mod tests {
                 endpoint.headers.clone(),
                 call.body,
             ));
+            let usage = if self.omit_cost.load(std::sync::atomic::Ordering::SeqCst) {
+                json!({"input_tokens": 476, "output_tokens": 70})
+            } else {
+                json!({"cost": 0.000019992, "input_tokens": 476, "output_tokens": 70})
+            };
             Ok(CompletionReply::SystemOne(
                 serde_json::from_value(json!({
                     "answers": {
@@ -1028,7 +1072,7 @@ pub(crate) mod tests {
                     "id": "gen-dec-1789738314-X5e5eKGQdvR9rblyX250",
                     "model": "typesafe/jev-1.14-20261014",
                     "provider": "TypeSafe",
-                    "usage": {"cost": 0.000019992, "input_tokens": 476, "output_tokens": 70}
+                    "usage": usage
                 }))
                 .unwrap(),
             ))
@@ -1039,30 +1083,16 @@ pub(crate) mod tests {
     /// declared: selected by id, sent over System One to the Decisions API on
     /// the workspace key, answered with typed answers, and listed with their
     /// price on every surface that shows decision offers.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_openrouter_decision_model_is_selected_by_id_and_answers_over_system_one() {
+    /// A workspace with OpenRouter's decision models listed, its System One
+    /// requests recorded.
+    async fn openrouter_decisions() -> (Orchestrator, Arc<OpenRouterDecisions>) {
         let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let recorder = Arc::new(OpenRouterDecisions::default());
         orch.models_runtime = ModelRuntime {
             complete: recorder.clone(),
             ..orch.models_runtime.clone()
         };
-        let mut enabled = orch.enabled_providers();
-        enabled.push("openrouter".to_string());
-        orch.update_settings(UpdateSettings {
-            enabled_providers: Some(enabled),
-            ..Default::default()
-        })
-        .unwrap();
-        orch.add_account(
-            crate::credentials::ApiProvider::OpenRouter,
-            "OpenRouter".into(),
-            ProviderAuth::ApiKey {
-                value: "sk-or-test".into(),
-            },
-            None,
-        )
-        .unwrap();
+        crate::backends::retention::fixtures::install_openrouter(&orch);
         orch.seed_model_catalog_for_test(cairn_models::types::catalog::ProviderModelCatalog {
             backend: "openrouter".into(),
             models: crate::backends::openrouter::decode_decision_models(include_str!(
@@ -1073,17 +1103,196 @@ pub(crate) mod tests {
             refreshed_at: Some(1_790_000_000),
             error: None,
         });
+        (orch, recorder)
+    }
 
-        let request = named_request(
-            Some("openrouter/typesafe/jev-1.14"),
-            json!([
-                {"name": "is_bug", "type": "predicate", "instructions": "Is this a defect?"},
-                {"name": "team", "type": "choice", "instructions": "Which team?",
-                 "options": [{"value": "account"}, {"value": "frontend"}, {"value": "payments"}]},
-                {"name": "urgency", "type": "score", "instructions": "How urgent?",
-                 "levels": [{"label": "later"}, {"label": "this week"}, {"label": "now"}]}
-            ]),
+    /// The three questions the scripted System One reply answers.
+    fn triage() -> Value {
+        json!([
+            {"name": "is_bug", "type": "predicate", "instructions": "Is this a defect?"},
+            {"name": "team", "type": "choice", "instructions": "Which team?",
+             "options": [{"value": "account"}, {"value": "frontend"}, {"value": "payments"}]},
+            {"name": "urgency", "type": "score", "instructions": "How urgent?",
+             "levels": [{"label": "later"}, {"label": "this week"}, {"label": "now"}]}
+        ])
+    }
+
+    /// Jev on OpenRouter asked [`triage`], held to `requirements`.
+    fn jev(requirements: Requirements) -> DecideRequest {
+        DecideRequest {
+            requirements,
+            ..named_request(Some("openrouter/typesafe/jev-1.14"), triage())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_retention_decision_on_openrouter_carries_zdr_and_says_how_it_was_kept() {
+        use crate::backends::retention::fixtures::zdr_list;
+        let (mut orch, recorder) = openrouter_decisions().await;
+        zdr_list(
+            &mut orch,
+            &[
+                ("typesafe/jev-1.14", "TypeSafe", "typesafe", false),
+                ("typesafe/jev-1.14", "Vertex", "google-vertex/global", true),
+                ("other/model", "Other", "other", false),
+            ],
         );
+        let outcome = orch
+            .decide_named(None, jev(Requirements::zero_data_retention()))
+            .await
+            .unwrap();
+        let sent = recorder.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent[0].2["provider"],
+            json!({"zdr": true, "ignore": ["google-vertex/global"]}),
+            "routes only to zero-retention endpoints, around the Safety Retention one"
+        );
+        let body = serde_json::to_value(&outcome).unwrap();
+        let zdr = &body["zeroDataRetention"];
+        assert_eq!(zdr["requiredBy"], "call");
+        assert_eq!(zdr["satisfiedBy"], "openrouter-zdr-routing");
+        let detail = zdr["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("1 endpoint(s) for typesafe/jev-1.14 (TypeSafe)"),
+            "{detail}"
+        );
+        assert!(detail.contains("google-vertex/global"), "{detail}");
+        assert_eq!(body["cost"], json!(0.000019992));
+        assert_eq!(body["costSource"], "provider");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_without_a_zero_retention_endpoint_is_refused_before_any_request() {
+        use crate::backends::retention::fixtures::{unreadable_zdr_list, zdr_list};
+        let (mut orch, recorder) = openrouter_decisions().await;
+        // Only a Safety Retention endpoint, which may keep prompts.
+        zdr_list(
+            &mut orch,
+            &[("typesafe/jev-1.14", "Vertex", "google-vertex/global", true)],
+        );
+        let refused = unanswerable(
+            orch.decide_named(None, jev(Requirements::zero_data_retention()))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            refused.contains("typesafe/jev-1.14 on openrouter cannot keep it"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("no endpoint for it that retains nothing"),
+            "{refused}"
+        );
+        assert!(refused.contains("Nothing was sent"), "{refused}");
+        assert!(refused.contains("zeroDataRetentionProviders"), "{refused}");
+
+        // An unreadable list is a refusal too, never a pass.
+        unreadable_zdr_list(&mut orch);
+        let refused = unanswerable(
+            orch.decide_named(None, jev(Requirements::zero_data_retention()))
+                .await
+                .unwrap_err(),
+        );
+        assert!(refused.contains("could not be read"), "{refused}");
+        assert!(recorder.sent.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_workspace_setting_requires_zero_retention_of_a_decision_that_says_nothing() {
+        use crate::backends::retention::fixtures::{require_zdr_of_openrouter, zdr_list};
+        let (mut orch, recorder) = openrouter_decisions().await;
+        zdr_list(
+            &mut orch,
+            &[("typesafe/jev-1.14", "TypeSafe", "typesafe", false)],
+        );
+        let silent = orch
+            .decide_named(None, jev(Requirements::default()))
+            .await
+            .unwrap();
+        assert_eq!(silent.zero_data_retention, None);
+        assert!(
+            recorder.sent.lock().unwrap()[0].2.get("provider").is_none(),
+            "nothing required, nothing sent"
+        );
+
+        require_zdr_of_openrouter(&orch);
+        let floored = orch
+            .decide_named(None, jev(Requirements::default()))
+            .await
+            .unwrap();
+        let report = floored
+            .zero_data_retention
+            .expect("the setting required it");
+        assert_eq!(
+            report.required_by,
+            cairn_models::interface::retention::RequiredBy::WorkspaceOpenRouterSetting
+        );
+        assert_eq!(
+            recorder.sent.lock().unwrap()[1].2["provider"],
+            json!({"zdr": true})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_whose_provider_reports_no_cost_is_priced_from_the_catalog() {
+        let (orch, recorder) = openrouter_decisions().await;
+        recorder
+            .omit_cost
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = orch
+            .decide_named(None, jev(Requirements::default()))
+            .await
+            .unwrap();
+        let body = serde_json::to_value(&outcome).unwrap();
+        // 476 input tokens at Jev's listed $0.042 per million.
+        let cost = body["cost"].as_f64().expect("priced");
+        assert!((cost - 476.0 * 0.042e-6).abs() < 1e-12, "{cost}");
+        assert_eq!(body["costSource"], "catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_custom_provider_refuses_zero_retention_unless_the_operator_declares_it() {
+        let (orch, server, key) = workspace_with_server(
+            CustomProtocol::Decisions,
+            Some("gateway-key"),
+            "typesafe-ai/jev",
+            vec![json!({
+                "model": "typesafe-ai/jev",
+                "answers": [{"type": "choice", "name": "scale", "choice": "large"}],
+                "usage": {"input_tokens": 40, "output_tokens": 0}
+            })],
+        )
+        .await;
+        let request = || DecideRequest {
+            requirements: Requirements::zero_data_retention(),
+            ..named_request(Some("typesafe-ai/jev"), scale())
+        };
+        let refused = unanswerable(orch.decide_named(None, request()).await.unwrap_err());
+        assert!(
+            refused.contains("sparks.invalid, a public host"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("No offer in scope can serve it with zero retention"),
+            "{refused}"
+        );
+        assert_eq!(server.calls(), 0, "nothing was sent");
+
+        crate::backends::retention::fixtures::declare_zero_retention(&orch, &[&key]);
+        let outcome = orch.decide_named(None, request()).await.unwrap();
+        let report = outcome.zero_data_retention.expect("declared");
+        assert_eq!(
+            report.satisfied_by,
+            cairn_models::interface::retention::ZdrBasis::OperatorDeclaration
+        );
+        assert_eq!(server.calls(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_openrouter_decision_model_is_selected_by_id_and_answers_over_system_one() {
+        let (orch, recorder) = openrouter_decisions().await;
+
+        let request = named_request(Some("openrouter/typesafe/jev-1.14"), triage());
         let outcome = orch.decide_named(None, request).await.unwrap();
         assert_eq!(
             outcome.offer,

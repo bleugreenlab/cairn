@@ -31,6 +31,7 @@ use cairn_models::interface::complete::CompletionError;
 use cairn_models::interface::embed::{
     EmbedCall, EmbedError, EmbedRequest, EmbedRoute, Embeddings, Purpose, Width, EMBED_TIMEOUT,
 };
+use cairn_models::interface::retention::{CostSource, Requirements, ZeroDataRetention};
 use cairn_models::interface::{
     Catalog, CatalogProvider, ModelScope, Models, NoOffer, SelectedOffer,
 };
@@ -45,6 +46,8 @@ use cairn_models::types::usage::{BillingUnit, Charge};
 
 use super::{resolve_embed_token, Orchestrator};
 use crate::backends::custom::CustomProviderConfig;
+use crate::backends::launch::admit_route;
+use crate::backends::Admitted;
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::embeddings::embedder::{EmbedSource, FacetEmbedder, SelectedEmbedOffer};
 use crate::embeddings::Embed;
@@ -95,6 +98,9 @@ pub(crate) struct EmbedDoorRequest {
     /// (`mcp/handlers/run/embed.rs`). Embedding ignores it.
     #[serde(default = "saved_by_default")]
     pub save: bool,
+    /// What the deployment that embeds must keep to (zero data retention).
+    #[serde(default)]
+    pub requirements: Requirements,
 }
 
 fn saved_by_default() -> bool {
@@ -118,10 +124,16 @@ pub(crate) struct EmbedOutcome {
     pub dims: u32,
     pub provider: String,
     pub usage: EmbedUsage,
-    /// USD, only when every provider request reported it.
+    /// USD: what every provider request reported, or the catalog's list
+    /// price for the tokens reported when a request reported no cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<CostSource>,
     pub latency_ms: u64,
+    /// How a zero-data-retention requirement was met, when one applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_data_retention: Option<ZeroDataRetention>,
 }
 
 /// How many offers a refusal names as the ones that do serve `embed`.
@@ -250,6 +262,8 @@ fn cairn_gateway_provider() -> CatalogProvider {
             output: vec![Modality::Embeddings],
         }),
         // Cohere's tokenizer has no pin; the gateway counts tokens itself.
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer: None,
         serves: Some(vec![ServedVerb {
             verb: Verb::Embed(EmbeddingCapabilities::cairn_gateway()),
@@ -389,18 +403,21 @@ impl Orchestrator {
         model: &str,
         request: &EmbedRequest,
     ) -> Result<Embeddings, EmbedError> {
-        self.embed_cancellable(scope, model, request, None)
+        self.embed_cancellable(scope, model, request, &Requirements::default(), None)
+            .map(|(embeddings, _)| embeddings)
     }
 
-    /// [`Self::embed_blocking`], ending before its next sub-batch once
-    /// `cancel` is set.
+    /// [`Self::embed_blocking`] held to `requirements`, which are admitted on
+    /// the offer before anything is sent, ending before its next sub-batch
+    /// once `cancel` is set.
     fn embed_cancellable(
         &self,
         scope: &ModelScope,
         model: &str,
         request: &EmbedRequest,
+        requirements: &Requirements,
         cancel: Option<&AtomicBool>,
-    ) -> Result<Embeddings, EmbedError> {
+    ) -> Result<(Embeddings, Admitted), EmbedError> {
         if model.trim().is_empty() {
             return Err(EmbedError::InvalidRequest(
                 "name the embedding model: stored vectors are keyed by it, so it is never chosen implicitly"
@@ -411,9 +428,17 @@ impl Orchestrator {
             EmbedError::Unsupported(format!("the model catalog is unavailable: {error}"))
         })?;
         let (offer, capabilities) = catalog.embedding_offer(Some(model), request)?;
+        let admitted = admit_route(
+            self,
+            &offer,
+            requirements,
+            scope.project_id.as_deref(),
+            VerbKind::Embed,
+        )
+        .map_err(EmbedError::Unsupported)?;
         // An inference engine answers to its own name for the model; the
         // vectors still carry the name the caller asked by.
-        let (route, sent) = self.embed_route(scope, &offer)?;
+        let (route, sent) = self.embed_route(scope, &offer, &admitted)?;
         let mut embeddings = embed(
             self.models_runtime.complete.as_ref(),
             EmbedCall {
@@ -426,7 +451,7 @@ impl Orchestrator {
             },
         )?;
         embeddings.model = offer.model.clone();
-        Ok(embeddings)
+        Ok((embeddings, admitted))
     }
 
     /// [`Self::embed_blocking`], off the async runtime. Dropping the future
@@ -439,11 +464,31 @@ impl Orchestrator {
         model: String,
         request: EmbedRequest,
     ) -> Result<Embeddings, EmbedError> {
+        self.embed_requiring(scope, model, request, Requirements::default())
+            .await
+            .map(|(embeddings, _)| embeddings)
+    }
+
+    /// [`Self::embed`] held to `requirements`, with how a zero-retention
+    /// requirement was met when one applied.
+    async fn embed_requiring(
+        &self,
+        scope: ModelScope,
+        model: String,
+        request: EmbedRequest,
+        requirements: Requirements,
+    ) -> Result<(Embeddings, Option<ZeroDataRetention>), EmbedError> {
         let orch = self.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(cancel.clone());
         tokio::task::spawn_blocking(move || {
-            orch.embed_cancellable(&scope, &model, &request, Some(&cancel))
+            orch.embed_cancellable(&scope, &model, &request, &requirements, Some(&cancel))
+                .map(|(embeddings, admitted)| {
+                    let retention = admitted
+                        .zero_data_retention()
+                        .map(|admitted| admitted.report.clone());
+                    (embeddings, retention)
+                })
         })
         .await
         .map_err(|error| {
@@ -524,8 +569,8 @@ impl Orchestrator {
                 other => other.to_string(),
             });
         }
-        let embeddings = self
-            .embed(
+        let (embeddings, zero_data_retention) = self
+            .embed_requiring(
                 scope,
                 model.to_string(),
                 EmbedRequest {
@@ -536,38 +581,51 @@ impl Orchestrator {
                     },
                     width,
                 },
+                request.requirements,
             )
             .await
             .map_err(|error| error.to_string())?;
+        let (cost, cost_source) = self.call_cost(
+            project_id,
+            &embeddings.provider,
+            &embeddings.model,
+            &embeddings.usage,
+        );
         Ok(EmbedOutcome {
             usage: EmbedUsage {
                 input_tokens: embeddings
                     .usage
                     .quantity(Charge::Input, BillingUnit::Tokens),
             },
-            cost: embeddings.usage.cost_usd,
+            cost,
+            cost_source,
             vectors: embeddings.vectors,
             model: embeddings.model,
             dims: embeddings.dims,
             provider: embeddings.provider,
             latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            zero_data_retention,
         })
     }
 
     /// Where `offer` is embedded, with this workspace's credentials for it,
     /// and the model id it is sent there: the offer's own, except on Cairn's
     /// inference deployments, whose engines answer to their served names.
+    ///
+    /// `admitted` is the call's admission ([`admit_route`]), which a route that
+    /// carries a retention routing preference (OpenRouter's) sends.
     pub(crate) fn embed_route(
         &self,
         scope: &ModelScope,
         offer: &SelectedOffer,
+        admitted: &Admitted,
     ) -> Result<(EmbedRoute, String), EmbedError> {
         let provider = offer.provider.as_str();
         if provider == crate::backends::inference::INFERENCE_BACKEND_KEY {
             return crate::backends::inference::embed_route(self, &offer.model)
                 .map_err(EmbedError::Unsupported);
         }
-        let route = self.provider_embed_route(scope, offer)?;
+        let route = self.provider_embed_route(scope, offer, admitted)?;
         Ok((route, offer.model.clone()))
     }
 
@@ -575,6 +633,7 @@ impl Orchestrator {
         &self,
         scope: &ModelScope,
         offer: &SelectedOffer,
+        admitted: &Admitted,
     ) -> Result<EmbedRoute, EmbedError> {
         let provider = offer.provider.as_str();
         let unavailable = |why: String| EmbedError::Unsupported(format!("{provider} {why}"));
@@ -588,7 +647,7 @@ impl Orchestrator {
             return Ok(gateway::route_for(&self.api_config.base_url, &token));
         }
         if provider == crate::backends::openrouter::OPENROUTER_BACKEND_KEY {
-            return crate::backends::openrouter::embed_route(self).map_err(unavailable);
+            return crate::backends::openrouter::embed_route(self, admitted).map_err(unavailable);
         }
         if provider == "ollama" {
             return self
@@ -870,6 +929,7 @@ pub(crate) mod tests {
             .embed_route(
                 &ModelScope::default(),
                 &offer(&key, "qwen/qwen3-embedding-4b"),
+                &unrequired(),
             )
             .unwrap();
         assert_eq!(url(&route), "http://hub.invalid/v1/embeddings");
@@ -906,7 +966,82 @@ pub(crate) mod tests {
             purpose: super::EmbedPurpose::Document,
             width,
             save: true,
+            requirements: Default::default(),
         }
+    }
+
+    /// The gate's proof for a route asked for directly, under no requirement.
+    fn unrequired() -> crate::backends::Admitted {
+        crate::backends::Admitted::for_test(None)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_retention_embedding_on_openrouter_carries_zdr_and_a_hosted_hub_is_refused() {
+        use crate::backends::retention::fixtures::{install_openrouter, zdr_list};
+        use cairn_models::interface::retention::{CostSource, Requirements, ZdrBasis};
+        use cairn_models::types::catalog::{ModelPricing, Price, ProviderModelCatalog};
+        use cairn_models::types::usage::{Charge, Meter};
+
+        let (mut orch, server, _) = workspace_with_hub(vec![hub_reply(2)]).await;
+        install_openrouter(&orch);
+        let mut model = super::cairn_gateway_provider()
+            .models
+            .unwrap()
+            .models
+            .remove(0);
+        model.id = "openai/text-embedding-3-small".into();
+        model.model = model.id.clone();
+        model.serves = Some(vec![ServedVerb {
+            verb: Verb::Embed(EmbeddingCapabilities {
+                native_dims: Some(4),
+                ..EmbeddingCapabilities::cairn_gateway()
+            }),
+            wire: Wire::OpenAiEmbeddings,
+        }]);
+        model.pricing = Some(ModelPricing {
+            prices: vec![Price {
+                meter: Meter::tokens(Charge::Input),
+                usd: "0.00000002".into(),
+            }],
+            ..ModelPricing::default()
+        });
+        orch.seed_model_catalog_for_test(ProviderModelCatalog {
+            backend: "openrouter".into(),
+            models: vec![model],
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        });
+        zdr_list(
+            &mut orch,
+            &[("openai/text-embedding-3-small", "OpenAI", "openai", false)],
+        );
+
+        let mut request = door(Some("openrouter/openai/text-embedding-3-small"), 2, None);
+        request.requirements = Requirements::zero_data_retention();
+        let outcome = orch.embed_named(None, request).await.unwrap();
+        assert_eq!(server.bodies()[0]["provider"], json!({"zdr": true}));
+        assert_eq!(
+            outcome
+                .zero_data_retention
+                .map(|report| report.satisfied_by),
+            Some(ZdrBasis::OpenRouterZdrRouting)
+        );
+        // The reply reported two tokens and no cost: priced at the list rate.
+        assert_eq!(outcome.cost_source, Some(CostSource::Catalog));
+        assert!((outcome.cost.unwrap() - 2.0 * 2e-8).abs() < 1e-15);
+
+        let mut request = door(Some(HUB_MODEL), 2, None);
+        request.requirements = Requirements::zero_data_retention();
+        let refused = orch.embed_named(None, request).await.unwrap_err();
+        assert!(refused.contains("hub.invalid, a public host"), "{refused}");
+        assert!(
+            refused.contains(
+                "Offers that can serve it with zero retention: openrouter/openai/text-embedding-3-small"
+            ),
+            "{refused}"
+        );
+        assert_eq!(server.bodies().len(), 1, "the refusal sent nothing");
     }
 
     const HUB_MODEL: &str = "qwen/qwen3-embedding-4b";
@@ -1030,7 +1165,11 @@ pub(crate) mod tests {
             .iter()
             .any(|provider| provider.descriptor.key == CAIRN_GATEWAY_KEY));
         let refusal = orch
-            .embed_route(&scope, &offer(CAIRN_GATEWAY_KEY, "cohere-embed-v4"))
+            .embed_route(
+                &scope,
+                &offer(CAIRN_GATEWAY_KEY, "cohere-embed-v4"),
+                &unrequired(),
+            )
             .unwrap_err();
         assert!(refusal.to_string().contains("no Cairn token"), "{refusal}");
 
@@ -1047,6 +1186,7 @@ pub(crate) mod tests {
             .embed_route(
                 &scope,
                 &offer("openrouter", "openai/text-embedding-3-small"),
+                &unrequired(),
             )
             .unwrap();
         assert_eq!(url(&route), "https://openrouter.ai/api/v1/embeddings");
@@ -1063,14 +1203,18 @@ pub(crate) mod tests {
         )
         .unwrap();
         let (route, sent) = orch
-            .embed_route(&scope, &offer("ollama", "nomic-embed-text:latest"))
+            .embed_route(
+                &scope,
+                &offer("ollama", "nomic-embed-text:latest"),
+                &unrequired(),
+            )
             .unwrap();
         assert_eq!(url(&route), "http://studio.invalid:11434/v1/embeddings");
         assert_eq!(sent, "nomic-embed-text:latest");
         assert!(header_names(&route).is_empty());
 
         assert!(orch
-            .embed_route(&scope, &offer("claude", "opus"))
+            .embed_route(&scope, &offer("claude", "opus"), &unrequired())
             .unwrap_err()
             .to_string()
             .contains("no embedding route"));

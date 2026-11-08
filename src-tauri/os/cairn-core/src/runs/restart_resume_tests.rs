@@ -2068,3 +2068,347 @@ async fn the_reaper_cancels_a_held_call_and_keeps_the_crash_shape() {
         Some("cancelled")
     );
 }
+
+/// The provider can drain its abort frames only after teardown removed its
+/// handle. Exercise the real reader, not pre-inserted transcript rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_abort_frames_belong_to_restart_turn_and_resume_once() {
+    shutdown_abort_frames(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_stop_before_shutdown_stays_user_interrupted_and_never_resumes() {
+    shutdown_abort_frames(true).await;
+}
+
+async fn shutdown_abort_frames(operator_stop: bool) {
+    let (orch, db, prompts, _backend) = host("shutdown-abort-frames").await;
+    seed_node_job(&db, "j", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-j",
+        "j",
+        Some("r-j"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    db.execute(
+        "INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,created_at)
+         VALUES('call-j','r-j','s-j','turn-j',2,2,'assistant',?1,2)",
+        (serde_json::json!({"eventType":"assistant","toolUses":[{"id":"toolu_cut","name":"mcp__cairn__run","input":{"commands":[{"command":"cargo test"}]}}]}).to_string(),),
+    ).await.unwrap();
+    let mut handle = RunHandle::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Some(
+            cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+        ))),
+        Some("s-j".into()),
+        Some("j".into()),
+    );
+    handle.begin_turn("turn-j");
+    orch.process_state
+        .register_process("r-j".into(), handle)
+        .unwrap();
+
+    let frames = [
+        serde_json::json!({"type":"user","uuid":"abort-frame","session_id":"s-j","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_cut","is_error":true,"content":"The user doesn't want to proceed with this tool use. STOP what you are doing and wait for the user to tell you how to proceed."}]}}),
+        serde_json::json!({"type":"user","uuid":"abort-frame","session_id":"s-j","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}),
+        serde_json::json!({"type":"result","session_id":"s-j","subtype":"error_during_execution","is_error":true,"errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],"terminal_reason":"aborted_tools","stop_reason":"tool_use","duration_ms":10,"duration_api_ms":10,"num_turns":1,"total_cost_usd":0.0,"usage":{"input_tokens":0,"output_tokens":0}}),
+    ].map(|frame| {
+        serde_json::from_value::<cairn_models::wire::claude_stream::ClaudeEvent>(frame.clone())
+            .expect("the specimen frame must pass the production wire parser");
+        frame.to_string()
+    }).join("\n") + "\n";
+    let (drain, gate) = std::sync::mpsc::channel();
+    let (ready, reading) = std::sync::mpsc::channel();
+    let reader_orch = orch.clone();
+    let reader_db = db.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        let runtime = crate::backends::claude::claude_runtime(
+            &reader_orch,
+            &reader_orch.services.emitter,
+            "r-j",
+            Some("s-j".into()),
+            reader_db.clone(),
+        );
+        cairn_session::backends::claude::ClaudeRuntime::reader_thread(
+            &runtime,
+            "r-j",
+            Some("s-j".into()),
+            Some("opus".into()),
+            false,
+            Box::new(std::io::BufReader::new(ShutdownDrain {
+                frames: std::io::Cursor::new(frames.into_bytes()),
+                gate: Some(gate),
+                ready: Some(ready),
+            })),
+            None,
+            reader_db,
+        );
+    });
+    reading
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    if operator_stop {
+        let stopping = orch.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::orchestrator::lifecycle::operator_stop_run(&stopping, "r-j").unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    let stopped = crate::orchestrator::lifecycle::stop_agents_for_host_shutdown(
+        &orch,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(stopped.stopped, 1);
+    assert_eq!(orch.process_state.has_process("r-j"), Some(false));
+    // The reader was live before shutdown. Release its buffered frames only
+    // after the handle is gone, the specimen's attribution-loss interleaving.
+    drain.send(()).unwrap();
+    reader.await.unwrap();
+
+    assert_eq!(
+        settlement(&db, "turn-j").await,
+        if operator_stop {
+            "interrupted/user_stop"
+        } else {
+            "interrupted/host_restart"
+        },
+    );
+    if operator_stop {
+        assert_eq!(
+            text(&db, "SELECT goal_intent FROM jobs WHERE id=?1", "j")
+                .await
+                .as_deref(),
+            Some("off")
+        );
+        reconcile(&orch).await;
+        assert_eq!(resume(&orch).await.selected, 0);
+        assert!(launched_turns(&db, "j").await.is_empty());
+        return;
+    }
+    for kind in [
+        "tool_result",
+        "user",
+        "result:error_during_execution",
+        "system:error",
+    ] {
+        let count = db.query_opt_i64(
+            "SELECT COUNT(*) FROM events WHERE run_id='r-j' AND event_type=?1 AND turn_id='turn-j' AND sequence>1",
+            (kind,),
+        ).await.unwrap();
+        assert_eq!(count, Some(1), "{kind} must belong to the interrupted turn");
+    }
+    // The old runner settled it BEFORE the next boot, not during its sweep.
+    let boot = chrono::Utc::now().timestamp() + 10;
+    let (orch, _restarted_backend) = reboot(&orch, prompts.clone());
+    let boot_orch = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        super::reconcile_stale_runs(&boot_orch, boot_orch.services.emitter.as_ref(), boot);
+    })
+    .await
+    .unwrap();
+    let boot_orch = orch.clone();
+    let summary = tokio::task::spawn_blocking(move || {
+        super::resume_jobs_interrupted_by_restart(&boot_orch, boot)
+    })
+    .await
+    .unwrap();
+    assert_eq!((summary.selected, summary.admitted), (1, 1), "{summary:?}");
+    assert_eq!(launched_turns(&db, "j").await.len(), 1);
+    assert!(launch_prompts(&db, &prompts, "j")
+        .await
+        .contains("came from the restart, not from the user"));
+    assert_eq!(resume(&orch).await.selected, 0);
+}
+
+/// Codex's app-server reports a different terminal frame. Neither an aborted
+/// turn nor a success racing teardown can overwrite the host's restart cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_codex_terminal_frames_preserve_restart_and_resume_once() {
+    for terminal in [
+        serde_json::json!({"method":"turn/aborted","params":{"turnId":"p1","reason":"interrupted"}}),
+        serde_json::json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}}),
+    ] {
+        let (orch, db, prompts, _backend) = host("shutdown-codex-frames").await;
+        seed_node_job(&db, "j", 1, "active").await;
+        seed_turn(
+            &db,
+            "turn-j",
+            "j",
+            Some("r-j"),
+            1,
+            "running",
+            "initial",
+            None,
+        )
+        .await;
+        db.execute_script(
+            "UPDATE sessions SET backend='codex', backend_id='native-thread' WHERE id='s-j'",
+        )
+        .await
+        .unwrap();
+        let mut handle = RunHandle::test_handle(Some("s-j"), Some("j"));
+        handle.begin_turn("turn-j");
+        orch.process_state
+            .register_process("r-j".into(), handle)
+            .unwrap();
+        let stopped = crate::orchestrator::lifecycle::stop_agents_for_host_shutdown(
+            &orch,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(stopped.stopped, 1);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        // Aborts with no usage intentionally omit their result event. Supply
+        // usage so both terminal shapes exercise late result attribution.
+        let counts = serde_json::json!({"totalTokens":12,"inputTokens":10,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0});
+        tx.send(serde_json::json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","tokenUsage":{"total":counts,"last":counts}}})).unwrap();
+        tx.send(terminal).unwrap();
+        drop(tx);
+        let reader_orch = orch.clone();
+        let reader_db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::backends::codex::CodexBackend::reader_thread_app_server(
+                &reader_orch,
+                &reader_orch.services.emitter,
+                "r-j",
+                Some("s-j".into()),
+                rx,
+                Arc::new(
+                    cairn_models::codex::app_server::AppServerClient::for_test_scripted(
+                        vec![],
+                        Arc::new(Mutex::new(Vec::new())),
+                    ),
+                ),
+                Arc::new(Mutex::new(Some("p1".into()))),
+                None,
+                "codex".into(),
+                reader_db,
+                None,
+            );
+        })
+        .await
+        .unwrap();
+        assert_eq!(settlement(&db, "turn-j").await, "interrupted/host_restart");
+        assert_eq!(db.query_opt_i64(
+            "SELECT COUNT(*) FROM events WHERE run_id='r-j' AND event_type LIKE 'result:%' AND turn_id='turn-j'", (),
+        ).await.unwrap(), Some(1));
+        let boot = chrono::Utc::now().timestamp() + 10;
+        let (orch, _restarted_backend) = reboot(&orch, prompts);
+        let restarted = orch.clone();
+        let summary = tokio::task::spawn_blocking(move || {
+            super::reconcile_stale_runs(&restarted, restarted.services.emitter.as_ref(), boot);
+            super::resume_jobs_interrupted_by_restart(&restarted, boot)
+        })
+        .await
+        .unwrap();
+        assert_eq!((summary.selected, summary.admitted), (1, 1), "{summary:?}");
+        assert_eq!(launched_turns(&db, "j").await.len(), 1);
+        assert_eq!(resume(&orch).await.selected, 0);
+    }
+}
+
+/// A successor host shares only durable storage, not the old process registry,
+/// launch claims or resume-pass latch.
+fn reboot(
+    predecessor: &Orchestrator,
+    prompts: Arc<Mutex<Vec<String>>>,
+) -> (
+    Orchestrator,
+    crate::orchestrator::session::OrchestratorTestSessionBackend,
+) {
+    let orch = Orchestrator::builder(
+        predecessor.db.clone(),
+        Arc::new(TestServicesBuilder::new().build()),
+        tempfile::tempdir().unwrap().keep(),
+    )
+    .build();
+    let backend =
+        crate::orchestrator::session::install_orchestrator_test_session_backend(&orch, move || {
+            Box::new(RecordingBackend {
+                prompts: prompts.clone(),
+            })
+        });
+    (orch, backend)
+}
+
+struct ShutdownDrain {
+    frames: std::io::Cursor<Vec<u8>>,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+    ready: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl std::io::Read for ShutdownDrain {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(gate) = self.gate.take() {
+            self.ready.take().unwrap().send(()).unwrap();
+            gate.recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+        }
+        std::io::Read::read(&mut self.frames, bytes)
+    }
+}
+
+/// A pre-mint refusal consumes an orderly shutdown's one attempt, even on
+/// another boot with no process registry or in-memory pass latch left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_resume_refused_before_mint_is_not_retried_on_later_boots() {
+    let (orch, db, prompts, _backend) = host("shutdown-pre-mint-refusal").await;
+    seed_thread_session(&db, "j", "th", "active").await;
+    seed_turn(
+        &db,
+        "turn-j",
+        "j",
+        Some("r-j"),
+        1,
+        "running",
+        "initial",
+        None,
+    )
+    .await;
+    let mut handle = RunHandle::test_handle(Some("s-j"), Some("j"));
+    handle.begin_turn("turn-j");
+    orch.process_state
+        .register_process("r-j".into(), handle)
+        .unwrap();
+    let stopped = crate::orchestrator::lifecycle::stop_agents_for_host_shutdown(
+        &orch,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(stopped.stopped, 1);
+    db.execute("UPDATE threads SET status='closed' WHERE id='th'", ())
+        .await
+        .unwrap();
+    let boot = chrono::Utc::now().timestamp() + 10;
+    let (orch, _backend) = reboot(&orch, prompts.clone());
+    let restarting = orch.clone();
+    let summary = tokio::task::spawn_blocking(move || {
+        super::resume_jobs_interrupted_by_restart(&restarting, boot)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        (summary.selected, summary.refused, summary.admitted),
+        (1, 1, 0),
+        "{summary:?}"
+    );
+    assert!(launched_turns(&db, "j").await.is_empty());
+    assert_eq!(settlement(&db, "turn-j").await, "interrupted/host_restart");
+    assert_eq!(db.query_opt_i64(
+        "SELECT COUNT(*) FROM events WHERE turn_id='turn-j' AND event_type='system:restart_resume_attempt'", (),
+    ).await.unwrap(), Some(1));
+    let (orch, _backend) = reboot(&orch, prompts);
+    let summary = tokio::task::spawn_blocking(move || {
+        super::resume_jobs_interrupted_by_restart(&orch, boot + 20)
+    })
+    .await
+    .unwrap();
+    assert_eq!(summary.selected, 0, "{summary:?}");
+}

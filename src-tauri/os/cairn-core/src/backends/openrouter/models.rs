@@ -445,6 +445,8 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
         router: model.id == "openrouter/auto",
         modalities,
         serves,
+        availability: None,
+        availability_by_verb: Default::default(),
         tokenizer,
     }
 }
@@ -1089,6 +1091,7 @@ mod tests {
             url: format!("{}/decisions", super::super::OPENROUTER_DECISIONS_BASE),
             headers: super::super::http::openrouter_headers(&api_key),
             context_limits: None,
+            extras: Default::default(),
         });
         let option =
             |value: &str, description: &str| DecisionOption::new(value, Some(description.into()));

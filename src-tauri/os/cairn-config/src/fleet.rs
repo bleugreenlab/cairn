@@ -1,9 +1,10 @@
 //! Persisted fleet policy and executor declarations; no running fleet.
+pub use crate::drain::*;
 pub use cairn_common::executor_protocol::{MachineRole, PlacementWorkClass};
 use cairn_common::executor_protocol::{EXECUTOR_NAME_RULE, LOCAL_EXECUTOR_NAME};
 use cairn_uri::normalize_executor_name;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 pub const COLOCATED_EXECUTOR_ID: &str = "colocated";
 pub const DEFAULT_PLACEMENT_PROFILE: &str = "default";
 pub const INTERACTIVE_PLACEMENT_PROFILE: &str = "interactive";
@@ -257,17 +258,10 @@ pub struct FleetConfig {
     /// this never synthesizes one: a listener claimed here may not have bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_listener: Option<ExecutorListenerSettings>,
-    /// Machines an operator has drained, by the key
-    /// [`FleetConfig::drain_key`] gives them.
-    ///
-    /// Draining is an admission-refusal fact the RUNNER holds, not a setting on
-    /// the machine: it says this runner will not place new work there. That is
-    /// why it lives here rather than only in the executor's memory. A drain is
-    /// reached for precisely when a machine is in no condition to agree to it,
-    /// and a flag that died with the connection let a crushed machine be
-    /// dogpiled again the moment it came back (CAIRN-4360).
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub drained_machines: BTreeSet<String>,
+    /// Runner-owned holds, retained revision counters and application receipts.
+    /// Whole-fleet writes preserve this authority from the current document.
+    #[serde(default)]
+    pub drains: DrainState,
     /// What each machine is for, by the key [`FleetConfig::drain_key`] gives
     /// it. Only roles other than general are stored, so an absent entry IS
     /// general and a fleet that never set one serializes nothing here.
@@ -863,26 +857,75 @@ impl FleetConfig {
 
     /// Whether this runner is holding a machine drained.
     pub fn is_machine_drained(&self, executor_id: &str) -> bool {
-        self.drained_machines.contains(Self::drain_key(executor_id))
+        !self.drains.records(executor_id).is_empty()
     }
 
-    /// Record or clear a drain. Returns whether the stored state changed.
-    pub fn set_machine_drained(&mut self, executor_id: &str, drained: bool) -> bool {
-        let key = Self::drain_key(executor_id).to_string();
-        if drained {
-            self.drained_machines.insert(key)
-        } else {
-            self.drained_machines.remove(&key)
+    /// Freeze the eligible owned records and the immutable enrollment identity
+    /// before remote teardown. Authentication is supplied by the caller.
+    pub fn prepare_removal(
+        &self,
+        executor_id: &str,
+        principal: &cairn_common::identity::PrincipalRef,
+    ) -> Result<FrozenRemoval, String> {
+        let enrollment = self
+            .remote_executors
+            .get(executor_id)
+            .ok_or("removal requires an enrolled remote executor")?;
+        if enrollment.executor_id != executor_id {
+            return Err("enrollment key does not match executor identity".into());
         }
+        self.drains
+            .prepare_removal_records(executor_id, principal, &enrollment.device_id)
     }
 
-    /// Drop a removed machine's runner-held facts (its drain and its role)
-    /// along with it, so a host that is enrolled again does not inherit a
-    /// refusal or a purpose nobody asked for.
-    pub fn forget_machine(&mut self, executor_id: &str) {
-        let key = Self::drain_key(executor_id);
-        self.drained_machines.remove(key);
-        self.machine_roles.remove(key);
+    /// The only own-operator removal exception also revokes enrollment. A
+    /// duplicate returns its immutable receipt before looking at or modifying a
+    /// possibly new enrollment that now occupies the same stable key.
+    pub fn apply_removal(
+        &mut self,
+        application: RemovalApplication,
+    ) -> Result<RemovalReceipt, String> {
+        if let Some(receipt) = self
+            .drains
+            .removal_receipts()
+            .get(&application.operation_id)
+        {
+            return if receipt.application == application {
+                Ok(receipt.clone())
+            } else {
+                Err("removal operation identity collision".into())
+            };
+        }
+        let frozen = &application.frozen;
+        let enrollment = self
+            .remote_executors
+            .get(&frozen.executor_id)
+            .ok_or("frozen removal enrollment no longer exists")?;
+        if enrollment.executor_id != frozen.executor_id
+            || enrollment.device_id != frozen.enrollment_device_id
+        {
+            return Err(
+                "enrollment identity changed during removal; no configuration removed".into(),
+            );
+        }
+        let executor_id = frozen.executor_id.clone();
+        let display_name = enrollment.display_name.clone();
+        let receipt = self.drains.apply_removal(application)?;
+        self.remote_executors.remove(&executor_id);
+        self.remote_host_identities.remove(&executor_id);
+        self.machine_roles.remove(Self::drain_key(&executor_id));
+        self.machine_services.forget_machine(&display_name);
+        Ok(receipt)
+    }
+
+    /// Remove non-drain facts only after exact drain cleanup has committed in
+    /// the same serialized mutation. Retained counters and receipts survive.
+    pub fn forget_machine(&mut self, executor_id: &str) -> Result<(), String> {
+        if self.is_machine_drained(executor_id) {
+            return Err("machine has standing owned drains; checked removal is required".into());
+        }
+        self.machine_roles.remove(Self::drain_key(executor_id));
+        Ok(())
     }
 
     /// What this runner holds a machine to be for. Absent means general.
@@ -935,9 +978,18 @@ impl FleetConfig {
 
     /// Every machine this runner is holding drained, by executor identity.
     pub fn drained_executor_ids(&self) -> Vec<String> {
-        self.drained_machines
-            .iter()
-            .map(|key| Self::executor_id_for_key(key))
+        self.drains
+            .records_by_key()
+            .into_iter()
+            .map(|(key, _)| Self::executor_id_for_key(&key))
+            .collect()
+    }
+
+    pub fn drain_records_executor_ids(&self) -> Vec<(String, Vec<DrainRecord>)> {
+        self.drains
+            .records_by_key()
+            .into_iter()
+            .map(|(key, records)| (Self::executor_id_for_key(&key), records))
             .collect()
     }
 
@@ -1064,6 +1116,7 @@ impl FleetConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.drains.validate()?;
         self.cpu_admission
             .validate(cairn_common::executor_protocol::StallInstrument::Cpu)?;
         self.memory_admission
@@ -1149,7 +1202,7 @@ impl Default for FleetConfig {
             machine_services: MachineServicesConfig::default(),
             legacy_desktop_automation: None,
             executor_listener: None,
-            drained_machines: BTreeSet::new(),
+            drains: DrainState::default(),
             machine_roles: BTreeMap::new(),
             colocated_build_root: None,
         }
@@ -1248,12 +1301,34 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_machine_drops_its_drain_and_its_role() {
+    fn forgetting_a_machine_refuses_standing_drains() {
         let mut config = FleetConfig::default();
-        config.set_machine_drained("sp1", true);
+        let principal = cairn_common::identity::PrincipalRef::Human {
+            issuer: "test".into(),
+            subject: "operator".into(),
+            organization: None,
+        };
+        config
+            .drains
+            .impose_operator("sp1", &principal, "maintenance", 1)
+            .unwrap();
         config.set_machine_role("sp1", MachineRole::InferenceOnly);
         config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::BuildsOnly);
-        config.forget_machine("sp1");
+        assert!(config.forget_machine("sp1").is_err());
+        let frozen = config
+            .drains
+            .prepare_removal_records("sp1", &principal, "device")
+            .unwrap();
+        config
+            .drains
+            .apply_removal(RemovalApplication {
+                install_id: "install".into(),
+                operation_id: "removal".into(),
+                provenance: "verified".into(),
+                frozen,
+            })
+            .unwrap();
+        config.forget_machine("sp1").unwrap();
         assert!(!config.is_machine_drained("sp1"));
         assert_eq!(config.machine_role("sp1"), MachineRole::General);
         assert_eq!(
@@ -1435,9 +1510,21 @@ drainedMachines:
 - bgsrv-win
 "#;
 
+    fn operator_legacy_fleet() -> FleetConfig {
+        let nested = OPERATOR_DESKTOP_AUTOMATION
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        serde_yaml::from_str::<crate::settings::SettingsFile>(&format!("buildSlots:\n{nested}"))
+            .unwrap()
+            .fleet()
+            .unwrap()
+            .unwrap()
+    }
+
     #[test]
     fn the_operators_desktop_toggles_become_exactly_two_selections() {
-        let mut config: FleetConfig = serde_yaml::from_str(OPERATOR_DESKTOP_AUTOMATION).unwrap();
+        let mut config = operator_legacy_fleet();
         let notes = config.adopt_legacy_desktop_automation().unwrap();
         let expected: MachineServicesConfig = serde_yaml::from_str(
             "axon/axon:\n  machines:\n    bgsrv-mac: {}\n    local:\n      override:\n        command: /Applications/Axon.app/Contents/Resources/bin/axon\n",
@@ -1469,9 +1556,7 @@ drainedMachines:
 
     #[test]
     fn every_typed_read_converts_so_a_snapshot_write_cannot_drop_the_row() {
-        let healed = serde_yaml::from_str::<FleetConfig>(OPERATOR_DESKTOP_AUTOMATION)
-            .unwrap()
-            .healed();
+        let healed = operator_legacy_fleet().healed();
         assert_eq!(healed.machine_services.machines_for(&axon()).len(), 2);
     }
 
@@ -1551,5 +1636,119 @@ desktopAutomation:
             .validate()
             .unwrap_err()
             .contains("not a public executor name"));
+    }
+}
+
+#[cfg(test)]
+mod owned_removal_tests {
+    use super::*;
+    use cairn_common::identity::PrincipalRef;
+
+    fn remote(device: &str) -> RemoteExecutorConfig {
+        serde_json::from_value(serde_json::json!({
+            "host":"machine.test", "sshUser":"runner", "binaryPath":"/bin/cairn-exec",
+            "cairnHome":"/home/runner/.cairn", "executorId":"machine",
+            "deviceId":device, "displayName":"machine", "projectIds":[]
+        }))
+        .unwrap()
+    }
+
+    fn principal() -> PrincipalRef {
+        PrincipalRef::Human {
+            issuer: "test".into(),
+            subject: "operator".into(),
+            organization: None,
+        }
+    }
+
+    fn application(fleet: &FleetConfig) -> RemovalApplication {
+        RemovalApplication {
+            install_id: "install".into(),
+            operation_id: "remove".into(),
+            provenance: "credential-proof".into(),
+            frozen: fleet.prepare_removal("machine", &principal()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn removal_revokes_enrollment_and_all_selections_but_retains_revision_and_receipt() {
+        let mut fleet = FleetConfig::default();
+        fleet
+            .remote_executors
+            .insert("machine".into(), remote("device"));
+        fleet
+            .remote_host_identities
+            .insert("machine".into(), "host-id".into());
+        fleet.set_machine_role("machine", MachineRole::BuildsOnly);
+        fleet.machine_services =
+            serde_yaml::from_str("demo/worker:\n  machines:\n    machine: {}\n    local: {}\n")
+                .unwrap();
+        fleet.drains = DrainState::import_legacy(vec!["machine".into()]).unwrap();
+        fleet
+            .drains
+            .impose_operator("machine", &principal(), "repair", 1)
+            .unwrap();
+        let application = application(&fleet);
+        assert_eq!(application.frozen.enrollment_device_id, "device");
+        let receipt = fleet.apply_removal(application.clone()).unwrap();
+        assert!(!fleet.remote_executors.contains_key("machine"));
+        assert!(!fleet.remote_host_identities.contains_key("machine"));
+        assert_eq!(fleet.machine_role("machine"), MachineRole::General);
+        let key: MachineServiceKey = "demo/worker".parse().unwrap();
+        assert!(fleet.machine_services.selection(&key, "machine").is_none());
+        assert!(fleet.machine_services.selection(&key, "local").is_some());
+        assert_eq!(fleet.drains.machine_revision("machine"), 3);
+        assert_eq!(fleet.drains.removal_receipts()["remove"], receipt);
+        fleet.validate().unwrap();
+
+        fleet
+            .remote_executors
+            .insert("machine".into(), remote("new-device"));
+        fleet
+            .drains
+            .impose_operator("machine", &principal(), "new enrollment", 2)
+            .unwrap();
+        let before = fleet.clone();
+        assert_eq!(fleet.apply_removal(application).unwrap(), receipt);
+        assert_eq!(
+            fleet, before,
+            "replay must not delete a new enrollment or replacement drain"
+        );
+    }
+
+    #[test]
+    fn changed_enrollment_identity_aborts_without_clearing_or_recording_receipt() {
+        let mut fleet = FleetConfig::default();
+        fleet
+            .remote_executors
+            .insert("machine".into(), remote("device"));
+        fleet
+            .drains
+            .impose_operator("machine", &principal(), "repair", 1)
+            .unwrap();
+        let application = application(&fleet);
+        fleet
+            .remote_executors
+            .insert("machine".into(), remote("changed-device"));
+        let before = fleet.clone();
+        assert!(fleet
+            .apply_removal(application)
+            .unwrap_err()
+            .contains("identity changed"));
+        assert_eq!(fleet, before);
+        assert!(fleet.drains.removal_receipts().is_empty());
+        assert!(fleet.prepare_removal("colocated", &principal()).is_err());
+    }
+
+    #[test]
+    fn removal_receipt_without_standing_drains_does_not_advance_revision() {
+        let mut fleet = FleetConfig::default();
+        fleet
+            .remote_executors
+            .insert("machine".into(), remote("device"));
+        let receipt = fleet.apply_removal(application(&fleet)).unwrap();
+        assert_eq!((receipt.before_revision, receipt.after_revision), (0, 0));
+        assert_eq!(fleet.drains.machine_revision("machine"), 0);
+        fleet.validate().unwrap();
     }
 }

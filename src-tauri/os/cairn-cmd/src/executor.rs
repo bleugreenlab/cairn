@@ -53,6 +53,9 @@ pub(crate) enum ExecutorCommand {
         /// will never clear on its own.
         #[arg(long)]
         confirm: bool,
+        /// Reuse this ID and the stable executor ID to reconcile a lost reply.
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// Give an executor a different public name.
     ///
@@ -533,12 +536,17 @@ pub(crate) async fn run(command: ExecutorCommand) -> bool {
                 Err(error) => Err(("add", error)),
             }
         }
-        ExecutorCommand::Remove { name, confirm } => {
-            eprintln!("Stopping remote executor, verifying cleanup, and revoking enrollment…");
+        ExecutorCommand::Remove {
+            name,
+            confirm,
+            operation_id,
+        } => {
+            let operation_id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            eprintln!("Revoking enrollment (removal operation {operation_id}). Retain this ID and use the stable executor ID when reconciling a lost reply.");
             client
                 .invoke::<MutationResult>(
                     "remove_remote_executor",
-                    json!({ "name": name, "confirm": confirm }),
+                    json!({ "name": name, "confirm": confirm, "operationId": operation_id }),
                 )
                 .await
                 .map(|result| format_mutation("Removed", &result))

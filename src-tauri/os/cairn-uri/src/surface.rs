@@ -253,8 +253,8 @@ impl CairnResource {
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
             | Self::Bug
-            | Self::SelfRebuild
-            | Self::SelfRebuildOutcome { .. }
+            | Self::Rebuilds
+            | Self::Rebuild { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => self.read(),

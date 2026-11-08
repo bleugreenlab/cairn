@@ -41,7 +41,9 @@ pub fn warm_provider_held_run(orch: &Orchestrator, run_id: &str) -> bool {
 /// successor, and any other failure is left to the queued-content flush and to
 /// the unowned-running sweep, which resumes or reports a job nothing owns.
 pub(crate) fn settle_provider_turn_failure(orch: &Orchestrator, run_id: &str) -> bool {
-    if orch.process_state.has_process(run_id) != Some(true) {
+    if host_shutdown_in_progress(orch, run_id)
+        || orch.process_state.has_process(run_id) != Some(true)
+    {
         return false;
     }
     let turn_id = orch
@@ -82,6 +84,11 @@ pub fn transition_to_warm_state(
     run_id: &str,
     end_reason: Option<TurnEndReason>,
 ) -> bool {
+    // An abort acknowledgement or a success racing shutdown cannot warm the
+    // process and flush queued work into a host that is leaving.
+    if host_shutdown_in_progress(orch, run_id) {
+        return false;
+    }
     // Complete the current turn before transitioning occupancy
     let completed_turn_id = orch.process_state.get_current_turn_id(run_id);
     if let Some(turn_id) = completed_turn_id.as_deref() {

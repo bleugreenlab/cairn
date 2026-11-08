@@ -64,6 +64,11 @@ pub(crate) fn restore_goal_after_failed_durable_wait(
     run_id: &str,
     pause: Option<super::codex::DurableGoalPause>,
 ) -> Result<(), String> {
+    // A wait that paused nothing has nothing to restore, and the session a
+    // restore would reach may already be gone: a park stops it.
+    if pause.is_none() {
+        return Ok(());
+    }
     with_session_control(process_state, run_id, |stdin, claim| {
         super::codex::restore_app_server_goal_after_failed_durable_wait(stdin, claim, pause)
     })
