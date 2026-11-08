@@ -496,9 +496,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     stream.flush()
 }
 
-/// A streamable-HTTP MCP server offering Cairn's three verbs, attached as
-/// Cairn attaches its own (`McpServer::cairn_http`), answering every request
-/// with plain JSON (no SSE stream).
+/// A streamable-HTTP MCP server offering Cairn's three verbs, answering every
+/// request with plain JSON (no SSE stream).
 pub struct McpStub {
     pub url: String,
     /// The JSON-RPC methods called, in order, and the bearer each carried.

@@ -514,7 +514,15 @@ mod tests {
     }
 
     fn mcp() -> McpServers {
-        McpServers::new(vec![McpServer::cairn_http("https://orch.example/mcp")]).unwrap()
+        McpServers::new(vec![McpServer {
+            name: "cairn".to_string(),
+            transport: crate::session::mcp::McpTransport::Http {
+                url: "https://orch.example/mcp".to_string(),
+                bearer_env: Some("FIXTURE_MCP_TOKEN".to_string()),
+            },
+            required_tools: Vec::new(),
+        }])
+        .unwrap()
     }
 
     /// The server start sends what every Codex launch has sent: initialize,
@@ -523,7 +531,7 @@ mod tests {
     fn a_server_starts_initialized_and_signed_in_as_before() {
         let host = host(empty_result);
         let env = BTreeMap::from([("CODEX_HOME".to_string(), "/codex-home".to_string())]);
-        let secrets = SecretEnv::new().with("CAIRN_MCP_TOKEN", "bearer-1");
+        let secrets = SecretEnv::new().with("FIXTURE_MCP_TOKEN", "bearer-1");
         let login = Secret::new(json!({"type": "apiKey", "apiKey": "sk-1"}));
         CodexAppServer
             .start_server(
@@ -557,7 +565,7 @@ mod tests {
         );
         assert_eq!(spawned[0].cwd.as_deref(), Some("/work"));
         assert_eq!(spawned[0].env.get("CODEX_HOME").unwrap(), "/codex-home");
-        assert_eq!(spawned[0].env.get("CAIRN_MCP_TOKEN").unwrap(), "bearer-1");
+        assert_eq!(spawned[0].env.get("FIXTURE_MCP_TOKEN").unwrap(), "bearer-1");
 
         let requests = host.requests.lock().unwrap();
         assert_eq!(requests[0]["method"], "initialize");

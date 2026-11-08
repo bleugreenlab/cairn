@@ -22,7 +22,9 @@ pub(crate) fn fixed_server(
 ) -> CairnMcpServer {
     CairnMcpServer::new(
         Arc::new(HttpCallbackSink {
+            label: callback_url.clone(),
             callback_url,
+            socket: None,
             mcp_secret,
             #[cfg(test)]
             timeout_override: None,
@@ -31,8 +33,55 @@ pub(crate) fn fixed_server(
     )
 }
 
+/// The server one `cairn-cmd` process speaks through when it was named a
+/// lineage callback socket: every call goes to that socket's `/api/mcp` with no
+/// credential, since the server identifies this process by its lineage.
+#[cfg(unix)]
+pub(crate) fn fixed_server_on_socket(
+    socket: std::path::PathBuf,
+    cwd: String,
+    run_id: Option<String>,
+) -> CairnMcpServer {
+    CairnMcpServer::new(
+        Arc::new(HttpCallbackSink {
+            callback_url: SOCKET_CALLBACK_URL.to_string(),
+            label: socket.display().to_string(),
+            socket: Some(socket),
+            mcp_secret: None,
+            #[cfg(test)]
+            timeout_override: None,
+        }),
+        Caller::Fixed { run_id, cwd },
+    )
+}
+
+/// The request URL on a callback socket. The authority is never resolved; the
+/// socket alone decides where the request goes.
+#[cfg(unix)]
+const SOCKET_CALLBACK_URL: &str = "http://localhost/api/mcp";
+
+/// The lineage callback socket this process was named, if any. On Windows
+/// there is none.
+pub(crate) fn callback_socket() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        std::env::var_os(cairn_common::lineage::CALLBACK_SOCKET_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 struct HttpCallbackSink {
     callback_url: String,
+    /// Where calls go, as diagnostics name it: the URL, or the socket's path.
+    label: String,
+    /// The lineage callback socket every request is sent over, instead of
+    /// resolving `callback_url`'s host.
+    socket: Option<std::path::PathBuf>,
     /// Shared secret (base64-encoded string from env var, sent directly as bearer token)
     mcp_secret: Option<String>,
     /// Replaces the contract socket bound in tests that need a short one.
@@ -130,15 +179,18 @@ fn send_failure(error: &reqwest::Error, elapsed: Duration) -> (CallbackFailureKi
 #[async_trait]
 impl CallbackSink for HttpCallbackSink {
     fn describe(&self) -> &str {
-        &self.callback_url
+        &self.label
     }
 
     async fn call(&self, request: &CallbackRequest) -> CallbackOutcome {
         let started = Instant::now();
-        let client = match reqwest::Client::builder()
-            .timeout(self.socket_bound(request))
-            .build()
-        {
+        #[allow(unused_mut)]
+        let mut builder = reqwest::Client::builder().timeout(self.socket_bound(request));
+        #[cfg(unix)]
+        if let Some(socket) = &self.socket {
+            builder = builder.unix_socket(socket.as_path());
+        }
+        let client = match builder.build() {
             Ok(client) => client,
             Err(e) => {
                 tracing::error!("Failed to build HTTP client: {}", e);
@@ -253,10 +305,65 @@ mod tests {
 
     fn sink(url: String, timeout: Option<Duration>) -> HttpCallbackSink {
         HttpCallbackSink {
+            label: url.clone(),
             callback_url: url,
+            socket: None,
             mcp_secret: None,
             timeout_override: timeout,
         }
+    }
+
+    /// A process named a callback socket reaches it, and presents nothing: the
+    /// request on the wire carries no `Authorization` header, even with a
+    /// credential in this process's environment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_call_carries_no_credential_and_is_answered() {
+        use tokio::io::AsyncWriteExt;
+        // Short, since macOS caps a socket path at 104 bytes.
+        let dir = std::path::PathBuf::from(format!("/tmp/cs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                assert!(read > 0, "the request ended early");
+                seen.extend_from_slice(&buf[..read]);
+            }
+            let body = br#"{"result":"answered"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+            String::from_utf8_lossy(&seen).to_ascii_lowercase()
+        });
+        let sink = HttpCallbackSink {
+            callback_url: SOCKET_CALLBACK_URL.to_string(),
+            label: path.display().to_string(),
+            socket: Some(path.clone()),
+            mcp_secret: None,
+            timeout_override: Some(Duration::from_secs(10)),
+        };
+        assert_eq!(sink.describe(), path.display().to_string());
+        let answered = sink.call(&request()).await;
+        assert!(answered.failure.is_none(), "{}", answered.result);
+        assert_eq!(answered.result, "answered");
+        let head = server.await.unwrap();
+        assert!(head.starts_with("post /api/mcp "), "{head}");
+        assert!(!head.contains("authorization"), "{head}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn request() -> CallbackRequest {

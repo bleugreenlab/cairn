@@ -507,6 +507,8 @@ impl TestMcpRelay {
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
+        #[cfg(unix)]
+        callback_socket::serve(&relay);
         relay
     }
 
@@ -520,10 +522,23 @@ impl TestMcpRelay {
         let context = batch.runner_context_id.clone();
         for item in &mut batch.items {
             item.env.retain(|(name, _)| {
-                name != "CAIRN_CALLBACK_URL" && (context.is_none() || name != "CAIRN_MCP_SECRET")
+                name != "CAIRN_CALLBACK_URL"
+                    && name != "CAIRN_CALLBACK_SOCKET"
+                    && (context.is_none() || name != "CAIRN_MCP_SECRET")
             });
             item.env
                 .push(("CAIRN_CALLBACK_URL".into(), self.url.clone()));
+            // As the executor binary does: on Unix an item reaches this
+            // relay's lineage socket and carries no capability; elsewhere it
+            // carries its batch's context as one.
+            #[cfg(unix)]
+            if let Some(socket) = cairn_exec::callback_roots::socket() {
+                item.env.push((
+                    "CAIRN_CALLBACK_SOCKET".into(),
+                    socket.to_string_lossy().into_owned(),
+                ));
+            }
+            #[cfg(not(unix))]
             if let Some(context) = &context {
                 item.env.push(("CAIRN_MCP_SECRET".into(), context.clone()));
             }
@@ -558,13 +573,38 @@ impl TestMcpRelay {
     }
 }
 
+/// The `Authorization` a call presented, if any.
+fn presented_authorization(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 async fn relay_test_resident_callback(
     State(relay): State<TestMcpRelay>,
     UrlPath(relay_id): UrlPath<String>,
     headers: HeaderMap,
-    Json(mut request): Json<McpCallbackRequest>,
+    Json(request): Json<McpCallbackRequest>,
 ) -> Response {
-    let relay_id = ResidentRelayId(relay_id);
+    answer_resident(
+        &relay,
+        ResidentRelayId(relay_id),
+        presented_authorization(&headers),
+        request,
+    )
+    .await
+}
+
+/// A resident process's call, on its relay URL or the lineage socket: judged
+/// by the runner's own `authorize_resident_relay`, then dispatched.
+async fn answer_resident(
+    relay: &TestMcpRelay,
+    relay_id: ResidentRelayId,
+    authorization: Option<String>,
+    mut request: McpCallbackRequest,
+) -> Response {
     let Some(RelayIdentity::Resident {
         holder,
         process_key,
@@ -578,18 +618,14 @@ async fn relay_test_resident_callback(
         )
             .into_response();
     };
-    let Some(authorization) = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(authorization) = authorization else {
         return (
             StatusCode::UNAUTHORIZED,
             "invalid or expired callback context",
         )
             .into_response();
     };
-    let authorization = RelayAuthorization(authorization.to_owned());
+    let authorization = RelayAuthorization(authorization);
     let call = cairn_core::internal::fleet::resident_relay::ResidentRelayCall {
         relay_id: &relay_id,
         holder: &holder,
@@ -635,6 +671,18 @@ async fn relay_test_callback(
         )
             .into_response();
     };
+    let context = context.to_owned();
+    answer_batch(&relay, &context, request).await
+}
+
+/// A batch item's call under its live `context`, on the relay port or the
+/// lineage socket: judged by the runner's `authorize_mcp_relay`, then
+/// dispatched.
+async fn answer_batch(
+    relay: &TestMcpRelay,
+    context: &str,
+    request: McpCallbackRequest,
+) -> Response {
     if let Err(diagnostic) = relay.orch.fleet.authorize_mcp_relay(
         relay.executor_id,
         relay.generation.load(Ordering::Acquire),
@@ -653,6 +701,139 @@ async fn relay_test_callback(
         reminders,
     })
     .into_response()
+}
+
+/// The lineage callback socket the in-process test executors serve, as the
+/// executor binary serves its own (`serve_callback_socket` in
+/// `cairn-exec/src/main.rs`): a caller is attested to the batch item or
+/// resident process it descends from, and answered by the relay that owns that
+/// root, with no credential in its environment.
+///
+/// The executor's roots and its socket path are process-wide, so one socket
+/// serves every test relay in this process, from a thread of its own that
+/// outlives any one test's runtime.
+#[cfg(unix)]
+mod callback_socket {
+    use super::*;
+    use axum::extract::ConnectInfo;
+    use cairn_exec::callback_roots::{self, CallbackRoot};
+
+    static RELAYS: Mutex<Vec<TestMcpRelay>> = Mutex::new(Vec::new());
+    static SERVED: OnceLock<PathBuf> = OnceLock::new();
+
+    /// The process that connected, as the kernel reported it at accept.
+    #[derive(Clone)]
+    struct Peer(Arc<Result<cairn_common::lineage::Peer, String>>);
+
+    impl
+        axum::extract::connect_info::Connected<
+            axum::serve::IncomingStream<'_, tokio::net::UnixListener>,
+        > for Peer
+    {
+        fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+            use std::os::fd::AsFd as _;
+            Self(Arc::new(
+                cairn_common::lineage::Peer::of(stream.io().as_fd())
+                    .map_err(|error| error.to_string()),
+            ))
+        }
+    }
+
+    /// Answer `relay`'s roots on this process's callback socket, binding it on
+    /// first use.
+    pub(super) fn serve(relay: &TestMcpRelay) {
+        RELAYS.lock().unwrap().push(relay.clone());
+        SERVED.get_or_init(|| {
+            // Short and fixed under /tmp: a socket path has a ~104-byte limit,
+            // which a macOS per-user temp directory can exceed.
+            let dir = PathBuf::from(format!("/tmp/cairn-test-cb-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create the test callback socket's directory");
+            let path = dir.join("executor.sock");
+            let listener =
+                cairn_common::lineage::bind(&path).expect("bind the test callback socket");
+            listener
+                .set_nonblocking(true)
+                .expect("make the test callback socket non-blocking");
+            callback_roots::set_socket(path.clone());
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("the test callback socket's runtime");
+                runtime.block_on(async move {
+                    let listener = tokio::net::UnixListener::from_std(listener)
+                        .expect("adopt the test callback socket");
+                    let router =
+                        Router::new()
+                            .route("/api/mcp", post(answer))
+                            .layer(DefaultBodyLimit::max(
+                                cairn_common::paths::MCP_CALLBACK_MAX_BODY_BYTES,
+                            ));
+                    let _ = axum::serve(
+                        listener,
+                        router.into_make_service_with_connect_info::<Peer>(),
+                    )
+                    .await;
+                });
+            });
+            path
+        });
+    }
+
+    async fn answer(
+        ConnectInfo(peer): ConnectInfo<Peer>,
+        headers: HeaderMap,
+        Json(request): Json<McpCallbackRequest>,
+    ) -> Response {
+        let attested = offload(move || match peer.0.as_ref() {
+            Ok(peer) => callback_roots::roots()
+                .attest(peer, cairn_common::lineage::DEFAULT_PENDING_WAIT)
+                .map_err(|refusal| refusal.to_string()),
+            Err(error) => Err(error.clone()),
+        })
+        .await;
+        let root = match attested {
+            Ok(root) => root,
+            Err(refusal) => return (StatusCode::FORBIDDEN, refusal).into_response(),
+        };
+        let relays = RELAYS.lock().unwrap().clone();
+        match root {
+            CallbackRoot::Batch { runner_context_id } => {
+                let Some(relay) = relays.into_iter().find(|relay| {
+                    relay
+                        .live_contexts
+                        .lock()
+                        .unwrap()
+                        .contains(&runner_context_id)
+                }) else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "invalid or expired callback context",
+                    )
+                        .into_response();
+                };
+                answer_batch(&relay, &runner_context_id, request).await
+            }
+            CallbackRoot::Resident {
+                relay_id,
+                authorization,
+            } => {
+                let Some(relay) = relays
+                    .into_iter()
+                    .find(|relay| relay.residents.lock().unwrap().contains_key(&relay_id))
+                else {
+                    return (
+                        StatusCode::GONE,
+                        "this resident relay is gone: the process exited or was restarted",
+                    )
+                        .into_response();
+                };
+                let authorization = presented_authorization(&headers).or(authorization);
+                answer_resident(&relay, relay_id, authorization, request).await
+            }
+        }
+    }
 }
 
 /// A machine whose readings are measured and unremarkable. Placement refuses a

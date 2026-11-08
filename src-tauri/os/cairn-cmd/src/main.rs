@@ -518,12 +518,7 @@ async fn async_main() -> Result<()> {
         .unwrap_or_else(|_| "unknown".to_string());
     // Run ID - preferred method for accurate run identification (avoids cwd ambiguity)
     let run_id = env::var("CAIRN_RUN_ID").ok();
-    // Shared secret for bearer token authentication (base64-encoded)
-    let mcp_secret = cairn_common::auth::callback_token(
-        env::var("CAIRN_MCP_SECRET").ok(),
-        run_id.as_deref(),
-        cairn_common::auth::load_local_mcp_token,
-    );
+    let socket = http_sink::callback_socket();
     // Stable home URI for client-side Cairn shorthand resolution.
     let home_uri = env::var("CAIRN_HOME_URI").ok().and_then(|uri| {
         if parse_cairn_uri(&uri).is_some() {
@@ -544,7 +539,24 @@ async fn async_main() -> Result<()> {
         tracing::info!("Home URI: {}", uri);
     }
 
-    let service = http_sink::fixed_server(callback_url, cwd, run_id, mcp_secret);
+    // Named a lineage callback socket, this process calls it with no
+    // credential. Otherwise (Windows, or outside Cairn) it presents the run's
+    // bearer, or, outside any run, this home's machine credential.
+    let service = match socket {
+        #[cfg(unix)]
+        Some(socket) => {
+            tracing::info!("Callback socket: {}", socket.display());
+            http_sink::fixed_server_on_socket(socket, cwd, run_id)
+        }
+        _ => {
+            let mcp_secret = cairn_common::auth::callback_token(
+                env::var("CAIRN_MCP_SECRET").ok(),
+                run_id.as_deref(),
+                cairn_common::auth::load_local_mcp_token,
+            );
+            http_sink::fixed_server(callback_url, cwd, run_id, mcp_secret)
+        }
+    };
 
     // Create stdio transport and run the server
     let transport = cairn_mcp_server::classic_stdio_transport(rmcp::transport::stdio());

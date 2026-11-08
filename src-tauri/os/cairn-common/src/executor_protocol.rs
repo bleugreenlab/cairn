@@ -5648,6 +5648,16 @@ pub struct LearnedResourceEstimate {
 /// placement over state the runner already holds: no frame, variant or field
 /// changes, so a runner talking to an older executor gets nothing wrong.
 ///
+/// cairn/6153 does not move the number. `cairn_common::lineage` is new shared
+/// code that both peers compile, but nothing in it crosses the link: an
+/// executor answers its own lineage callback socket for the processes it
+/// spawned, and attaches the capability it already holds (a batch's
+/// `runner_context_id`, a resident's relay grant and credential) to the same
+/// relay frames as before. No frame, variant or field changes. A runner
+/// talking to an older executor gets nothing wrong: that executor still
+/// injects the credential into its children's environment, which is the
+/// exposure this issue retires, not a misreading of any frame.
+///
 /// cairn/6090 does not move the number. An operator Compact's job-wide cancel
 /// now spares the job's check requests, reading the `priority` field
 /// the runner already holds, so the runner sends `Cancel` for fewer requests

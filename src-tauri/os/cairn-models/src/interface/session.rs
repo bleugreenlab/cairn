@@ -581,7 +581,7 @@ mod tests {
     fn secrets_debug_names_but_never_shows_values() {
         let env = SecretEnv::new()
             .with("ANTHROPIC_API_KEY", "sk-ant-very-secret")
-            .with("CAIRN_MCP_TOKEN", "bearer-value");
+            .with("FIXTURE_MCP_TOKEN", "bearer-value");
         let debug = format!("{env:?}");
         assert!(debug.contains("ANTHROPIC_API_KEY"));
         assert!(!debug.contains("sk-ant-very-secret"));
@@ -595,12 +595,12 @@ mod tests {
     #[test]
     fn secrets_reach_only_the_spawn_environment() {
         let config = SecretEnv::new()
-            .with("CAIRN_MCP_TOKEN", "bearer-value")
+            .with("FIXTURE_MCP_TOKEN", "bearer-value")
             .apply(SpawnConfig::new("claude"));
         assert!(config
             .env
             .iter()
-            .any(|(name, value)| name == "CAIRN_MCP_TOKEN" && value == "bearer-value"));
+            .any(|(name, value)| name == "FIXTURE_MCP_TOKEN" && value == "bearer-value"));
     }
 
     /// Neither secret type may be serializable: the compile-time half of the

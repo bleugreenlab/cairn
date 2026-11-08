@@ -35,8 +35,8 @@
 //!
 //! The SHA-256 digest of each token, never the token. The token's plaintext
 //! lives only inside its lease, from which it is presented into the process that
-//! carries it (an agent's or a project service's environment, a service call's
-//! frame, or a dev export) and compared in constant time on each request.
+//! carries it (an agent's or a project service's environment, or a service
+//! call's frame) and compared in constant time on each request.
 //! A revoked bearer leaves a non-secret tombstone for a day so a later
 //! presentation can be told *why* it is refused rather than just that it is.
 
@@ -50,33 +50,13 @@ use base64::Engine as _;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use cairn_models::session::mcp::{McpServer, McpTransport, MCP_TOKEN_ENV};
+use cairn_models::session::mcp::{McpServer, McpTransport};
 
 use crate::orchestrator::Orchestrator;
 use crate::security::broker::CredentialSource;
 use crate::security::lease::{
     leases, CredentialLease, LeaseAudience, LeaseDenied, LeaseId, LeaseTerms, Presented,
 };
-
-/// Where agents reach this orchestrator's `/mcp`: the workspace's configured
-/// `mcp.publicUrl` (for a headless orch, typically its `tailscale serve`
-/// hostname), else this machine's loopback.
-pub fn public_mcp_url(orch: &Orchestrator) -> String {
-    crate::config::settings::load_mcp_public_url(&orch.config_dir)
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}/mcp", orch.mcp_callback_port))
-}
-
-/// The streamable-HTTP attachment for one run, with a bearer freshly minted
-/// for it and bound to the attachment's host.
-pub fn attachment_for_run(
-    orch: &Orchestrator,
-    run_id: &str,
-    node_uri: &str,
-) -> Result<(McpServer, RunBearer), String> {
-    let attachment = McpServer::cairn_http(public_mcp_url(orch));
-    let bearer = bearer_for_attachment(orch, &attachment, run_id, node_uri)?;
-    Ok((attachment, bearer))
-}
 
 /// A bearer for `run_id`, bound to the destination `attachment` reaches: the
 /// public endpoint's host for HTTP, this machine's loopback for the stdio
@@ -104,9 +84,19 @@ pub fn bearer_for_pool(
         .mint_pool(server_id, attachment_audience(attachment)?))
 }
 
-/// The variable `cairn-cmd` reads its callback credential from. The name
-/// predates per-run bearers; what it carries is now always a bearer.
+/// The variable `cairn-cmd` reads its callback credential from on Windows,
+/// where no lineage socket exists. The name predates per-run bearers; what it
+/// carries is always a bearer.
+#[cfg(windows)]
 pub const STDIO_CREDENTIAL_ENV: &str = "CAIRN_MCP_SECRET";
+
+/// Where this runner's lineage callback socket listens, for the runner whose
+/// home is `config_dir`. A process this runner spawned, and its descendants,
+/// call it with no credential (see [`cairn_common::lineage`]).
+#[cfg(unix)]
+pub fn callback_socket_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    cairn_common::lineage::socket_path(config_dir, "runner")
+}
 
 /// Where `attachment`'s agent sends the bearer it presents: the HTTP
 /// endpoint, or the loopback callback the stdio shim posts to.
@@ -124,23 +114,36 @@ fn attachment_audience(attachment: &McpServer) -> Result<LeaseAudience, String> 
     audience_for_url(attachment_destination(attachment)?)
 }
 
-/// The environment variable, and its value, that an agent process's MCP entry
-/// authenticates with: its bearer, under the name the stdio shim or the HTTP
-/// client reads it from.
+/// The environment variable, and its value, that an agent process's `cairn-cmd`
+/// shim authenticates with. `None` on macOS and Linux, where the shim carries
+/// no credential: it reaches the runner's lineage socket, where the kernel says
+/// who it is. On Windows the shim still reads a bearer from its environment.
+///
+/// Cairn attaches the agents it spawns over stdio only, so an HTTP attachment
+/// here is refused rather than given a credential variable.
 pub fn mcp_credential_env(
     attachment: &McpServer,
     bearer: &RunBearer,
-) -> Result<(&'static str, String), String> {
-    let var = match &attachment.transport {
-        McpTransport::Stdio { .. } => STDIO_CREDENTIAL_ENV,
-        McpTransport::Http { .. } => MCP_TOKEN_ENV,
-    };
-    // Presented to the agent that will carry it to the attachment's
-    // destination, so the audience is derived from where it is going.
-    let presented = bearer
-        .present(&attachment_audience(attachment)?)
-        .map_err(|denied| format!("run bearer not presentable: {denied}"))?;
-    Ok((var, presented.expose().to_string()))
+) -> Result<Option<(&'static str, String)>, String> {
+    match &attachment.transport {
+        McpTransport::Http { .. } => {
+            Err("Cairn attaches its own agents over stdio only".to_string())
+        }
+        #[cfg(unix)]
+        McpTransport::Stdio { .. } => {
+            let _ = bearer;
+            Ok(None)
+        }
+        #[cfg(windows)]
+        McpTransport::Stdio { .. } => {
+            // Presented to the shim that will carry it to the attachment's
+            // loopback callback, so the audience is derived from there.
+            let presented = bearer
+                .present(&attachment_audience(attachment)?)
+                .map_err(|denied| format!("run bearer not presentable: {denied}"))?;
+            Ok(Some((STDIO_CREDENTIAL_ENV, presented.expose().to_string())))
+        }
+    }
 }
 
 /// The value a project service process presents to `audience`, where it
@@ -459,146 +462,6 @@ pub fn audience_for_url(public_url: &str) -> Result<LeaseAudience, String> {
     Ok(audience_for_host(host))
 }
 
-/// What a dev export wrote: where, and under which lease. Never the token.
-#[cfg(debug_assertions)]
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DevAttachmentExport {
-    pub run_id: String,
-    pub lease_id: String,
-    pub url: String,
-    /// `CAIRN_MCP_TOKEN=<bearer>`, for `source`-ing on the agent's host.
-    pub token_env: std::path::PathBuf,
-    /// The Claude `--mcp-config` JSON (names the bearer by variable only).
-    pub claude_mcp_config: std::path::PathBuf,
-    /// The Codex `-c` override value (names the bearer by variable only).
-    pub codex_config_override: std::path::PathBuf,
-}
-
-/// Development only: mint an HTTP attachment for a live run and write it to
-/// `out_dir`, so a `claude` or `codex` on another host can be pointed at this
-/// orchestrator by hand. The directory is owner-only and so is each file; the
-/// bearer is revoked with the run like any other.
-#[cfg(debug_assertions)]
-pub async fn dev_export_attachment(
-    orch: &Orchestrator,
-    run_id: &str,
-    out_dir: &std::path::Path,
-) -> Result<DevAttachmentExport, String> {
-    use crate::storage::{DbError, RowExt};
-
-    // A bearer minted for a run that has already finalized would never be
-    // revoked, so only a live run's attachment may be exported.
-    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let lookup = run_id.to_string();
-    let status = db
-        .read(|conn| {
-            let run_id = lookup.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT status FROM runs WHERE id = ?1 LIMIT 1",
-                        (run_id.as_str(),),
-                    )
-                    .await?;
-                let Some(row) = rows.next().await? else {
-                    return Err(DbError::Row(format!("No run found with id '{run_id}'")));
-                };
-                row.text(0)
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    if !matches!(status.as_str(), "starting" | "live") {
-        return Err(format!(
-            "run {run_id} is {status}; only a live run's MCP attachment can be exported"
-        ));
-    }
-    let request = cairn_common::protocol::CallbackRequest {
-        run_id: Some(run_id.to_string()),
-        ..Default::default()
-    };
-    let node_uri =
-        crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, &request).await?;
-
-    let (attachment, bearer) = attachment_for_run(orch, run_id, &node_uri)?;
-    let (_, token) = mcp_credential_env(&attachment, &bearer)?;
-    let McpTransport::Http { url, .. } = &attachment.transport else {
-        unreachable!("attachment_for_run always builds an HTTP attachment");
-    };
-    let written = write_attachment_files(out_dir, &attachment, &token)?;
-    log::info!(
-        "MCP bearer {} for run {} exported to {}",
-        bearer.lease_id(),
-        run_id,
-        out_dir.display()
-    );
-    Ok(DevAttachmentExport {
-        run_id: run_id.to_string(),
-        lease_id: bearer.lease_id().to_string(),
-        url: url.clone(),
-        token_env: written.0,
-        claude_mcp_config: written.1,
-        codex_config_override: written.2,
-    })
-}
-
-#[cfg(debug_assertions)]
-fn write_attachment_files(
-    out_dir: &std::path::Path,
-    attachment: &McpServer,
-    token: &str,
-) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {
-    use std::io::Write as _;
-    #[cfg(unix)]
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-
-    // Only a directory this call creates is owner-only by construction. An
-    // existing one, the files already in it, or a symlink planted in its place
-    // carry permissions and targets that are not ours to vouch for, so the
-    // export directory must be new and each file is created exclusively
-    // (`create_new` is O_EXCL, which also refuses to follow a symlink).
-    if let Some(parent) = out_dir.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    }
-    let mut dir = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    dir.mode(0o700);
-    dir.create(out_dir).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            format!(
-                "{} already exists; export into a new directory so its owner-only permissions hold",
-                out_dir.display()
-            )
-        } else {
-            format!("cannot create {}: {error}", out_dir.display())
-        }
-    })?;
-
-    let write = |name: &str, contents: String| -> Result<std::path::PathBuf, String> {
-        let path = out_dir.join(name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&path)
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-        file.write_all(contents.as_bytes())
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-        Ok(path)
-    };
-    let servers = crate::backends::cairn_servers(attachment);
-    Ok((
-        write("token.env", format!("{MCP_TOKEN_ENV}={token}\n"))?,
-        write("claude-mcp.json", servers.claude_mcp_config())?,
-        write("codex.override", servers.codex_config_overrides().concat())?,
-    ))
-}
-
 fn strip_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[') {
         // `[::1]:3849` — the address is everything inside the brackets.
@@ -701,7 +564,7 @@ impl RunBearer {
 
     /// The token, for the places it is handed out: the agent or project service
     /// process that will present it to `audience` ([`mcp_credential_env`],
-    /// [`service_credential`]), or a dev export.
+    /// [`service_credential`]).
     pub fn present(&self, audience: &LeaseAudience) -> Result<Presented<'_>, LeaseDenied> {
         self.lease.present(audience)
     }
@@ -776,12 +639,41 @@ struct BookState {
     /// racing finalization either lands first and is revoked with the rest, or
     /// lands after and is refused.
     revoked_runs: HashMap<String, Revocation>,
+    /// The lineage roots each scope's processes were recorded under. Held here
+    /// so revocation drops them under the same lock it publishes the
+    /// tombstone with, roots first: no connection is admitted between the two.
+    #[cfg(unix)]
+    roots: HashMap<BearerScope, Vec<cairn_common::lineage::RootGuard<BearerScope>>>,
 }
 
-/// This orchestrator's run bearers.
+/// This orchestrator's run bearers, and the lineage roots that speak for the
+/// same runs and pooled servers on its callback socket.
 #[derive(Default)]
 pub struct RunBearerBook {
     state: Mutex<BookState>,
+    #[cfg(unix)]
+    lineage: cairn_common::lineage::LineageRoots<BearerScope>,
+    /// Set once this runner's lineage callback socket is bound and served.
+    callback_socket_live: std::sync::atomic::AtomicBool,
+}
+
+/// A lineage root opened before an agent process spawns, recorded once its
+/// pid is known ([`RunBearerBook::record_root`]). Dropped unrecorded on any
+/// failure path, which closes it. Empty where nothing attests by lineage: on
+/// Windows, and for an agent attached over HTTP.
+pub struct RootRegistration {
+    #[cfg(unix)]
+    pending: Option<(cairn_common::lineage::PendingRoot<BearerScope>, BearerScope)>,
+}
+
+impl RootRegistration {
+    /// A registration that records nothing.
+    pub fn none() -> Self {
+        Self {
+            #[cfg(unix)]
+            pending: None,
+        }
+    }
 }
 
 impl RunBearerBook {
@@ -926,6 +818,112 @@ impl RunBearerBook {
         })
     }
 
+    /// Open a lineage root for the process about to spawn with `attachment`,
+    /// to speak for `scope`. Only the stdio shim reaches the callback socket;
+    /// an HTTP attachment presents its bearer instead.
+    pub fn pending_root(&self, attachment: &McpServer, scope: BearerScope) -> RootRegistration {
+        #[cfg(unix)]
+        {
+            RootRegistration {
+                pending: matches!(attachment.transport, McpTransport::Stdio { .. })
+                    .then(|| (self.lineage.pending(), scope)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (attachment, scope);
+            RootRegistration::none()
+        }
+    }
+
+    /// Record that this runner's lineage callback socket is bound and served.
+    pub fn mark_callback_socket_live(&self) {
+        self.callback_socket_live
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a process this runner spawns can reach it by lineage alone: the
+    /// callback socket is served, so a recorded root, a pooled Codex server's
+    /// included, is answered without any credential in its environment. Always
+    /// false on Windows.
+    pub fn serves_lineage_roots(&self) -> bool {
+        cfg!(unix)
+            && self
+                .callback_socket_live
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record `pid`, the process `registration` was opened for, as a lineage
+    /// root. A scope already revoked is refused, and so is a pid that is not a
+    /// live child of this process. A refusal leaves the process unable to call
+    /// back, never able to call for anything else.
+    pub fn record_root(&self, registration: RootRegistration, pid: Option<u32>) {
+        #[cfg(unix)]
+        {
+            let Some((pending, scope)) = registration.pending else {
+                return;
+            };
+            let Some(pid) = pid else {
+                log::error!(
+                    "no lineage root recorded for {}: the process has no pid",
+                    scope.label()
+                );
+                return;
+            };
+            let guard = match pending.record(pid, scope.clone()) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::error!(
+                        "no lineage root recorded for {} (pid {pid}): {error}; its callbacks will \
+                         be refused",
+                        scope.label()
+                    );
+                    return;
+                }
+            };
+            let mut state = self.state.lock().expect("run bearer book poisoned");
+            if scope
+                .run_id()
+                .is_some_and(|run_id| state.revoked_runs.contains_key(run_id))
+            {
+                // Dropped here, under the lock: the run finalized while its
+                // process spawned.
+                drop(guard);
+                return;
+            }
+            log::info!("lineage root pid {pid} recorded for {}", scope.label());
+            state.roots.entry(scope).or_default().push(guard);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (registration, pid);
+        }
+    }
+
+    /// What the process at the other end of a callback-socket connection speaks
+    /// for: the scope of the root it descends from, while that scope is live.
+    /// Blocking; see [`cairn_common::lineage::LineageRoots::attest`].
+    #[cfg(unix)]
+    pub fn attest(&self, peer: &cairn_common::lineage::Peer) -> Result<BearerScope, String> {
+        let scope = self
+            .lineage
+            .attest(peer, cairn_common::lineage::DEFAULT_PENDING_WAIT)
+            .map_err(|refusal| refusal.to_string())?;
+        if let Some(run_id) = scope.run_id() {
+            if self.run_is_revoked(run_id) {
+                return Err(format!("run {run_id} has finalized"));
+            }
+        }
+        Ok(scope)
+    }
+
+    /// Drop `scope`'s lineage roots. Called under the book's lock, before the
+    /// tombstone is published.
+    #[cfg(unix)]
+    fn drop_roots(state: &mut BookState, scope: &BearerScope) {
+        drop(state.roots.remove(scope));
+    }
+
     /// Whether `run_id`'s bearers have been revoked.
     pub fn run_is_revoked(&self, run_id: &str) -> bool {
         self.state
@@ -985,6 +983,8 @@ impl RunBearerBook {
     pub fn revoke_run(&self, run_id: &str, reason: &str) -> usize {
         let at = now();
         let mut state = self.state.lock().expect("run bearer book poisoned");
+        #[cfg(unix)]
+        Self::drop_roots(&mut state, &BearerScope::Run(run_id.to_string()));
         state
             .revoked_runs
             .entry(run_id.to_string())
@@ -1004,12 +1004,10 @@ impl RunBearerBook {
     /// that name `reason`. Idempotent. Returns how many this call revoked.
     pub fn revoke_pool(&self, server_id: &str, reason: &str) -> usize {
         let mut state = self.state.lock().expect("run bearer book poisoned");
-        Self::revoke_scope(
-            &mut state,
-            &BearerScope::CodexPool(server_id.to_string()),
-            now(),
-            reason,
-        )
+        let scope = BearerScope::CodexPool(server_id.to_string());
+        #[cfg(unix)]
+        Self::drop_roots(&mut state, &scope);
+        Self::revoke_scope(&mut state, &scope, now(), reason)
     }
 
     fn revoke_scope(state: &mut BookState, scope: &BearerScope, at: i64, reason: &str) -> usize {
@@ -1291,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn both_attachments_carry_a_bearer_under_their_own_variable() {
+    fn only_the_windows_stdio_shim_carries_a_bearer_in_its_environment() {
         let book = RunBearerBook::default();
         let stdio = crate::config::mcp_setup::stdio_attachment(
             "/usr/bin/cairn-cmd",
@@ -1304,18 +1302,32 @@ mod tests {
         let bearer = book
             .mint("run-a", NODE, attachment_audience(&stdio).unwrap())
             .unwrap();
-        let (var, value) = mcp_credential_env(&stdio, &bearer).unwrap();
-        assert_eq!(var, STDIO_CREDENTIAL_ENV);
-        assert_eq!(
-            book.verify(&value, &local()).unwrap().run_id(),
-            Some("run-a")
-        );
-
-        let http = McpServer::cairn_http("https://orch.tail1234.ts.net/mcp");
+        let stdio_credential = mcp_credential_env(&stdio, &bearer).unwrap();
+        #[cfg(unix)]
         assert!(
-            mcp_credential_env(&http, &bearer).is_err(),
-            "a loopback bearer is not presentable to a public endpoint"
+            stdio_credential.is_none(),
+            "the stdio shim reaches the lineage socket and carries no credential"
         );
+        #[cfg(windows)]
+        {
+            let (var, value) = stdio_credential.unwrap();
+            assert_eq!(var, STDIO_CREDENTIAL_ENV);
+            assert_eq!(
+                book.verify(&value, &local()).unwrap().run_id(),
+                Some("run-a")
+            );
+        }
+
+        let http = McpServer {
+            name: "cairn".to_string(),
+            transport: McpTransport::Http {
+                url: "http://127.0.0.1:3849/mcp".to_string(),
+                bearer_env: Some("FIXTURE_MCP_TOKEN".to_string()),
+            },
+            required_tools: Vec::new(),
+        };
+        let refused = mcp_credential_env(&http, &bearer).unwrap_err();
+        assert!(refused.contains("stdio only"), "{refused}");
     }
 
     #[test]
@@ -1596,68 +1608,6 @@ mod tests {
 
         let verified = book.verify(&token, &local()).unwrap();
         assert!(!format!("{verified:?}").contains(&token));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exported_files_are_owner_only_and_only_token_env_holds_the_token() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("export");
-        let attachment = McpServer::cairn_http("https://orch.tail1234.ts.net/mcp");
-        let token = "exported-bearer-Qm47Zx82Lp19Wd";
-        let (token_env, claude, codex) = write_attachment_files(&out, &attachment, token).unwrap();
-
-        let mode =
-            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&out), 0o700);
-        for path in [&token_env, &claude, &codex] {
-            assert_eq!(mode(path), 0o600, "{}", path.display());
-        }
-        assert_eq!(
-            std::fs::read_to_string(&token_env).unwrap(),
-            format!("CAIRN_MCP_TOKEN={token}\n")
-        );
-        for path in [&claude, &codex] {
-            let text = std::fs::read_to_string(path).unwrap();
-            assert!(!text.contains(token), "{}", path.display());
-            assert!(text.contains("CAIRN_MCP_TOKEN"), "{}", path.display());
-        }
-    }
-
-    /// An existing directory (with a world-readable `token.env` already in it)
-    /// or a symlink in the directory's place is refused, and nothing is written
-    /// through either.
-    #[cfg(unix)]
-    #[test]
-    fn export_refuses_an_existing_directory_or_a_symlink() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let attachment = McpServer::cairn_http("https://orch.tail1234.ts.net/mcp");
-        let token = "exported-bearer-Zk38Wq71Lm46Pd";
-
-        let existing = dir.path().join("existing");
-        std::fs::create_dir(&existing).unwrap();
-        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(existing.join("token.env"), "stale\n").unwrap();
-        std::fs::set_permissions(
-            existing.join("token.env"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-        let error = write_attachment_files(&existing, &attachment, token).unwrap_err();
-        assert!(error.contains("already exists"), "{error}");
-        assert_eq!(
-            std::fs::read_to_string(existing.join("token.env")).unwrap(),
-            "stale\n"
-        );
-
-        let target = dir.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(write_attachment_files(&link, &attachment, token).is_err());
-        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
     }
 
     #[test]

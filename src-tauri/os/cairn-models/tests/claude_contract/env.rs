@@ -42,7 +42,13 @@ use cairn_models::managed::codex::CODEX;
 use cairn_models::managed::{ManagedTool, ManagedTools, RefusingSource};
 use cairn_models::session::claude::ClaudeCli;
 use cairn_models::session::local::LocalSessionHost;
-use cairn_models::session::mcp::{McpServer, McpServers, MCP_TOKEN_ENV};
+use cairn_models::session::mcp::{
+    McpServer, McpServers, McpTransport, CAIRN_SERVER_NAME, CAIRN_TOOLS,
+};
+
+/// The variable the contract's HTTP MCP server reads its bearer from. A
+/// fixture name: Cairn attaches its own agents over stdio, never this way.
+const FIXTURE_MCP_TOKEN_ENV: &str = "FIXTURE_MCP_TOKEN";
 use cairn_models::wire::claude_stream::init::CORE_VERBS;
 use cairn_models::wire::claude_stream::{parse_event, ClaudeEvent, Init};
 use cairn_models::wire::MessageContent;
@@ -426,7 +432,8 @@ pub enum Credential {
 /// The MCP servers a launch attaches.
 #[derive(Clone)]
 pub enum Mcp {
-    /// Cairn's own server, over HTTP, as `McpServer::cairn_http` attaches it.
+    /// A server named `cairn` offering Cairn's three verbs, over streamable
+    /// HTTP with a bearer read from the environment.
     Cairn,
     /// None: a tool-free launch.
     Without,
@@ -1010,10 +1017,17 @@ impl ContractEnv {
         };
         let mcp = match launch.mcp {
             Mcp::Cairn => {
-                secrets = secrets.with(MCP_TOKEN_ENV, MCP_BEARER);
+                secrets = secrets.with(FIXTURE_MCP_TOKEN_ENV, MCP_BEARER);
                 Some(
-                    McpServers::new(vec![McpServer::cairn_http(&self.mcp.url)])
-                        .map_err(|error| error.to_string())?,
+                    McpServers::new(vec![McpServer {
+                        name: CAIRN_SERVER_NAME.to_string(),
+                        transport: McpTransport::Http {
+                            url: self.mcp.url.clone(),
+                            bearer_env: Some(FIXTURE_MCP_TOKEN_ENV.to_string()),
+                        },
+                        required_tools: CAIRN_TOOLS.iter().map(|tool| tool.to_string()).collect(),
+                    }])
+                    .map_err(|error| error.to_string())?,
                 )
             }
             Mcp::Without => None,

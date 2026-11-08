@@ -1558,9 +1558,7 @@ impl AgentBackend for ClaudeBackend {
                 config.run_id
             )
         })?;
-        let (mcp_credential_var, mcp_credential) =
-            crate::mcp::run_bearer::mcp_credential_env(&config.mcp, mcp_bearer)?;
-        log::info!("Using {} for run {}", mcp_credential_var, config.run_id);
+        let mcp_credential = crate::mcp::run_bearer::mcp_credential_env(&config.mcp, mcp_bearer)?;
 
         // Inject user identity into Claude process environment
         // Prefer pre-resolved identity from SessionConfig (includes project overrides)
@@ -1588,7 +1586,13 @@ impl AgentBackend for ClaudeBackend {
             user.claude_auth,
             Some(crate::credentials::ClaudeAuth::ApiKey(_))
         );
-        let mut secrets = SecretEnv::new().with(mcp_credential_var, mcp_credential);
+        let mut secrets = match mcp_credential {
+            Some((var, value)) => {
+                log::info!("Using {} for run {}", var, config.run_id);
+                SecretEnv::new().with(var, value)
+            }
+            None => SecretEnv::new(),
+        };
         // The home is also where the CLI keeps the conversation a resume
         // replays, so the transcript repair below reads the same path.
         let ClaudeLaunchCredential {
@@ -1696,6 +1700,10 @@ impl AgentBackend for ClaudeBackend {
             &config.run_id,
             session_id.as_deref(),
         )?;
+        let root = orch.run_bearers.pending_root(
+            &config.mcp,
+            crate::mcp::run_bearer::BearerScope::Run(config.run_id.clone()),
+        );
         let launched = runtime
             .claude
             .open(runtime.host.as_ref(), spec)
@@ -1711,6 +1719,14 @@ impl AgentBackend for ClaudeBackend {
                 }
                 error.to_string()
             })?;
+        orch.run_bearers.record_root(
+            root,
+            launched
+                .process
+                .lock()
+                .ok()
+                .and_then(|child| child.as_ref().map(|child| child.id())),
+        );
         let mut event = crate::resume_timing::ResumeTimingEvent::new("claude_process_spawned")
             .elapsed(spawn_started);
         event.run_id = Some(&config.run_id);

@@ -188,6 +188,14 @@ pub(crate) fn sbpl_profile(policy: &SandboxPolicy, floor: &OperatorCredentialFlo
         out.push_str(&format!(
             "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
         ));
+        // And the lineage callback socket, by its exact path: the same door,
+        // answered by the same relay, with no capability to carry.
+        if let Some(socket) = &policy.callback_socket {
+            out.push_str(&format!(
+                "(allow network-outbound (remote unix-socket (path-literal \"{}\")))\n",
+                escape_sbpl(&canonicalize_best_effort(socket).to_string_lossy())
+            ));
+        }
         out.push_str(&format!("(deny mach-lookup {report})\n"));
     }
 
@@ -864,6 +872,7 @@ fn recover_a_canary_denial(access: ViolationStreamAccess) -> ViolationRecoveryOu
         writable_regex: Vec::new(),
         worktree_writable: true,
         socket_resolvable: Vec::new(),
+        callback_socket: None,
         readable_extra: Vec::new(),
         violation_tag: crate::ViolationTag::fresh(),
         reach: Default::default(),
@@ -1108,6 +1117,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1172,6 +1182,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1339,6 +1350,7 @@ mod tests {
                 writable_regex: vec![],
                 worktree_writable: true,
                 socket_resolvable: vec![],
+                callback_socket: None,
                 readable_extra: vec![],
                 violation_tag: crate::ViolationTag::fresh(),
                 reach: Default::default(),
@@ -1387,6 +1399,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1448,6 +1461,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1497,6 +1511,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -1653,6 +1668,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -2133,6 +2149,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -2219,6 +2236,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -2584,6 +2602,7 @@ mod tests {
             writable_regex: vec![],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),
@@ -2631,6 +2650,7 @@ mod tests {
             writable_regex: vec![super::super::glob_to_regex(&glob)],
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),

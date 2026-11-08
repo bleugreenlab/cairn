@@ -51,6 +51,37 @@ pub(crate) fn stdio_attachment(
     McpServer::cairn_stdio(mcp_binary_path, env)
 }
 
+/// The stdio attachment for a process this runner spawns: [`stdio_attachment`]
+/// for this runner's port, home and log level, and on macOS and Linux its
+/// lineage callback socket in `CAIRN_CALLBACK_SOCKET`, which `cairn-cmd`
+/// calls instead of the port, presenting no credential.
+pub(crate) fn runner_stdio_attachment(
+    orch: &crate::orchestrator::Orchestrator,
+    home_uri: Option<&str>,
+) -> McpServer {
+    let cairn_home = cairn_common::paths::cairn_home();
+    let log_level = crate::config::settings::load_log_level(&orch.config_dir);
+    #[allow(unused_mut)]
+    let mut attachment = stdio_attachment(
+        &orch.mcp_binary_path,
+        orch.mcp_callback_port,
+        home_uri,
+        cairn_common::paths::env_str(),
+        Some(cairn_home.to_string_lossy().as_ref()),
+        log_level.as_str(),
+    );
+    #[cfg(unix)]
+    if let cairn_models::session::mcp::McpTransport::Stdio { env, .. } = &mut attachment.transport {
+        env.insert(
+            cairn_common::lineage::CALLBACK_SOCKET_ENV.to_string(),
+            crate::mcp::run_bearer::callback_socket_path(&orch.config_dir)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    attachment
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

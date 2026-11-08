@@ -386,10 +386,6 @@ pub struct SettingsFile {
     /// the Settings DTO); preserved across saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpEndpointSettings>,
-    /// How spawned agents are launched. Config-only (YAML, not in the Settings
-    /// DTO); preserved across saves.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    agents: Option<AgentLaunchSettings>,
     /// Extra case-insensitive names redacted from browser network headers,
     /// query parameters, JSON fields, and form fields. The built-in sensitive
     /// names always apply; this config-only list can only add to them.
@@ -911,7 +907,6 @@ impl SettingsFile {
             // Config-only (YAML, not in the DTO); preserved across saves.
             sandbox_deny_read: None,
             mcp: None,
-            agents: None,
             browser_network_sensitive_names: None,
             build_services: None,
             fleet: None,
@@ -1030,29 +1025,6 @@ pub struct McpEndpointSettings {
     pub public_url: Option<String>,
 }
 
-/// `agents:` in `settings.yaml`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentLaunchSettings {
-    /// TRANSITIONAL: a workspace-wide switch for dogfooding the HTTP MCP
-    /// endpoint with locally spawned agents. The token hub will choose the
-    /// attachment per session; when it does, delete this key rather than
-    /// extending it.
-    #[serde(default)]
-    pub mcp_transport: AgentMcpTransport,
-}
-
-/// How a spawned agent reaches Cairn's MCP server.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentMcpTransport {
-    /// `cairn-cmd mcp` over stdio, calling back on loopback.
-    #[default]
-    Stdio,
-    /// The orchestrator's streamable-HTTP `/mcp` endpoint with a run bearer.
-    Http,
-}
-
 /// The configured `mcp.publicUrl`, if any.
 pub fn load_mcp_public_url(config_dir: &std::path::Path) -> Option<String> {
     load_settings_file(config_dir)
@@ -1061,15 +1033,6 @@ pub fn load_mcp_public_url(config_dir: &std::path::Path) -> Option<String> {
         .and_then(|mcp| mcp.public_url)
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
-}
-
-/// The configured `agents.mcpTransport` (transitional), defaulting to stdio.
-pub fn load_agent_mcp_transport(config_dir: &std::path::Path) -> AgentMcpTransport {
-    load_settings_file(config_dir)
-        .ok()
-        .and_then(|file| file.agents)
-        .map(|agents| agents.mcp_transport)
-        .unwrap_or_default()
 }
 
 /// Load settings from file. Returns defaults if file doesn't exist or is invalid.
@@ -2423,6 +2386,21 @@ externalReplies: disabled
         let saved = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
         assert!(!saved.contains("subscriptionFees"), "{saved}");
         assert!(saved.contains("mergeType"), "{saved}");
+    }
+
+    /// `agents.mcpTransport` once switched locally spawned agents to the HTTP
+    /// endpoint; every such agent now attaches over stdio. A file that still
+    /// names the key loads as though it did not.
+    #[test]
+    fn the_retired_agent_mcp_transport_is_ignored() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(
+            get_settings_path(temp.path()),
+            "agents:\n  mcpTransport: http\nmergeType: rebase\n",
+        )
+        .unwrap();
+        assert!(load_settings_file(temp.path()).is_ok());
+        assert_eq!(load_settings(temp.path()).merge_type, MergeType::Rebase);
     }
 
     #[test]

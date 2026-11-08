@@ -32,8 +32,9 @@ fn post(url: &str, secret: &str, body: &std::path::Path) -> (String, String) {
 
 /// Acceptance 1 and 5: a terminal on a remote machine reads its own home
 /// through the relay its executor serves, never through the runner's loopback
-/// or its machine secret, and once it has exited the URL and credential it
-/// held reach nothing.
+/// or its machine secret, and once it has exited the URL it held reaches
+/// nothing. On macOS and Linux it holds no credential at all and calls on its
+/// executor's lineage socket; elsewhere it presents a credential of its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remote_terminal_reads_its_home_through_its_executors_relay() {
     if common::skip_if_fenced("a_remote_terminal_reads_its_home_through_its_executors_relay") {
@@ -52,12 +53,17 @@ async fn a_remote_terminal_reads_its_home_through_its_executors_relay() {
     )
     .unwrap();
     let (env, read, code) = (probe.join("env"), probe.join("read"), probe.join("code"));
+    let call = if cfg!(unix) {
+        "--unix-socket \"$CAIRN_CALLBACK_SOCKET\" http://localhost/api/mcp"
+    } else {
+        "-H \"Authorization: Bearer $CAIRN_MCP_SECRET\" \"$CAIRN_CALLBACK_URL\""
+    };
     node.start_terminal(
         "probe",
         &format!(
             "printf \"%s\\n%s\\n\" \"$CAIRN_CALLBACK_URL\" \"$CAIRN_MCP_SECRET\" > {env}; \
-             curl -s -o {read} -w \"%{{http_code}}\" -H \"Authorization: Bearer $CAIRN_MCP_SECRET\" \
-             -H \"content-type: application/json\" --data @{body} \"$CAIRN_CALLBACK_URL\" > {code}.part; \
+             curl -s -o {read} -w \"%{{http_code}}\" \
+             -H \"content-type: application/json\" --data @{body} {call} > {code}.part; \
              mv {code}.part {code}",
             env = env.display(),
             read = read.display(),
@@ -76,10 +82,17 @@ async fn a_remote_terminal_reads_its_home_through_its_executors_relay() {
         callback_url.starts_with("http://127.0.0.1:") && callback_url.contains("/resident/"),
         "a remote terminal calls back through its executor's relay: {callback_url}"
     );
-    assert!(
-        !secret.is_empty(),
-        "a remote terminal holds a credential of its own"
-    );
+    if cfg!(unix) {
+        assert!(
+            secret.is_empty(),
+            "a terminal on macOS or Linux holds no callback credential"
+        );
+    } else {
+        assert!(
+            !secret.is_empty(),
+            "a remote terminal holds a credential of its own"
+        );
+    }
     assert_ne!(
         secret,
         node.machines.orch.mcp_auth.get_secret_for_mcp().unwrap(),
@@ -97,10 +110,16 @@ async fn a_remote_terminal_reads_its_home_through_its_executors_relay() {
         "the read resolved the terminal's own home: {answer}"
     );
 
-    // The script has ended, so the terminal exits; its relay goes with it.
+    // The script has ended, so the terminal exits; its relay goes with it,
+    // whatever a caller presents.
+    let presented = if secret.is_empty() {
+        "none"
+    } else {
+        secret.as_str()
+    };
     let mut last = (String::new(), String::new());
     for _ in 0..200 {
-        last = post(&callback_url, &secret, &body);
+        last = post(&callback_url, presented, &body);
         if last.0 == "410" {
             break;
         }

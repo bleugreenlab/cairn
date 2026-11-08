@@ -82,11 +82,18 @@ fn select_callback_url(explicit: Option<String>) -> String {
 }
 
 /// Build a thin server client from the environment for CLI forwarding.
+///
+/// A process named a lineage callback socket calls it, with no credential: it
+/// never reads `CAIRN_MCP_SECRET` or the machine credential on disk.
 pub(crate) fn build_cli_client(callback_url: String) -> CairnMcpServer {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let run_id = env::var("CAIRN_RUN_ID").ok();
+    #[cfg(unix)]
+    if let Some(socket) = crate::http_sink::callback_socket() {
+        return crate::http_sink::fixed_server_on_socket(socket, cwd, run_id);
+    }
     let mcp_secret = cairn_common::auth::callback_token(
         env::var("CAIRN_MCP_SECRET").ok(),
         run_id.as_deref(),
@@ -156,12 +163,25 @@ fn probe_callback(callback_url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ensure the local MCP callback endpoint is reachable.
+/// Ensure the local MCP callback endpoint is reachable: the lineage callback
+/// socket when this process was named one, else the URL.
 pub(crate) async fn ensure_callback_reachable(callback_url: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(socket) = crate::http_sink::callback_socket() {
+        return std::os::unix::net::UnixStream::connect(socket).is_ok();
+    }
     probe_callback(callback_url)
 }
 
 pub(crate) fn print_unreachable_callback(callback_url: &str) {
+    if let Some(socket) = crate::http_sink::callback_socket() {
+        eprintln!(
+            "cairn: nothing answers at the callback socket {} (CAIRN_CALLBACK_SOCKET); the \
+             runner or executor that started this process is not serving it.",
+            socket.display()
+        );
+        return;
+    }
     eprintln!("{}", unreachable_callback_message(callback_url));
 }
 

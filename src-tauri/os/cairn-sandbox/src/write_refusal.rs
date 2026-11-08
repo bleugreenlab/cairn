@@ -223,6 +223,7 @@ mod tests {
             writable_regex: Vec::new(),
             worktree_writable: true,
             socket_resolvable: vec![],
+            callback_socket: None,
             readable_extra: vec![],
             violation_tag: crate::ViolationTag::fresh(),
             reach: Default::default(),

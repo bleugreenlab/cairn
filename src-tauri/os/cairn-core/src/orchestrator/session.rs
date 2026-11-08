@@ -2422,40 +2422,17 @@ pub fn start_agent_session(
 
     // How this run's agent reaches Cairn's MCP server, built per run and passed
     // inline to the backend (never a shared file) so concurrent sessions can't
-    // clobber each other's `CAIRN_HOME_URI`. The stdio shim is the default; the
-    // transitional `agents.mcpTransport: http` setting sends a session to the
-    // streamable-HTTP endpoint. Either way the agent carries a bearer minted for
-    // this run alone and revoked when it finalizes. Ephemeral calls stay on
-    // stdio: Codex pools them in one app-server that serves many runs, which
-    // carries a bearer of its own scoped to that server's calls.
-    let (mcp, mcp_bearer) =
-        match crate::config::settings::load_agent_mcp_transport(&orch.config_dir) {
-            crate::config::settings::AgentMcpTransport::Http if !constrain_output_natively => {
-                let (attachment, bearer) =
-                    crate::mcp::run_bearer::attachment_for_run(orch, run_id, &home_uri)?;
-                (attachment, bearer)
-            }
-            _ => {
-                let cairn_home = cairn_common::paths::cairn_home();
-                let log_level = crate::config::settings::load_log_level(&orch.config_dir);
-                let attachment = crate::config::mcp_setup::stdio_attachment(
-                    &orch.mcp_binary_path,
-                    orch.mcp_callback_port,
-                    Some(home_uri.as_str()),
-                    cairn_common::paths::env_str(),
-                    Some(cairn_home.to_string_lossy().as_ref()),
-                    log_level.as_str(),
-                );
-                let bearer = crate::mcp::run_bearer::bearer_for_attachment(
-                    orch,
-                    &attachment,
-                    run_id,
-                    &home_uri,
-                )?;
-                (attachment, bearer)
-            }
-        };
-    let mcp_bearer = Some(mcp_bearer);
+    // clobber each other's `CAIRN_HOME_URI`. Every locally spawned agent attaches
+    // over stdio through the `cairn-cmd mcp` shim. The run still gets a bearer
+    // minted for it alone and revoked when it finalizes: on macOS and Linux the
+    // shim reaches the runner's lineage socket and carries no credential, but on
+    // Windows it presents that bearer. Codex pools ephemeral calls in one
+    // app-server that serves many runs, which carries a bearer of its own scoped
+    // to that server's calls.
+    let mcp = crate::config::mcp_setup::runner_stdio_attachment(orch, Some(home_uri.as_str()));
+    let mcp_bearer = Some(crate::mcp::run_bearer::bearer_for_attachment(
+        orch, &mcp, run_id, &home_uri,
+    )?);
     log::debug!("start_agent_session: MCP attachment built inline");
     let mut event =
         crate::resume_timing::ResumeTimingEvent::new("mcp_config_ready").elapsed(start_time);

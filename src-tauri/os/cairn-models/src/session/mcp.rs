@@ -11,12 +11,18 @@
 //! - [`McpTransport::Http`]: the CLI speaks streamable HTTP to a URL,
 //!   optionally presenting a bearer it reads from the environment.
 //!
-//! Cairn's own server, `cairn`, is built by [`McpServer::cairn_stdio`] (the
-//! CLI launches `cairn-cmd mcp`, which forwards each call to the runner's
-//! loopback `/api/mcp` callback with the machine secret) or
-//! [`McpServer::cairn_http`] (the CLI reaches the orchestrator's `/mcp`
-//! endpoint with the run's bearer from [`MCP_TOKEN_ENV`]). A host outside
-//! Cairn builds its own servers and need not include `cairn` at all.
+//! Cairn's own server, `cairn`, is built by [`McpServer::cairn_stdio`]: the
+//! CLI launches `cairn-cmd mcp`, which forwards each call to the runner. On
+//! macOS and Linux it calls the runner's lineage socket, named in its `env` by
+//! `CAIRN_CALLBACK_SOCKET`, with no credential: the runner identifies it as a
+//! descendant of the agent process it spawned (`cairn_common::lineage`). On
+//! Windows it posts to the loopback `/api/mcp` with the run's bearer,
+//! inherited from the CLI's environment. Cairn attaches every agent it spawns
+//! this way; its streamable-HTTP `/mcp` endpoint serves remote clients, which
+//! are configured outside this facet.
+//!
+//! A host outside Cairn builds its own servers, over either transport, and
+//! need not include `cairn` at all.
 //!
 //! # Secrets never render inline
 //!
@@ -34,9 +40,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_common::callback_contract::AGENT_MCP_TOOL_TIMEOUT;
 
-/// The environment variable Cairn's HTTP attachment reads its bearer from.
-pub const MCP_TOKEN_ENV: &str = "CAIRN_MCP_TOKEN";
-
 /// The name Cairn's own server is attached under.
 pub const CAIRN_SERVER_NAME: &str = "cairn";
 
@@ -44,8 +47,14 @@ pub const CAIRN_SERVER_NAME: &str = "cairn";
 pub const CAIRN_TOOLS: [&str; 3] = ["read", "run", "write"];
 
 /// What `cairn-cmd` inherits from the agent process rather than receiving in
-/// its server entry: the run identity, and the machine secret, which must never
-/// appear in process arguments or on disk.
+/// its server entry: the run identity. On macOS and Linux nothing more, since
+/// the shim reaches a lineage socket that identifies it by its parent process
+/// and needs no credential. On Windows also the run's bearer, which must never
+/// appear in process arguments or on disk; that it travels in the environment
+/// is a named residual (`docs/identity.md`).
+#[cfg(unix)]
+const CAIRN_STDIO_INHERITED_ENV: [&str; 1] = ["CAIRN_RUN_ID"];
+#[cfg(windows)]
 const CAIRN_STDIO_INHERITED_ENV: [&str; 2] = ["CAIRN_RUN_ID", "CAIRN_MCP_SECRET"];
 
 /// The set of MCP servers a session or a Codex app-server is given.
@@ -73,7 +82,9 @@ pub struct McpServer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTransport {
     /// Streamable HTTP. `bearer_env` names the environment variable the CLI
-    /// reads its bearer from; `None` sends no `Authorization` header.
+    /// reads its bearer from; `None` sends no `Authorization` header. A bearer
+    /// named here sits in the child's launch environment, readable by every
+    /// same-user process, so a host bound by tenet #1381 prefers [`Self::Stdio`].
     Http {
         url: String,
         bearer_env: Option<String>,
@@ -103,19 +114,6 @@ impl McpServer {
                     .iter()
                     .map(|name| name.to_string())
                     .collect(),
-            },
-            required_tools: cairn_tools(),
-        }
-    }
-
-    /// Cairn's server over streamable HTTP, authenticated by the run bearer in
-    /// [`MCP_TOKEN_ENV`].
-    pub fn cairn_http(url: impl Into<String>) -> Self {
-        Self {
-            name: CAIRN_SERVER_NAME.to_string(),
-            transport: McpTransport::Http {
-                url: url.into(),
-                bearer_env: Some(MCP_TOKEN_ENV.to_string()),
             },
             required_tools: cairn_tools(),
         }
@@ -301,11 +299,23 @@ mod tests {
         .unwrap()
     }
 
+    /// The bearer variable an HTTP fixture names. Not one Cairn sets: Cairn
+    /// attaches its own agents over stdio only.
+    const FIXTURE_MCP_TOKEN_ENV: &str = "FIXTURE_MCP_TOKEN";
+
+    fn http_server(url: &str) -> McpServer {
+        McpServer {
+            name: CAIRN_SERVER_NAME.to_string(),
+            transport: McpTransport::Http {
+                url: url.to_string(),
+                bearer_env: Some(FIXTURE_MCP_TOKEN_ENV.to_string()),
+            },
+            required_tools: cairn_tools(),
+        }
+    }
+
     fn http() -> McpServers {
-        McpServers::new(vec![McpServer::cairn_http(
-            "https://orch.tail1234.ts.net/mcp",
-        )])
-        .unwrap()
+        McpServers::new(vec![http_server("https://orch.tail1234.ts.net/mcp")]).unwrap()
     }
 
     /// Parse a `-c key=value` override the way Codex does: the value is TOML.
@@ -343,7 +353,7 @@ mod tests {
             serde_json::json!({"mcpServers": {"cairn": {
                 "type": "http",
                 "url": "https://orch.tail1234.ts.net/mcp",
-                "headers": {"Authorization": "Bearer ${CAIRN_MCP_TOKEN}"}
+                "headers": {"Authorization": "Bearer ${FIXTURE_MCP_TOKEN}"}
             }}})
         );
     }
@@ -366,7 +376,9 @@ mod tests {
             .iter()
             .map(|name| name.as_str().unwrap())
             .collect();
-        assert_eq!(inherited, ["CAIRN_RUN_ID", "CAIRN_MCP_SECRET"]);
+        assert_eq!(inherited, CAIRN_STDIO_INHERITED_ENV);
+        #[cfg(unix)]
+        assert_eq!(inherited, ["CAIRN_RUN_ID"], "no credential on Unix");
         assert!(entry["env"].get("CAIRN_MCP_SECRET").is_none());
         assert_eq!(entry["tool_timeout_sec"].as_integer(), Some(604_800));
     }
@@ -378,7 +390,10 @@ mod tests {
             entry["url"].as_str(),
             Some("https://orch.tail1234.ts.net/mcp")
         );
-        assert_eq!(entry["bearer_token_env_var"].as_str(), Some(MCP_TOKEN_ENV));
+        assert_eq!(
+            entry["bearer_token_env_var"].as_str(),
+            Some(FIXTURE_MCP_TOKEN_ENV)
+        );
         assert!(entry.get("command").is_none());
         assert_eq!(entry["tool_timeout_sec"].as_integer(), Some(604_800));
     }
@@ -395,18 +410,22 @@ mod tests {
             stdio.claude_mcp_config(),
             r#"{"mcpServers":{"cairn":{"args":["mcp"],"command":"/bin/cairn-cmd","env":{"CAIRN_ENV":"dev"},"type":"stdio"}}}"#
         );
+        #[cfg(unix)]
+        let inherited = r#"["CAIRN_RUN_ID"]"#;
+        #[cfg(windows)]
+        let inherited = r#"["CAIRN_RUN_ID", "CAIRN_MCP_SECRET"]"#;
         assert_eq!(
             stdio.codex_config_overrides(),
-            [
-                r#"mcp_servers.cairn={command="/bin/cairn-cmd", args=["mcp"], env={CAIRN_ENV="dev"}, env_vars=["CAIRN_RUN_ID", "CAIRN_MCP_SECRET"], tool_timeout_sec=604800}"#
-            ]
+            [format!(
+                r#"mcp_servers.cairn={{command="/bin/cairn-cmd", args=["mcp"], env={{CAIRN_ENV="dev"}}, env_vars={inherited}, tool_timeout_sec=604800}}"#
+            )]
         );
         assert_eq!(
-            McpServers::new(vec![McpServer::cairn_http("https://o/mcp")])
+            McpServers::new(vec![http_server("https://o/mcp")])
                 .unwrap()
                 .codex_config_overrides(),
             [
-                r#"mcp_servers.cairn={url="https://o/mcp", bearer_token_env_var="CAIRN_MCP_TOKEN", tool_timeout_sec=604800}"#
+                r#"mcp_servers.cairn={url="https://o/mcp", bearer_token_env_var="FIXTURE_MCP_TOKEN", tool_timeout_sec=604800}"#
             ]
         );
     }
@@ -457,7 +476,7 @@ mod tests {
     fn names_are_validated() {
         let named = |name: &str| McpServer {
             name: name.to_string(),
-            ..McpServer::cairn_http("http://x")
+            ..http_server("http://x")
         };
         assert!(McpServers::new(vec![named("ok_name-2")]).is_ok());
         assert!(McpServers::new(Vec::new()).unwrap().is_empty());

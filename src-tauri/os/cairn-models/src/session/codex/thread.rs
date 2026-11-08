@@ -331,8 +331,22 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
+    fn http_server(url: &str) -> McpServer {
+        McpServer {
+            name: crate::session::mcp::CAIRN_SERVER_NAME.to_string(),
+            transport: crate::session::mcp::McpTransport::Http {
+                url: url.to_string(),
+                bearer_env: Some("FIXTURE_MCP_TOKEN".to_string()),
+            },
+            required_tools: crate::session::mcp::CAIRN_TOOLS
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect(),
+        }
+    }
+
     fn cairn() -> McpServers {
-        McpServers::new(vec![McpServer::cairn_http("https://orch.example/mcp")]).unwrap()
+        McpServers::new(vec![http_server("https://orch.example/mcp")]).unwrap()
     }
 
     fn ready_mcp_status() -> serde_json::Value {
@@ -702,12 +716,12 @@ mod tests {
             McpServer {
                 name: "tm".to_string(),
                 required_tools: Vec::new(),
-                ..McpServer::cairn_http("http://x")
+                ..http_server("http://x")
             },
             McpServer {
                 name: "deck".to_string(),
                 required_tools: vec!["get".to_string()],
-                ..McpServer::cairn_http("http://y")
+                ..http_server("http://y")
             },
         ])
         .unwrap();

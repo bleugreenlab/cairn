@@ -301,8 +301,7 @@ impl AgentBackend for CodexBackend {
                 config.run_id
             )
         })?;
-        let (mcp_credential_var, mcp_credential) =
-            crate::mcp::run_bearer::mcp_credential_env(&config.mcp, mcp_bearer)?;
+        let mcp_credential = crate::mcp::run_bearer::mcp_credential_env(&config.mcp, mcp_bearer)?;
 
         let identity = config
             .identity
@@ -339,10 +338,17 @@ impl AgentBackend for CodexBackend {
             ("CAIRN_RUN_ID".to_string(), config.run_id.clone()),
             ("CAIRN_HOME_URI".to_string(), config.home_uri.clone()),
         ]);
-        let secrets = SecretEnv::new().with(mcp_credential_var, mcp_credential);
+        let secrets = match mcp_credential {
+            Some((var, value)) => SecretEnv::new().with(var, value),
+            None => SecretEnv::new(),
+        };
 
         orch.collect_warm_if_needed();
 
+        let root = orch.run_bearers.pending_root(
+            &config.mcp,
+            crate::mcp::run_bearer::BearerScope::Run(config.run_id.clone()),
+        );
         let client = runtime
             .codex
             .start_server(
@@ -367,6 +373,7 @@ impl AgentBackend for CodexBackend {
                 }
                 error.to_string()
             })?;
+        orch.run_bearers.record_root(root, server_pid(&client));
         drop(start_guard);
 
         // The session answers its server from here on, before its thread
@@ -780,16 +787,16 @@ fn codex_response_availability(
 /// could credential it: it reaches Cairn over the stdio shim with a bearer
 /// scoped to that server's own calls.
 fn pooled_mcp_attachment(orch: &Orchestrator) -> cairn_models::session::mcp::McpServer {
-    let cairn_home = cairn_common::paths::cairn_home();
-    let log_level = crate::config::settings::load_log_level(&orch.config_dir);
-    crate::config::mcp_setup::stdio_attachment(
-        &orch.mcp_binary_path,
-        orch.mcp_callback_port,
-        None,
-        cairn_common::paths::env_str(),
-        Some(cairn_home.to_string_lossy().as_ref()),
-        log_level.as_str(),
-    )
+    crate::config::mcp_setup::runner_stdio_attachment(orch, None)
+}
+
+/// The pid of the process behind `client`, for recording its lineage root.
+fn server_pid(client: &cairn_models::codex::app_server::AppServerClient) -> Option<u32> {
+    client
+        .child_handle()
+        .lock()
+        .ok()
+        .and_then(|child| child.as_ref().map(|child| child.id()))
 }
 
 /// The transport that draws Codex's image offer: image worker threads on the
@@ -886,8 +893,8 @@ fn acquire_pooled_server(
                 orch.run_bearers
                     .revoke_pool(server_id, "closed (pooled Codex server failed to start)")
             };
-            let (mcp_credential_var, mcp_credential) =
-                crate::mcp::run_bearer::mcp_credential_env(&mcp, &bearer).inspect_err(|_| {
+            let mcp_credential = crate::mcp::run_bearer::mcp_credential_env(&mcp, &bearer)
+                .inspect_err(|_| {
                     revoke();
                 })?;
             // `CAIRN_RUN_ID` is a sentinel, not a run: every pooled tool call is
@@ -900,13 +907,22 @@ fn acquire_pooled_server(
                     crate::mcp::run_bearer::POOLED_CODEX_RUN_SENTINEL.to_string(),
                 ),
             ]);
-            let secrets = SecretEnv::new().with(mcp_credential_var, mcp_credential);
+            let secrets = match mcp_credential {
+                Some((var, value)) => SecretEnv::new().with(var, value),
+                None => SecretEnv::new(),
+            };
             // The process's own residence only; each thread passes its cwd.
             let residence = cairn_common::scratch::scratch_root();
             std::fs::create_dir_all(&residence).map_err(|error| {
                 revoke();
                 format!("Failed to prepare {}: {error}", residence.display())
             })?;
+            // The one root that speaks for several runs: each call it makes
+            // must name a thread that is a live call on this server.
+            let root = orch.run_bearers.pending_root(
+                &mcp,
+                crate::mcp::run_bearer::BearerScope::CodexPool(server_id.to_string()),
+            );
             let client = runtime
                 .codex
                 .start_server(
@@ -923,6 +939,7 @@ fn acquire_pooled_server(
                 .inspect_err(|_| {
                     revoke();
                 })?;
+            orch.run_bearers.record_root(root, server_pid(&client));
             Ok((client, super::pool::pool_host(orch, oauth_state)))
         })
         .map_err(|error| format!("Failed to start Codex app-server pool: {error}"))?;

@@ -813,27 +813,24 @@ pub(crate) fn runner_callback_url(orch: &Orchestrator) -> String {
     format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port)
 }
 
-/// The one decision every resident launch makes about its callback, from the
-/// executor it is placed on.
+/// The one decision a project service's launch makes about its callback, from
+/// the executor it is placed on.
 ///
-/// Only this runner's own colocated executor, or no placement at all (an
-/// unrouted job home, which `Fleet::job_home_executor` answers with the
-/// colocated machine), calls back directly. A placed machine this runner is not
-/// connected to at this instant is relayed: it may reattach before the start
-/// goes out, and answering it as colocated would ship the machine secret to a
-/// remote. A colocated executor serves the relay too, so the cost of guessing
-/// wrong this way is a relay where the loopback would have done.
+/// Every placed service is relayed, this runner's own colocated executor
+/// included, as terminals, REPLs and workflows are. The executor holds the
+/// service's bearer and attaches it to what the service sends on its lineage
+/// callback socket, so on macOS and Linux no bearer sits in the service's
+/// launch environment. A service with no placement is answered `Direct`, and a
+/// leased start refuses it as unplaced rather than launch it with its bearer.
 pub(crate) fn resident_callback(
     orch: &Orchestrator,
     placed_executor: Option<&str>,
 ) -> ResidentCallback {
     match placed_executor {
-        Some(executor_id) if orch.fleet.executor_is_colocated(executor_id) != Some(true) => {
-            ResidentCallback::Relayed {
-                executor_id: executor_id.to_string(),
-            }
-        }
-        _ => ResidentCallback::Direct {
+        Some(executor_id) => ResidentCallback::Relayed {
+            executor_id: executor_id.to_string(),
+        },
+        None => ResidentCallback::Direct {
             url: runner_callback_url(orch),
         },
     }

@@ -990,6 +990,13 @@ pub(crate) mod tests {
                         ExecutorMessage::ResidentProcessEvent { event },
                     );
                 })
+            })
+            // Every placed service is started relayed, and an executor that
+            // serves no relay refuses it, as the executor binary always serves
+            // one. Nothing here calls back, so the address reaches nothing.
+            .with_resident_relay(|_identity| cairn_exec::ResidentRelayLease {
+                callback_url: "http://127.0.0.1:9/resident/test/api/mcp".into(),
+                registration: Box::new(()),
             });
         let pool = ExecutorPool::new(runtime);
         let (sender, mut receiver) = mpsc::unbounded_channel();

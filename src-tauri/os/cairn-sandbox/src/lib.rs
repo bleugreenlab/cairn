@@ -155,6 +155,12 @@ pub struct SandboxPolicy {
     /// [`allow_job_sockets_in`](Self::allow_job_sockets_in)). Enforced by
     /// Linux landlock from ABI 9; macOS does not yet scope sockets.
     pub socket_resolvable: Vec<PathBuf>,
+    /// The executor's lineage callback socket, which every fence may reach,
+    /// whatever its network scope: a fenced command calls Cairn there with no
+    /// credential, so the socket is its one door to Cairn. On macOS a
+    /// relay-only profile allows exactly this path; on Linux its directory
+    /// joins the socket-resolvable set (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`).
+    pub callback_socket: Option<PathBuf>,
     /// The marker this spawn's denials carry into the macOS violation log.
     pub violation_tag: ViolationTag,
     /// How far reads and the network reach. Broad and ambient for every fence
@@ -382,6 +388,7 @@ impl SandboxPolicy {
             writable_regex: Vec::new(),
             worktree_writable: true,
             socket_resolvable: Vec::new(),
+            callback_socket: None,
             readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: Default::default(),
@@ -427,6 +434,7 @@ impl SandboxPolicy {
             writable_regex: Vec::new(),
             worktree_writable: false,
             socket_resolvable: Vec::new(),
+            callback_socket: None,
             readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: Default::default(),
@@ -465,6 +473,7 @@ impl SandboxPolicy {
             // a daemon's own control socket lives there.
             worktree_writable: true,
             socket_resolvable: Vec::new(),
+            callback_socket: None,
             readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: Default::default(),
@@ -501,6 +510,7 @@ impl SandboxPolicy {
             writable_regex: Vec::new(),
             worktree_writable: true,
             socket_resolvable: Vec::new(),
+            callback_socket: None,
             readable_extra: Vec::new(),
             violation_tag: ViolationTag::fresh(),
             reach: PolicyReach {
@@ -620,6 +630,13 @@ impl SandboxPolicy {
         }
         paths.extend(self.socket_resolvable.iter().cloned());
         paths.retain(|path| !is_shared_socket_root(path));
+        // Its directory holds nothing but Cairn's own sockets, so granting it
+        // reaches the callback socket and no one else's server.
+        if let Some(dir) = self.callback_socket.as_deref().and_then(Path::parent) {
+            if !paths.iter().any(|path| path == dir) {
+                paths.push(dir.to_path_buf());
+            }
+        }
         paths
     }
 

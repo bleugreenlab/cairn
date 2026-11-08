@@ -477,7 +477,17 @@ mod tests {
             output_schema: None,
             cwd: "/tmp/worktree".to_string(),
             env: std::collections::BTreeMap::new(),
-            mcp: Some(McpServers::new(vec![McpServer::cairn_http("http://o/mcp")]).unwrap()),
+            mcp: Some(
+                McpServers::new(vec![McpServer {
+                    name: "cairn".to_string(),
+                    transport: crate::session::mcp::McpTransport::Http {
+                        url: "http://o/mcp".to_string(),
+                        bearer_env: Some("FIXTURE_MCP_TOKEN".to_string()),
+                    },
+                    required_tools: Vec::new(),
+                }])
+                .unwrap(),
+            ),
             secrets: SecretEnv::new().with("CLAUDE_CONFIG_DIR", "/cairn/claude-home"),
             account_id: None,
             provider: ProviderSpec::Claude(ClaudeSpec {

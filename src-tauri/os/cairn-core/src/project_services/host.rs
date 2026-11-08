@@ -258,7 +258,17 @@ impl ServiceHost for LeaseHost {
                 crate::fleet::residency::ResidentCallback::Relayed { executor_id } => {
                     Some(executor_id)
                 }
-                crate::fleet::residency::ResidentCallback::Direct { .. } => None,
+                // A service reaches Cairn only through its executor's relay,
+                // which keeps its bearer out of its launch environment. With
+                // no route there is no relay to name, and the start would
+                // carry the bearer in its environment to whichever machine
+                // took it, so it waits for a route instead.
+                crate::fleet::residency::ResidentCallback::Direct { .. } => {
+                    return Err(LaunchError::Unplaced(
+                        "no executor routes this service's residency, so it has no callback relay"
+                            .into(),
+                    ));
+                }
             },
         };
         if let Some(executor_id) = relayed {
