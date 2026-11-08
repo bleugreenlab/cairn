@@ -3083,7 +3083,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node batches", &params) {
                 error
             } else {
-                read_node_batches(db, &project, number, exec_seq, &node_id, None, None).await
+                read_node_batches(orch, db, &project, number, exec_seq, &node_id, None, None).await
             }
         }
         CairnResource::NodeBatch {
@@ -3097,6 +3097,7 @@ async fn render_resource_body(
                 error
             } else {
                 read_node_batches(
+                    orch,
                     db,
                     &project,
                     number,
@@ -3119,6 +3120,7 @@ async fn render_resource_body(
                 error
             } else {
                 read_node_batches(
+                    orch,
                     db,
                     &project,
                     number,
@@ -3142,6 +3144,7 @@ async fn render_resource_body(
                 error
             } else {
                 read_node_batches(
+                    orch,
                     db,
                     &project,
                     number,

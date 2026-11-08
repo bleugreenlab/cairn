@@ -431,6 +431,16 @@ impl EntryDecline {
     }
 }
 
+/// Where a request no machine has claimed stands: since when it has waited,
+/// the machine it is offered to now, and each machine's last refusal of it,
+/// oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnclaimedWait {
+    pub(crate) queued_at_unix_ms: u64,
+    pub(crate) offered_to: Option<String>,
+    pub(crate) declines: Vec<(String, EntryDecline)>,
+}
+
 /// The request at the front of a machine's line for a provisioning hold, as a
 /// placement rejection names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1600,6 +1610,31 @@ impl ExecutionQueue {
             .collect()
     }
 
+    /// What the live attempt of a request id is waiting on while no machine
+    /// has claimed it. `None` once a machine has claimed it, and when the
+    /// queue does not hold it at all.
+    pub(crate) fn unclaimed_wait(&self, request_id: &str) -> Option<UnclaimedWait> {
+        let state = self.entries.lock().unwrap();
+        let entry = state
+            .entries
+            .values()
+            .find(|entry| entry.request.request_id == request_id)?;
+        if matches!(entry.state, EntryState::Claimed { .. }) {
+            return None;
+        }
+        let mut declines: Vec<(String, EntryDecline)> = entry
+            .declined
+            .iter()
+            .map(|(executor_id, decline)| (executor_id.clone(), decline.clone()))
+            .collect();
+        declines.sort_by_key(|(_, decline)| decline.at_unix_ms);
+        Some(UnclaimedWait {
+            queued_at_unix_ms: entry.queued_at_unix_ms,
+            offered_to: entry.state.executor_id().map(str::to_string),
+            declines,
+        })
+    }
+
     /// The live attempt of a request id, and where it is bound.
     ///
     /// A request id addresses at most one live attempt, which is what lets a
@@ -1942,6 +1977,86 @@ impl super::Fleet {
                 .claim(&entry_id, super::COLOCATED_EXECUTOR_ID, generation, now),
             ClaimVerdict::Granted
         );
+        receiver
+    }
+
+    /// Put one command batch in the queue as a request the colocated machine
+    /// refused for its project's provisioning hold, `holder` having taken it:
+    /// queued, claimed by nobody.
+    pub fn decline_for_provisioning_for_test(
+        &self,
+        request_id: &str,
+        holder: &str,
+        generation: u64,
+    ) -> tokio::sync::oneshot::Receiver<super::CellOutcome> {
+        let now = super::unix_time_ms();
+        let (entry_id, receiver) = self
+            .queue
+            .enqueue(
+                NewEntry {
+                    request: super::CellRequest {
+                        request_id: request_id.into(),
+                        attempt_id: format!("{request_id}-attempt"),
+                        project_id: "p".into(),
+                        repository: super::RepositoryLocator::ColocatedPath {
+                            project_id: "p".into(),
+                            repository_id: "p".into(),
+                            absolute_path: "/repo".into(),
+                        },
+                        base_commit: "base".into(),
+                        command: "bun run codex:pin status".into(),
+                        command_class: super::CellCommandClass::Other,
+                        placement_work_class: super::PlacementWorkClass::AgentSessions,
+                        owner: None,
+                        cwd: String::new(),
+                        env: Vec::new(),
+                        priority: super::CellPriority::AgentInteractive,
+                        wait_horizon_unix_ms: now + 60_000,
+                        waiting_since_unix_ms: 0,
+                        timeout_ms: 60_000,
+                        mutation_policy: super::MutationPolicy::PureVerdict,
+                        requesting_job_id: None,
+                        affinity_key: None,
+                        executor: None,
+                        pinned_executor_id: None,
+                        placement_mobility: Default::default(),
+                        verdict_platforms: Vec::new(),
+                        avoided_executor_ids: Vec::new(),
+                        project_requirements: Default::default(),
+                        command_resource_identity: None,
+                        resource_reservation: Default::default(),
+                        learned_estimate: None,
+                        scratch_sync: None,
+                        home_affinity: None,
+                    },
+                    admission_kind: super::CellAdmissionKind::Command,
+                    interactive: true,
+                    execution_residency: None,
+                    standing: false,
+                },
+                now,
+            )
+            .expect("a fresh request identity enqueues");
+        assert!(self.queue.offer(
+            &entry_id,
+            super::COLOCATED_EXECUTOR_ID,
+            super::COLOCATED_EXECUTOR_ID,
+            generation,
+            now
+        ));
+        let recorded = self.queue.decline(
+            &entry_id,
+            super::COLOCATED_EXECUTOR_ID,
+            generation,
+            super::DeclineReason::ProjectProvisioning,
+            Some(format!(
+                "project p is provisioning for request {holder}; a project provisions one cell at a time"
+            )),
+            None,
+            None,
+            now,
+        );
+        assert!(matches!(recorded, DeclineRecord::Recorded { .. }));
         receiver
     }
 }

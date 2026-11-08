@@ -2734,14 +2734,6 @@ impl Fleet {
             .reattach(executor_id, generation, relays);
     }
 
-    /// Whether `executor_id` is this runner's own colocated executor, as its
-    /// live connection says. `None` when it is not connected.
-    pub(crate) fn executor_is_colocated(&self, executor_id: &str) -> Option<bool> {
-        self.lock_connections()
-            .get(executor_id)
-            .map(|connection| connection.colocated)
-    }
-
     pub fn revoke_mcp_relay_contexts_for_executor(
         &self,
         executor_id: &str,
@@ -15122,6 +15114,39 @@ impl Fleet {
 
     /// The machine that has claimed the live attempt of `request_id`, if one
     /// has. An attempt only offered to a machine names none.
+    /// What a request no machine has claimed is waiting on, as one phrase:
+    /// since when, the machine it is offered to, and what each machine that
+    /// refused it said, in that machine's words. `None` once a machine has
+    /// claimed it, and when the queue does not hold it.
+    pub(crate) fn unplaced_wait(&self, request_id: &str) -> Option<String> {
+        let wait = self.queue.unclaimed_wait(request_id)?;
+        let since = chrono::DateTime::from_timestamp_millis(wait.queued_at_unix_ms as i64)
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| "an unknown time".to_string());
+        let waited = unix_time_ms().saturating_sub(wait.queued_at_unix_ms) / 1000;
+        let mut phrase = format!("waiting to be placed since {since} ({waited}s)");
+        if let Some(executor_id) = wait.offered_to.as_deref() {
+            phrase.push_str(&format!(
+                ", offered to `{}`, which has not answered",
+                self.executor_name_for_text(executor_id)
+            ));
+        }
+        if wait.declines.is_empty() && wait.offered_to.is_none() {
+            phrase.push_str(", and no machine has refused it yet");
+        }
+        for (executor_id, decline) in &wait.declines {
+            phrase.push_str(&format!(
+                "; `{}` declined it ({:?})",
+                self.executor_name_for_text(executor_id),
+                decline.reason
+            ));
+            if let Some(detail) = decline.detail.as_deref() {
+                phrase.push_str(&format!(": {detail}"));
+            }
+        }
+        Some(phrase)
+    }
+
     pub(crate) fn claimed_executor_of(&self, request_id: &str) -> Option<String> {
         let (attempt_id, _, _) = self.queue.attempt_binding_of(request_id)?;
         self.queue

@@ -212,6 +212,76 @@ pub(crate) fn has_live_resolver(request_id: &str) -> bool {
         .contains(request_id)
 }
 
+/// Where an unsettled batch actually stands. A parked row says it itself
+/// (`waiting_on`); for a running one the row says only that nothing has
+/// settled it, so this asks the fleet's queue whether a machine has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LiveState {
+    /// Not yet handed to the fleet; `waiting` is what it waits for.
+    Parked { waiting: String },
+    /// A machine claimed its attempt and may be running it.
+    Placed { on: String },
+    /// In the placement queue, and no machine has claimed it.
+    Unplaced { wait: String },
+    /// Its task is alive here but no machine holds it right now: it is
+    /// between placement attempts, or is publishing its result.
+    InRunner,
+    /// Nothing in this runner holds it; a batch an earlier runner placed is
+    /// settled from its machine's report or from evidence it cannot report.
+    Untracked,
+}
+
+impl LiveState {
+    /// The state as a running row's `State:` line and the batch list state it.
+    fn headline(&self) -> String {
+        match self {
+            Self::Parked { waiting } => format!("parked, {waiting}"),
+            Self::Placed { on } => format!("running on `{on}`"),
+            Self::Unplaced { .. } => "queued, not yet placed on any machine".to_string(),
+            Self::InRunner => "in this runner, held by no machine right now".to_string(),
+            Self::Untracked => "running".to_string(),
+        }
+    }
+
+    /// One sentence for a reader deciding whether to wait.
+    fn sentence(&self) -> String {
+        match self {
+            Self::Parked { waiting } => format!("it has not started: it is {waiting}, and it holds no branch until a machine has it"),
+            Self::Placed { on } => format!("it is running on `{on}`"),
+            Self::Unplaced { wait } => format!("no machine has taken it: it is {wait}"),
+            Self::InRunner => "it is between placement attempts or publishing its result; no machine holds it right now".to_string(),
+            Self::Untracked => "this runner holds no task for it, so it settles from its machine's own report or from evidence that it cannot report".to_string(),
+        }
+    }
+}
+
+/// Where an unsettled detached batch stands now: its own row for a parked
+/// one, and the fleet's queue and this runner's task registry for a running
+/// one.
+pub(crate) fn live_state(orch: &Orchestrator, batch: &DetachedBatch) -> LiveState {
+    let request_id = batch.request_id.as_str();
+    if batch.state == DetachedState::Parked {
+        return LiveState::Parked {
+            waiting: batch
+                .waiting_on
+                .clone()
+                .unwrap_or_else(|| "waiting to be placed".to_string()),
+        };
+    }
+    if let Some(executor_id) = orch.fleet.claimed_executor_of(request_id) {
+        return LiveState::Placed {
+            on: orch.fleet.executor_name_for_text(&executor_id),
+        };
+    }
+    if let Some(wait) = orch.fleet.unplaced_wait(request_id) {
+        return LiveState::Unplaced { wait };
+    }
+    if batch_is_live(orch, request_id) {
+        return LiveState::InRunner;
+    }
+    LiveState::Untracked
+}
+
 /// The caller-home-relative handle, resolved beneath the owning node or task.
 pub(crate) fn handle_uri(request_id: &str) -> String {
     format!("cairn:~/batches/{request_id}")
@@ -233,18 +303,12 @@ pub(crate) fn detach_answer_parked_text(request_id: &str, reason: &str, waiting:
     )
 }
 
-/// What a reissue of a batch that is still parked detached is told.
-pub(crate) fn reissue_refusal_parked_text(request_id: &str, waiting: &str) -> String {
+/// What a reissue of a batch still unsettled detached is told: which request
+/// it is, where that request stands now, and how to wait on it.
+pub(crate) fn reissue_refusal_text(request_id: &str, live: &LiveState) -> String {
     format!(
-        "This batch is already queued, detached from the call that issued it: it is {waiting}. Its result reaches this job as a notice when it settles, and `{}` shows it now. Nothing new was started.",
-        handle_uri(request_id)
-    )
-}
-
-/// What a reissue of a batch that is still running detached is told.
-pub(crate) fn reissue_refusal_text(request_id: &str) -> String {
-    format!(
-        "This batch is already running, detached from the call that started it; its result reaches this job as a notice when it settles, and `{}` shows it now. Nothing new was started.",
+        "This batch is already in flight as request `{request_id}`, detached from the call that issued it: {}. Nothing new was started. Wait on that request instead of re-running it: its result reaches this job as a notice when it settles, and `{}` shows where it stands now.",
+        live.sentence(),
         handle_uri(request_id)
     )
 }
@@ -282,12 +346,16 @@ pub(crate) fn notice_sentence(batch: &DetachedBatch) -> String {
 }
 
 /// The handle's read: state, verdict, label, what it committed, and its output.
-pub(crate) fn render(batch: &DetachedBatch) -> String {
+/// `live` is where a running batch stands now; other states ignore it.
+pub(crate) fn render(batch: &DetachedBatch, live: &LiveState) -> String {
+    let state = match batch.state {
+        DetachedState::Running => live.headline(),
+        other => other.as_str().to_string(),
+    };
     let mut out = format!(
-        "# Run batch `{}`\n\nLabel: {}\nState: {}\n",
+        "# Run batch `{}`\n\nLabel: {}\nState: {state}\n",
         batch.request_id,
         label_of(batch),
-        batch.state.as_str()
     );
     out.push_str(&format!("Detached because: {}\n", batch.reason));
     match batch.state {
@@ -301,6 +369,7 @@ pub(crate) fn render(batch: &DetachedBatch) -> String {
             );
         }
         DetachedState::Running => {
+            out.push_str(&format!("Now: {}.\n", live.sentence()));
             out.push_str(if batch.commits {
                 "Commits: not yet; it carries a commit_msg, so it may commit when it settles.\n"
             } else {
@@ -340,7 +409,7 @@ pub(crate) fn render(batch: &DetachedBatch) -> String {
 }
 
 /// One line for the node's batch list.
-pub(crate) fn summary_line(batch: &DetachedBatch, home: &str) -> String {
+pub(crate) fn summary_line(batch: &DetachedBatch, home: &str, live: &LiveState) -> String {
     let state = match batch.state {
         DetachedState::Parked => format!(
             "parked, {}",
@@ -349,7 +418,7 @@ pub(crate) fn summary_line(batch: &DetachedBatch, home: &str) -> String {
                 .as_deref()
                 .unwrap_or("waiting to be placed")
         ),
-        DetachedState::Running => "running".to_string(),
+        DetachedState::Running => live.headline(),
         DetachedState::Settled => format!(
             "{}, {}",
             batch.verdict.as_deref().unwrap_or("finished"),
@@ -1068,17 +1137,61 @@ mod tests {
 
     #[test]
     fn a_commitless_batch_says_it_cannot_have_committed() {
-        let running = render(&batch(DetachedState::Running, false, None));
+        let running = render(
+            &batch(DetachedState::Running, false, None),
+            &LiveState::Untracked,
+        );
         assert!(
             running.contains("it has no commit_msg, so it cannot commit"),
             "{running}"
         );
-        let settled = render(&batch(DetachedState::Settled, true, Some("abcdef1234567")));
+        let settled = render(
+            &batch(DetachedState::Settled, true, Some("abcdef1234567")),
+            &LiveState::Untracked,
+        );
         assert!(
             settled.contains("Commits: commit abcdef123456"),
             "{settled}"
         );
         assert!(settled.contains("## Output\n\nok"), "{settled}");
+    }
+
+    /// A running row no machine has taken reads queued with what it waits on,
+    /// never `running`; a parked one reads its own wait; and the reissue
+    /// refusal names the request, that wait, and the handle to wait on.
+    #[test]
+    fn an_unsettled_row_reads_where_its_request_stands() {
+        let queued = LiveState::Unplaced {
+            wait: "waiting to be placed since 2026-11-07T03:46:44Z (360s); `local` declined it (ProjectProvisioning): project p is provisioning for request holder".into(),
+        };
+        let row = running("req-1");
+        let read = render(&row, &queued);
+        assert!(
+            read.contains("State: queued, not yet placed on any machine"),
+            "{read}"
+        );
+        assert!(!read.contains("State: running"), "{read}");
+        assert!(read.contains("provisioning for request holder"), "{read}");
+        assert!(summary_line(&row, "cairn://p/x/1/1/builder", &queued)
+            .ends_with("queued, not yet placed on any machine"));
+        let refusal = reissue_refusal_text("req-1", &queued);
+        assert!(refusal.contains("request `req-1`"), "{refusal}");
+        assert!(refusal.contains("ProjectProvisioning"), "{refusal}");
+        assert!(refusal.contains("cairn:~/batches/req-1"), "{refusal}");
+        assert!(render(
+            &row,
+            &LiveState::Placed {
+                on: "bgsrv-ub".into()
+            }
+        )
+        .contains("State: running on `bgsrv-ub`"));
+        let parked = LiveState::Parked {
+            waiting: "waiting for the job's residency on bgsrv-mac: running `batch-1`".into(),
+        };
+        let refusal = reissue_refusal_text("req-2", &parked);
+        assert!(refusal.contains("request `req-2`"), "{refusal}");
+        assert!(refusal.contains("running `batch-1`"), "{refusal}");
+        assert!(refusal.contains("holds no branch"), "{refusal}");
     }
 
     #[test]

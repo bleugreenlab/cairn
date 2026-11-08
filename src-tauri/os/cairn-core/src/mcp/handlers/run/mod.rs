@@ -4522,6 +4522,11 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     }
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     let (task_orch, task_request, task_control) = (orch.clone(), request.clone(), control.clone());
+    log::info!(
+        "run batch {} starts for run {}",
+        control.request_id,
+        request.run_id.as_deref().unwrap_or("(none)")
+    );
     let live = detached::LiveBatch::claim(&control.request_id);
     // Registered before anything is placed, so no result of this batch is
     // acknowledged before its answer has reached where it was going.
@@ -7083,6 +7088,9 @@ async fn place_and_run_attempts(
         let above_ceiling = executed.above_ceiling;
         let pace = executed.pace;
         let claimed = executed.account.placement;
+        if claimed.is_some() {
+            control.note_claimed();
+        }
         let outcome = executed.outcome;
         if residence == BatchResidence::Home && cannot_hold.is_none() {
             if let Some(learned) = CannotHold::from_outcome(&outcome) {
@@ -7372,6 +7380,11 @@ struct BatchControl {
     /// can settle it; `None` for a host batch, which cannot outlive one.
     persisted: std::sync::Mutex<Option<PersistedSettlement>>,
     stage: std::sync::Mutex<PlacementStage>,
+    /// A machine claimed one of the batch's attempts, so it may have run.
+    ever_claimed: std::sync::atomic::AtomicBool,
+    /// What it was waiting on when it was stopped, taken before the fleet
+    /// withdraws its request, because the withdrawal forgets the declines.
+    stopped_unplaced: std::sync::Mutex<Option<String>>,
 }
 
 impl BatchControl {
@@ -7399,11 +7412,66 @@ impl BatchControl {
                 in_home: true,
                 row: None,
             }),
+            ever_claimed: std::sync::atomic::AtomicBool::new(false),
+            stopped_unplaced: std::sync::Mutex::new(None),
         })
     }
 
     fn stage(&self) -> std::sync::MutexGuard<'_, PlacementStage> {
         self.stage.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn note_claimed(&self) {
+        self.ever_claimed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Record, once, where the batch stood when it was stopped: claimed by a
+    /// machine, or the wait it had not got past (the fleet queue's account of
+    /// an admitted request, or the stage's own of one not yet admitted).
+    fn note_stopped(&self, fleet: &crate::fleet::Fleet) {
+        if fleet.claimed_executor_of(&self.request_id).is_some() {
+            self.note_claimed();
+            return;
+        }
+        let wait = fleet
+            .unplaced_wait(&self.request_id)
+            .or_else(|| self.unplaced())
+            .unwrap_or_else(|| "not yet in the placement queue".to_string());
+        let mut stopped = self
+            .stopped_unplaced
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if stopped.is_none() {
+            *stopped = Some(wait);
+        }
+    }
+
+    /// What the batch was waiting on when it was stopped, when no machine had
+    /// ever claimed it: evidence that none of its commands ran.
+    fn never_placed(&self) -> Option<String> {
+        if self.ever_claimed.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        self.stopped_unplaced
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The verdict and output a detached batch's row settles with. A batch
+    /// stopped before any machine claimed it settles as never placed, naming
+    /// what it waited on, rather than as an unexplained cancellation.
+    fn detached_settlement(&self, text: &str) -> (String, String) {
+        if text.starts_with(RUN_CANCELLED) {
+            if let Some(wait) = self.never_placed() {
+                return (
+                    format!("it was never placed ({wait})"),
+                    format!("{text}\n\nNo machine ever claimed this batch, so none of its commands ran and it committed nothing. When it was stopped it was {wait}."),
+                );
+            }
+        }
+        (self.verdict_for(text), text.to_string())
     }
 
     /// The batch starts toward a machine, waiting for `waiting`, in the job's
@@ -7626,6 +7694,7 @@ impl BatchControl {
     /// batch stopped by its ceiling reports through the ordinary
     /// cancelled-outcome tail.
     fn stop(&self, orch: &Orchestrator) {
+        self.note_stopped(&orch.fleet);
         self.stop_placement
             .store(true, std::sync::atomic::Ordering::SeqCst);
         orch.cancel_cell_request(&self.request_id);
@@ -7718,12 +7787,10 @@ async fn reissue_refusal(orch: &Orchestrator, request: &McpCallbackRequest) -> O
             ctx.run_id,
             twin.request_id
         );
-        return Some(match (twin.state, twin.waiting_on.as_deref()) {
-            (detached::DetachedState::Parked, Some(waiting)) => {
-                detached::reissue_refusal_parked_text(&twin.request_id, waiting)
-            }
-            _ => detached::reissue_refusal_text(&twin.request_id),
-        });
+        return Some(detached::reissue_refusal_text(
+            &twin.request_id,
+            &detached::live_state(orch, &twin),
+        ));
     }
     let turn_id =
         crate::mcp::handlers::durable_suspend::suspending_turn_id(orch, &db, &ctx.run_id).await?;
@@ -8020,14 +8087,8 @@ fn spawn_parked_resolver(
         // A wait abandoned while its batch ran became a detached batch, and
         // its result reaches the job as a notice instead. Settling is a no-op
         // for a wait that resolved normally: no detached row exists for it.
-        detached::settle_and_deliver(
-            &orch,
-            &db,
-            &control.request_id,
-            &control.verdict_for(&answer.resume_text),
-            &answer.resume_text,
-        )
-        .await;
+        let (verdict, output) = control.detached_settlement(&answer.resume_text);
+        detached::settle_and_deliver(&orch, &db, &control.request_id, &verdict, &output).await;
     });
 }
 
@@ -8104,14 +8165,9 @@ fn spawn_detached_resolver(
     tokio::spawn(async move {
         let _live = live;
         let answer = rx.await.unwrap_or_else(|_| BatchAnswer::task_failed());
-        detached::settle_and_deliver(
-            &orch,
-            &record.db,
-            &control.request_id,
-            &control.verdict_for(&answer.resume_text),
-            &answer.resume_text,
-        )
-        .await;
+        let (verdict, output) = control.detached_settlement(&answer.resume_text);
+        detached::settle_and_deliver(&orch, &record.db, &control.request_id, &verdict, &output)
+            .await;
     });
 }
 
@@ -12977,7 +13033,7 @@ pub(crate) mod host_batch_tests {
             .await
             .unwrap()
             .unwrap();
-        let rendered = detached::render(&batch);
+        let rendered = detached::render(&batch, &detached::live_state(&orch, &batch));
         assert!(rendered.contains("State: parked"), "{rendered}");
         assert!(rendered.contains("running `batch-1`"), "{rendered}");
 
@@ -13118,7 +13174,7 @@ pub(crate) mod host_batch_tests {
         let refusal = reissue_refusal(&orch, &call_request(payload.clone())).await;
         assert_eq!(
             refusal.as_deref(),
-            Some(detached::reissue_refusal_text("req-d").as_str())
+            Some(detached::reissue_refusal_text("req-d", &detached::LiveState::Untracked).as_str())
         );
         assert!(refusal.unwrap().contains("cairn:~/batches/req-d"));
         let different = call_request(json!({"commands": [{"command": "cargo check"}]}));
@@ -13132,6 +13188,164 @@ pub(crate) mod host_batch_tests {
             .await
             .unwrap();
         assert_eq!(reissue_refusal(&orch, &call_request(payload)).await, None);
+    }
+
+    fn pin_status_payload() -> serde_json::Value {
+        json!({"commands": [{"command": "bun run codex:pin status", "timeout": 90_000}]})
+    }
+
+    /// The cairn/6349 specimen's start: a call whose transport closes before
+    /// it answers, for a batch the fleet already has. Dropping the call's
+    /// future detaches it, `running` with nothing yet settling it.
+    async fn a_call_whose_transport_closed(
+        orch: &Orchestrator,
+    ) -> (
+        std::sync::Arc<BatchControl>,
+        tokio::sync::oneshot::Sender<BatchAnswer>,
+    ) {
+        let request = call_request(pin_status_payload());
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(5_000),
+            ms(9_000),
+            ms(10_000),
+            None,
+        );
+        let control = BatchControl::new(false);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let call = tokio::spawn({
+            let (orch, control) = (orch.clone(), control.clone());
+            async move { answer_call(&orch, &request, deadlines, control, rx).await }
+        });
+        tokio::time::sleep(ms(200)).await;
+        call.abort();
+        let _ = call.await;
+        eventually(Duration::from_secs(5), || async {
+            (detached_state(orch, &control.request_id).await.as_deref() == Some("running"))
+                .then_some(())
+        })
+        .await
+        .expect("the batch of a call whose transport closed is recorded as detached");
+        let reason = orch
+            .db
+            .local
+            .query_text(
+                "SELECT reason FROM run_batch_detached WHERE request_id=?1",
+                (control.request_id.clone(),),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some(TRANSPORT_CLOSED));
+        (control, tx)
+    }
+
+    async fn settled_verdict_and_output(orch: &Orchestrator, request_id: &str) -> (String, String) {
+        eventually(Duration::from_secs(10), || async {
+            (detached_state(orch, request_id).await.as_deref() == Some("settled")).then_some(())
+        })
+        .await
+        .expect("the detached batch settles");
+        orch.db
+            .local
+            .query_one(
+                "SELECT verdict, output FROM run_batch_detached WHERE request_id=?1",
+                (request_id.to_string(),),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// (a) The batch lived on after its call: its own result settles the row
+    /// with its own verdict.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transport_closed_batch_settles_with_its_own_verdict_when_its_result_arrives() {
+        let orch = env().await;
+        let (control, tx) = a_call_whose_transport_closed(&orch).await;
+        control.set_verdict("succeeded".to_string());
+        let _ = tx.send(batch_answer("codex pin is current"));
+        let (verdict, output) = settled_verdict_and_output(&orch, &control.request_id).await;
+        assert_eq!(verdict, "succeeded");
+        assert!(output.contains("codex pin is current"), "{output}");
+    }
+
+    /// (b) The specimen: admitted, the batch sits in the queue under its
+    /// project's provisioning hold; a reissue is told which request to wait
+    /// on and what holds it; and when the run ends before any machine claims
+    /// it the row settles never placed, naming the hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transport_closed_batch_stopped_while_queued_settles_never_placed_naming_its_hold() {
+        let orch = env().await;
+        let (control, tx) = a_call_whose_transport_closed(&orch).await;
+        let _queued =
+            orch.fleet
+                .decline_for_provisioning_for_test(&control.request_id, "holder-request", 1);
+        let row = detached::load(&orch.db.local, &control.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            detached::live_state(&orch, &row),
+            detached::LiveState::Unplaced { .. }
+        ));
+        let refusal = reissue_refusal(&orch, &call_request(pin_status_payload()))
+            .await
+            .expect("an identical batch is still in flight");
+        assert!(
+            refusal.contains(&format!("request `{}`", control.request_id)),
+            "{refusal}"
+        );
+        assert!(refusal.contains("ProjectProvisioning"), "{refusal}");
+        assert!(refusal.contains("holder-request"), "{refusal}");
+
+        // The run ends: its supervisor stops the batches it still holds.
+        crate::project_services::authority::BatchStop::stop(&*control, &orch);
+        let _ = tx.send(batch_answer(&RunFailure::Cancelled(None).text()));
+        let (verdict, output) = settled_verdict_and_output(&orch, &control.request_id).await;
+        assert!(verdict.starts_with("it was never placed"), "{verdict}");
+        assert!(verdict.contains("ProjectProvisioning"), "{verdict}");
+        assert!(verdict.contains("holder-request"), "{verdict}");
+        assert!(output.contains("none of its commands ran"), "{output}");
+    }
+
+    /// A batch stopped while still parked (before the fleet had it) settles
+    /// never placed with the stage's own wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_stopped_before_admission_settles_never_placed_with_its_stage_wait() {
+        let orch = env().await;
+        let (control, tx) = a_call_whose_transport_closed(&orch).await;
+        control.begin_placement(
+            "waiting for the job's residency on bgsrv-mac: running `batch-1`".into(),
+            true,
+        );
+        crate::project_services::authority::BatchStop::stop(&*control, &orch);
+        let _ = tx.send(batch_answer(&RunFailure::Cancelled(None).text()));
+        let (verdict, _) = settled_verdict_and_output(&orch, &control.request_id).await;
+        assert!(verdict.starts_with("it was never placed"), "{verdict}");
+        assert!(verdict.contains("running `batch-1`"), "{verdict}");
+    }
+
+    /// The control: a batch a machine had claimed may have run, so stopping
+    /// it settles as cancelled, never as never placed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transport_closed_batch_a_machine_claimed_settles_cancelled() {
+        let orch = env().await;
+        let (control, tx) = a_call_whose_transport_closed(&orch).await;
+        let _claimed = orch
+            .fleet
+            .claim_job_command_for_test(&control.request_id, "job-1", 1);
+        let row = detached::load(&orch.db.local, &control.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            detached::live_state(&orch, &row),
+            detached::LiveState::Placed { .. }
+        ));
+        crate::project_services::authority::BatchStop::stop(&*control, &orch);
+        let _ = tx.send(batch_answer(&RunFailure::Cancelled(None).text()));
+        let (verdict, _) = settled_verdict_and_output(&orch, &control.request_id).await;
+        assert_eq!(verdict, "it was cancelled");
     }
 
     /// A wait abandoned while its batch ran (an operator compact) converts the
@@ -13173,7 +13387,10 @@ pub(crate) mod host_batch_tests {
         reissue.tool_use_id = Some("tool-2".into());
         assert_eq!(
             reissue_refusal(&orch, &reissue).await.as_deref(),
-            Some(detached::reissue_refusal_text("req-compacted").as_str())
+            Some(
+                detached::reissue_refusal_text("req-compacted", &detached::LiveState::Untracked)
+                    .as_str()
+            )
         );
     }
 

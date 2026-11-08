@@ -607,7 +607,9 @@ pub(super) async fn read_node_wakes(
 
 /// A node or task job's batches that outlived their calls, or one by request
 /// id: the handle a detached call answered with.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn read_node_batches(
+    orch: &crate::orchestrator::Orchestrator,
     db: &LocalDb,
     project_key: &str,
     number: i32,
@@ -638,7 +640,9 @@ pub(super) async fn read_node_batches(
     };
     match request_id {
         Some(request_id) => match detached::load(db, request_id).await {
-            Ok(Some(batch)) if batch.job_id == job_id => detached::render(&batch),
+            Ok(Some(batch)) if batch.job_id == job_id => {
+                detached::render(&batch, &detached::live_state(orch, &batch))
+            }
             Ok(Some(batch)) => {
                 match crate::jobs::queries::home_uri_for_job(db, &batch.job_id).await {
                     Ok(Some(owner)) => format!(
@@ -659,7 +663,11 @@ pub(super) async fn read_node_batches(
             Ok(batches) => {
                 let mut out = format!("# Batches ({label})\n\nOnly this job's batches; tasks have their own `batches` collections.\n\n");
                 for batch in batches {
-                    out.push_str(&format!("- {}\n", detached::summary_line(&batch, &home)));
+                    let live = detached::live_state(orch, &batch);
+                    out.push_str(&format!(
+                        "- {}\n",
+                        detached::summary_line(&batch, &home, &live)
+                    ));
                 }
                 out
             }

@@ -5648,6 +5648,13 @@ pub struct LearnedResourceEstimate {
 /// to one process's spawns: no frame, variant or field changes, so a runner
 /// talking to an older executor gets nothing wrong.
 ///
+/// cairn/6349 does not move the number. The runner's queue reads, for a
+/// request no machine has claimed, the declines it already recorded, so a
+/// detached batch's row and its reissue refusal can say what it waits on. It
+/// reads state the runner already holds and sends nothing: no frame, variant
+/// or field changes, so a runner talking to an older executor gets nothing
+/// wrong.
+///
 /// cairn/6382 does not move the number. Placement checks a residency pin
 /// mismatch ahead of the drain and update holds, records a waiting decision
 /// for work held by a machine's self-update, and waits for a named machine
