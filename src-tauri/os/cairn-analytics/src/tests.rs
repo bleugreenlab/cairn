@@ -1420,6 +1420,63 @@ async fn a_plan_toggled_within_a_month_counts_once_at_the_plan_last_held() {
     assert!(p.unpriced_accounts.is_empty());
 }
 
+#[tokio::test]
+async fn claude_upgrade_within_a_month_counts_only_the_latest_plan_price() {
+    let db = cost_db().await;
+    let detected_at = JAN_2025 + 15 * 86400;
+    hold(
+        &db,
+        "claude",
+        "claude",
+        Some("max_5x"),
+        "Max 5x",
+        JAN_2025,
+        Some(detected_at),
+    )
+    .await;
+    hold(
+        &db,
+        "claude",
+        "claude",
+        Some("max_20x"),
+        "Max 20x",
+        detected_at,
+        None,
+    )
+    .await;
+    seed_run(&db, "claude-run", "claude", "claude-sonnet-4-5").await;
+    add_event(
+        &db,
+        "claude-event",
+        "claude-run",
+        "assistant",
+        detected_at + 100,
+        1000,
+        1000,
+        None,
+    )
+    .await;
+    let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+        .await
+        .unwrap();
+    let p = point(&points, JAN_2025, "claude");
+    assert_eq!(
+        p.subscription_cost,
+        Some(200.0),
+        "not 100 + 200 or two monthly fees"
+    );
+    assert_eq!(p.billable_tokens, 2000);
+    assert!((p.effective_cost - 200.0).abs() < 1e-9);
+    assert_eq!(
+        p.plans,
+        vec![PlanCount {
+            label: "Max 20x".into(),
+            count: 1
+        }]
+    );
+    assert!(p.unpriced_accounts.is_empty());
+}
+
 fn held(account: &str, plan_key: Option<&str>, plan: &str, created_at: i64) -> HeldSubscription {
     HeldSubscription {
         account_id: account.to_string(),

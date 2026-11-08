@@ -6,7 +6,8 @@
 //! `auth.json` carries an id token whose `chatgpt_plan_type` claim names the
 //! ChatGPT plan. Reading it from the stored credential means an account
 //! signed in before Cairn priced plans resolves without signing in again, and
-//! a plan the provider changes is seen at the next token rotation.
+//! a Claude plan change is seen at the next successful usage-time profile
+//! check. ChatGPT's plan claim is refreshed with its token.
 
 use cairn_models_types::subscription::{
     resolve, settle, AccountPlan, PlanResolution, SubscriptionProvider,

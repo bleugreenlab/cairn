@@ -186,6 +186,42 @@ impl ClaudeOAuth {
         self
     }
 
+    /// Refresh only the provider's plan metadata, without rotating a token or
+    /// changing its generation. A profile with no tier clears the old tier so
+    /// a downgrade cannot keep resolving to the previous Max plan.
+    pub fn with_subscription_plan(&self, subscription_type: &str, tier: Option<&str>) -> Self {
+        let mut next = self.clone();
+        next.0
+            .insert("subscriptionType".into(), Value::from(subscription_type));
+        match tier {
+            Some(tier) => {
+                next.0.insert("rateLimitTier".into(), Value::from(tier));
+            }
+            None => {
+                next.0.remove("rateLimitTier");
+            }
+        }
+        next
+    }
+
+    /// Keep the latest durable plan when publishing a rotation prepared before
+    /// a profile update. Copy absence too, so cleared tiers stay cleared.
+    /// Tokens and Cairn's rotation fields remain this credential's own.
+    pub fn with_subscription_plan_from(&self, current: &Self) -> Self {
+        let mut next = self.clone();
+        for field in ["subscriptionType", "rateLimitTier"] {
+            match current.0.get(field) {
+                Some(value) => {
+                    next.0.insert(field.into(), value.clone());
+                }
+                None => {
+                    next.0.remove(field);
+                }
+            }
+        }
+        next
+    }
+
     /// The next rotation of this credential: the provider's new tokens laid
     /// over the durable object, so every field the CLI or an earlier Cairn
     /// wrote survives. A response without a refresh token keeps the current
