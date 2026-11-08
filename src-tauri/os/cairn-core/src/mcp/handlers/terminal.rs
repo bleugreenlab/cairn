@@ -2653,6 +2653,20 @@ pub(crate) async fn create_terminal_from_resource(
     ensure_terminal_slug_available(&orch.db.local, &target)
         .await
         .map_err(|e| e.to_string())?;
+    // A job terminal lives in the job's home, whose acquisition waits for a
+    // batch running there; an accepted create answers with a row or a refusal,
+    // never a wait nobody sees (cairn/6426).
+    if let Some(occupant) = target
+        .job_id
+        .as_deref()
+        .filter(|_| target.branch.is_some())
+        .and_then(crate::mcp::handlers::run::occupancy::occupant)
+    {
+        return Err(crate::mcp::handlers::run::occupancy::terminal_refusal(
+            &target.slug,
+            &occupant,
+        ));
+    }
     let (target, landing) = materialize_terminal_lease(orch, target).await?;
     let session_id = spawn_terminal_session(
         orch,

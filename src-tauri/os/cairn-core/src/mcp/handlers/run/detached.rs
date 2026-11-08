@@ -11,7 +11,12 @@
 //!   notice for the job ([`settle_and_deliver`]), never a message from anyone;
 //! - the node reads it at `cairn:~/batches/<request_id>`;
 //! - an identical reissue is refused while it runs;
-//! - the replay mutation boundary holds the branch while it is unsettled.
+//! - the replay mutation boundary holds the branch while it runs unsettled.
+//!
+//! A batch no machine has been handed yet is `parked`: its row names what it
+//! waits for and holds no branch, and it becomes `running` when it is
+//! admitted ([`mark_admitted`]). A parked row never claims work that exists
+//! nowhere.
 //!
 //! A runner restart does not settle it. Only the batch's report, or evidence
 //! that it can no longer report, does.
@@ -24,6 +29,8 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 /// Where a detached batch stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedState {
+    /// No machine has been handed it yet; `waiting_on` says why.
+    Parked,
     /// It has not reported, and nothing shows it cannot.
     Running,
     /// Its result arrived.
@@ -35,6 +42,7 @@ pub(crate) enum DetachedState {
 impl DetachedState {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Parked => "parked",
             Self::Running => "running",
             Self::Settled => "settled",
             Self::Lost => "lost",
@@ -43,6 +51,7 @@ impl DetachedState {
 
     fn parse(raw: &str) -> Self {
         match raw {
+            "parked" => Self::Parked,
             "settled" => Self::Settled,
             "lost" => Self::Lost,
             _ => Self::Running,
@@ -76,9 +85,11 @@ pub(crate) struct DetachedBatch {
     /// What a later runner process needs to settle and publish the batch from
     /// a result it adopts (see [`super::adopted`]).
     pub(crate) settlement: Option<super::PersistedSettlement>,
+    /// What a parked batch waits for, in a sentence.
+    pub(crate) waiting_on: Option<String>,
 }
 
-const COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms,settlement_json";
+const COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms,settlement_json,waiting_on";
 
 fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
     Ok(DetachedBatch {
@@ -103,6 +114,7 @@ fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
         settlement: row
             .opt_text(16)?
             .and_then(|json| serde_json::from_str(&json).ok()),
+        waiting_on: row.opt_text(17)?,
     })
 }
 
@@ -213,6 +225,22 @@ pub(crate) fn detach_answer_text(request_id: &str, reason: &str) -> String {
     )
 }
 
+/// What a call that detached a batch no machine has yet answers with.
+pub(crate) fn detach_answer_parked_text(request_id: &str, reason: &str, waiting: &str) -> String {
+    format!(
+        "This batch has not started yet: it is {waiting}. Cairn could not suspend this call ({reason}), so the call answers now instead. Nothing was cancelled, and it holds no branch until it starts. When it settles, Cairn delivers its result to this job as a notice, and `{}` shows where it stands. Do not re-run it.",
+        handle_uri(request_id)
+    )
+}
+
+/// What a reissue of a batch that is still parked detached is told.
+pub(crate) fn reissue_refusal_parked_text(request_id: &str, waiting: &str) -> String {
+    format!(
+        "This batch is already queued, detached from the call that issued it: it is {waiting}. Its result reaches this job as a notice when it settles, and `{}` shows it now. Nothing new was started.",
+        handle_uri(request_id)
+    )
+}
+
 /// What a reissue of a batch that is still running detached is told.
 pub(crate) fn reissue_refusal_text(request_id: &str) -> String {
     format!(
@@ -263,6 +291,15 @@ pub(crate) fn render(batch: &DetachedBatch) -> String {
     );
     out.push_str(&format!("Detached because: {}\n", batch.reason));
     match batch.state {
+        DetachedState::Parked => {
+            out.push_str(&format!(
+                "Waiting: it is {}. No machine has it yet, and it holds no branch until one does.\n",
+                batch.waiting_on.as_deref().unwrap_or("waiting to be placed")
+            ));
+            out.push_str(
+                "\nIts result reaches this job as a notice when it settles. Do not re-run it.\n",
+            );
+        }
         DetachedState::Running => {
             out.push_str(if batch.commits {
                 "Commits: not yet; it carries a commit_msg, so it may commit when it settles.\n"
@@ -305,6 +342,13 @@ pub(crate) fn render(batch: &DetachedBatch) -> String {
 /// One line for the node's batch list.
 pub(crate) fn summary_line(batch: &DetachedBatch, home: &str) -> String {
     let state = match batch.state {
+        DetachedState::Parked => format!(
+            "parked, {}",
+            batch
+                .waiting_on
+                .as_deref()
+                .unwrap_or("waiting to be placed")
+        ),
         DetachedState::Running => "running".to_string(),
         DetachedState::Settled => format!(
             "{}, {}",
@@ -465,7 +509,19 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                     .settlement
                     .as_ref()
                     .and_then(|settlement| settlement.placed_on.as_ref());
-                let finished = if placed_here(id) {
+                // A parked batch was never handed to any machine, so once the
+                // task that would have placed it is gone nothing ever will.
+                let finished = if batch.state == DetachedState::Parked {
+                    mark_lost(
+                        &db,
+                        id,
+                        &format!(
+                            "it was never placed: it was still {} when the runner task that would have placed it ended",
+                            batch.waiting_on.as_deref().unwrap_or("waiting to be placed")
+                        ),
+                    )
+                    .await
+                } else if placed_here(id) {
                     mark_lost(
                         &db,
                         id,
@@ -536,7 +592,7 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
         let b = batch.clone();
         Box::pin(async move {
             c.execute(
-                &format!("INSERT INTO run_batch_detached({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"),
+                &format!("INSERT INTO run_batch_detached({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"),
                 params![
                     b.request_id.as_str(),
                     b.job_id.as_str(),
@@ -556,7 +612,8 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
                     b.notified_ms,
                     b.settlement
                         .as_ref()
-                        .and_then(|settlement| serde_json::to_string(settlement).ok())
+                        .and_then(|settlement| serde_json::to_string(settlement).ok()),
+                    b.waiting_on.as_deref()
                 ],
             )
             .await?;
@@ -590,13 +647,58 @@ pub(crate) async fn for_job(db: &LocalDb, job_id: &str) -> Result<Vec<DetachedBa
     .map_err(|error| error.to_string())
 }
 
-/// The job's batches still running detached.
+/// A parked batch has been handed to a machine: it runs now, and holds its
+/// branch when `holds_branch`. `false` when the row was not parked.
+pub(crate) async fn mark_admitted(
+    db: &LocalDb,
+    request_id: &str,
+    holds_branch: bool,
+) -> Result<bool, String> {
+    let id = request_id.to_string();
+    db.write(|c| {
+        let id = id.clone();
+        Box::pin(async move {
+            let changed = c
+                .execute(
+                    "UPDATE run_batch_detached SET state='running',holds_branch=?2,waiting_on=NULL WHERE request_id=?1 AND state='parked'",
+                    params![id, holds_branch as i64],
+                )
+                .await?;
+            Ok(changed > 0)
+        })
+    })
+    .await
+    .map_err(|error| format!("admit detached run batch: {error}"))
+}
+
+/// Restate what a parked batch waits for.
+pub(crate) async fn note_waiting(db: &LocalDb, request_id: &str, waiting: &str) {
+    let (id, waiting) = (request_id.to_string(), waiting.to_string());
+    let updated = db
+        .write(|c| {
+            let (id, waiting) = (id.clone(), waiting.clone());
+            Box::pin(async move {
+                c.execute(
+                    "UPDATE run_batch_detached SET waiting_on=?2 WHERE request_id=?1 AND state='parked'",
+                    params![id, waiting],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await;
+    if let Err(error) = updated {
+        log::warn!("could not restate what parked run batch {request_id} waits for: {error}");
+    }
+}
+
+/// The job's batches still unsettled detached: parked or running.
 pub(crate) async fn running_for_job(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
-        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE job_id=?1 AND state='running'"),
+        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE job_id=?1 AND state IN ('parked','running')"),
         params![job_id.to_string()],
         from_row,
     )
@@ -604,10 +706,10 @@ pub(crate) async fn running_for_job(
     .map_err(|error| error.to_string())
 }
 
-/// Every batch still running detached in this database.
+/// Every batch still unsettled detached in this database: parked or running.
 pub(crate) async fn all_running(db: &LocalDb) -> Result<Vec<DetachedBatch>, String> {
     db.query_all(
-        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE state='running'"),
+        format!("SELECT {COLUMNS} FROM run_batch_detached WHERE state IN ('parked','running')"),
         (),
         from_row,
     )
@@ -653,7 +755,7 @@ pub(crate) async fn queue_notice(
     Ok(())
 }
 
-/// End a running batch, and, when `notify`, queue its notice in the same
+/// End a parked or running batch, and, when `notify`, queue its notice in the same
 /// transaction: a finished batch is never left without the notice its job is
 /// owed, whatever crashes after. `None` when it was not running, so something
 /// else already finished it and this call queues nothing.
@@ -690,7 +792,7 @@ async fn finish(
             let now = chrono::Utc::now().timestamp_millis();
             let changed = c
                 .execute(
-                    "UPDATE run_batch_detached SET state=?2,verdict=?3,output=?4,commit_id=?5,lost_evidence=?6,settled_ms=?7 WHERE request_id=?1 AND state='running'",
+                    "UPDATE run_batch_detached SET state=?2,verdict=?3,output=?4,commit_id=?5,lost_evidence=?6,settled_ms=?7,waiting_on=NULL WHERE request_id=?1 AND state IN ('parked','running')",
                     params![id.clone(), state, verdict, output, commit, evidence, now],
                 )
                 .await?;
@@ -833,6 +935,7 @@ mod tests {
             settled_ms: None,
             notified_ms: None,
             settlement: None,
+            waiting_on: None,
         }
     }
 

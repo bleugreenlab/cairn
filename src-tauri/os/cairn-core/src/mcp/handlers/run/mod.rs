@@ -17,6 +17,7 @@ pub(crate) mod held;
 mod hygiene;
 mod machine_route;
 mod media;
+pub(crate) mod occupancy;
 mod output;
 mod pace;
 mod process;
@@ -5332,6 +5333,7 @@ async fn prepare_and_run_batch(
                 ceiling_horizon_unix_ms,
                 node_default: node_default.is_some(),
                 home_selector: selectors.declared.clone(),
+                hermetic_pin: None,
                 template,
             };
             let batch = ResolvedRunBatch {
@@ -6439,6 +6441,9 @@ struct BatchPlacement {
     /// affinity guess: a guess may send the batch somewhere, but it must never
     /// settle where the job's home lives.
     home_selector: Option<ExecutorSelector>,
+    /// The machine a commitless batch sent off a busy home is pinned to when
+    /// it named none: the home's own, on a cell of its own there.
+    hermetic_pin: Option<String>,
 }
 
 impl BatchPlacement {
@@ -6476,11 +6481,61 @@ impl BatchPlacement {
         }
         request.pinned_executor_id = match residence {
             BatchResidence::Home => home_bound_pin(home),
-            BatchResidence::Detached => None,
+            BatchResidence::Detached => self.hermetic_pin.clone(),
         };
         request
     }
 
+    /// Run on a cell of its own because `occupant` is running in the job's
+    /// home and this batch has no `commit_msg`. It reads the branch at its
+    /// committed tip, which is the tree the home would start it from (the home
+    /// is restored to HEAD after every batch), and discards its edits. One
+    /// that named no machine runs beside the home, on the home's machine. The
+    /// returned sentence is what its result says about where it ran.
+    fn go_hermetic(
+        &mut self,
+        occupant: &str,
+        home_machine: Option<String>,
+        home_name: Option<&str>,
+    ) -> String {
+        self.environment = None;
+        self.residence = BatchResidence::Detached;
+        let named = self
+            .template
+            .executor
+            .as_ref()
+            .is_some_and(|selector| !selector.is_empty());
+        if !named {
+            self.hermetic_pin = home_machine;
+        }
+        hermetic_note(occupant, home_name)
+    }
+}
+
+/// Why a commitless batch ran on a cell of its own rather than in its job's
+/// home.
+fn hermetic_note(occupant: &str, home_machine: Option<&str>) -> String {
+    let on = home_machine
+        .map(|machine| format!(" on {machine}"))
+        .unwrap_or_default();
+    format!(
+        "It ran on a cell of its own: the job's working tree{on} was running batch `{occupant}`, and a batch without `commit_msg` does not wait for it. It read the branch at its committed tip, and its edits were discarded."
+    )
+}
+
+/// What a committing batch waiting for its job's home is waiting for.
+fn home_wait_sentence(occupant: &str, home_machine: Option<&str>) -> String {
+    let on = home_machine
+        .map(|machine| format!(" on {machine}"))
+        .unwrap_or_default();
+    format!("waiting for the job's residency{on}: running `{occupant}`")
+}
+
+/// How often a batch waiting for its job's home looks again when no vacancy
+/// wakes it, which bounds how late a stop between checks takes effect.
+const HOME_WAIT_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl BatchPlacement {
     /// Where this attempt runs, now that the environment's machine is known.
     ///
     /// `cannot_hold` is what an earlier attempt learned from placement: the
@@ -6585,6 +6640,9 @@ struct PlacementNotes {
     /// run was learned from, so the result can say when an item ran far past
     /// it. Only a completed batch carries it.
     pace: Option<crate::fleet::BatchPace>,
+    /// The batch ran on a cell of its own because another batch occupied its
+    /// job's home. True of the placement, so it rides on every outcome.
+    hermetic: Option<String>,
 }
 
 impl PlacementNotes {
@@ -6592,6 +6650,7 @@ impl PlacementNotes {
     fn executed(&self) -> Option<String> {
         [
             self.scratch_affinity.clone(),
+            self.hermetic.clone(),
             self.drained_home.clone(),
             self.ran_elsewhere.clone(),
             self.above_ceiling.clone(),
@@ -6606,6 +6665,7 @@ impl PlacementNotes {
     fn claimed(&self) -> Option<String> {
         [
             self.scratch_affinity.clone(),
+            self.hermetic.clone(),
             self.drained_home.clone(),
             self.above_ceiling.clone(),
         ]
@@ -6681,6 +6741,10 @@ async fn run_routed_batch(
         verdict_only: settlement.verdict_only,
     });
     control.set_persisted(settlement.persist(placement.residence));
+    control.begin_placement(
+        "waiting to be placed".to_string(),
+        placement.residence == BatchResidence::Home,
+    );
     control.phase_done("prepare");
     let task_orch = orch.clone();
     let task_control = control.clone();
@@ -6846,6 +6910,65 @@ async fn place_and_run_attempts(
     // hold this batch, and kept for every later attempt: a machine's size does
     // not change between them.
     let mut cannot_hold: Option<CannotHold> = None;
+    // The job's home runs one batch at a time. Decide before acquiring it,
+    // since acquisition itself waits on the executor for the batch in there
+    // with nothing anywhere saying so (cairn/6426).
+    let mut hermetic = None;
+    let tenancy = match placement.environment.as_ref().map(|env| env.job_id.clone()) {
+        None => None,
+        Some(job_id) => loop {
+            match occupancy::claim(&job_id, &request_id, placement.commit_present) {
+                occupancy::HomeClaim::Tenant(tenancy) => break Some(tenancy),
+                occupancy::HomeClaim::Elsewhere(occupant) => {
+                    log::info!(
+                        "run batch {request_id} has no commit_msg and its job's home is running {}; it runs on a cell of its own",
+                        occupant.request_id
+                    );
+                    let home_machine = occupant.executor_id.clone().or_else(|| {
+                        orch.fleet
+                            .predicted_job_home(
+                                &cairn_common::executor_protocol::ResidencyHolder::Job {
+                                    job_id: job_id.clone(),
+                                },
+                            )
+                            .map(|home| home.executor_id)
+                    });
+                    let home_name = home_machine
+                        .as_deref()
+                        .map(|id| orch.fleet.executor_name_for_text(id));
+                    hermetic = Some(placement.go_hermetic(
+                        &occupant.request_id,
+                        home_machine,
+                        home_name.as_deref(),
+                    ));
+                    control.leave_home();
+                    break None;
+                }
+                occupancy::HomeClaim::Wait(occupant) => {
+                    let machine = occupant
+                        .executor_id
+                        .as_deref()
+                        .map(|id| orch.fleet.executor_name_for_text(id));
+                    let waiting = home_wait_sentence(&occupant.request_id, machine.as_deref());
+                    if control.unplaced().as_deref() != Some(waiting.as_str()) {
+                        log::info!("run batch {request_id} carries a commit_msg and is {waiting}");
+                    }
+                    control.set_waiting(waiting).await;
+                    occupancy::vacancy(&job_id, &request_id, HOME_WAIT_POLL).await;
+                    if cancelled.load(Ordering::SeqCst) {
+                        return PlacedBatch::Cell(
+                            Box::new(CellOutcome::Cancelled {
+                                request_id: request_id.clone(),
+                                attempt_id: String::new(),
+                            }),
+                            placement.residence,
+                            PlacementNotes::default(),
+                        );
+                    }
+                }
+            }
+        },
+    };
     loop {
         if cancelled.load(Ordering::SeqCst) {
             return PlacedBatch::Cell(
@@ -6856,6 +6979,11 @@ async fn place_and_run_attempts(
                 placement.residence,
                 PlacementNotes::default(),
             );
+        }
+        if placement.environment.is_some() {
+            control
+                .set_waiting("acquiring the job's execution environment".to_string())
+                .await;
         }
         let fence = match placement.environment.as_ref() {
             None => None,
@@ -6898,6 +7026,9 @@ async fn place_and_run_attempts(
             waiting_for_room = Some(placement.begin_waiting_for_room());
         }
         let home = resolve_home_executor(orch, fence.as_ref());
+        if let (Some(tenancy), Some(home)) = (tenancy.as_ref(), home.as_ref()) {
+            tenancy.located(&home.executor_id);
+        }
         let residence = match placement
             .residence_for(orch, home.as_ref(), cannot_hold.as_ref())
             .await
@@ -6944,6 +7075,7 @@ async fn place_and_run_attempts(
                 executor_id,
             });
         }
+        control.admit().await;
         let executed = orch.fleet.submit_run_batch(orch, request, attempt).await;
         if let Some(grant) = executed.grant_without_result {
             *grant_without_result = Some(grant);
@@ -6982,6 +7114,7 @@ async fn place_and_run_attempts(
                 // Filled at settlement, which holds what the affinity did.
                 scratch_affinity: None,
                 pace,
+                hermetic: hermetic.clone(),
             };
             return PlacedBatch::Cell(Box::new(outcome), residence, notes);
         }
@@ -7197,13 +7330,18 @@ struct BatchFacts {
     verdict_only: bool,
 }
 
-impl BatchFacts {
-    /// Whether the batch can write its branch or runs in the node's
-    /// residence, which is what makes it hold the replay mutation boundary.
-    /// Before preparation has said otherwise, a batch is assumed to.
-    fn holds_branch(&self, commits: bool) -> bool {
-        !self.host && (commits || !self.verdict_only)
-    }
+/// Where a batch stands on its way to a machine, which is what its detached
+/// row says and whether that row holds the branch.
+struct PlacementStage {
+    /// The fleet has been handed the batch. Until then nothing runs it, and
+    /// its row is parked and holds nothing.
+    admitted: bool,
+    /// What it waits for while it is not admitted, in a sentence.
+    waiting: Option<String>,
+    /// It runs in the job's home rather than on a cell of its own.
+    in_home: bool,
+    /// The database of its detached row, once the row is written.
+    row: Option<std::sync::Arc<crate::storage::LocalDb>>,
 }
 
 const SETTLE_RUNNING: u8 = 0;
@@ -7233,6 +7371,7 @@ struct BatchControl {
     /// What a durable record of this batch carries so a later runner process
     /// can settle it; `None` for a host batch, which cannot outlive one.
     persisted: std::sync::Mutex<Option<PersistedSettlement>>,
+    stage: std::sync::Mutex<PlacementStage>,
 }
 
 impl BatchControl {
@@ -7252,7 +7391,113 @@ impl BatchControl {
             interrupter: std::sync::Mutex::new(None),
             phases: std::sync::Mutex::new((std::time::Instant::now(), Vec::new())),
             persisted: std::sync::Mutex::new(None),
+            // Admitted until a routed placement says otherwise: only that path
+            // has a stage before a machine.
+            stage: std::sync::Mutex::new(PlacementStage {
+                admitted: true,
+                waiting: None,
+                in_home: true,
+                row: None,
+            }),
         })
+    }
+
+    fn stage(&self) -> std::sync::MutexGuard<'_, PlacementStage> {
+        self.stage.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The batch starts toward a machine, waiting for `waiting`, in the job's
+    /// home or not.
+    fn begin_placement(&self, waiting: String, in_home: bool) {
+        let mut stage = self.stage();
+        stage.admitted = false;
+        stage.waiting = Some(waiting);
+        stage.in_home = in_home;
+    }
+
+    /// What the batch waits for, while no machine has it.
+    fn unplaced(&self) -> Option<String> {
+        let stage = self.stage();
+        (!stage.admitted).then(|| {
+            stage
+                .waiting
+                .clone()
+                .unwrap_or_else(|| "waiting to be placed".to_string())
+        })
+    }
+
+    /// Restate what the unplaced batch waits for, on its row too.
+    async fn set_waiting(&self, waiting: String) {
+        let row = {
+            let mut stage = self.stage();
+            if stage.admitted || stage.waiting.as_deref() == Some(waiting.as_str()) {
+                return;
+            }
+            stage.waiting = Some(waiting.clone());
+            stage.row.clone()
+        };
+        if let Some(db) = row {
+            detached::note_waiting(&db, &self.request_id, &waiting).await;
+        }
+    }
+
+    /// The batch runs on a cell of its own, not in the job's home.
+    fn leave_home(&self) {
+        self.stage().in_home = false;
+        if let Some(persisted) = self
+            .persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            persisted.detached = true;
+        }
+    }
+
+    /// The fleet has the batch now. A row written while it waited becomes
+    /// `running`, and holds the branch only from here.
+    async fn admit(&self) {
+        let row = {
+            let mut stage = self.stage();
+            if stage.admitted {
+                return;
+            }
+            stage.admitted = true;
+            stage.waiting = None;
+            stage.row.clone()
+        };
+        if let Some(db) = row {
+            self.mark_row_admitted(&db).await;
+        }
+    }
+
+    async fn mark_row_admitted(&self, db: &crate::storage::LocalDb) {
+        if let Err(error) = detached::mark_admitted(db, &self.request_id, self.holds_branch()).await
+        {
+            log::warn!(
+                "parked run batch {} was admitted but its row still reads parked: {error}",
+                self.request_id
+            );
+        }
+    }
+
+    /// Remember the detached row's database. `true` when the batch was
+    /// admitted by now, so a row written as parked must be admitted by the
+    /// writer: the batch's own admission found no row to update.
+    fn row_written(&self, db: std::sync::Arc<crate::storage::LocalDb>) -> bool {
+        let mut stage = self.stage();
+        stage.row = Some(db);
+        stage.admitted
+    }
+
+    /// Whether the batch holds the replay mutation boundary: once a machine
+    /// has it, when it can write its branch or runs in the job's home. A host
+    /// batch holds no tree; a commitless batch on a cell of its own reads the
+    /// branch's committed tip and keeps nothing.
+    fn holds_branch(&self) -> bool {
+        let facts = self.facts();
+        let stage = self.stage();
+        stage.admitted && !facts.host && (self.commits || (!facts.verdict_only && stage.in_home))
     }
 
     fn set_persisted(&self, persisted: PersistedSettlement) {
@@ -7473,7 +7718,12 @@ async fn reissue_refusal(orch: &Orchestrator, request: &McpCallbackRequest) -> O
             ctx.run_id,
             twin.request_id
         );
-        return Some(detached::reissue_refusal_text(&twin.request_id));
+        return Some(match (twin.state, twin.waiting_on.as_deref()) {
+            (detached::DetachedState::Parked, Some(waiting)) => {
+                detached::reissue_refusal_parked_text(&twin.request_id, waiting)
+            }
+            _ => detached::reissue_refusal_text(&twin.request_id),
+        });
     }
     let turn_id =
         crate::mcp::handlers::durable_suspend::suspending_turn_id(orch, &db, &ctx.run_id).await?;
@@ -7809,7 +8059,9 @@ async fn record_detached(
     let (ctx, db) = super::run_context::lookup_run_routed(&orch.db, request)
         .await
         .map_err(|error| format!("its run could not be found ({error})"))?;
-    let facts = control.facts();
+    // A batch no machine has yet is parked and holds nothing; its admission
+    // makes the row running (`BatchControl::admit`).
+    let waiting_on = control.unplaced();
     let batch = detached::DetachedBatch {
         request_id: control.request_id.clone(),
         job_id: ctx.job_id.clone(),
@@ -7817,8 +8069,12 @@ async fn record_detached(
         label: batch_label(&request.payload),
         identity: batch_identity(&request.payload).map(|identity| identity.to_string()),
         commits: control.commits,
-        holds_branch: facts.holds_branch(control.commits),
-        state: detached::DetachedState::Running,
+        holds_branch: control.holds_branch(),
+        state: match waiting_on {
+            Some(_) => detached::DetachedState::Parked,
+            None => detached::DetachedState::Running,
+        },
+        waiting_on: waiting_on.clone(),
         verdict: None,
         output: None,
         commit_id: None,
@@ -7830,6 +8086,9 @@ async fn record_detached(
         settlement: control.persisted_for_record(&orch.fleet),
     };
     detached::insert(&db, &batch).await?;
+    if control.row_written(db.clone()) && waiting_on.is_some() {
+        control.mark_row_admitted(&db).await;
+    }
     Ok(DetachedRecord { db })
 }
 
@@ -8334,22 +8593,28 @@ impl CallAnswer {
                 return self.cancel_in_time(reason).await;
             }
         };
-        log::info!(
-            "run batch {} cannot be parked ({reason}); it keeps running detached",
-            self.control.request_id
-        );
+        let text = match self.control.unplaced() {
+            Some(waiting) => {
+                log::info!(
+                    "run batch {} cannot be parked ({reason}); it is detached unplaced, {waiting}",
+                    self.control.request_id
+                );
+                detached::detach_answer_parked_text(&self.control.request_id, reason, &waiting)
+            }
+            None => {
+                log::info!(
+                    "run batch {} cannot be parked ({reason}); it keeps running detached",
+                    self.control.request_id
+                );
+                detached::detach_answer_text(&self.control.request_id, reason)
+            }
+        };
         let rx = self
             .rx
             .take()
             .expect("an unanswered call holds its receiver");
         spawn_detached_resolver(&self.orch, self.control.clone(), record, rx);
-        self.finish(
-            AnswerOutcome::Detached,
-            run_envelope(
-                detached::detach_answer_text(&self.control.request_id, reason),
-                Vec::new(),
-            ),
-        )
+        self.finish(AnswerOutcome::Detached, run_envelope(text, Vec::new()))
     }
 
     /// A host batch that can never park: its response and MCP-tool items are
@@ -10133,7 +10398,45 @@ mod tests {
             scratch: None,
             scratch_affinity: None,
             pace: None,
+            hermetic: None,
         }
+    }
+
+    /// cairn/6426 (a): a commitless batch whose job's home is running another
+    /// batch is placed at once on a cell of its own: no environment to
+    /// acquire, its edits discarded, pinned beside the home when it named no
+    /// machine, and its result saying why.
+    #[test]
+    fn a_commitless_batch_beside_a_busy_home_runs_on_a_cell_of_its_own() {
+        let mut placement = test_placement(false);
+        placement.template.executor = None;
+        let note = placement.go_hermetic("batch-1", Some("bgsrv-mac".into()), Some("bgsrv-mac"));
+        assert!(placement.environment.is_none(), "nothing waits on the home");
+        assert_eq!(placement.residence, BatchResidence::Detached);
+        let request = placement.attempt(None, false, placement.residence);
+        assert_eq!(request.pinned_executor_id.as_deref(), Some("bgsrv-mac"));
+        assert_eq!(request.mutation_policy, MutationPolicy::PureVerdict);
+        assert!(
+            note.contains("working tree on bgsrv-mac was running batch `batch-1`"),
+            "{note}"
+        );
+        let notes = PlacementNotes {
+            hermetic: Some(note.clone()),
+            ..PlacementNotes::default()
+        };
+        assert_eq!(notes.executed().as_deref(), Some(note.as_str()));
+        assert_eq!(notes.claimed().as_deref(), Some(note.as_str()));
+
+        // One that named a machine keeps its own selector and gets no pin.
+        let mut named = test_placement(false);
+        named.go_hermetic("batch-1", Some("bgsrv-mac".into()), None);
+        let request = named.attempt(None, false, named.residence);
+        assert_eq!(request.pinned_executor_id, None);
+        assert_eq!(request.executor.as_ref(), Some(&named_selector("local")));
+    }
+
+    fn named_selector(name: &str) -> ExecutorSelector {
+        named(name)
     }
 
     /// Running above the ceiling is never silent, least of all when the batch
@@ -10314,6 +10617,7 @@ mod tests {
             ceiling_horizon_unix_ms: u64::MAX,
             node_default: false,
             home_selector: None,
+            hermetic_pin: None,
         }
     }
 
@@ -12618,6 +12922,152 @@ pub(crate) mod host_batch_tests {
             "the turn never yielded"
         );
         deliver_and_expect_one_notice(&orch, &control.request_id, tx, "tests passed").await;
+    }
+
+    async fn detached_row(orch: &Orchestrator, request_id: &str) -> (String, i64, Option<String>) {
+        orch.db
+            .local
+            .query_one(
+                "SELECT state, holds_branch, waiting_on FROM run_batch_detached WHERE request_id=?1",
+                (request_id.to_string(),),
+                |r| Ok((r.text(0)?, r.i64(1)?, r.opt_text(2)?)),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// cairn/6426 (b), the specimens' shape: a Codex nested batch with a
+    /// `commit_msg` is still waiting for its job's home, which another batch
+    /// occupies, when its call must answer. Its row is parked, names the batch
+    /// it waits behind and the machine, and holds no branch; so does its
+    /// answer. Admission makes it running and holding, and its result settles
+    /// it as usual.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committing_batch_waiting_for_its_home_detaches_parked_naming_its_predecessor() {
+        let orch = env().await;
+        let mut request = call_request(declared_payload());
+        request.tool_use_id = None;
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(200),
+            ms(1_500),
+            Some(ms(600_000)),
+        );
+        let control = BatchControl::new(true);
+        let waiting = home_wait_sentence("batch-1", Some("bgsrv-mac"));
+        assert_eq!(
+            waiting,
+            "waiting for the job's residency on bgsrv-mac: running `batch-1`"
+        );
+        control.begin_placement(waiting.clone(), true);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let text =
+            envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
+        assert_eq!(
+            text,
+            detached::detach_answer_parked_text(&control.request_id, NO_RESUMABLE_CALL, &waiting)
+        );
+        assert!(!text.contains("still running"), "{text}");
+        let (state, holds, waiting_on) = detached_row(&orch, &control.request_id).await;
+        assert_eq!(state, "parked", "never `running` while no machine has it");
+        assert_eq!(holds, 0, "it holds no branch before admission");
+        assert_eq!(waiting_on.as_deref(), Some(waiting.as_str()));
+        let batch = detached::load(&orch.db.local, &control.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let rendered = detached::render(&batch);
+        assert!(rendered.contains("State: parked"), "{rendered}");
+        assert!(rendered.contains("running `batch-1`"), "{rendered}");
+
+        control.admit().await;
+        let (state, holds, waiting_on) = detached_row(&orch, &control.request_id).await;
+        assert_eq!((state.as_str(), holds), ("running", 1));
+        assert_eq!(waiting_on, None);
+        deliver_and_expect_one_notice(&orch, &control.request_id, tx, "committed").await;
+    }
+
+    /// The control: the same committing batch with nothing ahead of it is
+    /// admitted before its call must answer, so its row is running and holds
+    /// its branch from the start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committing_batch_with_a_vacant_home_is_admitted_at_once() {
+        let orch = env().await;
+        let mut request = call_request(declared_payload());
+        request.tool_use_id = None;
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(200),
+            ms(1_500),
+            Some(ms(600_000)),
+        );
+        let control = BatchControl::new(true);
+        control.begin_placement("waiting to be placed".into(), true);
+        let tenancy = match occupancy::claim("job-vacant-control", &control.request_id, true) {
+            occupancy::HomeClaim::Tenant(tenancy) => tenancy,
+            other => panic!("a vacant home is taken at once: {other:?}"),
+        };
+        control.admit().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let text =
+            envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
+        assert_eq!(
+            text,
+            detached::detach_answer_text(&control.request_id, NO_RESUMABLE_CALL)
+        );
+        let (state, holds, _) = detached_row(&orch, &control.request_id).await;
+        assert_eq!((state.as_str(), holds), ("running", 1));
+        deliver_and_expect_one_notice(&orch, &control.request_id, tx, "committed").await;
+        drop(tenancy);
+    }
+
+    /// A commitless batch on a cell of its own holds no branch even once a
+    /// machine has it: it reads the committed tip and keeps nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commitless_batch_on_its_own_cell_never_holds_its_branch() {
+        let control = BatchControl::new(false);
+        control.begin_placement("waiting to be placed".into(), true);
+        assert!(!control.holds_branch(), "nothing is held before admission");
+        control.leave_home();
+        control.admit().await;
+        assert!(!control.holds_branch());
+        let home = BatchControl::new(false);
+        home.begin_placement("waiting to be placed".into(), true);
+        home.admit().await;
+        assert!(home.holds_branch(), "a batch in the home holds it");
+    }
+
+    /// No phantom rows: a parked row whose batch task is gone (nothing in this
+    /// process will ever hand it to a machine) is settled lost by the sweep,
+    /// naming what it waited for, never left reading parked or running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_row_nothing_will_place_is_settled_never_placed() {
+        let orch = env().await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO run_batch_detached(request_id,job_id,run_id,label,commits,holds_branch,state,reason,created_ms,waiting_on) VALUES('req-orphan','job-1','run-1','cargo test',1,0,'parked','x',1,'waiting for the job''s residency on bgsrv-mac: running `batch-1`')",
+                (),
+            )
+            .await
+            .unwrap();
+        detached::sweep_unreported(&orch).await;
+        let (state, evidence): (String, Option<String>) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT state, lost_evidence FROM run_batch_detached WHERE request_id='req-orphan'",
+                (),
+                |r| Ok((r.text(0)?, r.opt_text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, "lost");
+        let evidence = evidence.unwrap();
+        assert!(evidence.contains("never placed"), "{evidence}");
+        assert!(evidence.contains("running `batch-1`"), "{evidence}");
     }
 
     /// The same carrier's batch that answers on its socket after grace settles
