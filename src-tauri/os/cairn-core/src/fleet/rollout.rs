@@ -300,6 +300,16 @@ pub(crate) struct Step {
     pub unreturned: Vec<Unreturned>,
 }
 
+/// Where a held machine's update stands, in the terms work waiting on it is
+/// told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateWait {
+    /// Emptying: what it still waits on, latest bound first.
+    Draining { holds: Vec<DrainHold> },
+    /// Directed to install the build and awaited on its return.
+    Directed { at_unix_ms: u64 },
+}
+
 #[derive(Debug, Clone)]
 struct Turn {
     executor_id: String,
@@ -425,6 +435,30 @@ impl Rollout {
     pub(crate) fn holds(&self, executor_id: &str) -> bool {
         self.turns()
             .any(|(_, turn)| turn.executor_id == executor_id)
+    }
+
+    /// Where this machine's update stands for work waiting on it, or `None`
+    /// when no turn holds it.
+    pub(crate) fn update_wait(&self, executor_id: &str) -> Option<UpdateWait> {
+        self.turns()
+            .find(|(_, turn)| turn.executor_id == executor_id)
+            .map(|(_, turn)| match &turn.phase {
+                TurnPhase::Draining { holds, .. } => UpdateWait::Draining {
+                    holds: holds.clone(),
+                },
+                TurnPhase::Directed { at_unix_ms, .. } => UpdateWait::Directed {
+                    at_unix_ms: *at_unix_ms,
+                },
+            })
+    }
+
+    /// The machines directed to install the build and awaited on their
+    /// return, as `(executor id, public name)`.
+    pub(crate) fn directed(&self) -> Vec<(String, String)> {
+        self.turns()
+            .filter(|(_, turn)| matches!(turn.phase, TurnPhase::Directed { .. }))
+            .map(|(_, turn)| (turn.executor_id.clone(), turn.name.clone()))
+            .collect()
     }
 
     fn turns(&self) -> impl Iterator<Item = (Slot, &Turn)> {

@@ -8329,6 +8329,52 @@ impl Fleet {
         recent.push_back(decision);
     }
 
+    /// What work waiting on `executor_id`'s self-update is told: the machine,
+    /// that it is being updated, and how much of that is left.
+    fn update_wait_sentence(&self, executor_id: &str, name: &str, now_unix_ms: u64) -> String {
+        let wait = self.self_update.lock().unwrap().update_wait(executor_id);
+        let progress = match wait {
+            Some(rollout::UpdateWait::Draining { holds }) => match holds.first() {
+                Some(hold) => format!(
+                    " ({} in flight, {}{}, {})",
+                    holds.len(),
+                    if holds.len() > 1 { "the longest " } else { "" },
+                    hold.label,
+                    crate::resources::executors::hold_remaining(hold, now_unix_ms)
+                ),
+                None => " (empty, about to install it)".to_string(),
+            },
+            Some(rollout::UpdateWait::Directed { at_unix_ms }) => format!(
+                " (installing it, directed {} ago)",
+                describe_quiet_ms(now_unix_ms.saturating_sub(at_unix_ms))
+            ),
+            None => String::new(),
+        };
+        format!(
+            "{name} being emptied for an executor update{progress}, which ends on its own when it returns on the runner's build (cairn://executors/{name})"
+        )
+    }
+
+    /// The machine this request names, by pin or by selector name, that has
+    /// closed its link to install the runner's build and is awaited on its
+    /// return, as `(executor id, public name)`.
+    fn named_machine_installing_update(&self, request: &CellRequest) -> Option<(String, String)> {
+        let directed = self.self_update.lock().unwrap().directed();
+        if directed.is_empty() {
+            return None;
+        }
+        let named = request
+            .executor
+            .as_ref()
+            .and_then(|selector| selector.name.as_deref());
+        let connections = self.lock_connections();
+        directed.into_iter().find(|(executor_id, name)| {
+            !connections.contains_key(executor_id)
+                && (request.pinned_executor_id.as_deref() == Some(executor_id.as_str())
+                    || named.is_some_and(|named| executor_names_match(named, name)))
+        })
+    }
+
     /// Every placement decision this machine took part in, newest first.
     fn placements_naming(&self, executor_id: &str) -> Vec<PlacementDecision> {
         self.recent_placements
@@ -14514,9 +14560,9 @@ impl Fleet {
         policy: &ActivePlacementPolicy,
         entry_id: Option<&str>,
     ) -> Result<Placement, CellOutcome> {
-        // The memory reasons the last recorded wait named, so a request parked
-        // on them is recorded once per change rather than on every pass.
-        let mut recorded_memory_wait: Option<Vec<(String, String)>> = None;
+        // The reasons the last recorded wait named, so a request parked on them
+        // is recorded once per change rather than on every pass.
+        let mut recorded_wait: Option<Vec<(String, String)>> = None;
         loop {
             // A machine that posted new state may have become willing, so its
             // report wakes this wait as surely as a new connection does. That is
@@ -14541,15 +14587,35 @@ impl Fleet {
             .await;
             let rejected = match selection {
                 Ok(Selection::Placed(placement)) => return Ok(*placement),
-                Err(refused) => {
-                    // A refusal is a decision with the same evidence attached as
-                    // a success, and it is recorded as one.
-                    self.record_placement_decision(refused.decision);
-                    return Err(CellOutcome::Unavailable {
-                        reason: refused.reason,
-                        diagnostic: refused.diagnostic,
-                    });
-                }
+                // A machine this request named that closed its link only to
+                // install the runner's build comes back in minutes, and refusing
+                // now refuses at the moment its update hold ends: a named batch
+                // that waited out a whole drain was refused as bbs restarted
+                // (cairn/6382). It stays a machine being updated, so the wait is
+                // recorded and bounded like one, by the rollout's return bound
+                // and the request's own horizon.
+                Err(refused) => match self.named_machine_installing_update(request) {
+                    Some((executor_id, executor_name)) => {
+                        let mut rejected = refused.decision.rejected;
+                        rejected.retain(|rejection| rejection.executor_id != executor_id);
+                        rejected.push(PlacementRejection {
+                            prediction: None,
+                            executor_name,
+                            executor_id,
+                            reason: PlacementRejectionReason::UpdatePending,
+                        });
+                        rejected
+                    }
+                    None => {
+                        // A refusal is a decision with the same evidence attached
+                        // as a success, and it is recorded as one.
+                        self.record_placement_decision(refused.decision);
+                        return Err(CellOutcome::Unavailable {
+                            reason: refused.reason,
+                            diagnostic: refused.diagnostic,
+                        });
+                    }
+                },
                 Ok(Selection::Waiting { rejected }) => rejected,
             };
             // The work went nowhere. A machine that refused it only for room
@@ -14580,10 +14646,21 @@ impl Fleet {
                     })
                     .map(|rejection| rejection.executor_name.clone()),
             );
-            // Work kept off the machines it cannot run on is pending for a
-            // reason the queue view owes its reader, and nothing else records a
+            // Work kept off the machines it cannot run on, or waiting on a
+            // machine's update, is pending for a reason the queue view and the
+            // machine's own page owe their reader, and nothing else records a
             // pass that placed nothing.
-            if let Some(mut waiting) = memory_wait_decision(request, policy, &rejected) {
+            let now = unix_time_ms();
+            let updates: Vec<String> = rejected
+                .iter()
+                .filter(|rejection| {
+                    matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
+                })
+                .map(|rejection| {
+                    self.update_wait_sentence(&rejection.executor_id, &rejection.executor_name, now)
+                })
+                .collect();
+            if let Some(mut waiting) = wait_decision(request, policy, &rejected, &updates) {
                 let mut signature: Vec<(String, String)> = rejected
                     .iter()
                     .map(|rejection| {
@@ -14594,12 +14671,12 @@ impl Fleet {
                     })
                     .collect();
                 signature.sort();
-                if recorded_memory_wait.as_ref() != Some(&signature) {
+                if recorded_wait.as_ref() != Some(&signature) {
                     if let Some(entry_id) = entry_id {
                         self.record_binding_chain(&mut waiting, entry_id);
                     }
                     self.record_placement_decision(waiting);
-                    recorded_memory_wait = Some(signature);
+                    recorded_wait = Some(signature);
                 }
             }
             // An exclusion is waited out like a decline: the work cannot go
@@ -14613,7 +14690,6 @@ impl Fleet {
                 })
                 .cloned()
                 .collect();
-            let now = unix_time_ms();
             let colocated = self.colocated_substrate();
             // A held generation is not a recovery in progress, however fresh its
             // declaration: it ends when another process exits, so waiting on it
@@ -16061,6 +16137,18 @@ fn candidate_rejection(
             os: entry.advertisement.capabilities.os.clone(),
             trusted: scope.verdict_platforms.to_vec(),
         })
+    } else if scope
+        .pinned_executor_id
+        .is_some_and(|id| id != entry.identity.executor_id)
+    {
+        // Ahead of every hold for the selector's reason: a machine the pin
+        // excludes can never run the work, and reporting its drain or update
+        // hold instead makes it a machine to wait for. A batch waiting for room
+        // on its own home then read as waiting on another machine's executor
+        // update (cairn/6382).
+        Some(PlacementRejectionReason::PinMismatch {
+            pinned_executor_id: scope.pinned_executor_id.unwrap_or_default().to_string(),
+        })
     } else if entry.drained && !pinned_here {
         // The runner owns this refusal rather than asking the machine. A
         // residency pin is the exception: a batch reaches a drained home only
@@ -16133,13 +16221,6 @@ fn candidate_rejection(
         }
     {
         Some(reason)
-    } else if scope
-        .pinned_executor_id
-        .is_some_and(|id| id != entry.identity.executor_id)
-    {
-        Some(PlacementRejectionReason::PinMismatch {
-            pinned_executor_id: scope.pinned_executor_id.unwrap_or_default().to_string(),
-        })
     } else if !serves_project(entry, scope.project_id) {
         Some(PlacementRejectionReason::ProjectUnavailable {
             project_id: scope.project_id.to_string(),
@@ -16676,24 +16757,40 @@ fn describe_memory_rejections(rejected: &[PlacementRejection]) -> Option<String>
     (!rows.is_empty()).then(|| rows.join("; "))
 }
 
-/// The record of a pass that kept work off the machines it cannot run on and
-/// placed it nowhere, so the queue view shows why the request is pending.
-fn memory_wait_decision(
+/// The record of a pass that placed work nowhere for a reason that ends on its
+/// own (machines it cannot run on for memory, or a machine being emptied for
+/// its executor update), so the queue view and each named machine's page show
+/// why the request is pending. `updates` describes each update it waits on.
+fn wait_decision(
     request: &CellRequest,
     policy: &ActivePlacementPolicy,
     rejected: &[PlacementRejection],
+    updates: &[String],
 ) -> Option<PlacementDecision> {
-    let memory = describe_memory_rejections(rejected)?;
+    let memory = describe_memory_rejections(rejected)
+        .map(|memory| format!("not placed where it cannot run: {memory}."));
+    let waiting_on_update =
+        (!updates.is_empty()).then(|| format!("waiting on {}.", updates.join("; ")));
+    if memory.is_none() && waiting_on_update.is_none() {
+        return None;
+    }
+    // The update sentences already say what the decline account would.
+    let others: Vec<PlacementRejection> = rejected
+        .iter()
+        .filter(|rejection| {
+            waiting_on_update.is_none()
+                || !matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
+        })
+        .cloned()
+        .collect();
+    let reasons: Vec<String> = [memory, waiting_on_update].into_iter().flatten().collect();
     Some(placement_decision(
         request,
         unix_time_ms(),
         Some(policy_evidence(request, policy, false)),
         None,
         PlacementOutcome::Waiting {
-            diagnostic: format!(
-                "not placed where it cannot run: {memory}.{}",
-                describe_declines(rejected)
-            ),
+            diagnostic: format!("{}{}", reasons.join(" "), describe_declines(&others)),
         },
         rejected.to_vec(),
     ))
@@ -28741,7 +28838,7 @@ mod tests {
                 && matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
         }));
         let waiting =
-            memory_wait_decision(&request, &policy, &rejected).expect("the wait is recorded");
+            wait_decision(&request, &policy, &rejected, &[]).expect("the wait is recorded");
         let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
             unreachable!("a memory wait is a waiting decision");
         };
@@ -34461,6 +34558,190 @@ mod tests {
                 .0
                 .executor_id,
             "bbs"
+        );
+    }
+
+    /// cairn/6382's acceptance: a job resident on a machine draining for its
+    /// update runs its next batch there, on the outgoing build, and the update
+    /// waits for it like any other in-flight command. Work that would make a
+    /// new environment there is still held.
+    #[test]
+    fn an_update_hold_admits_work_pinned_to_the_execution_home_it_already_hosts() {
+        let (executor_id, mut resident_home) = fleet_entry("bbs", "linux", 0, &[]);
+        resident_home.update_hold = true;
+        let connections = HashMap::from([(executor_id, resident_home)]);
+        let mut resident = targeted_request("linux");
+        resident.pinned_executor_id = Some("bbs".into());
+        let selected = place(&connections, &resident)
+            .expect("resident work crosses the update hold")
+            .selected
+            .expect("its home takes it")
+            .0;
+        assert_eq!(selected.executor_id, "bbs");
+
+        let mut named = targeted_request("linux");
+        named.executor = Some(ExecutorSelector {
+            name: Some("bbs".into()),
+            ..ExecutorSelector::default()
+        });
+        let draft = place(&connections, &named).expect("new work waits for the update");
+        assert!(draft.selected.is_none(), "new work is still held");
+    }
+
+    /// cairn/6382's misattribution: a batch pinned to its home on bgsrv-ub,
+    /// waiting there for room, was told it waited on bbs being emptied for an
+    /// update. A machine the pin excludes says so, never its hold.
+    #[test]
+    fn a_pin_elsewhere_is_not_reported_as_waiting_on_another_machines_update() {
+        let mut connections = HashMap::from([
+            fleet_entry("bbs", "linux", 0, &[]),
+            fleet_entry("bgsrv-ub", "linux", 0, &[]),
+        ]);
+        connections.get_mut("bbs").unwrap().update_hold = true;
+        connections.get_mut("bgsrv-ub").unwrap().drained = true;
+        let mut request = targeted_request("linux");
+        request.pinned_executor_id = Some("bgsrv-ub".into());
+        let rejected = match place(&connections, &request) {
+            Ok(draft) => draft.rejected,
+            Err(_) => survey_candidates(
+                &connections,
+                &[],
+                &request,
+                NOW,
+                &HashMap::new(),
+                &AdmissionView::of_request(&request),
+            )
+            .err()
+            .map(|_| Vec::new())
+            .unwrap_or_default(),
+        };
+        assert!(
+            !rejected
+                .iter()
+                .any(|rejection| rejection.executor_id == "bbs"
+                    && rejection.reason == PlacementRejectionReason::UpdatePending),
+            "{rejected:?}"
+        );
+        let survey = HashMap::from([connections
+            .remove("bbs")
+            .map(|entry| ("bbs".to_string(), entry))
+            .unwrap()]);
+        let reason = candidate_rejection(&survey["bbs"], PlacementScope::of(&request), NOW);
+        assert!(
+            matches!(reason, Some(PlacementRejectionReason::PinMismatch { .. })),
+            "{reason:?}"
+        );
+    }
+
+    /// A request waiting on a machine's update records the wait where its
+    /// reader looks, naming the machine, the reason, and how long is left;
+    /// before cairn/6382 only a memory wait was recorded, and work parked on
+    /// bbs's 68-minute drain left no decision anywhere.
+    #[tokio::test]
+    async fn a_wait_on_a_machines_update_is_recorded_with_its_estimate() {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let (executor_id, mut connection) = fleet_entry_at("bbs", "linux", 0, &[], now);
+        connection.executor_build_id = Some("build-0759".into());
+        Arc::make_mut(&mut connection.snapshot).granted_attempts =
+            vec![cairn_common::executor_protocol::GrantedAttempt {
+                request_id: "long-lane".into(),
+                attempt_id: "a".into(),
+            }];
+        pool.lock_connections()
+            .insert(executor_id.clone(), connection);
+        pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
+        pool.advance_self_update_rollout(now);
+        assert!(pool.lock_connections()[&executor_id].update_hold);
+
+        let mut request = targeted_request("linux");
+        request.executor = Some(ExecutorSelector {
+            name: Some("bbs".into()),
+            ..ExecutorSelector::default()
+        });
+        request.wait_horizon_unix_ms = unix_time_ms() + 400;
+        let policy = ActivePlacementPolicy::default_profile();
+        pool.select_executor(&request, None, &policy, None)
+            .await
+            .expect_err("the horizon arrives before the update ends");
+
+        let waits: Vec<String> = pool
+            .placements_naming("bbs")
+            .into_iter()
+            .filter_map(|decision| match decision.outcome {
+                PlacementOutcome::Waiting { diagnostic } => Some(diagnostic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits.len(), 1, "recorded once while unchanged: {waits:?}");
+        assert!(
+            waits[0].starts_with(
+                "waiting on bbs being emptied for an executor update (1 in flight, request long-lane"
+            ),
+            "{}",
+            waits[0]
+        );
+        assert!(waits[0].contains("cairn://executors/bbs"), "{}", waits[0]);
+    }
+
+    /// A machine that closes its link to install the runner's build is about
+    /// to return. Work that named it waits for that rather than being refused
+    /// the moment the update hold is about to end.
+    #[tokio::test]
+    async fn work_naming_a_machine_installing_its_update_waits_for_its_return() {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let (executor_id, mut connection) = fleet_entry_at("bbs", "linux", 0, &[], now);
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        connection.sender = sender;
+        connection.executor_build_id = Some("build-0759".into());
+        connection.snapshots_received = 0;
+        pool.lock_connections()
+            .insert(executor_id.clone(), connection);
+        pool.record_executor_artifact_build("x86_64-unknown-linux-gnu", Ok("build-1329".into()));
+        pool.advance_self_update_rollout(now);
+        pool.lock_connections()
+            .get_mut(&executor_id)
+            .unwrap()
+            .snapshots_received += 2;
+        pool.advance_self_update_rollout(now + 30_000);
+        assert!(
+            std::iter::from_fn(|| executor.try_recv().ok())
+                .any(|message| matches!(message, ExecutorMessage::UpdateDirected { .. })),
+            "the empty machine is directed"
+        );
+        pool.lock_connections().remove(&executor_id);
+
+        let mut request = targeted_request("linux");
+        request.executor = Some(ExecutorSelector {
+            name: Some("bbs".into()),
+            ..ExecutorSelector::default()
+        });
+        request.wait_horizon_unix_ms = unix_time_ms() + 400;
+        let policy = ActivePlacementPolicy::default_profile();
+        let refusal = pool
+            .select_executor(&request, None, &policy, None)
+            .await
+            .expect_err("bbs does not return inside the horizon");
+        let CellOutcome::Unavailable { diagnostic, .. } = refusal else {
+            panic!("expected a refusal at the horizon, got {refusal:?}");
+        };
+        assert!(
+            diagnostic.contains("wait horizon"),
+            "waited rather than refused at once: {diagnostic}"
+        );
+        let waits: Vec<String> = pool
+            .placements_naming("bbs")
+            .into_iter()
+            .filter_map(|decision| match decision.outcome {
+                PlacementOutcome::Waiting { diagnostic } => Some(diagnostic),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            waits.iter().any(|wait| wait
+                .contains("bbs being emptied for an executor update (installing it, directed")),
+            "{waits:?}"
         );
     }
 

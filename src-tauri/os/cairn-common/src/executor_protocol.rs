@@ -5641,6 +5641,13 @@ pub struct LearnedResourceEstimate {
 /// variant or field changes, and a runner talking to an older executor gets
 /// nothing wrong: every name either side folds folds to the same string.
 ///
+/// cairn/6382 does not move the number. Placement checks a residency pin
+/// mismatch ahead of the drain and update holds, records a waiting decision
+/// for work held by a machine's self-update, and waits for a named machine
+/// that closed its link to install the runner's build. All of it is runner
+/// placement over state the runner already holds: no frame, variant or field
+/// changes, so a runner talking to an older executor gets nothing wrong.
+///
 /// cairn/6090 does not move the number. An operator Compact's job-wide cancel
 /// now spares the job's check requests, reading the `priority` field
 /// the runner already holds, so the runner sends `Cancel` for fewer requests

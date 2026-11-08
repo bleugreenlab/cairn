@@ -1181,7 +1181,7 @@ fn machines(count: u32) -> String {
 ///
 /// Work past its bound that its own stall stop still sees progressing has no
 /// remaining wait to name: it holds the turn for as long as it keeps moving.
-fn hold_remaining(
+pub(crate) fn hold_remaining(
     hold: &cairn_common::executor_protocol::DrainHold,
     captured_at_unix_ms: u64,
 ) -> String {
