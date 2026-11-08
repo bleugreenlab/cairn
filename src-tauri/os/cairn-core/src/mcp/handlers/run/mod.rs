@@ -5042,7 +5042,7 @@ async fn prepare_and_run_batch(
         .and_then(selector::EffectiveSelector::node_default)
         .cloned();
     // What placement reads, and what the shells' `CAIRN_BATCH_EXECUTOR`
-    // carries, which is never a default.
+    // carries, which is only the call-level selector, never a default or affinity.
     let selectors = selector::BatchSelectors::of(effective.as_ref());
     let batch_residence = match if page_call {
         // A page call has no execution home: it runs wherever the page-call

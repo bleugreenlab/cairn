@@ -8,10 +8,10 @@
 //! default, a default beats affinity, and affinity is consulted only when
 //! neither said anything.
 //!
-//! Only a call-level selector (and, until cairn/5988, an affinity guess)
-//! reaches the shell's `CAIRN_BATCH_EXECUTOR`, which a nested `cairn check run`
-//! inherits as a narrowing. A default never does: a check result is identified
-//! by what was checked and placed by platform (tenet 1233).
+//! Only a call-level selector reaches the shell's `CAIRN_BATCH_EXECUTOR`, which
+//! a nested `cairn check run` inherits as a narrowing. Defaults and affinity never
+//! do: a check result is identified by what was checked and placed by platform
+//! (tenet 1233).
 
 use crate::fleet::placement_default::PlacementDefault;
 use cairn_common::executor_protocol::ExecutorSelector;
@@ -79,7 +79,7 @@ impl EffectiveSelector {
 /// `placement` is what residence and the cell request read, so it is every
 /// effective selector. `shell_pin` is what the batch's shells receive as
 /// `CAIRN_BATCH_EXECUTOR`, which a nested `cairn check run` inherits as a
-/// narrowing, so it is never a node default (tenet 1233). `declared` is what the
+/// narrowing, so it is only a call-level selector (tenet 1233). `declared` is what the
 /// job's home is acquired under: the caller's own statement of intent, so it is
 /// never an affinity guess, which reaches the acquisition only as a price and may
 /// be refused and passed over (tenet 1395). All call sites read this, so none can
@@ -99,12 +99,8 @@ impl BatchSelectors {
         Self {
             placement: Some(effective.selector.clone()),
             shell_pin: match effective.source {
-                SelectorSource::NodeDefault => None,
-                // The affinity guess reaches the shells as it did before node
-                // defaults existed; cairn/5988 takes it off.
-                SelectorSource::Call | SelectorSource::ScratchAffinity => {
-                    Some(effective.selector.clone())
-                }
+                SelectorSource::Call => Some(effective.selector.clone()),
+                SelectorSource::NodeDefault | SelectorSource::ScratchAffinity => None,
             },
             declared: match effective.source {
                 SelectorSource::Call | SelectorSource::NodeDefault => {
@@ -217,12 +213,53 @@ mod tests {
             BatchSelectors::of(Some(&affinity)),
             BatchSelectors {
                 placement: Some(named("fedora")),
-                shell_pin: Some(named("fedora")),
+                shell_pin: None,
                 declared: None,
             },
             "an affinity guess places the batch and never its home"
         );
         assert_eq!(BatchSelectors::of(None), BatchSelectors::default());
+    }
+
+    #[test]
+    fn scratch_affinity_places_the_batch_without_pinning_nested_checks() {
+        assert_eq!(EffectiveSelector::declared(None, None), None);
+        let affinity = EffectiveSelector::from_affinity(named("warm-machine"));
+        assert_eq!(affinity.source, SelectorSource::ScratchAffinity);
+        let selectors = BatchSelectors::of(Some(&affinity));
+        assert_eq!(selectors.placement, Some(named("warm-machine")));
+
+        let env = super::super::placed_process_env(
+            Some("run-7"),
+            None,
+            None,
+            None,
+            selectors.shell_pin.as_ref(),
+        );
+        assert!(
+            !env.iter()
+                .any(|(key, _)| key == cairn_common::executor_protocol::BATCH_EXECUTOR_ENV),
+            "a scratch holder's machine must not narrow a nested check lane"
+        );
+
+        let call = EffectiveSelector::declared(Some(&named("explicit-machine")), None);
+        let selectors = BatchSelectors::of(call.as_ref());
+        assert_eq!(selectors.placement, Some(named("explicit-machine")));
+        let env = super::super::placed_process_env(
+            Some("run-7"),
+            None,
+            None,
+            None,
+            selectors.shell_pin.as_ref(),
+        );
+        let (_, pin) = env
+            .iter()
+            .find(|(key, _)| key == cairn_common::executor_protocol::BATCH_EXECUTOR_ENV)
+            .expect("a call-level selector still narrows nested checks");
+        assert_eq!(
+            serde_json::from_str::<ExecutorSelector>(pin).unwrap(),
+            named("explicit-machine")
+        );
     }
 
     #[test]
