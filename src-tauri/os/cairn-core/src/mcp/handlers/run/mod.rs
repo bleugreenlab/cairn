@@ -630,6 +630,8 @@ pub(crate) struct PublishedSlotDelta {
 
 /// Publish an executor delta into a managed workspace and seal it through the
 /// same importer, store lock, cleanliness checks, and commit barrier as `run`.
+/// Returns `None` when the check's input commit is no longer the branch head;
+/// unlike agent edits, stale check output is discarded rather than integrated.
 pub(crate) async fn publish_and_seal_slot_delta(
     orch: &Orchestrator,
     store_dir: &Path,
@@ -638,7 +640,7 @@ pub(crate) async fn publish_and_seal_slot_delta(
     branch: &str,
     message: &str,
     author: Option<&PublicationIdentity>,
-) -> Result<PublishedSlotDelta, String> {
+) -> Result<Option<PublishedSlotDelta>, String> {
     let repository = request
         .repository
         .colocated_path()
@@ -667,7 +669,8 @@ pub(crate) async fn publish_and_seal_slot_delta(
     )
     .await?;
     let trace = guard.as_ref().map(|guard| guard.trace());
-    let landed = land_prepared_slot_delta(
+    let consume_receipt = prepared.available.consume_receipt;
+    let landed = land_prepared_check_delta(
         orch,
         &target,
         request,
@@ -678,33 +681,18 @@ pub(crate) async fn publish_and_seal_slot_delta(
         prepared,
     )
     .await;
-    // Receipt finalization talks to the object plane and the patch capture
-    // reads immutable commits; neither needs the store.
+    // Neither receipt finalization nor immutable patch capture needs the store.
     drop(guard);
-    let mut publication = match landed {
-        Ok(publication) => publication,
-        Err(error) => {
-            if let SlotPublicationError::Held {
-                consume_receipt: true,
-                ..
-            } = &error
-            {
-                if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
-                    log::warn!("held system-fix delta upload was not finalized: {error}");
-                }
-            }
-            return Err(error.to_string());
-        }
-    };
-    // The upload was validated and installed before either outcome was reached,
-    // so it is finalized on both.
-    if publication.consume_receipt {
+    if consume_receipt {
         if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
-            log::warn!("system-fix delta upload was not finalized: {error}");
+            log::warn!("check delta upload was not finalized: {error}");
         }
     }
-    publication.outcome.capture_patch(&target.repository);
-    let (commit, patch, landed_on_tested_base) = match publication.outcome {
+    let Some(mut outcome) = landed? else {
+        return Ok(None);
+    };
+    outcome.capture_patch(&target.repository);
+    let (commit, patch, landed_on_tested_base) = match outcome {
         SlotPublicationOutcome::Published {
             landed,
             export,
@@ -740,12 +728,65 @@ pub(crate) async fn publish_and_seal_slot_delta(
         .into_iter()
         .map(|change| change.path)
         .collect();
-    Ok(PublishedSlotDelta {
+    Ok(Some(PublishedSlotDelta {
         commit,
         patch,
         paths,
         landed_on_tested_base,
-    })
+    }))
+}
+
+/// Caller holds the store lock through both input validation and publication.
+#[allow(clippy::too_many_arguments)]
+async fn land_prepared_check_delta(
+    orch: &Orchestrator,
+    target: &RunnerPublicationTarget,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    message: &str,
+    author: Option<&PublicationIdentity>,
+    trace: Option<&JjStoreOperationTrace>,
+    prepared: PreparedSlot,
+) -> Result<Option<SlotPublicationOutcome>, String> {
+    // Check output is valid only for the tree it ran on. Unlike an agent's
+    // edits, a formatter delta must never be integrated onto a newer head.
+    // Compare under the publication lock, not at preparation time, so a commit
+    // arriving while this wave waits for the lock also supersedes the fold.
+    let head = cairn_vcs::resolve_coordinate(&target.store_dir, &target.branch)
+        .await
+        .map_err(|error| format!("resolve `{}` for check fold: {error}", target.branch))?;
+    let parent = git_output(
+        &target.repository,
+        &["rev-parse", &format!("{}^1", delta.delta_commit)],
+        "read check fold input commit",
+    )?;
+    if head != request.base_commit || head != delta.base_commit || parent != head {
+        return Ok(None);
+    }
+    let publication = slot_delta_publication(
+        target,
+        request,
+        delta,
+        message,
+        author,
+        trace,
+        prepared.run_id.as_deref(),
+        prepared.prior_since_ms,
+    );
+    // Do not use the agent-delta hold path: a failed formatter publication must
+    // not become a held delta that a later drain can replay onto a newer head.
+    // The available delta's pin stays alive through the publication attempt.
+    publish_available_delta(orch, &publication, prepared.plan)
+        .await
+        .map(Some)
+        .map_err(|error| match error {
+            PublishFailure::Failed(error) => error,
+            PublishFailure::Retired(retired) => retired.to_string(),
+            PublishFailure::Conflicted { head, paths } => format!(
+                "check output discarded: branch moved to {head}; conflicting paths: {}",
+                paths.join(", ")
+            ),
+        })
 }
 
 fn validate_publication_identity(
@@ -2523,11 +2564,8 @@ pub(crate) mod slot_publication_tests {
         receipt
     }
 
-    /// A managed upload is validated and installed before the runner discovers
-    /// the branch already carries its content, so it has been fully handled and
-    /// its receipt has to be finalized — exactly as on the published path. This
-    /// is what the flag living beside the outcome rather than inside it buys:
-    /// no branch can be written that skips it.
+    /// A superseded check upload is fully handled even when the newer head
+    /// already carries its content: discard it and finalize its receipt.
     #[tokio::test]
     #[serial_test::serial(jj)]
     async fn an_already_landed_managed_delta_still_finalizes_its_upload() {
@@ -2557,14 +2595,9 @@ pub(crate) mod slot_publication_tests {
         .await
         .expect("an already-landed managed delta is a success, not a failure");
 
-        assert_eq!(
-            published.commit, fx.head,
-            "nothing new was committed: the reported commit is the head that already carries it"
-        );
-        assert!(published.paths.is_empty());
         assert!(
-            !published.landed_on_tested_base,
-            "the head carrying the fix is a sibling's commit, not the one the batch ran on"
+            published.is_none(),
+            "a newer head supersedes the check output"
         );
         assert_eq!(
             fx.bookmark(),
@@ -2577,13 +2610,11 @@ pub(crate) mod slot_publication_tests {
         );
     }
 
-    /// A write-check fix published while the branch stood still lands on the
-    /// commit the batch tested; one merged onto a head that advanced mid-batch
-    /// does not, and says so, because the published commit then carries code no
-    /// check in the batch ran against.
+    /// Even a disjoint advance supersedes check output. Only the unmoved case
+    /// publishes; ordinary agent deltas retain their separate merge behavior.
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn a_fix_merged_onto_an_advanced_head_reports_it_left_the_tested_base() {
+    async fn a_check_fix_publishes_only_on_its_tested_base() {
         for (advance, expected) in [
             (None, true),
             (Some(&[("advanced.rs", "after\n")][..]), false),
@@ -2605,13 +2636,317 @@ pub(crate) mod slot_publication_tests {
             .await
             .expect("a clean fix publishes");
             assert_eq!(
-                published.landed_on_tested_base,
+                published.is_some(),
                 expected,
                 "advance={}",
                 advance.is_some()
             );
-            assert_eq!(fx.blob(&published.commit, "mine.rs"), "formatted");
+            if let Some(published) = published {
+                assert!(published.landed_on_tested_base);
+                assert_eq!(fx.blob(&published.commit, "mine.rs"), "formatted");
+            } else {
+                assert_eq!(fx.bookmark(), fx.head);
+                assert_eq!(fx.blob(&fx.head, "mine.rs"), "base");
+            }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_stale_check_fold_never_restores_a_removed_line() {
+        let fx = straddle(
+            Some(&[("mine.rs", "")]),
+            &[("mine.rs", "base\nformatted\n")],
+        )
+        .await
+        .expect("jj is required for the check-fold regression");
+        let orch = orchestrator().await;
+        assert_eq!(fx.blob(&fx.base, "mine.rs"), "base");
+        assert_eq!(fx.blob(&fx.head, "mine.rs"), "");
+
+        let published = publish_and_seal_slot_delta(
+            &orch,
+            &fx.repository,
+            &fx.request,
+            &fx.delta,
+            "feature",
+            "fix: apply write-check changes",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(published.is_none());
+        assert_eq!(fx.bookmark(), fx.head);
+        assert_eq!(
+            fx.blob(&fx.bookmark(), "mine.rs"),
+            "",
+            "commit 2's removal survives the late fold of commit 1"
+        );
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", "refs/heads/feature"]),
+            fx.head,
+            "neither the store bookmark nor the exported Git ref moves"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_check_fold_prepared_before_a_removal_is_withdrawn_at_landing() {
+        let fx = straddle(None, &[("mine.rs", "base\nformatted\n")])
+            .await
+            .expect("jj is required for the check-fold regression");
+        let orch = orchestrator().await;
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "fix", None)
+                .await
+                .unwrap();
+        assert_eq!(prepared.plan.as_ref().unwrap().head, fx.base);
+        let sibling = side_commit(&fx, &fx.base, &[("mine.rs", "")]);
+        let moved = crate::jj::publish_logical_head_exported(
+            &fx.jj,
+            &fx.repository,
+            "feature",
+            &fx.base,
+            crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
+            None,
+            cairn_vcs::PublicationMode::Child {
+                description: "remove line".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .landed
+        .head;
+        let _guard = acquire_store_lock(
+            &orch,
+            Some(&fx.repository),
+            crate::orchestrator::StoreLockClass::Foreground,
+            "check-fold regression",
+            STORE_LOCK_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let outcome = land_prepared_check_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "fix",
+            None,
+            None,
+            prepared,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(fx.bookmark(), moved);
+        assert_eq!(fx.blob(&moved, "mine.rs"), "");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_check_fold_prepared_before_base_replay_preserves_the_new_base() {
+        let mut fx = straddle(None, &[("mine.rs", "formatted\n")])
+            .await
+            .expect("jj is required for the check-fold regression");
+        let orch = orchestrator().await;
+        let original_base = fx.base.clone();
+        let source = side_commit(&fx, &original_base, &[("mine.rs", "unformatted\n")]);
+        // A bookmark target must be indexed by jj, not merely present in Git.
+        git(
+            &fx.repository,
+            &["update-ref", "refs/heads/source", &source],
+        );
+        fx.jj
+            .run(&fx.repository, &["git", "import"], "import source")
+            .unwrap();
+        cairn_vcs::repoint_bookmark_if_unchanged(
+            &fx.repository,
+            "feature",
+            std::slice::from_ref(&original_base),
+            &source,
+            "land source",
+        )
+        .unwrap();
+        fx.jj
+            .run(&fx.repository, &["git", "export"], "export source")
+            .unwrap();
+        fx.base = source.clone();
+        fx.head = source.clone();
+        fx.request.base_commit = source.clone();
+        fx.delta.base_commit = source.clone();
+        fx.delta.delta_commit = side_commit(&fx, &source, &[("mine.rs", "formatted\n")]);
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "fix", None)
+                .await
+                .unwrap();
+
+        // Replay the source change onto a newer main, rather than adding a
+        // sibling child to its old head. The old source is not an ancestor.
+        let new_main = side_commit(
+            &fx,
+            &original_base,
+            &[("advanced.rs", "new base dependency\n")],
+        );
+        let replayed = side_commit(&fx, &new_main, &[("mine.rs", "unformatted\n")]);
+        git(
+            &fx.repository,
+            &["update-ref", "refs/heads/replayed", &replayed],
+        );
+        fx.jj
+            .run(&fx.repository, &["git", "import"], "import replay")
+            .unwrap();
+        cairn_vcs::repoint_bookmark_if_unchanged(
+            &fx.repository,
+            "feature",
+            std::slice::from_ref(&source),
+            &replayed,
+            "replay onto main",
+        )
+        .unwrap();
+        fx.jj
+            .run(&fx.repository, &["git", "export"], "export replay")
+            .unwrap();
+        assert!(!git_is_ancestor(&fx.repository, &source, &replayed));
+
+        let _guard = acquire_store_lock(
+            &orch,
+            Some(&fx.repository),
+            crate::orchestrator::StoreLockClass::Foreground,
+            "check-fold replay regression",
+            STORE_LOCK_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let outcome = land_prepared_check_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "fix",
+            None,
+            None,
+            prepared,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(fx.bookmark(), replayed);
+        assert_eq!(fx.blob(&replayed, "advanced.rs"), "new base dependency");
+        assert_eq!(fx.blob(&replayed, "mine.rs"), "unformatted");
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", "refs/heads/feature"]),
+            replayed
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_check_fold_rejects_an_unpublished_carried_parent() {
+        let fx = straddle(None, &[("mine.rs", "unpublished\n")])
+            .await
+            .expect("jj is required for the check-fold regression");
+        let orch = orchestrator().await;
+        let (request, delta) = absorbing_delta(&fx, &[("mine.rs", "formatted\n")]);
+        assert_eq!(request.base_commit, fx.head);
+        assert_eq!(delta.base_commit, fx.head);
+        let published = publish_and_seal_slot_delta(
+            &orch,
+            &fx.repository,
+            &request,
+            &delta,
+            "feature",
+            "fix",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(published.is_none());
+        assert_eq!(fx.bookmark(), fx.head);
+        assert_eq!(fx.blob(&fx.head, "mine.rs"), "base");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_failed_check_publication_cannot_be_replayed_after_a_removal() {
+        let fx = straddle(None, &[("mine.rs", "base\nformatted\n")])
+            .await
+            .expect("jj is required for the check-fold regression");
+        let orch = orchestrator().await;
+        // Simulate a transient fence-read failure after input validation.
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "ALTER TABLE jj_branch_recoveries RENAME TO unavailable_recoveries",
+                        (),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let error = publish_and_seal_slot_delta(
+            &orch,
+            &fx.repository,
+            &fx.request,
+            &fx.delta,
+            "feature",
+            "fix",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("recovery fences could not be read"),
+            "{error}"
+        );
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "ALTER TABLE unavailable_recoveries RENAME TO jj_branch_recoveries",
+                        (),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(held::held_rows(&orch.db.local, "project", "feature")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!ref_exists(&fx, "refs/cairn/stranded/attempt-3231"));
+
+        let sibling = side_commit(&fx, &fx.base, &[("mine.rs", "")]);
+        let moved = crate::jj::publish_logical_head_exported(
+            &fx.jj,
+            &fx.repository,
+            "feature",
+            &fx.base,
+            crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
+            None,
+            cairn_vcs::PublicationMode::Child {
+                description: "remove line".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .landed
+        .head;
+        assert!(
+            held::drain_held_publications(&orch, "project", "feature", None)
+                .await
+                .is_empty()
+        );
+        assert_eq!(fx.bookmark(), moved);
+        assert_eq!(fx.blob(&moved, "mine.rs"), "");
     }
 
     /// The one publication failure that leaves real work behind. Divergent edits
@@ -3343,11 +3678,11 @@ pub(crate) mod slot_publication_tests {
         );
     }
 
-    /// A held managed upload was installed exactly as a published one is, so
-    /// its staging copy is spent the same way.
+    /// A check fold whose head cannot be read fails closed and finalizes its
+    /// upload rather than leaving stale formatting available for later replay.
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn a_held_managed_delta_still_finalizes_its_upload() {
+    async fn an_unresolvable_check_branch_still_finalizes_its_upload() {
         let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
             eprintln!("skipping a_held_managed_delta: jj not resolvable");
             return;
@@ -3368,9 +3703,9 @@ pub(crate) mod slot_publication_tests {
         .await
         .expect_err("a branch that does not exist cannot take the fix");
 
-        assert!(error.contains("Do not redo"), "{error}");
+        assert!(error.contains("for check fold"), "{error}");
         assert!(orch.object_plane.staged_delta(&receipt).is_none());
-        assert_eq!(held_status(&orch, "attempt-3231").await.0, "held");
+        assert_eq!(fx.bookmark(), fx.head);
     }
 }
 

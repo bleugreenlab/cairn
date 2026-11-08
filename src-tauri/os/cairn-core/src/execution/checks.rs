@@ -8191,7 +8191,15 @@ async fn run_write_checks_after_seal_inner(
         )
         .await;
         let published = match published {
-            Ok(published) => published,
+            Ok(Some(published)) => published,
+            Ok(None) => {
+                return Some(
+                    "Checks: \u{22EF} superseded — the branch advanced before this wave's fix landed. \
+                     The stale fix was discarded without changing the branch or recording verdicts. \
+                     Read cairn:~/checks for the branch's current verdicts."
+                        .into(),
+                );
+            }
             Err(error) => {
                 let patch = delta_patch_excerpt(repo_root, &delta);
                 return Some(format!(
@@ -8213,28 +8221,7 @@ async fn run_write_checks_after_seal_inner(
             "db-change",
             serde_json::json!({"table": "check_result_cache", "action": "invalidate"}),
         );
-        // The branch moved while this wave ran (the caller may have answered
-        // pending and committed again), so the fix merged onto a newer head.
-        // Re-verifying there is only meaningful under the contract this wave
-        // planned with; if that commit changed the contract, its own cadence
-        // owns its verdicts and this wave records none.
-        if !published.landed_on_tested_base {
-            let same_contract =
-                load_checks_contract_at_commit(&object_repository, &published.commit)
-                    .await
-                    .is_some_and(|at_fix| {
-                        at_fix.contract.checks == checks
-                            && at_fix.contract.extra_inputs == extra_inputs
-                    });
-            if !same_contract {
-                return Some(format!(
-                    "Checks: \u{22EF} superseded \u{2014} the branch advanced before this wave's fix landed. \
-                     The fix merged onto the newer head as {}, which declares different checks, so this \
-                     wave records no verdicts. Read cairn:~/checks for the branch's current verdicts.",
-                    published.commit.get(..12).unwrap_or(&published.commit)
-                ));
-            }
-        }
+        debug_assert!(published.landed_on_tested_base);
         let rekeyed = rekey_wave_onto_fix(
             orch,
             WriteCheckBatchRequest {
