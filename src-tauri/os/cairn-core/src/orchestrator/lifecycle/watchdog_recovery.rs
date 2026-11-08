@@ -13,7 +13,7 @@ use crate::runs::watchdog_ledger::{
 };
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
 
-use super::{kill_session_with_reason, PROVIDER_SILENCE_RECOVERY_EXIT_REASON};
+use super::{kill_session_with_reason, TerminalPolicy, PROVIDER_SILENCE_RECOVERY_EXIT_REASON};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderWatchdogRecovery {
@@ -214,6 +214,9 @@ pub(super) struct CurrentRecoveryTarget {
 
 pub(crate) const ALREADY_TERMINAL_RECONCILED_REASON: &str =
     "provider_silence_already_terminal_reconciled";
+/// The lease's turn had already ended when recovery came to act on it, so the
+/// recovery stood down: nothing killed, no successor reserved.
+pub(crate) const TARGET_TURN_COMPLETED_REASON: &str = "target_turn_completed";
 const RECOVERY_SUCCESSOR_BUDGET: i64 = 3;
 const RECOVERY_SUCCESSOR_WINDOW_SECS: i64 = 30 * 60;
 
@@ -525,10 +528,76 @@ pub fn recover_provider_watchdog(
             }
         }
     }
+    // Everything below ends the run's process. A claim is taken on a deadline
+    // that passed earlier, and the turn it names may have completed (and the
+    // job moved on) since, so the turn is judged again at the moment of acting,
+    // under the lock that admits the job's next turn.
+    let launch_lock = orch.job_launch_lock(&target.job_id);
+    let check_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let claimed_target = target;
+    let target = match current_recovery_target(db.clone(), identity, claimed_at) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            drop(check_guard);
+            let reason = "watchdog_target_no_longer_current";
+            finish_recovery(db, identity, claimed_at, true, reason, None, now)?;
+            return Ok(ProviderWatchdogRecovery::Recovered {
+                reason: reason.to_string(),
+                successor: None,
+            });
+        }
+        Err(error) => {
+            drop(check_guard);
+            let reason = "watchdog_target_validation_failed";
+            finish_recovery(db, identity, claimed_at, false, reason, None, now)?;
+            return Err(format!(
+                "failed to revalidate watchdog recovery target for run {}: {error}",
+                identity.run_id
+            ));
+        }
+    };
+    if let Some(evidence) = watched_turn_end(orch, identity, &claimed_target, &target) {
+        drop(check_guard);
+        record_lifecycle(
+            db.clone(),
+            identity,
+            WatchdogLifecycleKind::TerminalizationSucceeded,
+            Some(TARGET_TURN_COMPLETED_REASON),
+            Some(serde_json::json!({
+                "evidence": evidence,
+                "claimed_turn_id": claimed_target.cairn_turn_id,
+                "current_turn_id": target.cairn_turn_id,
+                "observed_turn_state": target.turn_state,
+                "observed_job_status": target.job_status,
+                "outcome": "stale_target_noop"
+            })),
+            now,
+        );
+        finish_recovery(
+            db,
+            identity,
+            claimed_at,
+            true,
+            TARGET_TURN_COMPLETED_REASON,
+            None,
+            now,
+        )?;
+        return Ok(ProviderWatchdogRecovery::Recovered {
+            reason: TARGET_TURN_COMPLETED_REASON.to_string(),
+            successor: None,
+        });
+    }
+    // Reached with a settled turn only when this host holds no process for the
+    // run: the kill then has nothing to stop and finalizes the orphaned row.
+    let settled_without_successor =
+        target.turn_state == "complete" && target.job_status == "complete";
     if !settled_without_successor {
         match reserve_recovery_successor(db.clone(), identity, &target.job_id, now) {
             SuccessorReservation::Reserved => {}
             SuccessorReservation::BudgetExhausted => {
+                drop(check_guard);
                 finish_recovery(
                     db,
                     identity,
@@ -544,6 +613,7 @@ pub fn recover_provider_watchdog(
                 ));
             }
             SuccessorReservation::Undetermined(error) => {
+                drop(check_guard);
                 record_lifecycle(
                     db.clone(),
                     identity,
@@ -568,10 +638,15 @@ pub fn recover_provider_watchdog(
             }
         }
     }
+    // Exit bookkeeping can resume the job and must run outside the launch lock.
+    drop(check_guard);
+    // The job continues in a successor, so its background terminals stay up for
+    // it: a compile or dev server is the job's work, not the silent process's.
     if let Err(error) = kill_session_with_reason(
         orch,
         &identity.run_id,
         PROVIDER_SILENCE_RECOVERY_EXIT_REASON,
+        TerminalPolicy::Keep,
     ) {
         record_lifecycle(
             db.clone(),
@@ -596,7 +671,6 @@ pub fn recover_provider_watchdog(
         ));
     }
 
-    let launch_lock = orch.job_launch_lock(&target.job_id);
     let launch_guard = launch_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -805,6 +879,47 @@ pub fn recover_provider_watchdog(
             successor,
         })
     }
+}
+
+/// What says the turn a recovery claimed is already over, read at the moment
+/// the recovery would end its process; `None` when nothing does.
+///
+/// Only a process this host holds can testify about the turn it serves. With
+/// none, the kill that follows has nothing to stop and is what finalizes the
+/// orphaned row, so it is still owed. The provider's own answer outranks
+/// Cairn's turn row and warm state, which are the fallback only when the
+/// provider cannot say.
+fn watched_turn_end(
+    orch: &Orchestrator,
+    identity: &WatchdogIdentity,
+    claimed: &CurrentRecoveryTarget,
+    current: &CurrentRecoveryTarget,
+) -> Option<&'static str> {
+    if current.cairn_turn_id != claimed.cairn_turn_id {
+        return Some("job_turn_advanced");
+    }
+    if orch.process_state.has_process(&identity.run_id) != Some(true) {
+        return None;
+    }
+    match crate::backends::stdin::provider_serves_turn(
+        &orch.process_state,
+        &identity.run_id,
+        &identity.provider_turn_id,
+    ) {
+        Some(false) => return Some("provider_turn_terminal_observed"),
+        // The provider never ended the turn, whatever Cairn's rows say: a
+        // settled Cairn turn or a warm run over it is a provider wedged
+        // mid-turn, which is what the watchdog exists to end.
+        Some(true) => return None,
+        None => {}
+    }
+    if current.turn_state == "complete" {
+        return Some("cairn_turn_complete");
+    }
+    if orch.process_state.is_warm(&identity.run_id) {
+        return Some("run_warm_idle");
+    }
+    None
 }
 
 fn successor_is_started(orch: &Orchestrator, successor: &(String, String)) -> bool {

@@ -288,22 +288,36 @@ pub(super) async fn dispatch(
                         "payload.confirmed must be true to confirm a gated artifact; there is no 'unconfirm' (omit the key to edit artifact data)",
                     ));
                 }
+                // The confirmer is the run this request authenticated as. A
+                // resource write never carries operator authority: the
+                // operator confirms through the `approve_job` invoke.
+                let confirmer = match request.run_id.as_deref().filter(|run| !run.is_empty()) {
+                    Some(run_id) => {
+                        crate::execution::checkpoints::Confirmer::AgentRun(run_id.to_string())
+                    }
+                    None => crate::execution::checkpoints::Confirmer::Unproven(
+                        "resource write from outside a run",
+                    ),
+                };
                 if dry_run {
+                    let job_id = crate::resources::resolve_node_or_task_job_id_for_read(
+                        &orch.db.local,
+                        project,
+                        *number,
+                        *exec_seq,
+                        node_id,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
                     if let Some(name) = name.as_deref() {
-                        let job_id = crate::resources::resolve_node_or_task_job_id_for_read(
-                            &orch.db.local,
-                            project,
-                            *number,
-                            *exec_seq,
-                            node_id,
-                            None,
-                        )
-                        .await
-                        .map_err(|error| build_failure(index, item, error))?;
                         require_own_artifact_chain(orch, &job_id, node_id, name)
                             .await
                             .map_err(|error| build_failure(index, item, error))?;
                     }
+                    crate::execution::checkpoints::check_confirmation(orch, &job_id, &confirmer)
+                        .await
+                        .map_err(|error| build_failure(index, item, error.to_string()))?;
                     format!("Would confirm artifact {node_id}/{artifact_label}")
                 } else {
                     let job_id = crate::resources::resolve_node_or_task_job_id(
@@ -321,9 +335,11 @@ pub(super) async fn dispatch(
                             .await
                             .map_err(|error| build_failure(index, item, error))?;
                     }
-                    crate::execution::checkpoints::approve_job_inner(orch, &job_id)
-                        .await
-                        .map_err(|error| build_failure(index, item, error))?;
+                    crate::execution::checkpoints::confirm_gated_artifact(
+                        orch, &job_id, &confirmer,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error.to_string()))?;
                     format!("Confirmed artifact {node_id}/{artifact_label}; gate resolved")
                 }
             } else if dry_run {

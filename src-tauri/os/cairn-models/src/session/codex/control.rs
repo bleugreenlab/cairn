@@ -155,6 +155,13 @@ impl CodexControl {
         }
     }
 
+    /// Whether `turn_id` is still the provider turn this thread is serving. The
+    /// session's reader clears the slot the moment it observes the turn's
+    /// terminal notification, before any of Cairn's completion bookkeeping.
+    pub fn serves_turn(&self, turn_id: &str) -> Result<bool, String> {
+        Ok(self.cached_turn_id()?.as_deref() == Some(turn_id))
+    }
+
     pub fn get_goal(&self) -> Result<Option<Goal>, String> {
         let value = self.client.send_request(
             "thread/goal/get",

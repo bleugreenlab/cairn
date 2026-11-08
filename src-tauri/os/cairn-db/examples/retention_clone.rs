@@ -1,4 +1,13 @@
-//! Clone-only rehearsal of the retention evictor (`storage::retention`).
+//! Retention rehearsals and a bounded synthetic migration probe.
+//!
+//! `synthetic <temp-root>` (Linux) creates a fresh temporary DB under
+//! `<temp-root>`, applies every migration before the historical-observation
+//! relink through the real MigrationRunner, seeds post-trim attribution rows
+//! (no jobId, requestId, failureNames or failureKind; name and ranAt kept)
+//! with unique, missed, ambiguous, undated and already-cited lanes, then times
+//! the relink and checks every row against the expected result. The
+//! directory is removed before the report prints. A synthetic measurement,
+//! not a clone measurement.
 //!
 //! Point it at an APFS clone of the three-file set, never at the live file:
 //!
@@ -12,6 +21,7 @@
 //! extension; cairn/5590). Each prints one JSON document on stdout:
 //!
 //!   fold <db>                  TRUNCATE-checkpoint the clone's logical log
+//!   migration <db> <name>      apply one named pending migration, timed as at boot
 //!   sql <db> <statement>       one ad-hoc statement, rows as JSON
 //!   catchup <db> <now> <rules> run the evictor (`retention::run_rules`) to
 //!                              completion at clock `now` (unix seconds; use the
@@ -80,7 +90,10 @@ type Res<T> = Result<T, String>;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(path) = args.get(1) {
+    if let Some(path) = args
+        .get(1)
+        .filter(|_| args.first().map(String::as_str) != Some("synthetic"))
+    {
         if let Err(error) = check_path(path) {
             eprintln!("retention_clone: {error}");
             std::process::exit(2);
@@ -92,8 +105,10 @@ async fn main() {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["synthetic", root] => synthetic_migration(root).await,
         ["fold", db] => fold(db).await,
         ["sql", db, sql] => adhoc(db, sql).await,
+        ["migration", db, name] => migration(db, name).await,
         ["catchup", db, now, rules] => catchup(db, now, rules).await,
         ["logdelta", db, sql] => logdelta(db, sql).await,
         ["loadfold", db, mib, threads, fsync] => loadfold(db, mib, threads, fsync).await,
@@ -151,6 +166,25 @@ async fn fold(path: &str) -> Res<Json> {
         "checkpoint_s": report.duration.as_secs_f64(),
         "error": report.error,
     }))
+}
+
+async fn migration(path: &str, name: &str) -> Res<Json> {
+    use cairn_db::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    let migration = TURSO_MIGRATIONS
+        .iter()
+        .find(|migration| migration.name() == name)
+        .ok_or_else(|| format!("unknown migration: {name}"))?;
+    let (db, open_s) = open(path).await?;
+    let started = Instant::now();
+    let applied = MigrationRunner::new(vec![*migration])
+        .run(&db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if applied.is_empty() {
+        return Err(format!("{name} already applied; no migration was timed"));
+    }
+    Ok(json!({ "open_s": open_s, "migration": name,
+        "seconds": started.elapsed().as_secs_f64(), "applied": applied }))
 }
 
 async fn adhoc(path: &str, sql: &str) -> Res<Json> {
@@ -1117,4 +1151,611 @@ fn json_value(value: Value) -> Json {
         Value::Text(t) => json!(t),
         Value::Blob(b) => json!(format!("<blob {} bytes>", b.len())),
     }
+}
+
+// The live store's historical attribution rows after the original 0393 ran:
+// lanes keep name, ranAt, state and counts, but no jobId, requestId,
+// failureNames or failureKind. The job is recovered from the attribution's
+// merge request, and the observation by an exact (job, check name, ranAt)
+// match.
+const SYNTHETIC_ROWS: usize = 3659;
+const SYNTHETIC_LANES: usize = 41;
+const SYNTHETIC_OBSERVATIONS: usize = 135_000;
+/// Two attribution rows per merge request (merge plus a re-journal), so a
+/// job's observation catalog is shared by rows that must not cite each other.
+const ROWS_PER_MR: usize = 2;
+const FORWARD_MIGRATION: &str = "relink_pr_resolution_lane_observations";
+
+/// What a historical lane offers the forward migration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LaneCase {
+    /// Exactly one observation of the row's job, this check and this ranAt.
+    /// Lanes 5, 15, 25 and 35 carry `observation: null`, which is no citation.
+    Unique,
+    /// None of the row's job; one of another job with the same name and ranAt.
+    Miss,
+    /// Two observations of the row's job, this check and this ranAt.
+    Ambiguous,
+    /// ranAt null (even lanes) or absent (odd lanes); a same-job, same-name
+    /// observation exists at another time.
+    NoRanAt,
+    /// Already carries a citation (`observationId`, or an `observation` object
+    /// on odd lanes) and also has a unique match that must not replace it.
+    Cited,
+}
+
+/// Rows with lanes are two in three; a third of those have only null or
+/// absent ranAt, which puts the share of lane-bearing rows with a real ranAt
+/// near the live 1,643 of 2,386.
+fn row_has_lanes(row: usize) -> bool {
+    row % 3 != 2
+}
+
+fn lane_case(row: usize, lane: usize) -> LaneCase {
+    if (row / 3) % 10 < 3 {
+        return LaneCase::NoRanAt;
+    }
+    match lane % 5 {
+        0 => LaneCase::Unique,
+        1 => LaneCase::Miss,
+        2 => LaneCase::Ambiguous,
+        3 => LaneCase::NoRanAt,
+        _ => LaneCase::Cited,
+    }
+}
+
+fn row_job(row: usize) -> String {
+    format!("job-{:04}", row / ROWS_PER_MR)
+}
+
+fn lane_ran_at(row: usize, lane: usize) -> i64 {
+    1_762_000_000_000 + (row as i64) * 100 + lane as i64
+}
+
+fn lane_name(lane: usize) -> String {
+    format!("check-{lane:02}")
+}
+
+fn post_trim_lane(row: usize, lane: usize) -> Json {
+    let case = lane_case(row, lane);
+    let mut value = json!({
+        "cached": false, "complete": true, "deferred": false, "durationMs": 1422,
+        "failed": 1, "name": lane_name(lane), "passed": 120, "policy": "advisory",
+        "ranAt": lane_ran_at(row, lane), "skipped": 0, "state": "failed",
+        "suiteFailures": 1, "suppressedAfter": null, "when": "review",
+        "verifiedOn": {"head": "0123456789abcdef"}
+    });
+    let object = value.as_object_mut().unwrap();
+    match case {
+        LaneCase::NoRanAt if lane.is_multiple_of(2) => {
+            object.insert("ranAt".into(), Json::Null);
+        }
+        LaneCase::NoRanAt => {
+            object.remove("ranAt");
+        }
+        LaneCase::Cited if lane.is_multiple_of(2) => {
+            object.insert(
+                "observationId".into(),
+                json!(format!("cited-{row:04}-{lane:02}")),
+            );
+        }
+        LaneCase::Cited => {
+            object.insert(
+                "observation".into(),
+                json!({"kind": "cited", "id": format!("cited-{row:04}-{lane:02}")}),
+            );
+        }
+        LaneCase::Unique if lane % 10 == 5 => {
+            object.insert("observation".into(), Json::Null);
+        }
+        _ => {}
+    }
+    value
+}
+
+fn post_trim_snapshot(row: usize) -> Json {
+    let mut value = json!({
+        "execution": {"executionStatus": "complete",
+            "jobs": [{"node": "builder", "status": "complete"}]}
+    });
+    if row_has_lanes(row) {
+        value["systematicChecks"] = (0..SYNTHETIC_LANES)
+            .map(|lane| post_trim_lane(row, lane))
+            .collect();
+    } else if row % 6 == 2 {
+        value["systematicChecks"] = json!([]);
+    }
+    value
+}
+
+/// The observations each lane's case calls for: (id, job, check, ran_at).
+fn key_observations(row: usize, lane: usize) -> Vec<(String, String, String, i64)> {
+    let (job, name, ran_at) = (row_job(row), lane_name(lane), lane_ran_at(row, lane));
+    let id = |tag: &str| format!("{tag}-{row:04}-{lane:02}");
+    match lane_case(row, lane) {
+        LaneCase::Unique => vec![
+            (id("obs"), job.clone(), name.clone(), ran_at),
+            // Same job and check one millisecond later: not exact.
+            (id("near"), job, name, ran_at + 1),
+        ],
+        LaneCase::Miss => vec![(id("otherjob"), format!("other-{job}"), name, ran_at)],
+        LaneCase::Ambiguous => vec![
+            (id("ambig-a"), job.clone(), name.clone(), ran_at),
+            (id("ambig-b"), job, name, ran_at),
+        ],
+        LaneCase::NoRanAt if lane.is_multiple_of(4) || (row / 3) % 10 >= 3 => {
+            vec![(id("undated"), job, name, ran_at)]
+        }
+        LaneCase::NoRanAt => Vec::new(),
+        LaneCase::Cited => vec![(id("uncited"), job, name, ran_at)],
+    }
+}
+
+/// The lane snapshot the forward migration must produce: the input unchanged
+/// except a unique match gains the canonical citation new rows carry.
+fn expected_snapshot(row: usize) -> Json {
+    let mut value = post_trim_snapshot(row);
+    // `get_mut`, not `value[..]`: indexing would insert a null key into the
+    // rows that have none.
+    if let Some(lanes) = value
+        .get_mut("systematicChecks")
+        .and_then(Json::as_array_mut)
+    {
+        for (lane, entry) in lanes.iter_mut().enumerate() {
+            if lane_case(row, lane) == LaneCase::Unique {
+                entry["observation"] =
+                    json!({"kind": "cited", "id": format!("obs-{row:04}-{lane:02}")});
+            }
+        }
+    }
+    value
+}
+
+fn process_cpu_ticks() -> Res<[u64; 2]> {
+    let stat = std::fs::read_to_string("/proc/self/stat").map_err(|e| e.to_string())?;
+    // comm (field 2) may contain spaces or parentheses; fields after its final
+    // ')' start at state (3). utime/stime (14/15) include all process threads.
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .ok_or("malformed process stat")?
+        .1
+        .split_whitespace()
+        .collect();
+    let parse = |index: usize| -> Res<u64> {
+        fields
+            .get(index)
+            .ok_or("missing CPU stat")?
+            .parse()
+            .map_err(|e| format!("CPU stat: {e}"))
+    };
+    Ok([parse(11)?, parse(12)?])
+}
+
+fn linux_loads() -> Res<[f64; 3]> {
+    let text = std::fs::read_to_string("/proc/loadavg").map_err(|e| e.to_string())?;
+    let mut fields = text.split_whitespace();
+    let mut result = [0.0; 3];
+    for field in &mut result {
+        *field = fields
+            .next()
+            .ok_or("missing load")?
+            .parse()
+            .map_err(|e| format!("load: {e}"))?;
+    }
+    Ok(result)
+}
+
+async fn synthetic_fold(db: &LocalDb) -> Res<()> {
+    let fold = db
+        .checkpoint(3, Duration::from_millis(250), DrainBudget::PRODUCTION)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !fold.succeeded() {
+        return Err(format!("setup checkpoint failed: {:?}", fold.error));
+    }
+    Ok(())
+}
+
+/// Lane-level census of the attribution table, computed by SQL so it counts
+/// what the store holds rather than what the fixture intended.
+async fn lane_census(db: &LocalDb) -> Res<Json> {
+    let mut rows = db
+        .query_all(
+            "SELECT COUNT(DISTINCT a.id),
+                    COUNT(lane.key),
+                    SUM(CASE WHEN json_type(lane.value, '$.ranAt') IN ('integer','real') THEN 1 ELSE 0 END),
+                    COUNT(DISTINCT CASE WHEN json_type(lane.value, '$.ranAt') IN ('integer','real') THEN a.id END),
+                    SUM(CASE WHEN json_type(lane.value, '$.observationId') IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_extract(lane.value, '$.observation.kind') = 'cited' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_type(lane.value, '$.requestId') IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_type(lane.value, '$.jobId') IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_type(lane.value, '$.failureNames') IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_type(lane.value, '$.failureKind') IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN lane.type = 'object'
+                              AND json_type(lane.value, '$.ranAt') = 'integer'
+                              AND json_type(lane.value, '$.name') = 'text'
+                              AND COALESCE(json_type(lane.value, '$.observation'), 'null') = 'null'
+                              AND COALESCE(json_type(lane.value, '$.observationId'), 'null') = 'null'
+                             THEN 1 ELSE 0 END)
+               FROM pr_resolution_attributions a
+               JOIN json_each(a.lane_snapshot, '$.systematicChecks') AS lane
+              WHERE json_valid(a.lane_snapshot)
+                AND json_type(a.lane_snapshot, '$.systematicChecks') = 'array'",
+            (),
+            |row| {
+                Ok(json!({
+                    "rows_with_lanes": row.get::<i64>(0)?,
+                    "lanes": row.get::<i64>(1)?,
+                    "lanes_with_ranAt": row.get::<Option<i64>>(2)?.unwrap_or(0),
+                    "rows_with_a_ranAt_lane": row.get::<i64>(3)?,
+                    "lanes_with_observationId": row.get::<Option<i64>>(4)?.unwrap_or(0),
+                    "lanes_cited": row.get::<Option<i64>>(5)?.unwrap_or(0),
+                    "lanes_with_requestId": row.get::<Option<i64>>(6)?.unwrap_or(0),
+                    "lanes_with_jobId": row.get::<Option<i64>>(7)?.unwrap_or(0),
+                    "lanes_with_failureNames": row.get::<Option<i64>>(8)?.unwrap_or(0),
+                    "lanes_with_failureKind": row.get::<Option<i64>>(9)?.unwrap_or(0),
+                    // The relink's own candidate filter: uncited, integer ranAt.
+                    "uncited_integer_ranAt_lanes": row.get::<Option<i64>>(10)?.unwrap_or(0),
+                }))
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out = rows.pop().ok_or("missing lane census")?;
+    let totals = db
+        .query_all(
+            "SELECT COUNT(*), COALESCE(SUM(length(CAST(lane_snapshot AS BLOB))), 0)
+               FROM pr_resolution_attributions",
+            (),
+            |row| Ok((row.get::<i64>(0)?, row.get::<i64>(1)?)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let (count, bytes) = totals.first().copied().ok_or("missing totals")?;
+    out["rows"] = json!(count);
+    out["lane_snapshot_bytes"] = json!(bytes);
+    Ok(out)
+}
+
+async fn table_count(db: &LocalDb, table: &str) -> Res<i64> {
+    db.query_opt_i64(format!("SELECT COUNT(*) FROM {table}"), ())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("missing count for {table}"))
+}
+
+fn leftover_dirs(root: &str, prefix: &str) -> Res<Vec<String>> {
+    Ok(std::fs::read_dir(root)
+        .map_err(|e| format!("{root}: {e}"))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(prefix))
+        .collect())
+}
+
+const SYNTHETIC_PREFIX: &str = "synthetic-forward-";
+
+async fn synthetic_migration(root: &str) -> Res<Json> {
+    let leftovers_before = leftover_dirs(root, SYNTHETIC_PREFIX)?;
+    let dir = tempfile::Builder::new()
+        .prefix(SYNTHETIC_PREFIX)
+        .tempdir_in(root)
+        .map_err(|e| e.to_string())?;
+    // `dir` outlives everything that opens the database, so an early return
+    // drops the database first and then removes the directory.
+    let mut report = synthetic_run(&dir.path().join("synthetic.db")).await?;
+    dir.close().map_err(|e| format!("cleanup: {e}"))?;
+    report["cleanup"] = json!({
+        "tempdir_closed": true,
+        "same_prefix_dirs_before": leftovers_before,
+        "same_prefix_dirs_after": leftover_dirs(root, SYNTHETIC_PREFIX)?,
+    });
+    Ok(report)
+}
+
+async fn synthetic_run(path: &Path) -> Res<Json> {
+    use cairn_db::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
+    let setup_started = Instant::now();
+    let target = *TURSO_MIGRATIONS
+        .iter()
+        .find(|m| m.name() == FORWARD_MIGRATION)
+        .ok_or_else(|| format!("{FORWARD_MIGRATION} missing from TURSO_MIGRATIONS"))?;
+    let prior: Vec<_> = TURSO_MIGRATIONS
+        .iter()
+        .take_while(|m| m.name() != FORWARD_MIGRATION)
+        .copied()
+        .collect();
+    if !prior
+        .iter()
+        .any(|m| m.name() == "trim_pr_resolution_lane_snapshot")
+    {
+        return Err("the trim migration must precede the forward migration".into());
+    }
+    check_path(path.to_str().ok_or("non-UTF8 path")?)?;
+    let db = LocalDb::open(path).await.map_err(|e| e.to_string())?;
+    MigrationRunner::new(prior.clone())
+        .run(&db)
+        .await
+        .map_err(|e| e.to_string())?;
+    db.execute_script(
+        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES('p', 'w', 'P', 'p', '/tmp/p', 1, 1);
+         INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+          VALUES('i', 'p', 1, 'I', 'merged', 'merged', 'none', 1, 1);",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let mrs = SYNTHETIC_ROWS.div_ceil(ROWS_PER_MR);
+    for start in (0..mrs).step_by(256) {
+        db.write(move |conn| {
+            Box::pin(async move {
+                for mr in start..(start + 256).min(mrs) {
+                    let job = format!("job-{mr:04}");
+                    conn.execute(
+                        "INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+                         VALUES(?1, 'p', 'i', 'complete', 1, 1)",
+                        params![job.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title,
+                          source_branch, target_branch, status, opened_at, updated_at)
+                         VALUES(?1, ?2, 'p', 'i', 'PR', 'feature', 'main', 'merged', 1, 2)",
+                        params![format!("mr-{mr:04}").as_str(), job.as_str()],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    let mut observations = Vec::new();
+    let mut expected_cases = std::collections::BTreeMap::<String, usize>::new();
+    for row in (0..SYNTHETIC_ROWS).filter(|row| row_has_lanes(*row)) {
+        for lane in 0..SYNTHETIC_LANES {
+            *expected_cases
+                .entry(format!("{:?}", lane_case(row, lane)))
+                .or_default() += 1;
+            observations.extend(key_observations(row, lane));
+        }
+    }
+    let key_observation_count = observations.len();
+    if key_observation_count > SYNTHETIC_OBSERVATIONS {
+        return Err(format!(
+            "{key_observation_count} key observations exceed the catalog"
+        ));
+    }
+    // The rest of the catalog: the same jobs and checks at other times, so the
+    // match has to discriminate by ranAt within a job's own history.
+    for index in key_observation_count..SYNTHETIC_OBSERVATIONS {
+        observations.push((
+            format!("catalog-{index}"),
+            format!("job-{:04}", index % mrs),
+            lane_name(index % SYNTHETIC_LANES),
+            1_000 + index as i64,
+        ));
+    }
+    for (batch, chunk) in observations.chunks(256).enumerate() {
+        db.write(|conn| {
+            let chunk = chunk.to_vec();
+            Box::pin(async move {
+                for (id, job, name, ran_at) in &chunk {
+                    conn.execute(
+                        "INSERT INTO check_result_observations
+                         (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+                          environment_fingerprint, exit_code, verdict, failure_kind, complete,
+                          reusable, parser_version, result_schema_version, ran_at, duration_ms,
+                          cadence, output_tail, job_id)
+                         VALUES (?1,'p','c','t',?2,'i','env',1,'failed','testFailure',1,0,1,1,?3,
+                                 1422,'review','test failed',?4)",
+                        params![id.as_str(), name.as_str(), *ran_at, job.as_str()],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if batch % 8 == 7 {
+            synthetic_fold(&db).await?;
+        }
+    }
+    drop(observations);
+    synthetic_fold(&db).await?;
+
+    for start in (0..SYNTHETIC_ROWS).step_by(64) {
+        let batch: Vec<(String, String, String)> = (start..(start + 64).min(SYNTHETIC_ROWS))
+            .map(|row| {
+                (
+                    format!("attribution-{row:04}"),
+                    format!("mr-{:04}", row / ROWS_PER_MR),
+                    post_trim_snapshot(row).to_string(),
+                )
+            })
+            .collect();
+        db.write(|conn| {
+            let batch = batch.clone();
+            Box::pin(async move {
+                for (id, mr, value) in batch {
+                    conn.execute(
+                        "INSERT INTO pr_resolution_attributions
+                        (id, merge_request_id, action, actor_kind, surface, lane_snapshot, created_at)
+                        VALUES (?1, ?2, 'merge', 'operator-ui', 'operator-ui', ?3, 2)",
+                        params![id.as_str(), mr.as_str(), value.as_str()],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    synthetic_fold(&db).await?;
+
+    let before = lane_census(&db).await?;
+    let observations_before = table_count(&db, "check_result_observations").await?;
+    let mrs_before = table_count(&db, "merge_requests").await?;
+    let unique_lanes = expected_cases.get("Unique").copied().unwrap_or(0) as i64;
+    let cited_lanes = expected_cases.get("Cited").copied().unwrap_or(0) as i64;
+    if before["rows"] != json!(SYNTHETIC_ROWS)
+        || observations_before != SYNTHETIC_OBSERVATIONS as i64
+        || before["lanes_with_requestId"] != json!(0)
+        || before["lanes_with_jobId"] != json!(0)
+        || before["lanes_with_failureNames"] != json!(0)
+        || before["lanes_with_failureKind"] != json!(0)
+    {
+        return Err(format!("fixture mismatch: {before}"));
+    }
+    let setup_seconds = setup_started.elapsed().as_secs_f64();
+    eprintln!("synthetic setup complete in {setup_seconds:.3}s: {before}");
+
+    let ticks_per_second: f64 = {
+        let clock = std::process::Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !clock.status.success() {
+            return Err("getconf CLK_TCK failed".into());
+        }
+        String::from_utf8_lossy(&clock.stdout)
+            .trim()
+            .parse()
+            .map_err(|e| format!("CLK_TCK: {e}"))?
+    };
+    if ticks_per_second <= 0.0 {
+        return Err("invalid CLK_TCK".into());
+    }
+    let loads_before = linux_loads()?;
+    let migration_started_utc = chrono::Utc::now().to_rfc3339();
+    eprintln!("synthetic migration starting at {migration_started_utc}, loads {loads_before:?}");
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = done.clone();
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..300 {
+            if watchdog_done.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !watchdog_done.load(Ordering::Acquire) {
+            eprintln!("SYNTHETIC MIGRATION EXCEEDS 30 SECONDS");
+        }
+    });
+    let cpu_before = process_cpu_ticks()?;
+    let started = Instant::now();
+    let applied = MigrationRunner::new(vec![target]).run(&db).await;
+    let seconds = started.elapsed().as_secs_f64();
+    let cpu_after = process_cpu_ticks()?;
+    let loads_after = linux_loads()?;
+    done.store(true, Ordering::Release);
+    watchdog.join().map_err(|_| "watchdog panicked")?;
+    let cpu_user_seconds = (cpu_after[0] - cpu_before[0]) as f64 / ticks_per_second;
+    let cpu_system_seconds = (cpu_after[1] - cpu_before[1]) as f64 / ticks_per_second;
+    let applied = applied.map_err(|e| format!("migration failed after {seconds:.3}s: {e}"))?;
+    if applied.len() != 1 {
+        return Err(format!("expected one applied migration: {applied:?}"));
+    }
+    eprintln!("synthetic migration finished: {seconds:.3}s, loads {loads_after:?}");
+
+    let after = lane_census(&db).await?;
+    // Every row compared whole: lanes, untouched siblings, and the columns
+    // beside the snapshot. Any difference other than the expected citations
+    // fails the probe and names the row.
+    let mut mismatches = Vec::new();
+    for row in 0..SYNTHETIC_ROWS {
+        let id = format!("attribution-{row:04}");
+        let found = db
+            .query_all(
+                "SELECT lane_snapshot, merge_request_id, created_at
+                   FROM pr_resolution_attributions WHERE id = ?1",
+                params![id.as_str()],
+                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?, r.get::<i64>(2)?)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let (text, mr, created_at) = found.into_iter().next().ok_or("missing attribution")?;
+        let actual: Json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if actual != expected_snapshot(row)
+            || mr != format!("mr-{:04}", row / ROWS_PER_MR)
+            || created_at != 2
+        {
+            mismatches.push(id);
+        }
+    }
+    let observations_after = table_count(&db, "check_result_observations").await?;
+    let mrs_after = table_count(&db, "merge_requests").await?;
+    let lanes_with_ran_at = after["lanes_with_ranAt"].as_i64().unwrap_or(0);
+    let candidates = before["uncited_integer_ranAt_lanes"].as_i64().unwrap_or(0);
+    let modeled_candidates = ["Unique", "Miss", "Ambiguous"]
+        .iter()
+        .map(|case| expected_cases.get(*case).copied().unwrap_or(0) as i64)
+        .sum::<i64>();
+    let relinked =
+        after["lanes_cited"].as_i64().unwrap_or(0) - before["lanes_cited"].as_i64().unwrap_or(0);
+    let passed = mismatches.is_empty()
+        && relinked == unique_lanes
+        && candidates == modeled_candidates
+        && after["uncited_integer_ranAt_lanes"] == json!(candidates - relinked)
+        && after["lanes_with_requestId"] == json!(0)
+        && after["lanes_with_jobId"] == json!(0)
+        && after["lanes_with_observationId"] == before["lanes_with_observationId"]
+        && after["lanes"] == before["lanes"]
+        && observations_after == observations_before
+        && mrs_after == mrs_before;
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").map_err(|e| e.to_string())?;
+    let report = json!({
+        "measurement": "synthetic post-trim fixture, not a clone",
+        "migration": FORWARD_MIGRATION,
+        "prior_migrations_applied": prior.len(),
+        "host": host.trim(),
+        "rustc": String::from_utf8_lossy(&std::process::Command::new("rustc").arg("--version")
+            .output().map_err(|e| e.to_string())?.stdout).trim(),
+        "setup_seconds": setup_seconds,
+        "migration_started_utc": migration_started_utc,
+        "migration_wall_seconds": seconds,
+        "under_30s_cap": seconds < 30.0,
+        "cpu": {"method": "/proc/self/stat utime+stime, all threads, around MigrationRunner only",
+            "ticks_per_second": ticks_per_second, "user_seconds": cpu_user_seconds,
+            "system_seconds": cpu_system_seconds,
+            "total_seconds": cpu_user_seconds + cpu_system_seconds},
+        "load_before_1m_5m_15m": loads_before,
+        "load_after_1m_5m_15m": loads_after,
+        "applied": applied,
+        "fixture": {"rows": SYNTHETIC_ROWS, "lanes_per_lane_row": SYNTHETIC_LANES,
+            "rows_per_merge_request": ROWS_PER_MR, "merge_requests": mrs,
+            "observations": observations_before, "key_observations": key_observation_count,
+            "lane_cases": expected_cases,
+            "note": "Modeled distribution, not a captured live one."},
+        "before": before,
+        "after": after,
+        "acceptance": {
+            "relinked_lanes": relinked,
+            "candidate_lanes_uncited_integer_ranAt": candidates,
+            "relinked_of_candidates": format!("{relinked} / {candidates}"),
+            "candidates_left_uncited": after["uncited_integer_ranAt_lanes"],
+            "dated_lanes_including_cited": lanes_with_ran_at,
+            "relinked_of_dated_lanes": format!("{relinked} / {lanes_with_ran_at}"),
+            "expected_unique": unique_lanes,
+            "existing_citations_preserved": cited_lanes,
+            "rows_compared_whole": SYNTHETIC_ROWS,
+            "rows_mismatched": mismatches.len(),
+            "first_mismatches": mismatches.iter().take(5).collect::<Vec<_>>(),
+            "guessed_requestIds": after["lanes_with_requestId"],
+            "observations_unchanged": observations_after == observations_before,
+            "merge_requests_unchanged": mrs_after == mrs_before,
+            "passed": passed,
+        },
+    });
+    drop(db);
+    if !passed {
+        return Err(format!("acceptance failed: {}", report["acceptance"]));
+    }
+    Ok(report)
 }

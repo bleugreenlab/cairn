@@ -1411,9 +1411,12 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
     // 4. Hard-kill the old run now that the new one is live. Its link is gone so
     //    it journals nothing, and it is no longer the latest run so the await
     //    ignores it; the job stays live on the new run's turn.
-    if let Err(e) =
-        crate::orchestrator::lifecycle::kill_session_with_reason(orch, &old_run_id, "user_stop")
-    {
+    if let Err(e) = crate::orchestrator::lifecycle::kill_session_with_reason(
+        orch,
+        &old_run_id,
+        "user_stop",
+        crate::orchestrator::lifecycle::TerminalPolicy::Keep,
+    ) {
         log::warn!("restart_call: failed to kill prior run {old_run_id}: {e}");
     }
 

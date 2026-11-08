@@ -2,11 +2,12 @@ use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
     CellCommandClass, CellExecutionMeta, CommandResourceIdentity, CommandStop, ContentionEstimate,
-    ContentionEvidence, ContentionFallback, DurationEstimate, DurationEvidence, DurationFallback,
-    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
-    MemoryKill, ProcessDemandBasis, ReservationFallback, ReservationRationale,
-    DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT,
-    MIN_CONFIDENT_DURATION_SAMPLES, MIN_CONFIDENT_RESERVATION_SAMPLES,
+    ContentionEvidence, ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence,
+    DurationFallback, ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities,
+    MeasurementQuality, MemoryCeiling, MemoryKill, ProcessDemandBasis, ReservationFallback,
+    ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW,
+    MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
+    MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
 use std::sync::Arc;
@@ -404,9 +405,8 @@ pub(super) struct ProcessDemand {
     pub suite: Option<String>,
     /// The machine context (`device:executor`) the deciding number came from.
     pub measured_on: Option<String>,
-    /// Kills of this suite in this machine context, and the machine total
-    /// they happened at.
-    pub kills_here: Option<(u32, u64)>,
+    /// Kills of this suite in this machine context.
+    pub kills_here: Option<SuiteKills>,
     /// Whether the number was measured on this platform, borrowed from
     /// another, or is the project's class prior.
     pub basis: ProcessDemandBasis,
@@ -426,8 +426,8 @@ impl ProcessDemand {
         match (left, right) {
             (None, other) | (other, None) => other,
             (Some(left), Some(right)) => {
-                let kills = match (left.kills_here, right.kills_here) {
-                    (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
+                let kills = match (left.kills_here.clone(), right.kills_here.clone()) {
+                    (Some(a), Some(b)) => Some(if a.alone >= b.alone { a } else { b }),
                     (a, b) => a.or(b),
                 };
                 let mut larger = if right.peak_bytes > left.peak_bytes {
@@ -440,6 +440,135 @@ impl ProcessDemand {
             }
         }
     }
+}
+
+/// A suite's out-of-memory kills in one machine context, split by what each
+/// says about one process on this machine.
+///
+/// A kill while the victim ran alone is the machine's answer that one process
+/// of the suite does not fit it. A kill while other commands shared the
+/// machine is admission's over-commitment: evidence for the owed accounting
+/// and the memory brake, never for the single-process fit. Counting the second
+/// kind as the first excluded bginf-sp1 (121.7 GiB) from every Rust test lane
+/// for a 32.5 GiB rustc after three kills under nineteen stacked lanes and no
+/// memory brake (cairn/6496).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SuiteKills {
+    /// Kills while the victim ran alone, at `machine_total_bytes`, under
+    /// `memory_brake`. A kill at another total, or under another brake state,
+    /// started the count again.
+    pub alone: u32,
+    pub machine_total_bytes: u64,
+    /// Whether the machine's memory brake existed at the alone kills. `None`
+    /// for kills the ledger counted before it recorded their admission, all
+    /// of which predate the brake.
+    pub memory_brake: Option<bool>,
+    pub crowded: Option<CrowdedKills>,
+}
+
+impl SuiteKills {
+    /// These kills as the machine's admission now reads them. An alone kill
+    /// is read from the load at its command's start; with no brake, work
+    /// admitted after that start could crowd it unseen, so an alone kill under
+    /// another brake state than the machine's current one has lost its basis
+    /// and no longer counts (tenet 297).
+    pub(super) fn under_brake(mut self, memory_brake_now: bool) -> Self {
+        if self.memory_brake != Some(memory_brake_now) {
+            self.alone = 0;
+        }
+        self
+    }
+
+    /// Fold one kill in.
+    fn fold(mut self, kill: &SuiteKill, killed_at_unix_ms: u64) -> Self {
+        match (kill.admission.alone(), kill.machine_total_bytes) {
+            (true, Some(total)) => {
+                let same_regime = self.alone > 0
+                    && same_machine_total(self.machine_total_bytes, total)
+                    && self.memory_brake == Some(kill.admission.memory_brake);
+                self.alone = if same_regime { self.alone + 1 } else { 1 };
+                self.machine_total_bytes = total;
+                self.memory_brake = Some(kill.admission.memory_brake);
+            }
+            // Alone, but the machine's size was unread: nothing to count it
+            // against, as before.
+            (true, None) => {}
+            (false, _) => {
+                let prior = self.crowded.take();
+                let most_co_resident = match (
+                    prior.as_ref().and_then(|prior| prior.most_co_resident),
+                    kill.admission.co_resident_commands,
+                ) {
+                    (Some(held), Some(now)) => Some(held.max(now)),
+                    (held, now) => held.or(now),
+                };
+                self.crowded = Some(CrowdedKills {
+                    count: prior.as_ref().map_or(0, |prior| prior.count) + 1,
+                    most_co_resident,
+                    memory_brake: kill.admission.memory_brake,
+                    last_killed_at_unix_ms: prior
+                        .map_or(0, |prior| prior.last_killed_at_unix_ms)
+                        .max(killed_at_unix_ms),
+                });
+            }
+        }
+        self
+    }
+}
+
+/// What admission held on the machine when one of a suite's processes was
+/// killed there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct KillAdmission {
+    /// Commands that shared the machine with the victim when its command
+    /// started, batch siblings included. `None` where no load was stated,
+    /// which is never read as alone.
+    pub co_resident_commands: Option<u32>,
+    /// Whether the machine's memory brake existed: its stall instrument had
+    /// measured, so it could hold new work.
+    pub memory_brake: bool,
+}
+
+impl KillAdmission {
+    /// The admission one completion ran under.
+    pub(super) fn of(metadata: &CellExecutionMeta, machine: MachineAdmission) -> Self {
+        Self {
+            co_resident_commands: co_resident_commands(metadata, machine.batch_siblings),
+            memory_brake: machine.memory_brake,
+        }
+    }
+
+    fn alone(&self) -> bool {
+        self.co_resident_commands == Some(0)
+    }
+}
+
+/// What the runner knows of a machine's admission beside one completion that
+/// the completion's own metadata does not say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct MachineAdmission {
+    pub memory_brake: bool,
+    /// Items of the same parallel batch that ran beside this one.
+    pub batch_siblings: u32,
+}
+
+/// The commands that shared the machine with `metadata`'s when it started,
+/// from the load the executor stated plus `batch_siblings`, which the load
+/// cannot see. Work admitted after the start is invisible here, which is why
+/// an alone reading is only as good as the brake that kept such work off.
+fn co_resident_commands(metadata: &CellExecutionMeta, batch_siblings: u32) -> Option<u32> {
+    metadata.load_context.as_ref().map(|load| {
+        load.co_resident_compile_jobs
+            .saturating_add(load.co_resident_light_jobs)
+            .saturating_add(batch_siblings)
+    })
+}
+
+/// One out-of-memory kill as the suite ledger folds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SuiteKill {
+    pub machine_total_bytes: Option<u64>,
+    pub admission: KillAdmission,
 }
 
 /// What is known about one process of a request's work, split by whether it
@@ -561,7 +690,7 @@ pub(super) async fn resolve_process_demand(
         suite_key.is_some_and(|key| suite_display(key).starts_with(CLASS_SUITE_PREFIX));
     let suite_applies = !class_suite || own.is_empty();
     let measured_nowhere = own.is_empty() && own_elsewhere.is_none();
-    let kills_here = suite.as_ref().and_then(|suite| suite.kills_here);
+    let kills_here = suite.as_ref().and_then(|suite| suite.kills_here.clone());
     let suite_peak = suite
         .as_ref()
         .filter(|_| suite_applies)
@@ -648,7 +777,7 @@ fn platform_label(os: &str, arch: &str, context: &ProfileContext) -> String {
 /// platform that measured it.
 struct SuiteEvidence {
     peak: Option<(u64, Option<String>, String)>,
-    kills_here: Option<(u32, u64)>,
+    kills_here: Option<SuiteKills>,
     elsewhere: Option<(u64, String, String, String)>,
 }
 
@@ -742,7 +871,10 @@ async fn load_suite_evidence(
             let mut rows = conn
                 .query(
                     "SELECT executor_class, upper_process_peak_bytes, process_peak_name,
-                            oom_kill_count, oom_machine_total_bytes, os, arch
+                            oom_kill_count, oom_machine_total_bytes, os, arch,
+                            oom_kill_memory_brake, oom_crowded_kill_count,
+                            oom_crowded_most_co_resident, oom_crowded_memory_brake,
+                            oom_crowded_killed_at_unix_ms
                      FROM suite_memory_evidence
                      WHERE suite_key=?1",
                     params![suite_key],
@@ -788,9 +920,9 @@ async fn load_suite_evidence(
                     }
                 }
                 if executor_class == context.executor_class {
-                    let count = row.get::<i64>(3)?.max(0) as u32;
-                    if let (true, Some(total)) = (count > 0, row.get::<Option<i64>>(4)?) {
-                        evidence.kills_here = Some((count, total as u64));
+                    let kills = suite_kills_from_row(&row, 3)?;
+                    if kills.alone > 0 || kills.crowded.is_some() {
+                        evidence.kills_here = Some(kills);
                     }
                 }
             }
@@ -799,6 +931,41 @@ async fn load_suite_evidence(
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+/// The kill columns of a `suite_memory_evidence` row, from `first`:
+/// `oom_kill_count, oom_machine_total_bytes`, then two columns this reader
+/// skips (`os, arch`), then `oom_kill_memory_brake, oom_crowded_kill_count,
+/// oom_crowded_most_co_resident, oom_crowded_memory_brake,
+/// oom_crowded_killed_at_unix_ms`.
+fn suite_kills_from_row(
+    row: &cairn_db::turso::Row,
+    first: usize,
+) -> Result<SuiteKills, cairn_db::turso::Error> {
+    let alone = row.get::<i64>(first)?.max(0) as u32;
+    let total = row.get::<Option<i64>>(first + 1)?;
+    let crowded_count = row.get::<i64>(first + 5)?.max(0) as u32;
+    Ok(SuiteKills {
+        alone: if total.is_some() { alone } else { 0 },
+        machine_total_bytes: total.map_or(0, |total| total.max(0) as u64),
+        memory_brake: row.get::<Option<i64>>(first + 4)?.map(|brake| brake != 0),
+        crowded: (crowded_count > 0)
+            .then(|| -> Result<_, cairn_db::turso::Error> {
+                Ok(CrowdedKills {
+                    count: crowded_count,
+                    most_co_resident: row
+                        .get::<Option<i64>>(first + 6)?
+                        .map(|commands| commands.max(0) as u32),
+                    memory_brake: row
+                        .get::<Option<i64>>(first + 7)?
+                        .is_some_and(|brake| brake != 0),
+                    last_killed_at_unix_ms: row
+                        .get::<Option<i64>>(first + 8)?
+                        .map_or(0, |at| at.max(0) as u64),
+                })
+            })
+            .transpose()?,
+    })
 }
 
 /// The class prior for a Rust compile of `project_id` that nothing has
@@ -863,19 +1030,23 @@ pub(super) fn same_machine_total(killed_at_total: u64, total_bytes: u64) -> bool
 
 /// Fold one completion into its suite's evidence in this machine context:
 /// the largest single process it held, and, for an out-of-memory kill, the
-/// victim's size and one more kill at the machine's total.
+/// victim's size and the kill, read alone or crowded by `machine`'s admission
+/// ([`SuiteKills`]).
 ///
 /// Every completion with a suite teaches this, measured identity or not: an
 /// agent's batch carries no command identity, and its suite is the only
-/// place its evidence can live. Rise-only, with no decay: warm runs say
-/// nothing about the cold compile, and one process's working set depends on
-/// the code, not on how busy the machine was.
+/// place its evidence can live. The peak is rise-only, with no decay: warm
+/// runs say nothing about the cold compile, and one process's working set
+/// depends on the code, not on how busy the machine was. The kills are not: a
+/// successful run of the suite here is the machine's later answer that it can
+/// hold it, and clears them.
 pub(super) async fn observe_suite(
     db: Arc<LocalDb>,
     suite_key: Option<&str>,
     context: &ProfileContext,
     metadata: &CellExecutionMeta,
     kind: CompletionKind,
+    machine: MachineAdmission,
 ) {
     let Some(suite_key) = suite_key else { return };
     if kind == CompletionKind::SelectedNothing {
@@ -885,7 +1056,7 @@ pub(super) async fn observe_suite(
         .peak_process
         .as_ref()
         .map(|peak| (peak.bytes, peak.name.clone()));
-    let mut kill_total = None;
+    let mut kills = KillsSeen::Neither;
     if let Some(CommandStop::OomKilled {
         rss_bytes,
         machine_total_bytes,
@@ -898,10 +1069,12 @@ pub(super) async fn observe_suite(
                 peak = Some((*victim, process_name.clone()));
             }
         }
-        kill_total = *machine_total_bytes;
-    }
-    if peak.is_none() && kill_total.is_none() {
-        return;
+        kills = KillsSeen::Killed(SuiteKill {
+            machine_total_bytes: *machine_total_bytes,
+            admission: KillAdmission::of(metadata, machine),
+        });
+    } else if kind == CompletionKind::Succeeded {
+        kills = KillsSeen::CleanRun;
     }
     let _ = record_suite_evidence(
         db,
@@ -909,15 +1082,62 @@ pub(super) async fn observe_suite(
         context,
         metadata.finished_at_unix_ms,
         peak,
-        kill_total,
+        kills,
         None,
     )
     .await;
 }
 
+/// What one observation says about a suite's kills here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillsSeen {
+    Killed(SuiteKill),
+    /// The suite ran to success here: whatever killed it before no longer
+    /// does, and its kills here are forgotten.
+    CleanRun,
+    Neither,
+}
+
+/// Forget every suite's kills on `executor_id`, whatever machine context it
+/// was in, and the solo-kill ceiling its command profiles hold: the
+/// operator's `repaired`, the word for what no run of the machine has had the
+/// chance to show. Returns the suites cleared.
+pub(crate) async fn forget_kills_on(db: &LocalDb, executor_id: &str) -> Result<u64, String> {
+    // A context is `device:executor`; the device can be unknown to a runner
+    // the machine is not connected to, so the executor's half identifies it.
+    let suffix = format!(":{executor_id}");
+    let cleared = db
+        .execute(
+            format!(
+                "UPDATE suite_memory_evidence SET {FORGET_SUITE_KILLS}
+                 WHERE substr(executor_class, -?2) = ?1
+                   AND (oom_kill_count > 0 OR oom_crowded_kill_count > 0)"
+            ),
+            (suffix.clone(), suffix.len() as i64),
+        )
+        .await
+        .map_err(|error| format!("Failed to forget the machine's suite kills: {error}"))?;
+    db.execute(
+        "UPDATE command_resource_profiles SET oom_alone_machine_bytes = NULL
+         WHERE substr(executor_class, -?2) = ?1 AND oom_alone_machine_bytes IS NOT NULL",
+        (suffix.clone(), suffix.len() as i64),
+    )
+    .await
+    .map_err(|error| format!("Failed to forget the machine's solo kills: {error}"))?;
+    Ok(cleared)
+}
+
+/// The assignments that empty a suite row's kill ledger.
+const FORGET_SUITE_KILLS: &str = "oom_kill_count = 0, oom_machine_total_bytes = NULL,
+     oom_kill_memory_brake = NULL, oom_crowded_kill_count = 0,
+     oom_crowded_most_co_resident = NULL, oom_crowded_memory_brake = NULL,
+     oom_crowded_killed_at_unix_ms = NULL";
+
 /// One out-of-memory kill of a suite's process outside any completion: a
 /// resident's, which the executor reports on its health rather than on a
-/// result. `victim` is its size and name, when the executor read them.
+/// result. Its victim's size and name are learned when the executor read
+/// them. A resident states no load at its start, so its kill is never read as
+/// alone: it counts as crowded, with `memory_brake` the machine's brake state.
 ///
 /// Idempotent by `(machine context, killed_at_unix_ms, pid)`: the machine
 /// re-reports a kill on every snapshot for a day, and a runner that restarts
@@ -926,11 +1146,13 @@ pub(super) async fn observe_suite_kill(
     db: Arc<LocalDb>,
     suite_key: &str,
     context: &ProfileContext,
-    killed_at_unix_ms: u64,
-    pid: u32,
-    victim: Option<(u64, Option<String>)>,
+    kill: &cairn_common::executor_protocol::OomKillReport,
     machine_total_bytes: Option<u64>,
+    memory_brake: bool,
 ) {
+    let victim = kill
+        .footprint_bytes
+        .map(|bytes| (bytes, kill.process_name.clone()));
     if victim.is_none() && machine_total_bytes.is_none() {
         return;
     }
@@ -938,10 +1160,16 @@ pub(super) async fn observe_suite_kill(
         db,
         suite_key,
         context,
-        killed_at_unix_ms,
+        kill.killed_at_unix_ms,
         victim,
-        machine_total_bytes,
-        Some(pid),
+        KillsSeen::Killed(SuiteKill {
+            machine_total_bytes,
+            admission: KillAdmission {
+                co_resident_commands: None,
+                memory_brake,
+            },
+        }),
+        Some(kill.pid),
     )
     .await;
 }
@@ -963,9 +1191,12 @@ async fn record_suite_evidence(
     context: &ProfileContext,
     finished_at_unix_ms: u64,
     peak: Option<(u64, Option<String>)>,
-    kill_total: Option<u64>,
+    kills: KillsSeen,
     resident_kill: Option<u32>,
 ) -> Result<(), String> {
+    if peak.is_none() && kills == KillsSeen::Neither {
+        return Ok(());
+    }
     let suite_key = suite_key.to_string();
     let context = context.clone();
     db.write(move |conn| {
@@ -1000,19 +1231,66 @@ async fn record_suite_evidence(
                 )
                 .await?;
             }
+            let key = params![
+                suite_key.clone(),
+                context.executor_class.clone(),
+                context.os.clone(),
+                context.arch.clone()
+            ];
+            if peak.is_none() && kills == KillsSeen::CleanRun {
+                // Nothing to learn but that the kills are over: a row that
+                // does not exist has none to forget.
+                conn.execute(
+                    &format!(
+                        "UPDATE suite_memory_evidence SET {FORGET_SUITE_KILLS}
+                         WHERE suite_key=?1 AND executor_class=?2 AND os=?3 AND arch=?4"
+                    ),
+                    key,
+                )
+                .await?;
+                return Ok(());
+            }
+            let held = {
+                let mut rows = conn
+                    .query(
+                        "SELECT oom_kill_count, oom_machine_total_bytes, 0, 0,
+                                oom_kill_memory_brake, oom_crowded_kill_count,
+                                oom_crowded_most_co_resident, oom_crowded_memory_brake,
+                                oom_crowded_killed_at_unix_ms
+                         FROM suite_memory_evidence
+                         WHERE suite_key=?1 AND executor_class=?2 AND os=?3 AND arch=?4",
+                        key,
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => suite_kills_from_row(&row, 0)?,
+                    None => SuiteKills::default(),
+                }
+            };
+            let ledger = match kills {
+                KillsSeen::Killed(kill) => held.fold(&kill, finished_at_unix_ms),
+                KillsSeen::CleanRun => SuiteKills::default(),
+                KillsSeen::Neither => held,
+            };
+            let crowded = ledger.crowded.as_ref();
             let (peak_bytes, peak_name) = match &peak {
                 Some((bytes, name)) => (Some(*bytes as i64), name.clone()),
                 None => (None, None),
             };
             conn.execute(
-                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, CASE WHEN ?7 IS NULL THEN 0 ELSE 1 END, ?7, ?8)
+                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                    ON CONFLICT(suite_key, executor_class, os, arch) DO UPDATE SET
                      upper_process_peak_bytes=CASE WHEN ?5 IS NULL THEN suite_memory_evidence.upper_process_peak_bytes WHEN suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes THEN ?5 ELSE suite_memory_evidence.upper_process_peak_bytes END,
                      process_peak_name=CASE WHEN ?5 IS NOT NULL AND (suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes) THEN COALESCE(?6, suite_memory_evidence.process_peak_name) ELSE suite_memory_evidence.process_peak_name END,
-                     oom_kill_count=CASE WHEN ?7 IS NULL THEN suite_memory_evidence.oom_kill_count WHEN suite_memory_evidence.oom_machine_total_bytes IS NOT NULL AND ABS(suite_memory_evidence.oom_machine_total_bytes - ?7) <= suite_memory_evidence.oom_machine_total_bytes / ?9 THEN suite_memory_evidence.oom_kill_count + 1 ELSE 1 END,
-                     oom_machine_total_bytes=COALESCE(?7, suite_memory_evidence.oom_machine_total_bytes),
-                     updated_at_unix_ms=MAX(suite_memory_evidence.updated_at_unix_ms, ?8)"#,
+                     oom_kill_count=?7,
+                     oom_machine_total_bytes=?8,
+                     updated_at_unix_ms=MAX(suite_memory_evidence.updated_at_unix_ms, ?9),
+                     oom_kill_memory_brake=?10,
+                     oom_crowded_kill_count=?11,
+                     oom_crowded_most_co_resident=?12,
+                     oom_crowded_memory_brake=?13,
+                     oom_crowded_killed_at_unix_ms=?14"#,
                 params![
                     suite_key.clone(),
                     context.executor_class.clone(),
@@ -1020,9 +1298,14 @@ async fn record_suite_evidence(
                     context.arch.clone(),
                     peak_bytes,
                     peak_name,
-                    kill_total.map(|bytes| bytes as i64),
+                    ledger.alone as i64,
+                    (ledger.alone > 0).then_some(ledger.machine_total_bytes as i64),
                     finished_at_unix_ms as i64,
-                    KILL_TOTAL_MARGIN_DIVISOR as i64
+                    ledger.memory_brake.map(i64::from),
+                    crowded.map_or(0, |crowded| crowded.count as i64),
+                    crowded.and_then(|crowded| crowded.most_co_resident.map(i64::from)),
+                    crowded.map(|crowded| i64::from(crowded.memory_brake)),
+                    crowded.map(|crowded| crowded.last_killed_at_unix_ms as i64)
                 ],
             )
             .await?;
@@ -2378,6 +2661,7 @@ mod process_peak_tests {
                 &fedora,
                 &meta,
                 CompletionKind::Succeeded,
+                MachineAdmission::default(),
             )
             .await;
             observe_completed(
@@ -2419,6 +2703,7 @@ mod process_peak_tests {
             &fedora,
             &completed(10 * GIB, 1),
             CompletionKind::Succeeded,
+            MachineAdmission::default(),
         )
         .await;
         let unseen = identity("rust-tests-b");
@@ -2511,6 +2796,7 @@ mod process_peak_tests {
             &ub,
             &completed(9 * GIB, 1),
             CompletionKind::Succeeded,
+            MachineAdmission::default(),
         )
         .await;
         let prior = resolve(compile.clone(), CellCommandClass::CargoCheck)
@@ -2546,6 +2832,7 @@ mod process_peak_tests {
             &spark,
             &completed(10 * GIB, 2),
             CompletionKind::Succeeded,
+            MachineAdmission::default(),
         )
         .await;
         let borrowed = resolve(compile.clone(), CellCommandClass::CargoCheck)
@@ -2571,6 +2858,7 @@ mod process_peak_tests {
             &context("bbs-device:bbs"),
             &completed(8 * GIB, 3),
             CompletionKind::Succeeded,
+            MachineAdmission::default(),
         )
         .await;
         let here = resolve(compile, CellCommandClass::CargoCheck)
@@ -2596,6 +2884,7 @@ mod process_peak_tests {
             &fedora,
             &completed(10 * GIB, 1),
             CompletionKind::Failed,
+            MachineAdmission::default(),
         )
         .await;
         assert_eq!(
@@ -2639,8 +2928,9 @@ mod process_peak_tests {
         );
     }
 
-    /// A kill teaches the suite its victim's size and counts against this
-    /// machine at its total; a kill at another total starts the count again.
+    /// A kill while the victim ran alone teaches the suite its victim's size
+    /// and counts against this machine at its total; a kill at another total
+    /// starts the count again.
     #[tokio::test]
     async fn kills_are_counted_per_machine_total() {
         let db = Arc::new(crate::storage::migrated_test_db("process-peak-kills.db").await);
@@ -2649,7 +2939,7 @@ mod process_peak_tests {
         let suite = suite_key("cairn", Some(&id), CellCommandClass::CargoTest);
         let total = 13_000_000_000;
         let kill = |victim, total, at| {
-            let mut meta = oom_killed_for_test(victim, Some(total), 1, at);
+            let mut meta = oom_killed_for_test(victim, Some(total), 0, at);
             if let Some(CommandStop::OomKilled { process_name, .. }) = &mut meta.stop {
                 *process_name = Some("rustc".into());
             }
@@ -2662,6 +2952,7 @@ mod process_peak_tests {
                 &ub,
                 &kill(3 * GIB, total, at),
                 CompletionKind::Failed,
+                MachineAdmission::default(),
             )
             .await;
         }
@@ -2675,7 +2966,13 @@ mod process_peak_tests {
         .await
         .demand
         .unwrap();
-        assert_eq!(demand.kills_here, Some((2, total)));
+        let counted = |demand: &ProcessDemand| {
+            demand
+                .kills_here
+                .as_ref()
+                .map(|kills| (kills.alone, kills.machine_total_bytes))
+        };
+        assert_eq!(counted(&demand), Some((2, total)));
         assert_eq!(demand.peak_bytes, 3 * GIB);
         observe_suite(
             db.clone(),
@@ -2683,6 +2980,7 @@ mod process_peak_tests {
             &ub,
             &kill(GIB, 2 * total, 3),
             CompletionKind::Failed,
+            MachineAdmission::default(),
         )
         .await;
         let demand = resolve_process_demand(
@@ -2695,8 +2993,209 @@ mod process_peak_tests {
         .await
         .demand
         .unwrap();
-        assert_eq!(demand.kills_here, Some((1, 2 * total)));
+        assert_eq!(counted(&demand), Some((1, 2 * total)));
         assert_eq!(demand.peak_bytes, 3 * GIB, "the largest victim stands");
+    }
+
+    /// A kill of `victim` bytes at `at`, with `co_resident` compile commands
+    /// beside it at its start.
+    fn rustc_killed(victim: u64, total: u64, co_resident: u32, at: u64) -> CellExecutionMeta {
+        let mut meta = oom_killed_for_test(victim, Some(total), co_resident, at);
+        if let Some(CommandStop::OomKilled { process_name, .. }) = &mut meta.stop {
+            *process_name = Some("rustc".into());
+        }
+        meta
+    }
+
+    async fn kills_on(
+        db: Arc<LocalDb>,
+        suite: &str,
+        context: &ProfileContext,
+    ) -> Option<SuiteKills> {
+        resolve_process_demand(db, None, Some(suite), CellCommandClass::CargoTest, context)
+            .await
+            .demand
+            .and_then(|demand| demand.kills_here)
+    }
+
+    /// cairn/6496: a kill while other commands shared the machine is
+    /// recorded apart from the alone kills, with the most commands beside a
+    /// victim and the brake state at the latest; it never joins the count
+    /// that ends fit. A later successful run of the suite here clears both.
+    #[tokio::test]
+    async fn crowded_kills_are_kept_apart_and_a_clean_run_clears_every_kill() {
+        let db = Arc::new(crate::storage::migrated_test_db("suite-kills-crowded.db").await);
+        let sp1 = context("bginf-sp1-device:bginf-sp1");
+        let suite = "cairn/rust-tests";
+        let total = 130_663_231_488;
+        let observe = |meta: CellExecutionMeta, kind, memory_brake| {
+            let db = db.clone();
+            let sp1 = sp1.clone();
+            async move {
+                observe_suite(
+                    db,
+                    Some(suite),
+                    &sp1,
+                    &meta,
+                    kind,
+                    MachineAdmission {
+                        memory_brake,
+                        batch_siblings: 0,
+                    },
+                )
+                .await
+            }
+        };
+        for (co_resident, at) in [(18, 10), (6, 20)] {
+            observe(
+                rustc_killed(20 * GIB, total, co_resident, at),
+                CompletionKind::Failed,
+                false,
+            )
+            .await;
+        }
+        observe(
+            rustc_killed(19 * GIB, total, 0, 30),
+            CompletionKind::Failed,
+            true,
+        )
+        .await;
+        let kills = kills_on(db.clone(), suite, &sp1).await.expect("kills here");
+        assert_eq!(kills.alone, 1, "only the alone kill counts");
+        assert_eq!(kills.memory_brake, Some(true));
+        assert_eq!(
+            kills.crowded,
+            Some(CrowdedKills {
+                count: 2,
+                most_co_resident: Some(18),
+                memory_brake: false,
+                last_killed_at_unix_ms: 20,
+            })
+        );
+
+        observe(
+            CellExecutionMeta {
+                stop: None,
+                peak_process: Some(cairn_common::executor_protocol::PeakProcess {
+                    bytes: 21 * GIB,
+                    name: Some("rustc".into()),
+                }),
+                ..oom_killed_for_test(GIB, None, 0, 40)
+            },
+            CompletionKind::Succeeded,
+            true,
+        )
+        .await;
+        assert_eq!(kills_on(db.clone(), suite, &sp1).await, None);
+        let peak = resolve_process_demand(db, None, Some(suite), CellCommandClass::CargoTest, &sp1)
+            .await
+            .demand
+            .map(|demand| demand.peak_bytes);
+        assert_eq!(
+            peak,
+            Some(21 * GIB),
+            "the peak is rise-only; only the kills clear"
+        );
+    }
+
+    /// Batch siblings share the machine though the load at the start does
+    /// not show them, so a kill beside them is crowded.
+    #[tokio::test]
+    async fn a_kill_beside_batch_siblings_is_crowded() {
+        let db = Arc::new(crate::storage::migrated_test_db("suite-kills-siblings.db").await);
+        let ub = context("bgsrv-ub-device:bgsrv-ub");
+        observe_suite(
+            db.clone(),
+            Some("cairn/rust-tests"),
+            &ub,
+            &rustc_killed(3 * GIB, 13_000_000_000, 0, 1),
+            CompletionKind::Failed,
+            MachineAdmission {
+                memory_brake: true,
+                batch_siblings: 2,
+            },
+        )
+        .await;
+        let kills = kills_on(db, "cairn/rust-tests", &ub).await.unwrap();
+        assert_eq!(kills.alone, 0);
+        assert_eq!(kills.crowded.unwrap().most_co_resident, Some(2));
+    }
+
+    /// An alone kill under another brake state than the count's starts the
+    /// count again, and a count read under another brake state than the
+    /// machine's current one does not count, including the counts recorded
+    /// before the ledger stamped a brake state at all.
+    #[tokio::test]
+    async fn alone_kills_count_only_under_the_brake_state_they_happened_in() {
+        let db = Arc::new(crate::storage::migrated_test_db("suite-kills-brake.db").await);
+        let ub = context("bgsrv-ub-device:bgsrv-ub");
+        let total = 13_000_000_000;
+        for (memory_brake, at) in [(false, 1), (false, 2), (true, 3)] {
+            observe_suite(
+                db.clone(),
+                Some("cairn/rust-tests"),
+                &ub,
+                &rustc_killed(3 * GIB, total, 0, at),
+                CompletionKind::Failed,
+                MachineAdmission {
+                    memory_brake,
+                    batch_siblings: 0,
+                },
+            )
+            .await;
+        }
+        let kills = kills_on(db.clone(), "cairn/rust-tests", &ub).await.unwrap();
+        assert_eq!((kills.alone, kills.memory_brake), (1, Some(true)));
+        assert_eq!(kills.clone().under_brake(true).alone, 1);
+        assert_eq!(kills.under_brake(false).alone, 0);
+
+        // A row the ledger counted before it recorded admission.
+        db.execute(
+            "INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms)
+             VALUES ('cairn/class:cargoTest', ?1, ?2, ?3, 3, ?4, 1)",
+            (
+                ub.executor_class.clone(),
+                ub.os.clone(),
+                ub.arch.clone(),
+                total as i64,
+            ),
+        )
+        .await
+        .unwrap();
+        let legacy = kills_on(db, "cairn/class:cargoTest", &ub).await.unwrap();
+        assert_eq!((legacy.alone, legacy.memory_brake), (3, None));
+        assert_eq!(legacy.clone().under_brake(true).alone, 0);
+        assert_eq!(legacy.under_brake(false).alone, 0);
+    }
+
+    /// The operator's `repaired` forgets every kill the machine holds, in
+    /// any device context, and no other machine's.
+    #[tokio::test]
+    async fn repaired_forgets_the_machines_kills_and_only_its() {
+        let db = Arc::new(crate::storage::migrated_test_db("suite-kills-repaired.db").await);
+        let sp1 = context("bginf-sp1-device:bginf-sp1");
+        let sp2 = context("bginf-sp2-device:bginf-sp2");
+        for machine in [&sp1, &sp2] {
+            for at in [1, 2] {
+                observe_suite(
+                    db.clone(),
+                    Some("cairn/rust-tests"),
+                    machine,
+                    &rustc_killed(3 * GIB, 130_000_000_000, 0, at),
+                    CompletionKind::Failed,
+                    MachineAdmission::default(),
+                )
+                .await;
+            }
+        }
+        assert_eq!(forget_kills_on(&db, "bginf-sp1").await.unwrap(), 1);
+        assert_eq!(kills_on(db.clone(), "cairn/rust-tests", &sp1).await, None);
+        assert_eq!(
+            kills_on(db, "cairn/rust-tests", &sp2)
+                .await
+                .map(|kills| kills.alone),
+            Some(2)
+        );
     }
 
     /// cairn/6310's specimen: the macOS sampler names no process, so the
@@ -2731,6 +3230,7 @@ mod process_peak_tests {
                 &host,
                 &unnamed,
                 CompletionKind::Succeeded,
+                MachineAdmission::default(),
             )
             .await;
             observe_completed(

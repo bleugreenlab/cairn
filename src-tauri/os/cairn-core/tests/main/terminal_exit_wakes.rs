@@ -920,3 +920,54 @@ async fn project_terminal_wake_requires_agent_caller_before_spawning() {
     );
     assert_eq!(terminal_count(&db, "no-agent").await, 0);
 }
+
+/// cairn/6410, through a real PTY: a kill the job continues past (watchdog
+/// recovery) leaves the job's background terminal running for the successor;
+/// an operator kill still ends it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_recovery_kill_keeps_the_jobs_terminal_and_an_operator_kill_ends_it() {
+    use cairn_core::internal::orchestrator::lifecycle;
+
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    seed_node(&db).await;
+    prepare_terminal_repository(&db, &repo_path, &t.path().join("config")).await;
+
+    change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/txw/1/1/builder/terminal/build",
+            "mode": "create",
+            "payload": {"command": "sleep 300"}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert_eq!(terminal_state(&db, "build").await.0, "running");
+
+    let recovery = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        lifecycle::kill_session_with_reason(
+            &recovery,
+            "r-1",
+            "provider_silence_recovery",
+            lifecycle::TerminalPolicy::Keep,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        terminal_state(&db, "build").await,
+        ("running".to_string(), None),
+        "the job's compile outlives the provider process recovery ended"
+    );
+
+    let operator = orch.clone();
+    tokio::task::spawn_blocking(move || lifecycle::kill_session(&operator, "r-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_terminal_exit(&db, "build").await;
+}

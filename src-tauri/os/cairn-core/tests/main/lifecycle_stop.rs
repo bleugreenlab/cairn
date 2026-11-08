@@ -465,7 +465,13 @@ async fn kill_session_finalizes_after_process_registry_poisoning() {
         assert!(poisoner.join().is_err());
     });
 
-    lifecycle::kill_session_with_reason(&orch, "run-1", "provider_silence_recovery").unwrap();
+    lifecycle::kill_session_with_reason(
+        &orch,
+        "run-1",
+        "provider_silence_recovery",
+        lifecycle::TerminalPolicy::Keep,
+    )
+    .unwrap();
 
     assert_eq!(
         common::scalar_text_by_id(
@@ -517,7 +523,13 @@ async fn watchdog_arm_failure_crashes_run_and_does_not_complete_turn() {
     let (_temp, orch) = common::test_orchestrator().await;
     insert_project_job_run_turn(&orch.db.local, "running").await;
 
-    lifecycle::kill_session_with_reason(&orch, "run-1", "watchdog_arm_failed").unwrap();
+    lifecycle::kill_session_with_reason(
+        &orch,
+        "run-1",
+        "watchdog_arm_failed",
+        lifecycle::TerminalPolicy::Keep,
+    )
+    .unwrap();
 
     assert_eq!(
         common::scalar_text_by_id(
@@ -749,7 +761,12 @@ async fn kill_until_inside_graceful_stop(
         let orch = orch.clone();
         let run_id = run_id.to_string();
         tokio::task::spawn_blocking(move || {
-            lifecycle::kill_session_with_reason(&orch, &run_id, "warm_evict")
+            lifecycle::kill_session_with_reason(
+                &orch,
+                &run_id,
+                "warm_evict",
+                lifecycle::TerminalPolicy::Finalize,
+            )
         })
     };
     let started = std::time::Instant::now();

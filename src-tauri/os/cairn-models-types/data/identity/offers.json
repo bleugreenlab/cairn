@@ -1,6 +1,13 @@
 {
   "notes": "Provider offers whose native id is not a canonical id with an optional maker/ prefix, mapped by hand. Keyed provider/native as a ladder writes it. Nothing is matched by date stripping or by hyphen-for-dot rewriting: each such offer is listed here. Claude API snapshot dates are supported by the existing HELM, Epoch SWE-bench and catalog fixtures; the misdated tau2 Sonnet 4.5 submission is not an API snapshot.",
   "offers": {
+    "claude/claude-sonnet-4": "claude-sonnet-4",
+    "claude/claude-opus-4": "claude-opus-4",
+    "claude/claude-sonnet-5": "claude-sonnet-5",
+    "claude/claude-opus-5": "claude-opus-5",
+    "claude/claude-fable-5": "claude-fable-5",
+    "claude/claude-haiku-5-5": "claude-haiku-5.5",
+    "claude/claude-sonnet-5-5": "claude-sonnet-5.5",
     "claude/claude-3-haiku": "claude-haiku-3",
     "claude/claude-3-5-haiku": "claude-haiku-3.5",
     "claude/claude-haiku-4-5": "claude-haiku-4.5",

@@ -724,6 +724,8 @@ impl CodexHost for CodexReaderHost {
             &self.session.orch,
             &self.session.run_id,
             crate::orchestrator::lifecycle::WATCHDOG_ARM_FAILED_EXIT_REASON,
+            // A lease write that failed says nothing about the job's own work.
+            crate::orchestrator::lifecycle::TerminalPolicy::Keep,
         )
     }
     fn recover_watchdog(

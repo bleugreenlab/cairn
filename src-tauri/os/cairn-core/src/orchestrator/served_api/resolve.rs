@@ -2,10 +2,11 @@
 //!
 //! Models go by their real names (tenet 1336). A local model's real name is
 //! the model its engine loads (`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`); a
-//! remote one's is the provider's id (`anthropic/claude-sonnet-4.5`), and
-//! `provider/native-id` pins a provider. The upstream slug a local profile
-//! declares (the OpenRouter id the catalog merges on) also resolves, local
-//! first. A tier is never a model name. Any other name for a local model (its
+//! remote one's is the provider's id (`anthropic/claude-sonnet-4.5`). Names
+//! resolve through the catalog's tiers: `provider/native-id`, provider spelling
+//! (native id or reported slug), then canonical id. Local deployments win;
+//! remote offers must serve the verb and pass the client's grants before
+//! ambiguity is judged. A tier is never a model name. Any other name for a local model (its
 //! engine's served name, one bgllm answered to) is refused with a 404 that
 //! names the real model, so a client still sending it fails visibly rather
 //! than silently.
@@ -53,6 +54,8 @@ pub enum ServedRefusal {
     /// Only a remote provider serves it, and the client holds no grant for
     /// that provider.
     RemoteNotGranted { model: String, provider: String },
+    /// More than one granted remote provider serves the name.
+    Ambiguous { model: String, offers: Vec<String> },
 }
 
 /// `asked` without an `inference/` qualifier, which names Cairn's own
@@ -103,17 +106,28 @@ fn renamed(asked: &str, served: &[ServedModel]) -> Option<String> {
 /// Resolve `name` for `door`.
 ///
 /// A deployment's real name reaches that deployment; any other name goes to
-/// the catalog's exact names ([`Catalog::named_offers`]). Of the offers that
+/// the catalog's name tiers ([`Catalog::offers_named`]). Of the offers that
 /// serve the door's verb, Cairn's own inference deployment wins whenever there
 /// is one: it is never passed over for a remote provider, even unloaded, since
-/// asking is what loads it. Otherwise the first remote offer `may_use` allows
-/// is taken.
+/// asking is what loads it. Otherwise remote offers are admitted by verb and
+/// filtered by `may_use`; multiple remaining providers are refused as ambiguous.
 pub fn resolve(
     name: &str,
     door: RelayDoor,
     served: &[ServedModel],
     catalog: &Catalog,
     may_use: impl Fn(&str) -> bool,
+) -> Result<Resolved, ServedRefusal> {
+    resolve_relaying(name, door, served, catalog, may_use, relays_to)
+}
+
+fn resolve_relaying(
+    name: &str,
+    door: RelayDoor,
+    served: &[ServedModel],
+    catalog: &Catalog,
+    may_use: impl Fn(&str) -> bool,
+    relays: impl Fn(&str) -> bool,
 ) -> Result<Resolved, ServedRefusal> {
     let asked = name.trim().to_string();
     if let Some(real) = renamed(&asked, served) {
@@ -123,9 +137,9 @@ pub fn resolve(
         .map(|model| model.id.clone())
         .unwrap_or_else(|| asked.clone());
     let offers: Vec<CatalogOffer> = catalog
-        .named_offers(&model)
+        .offers_named(&model)
         .into_iter()
-        .filter(|offer| relays_to(&offer.provider))
+        .filter(|offer| relays(&offer.provider))
         .collect();
     if offers.is_empty() {
         return Err(ServedRefusal::NotFound { model: asked });
@@ -177,14 +191,26 @@ pub fn resolve(
         });
     };
     let first_provider = first.provider.clone();
-    serving
+    let granted: Vec<SelectedOffer> = serving
         .into_iter()
-        .find(|offer| may_use(&offer.provider))
-        .map(resolved)
-        .ok_or(ServedRefusal::RemoteNotGranted {
+        .filter(|offer| may_use(&offer.provider))
+        .collect();
+    let Some(first) = granted.first() else {
+        return Err(ServedRefusal::RemoteNotGranted {
             model: asked,
             provider: first_provider,
-        })
+        });
+    };
+    if granted.iter().any(|offer| offer.provider != first.provider) {
+        return Err(ServedRefusal::Ambiguous {
+            model: asked,
+            offers: granted
+                .iter()
+                .map(|offer| format!("{}/{}", offer.provider, offer.model))
+                .collect(),
+        });
+    }
+    Ok(resolved(first.clone()))
 }
 
 #[cfg(test)]
@@ -289,7 +315,7 @@ mod tests {
             assert_eq!(resolved.asked, DSV4);
             assert_eq!(resolved.offer.provider, LOCAL_PROVIDER);
             assert_eq!(resolved.offer.model, DSV4);
-            // The upstream slug groups the same offers, local first.
+            // The upstream spelling reaches the same offers, local first.
             let by_slug = chat(DSV4_SLUG, remote).unwrap();
             assert_eq!(by_slug.offer.provider, LOCAL_PROVIDER);
         }
@@ -368,6 +394,125 @@ mod tests {
                 model: "openrouter/big".into()
             })
         );
+    }
+
+    fn two_remote_providers(embed_second: bool) -> Catalog {
+        Catalog {
+            providers: vec![
+                provider(
+                    "openrouter",
+                    vec![discovered("anthropic/claude-opus-4.6", None, false)],
+                ),
+                provider(
+                    "opencode-go",
+                    vec![discovered(
+                        "claude-opus-4-6",
+                        Some("anthropic/claude-opus-4.6"),
+                        embed_second,
+                    )],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn granted_remote_providers_are_ambiguous_only_after_grants() {
+        let catalog = two_remote_providers(false);
+        // Production currently relays only one remote provider. Exercise the
+        // same resolver with both admitted at that boundary.
+        let resolve_remote = |may_use: fn(&str) -> bool| {
+            resolve_relaying(
+                "claude-opus-4.6",
+                RelayDoor::ChatCompletions,
+                &[],
+                &catalog,
+                may_use,
+                |_| true,
+            )
+        };
+        assert_eq!(
+            resolve_remote(|_| true),
+            Err(ServedRefusal::Ambiguous {
+                model: "claude-opus-4.6".into(),
+                offers: vec![
+                    "openrouter/anthropic/claude-opus-4.6".into(),
+                    "opencode-go/claude-opus-4-6".into(),
+                ],
+            })
+        );
+        for allowed in ["openrouter", "opencode-go"] {
+            let resolved = resolve_relaying(
+                "claude-opus-4.6",
+                RelayDoor::ChatCompletions,
+                &[],
+                &catalog,
+                |provider| provider == allowed,
+                |_| true,
+            )
+            .unwrap();
+            assert_eq!(resolved.offer.provider, allowed);
+        }
+        assert_eq!(
+            resolve_remote(|_| false),
+            Err(ServedRefusal::RemoteNotGranted {
+                model: "claude-opus-4.6".into(),
+                provider: "openrouter".into(),
+            })
+        );
+        // The real served boundary must not expand when the catalog does.
+        assert_eq!(
+            resolve(
+                "claude-opus-4.6",
+                RelayDoor::ChatCompletions,
+                &[],
+                &catalog,
+                |_| true
+            )
+            .unwrap()
+            .offer
+            .provider,
+            "openrouter"
+        );
+    }
+
+    #[test]
+    fn remote_admission_precedes_grants_and_ambiguity() {
+        let catalog = two_remote_providers(true);
+        let resolved = resolve_relaying(
+            "claude-opus-4.6",
+            RelayDoor::ChatCompletions,
+            &[],
+            &catalog,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(resolved.offer.provider, "openrouter");
+        assert_eq!(
+            resolve_relaying(
+                "claude-opus-4.6",
+                RelayDoor::ChatCompletions,
+                &[],
+                &catalog,
+                |provider| provider == "opencode-go",
+                |_| true,
+            ),
+            Err(ServedRefusal::RemoteNotGranted {
+                model: "claude-opus-4.6".into(),
+                provider: "openrouter".into(),
+            })
+        );
+        assert!(matches!(
+            resolve_relaying(
+                "claude-opus-4.6",
+                RelayDoor::Embeddings,
+                &[],
+                &two_remote_providers(false),
+                |_| panic!("grants must not be checked for an unserved verb"),
+                |_| true,
+            ),
+            Err(ServedRefusal::Unserved { .. })
+        ));
     }
 
     #[test]

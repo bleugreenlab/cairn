@@ -78,16 +78,54 @@ pub async fn coordinating_job_for_child_issue(
 /// on the thread axis until the thread is reopened.
 ///
 /// Every child-attention path resolves through here — wake routing, the `/wakes`
-/// projection, and `parent_wake::load_parent_job` — so the rule is stated once.
+/// projection, and `parent_wake::load_parent_job` — so the rule is stated once,
+/// in [`gate_owner_for_child_conn`]; this only establishes the thread session
+/// that owner names.
 pub async fn coordinating_job_for_child(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
     conn: &cairn_db::storage::TrackedConnection,
     child_issue_id: &str,
 ) -> DbResult<Option<String>> {
+    match gate_owner_for_child_conn(host.clone(), conn, child_issue_id).await? {
+        GateOwner::Job(job_id) => Ok(Some(job_id)),
+        // A child fact carries no model choice; a session established on this
+        // path launches with the thread definition's default.
+        GateOwner::Thread(thread_id) => {
+            host.ensure_thread_session(conn, &thread_id).await.map(Some)
+        }
+        GateOwner::Operator => Ok(None),
+    }
+}
+
+/// Who a child issue's gates (its question, approval and confirm gates) wait
+/// on: the party [`coordinating_job_for_child`] routes them to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateOwner {
+    /// An active parent thread, whatever session it currently runs in.
+    Thread(String),
+    /// The spawning node, or the node currently driving the parent issue.
+    Job(String),
+    /// No coordinating party: no parent edge, a closed thread, or a parent
+    /// issue nothing is driving. The operator answers.
+    Operator,
+}
+
+/// The gate owner of `child_issue_id`, resolved without side effects: unlike
+/// [`coordinating_job_for_child`] it never establishes a thread session, so an
+/// evaluator or authorization check may ask it freely.
+///
+/// This is *routing*. It says whom the gate is addressed to, not that the
+/// parent edge it followed confers authority; an authority check must also
+/// prove the edge (see `docs/authorization.md`).
+pub async fn gate_owner_for_child_conn(
+    host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
+    conn: &cairn_db::storage::TrackedConnection,
+    child_issue_id: &str,
+) -> DbResult<GateOwner> {
     let Some((spawning_job_id, parent_issue_id, parent_thread_id)) =
         parent_edge(conn, child_issue_id).await?
     else {
-        return Ok(None);
+        return Ok(GateOwner::Operator);
     };
     if let Some(parent_issue_id) = parent_issue_id {
         if let Some(spawning_job_id) = spawning_job_id {
@@ -95,27 +133,25 @@ pub async fn coordinating_job_for_child(
                 validated_spawning_job(host.clone(), conn, &spawning_job_id, &parent_issue_id)
                     .await?
             {
-                return Ok(Some(job_id));
+                return Ok(GateOwner::Job(job_id));
             }
         }
-        return coordinating_job_for_issue(conn, &parent_issue_id).await;
+        return Ok(coordinating_job_for_issue(conn, &parent_issue_id)
+            .await?
+            .map_or(GateOwner::Operator, GateOwner::Job));
     }
     match parent_thread_id {
-        Some(thread_id) => {
-            // Asked before establishing rather than caught after: a closed thread
-            // is "no derived coordinator", which routing drops quietly, and not a
-            // routing failure, which it would log and treat as breakage.
-            if !cairn_db::lineage::thread_status_conn(conn, &thread_id)
+        // A closed thread is "no derived coordinator", which routing drops
+        // quietly, and not a routing failure, which it would log and treat as
+        // breakage.
+        Some(thread_id)
+            if cairn_db::lineage::thread_status_conn(conn, &thread_id)
                 .await?
-                .is_some_and(|status| status.is_active())
-            {
-                return Ok(None);
-            }
-            // A child fact carries no model choice; a session established on this
-            // path launches with the thread definition's default.
-            host.ensure_thread_session(conn, &thread_id).await.map(Some)
+                .is_some_and(|status| status.is_active()) =>
+        {
+            Ok(GateOwner::Thread(thread_id))
         }
-        None => Ok(None),
+        _ => Ok(GateOwner::Operator),
     }
 }
 

@@ -10283,22 +10283,26 @@ impl Fleet {
         executor_id: &str,
         context: &resource_profiles::ProfileContext,
     ) {
-        let kills: Vec<(
-            String,
-            cairn_common::executor_protocol::OomKillReport,
-            Option<u64>,
-        )> = {
+        let (kills, memory_brake): (
+            Vec<(
+                String,
+                cairn_common::executor_protocol::OomKillReport,
+                Option<u64>,
+            )>,
+            bool,
+        ) = {
             let connections = self.lock_connections();
             let Some(entry) = connections.get(executor_id) else {
                 return;
             };
+            let memory_brake = memory_brake_exists(entry);
             let total = entry
                 .health
                 .machine
                 .memory
                 .value()
                 .map(|memory| memory.total_bytes);
-            entry
+            let kills = entry
                 .health
                 .memory_record
                 .oom_kills
@@ -10321,20 +10325,35 @@ impl Fleet {
                     )?;
                     Some((suite, kill.clone(), total))
                 })
-                .collect()
+                .collect();
+            (kills, memory_brake)
         };
         for (suite, kill, total) in kills {
             resource_profiles::observe_suite_kill(
                 db.clone(),
                 &suite,
                 context,
-                kill.killed_at_unix_ms,
-                kill.pid,
-                kill.footprint_bytes
-                    .map(|bytes| (bytes, kill.process_name.clone())),
+                &kill,
                 total,
+                memory_brake,
             )
             .await;
+        }
+    }
+
+    /// What placement knows of `executor_id`'s admission beside one
+    /// completion, for reading a kill in it.
+    fn machine_admission(
+        &self,
+        executor_id: &str,
+        batch_siblings: u32,
+    ) -> resource_profiles::MachineAdmission {
+        resource_profiles::MachineAdmission {
+            memory_brake: self
+                .lock_connections()
+                .get(executor_id)
+                .is_some_and(memory_brake_exists),
+            batch_siblings,
         }
     }
 
@@ -13899,6 +13918,7 @@ impl Fleet {
                     &profile_context,
                     metadata,
                     kind,
+                    self.machine_admission(&selected.executor_id, 0),
                 )
                 .await;
                 resource_profiles::observe_completed(
@@ -13936,6 +13956,14 @@ impl Fleet {
                 // Every item teaches its suite, with or without a command
                 // identity: an agent's batch carries none, and its suite is
                 // the only place its largest process can be learned.
+                let machine = self.machine_admission(
+                    &selected.executor_id,
+                    if batch_items_share_the_machine {
+                        items.len().saturating_sub(1) as u32
+                    } else {
+                        0
+                    },
+                );
                 for (index, item) in items.iter().enumerate() {
                     if item.suspended {
                         continue;
@@ -13949,6 +13977,7 @@ impl Fleet {
                             item.succeeded && !item.timed_out,
                             &item.body,
                         ),
+                        machine,
                     )
                     .await;
                 }
@@ -16493,10 +16522,25 @@ fn excluded_by_memory_kill(reason: &PlacementRejectionReason) -> bool {
     )
 }
 
-/// Two kills of a suite on one machine at one total end its fit there,
-/// whatever their size: one kill below the fit line can be crowding, a second
-/// is the machine's answer. A constant, not a setting.
+/// Two kills of a suite while it ran alone on one machine at one total, under
+/// the machine's current memory-brake state, end its fit there whatever their
+/// size: one can be a fluke of the input, a second is the machine's answer. A
+/// kill while other commands shared the machine never counts
+/// ([`resource_profiles::SuiteKills`]). A constant, not a setting.
 const KILLS_THAT_END_FIT: u32 = 2;
+
+/// Whether this machine's memory brake exists: its memory-stall instrument
+/// has measured, so admission can hold new work there. An executor that
+/// predates the brake, or a platform without the kernel's pressure stall
+/// information, never has.
+fn memory_brake_exists(entry: &ExecutorConnectionState) -> bool {
+    entry
+        .health
+        .host
+        .memory_admission
+        .measured_at_unix_ms
+        .is_some()
+}
 
 /// What the single-process fit concluded on one machine, when it concluded
 /// anything but "fits".
@@ -16531,8 +16575,15 @@ fn process_fit(
     evidence: &resource_profiles::ProcessEvidence,
     entry: &ExecutorConnectionState,
 ) -> Option<ProcessFit> {
+    let mut evidence = evidence.clone();
+    if let Some(demand) = evidence.demand.as_mut() {
+        demand.kills_here = demand
+            .kills_here
+            .take()
+            .map(|kills| kills.under_brake(memory_brake_exists(entry)));
+    }
     judge_process_evidence(
-        evidence,
+        &evidence,
         entry.health.machine.memory.value()?.total_bytes,
         entry.health.memory_record.standing_bytes,
         entry.advertisement.capabilities.memory_budget_bytes,
@@ -16603,9 +16654,9 @@ fn judge_process_fit(
 ) -> Option<cairn_common::executor_protocol::ProcessMisfit> {
     let capacity_bytes = single_process_capacity(total_bytes, standing_bytes, memory_budget_bytes);
     let too_large = demand.peak_bytes > 0 && demand.demand_bytes() > capacity_bytes;
-    let killed_out = demand.kills_here.filter(|(count, killed_at_total)| {
-        *count >= KILLS_THAT_END_FIT
-            && resource_profiles::same_machine_total(*killed_at_total, total_bytes)
+    let killed_out = demand.kills_here.as_ref().filter(|kills| {
+        kills.alone >= KILLS_THAT_END_FIT
+            && resource_profiles::same_machine_total(kills.machine_total_bytes, total_bytes)
     });
     if !too_large && killed_out.is_none() {
         return None;
@@ -16628,7 +16679,11 @@ fn judge_process_fit(
         kills_here: (!too_large)
             .then_some(killed_out)
             .flatten()
-            .map(|(count, _)| count),
+            .map(|kills| kills.alone),
+        crowded_kills: demand
+            .kills_here
+            .as_ref()
+            .and_then(|kills| kills.crowded.clone()),
         basis: demand.basis.clone(),
     })
 }
@@ -16836,15 +16891,123 @@ mod process_fit_tests {
 
     const GIB: u64 = 1 << 30;
 
+    /// A rustc demand, with `(count, machine total)` kills while it ran alone.
     fn rustc(peak_bytes: u64, kills_here: Option<(u32, u64)>) -> resource_profiles::ProcessDemand {
         resource_profiles::ProcessDemand {
             peak_bytes,
             name: Some("rustc".into()),
             suite: Some("rust-tests".into()),
             measured_on: Some("bgsrv-ub2-device:bgsrv-ub2".into()),
-            kills_here,
+            kills_here: kills_here.map(|(alone, machine_total_bytes)| {
+                resource_profiles::SuiteKills {
+                    alone,
+                    machine_total_bytes,
+                    memory_brake: Some(true),
+                    crowded: None,
+                }
+            }),
             basis: Default::default(),
         }
+    }
+
+    /// sp1 on 11-08, as cairn/6496 found it: 121.7 GiB, 9.3 GiB standing.
+    const SP1_TOTAL: u64 = 130_663_231_488;
+    const SP1_STANDING: u64 = 10_029_236_224;
+    const SP1: &str = "bginf-sp1-device:bginf-sp1";
+
+    /// The rustc sp2 measured at 26.0 GiB, with sp1's kills.
+    fn sp1_rustc(kills: resource_profiles::SuiteKills) -> resource_profiles::ProcessDemand {
+        resource_profiles::ProcessDemand {
+            measured_on: Some("bginf-sp2-device:bginf-sp2".into()),
+            kills_here: Some(kills),
+            ..rustc(26_017_456_128, None)
+        }
+    }
+
+    fn sp1_crowded() -> cairn_common::executor_protocol::CrowdedKills {
+        cairn_common::executor_protocol::CrowdedKills {
+            count: 3,
+            most_co_resident: Some(18),
+            memory_brake: false,
+            last_killed_at_unix_ms: 1_794_100_665_217,
+        }
+    }
+
+    /// cairn/6496's specimen: three kills of a 32.5 GiB rustc on a 120.6 GiB
+    /// capacity while eighteen other lanes shared the machine with no memory
+    /// brake. They say admission over-committed sp1, not that one rustc
+    /// cannot fit it, so sp1 is offered the suite.
+    #[test]
+    fn crowded_kills_do_not_end_a_machines_fit() {
+        let crowded = sp1_rustc(resource_profiles::SuiteKills {
+            crowded: Some(sp1_crowded()),
+            ..Default::default()
+        });
+        assert_eq!(
+            refuse(&crowded, SP1_TOTAL, Some(SP1_STANDING), None, SP1),
+            None
+        );
+    }
+
+    /// sp1's rows as the rebuild found them: three kills counted before the
+    /// ledger recorded admission, so with no brake state. The fit reads them
+    /// under the machine's current brake, which exists, and they no longer
+    /// count; judged without that reading they would still refuse.
+    #[test]
+    fn kills_from_before_the_brake_expire_once_it_is_live() {
+        let legacy = resource_profiles::SuiteKills {
+            alone: 3,
+            machine_total_bytes: SP1_TOTAL,
+            memory_brake: None,
+            crowded: None,
+        };
+        assert!(refuse(
+            &sp1_rustc(legacy.clone()),
+            SP1_TOTAL,
+            Some(SP1_STANDING),
+            None,
+            SP1
+        )
+        .is_some());
+        assert_eq!(
+            refuse(
+                &sp1_rustc(legacy.under_brake(true)),
+                SP1_TOTAL,
+                Some(SP1_STANDING),
+                None,
+                SP1
+            ),
+            None
+        );
+    }
+
+    /// A refusal on alone kills says so and is the machine's answer; the
+    /// crowded kills beside it are named as admission's, not the machine's.
+    #[test]
+    fn the_refusal_text_tells_alone_kills_from_crowded_ones() {
+        let Some(PlacementRejectionReason::ProcessTooLarge(misfit)) = refuse(
+            &sp1_rustc(resource_profiles::SuiteKills {
+                alone: 2,
+                machine_total_bytes: SP1_TOTAL,
+                memory_brake: Some(true),
+                crowded: Some(sp1_crowded()),
+            }),
+            SP1_TOTAL,
+            Some(SP1_STANDING),
+            None,
+            SP1,
+        ) else {
+            panic!("two alone kills end fit");
+        };
+        let text = misfit.describe();
+        assert!(
+            text.contains("the kernel killed it here for memory 2 times while it ran alone on this 121.7 GiB machine, which is its answer until its memory changes"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the kernel killed it here 3 times while up to 18 other commands shared the machine with no memory brake (last 11-08 UTC), which says admission over-committed the machine then, not that one process cannot fit it"),
+            "{text}"
+        );
     }
 
     /// The fit of a single named demand on a platform whose kernel kills: a
@@ -17165,6 +17328,7 @@ mod process_fit_tests {
             &linux("bgsrv-ub2-device:bgsrv-ub2", "x86_64"),
             &rustc_completion(KILLED_RUSTC, 1),
             resource_profiles::CompletionKind::Failed,
+            resource_profiles::MachineAdmission::default(),
         )
         .await;
         let evidence = evidence_on_ub(db, &workspace_compile("workspace-compile:cold")).await;
@@ -17201,7 +17365,7 @@ mod process_fit_tests {
         let db = Arc::new(crate::storage::migrated_test_db("process-fit-killed.db").await);
         for at in [1, 2] {
             let mut kill =
-                resource_profiles::oom_killed_for_test(KILLED_RUSTC, Some(UB_TOTAL), 1, at);
+                resource_profiles::oom_killed_for_test(KILLED_RUSTC, Some(UB_TOTAL), 0, at);
             if let Some(cairn_common::executor_protocol::CommandStop::OomKilled {
                 process_name,
                 ..
@@ -17215,12 +17379,19 @@ mod process_fit_tests {
                 &linux(UB, "x86_64"),
                 &kill,
                 resource_profiles::CompletionKind::Failed,
+                resource_profiles::MachineAdmission::default(),
             )
             .await;
         }
         let evidence = evidence_on_ub(db, &workspace_compile("workspace-compile:next")).await;
         let demand = evidence.demand.as_ref().unwrap();
-        assert_eq!(demand.kills_here, Some((2, UB_TOTAL)));
+        assert_eq!(
+            demand
+                .kills_here
+                .as_ref()
+                .map(|kills| (kills.alone, kills.machine_total_bytes)),
+            Some((2, UB_TOTAL))
+        );
         let Some(ProcessFit::Refused(reason)) =
             judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, UB, true)
         else {
@@ -27840,6 +28011,7 @@ mod tests {
                 ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
             },
             resource_profiles::CompletionKind::Succeeded,
+            resource_profiles::MachineAdmission::default(),
         )
         .await;
         request.command_resource_identity = Some(identity);
@@ -28046,10 +28218,9 @@ mod tests {
             db.clone(),
             &suite_a,
             &context,
-            old.killed_at_unix_ms,
-            old.pid,
-            Some((2 * GIB, Some("rustc".into()))),
+            &old,
             Some(13_000_000_000),
+            false,
         )
         .await;
         for _ in 0..3 {
@@ -28061,7 +28232,7 @@ mod tests {
                 Box::pin(async move {
                     let mut rows = conn
                         .query(
-                            "SELECT suite_key, oom_kill_count FROM suite_memory_evidence ORDER BY suite_key",
+                            "SELECT suite_key, oom_crowded_kill_count FROM suite_memory_evidence ORDER BY suite_key",
                             (),
                         )
                         .await?;
@@ -28215,6 +28386,7 @@ mod tests {
                         ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
                     },
                     resource_profiles::CompletionKind::Failed,
+                    resource_profiles::MachineAdmission::default(),
                 )
                 .await;
             }
@@ -28364,6 +28536,7 @@ mod tests {
                 ..resource_profiles::oom_killed_for_test(GIB, None, 0, 1)
             },
             resource_profiles::CompletionKind::Succeeded,
+            resource_profiles::MachineAdmission::default(),
         )
         .await;
         request.command_resource_identity = Some(identity);

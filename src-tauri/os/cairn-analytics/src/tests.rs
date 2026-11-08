@@ -1745,7 +1745,7 @@ async fn model_role_economics_uses_real_metered_cost() {
         },
         long_prompt: pricing::Components::default(),
     };
-    assert_eq!(pricing::cost_usd(Some("z-ai/glm"), &usage), 0.0);
+    assert_eq!(pricing::cost_usd("claude", Some("z-ai/glm"), &usage), 0.0);
 
     let out = model_role_economics(&db, &Scope::default(), &TimeRange::default())
         .await
@@ -1797,6 +1797,7 @@ async fn model_role_economics_costs_match_the_shared_rule() {
     let mut total = 0.0;
     for row in &rows {
         let expected = crate::cost::exact_or_priced(
+            &row.backend,
             row.model.as_deref(),
             &row.unmetered_usage,
             row.exact_cost,
@@ -1900,7 +1901,7 @@ async fn row_grain_cost_keeps_unmetered_rows_in_a_metered_group() {
         },
         ..Default::default()
     };
-    let expected = 0.42 + pricing::cost_usd(Some("sonnet"), &usage);
+    let expected = 0.42 + pricing::cost_usd("claude", Some("sonnet"), &usage);
     for bucket in [Bucket::Hour, Bucket::Day, Bucket::Week, Bucket::Month] {
         let points = cost_timeseries(&db, &Scope::default(), &TimeRange::default(), bucket)
             .await
@@ -1988,6 +1989,7 @@ async fn row_grain_cost_partial_and_zero_metering_stays_exact_only() {
             output: 1_000,
         };
         let list = pricing::cost_usd(
+            "claude",
             Some("haiku"),
             &pricing::TieredUsage {
                 all: usage,
@@ -4392,7 +4394,9 @@ async fn spend_by_thread_nests_issues_under_their_threads() {
         },
         ..Default::default()
     };
-    assert!((child_own.cost_usd - pricing::cost_usd(Some("sonnet"), &usage)).abs() < 1e-12);
+    assert!(
+        (child_own.cost_usd - pricing::cost_usd("claude", Some("sonnet"), &usage)).abs() < 1e-12
+    );
     assert_eq!(child_own.billable_tokens, 42_000);
     // The grandchild carries its builder plus the stale task that walked
     // parent_job_id up to it.

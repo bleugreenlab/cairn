@@ -290,12 +290,11 @@ fn kinds(serves: &[ServedVerb]) -> Vec<VerbKind> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogModel {
-    /// The provider's canonical slug when it reports one, otherwise
-    /// `{provider}/{model}`.
+    /// The canonical model id when known, otherwise `{provider}/{model}`.
     pub catalog_id: String,
     pub display_name: String,
     pub offers: Vec<CatalogOffer>,
-    /// Native ids that differ from the catalog id.
+    /// Provider spellings (native ids and slugs) that differ from the catalog id.
     pub aliases: Vec<String>,
 }
 
@@ -312,6 +311,9 @@ pub struct CatalogOffer {
     pub provider: String,
     /// The id the provider itself is sent.
     pub model: String,
+    /// The canonical slug reported by this provider, when nonempty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
     pub context_window: Option<i64>,
     /// What the model takes in and gives out, when its provider said.
     pub modalities: Option<Modalities>,
@@ -326,7 +328,7 @@ pub struct CatalogOffer {
     pub serving_account_ids: Vec<String>,
     /// The provider-independent model this offer is
     /// ([`cairn_models_types::identity`]), when Cairn can tell without
-    /// guessing. Annotation only: offers still group by catalog id.
+    /// guessing. Offers with the same identity share a catalog entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical: Option<String>,
     /// Session provenance for a moving alias, including missing or stale evidence.
@@ -509,24 +511,15 @@ fn preference(served: &ServedVerb) -> u8 {
     }
 }
 
-/// The offers of every model `requested` names exactly, as `query` admits
-/// them, and those of them that serve its verb, best first. `qualifier` and
-/// `native` are `requested` split at an installed provider's key.
-///
-/// `provider/native-id` names that provider's offer of that native id, the
-/// form refusals and listings name offers in. The native id may itself hold a
-/// slash (`openrouter/typesafe/jev-1.14`), and a model with a canonical slug
-/// has a catalog id that is neither, so this is matched on the offer rather
-/// than the catalog id. Anything else names a model by its catalog id, an
-/// alias, or an offer's native id, and reaches every offer of that model: a
-/// local profile's upstream slug merges its offer with a remote one's.
-fn exact_offers(
+/// Resolve the most specific spelling before applying any capability or grant
+/// filters: a qualified native id, a provider's native id or slug, then a
+/// canonical id. A spelling reaches only the offers spelled that way.
+fn matching_offers(
     models: &[CatalogModel],
-    query: &OfferQuery<'_>,
     requested: &str,
     qualifier: Option<&str>,
     native: &str,
-) -> (Vec<CatalogOffer>, Vec<SelectedOffer>) {
+) -> Vec<CatalogOffer> {
     let names_offer = |offer: &CatalogOffer| {
         qualifier.is_some_and(|key| offer.provider == key && offer.model == native)
     };
@@ -534,16 +527,38 @@ fn exact_offers(
         .iter()
         .flat_map(|model| &model.offers)
         .any(names_offer);
-    let matching: Vec<CatalogOffer> = models
+    let spelled = models
         .iter()
-        .filter(|model| {
-            qualified
-                || model.catalog_id == requested
-                || model.aliases.iter().any(|alias| alias == requested)
-                || model.offers.iter().any(|offer| offer.model == requested)
+        .flat_map(|model| &model.offers)
+        .any(|offer| offer.model == requested || offer.slug.as_deref() == Some(requested));
+    models
+        .iter()
+        .flat_map(|model| {
+            model.offers.iter().filter(move |offer| {
+                if qualified {
+                    names_offer(offer)
+                } else if spelled {
+                    offer.model == requested || offer.slug.as_deref() == Some(requested)
+                } else {
+                    model.catalog_id == requested
+                }
+            })
         })
-        .flat_map(|model| model.offers.iter().cloned())
-        .filter(|offer| !qualified || names_offer(offer))
+        .cloned()
+        .collect()
+}
+
+/// Offers named by the shared three tiers, narrowed by the query, then by
+/// capability. A more general tier never substitutes for an incapable offer.
+fn exact_offers(
+    models: &[CatalogModel],
+    query: &OfferQuery<'_>,
+    requested: &str,
+    qualifier: Option<&str>,
+    native: &str,
+) -> (Vec<CatalogOffer>, Vec<SelectedOffer>) {
+    let matching: Vec<CatalogOffer> = matching_offers(models, requested, qualifier, native)
+        .into_iter()
         .filter(|offer| query.admits_offer(offer))
         .collect();
     let mut capable: Vec<SelectedOffer> = matching
@@ -627,9 +642,10 @@ impl Catalog {
     /// grouped by catalog id.
     ///
     /// Nothing is merged by guess. Two providers' offers share an entry only
-    /// when both report the same canonical slug; the Claude CLI's `opus` stays
-    /// `claude/opus`, because the CLI, not Cairn, decides which version it
-    /// means. Hidden models (ones the provider cannot serve) are left out.
+    /// when identity resolves both to one canonical id. An unidentified offer
+    /// stays under its provider-qualified native id. Moving aliases group only
+    /// when their provider supplies current identity evidence. Hidden models
+    /// (ones the provider cannot serve) are left out.
     pub fn models(&self) -> Vec<CatalogModel> {
         let mut out: Vec<CatalogModel> = Vec::new();
         let mut place =
@@ -668,12 +684,13 @@ impl Catalog {
                 .map(|catalog| catalog.models.as_slice())
                 .unwrap_or_default();
             for model in discovered.iter().filter(|model| !model.hidden) {
-                let catalog_id = model
-                    .canonical_slug
+                let canonical = provider.canonical(&model.model);
+                let catalog_id = canonical
                     .clone()
-                    .filter(|slug| !slug.is_empty())
                     .unwrap_or_else(|| format!("{key}/{}", model.model));
-                let aliases = vec![model.model.clone()];
+                let slug = model.canonical_slug.clone().filter(|slug| !slug.is_empty());
+                let mut aliases = vec![model.model.clone()];
+                aliases.extend(slug.iter().cloned());
                 place(
                     catalog_id,
                     &model.display_name,
@@ -682,12 +699,13 @@ impl Catalog {
                         availability_by_verb: model.availability_by_verb.clone(),
                         provider: key.to_string(),
                         model: model.model.clone(),
+                        slug,
                         context_window: model.context_window,
                         modalities: model.modalities.clone(),
                         pricing: model.pricing.clone(),
                         serves: provider.serves_declared(&model.model, model.serves.as_deref()),
                         serving_account_ids: model.serving_account_ids.clone(),
-                        canonical: provider.canonical(&model.model),
+                        canonical,
                         identity_note: provider.identity_note(&model.model),
                     },
                     aliases,
@@ -713,35 +731,16 @@ impl Catalog {
             .cloned()
     }
 
-    /// Every offer of the model `name` names exactly: its catalog id, a
-    /// provider's native id, or `provider/native-id` for that provider's offer
-    /// alone. A pool is never a name here: pools are the workspace's own
-    /// vocabulary for its agents, chosen within by selection, not by the
-    /// catalog.
-    pub fn named_offers(&self, name: &str) -> Vec<CatalogOffer> {
+    /// Offers reached by a qualified native id, then a provider's spelling,
+    /// then a canonical id, without filtering by verb. Pools are workspace
+    /// selection vocabulary, never catalog names.
+    pub fn offers_named(&self, name: &str) -> Vec<CatalogOffer> {
         let name = name.trim();
         if name.is_empty() {
             return Vec::new();
         }
-        let models = self.models();
-        if let Some((key, native)) = name.split_once('/') {
-            let qualified: Vec<CatalogOffer> = models
-                .iter()
-                .flat_map(|model| &model.offers)
-                .filter(|offer| offer.provider == key && offer.model == native)
-                .cloned()
-                .collect();
-            if !qualified.is_empty() {
-                return qualified;
-            }
-        }
-        models
-            .into_iter()
-            .filter(|model| {
-                model.catalog_id == name || model.offers.iter().any(|offer| offer.model == name)
-            })
-            .flat_map(|model| model.offers)
-            .collect()
+        let (qualifier, native) = self.qualified_by(name);
+        matching_offers(&self.models(), name, qualifier, native)
     }
 
     /// The installed provider whose key is `key`.
@@ -852,6 +851,9 @@ impl Catalog {
                 }
                 for offer in admitted {
                     spell(&offer.model);
+                    if let Some(slug) = &offer.slug {
+                        spell(slug);
+                    }
                 }
             }
         }
@@ -1176,8 +1178,29 @@ impl Catalog {
             .filter(|offer| query.admits_offer(offer))
             .filter_map(|offer| offer.selected(query.verb))
             .collect();
-        // Stable: provider order survives within each rank.
-        offers.sort_by_key(|offer| preference(&offer.served));
+        // Canonical groups interleave providers, so their flattened order is
+        // not selection priority. Recover discovery order before wire ranking.
+        let order: std::collections::HashMap<_, _> = self
+            .installed()
+            .enumerate()
+            .flat_map(|(provider_index, provider)| {
+                let key = provider.descriptor.key.as_ref();
+                provider
+                    .models
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|catalog| catalog.models.iter().enumerate())
+                    .map(move |(model_index, model)| {
+                        ((key, model.model.as_str()), (provider_index, model_index))
+                    })
+            })
+            .collect();
+        offers.sort_by_key(|offer| {
+            (
+                preference(&offer.served),
+                order[&(offer.provider.as_str(), offer.model.as_str())],
+            )
+        });
         offers
     }
 
@@ -1466,7 +1489,7 @@ mod tests {
         };
         let providers = |name: &str| {
             catalog
-                .named_offers(name)
+                .offers_named(name)
                 .into_iter()
                 .map(|offer| offer.provider)
                 .collect::<Vec<_>>()
@@ -1545,7 +1568,7 @@ mod tests {
 
     /// An OpenRouter decision model is named the way a refusal names it,
     /// `provider/native-id`, though its native id holds a slash and its
-    /// catalog id is its canonical slug; that names only this provider's
+    /// catalog id is independent of that spelling; that names only this provider's
     /// offer.
     #[test]
     fn a_provider_qualified_native_id_selects_that_providers_offer() {
@@ -1796,9 +1819,8 @@ mod tests {
     }
 
     /// The live workspace's two Qwen3-Embedding-4B offers: OpenRouter's, and
-    /// Cairn inference's under its real name, merged on the upstream slug the
-    /// inference profile declares. OpenRouter comes first in provider order,
-    /// so it was the one silently chosen.
+    /// Cairn inference's under its real name, with a shared upstream spelling.
+    /// The identity table does not list this model, so the offers stay separate.
     fn two_embedders() -> Catalog {
         Catalog {
             providers: vec![
@@ -1832,10 +1854,15 @@ mod tests {
         let catalog = two_embedders();
         assert_eq!(
             catalog.models().len(),
-            2,
-            "the two Qwen offers share an entry"
+            3,
+            "unidentified Qwen offers remain separate despite their shared spelling"
         );
-        for requested in [QWEN_EMBED, QWEN_SLUG] {
+        assert_eq!(
+            embed_offer(&catalog, QWEN_EMBED).unwrap().provider,
+            "inference"
+        );
+        {
+            let requested = QWEN_SLUG;
             let refusal = embed_offer(&catalog, requested).unwrap_err();
             assert!(refusal.ambiguous, "{requested}");
             assert_eq!(
@@ -1902,7 +1929,7 @@ mod tests {
     }
 
     /// A Claude subscription beside one chat model two providers offer, merged
-    /// on the upstream slug: OpenRouter's lowercase id and Cairn inference's
+    /// by canonical identity: OpenRouter's lowercase id and Cairn inference's
     /// real name.
     fn pinnable() -> Catalog {
         const QWEN_CHAT: &str = "qwen/qwen3.6-35b-a3b";
@@ -1955,8 +1982,14 @@ mod tests {
     #[test]
     fn a_pin_two_providers_offer_is_refused_naming_each() {
         let catalog = pinnable();
-        let expected = "'Qwen/Qwen3.6-35B-A3B' is offered by inference (inference/Qwen/Qwen3.6-35B-A3B) and openrouter (openrouter/qwen/qwen3.6-35b-a3b): name one.";
-        let refusal = pin(&catalog, "Qwen/Qwen3.6-35B-A3B", None).unwrap_err();
+        // The exact real name is only inference's spelling; the shared
+        // lowercase slug reaches both providers.
+        assert_eq!(
+            pin(&catalog, "Qwen/Qwen3.6-35B-A3B", None),
+            Ok(("inference".into(), "Qwen/Qwen3.6-35B-A3B".into()))
+        );
+        let expected = "'qwen/qwen3.6-35b-a3b' is offered by inference (inference/Qwen/Qwen3.6-35B-A3B) and openrouter (openrouter/qwen/qwen3.6-35b-a3b): name one.";
+        let refusal = pin(&catalog, "qwen/qwen3.6-35b-a3b", None).unwrap_err();
         assert!(refusal.ambiguous);
         assert_eq!(refusal.to_string(), expected);
         // Reached only by case, it is refused the same way, under the name
@@ -1965,7 +1998,7 @@ mod tests {
         assert!(refusal.ambiguous);
         assert_eq!(
             refusal.to_string(),
-            expected.replacen("Qwen/Qwen3.6-35B-A3B", "QWEN/QWEN3.6-35B-A3B", 1)
+            expected.replacen("qwen/qwen3.6-35b-a3b", "QWEN/QWEN3.6-35B-A3B", 1)
         );
 
         // Two models that differ only by case are two models.
@@ -2072,8 +2105,8 @@ mod tests {
             names,
             [
                 "openrouter/qwen/qwen3-embedding-4b",
-                "inference/Qwen/Qwen3-Embedding-4B",
                 "openai/text-embedding-3-small",
+                "Qwen/Qwen3-Embedding-4B",
             ]
         );
         for (offer, name) in offers.iter().zip(&names) {
@@ -2413,34 +2446,171 @@ mod tests {
     }
 
     #[test]
-    fn offers_sharing_a_canonical_slug_group_under_it() {
-        let catalog = Catalog {
-            providers: vec![
-                provider(
-                    "openrouter",
-                    Some(vec![model("z-ai/glm-4.6", Some("z-ai/glm-4.6"))]),
-                ),
-                provider(
-                    "opencode-go",
-                    Some(vec![model("glm-4.6", Some("z-ai/glm-4.6"))]),
-                ),
-            ],
-        };
+    fn offers_resolving_to_one_canonical_id_group_under_it() {
+        let catalog = glm_catalog();
         let models = catalog.models();
         assert_eq!(models.len(), 1);
-        let glm = find(&models, "z-ai/glm-4.6");
+        let glm = find(&models, "glm-5.2");
         let providers: Vec<&str> = glm.offers.iter().map(|o| o.provider.as_str()).collect();
         assert_eq!(providers, vec!["openrouter", "opencode-go"]);
-        // The native id that differs from the slug.
-        assert_eq!(glm.aliases, vec!["glm-4.6"]);
+        assert_eq!(glm.aliases, vec!["z-ai/glm-5.2", "z-ai/glm-5.2-20261001"]);
+    }
+
+    fn glm_catalog() -> Catalog {
+        Catalog {
+            providers: vec![
+                conversing(provider(
+                    "openrouter",
+                    Some(vec![model("z-ai/glm-5.2", Some("z-ai/glm-5.2-20261001"))]),
+                )),
+                conversing(provider("opencode-go", Some(vec![model("glm-5.2", None)]))),
+            ],
+        }
     }
 
     #[test]
-    fn a_model_without_a_slug_is_qualified_by_its_provider_and_never_merged() {
+    fn canonical_groups_do_not_change_unset_selection_priority() {
+        let mut catalog = Catalog {
+            providers: vec![
+                conversing(provider(
+                    "openrouter",
+                    Some(vec![model("gpt-5.5", None), model("gpt-5.4", None)]),
+                )),
+                conversing(provider("opencode-go", Some(vec![model("gpt-5.5", None)]))),
+            ],
+        };
+        assert_eq!(catalog.models().len(), 2);
+        let query = OfferQuery::new(VerbKind::Complete);
+        let offers = catalog.offers_serving(VerbKind::Complete);
+        assert_eq!(
+            offers
+                .iter()
+                .map(|offer| (offer.provider.as_str(), offer.model.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("openrouter", "gpt-5.5"),
+                ("openrouter", "gpt-5.4"),
+                ("opencode-go", "gpt-5.5"),
+            ]
+        );
+        let (offer, ()) = catalog
+            .admitting_offer(query, |offer| {
+                if offer.provider == "openrouter" && offer.model == "gpt-5.5" {
+                    Err("request exceeds this offer")
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            (offer.provider.as_str(), offer.model.as_str()),
+            ("openrouter", "gpt-5.4")
+        );
+        catalog.providers[0].models.as_mut().unwrap().models[0].serves = Some(vec![]);
+        let offer = catalog.offer_for(query).unwrap();
+        assert_eq!(
+            (offer.provider.as_str(), offer.model.as_str()),
+            ("openrouter", "gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn provider_spellings_win_over_the_canonical_group() {
+        let catalog = glm_catalog();
+        for (name, expected) in [
+            ("glm-5.2", "opencode-go"),
+            ("z-ai/glm-5.2", "openrouter"),
+            ("z-ai/glm-5.2-20261001", "openrouter"),
+            ("opencode-go/glm-5.2", "opencode-go"),
+        ] {
+            let offer = catalog
+                .offer_for(OfferQuery {
+                    requested: Some(name),
+                    ..OfferQuery::new(VerbKind::Complete)
+                })
+                .unwrap();
+            assert_eq!(offer.provider, expected, "{name}");
+            assert_eq!(catalog.offers_named(name).len(), 1, "{name}");
+        }
+        assert_eq!(
+            catalog.request_names(&catalog.offers_serving(VerbKind::Complete)),
+            ["z-ai/glm-5.2", "glm-5.2"]
+        );
+        // Case-insensitive edits include the provider's slug as a spelling.
+        assert_eq!(
+            pin(&catalog, "Z-AI/GLM-5.2-20261001", None).unwrap(),
+            ("openrouter".into(), "z-ai/glm-5.2".into())
+        );
+        // Narrowing cannot fall through to a less specific canonical tier.
+        assert!(catalog
+            .offer_for(OfferQuery {
+                requested: Some("glm-5.2"),
+                provider: Some("openrouter"),
+                ..OfferQuery::new(VerbKind::Complete)
+            })
+            .is_err());
+        let mut incapable = catalog;
+        incapable.providers[1].serves.clear();
+        assert!(incapable
+            .offer_for(OfferQuery {
+                requested: Some("glm-5.2"),
+                ..OfferQuery::new(VerbKind::Complete)
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn a_canonical_name_requires_one_capable_provider() {
+        let mut catalog = Catalog {
+            providers: vec![conversing(provider(
+                "openrouter",
+                Some(vec![model("anthropic/claude-opus-4.6", None)]),
+            ))],
+        };
+        let query = OfferQuery {
+            requested: Some("claude-opus-4.6"),
+            ..OfferQuery::new(VerbKind::Complete)
+        };
+        assert_eq!(catalog.offer_for(query).unwrap().provider, "openrouter");
+        catalog.providers.push(conversing(provider(
+            "opencode-go",
+            Some(vec![model("anthropic/claude-opus-4.6", None)]),
+        )));
+        assert_eq!(catalog.models().len(), 1);
+        assert_eq!(catalog.offers_named("claude-opus-4.6").len(), 2);
+        let refusal = catalog.offer_for(query).unwrap_err();
+        assert!(refusal.ambiguous);
+        let detail = refusal.detail.unwrap();
+        for provider in ["openrouter", "opencode-go"] {
+            assert!(detail.contains(&format!("{provider}/anthropic/claude-opus-4.6")));
+            assert_eq!(
+                catalog
+                    .offer_for(OfferQuery {
+                        provider: Some(provider),
+                        ..query
+                    })
+                    .unwrap()
+                    .provider,
+                provider
+            );
+        }
+        assert_eq!(
+            catalog.request_names(&catalog.offers_serving(VerbKind::Complete)),
+            [
+                "openrouter/anthropic/claude-opus-4.6",
+                "opencode-go/anthropic/claude-opus-4.6"
+            ]
+        );
+        catalog.providers[1].serves.clear();
+        assert_eq!(catalog.offer_for(query).unwrap().provider, "openrouter");
+    }
+
+    #[test]
+    fn a_model_without_identity_is_qualified_by_its_provider_and_never_merged() {
         let catalog = Catalog {
             providers: vec![
-                provider("claude", Some(claude_models())),
-                provider("ollama", Some(vec![model("opus", None)])),
+                conversing(provider("claude", Some(claude_models()))),
+                conversing(provider("ollama", Some(vec![model("opus", None)]))),
             ],
         };
         let models = catalog.models();
@@ -2452,10 +2622,36 @@ mod tests {
         let local = find(&models, "ollama/opus");
         assert_eq!(local.offers[0].provider, "ollama");
         assert_eq!(local.aliases, vec!["opus"]);
+        assert!(pin(&catalog, "opus", None).unwrap_err().ambiguous);
     }
 
     #[test]
-    fn offers_carry_their_canonical_id_without_regrouping() {
+    fn an_unknown_shared_slug_does_not_merge_offers() {
+        let catalog = Catalog {
+            providers: vec![
+                provider(
+                    "openrouter",
+                    Some(vec![model("unknown-a", Some("unknown/model"))]),
+                ),
+                provider(
+                    "ollama",
+                    Some(vec![model("unknown-b", Some("unknown/model"))]),
+                ),
+            ],
+        };
+        let models = catalog.models();
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            find(&models, "openrouter/unknown-a").offers[0].canonical,
+            None
+        );
+        assert_eq!(find(&models, "ollama/unknown-b").offers[0].canonical, None);
+        // A shared spelling still reaches both, independently of grouping.
+        assert_eq!(catalog.offers_named("unknown/model").len(), 2);
+    }
+
+    #[test]
+    fn offers_group_under_their_canonical_id() {
         let catalog = Catalog {
             providers: vec![
                 provider("claude", Some(claude_models())),
@@ -2470,9 +2666,9 @@ mod tests {
             ],
         };
         let models = catalog.models();
-        let opus = find(&models, "anthropic/claude-4.6-opus-20260205");
+        let opus = find(&models, "claude-opus-4.6");
         assert_eq!(opus.offers[0].canonical.as_deref(), Some("claude-opus-4.6"));
-        let kimi = find(&models, "opencode-go/kimi-k2.5");
+        let kimi = find(&models, "kimi-k2.5");
         assert_eq!(kimi.offers[0].canonical.as_deref(), Some("kimi-k2.5"));
         // The CLI's alias names no version, so it has no canonical id.
         assert_eq!(find(&models, "claude/opus").offers[0].canonical, None);

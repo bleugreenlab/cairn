@@ -7234,6 +7234,16 @@ pub struct LearnedResourceEstimate {
 /// available memory as before, while the newer executor's own admission
 /// enforces the rest.
 ///
+/// cairn/6496 does not move the number. It adds `crowdedKills` on
+/// [`ProcessMisfit`], with its new [`CrowdedKills`], omitted when absent:
+/// runner placement vocabulary under cairn/4931's argument, carried to no
+/// executor. A suite's kills now end a machine's fit only when the victim ran
+/// alone under the machine's current memory-brake state, read from the load
+/// context and stall instrument executors already send, which is runner-local
+/// placement. What a runner gets wrong talking to an older executor: nothing;
+/// that executor posts no memory instrument, so its brake reads as absent, and
+/// its alone kills count against it exactly as they did.
+///
 /// Version 167 (cairn/5536) makes a finished attempt's result outlive the
 /// runner process that granted it. The executor retains every `Result` it sends,
 /// keyed by request and attempt, until the runner answers
@@ -17854,10 +17864,16 @@ pub struct ProcessMisfit {
     /// capacity is the reservation cap instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standing_bytes: Option<u64>,
-    /// Kills of this suite on this machine at this total, when the count
-    /// rather than the size decided the misfit.
+    /// Kills of this suite on this machine at this total while it ran alone
+    /// there, under the machine's current admission, when the count rather
+    /// than the size decided the misfit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kills_here: Option<u32>,
+    /// Kills of this suite here while other commands shared the machine.
+    /// They decided nothing; they are named so a reader does not take them
+    /// for the machine's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crowded_kills: Option<CrowdedKills>,
     /// Where the demand came from when no machine of this platform measured
     /// this work. Absent means it did.
     #[serde(default, skip_serializing_if = "ProcessDemandBasis::is_this_platform")]
@@ -17990,14 +18006,79 @@ impl ProcessMisfit {
             "needs one process of ~{} ({evidence})",
             describe_gib(self.process_bytes)
         );
-        match self.kills_here {
+        let decided = match self.kills_here {
             Some(kills) => format!(
-                "{demand}; the kernel killed it here for memory {kills} times on this {} machine, which is its answer until its memory changes",
+                "{demand}; the kernel killed it here for memory {kills} times while it ran alone on this {} machine, which is its answer until its memory changes",
                 describe_gib(self.total_bytes)
             ),
             None => format!("{demand}; {capacity}"),
+        };
+        match &self.crowded_kills {
+            Some(crowded) => format!("{decided}; {}", crowded.describe()),
+            None => decided,
         }
     }
+}
+
+/// A suite's out-of-memory kills on one machine that came while other
+/// commands shared it. Such a kill says admission over-committed the machine
+/// when it happened, which is for its owed accounting and the memory brake to
+/// answer; it says nothing about whether one process of the suite fits the
+/// machine, so it never ends the machine's fit for the suite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CrowdedKills {
+    pub count: u32,
+    /// The most commands that shared the machine with a victim when it
+    /// started, its batch siblings included. `None` where no kill stated its
+    /// load, as for a resident's, which is never read as alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub most_co_resident: Option<u32>,
+    /// Whether the machine's memory brake existed at the latest of them.
+    pub memory_brake: bool,
+    pub last_killed_at_unix_ms: u64,
+}
+
+impl CrowdedKills {
+    /// `the kernel killed it here 3 times while up to 18 other commands
+    /// shared the machine with no memory brake (last 11-07 UTC), ...`.
+    pub fn describe(&self) -> String {
+        let times = match self.count {
+            1 => "once".to_string(),
+            count => format!("{count} times"),
+        };
+        let company = match self.most_co_resident {
+            Some(commands) => format!("up to {commands} other commands"),
+            None => "other work".to_string(),
+        };
+        let brake = if self.memory_brake {
+            "under the memory brake"
+        } else {
+            "with no memory brake"
+        };
+        format!(
+            "the kernel killed it here {times} while {company} shared the machine {brake} (last {} UTC), which says admission over-committed the machine then, not that one process cannot fit it",
+            utc_month_day(self.last_killed_at_unix_ms)
+        )
+    }
+}
+
+/// `MM-DD` of a Unix time in milliseconds, in UTC: the civil-from-days
+/// conversion, so a sentence can date a kill without a calendar crate.
+fn utc_month_day(unix_ms: u64) -> String {
+    let z = (unix_ms / 86_400_000) as i64 + 719_468;
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    format!("{month:02}-{day:02}")
 }
 
 /// [`MEASURED_RESERVATION_HEADROOM_PERCENT`] as the factor a measurement is

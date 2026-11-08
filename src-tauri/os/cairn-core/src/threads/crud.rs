@@ -1061,7 +1061,7 @@ mod tests {
             db,
             &thread.id,
             None,
-            crate::execution::provider_change::tests::QWEN_LOCAL,
+            crate::execution::provider_change::tests::QWEN_SLUG,
         )
         .await
         .unwrap_err()

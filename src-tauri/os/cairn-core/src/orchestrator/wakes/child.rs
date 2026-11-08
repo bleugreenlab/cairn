@@ -23,6 +23,21 @@ pub(crate) async fn coordinating_job_for_child(
     .await
 }
 
+/// [`cairn_attention::wakes::gate_owner_for_child_conn`] with the application's
+/// recipient host: who a child issue's gates wait on, without establishing a
+/// session.
+pub(crate) async fn gate_owner_for_child_conn(
+    conn: &crate::storage::TrackedConnection,
+    child_issue_id: &str,
+) -> crate::storage::DbResult<cairn_attention::wakes::GateOwner> {
+    cairn_attention::wakes::gate_owner_for_child_conn(
+        std::sync::Arc::new(crate::attention_host::CoreRecipients),
+        conn,
+        child_issue_id,
+    )
+    .await
+}
+
 pub async fn watcher_jobs_for_issue(
     db: &crate::storage::LocalDb,
     issue_uri: &str,

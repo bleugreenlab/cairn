@@ -4172,7 +4172,12 @@ impl Orchestrator {
                 "GC: evicting warm process {}",
                 &run_id[..run_id.len().min(8)]
             );
-            if let Err(e) = lifecycle::kill_session_with_reason(self, run_id, "warm_evict") {
+            if let Err(e) = lifecycle::kill_session_with_reason(
+                self,
+                run_id,
+                "warm_evict",
+                lifecycle::TerminalPolicy::Finalize,
+            ) {
                 log::error!("GC: failed to kill evicted process {}: {}", run_id, e);
             }
         }

@@ -37,6 +37,7 @@ pub(crate) fn price_job_rows(rows: Vec<JobCostComponentRow>) -> Vec<(JobCostComp
         .filter(|row| token_groups.contains(&key(row)))
         .map(|row| {
             let cost = super::cost::exact_or_priced(
+                &row.backend,
                 row.model.as_deref(),
                 &row.unmetered_usage,
                 row.exact_cost,

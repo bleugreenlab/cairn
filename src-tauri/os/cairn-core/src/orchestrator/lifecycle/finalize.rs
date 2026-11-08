@@ -642,6 +642,7 @@ fn maybe_kill_completed_call_child(orch: &Orchestrator, run_id: &str) {
             &reaper,
             &run_id,
             "call_complete",
+            crate::orchestrator::lifecycle::TerminalPolicy::Finalize,
         ) {
             log::warn!("Failed to reap completed call child {}: {}", run_id, e);
         }

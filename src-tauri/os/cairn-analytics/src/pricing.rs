@@ -1,21 +1,17 @@
 //! Model token pricing, in USD per million tokens.
 //!
 //! Prices are public list prices as of [`PRICE_SOURCE_DATE`] and drift over
-//! time, so treat this table as an estimate. Models are classified from the
-//! stored `jobs.model` value by substring so both short aliases (`opus`,
-//! `sonnet`, `fable`) and dated full names (`claude-sonnet-4-20250514`,
-//! `gpt-5.6-sol`) resolve to a tier. Classification is version-aware where pricing
-//! changed across versions: each Claude family reads its generation with
-//! [`claude_generation`], so Opus 4/4.1, Opus 4.5 to 5.0 and Opus 5.5+ are three
-//! prices, and Sonnet and Haiku each split at 5.5. A bare Claude alias is priced
-//! as the generation the current CLI resolves it to (5.5); an executor on an
-//! older CLI runs the alias on an older, dearer model, which this underprices.
-//! Truly unrecognized models return `None` and are reported as unpriced.
+//! time, so treat this table as an estimate. Pricing is an exact table keyed
+//! by canonical model id from `cairn_models_types::identity`. Stored model
+//! names resolve through those identity tables, never by substring. A Claude
+//! CLI alias is priced as the generation [`ALIAS_GENERATIONS`] names; an
+//! executor on an older CLI can run it on an older, dearer model, which this
+//! underprices. A model with no canonical id, or no price row, is unpriced.
 //!
 //! GPT tiers are OpenAI's Standard-processing list prices from
 //! <https://developers.openai.com/api/docs/pricing>. A temporary promotion is
 //! not a list price: that page shows GPT-5.6 Sol at a promotional rate (through
-//! at least 2026-11-21), so its tier keeps the $5 / $30 launch price from
+//! 2026-11-30), so its tier keeps the $5 / $30 launch price from
 //! <https://openai.com/index/gpt-5-6/>. GPT-5.6 Terra and Luna take the page's
 //! current rate, below their launch prices, because the page does not mark it
 //! as promotional. Most GPT-5.4-and-later models bill a request over 272k input
@@ -58,10 +54,10 @@
 //! Codex sessions: tokens OpenAI bills as cache writes (1.25x input from
 //! GPT-5.6 on) are priced here at the plain input rate.
 
-use cairn_models_types::catalog::claude_generation;
+use cairn_models_types::identity;
 
 /// Date the price table was last reviewed against public list prices.
-pub(crate) const PRICE_SOURCE_DATE: &str = "2026-10-20";
+pub(crate) const PRICE_SOURCE_DATE: &str = "2026-11-07";
 
 /// Prompt length (input + cache reads + cache writes) above which a request
 /// is billed at a model's [`ModelPrice::above_long_prompt`] tier. A prompt of
@@ -204,13 +200,15 @@ impl ModelPrice {
     }
 }
 
-// Claude tiers.
-const FABLE: ModelPrice = ModelPrice::new(10.0, 1.0, 12.50, 50.0); // Fable 5 / 5.1
-const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 0.40, 5.0, 20.0); // Opus 5.5+
+// Claude list prices: https://platform.claude.com/docs/en/about-claude/pricing
+const FABLE: ModelPrice = ModelPrice::new(10.0, 1.0, 12.50, 50.0); // Fable 5
+const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 0.25, 12.50, 50.0);
+const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 0.20, 5.0, 20.0);
 const OPUS_4_5: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 25.0); // Opus 4.5 to 5
 const OPUS_LEGACY: ModelPrice = ModelPrice::new(15.0, 1.50, 18.75, 75.0); // Opus 4 / 4.1
-const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 0.20, 2.50, 10.0); // Sonnet 5.5+
-const SONNET_4: ModelPrice = ModelPrice::new(3.0, 0.30, 3.75, 15.0); // Sonnet 4 to 5
+const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 0.10, 2.50, 10.0);
+const SONNET_5: ModelPrice = ModelPrice::new(2.0, 0.20, 2.50, 10.0);
+const SONNET_4: ModelPrice = ModelPrice::new(3.0, 0.30, 3.75, 15.0); // Sonnet 4 to 4.6
 /// Haiku 5.5: prompts over 100k tokens bill at five times the base rates.
 const HAIKU_5_5: ModelPrice =
     ModelPrice::new(0.10, 0.01, 0.125, 0.50).above_long_prompt(0.50, 0.05, 0.625, 2.50);
@@ -228,10 +226,9 @@ const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 0.50, 5.0, 30.0);
 const GPT_5_4: ModelPrice = ModelPrice::new(2.50, 0.25, 2.50, 15.0);
 const GPT_5_4_MINI: ModelPrice = ModelPrice::new(0.75, 0.075, 0.75, 4.50);
 
-/// The concrete Claude id each bare alias is priced as: the generation
-/// [`price_for`] reads the alias as (its tier boundaries below), so the id
-/// costs exactly what the alias does. The `token_rollup` model key folds this
-/// generation onto its alias (`claude-opus-5-5` keys as `opus`) and leaves
+/// The concrete Claude API id each bare alias is priced as, resolved through
+/// the identity table so the id costs exactly what the alias does. The
+/// `token_rollup` model key folds this generation onto its alias (`claude-opus-5-5` keys as `opus`) and leaves
 /// every other generation under its own id, so keying never moves usage
 /// between price tiers. When an alias moves to a new generation, update this
 /// row with the tier boundary and re-fold.
@@ -242,88 +239,84 @@ pub(crate) const ALIAS_GENERATIONS: [(&str, &str); 4] = [
     ("fable", "claude-fable-5-1"),
 ];
 
-/// Resolve a `jobs.model` value to its price tier, or `None` when the model is
-/// unrecognized.
-fn price_for(model: Option<&str>) -> Option<ModelPrice> {
-    let model = model?.to_ascii_lowercase();
-    // Order matters: match the most specific aliases first.
-    if model.contains("fable") || model.contains("mythos") {
-        Some(FABLE)
-    } else if model.contains("opus") {
-        Some(if at_least(&model, "opus", (5, 5)) {
-            OPUS_5_5
-        } else if at_least(&model, "opus", (4, 5)) {
-            OPUS_4_5
-        } else {
-            OPUS_LEGACY
-        })
-    } else if model.contains("sonnet") {
-        Some(if at_least(&model, "sonnet", (5, 5)) {
-            SONNET_5_5
-        } else {
-            SONNET_4
-        })
-    } else if model.contains("haiku") {
-        Some(if at_least(&model, "haiku", (5, 5)) {
-            HAIKU_5_5
-        } else {
-            HAIKU_4_5
-        })
-    } else if model.contains("gpt") || model.contains("codex") {
-        Some(
-            // `gpt-6.1-*` also contains `gpt-6`, so the point release goes first.
-            if model.contains("gpt-6.1") || model.contains("gpt-6-1") {
-                // Sol is the only 6.1 model.
-                GPT_6_1_SOL
-            } else if model.contains("gpt-6") {
-                if model.contains("-astra") {
-                    GPT_6_ASTRA
-                } else if model.contains("-luna") {
-                    GPT_6_LUNA
-                } else {
-                    GPT_6_SOL
-                }
-            } else if model.contains("5.6-luna") || model.contains("5-6-luna") {
-                GPT_5_6_LUNA
-            } else if model.contains("5.6-terra") || model.contains("5-6-terra") {
-                GPT_5_6_TERRA
-            } else if model.contains("5.6-sol")
-                || model.contains("5-6-sol")
-                || model.contains("5.6")
-                || model.contains("5-6")
-            {
-                GPT_5_6_SOL
-            } else if model.contains("mini") {
-                GPT_5_4_MINI
-            } else if model.contains("5.5") || model.contains("5-5") {
-                GPT_5_5
-            } else {
-                // Bare `gpt-5` / `gpt-5.4` / codex default to the 5.4 tier.
-                GPT_5_4
-            },
-        )
-    } else {
-        None
+// Historical fallback corrections, reviewed 2026-11-07:
+// https://www.anthropic.com/news/3-5-models-and-computer-use (2024-12-03 update),
+// with 5-minute writes at 1.25x input and hits at 0.1x per
+// https://platform.claude.com/docs/en/about-claude/pricing.
+const HAIKU_3_5: ModelPrice = ModelPrice::new(0.80, 0.08, 1.0, 4.0);
+// https://developers.openai.com/api/docs/models/gpt-5
+// https://developers.openai.com/api/docs/models/gpt-5-codex
+// Neither publishes a cache-write surcharge; use plain input for that component.
+const GPT_5: ModelPrice = ModelPrice::new(1.25, 0.125, 1.25, 10.0);
+// https://developers.openai.com/api/docs/models/codex-mini-latest
+const CODEX_MINI: ModelPrice = ModelPrice::new(1.50, 0.375, 1.50, 6.0);
+// https://developers.openai.com/api/docs/models/gpt-5.3-codex
+const GPT_5_3_CODEX: ModelPrice = ModelPrice::new(1.75, 0.175, 1.75, 14.0);
+// Standard processing: https://developers.openai.com/api/docs/pricing
+const GPT_6_1_TERRA: ModelPrice = ModelPrice::new(1.0, 0.05, 1.25, 5.0);
+
+const PRICES: &[(&str, ModelPrice)] = &[
+    ("claude-fable-5", FABLE),
+    ("claude-fable-5.1", FABLE_5_1),
+    ("claude-opus-5.5", OPUS_5_5),
+    ("claude-opus-4.5", OPUS_4_5),
+    ("claude-opus-4.6", OPUS_4_5),
+    ("claude-opus-4.7", OPUS_4_5),
+    ("claude-opus-4.8", OPUS_4_5),
+    ("claude-opus-5", OPUS_4_5),
+    ("claude-opus-4", OPUS_LEGACY),
+    ("claude-opus-4.1", OPUS_LEGACY),
+    ("claude-sonnet-5.5", SONNET_5_5),
+    ("claude-sonnet-4", SONNET_4),
+    ("claude-sonnet-4.5", SONNET_4),
+    ("claude-sonnet-4.6", SONNET_4),
+    ("claude-sonnet-5", SONNET_5),
+    ("claude-haiku-5.5", HAIKU_5_5),
+    ("claude-haiku-4.5", HAIKU_4_5),
+    ("claude-haiku-3.5", HAIKU_3_5),
+    ("gpt-6-astra", GPT_6_ASTRA),
+    ("gpt-6.1-sol", GPT_6_1_SOL),
+    ("gpt-6.1-terra", GPT_6_1_TERRA),
+    ("gpt-6-sol", GPT_6_SOL),
+    ("gpt-6-luna", GPT_6_LUNA),
+    ("gpt-5.6-sol", GPT_5_6_SOL),
+    ("gpt-5.6-terra", GPT_5_6_TERRA),
+    ("gpt-5.6-luna", GPT_5_6_LUNA),
+    ("gpt-5.5", GPT_5_5),
+    ("gpt-5.4", GPT_5_4),
+    ("gpt-5.4-mini", GPT_5_4_MINI),
+    ("gpt-5.3-codex", GPT_5_3_CODEX),
+    ("gpt-5", GPT_5),
+    ("gpt-5-codex", GPT_5),
+    ("codex-mini-latest", CODEX_MINI),
+];
+
+fn canonical_for(backend: &str, model: &str) -> Option<&'static str> {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_suffix("[1m]").unwrap_or(&model);
+    if let Some((_, concrete)) = ALIAS_GENERATIONS
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(model))
+    {
+        return identity::for_offer("claude", concrete, None);
     }
+    identity::for_offer(backend, model, None).or_else(|| identity::for_offer("claude", model, None))
 }
 
-/// Whether `model`, a lowercased name in `family`, is at least `generation`.
-/// The bare alias (`opus`, `opus[1m]`) is the current generation; any other
-/// name without a readable family-first version (`claude-3-5-haiku-…`) is an
-/// old one.
-fn at_least(model: &str, family: &str, generation: (u32, u32)) -> bool {
-    match claude_generation(model) {
-        Some(version) => version >= generation,
-        None => model.trim_end_matches("[1m]") == family,
-    }
+/// Resolve a stored model name through identity to its exact price row.
+fn price_for(backend: &str, model: Option<&str>) -> Option<ModelPrice> {
+    let canonical = canonical_for(backend, model?)?;
+    PRICES
+        .iter()
+        .find_map(|(id, price)| (*id == canonical).then_some(*price))
 }
 
 /// List-price USD cost of `usage` on `model`, `0.0` when the model is
 /// unpriced. Persisted components are disjoint for every backend, so the math
 /// is componentwise, with each request's prompt-length tier already split out
 /// in `usage`.
-pub(crate) fn cost_usd(model: Option<&str>, usage: &TieredUsage) -> f64 {
-    price_for(model).map_or(0.0, |price| price.cost(usage))
+pub(crate) fn cost_usd(backend: &str, model: Option<&str>, usage: &TieredUsage) -> f64 {
+    price_for(backend, model).map_or(0.0, |price| price.cost(usage))
 }
 
 #[cfg(test)]
@@ -373,12 +366,12 @@ mod tests {
         // B at $0.50 / $0.05 / $0.625 / $2.50: 1*0.5 + 90000*0.05 + 10000*0.625 + 500*2.5
         let b_cost = (0.5 + 4_500.0 + 6_250.0 + 1_250.0) / 1e6;
         for model in ["haiku", "claude-haiku-5-5"] {
-            let cost = cost_usd(Some(model), &usage);
+            let cost = cost_usd("claude", Some(model), &usage);
             assert!((cost - (a_cost + b_cost)).abs() < 1e-12, "{model}: {cost}");
         }
         // The input and output sides still price to the whole.
-        let sides = cost_usd(Some("haiku"), &usage.input_side())
-            + cost_usd(Some("haiku"), &usage.output_side());
+        let sides = cost_usd("claude", Some("haiku"), &usage.input_side())
+            + cost_usd("claude", Some("haiku"), &usage.output_side());
         assert!((sides - (a_cost + b_cost)).abs() < 1e-12, "sides {sides}");
     }
 
@@ -398,8 +391,8 @@ mod tests {
         };
         for model in ["sonnet", "opus", "claude-haiku-4-5", "gpt-5.6-sol"] {
             assert_eq!(
-                cost_usd(Some(model), &split),
-                cost_usd(Some(model), &short(1_000, 200_000, 0, 1_000)),
+                cost_usd("claude", Some(model), &split),
+                cost_usd("claude", Some(model), &short(1_000, 200_000, 0, 1_000)),
                 "{model}"
             );
         }
@@ -407,49 +400,70 @@ mod tests {
 
     #[test]
     fn bare_aliases_price_as_the_generation_the_cli_resolves_them_to() {
-        assert_eq!(price_for(Some("fable")), Some(FABLE));
-        assert_eq!(price_for(Some("claude-fable-5-1")), Some(FABLE));
-        assert_eq!(price_for(Some("opus")), Some(OPUS_5_5));
-        assert_eq!(price_for(Some("opus[1m]")), Some(OPUS_5_5));
-        assert_eq!(price_for(Some("sonnet")), Some(SONNET_5_5));
-        assert_eq!(price_for(Some("haiku")), Some(HAIKU_5_5));
+        assert_eq!(price_for("claude", Some("fable")), Some(FABLE_5_1));
+        assert_eq!(
+            price_for("claude", Some("claude-fable-5-1")),
+            Some(FABLE_5_1)
+        );
+        assert_eq!(price_for("claude", Some("opus")), Some(OPUS_5_5));
+        assert_eq!(price_for("claude", Some("opus[1m]")), Some(OPUS_5_5));
+        assert_eq!(price_for("claude", Some("sonnet")), Some(SONNET_5_5));
+        assert_eq!(price_for("claude", Some("haiku")), Some(HAIKU_5_5));
     }
 
     #[test]
     fn each_claude_family_is_priced_by_generation() {
         // 5.5: the published 2026-10 list prices.
-        assert_eq!(price_for(Some("claude-opus-5-5")), Some(OPUS_5_5));
-        assert_eq!(price_for(Some("claude-opus-5-5[1m]")), Some(OPUS_5_5));
-        assert_eq!(price_for(Some("claude-sonnet-5-5")), Some(SONNET_5_5));
-        assert_eq!(price_for(Some("claude-haiku-5-5")), Some(HAIKU_5_5));
-        // 4.x and 5.0 keep their own prices.
-        assert_eq!(price_for(Some("claude-opus-5")), Some(OPUS_4_5));
-        assert_eq!(price_for(Some("claude-opus-4-5")), Some(OPUS_4_5));
-        assert_eq!(price_for(Some("claude-sonnet-5")), Some(SONNET_4));
+        assert_eq!(price_for("claude", Some("claude-opus-5-5")), Some(OPUS_5_5));
         assert_eq!(
-            price_for(Some("claude-sonnet-4-5-20250929")),
+            price_for("claude", Some("claude-opus-5-5[1m]")),
+            Some(OPUS_5_5)
+        );
+        assert_eq!(
+            price_for("claude", Some("claude-sonnet-5-5")),
+            Some(SONNET_5_5)
+        );
+        assert_eq!(
+            price_for("claude", Some("claude-haiku-5-5")),
+            Some(HAIKU_5_5)
+        );
+        // 4.x and 5.0 keep their own prices.
+        assert_eq!(price_for("claude", Some("claude-opus-5")), Some(OPUS_4_5));
+        assert_eq!(price_for("claude", Some("claude-opus-4-5")), Some(OPUS_4_5));
+        assert_eq!(price_for("claude", Some("claude-sonnet-5")), Some(SONNET_5));
+        assert_eq!(
+            price_for("claude", Some("claude-sonnet-4-5-20250929")),
             Some(SONNET_4)
         );
-        assert_eq!(price_for(Some("claude-sonnet-4-20250514")), Some(SONNET_4));
         assert_eq!(
-            price_for(Some("claude-haiku-4-5-20251001")),
+            price_for("claude", Some("claude-sonnet-4-20250514")),
+            Some(SONNET_4)
+        );
+        assert_eq!(
+            price_for("claude", Some("claude-haiku-4-5-20251001")),
             Some(HAIKU_4_5)
         );
         // A version-first name is an old model, not the current alias.
         assert_eq!(
-            price_for(Some("claude-3-5-haiku-20241022")),
-            Some(HAIKU_4_5)
+            price_for("claude", Some("claude-3-5-haiku-20241022")),
+            Some(HAIKU_3_5)
         );
     }
 
     #[test]
     fn legacy_opus_is_priced_higher() {
         assert_eq!(
-            price_for(Some("claude-opus-4-1-20250805")),
+            price_for("claude", Some("claude-opus-4-1-20250805")),
             Some(OPUS_LEGACY)
         );
-        assert_eq!(price_for(Some("claude-opus-4-20250514")), Some(OPUS_LEGACY));
-        assert_eq!(price_for(Some("claude-opus-4.1")), Some(OPUS_LEGACY));
+        assert_eq!(
+            price_for("claude", Some("claude-opus-4-20250514")),
+            Some(OPUS_LEGACY)
+        );
+        assert_eq!(
+            price_for("claude", Some("claude-opus-4.1")),
+            Some(OPUS_LEGACY)
+        );
     }
 
     /// The 5.5 rates agree with the CLI's own `modelUsage[..].costUSD`, observed
@@ -462,31 +476,40 @@ mod tests {
             ("claude-opus-5-5", 0.000_064),
             ("claude-fable-5-1", 0.000_16),
         ] {
-            let cost = cost_usd(Some(model), &short(1, 0, 0, 3));
+            let cost = cost_usd("claude", Some(model), &short(1, 0, 0, 3));
             assert!((cost - cli_cost).abs() < 1e-12, "{model}: {cost}");
         }
     }
 
     #[test]
     fn gpt_versions_and_mini() {
-        assert_eq!(price_for(Some("gpt-5.6-sol")), Some(GPT_5_6_SOL));
-        assert_eq!(price_for(Some("gpt-5.6-terra")), Some(GPT_5_6_TERRA));
-        assert_eq!(price_for(Some("gpt-5.6-luna")), Some(GPT_5_6_LUNA));
-        assert_eq!(price_for(Some("gpt-5.5")), Some(GPT_5_5));
-        assert_eq!(price_for(Some("gpt-5.4-mini")), Some(GPT_5_4_MINI));
-        assert_eq!(price_for(Some("gpt-5")), Some(GPT_5_4));
-        assert_eq!(price_for(Some("gpt-5-codex")), Some(GPT_5_4));
+        assert_eq!(price_for("claude", Some("gpt-5.6-sol")), Some(GPT_5_6_SOL));
+        assert_eq!(
+            price_for("claude", Some("gpt-5.6-terra")),
+            Some(GPT_5_6_TERRA)
+        );
+        assert_eq!(
+            price_for("claude", Some("gpt-5.6-luna")),
+            Some(GPT_5_6_LUNA)
+        );
+        assert_eq!(price_for("claude", Some("gpt-5.5")), Some(GPT_5_5));
+        assert_eq!(
+            price_for("claude", Some("gpt-5.4-mini")),
+            Some(GPT_5_4_MINI)
+        );
+        assert_eq!(price_for("claude", Some("gpt-5")), Some(GPT_5));
+        assert_eq!(price_for("claude", Some("gpt-5-codex")), Some(GPT_5));
     }
 
     #[test]
     fn gpt_six_family_is_priced_by_size() {
-        assert_eq!(price_for(Some("gpt-6.1-sol")), Some(GPT_6_1_SOL));
-        assert_eq!(price_for(Some("gpt-6-astra")), Some(GPT_6_ASTRA));
-        assert_eq!(price_for(Some("gpt-6-sol")), Some(GPT_6_SOL));
-        assert_eq!(price_for(Some("gpt-6-luna")), Some(GPT_6_LUNA));
+        assert_eq!(price_for("claude", Some("gpt-6.1-sol")), Some(GPT_6_1_SOL));
+        assert_eq!(price_for("claude", Some("gpt-6-astra")), Some(GPT_6_ASTRA));
+        assert_eq!(price_for("claude", Some("gpt-6-sol")), Some(GPT_6_SOL));
+        assert_eq!(price_for("claude", Some("gpt-6-luna")), Some(GPT_6_LUNA));
         // None of them falls through to the bare-`gpt` default.
         for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
-            assert_ne!(price_for(Some(model)), Some(GPT_5_4), "{model}");
+            assert_ne!(price_for("claude", Some(model)), Some(GPT_5_4), "{model}");
         }
     }
 
@@ -495,18 +518,22 @@ mod tests {
     #[test]
     fn gpt_six_one_is_not_classified_as_gpt_six() {
         assert_ne!(GPT_6_1_SOL, GPT_6_SOL);
-        assert_ne!(price_for(Some("gpt-6.1-sol")), Some(GPT_6_SOL));
-        assert_eq!(price_for(Some("gpt-6-1-sol")), Some(GPT_6_1_SOL));
-        assert_eq!(price_for(Some("gpt-6.1")), Some(GPT_6_1_SOL));
+        assert_ne!(price_for("claude", Some("gpt-6.1-sol")), Some(GPT_6_SOL));
+        assert_eq!(price_for("claude", Some("gpt-6-1-sol")), None);
+        assert_eq!(price_for("claude", Some("gpt-6.1")), None);
     }
 
     #[test]
     fn each_alias_generation_costs_what_its_alias_costs() {
         for (alias, concrete) in ALIAS_GENERATIONS {
-            let price = price_for(Some(alias));
+            let price = price_for("claude", Some(alias));
             assert!(price.is_some(), "{alias} is priced");
             for spelling in [concrete.to_string(), format!("{concrete}[1m]")] {
-                assert_eq!(price_for(Some(&spelling)), price, "{spelling} vs {alias}");
+                assert_eq!(
+                    price_for("claude", Some(&spelling)),
+                    price,
+                    "{spelling} vs {alias}"
+                );
             }
         }
     }
@@ -527,10 +554,116 @@ mod tests {
     }
 
     #[test]
+    fn price_keys_are_unique_canonical_ids() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (id, _) in PRICES {
+            assert!(identity::canonical(id).is_some(), "{id}");
+            assert!(seen.insert(id), "duplicate price for {id}");
+        }
+        for (_, concrete) in ALIAS_GENERATIONS {
+            let id = identity::for_offer("claude", concrete, None).expect(concrete);
+            assert!(PRICES.iter().any(|(key, _)| *key == id), "{concrete}");
+        }
+    }
+
+    #[test]
+    fn aliases_are_backend_independent_and_normalized() {
+        for backend in ["claude", "codex", "openrouter"] {
+            for model in ["opus", "Opus", "opus[1m]", "  OPUS[1M]  "] {
+                assert_eq!(price_for(backend, Some(model)), Some(OPUS_5_5));
+            }
+            assert_eq!(
+                price_for(backend, Some("claude-sonnet-4-5-20250929")),
+                Some(SONNET_4)
+            );
+        }
+        assert_eq!(
+            price_for("openrouter", Some("anthropic/claude-opus-4.6")),
+            Some(OPUS_4_5)
+        );
+    }
+
+    #[test]
+    fn sampled_live_models_have_exact_prices() {
+        for (backend, model, expected) in [
+            ("claude", "opus", Some(OPUS_5_5)),
+            ("claude", "haiku", Some(HAIKU_5_5)),
+            ("claude", "fable", Some(FABLE_5_1)),
+            ("claude", "sonnet", Some(SONNET_5_5)),
+            ("codex", "gpt-5.6-sol", Some(GPT_5_6_SOL)),
+            ("codex", "gpt-6-astra", Some(GPT_6_ASTRA)),
+            ("codex", "gpt-5.6-luna", Some(GPT_5_6_LUNA)),
+            ("codex", "gpt-5.5", Some(GPT_5_5)),
+            ("claude", "gpt-5.4", Some(GPT_5_4)),
+            ("claude", "gpt-5.4-mini", Some(GPT_5_4_MINI)),
+            ("codex", "gpt-5.3-codex", Some(GPT_5_3_CODEX)),
+            ("openrouter", "deepseek/deepseek-v4-flash", None),
+        ] {
+            assert_eq!(
+                price_for(backend, Some(model)),
+                expected,
+                "{backend}/{model}"
+            );
+            let expected_cost = expected.map_or(0.0, |p| p.cost(&short(17, 31, 11, 23)));
+            assert_eq!(
+                cost_usd(backend, Some(model), &short(17, 31, 11, 23)),
+                expected_cost
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_corrections_use_each_models_own_list_price() {
+        for (model, rates) in [
+            ("gpt-5", (1.25, 0.125, 1.25, 10.0)),
+            ("gpt-5-codex", (1.25, 0.125, 1.25, 10.0)),
+            ("codex-mini-latest", (1.50, 0.375, 1.50, 6.0)),
+            ("claude-3-5-haiku", (0.80, 0.08, 1.0, 4.0)),
+            ("claude-3-5-haiku-20241022", (0.80, 0.08, 1.0, 4.0)),
+            ("gpt-6.1-terra", (1.0, 0.05, 1.25, 5.0)),
+            ("gpt-5.3-codex", (1.75, 0.175, 1.75, 14.0)),
+            ("claude-fable-5-1", (10.0, 0.25, 12.50, 50.0)),
+            ("claude-fable-5", (10.0, 1.0, 12.50, 50.0)),
+            ("claude-opus-5-5", (4.0, 0.20, 5.0, 20.0)),
+            ("claude-sonnet-5-5", (2.0, 0.10, 2.50, 10.0)),
+            ("claude-sonnet-5", (2.0, 0.20, 2.50, 10.0)),
+        ] {
+            assert_eq!(
+                price_for("codex", Some(model)),
+                Some(ModelPrice::new(rates.0, rates.1, rates.2, rates.3)),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn substrings_and_unknown_versions_never_inherit_prices() {
+        for model in [
+            "z-ai/glm",
+            "my-opus-model",
+            "not-gpt-5.4",
+            "codex",
+            "claude-opus-99-7",
+            "claude-opus-4-6-20990101",
+            "gpt-5.4-unlisted",
+            "gpt-6.1",
+            "gpt-6-1-sol",
+            "mythos",
+            "someone/claude-opus-4.6",
+            "gpt-oss-20b",
+        ] {
+            assert_eq!(price_for("openrouter", Some(model)), None, "{model}");
+        }
+    }
+
+    #[test]
     fn unknown_models_are_unpriced() {
-        assert_eq!(price_for(Some("mystery-model")), None);
-        assert_eq!(price_for(None), None);
-        assert_eq!(cost_usd(Some("mystery"), &short(1000, 0, 0, 1000)), 0.0);
+        assert_eq!(price_for("claude", Some("mystery-model")), None);
+        assert_eq!(price_for("claude", None), None);
+        assert_eq!(
+            cost_usd("claude", Some("mystery"), &short(1000, 0, 0, 1000)),
+            0.0
+        );
     }
 
     #[test]
@@ -538,7 +671,8 @@ mod tests {
         // gpt-5.4: 1M input($2.50) + 0.5M cache read($0.125)
         // + 0.5M cache write($1.25) + 1M output($15).
         let cost = cost_usd(
-            Some("gpt-5"),
+            "claude",
+            Some("gpt-5.4"),
             &short(1_000_000, 500_000, 500_000, 1_000_000),
         );
         assert!((cost - 18.875).abs() < 1e-9, "got {cost}");
@@ -546,11 +680,12 @@ mod tests {
 
     #[test]
     fn claude_cost_prices_each_component() {
-        // sonnet 5.5: 1M input(2) + 1M cache_read(0.20) + 1M cache_write(2.50) + 1M output(10)
+        // sonnet 5.5: 1M input(2) + 1M cache_read(0.10) + 1M cache_write(2.50) + 1M output(10)
         let cost = cost_usd(
+            "claude",
             Some("sonnet"),
             &short(1_000_000, 1_000_000, 1_000_000, 1_000_000),
         );
-        assert!((cost - 14.70).abs() < 1e-9, "got {cost}");
+        assert!((cost - 14.60).abs() < 1e-9, "got {cost}");
     }
 }

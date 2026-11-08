@@ -48,6 +48,9 @@ pub(crate) async fn last_repair(db: &LocalDb, executor_id: &str) -> Option<(i64,
 /// exactly the moment it mattered (CAIRN-4360), and the same holds here — an
 /// operator who has just fixed a machine may well be about to restart its
 /// executor, and must be able to say so either way.
+/// The out-of-memory kills a repaired machine is no longer held to.
+pub(crate) use super::resource_profiles::forget_kills_on;
+
 pub(crate) async fn mark_repaired(db: &LocalDb, executor_id: &str) -> Result<i64, String> {
     let now = chrono::Utc::now().timestamp();
     db.execute(

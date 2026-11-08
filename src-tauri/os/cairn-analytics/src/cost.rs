@@ -22,16 +22,22 @@ use super::types::{
 /// settlement covers, so prorating or pricing its remaining tokens would invent
 /// a cost. No other row loses its list price because this row was metered.
 pub(super) fn exact_or_priced(
+    backend: &str,
     model: Option<&str>,
     unmetered_usage: &TieredUsage,
     exact_cost: f64,
 ) -> f64 {
-    exact_cost + pricing::cost_usd(model, unmetered_usage)
+    exact_cost + pricing::cost_usd(backend, model, unmetered_usage)
 }
 
 /// The cost of one (bucket, model, backend) group via [`exact_or_priced`].
 fn group_cost(row: &queries::CostComponentRow) -> f64 {
-    exact_or_priced(row.model.as_deref(), &row.unmetered_usage, row.exact_cost)
+    exact_or_priced(
+        &row.backend,
+        row.model.as_deref(),
+        &row.unmetered_usage,
+        row.exact_cost,
+    )
 }
 
 /// Real per-model cost for one backend: the metered dollar amount Cairn recorded
@@ -119,7 +125,12 @@ pub async fn cost_by_project(
     let rows = queries::cost_by_project(db, scope, range).await?;
     let mut by_project: HashMap<String, (String, f64, i64)> = HashMap::new();
     for row in &rows {
-        let cost = exact_or_priced(row.model.as_deref(), &row.unmetered_usage, row.exact_cost);
+        let cost = exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            &row.unmetered_usage,
+            row.exact_cost,
+        );
         let entry = by_project
             .entry(row.project_id.clone())
             .or_insert_with(|| (row.project_name.clone(), 0.0, 0));
@@ -165,8 +176,12 @@ pub async fn provider_model_costs(
     let mut costs: Vec<ProviderModelCost> = rows
         .into_iter()
         .map(|row| {
-            let cost_usd =
-                exact_or_priced(row.model.as_deref(), &row.unmetered_usage, row.exact_cost);
+            let cost_usd = exact_or_priced(
+                backend,
+                row.model.as_deref(),
+                &row.unmetered_usage,
+                row.exact_cost,
+            );
             let model = row
                 .model
                 .filter(|m| !m.is_empty())
@@ -310,8 +325,8 @@ pub async fn effective_cost(
         // Split list price into input/output sides by calling the linear pricing
         // function once per side: input_list + output_list == the full cost.
         let model = row.model.as_deref();
-        let input_list = pricing::cost_usd(model, &row.usage.input_side());
-        let output_list = pricing::cost_usd(model, &row.usage.output_side());
+        let input_list = pricing::cost_usd(&row.backend, model, &row.usage.input_side());
+        let output_list = pricing::cost_usd(&row.backend, model, &row.usage.output_side());
         let entry = fine
             .entry((row.bucket_start, row.backend.clone()))
             .or_default();

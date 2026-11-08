@@ -22,6 +22,7 @@ ctor::declarative::ctor! {
 mod account;
 mod accumulator;
 mod action_runs;
+mod artifact_confirm_authority;
 mod artifact_revision_delivery;
 mod artifact_seen;
 mod authority_protected_document;

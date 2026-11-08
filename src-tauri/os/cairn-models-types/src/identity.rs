@@ -582,6 +582,18 @@ mod tests {
         );
         assert_eq!(offer("opencode-go", "kimi-k2.5", None), Some("kimi-k2.5"));
         assert_eq!(offer("codex", "gpt-5.5", None), Some("gpt-5.5"));
+        for (native, canonical) in [
+            ("claude-haiku-5-5", "claude-haiku-5.5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5.5"),
+            ("claude-fable-5", "claude-fable-5"),
+            ("claude-opus-5", "claude-opus-5"),
+        ] {
+            assert_eq!(offer("claude", native, None), Some(canonical));
+        }
+        assert_eq!(
+            offer("openrouter", "deepseek/deepseek-v4-flash-vision-exp", None),
+            Some("deepseek-v4-flash-vision-exp")
+        );
         // The CLI decides which version an alias means.
         assert_eq!(offer("claude", "opus", None), None);
         // A prefix that is not the model's maker is not that model.

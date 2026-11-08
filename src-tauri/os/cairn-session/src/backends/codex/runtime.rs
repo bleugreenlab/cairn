@@ -298,83 +298,20 @@ impl OwnedCodexWatchdog {
         let worker_name = format!("codex-turn-watchdog-{}", &run_id[..run_id.len().min(8)]);
         let join = thread::Builder::new().name(worker_name).spawn(move || {
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                let mut last_phase = None;
-                let mut last_persisted_progress = 0;
-                let mut last_heartbeat = Instant::now();
+                let mut worker = WatchdogWorker::default();
                 loop {
                     match cancelled.recv_timeout(CODEX_TURN_WATCHDOG_POLL) {
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => return true,
                         Err(RecvTimeoutError::Timeout) => {}
                     }
-                    let snapshot = match worker_state.lock() {
-                        Ok(mut guard) => {
-                            let now = Instant::now();
-                            let expiry = guard.expired(now);
-                            let phase = guard.active_turn_id.as_ref().map(|_| guard.phase);
-                            let deadline = guard.deadline_at(now, chrono::Utc::now().timestamp());
-                            (phase, deadline, expiry, guard.progress_sequence)
+                    let tick = worker.tick(&worker_state, &worker_identity, &worker_db, |identity, now| {
+                        if let Err(error) = worker_host.host.recover_watchdog(identity, now) {
+                            log::error!("Codex watchdog recovery failed for {:?}: {}", identity, error);
                         }
-                        Err(poisoned) => {
-                            drop(poisoned.into_inner());
-                            log::error!("Codex watchdog state poisoned for run {}; worker exiting for durable reconciliation", worker_run_id);
-                            return false;
-                        }
-                    };
-                    let current_identity = worker_identity.lock().ok().and_then(|guard| guard.clone());
-                    let Some(current_identity) = current_identity else { continue };
-                    let wall_now = chrono::Utc::now().timestamp();
-                    if let (Some(phase), Some(deadline)) = (snapshot.0, snapshot.1) {
-                        if last_phase != Some(phase) || last_persisted_progress != snapshot.3 {
-                            let id = current_identity.clone();
-                            let phase_db = worker_db.clone();
-                            match watchdog_db(phase_db.clone(), async move {
-                                crate::runs::watchdog_ledger::refresh_watchdog_progress(
-                                    &phase_db, &id, phase.into(), deadline, wall_now, wall_now,
-                                ).await
-                            }) {
-                                Ok(true) => {
-                                    let phase_changed = last_phase.is_some() && last_phase != Some(phase);
-                                    last_persisted_progress = snapshot.3;
-                                    if phase_changed {
-                                    if let Err(error) = watchdog_lifecycle(worker_db.clone(), current_identity.clone(), crate::runs::watchdog_ledger::WatchdogLifecycleKind::PhaseTransition, Some(phase), None) {
-                                        log::error!("Failed to persist Codex watchdog phase lifecycle for {:?}: {}", current_identity, error);
-                                    }
-                                    }
-                                }
-                                Ok(false) if last_phase.is_some() => log::error!("Codex watchdog phase CAS lost for {:?}", current_identity),
-                                Ok(false) => {}
-                                Err(error) => log::error!("Failed to persist Codex watchdog phase for {:?}: {}", current_identity, error),
-                            }
-                            last_phase = Some(phase);
-                        }
-                    }
-                    if last_heartbeat.elapsed() >= CODEX_TURN_WATCHDOG_HEARTBEAT {
-                        let id = current_identity.clone();
-                        let heartbeat_db = worker_db.clone();
-                        match watchdog_db(heartbeat_db.clone(), async move { crate::runs::watchdog_ledger::heartbeat_watchdog(&heartbeat_db, &id, wall_now).await }) {
-                            Ok(true) => {}
-                            Ok(false) => log::error!("Codex watchdog heartbeat lost active lease for {:?}", current_identity),
-                            Err(error) => log::error!("Failed to persist Codex watchdog heartbeat for {:?}: {}", current_identity, error),
-                        }
-                        last_heartbeat = Instant::now();
-                    }
-                    if let Some(expiry) = snapshot.2 {
-                        let id = current_identity.clone();
-                        let expiry_db = worker_db.clone();
-                        let expired = watchdog_db(expiry_db.clone(), async move { crate::runs::watchdog_ledger::expire_watchdog(&expiry_db, &id, wall_now).await });
-                        match expired {
-                            Ok(true) => {
-                                if let Err(error) = watchdog_lifecycle(worker_db.clone(), current_identity.clone(), crate::runs::watchdog_ledger::WatchdogLifecycleKind::Expired, Some(expiry.phase), Some(format!("no provider progress for {:?}", expiry.elapsed))) {
-                                    log::error!("Failed to persist Codex watchdog expiry lifecycle for {:?}: {}", current_identity, error);
-                                }
-                                if let Err(error) = worker_host.host.recover_watchdog(&current_identity, wall_now) {
-                                    log::error!("Codex watchdog recovery failed for {:?}: {}", current_identity, error);
-                                }
-                            }
-                            Ok(false) => log::error!("Codex watchdog expiry lost active lease for {:?}", current_identity),
-                            Err(error) => log::error!("Failed to persist Codex watchdog expiry for {:?}: {}", current_identity, error),
-                        }
-                        return true;
+                    });
+                    if tick == WorkerTick::StatePoisoned {
+                        log::error!("Codex watchdog state poisoned for run {}; worker exiting for durable reconciliation", worker_run_id);
+                        return false;
                     }
                 }
             }));
@@ -484,6 +421,174 @@ impl OwnedCodexWatchdog {
 
     pub fn disarm(&self, reason: &str) {
         self.disarm_turn(None, reason);
+    }
+}
+
+/// What one poll of an owned watchdog's worker leaves the thread to do.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorkerTick {
+    Continue,
+    /// The in-memory watchdog is unreadable; the thread exits and durable
+    /// reconciliation takes over the lease.
+    StatePoisoned,
+}
+
+/// What an owned watchdog's worker thread carries from one poll to the next.
+pub(crate) struct WatchdogWorker {
+    last_phase: Option<CodexTurnWatchdogPhase>,
+    last_persisted_progress: u64,
+    last_heartbeat: Instant,
+    /// The lease generation this worker already expired. Its recovery owns
+    /// that lease from then on, and the worker carries on with the next turn
+    /// armed on the run: recovery often keeps the process (a post-tool
+    /// interrupt, an uncertain outcome), so a worker that stopped at its first
+    /// expiry would leave every later turn on the run armed but untended.
+    expired_generation: Option<String>,
+}
+
+impl Default for WatchdogWorker {
+    fn default() -> Self {
+        Self {
+            last_phase: None,
+            last_persisted_progress: 0,
+            last_heartbeat: Instant::now(),
+            expired_generation: None,
+        }
+    }
+}
+
+impl WatchdogWorker {
+    /// Persist the watched turn's phase and deadline when they move, heartbeat
+    /// the lease, and on expiry hand it to `recover`.
+    pub(crate) fn tick(
+        &mut self,
+        state: &Mutex<CodexTurnProgressWatchdog>,
+        identity: &Mutex<Option<crate::runs::watchdog_ledger::WatchdogIdentity>>,
+        db: &Arc<LocalDb>,
+        recover: impl FnOnce(&crate::runs::watchdog_ledger::WatchdogIdentity, i64),
+    ) -> WorkerTick {
+        let (phase, deadline, expiry, progress) = match state.lock() {
+            Ok(mut guard) => {
+                let now = Instant::now();
+                let expiry = guard.expired(now);
+                let phase = guard.active_turn_id.as_ref().map(|_| guard.phase);
+                let deadline = guard.deadline_at(now, chrono::Utc::now().timestamp());
+                (phase, deadline, expiry, guard.progress_sequence)
+            }
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                return WorkerTick::StatePoisoned;
+            }
+        };
+        let Some(current_identity) = identity.lock().ok().and_then(|guard| guard.clone()) else {
+            return WorkerTick::Continue;
+        };
+        if self.expired_generation.as_deref() == Some(current_identity.generation.as_str()) {
+            return WorkerTick::Continue;
+        }
+        let wall_now = chrono::Utc::now().timestamp();
+        if let (Some(phase), Some(deadline)) = (phase, deadline) {
+            if self.last_phase != Some(phase) || self.last_persisted_progress != progress {
+                let id = current_identity.clone();
+                let phase_db = db.clone();
+                match watchdog_db(phase_db.clone(), async move {
+                    crate::runs::watchdog_ledger::refresh_watchdog_progress(
+                        &phase_db,
+                        &id,
+                        phase.into(),
+                        deadline,
+                        wall_now,
+                        wall_now,
+                    )
+                    .await
+                }) {
+                    Ok(true) => {
+                        let phase_changed =
+                            self.last_phase.is_some() && self.last_phase != Some(phase);
+                        self.last_persisted_progress = progress;
+                        if phase_changed {
+                            if let Err(error) = watchdog_lifecycle(
+                                db.clone(),
+                                current_identity.clone(),
+                                crate::runs::watchdog_ledger::WatchdogLifecycleKind::PhaseTransition,
+                                Some(phase),
+                                None,
+                            ) {
+                                log::error!(
+                                    "Failed to persist Codex watchdog phase lifecycle for {:?}: {}",
+                                    current_identity,
+                                    error
+                                );
+                            }
+                        }
+                    }
+                    Ok(false) if self.last_phase.is_some() => {
+                        log::error!("Codex watchdog phase CAS lost for {:?}", current_identity)
+                    }
+                    Ok(false) => {}
+                    Err(error) => log::error!(
+                        "Failed to persist Codex watchdog phase for {:?}: {}",
+                        current_identity,
+                        error
+                    ),
+                }
+                self.last_phase = Some(phase);
+            }
+        }
+        if self.last_heartbeat.elapsed() >= CODEX_TURN_WATCHDOG_HEARTBEAT {
+            let id = current_identity.clone();
+            let heartbeat_db = db.clone();
+            match watchdog_db(heartbeat_db.clone(), async move {
+                crate::runs::watchdog_ledger::heartbeat_watchdog(&heartbeat_db, &id, wall_now).await
+            }) {
+                Ok(true) => {}
+                Ok(false) => log::error!(
+                    "Codex watchdog heartbeat lost active lease for {:?}",
+                    current_identity
+                ),
+                Err(error) => log::error!(
+                    "Failed to persist Codex watchdog heartbeat for {:?}: {}",
+                    current_identity,
+                    error
+                ),
+            }
+            self.last_heartbeat = Instant::now();
+        }
+        if let Some(expiry) = expiry {
+            self.expired_generation = Some(current_identity.generation.clone());
+            let id = current_identity.clone();
+            let expiry_db = db.clone();
+            match watchdog_db(expiry_db.clone(), async move {
+                crate::runs::watchdog_ledger::expire_watchdog(&expiry_db, &id, wall_now).await
+            }) {
+                Ok(true) => {
+                    if let Err(error) = watchdog_lifecycle(
+                        db.clone(),
+                        current_identity.clone(),
+                        crate::runs::watchdog_ledger::WatchdogLifecycleKind::Expired,
+                        Some(expiry.phase),
+                        Some(format!("no provider progress for {:?}", expiry.elapsed)),
+                    ) {
+                        log::error!(
+                            "Failed to persist Codex watchdog expiry lifecycle for {:?}: {}",
+                            current_identity,
+                            error
+                        );
+                    }
+                    recover(&current_identity, wall_now);
+                }
+                Ok(false) => log::error!(
+                    "Codex watchdog expiry lost active lease for {:?}",
+                    current_identity
+                ),
+                Err(error) => log::error!(
+                    "Failed to persist Codex watchdog expiry for {:?}: {}",
+                    current_identity,
+                    error
+                ),
+            }
+        }
+        WorkerTick::Continue
     }
 }
 
@@ -1239,6 +1344,14 @@ impl CodexRuntime {
                         completed_provider_turn_id,
                         chrono::Utc::now().timestamp_millis()
                     );
+                    // Disarm before Cairn's own completion bookkeeping, which
+                    // marks the turn complete and parks the run warm. A lease
+                    // still active in that window is claimable by a reconciler
+                    // for a turn that has already ended.
+                    owned_watchdog.disarm_turn(
+                        completed_provider_turn_id.as_deref(),
+                        "provider_turn_completed",
+                    );
                     // Schema-constrained call (CAIRN-2505): when the turn's final
                     // agent message is the native structured output, capture it as
                     // the return artifact server-side BEFORE the run finalizes.
@@ -1304,10 +1417,6 @@ impl CodexRuntime {
                             failure_disposition,
                         },
                     );
-                    owned_watchdog.disarm_turn(
-                        completed_provider_turn_id.as_deref(),
-                        "provider_turn_completed",
-                    );
                     // A pooled call is a single one-shot turn: its turn/completed
                     // is terminal, so stop consuming and let the thread exit.
                     if ephemeral {
@@ -1343,6 +1452,8 @@ impl CodexRuntime {
                         aborted_provider_turn_id,
                         chrono::Utc::now().timestamp_millis()
                     );
+                    owned_watchdog
+                        .disarm_turn(aborted_provider_turn_id.as_deref(), "provider_turn_aborted");
                     let status = ProviderTurnStatus::from_abort_reason(reason);
                     if status == ProviderTurnStatus::Interrupted {
                         log::info!("codex turn aborted ({}), handling interrupt", reason);
@@ -1367,8 +1478,6 @@ impl CodexRuntime {
                     if let Some(turn_id) = aborted_provider_turn_id.as_deref() {
                         provider_turn_failures.remove(turn_id);
                     }
-                    owned_watchdog
-                        .disarm_turn(aborted_provider_turn_id.as_deref(), "provider_turn_aborted");
                     // A pooled call's aborted turn is terminal (killed or
                     // failed): stop consuming and exit the thread.
                     if ephemeral {
@@ -1568,6 +1677,119 @@ mod tests {
             codex_turn_completion(ProviderTurnStatus::Completed, None, false).usage,
             TokenCounts::default()
         );
+    }
+    /// cairn/6410: after one expiry the run's worker must still tend the next
+    /// turn's lease. It used to stop at its first expiry, so on a run whose
+    /// recovery kept the process every later lease sat at its arming values, no
+    /// progress, phase or heartbeat ever persisted, until the periodic
+    /// reconciler claimed it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_worker_keeps_tending_the_run_after_an_expiry() {
+        use crate::runs::watchdog_ledger::{
+            arm_watchdog, get_watchdog_lease, NewWatchdogLease, WatchdogIdentity,
+            WatchdogLeaseState, WatchdogPhase,
+        };
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = Arc::new(
+            LocalDb::open_migrated_for_test(dir.join("worker.db"))
+                .await
+                .unwrap(),
+        );
+        db.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO sessions (id, chat_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('session', 'chat', 'codex', 'open', 1, 1, 1);
+             INSERT INTO runs (id, status, session_id, created_at, updated_at, start_mode)
+               VALUES ('run', 'live', 'session', 1, 1, 'new');
+             PRAGMA foreign_keys = ON;",
+        )
+        .await
+        .unwrap();
+        let lease_for = |provider_turn_id: &str, generation: &str| WatchdogIdentity {
+            run_id: "run".into(),
+            session_id: "session".into(),
+            provider_turn_id: provider_turn_id.into(),
+            generation: generation.into(),
+        };
+        let arm = |identity: WatchdogIdentity| {
+            let db = db.clone();
+            async move {
+                assert!(arm_watchdog(
+                    &db,
+                    NewWatchdogLease {
+                        identity,
+                        runner_boot_id: "boot".into(),
+                        phase: WatchdogPhase::ProviderProgress,
+                        phase_deadline_at: 400,
+                        now: 100,
+                    },
+                    Uuid::new_v4().to_string(),
+                )
+                .await
+                .unwrap());
+            }
+        };
+
+        let first = lease_for("provider-1", "generation-1");
+        arm(first.clone()).await;
+        let state = Mutex::new(CodexTurnProgressWatchdog::new(
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ));
+        state
+            .lock()
+            .unwrap()
+            .start_turn("provider-1", Instant::now() - Duration::from_secs(1));
+        let identity = Mutex::new(Some(first.clone()));
+        let mut worker = WatchdogWorker::default();
+        let mut recovered = Vec::new();
+
+        assert_eq!(
+            worker.tick(&state, &identity, &db, |id, _| recovered.push(id.clone())),
+            WorkerTick::Continue
+        );
+        assert_eq!(recovered, vec![first.clone()]);
+        assert_eq!(
+            get_watchdog_lease(&db, "run", "session", "provider-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            WatchdogLeaseState::Expired
+        );
+        // A further poll on the expired lease leaves it to its recovery.
+        assert_eq!(
+            worker.tick(&state, &identity, &db, |id, _| recovered.push(id.clone())),
+            WorkerTick::Continue
+        );
+        assert_eq!(recovered.len(), 1);
+
+        // Recovery kept the process, and the provider starts the next turn.
+        let second = lease_for("provider-2", "generation-2");
+        arm(second.clone()).await;
+        *identity.lock().unwrap() = Some(second);
+        {
+            let mut guard = state.lock().unwrap();
+            guard.general_timeout = Duration::from_secs(3600);
+            guard.post_tool_timeout = Duration::from_secs(3600);
+            guard.start_turn("provider-2", Instant::now());
+            guard.start_tool("write-call".into(), Instant::now());
+        }
+        assert_eq!(
+            worker.tick(&state, &identity, &db, |id, _| recovered.push(id.clone())),
+            WorkerTick::Continue
+        );
+        let lease = get_watchdog_lease(&db, "run", "session", "provider-2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.state, WatchdogLeaseState::Active);
+        assert_eq!(lease.phase, WatchdogPhase::ToolOutstanding);
+        assert!(
+            lease.last_provider_progress_at > 100,
+            "the next turn's progress reaches its lease: {lease:?}"
+        );
+        assert_eq!(recovered.len(), 1);
     }
     #[test]
     fn deferred_goal_notifications_and_terminals_are_idempotent() {

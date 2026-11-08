@@ -567,7 +567,7 @@ pub fn stop_call(orch: &Orchestrator, call_run_id: &str) -> Result<(), String> {
             "Run {call_run_id} is not a workflow child call; refusing stop_call"
         ));
     }
-    kill_session_with_reason(orch, call_run_id, "user_stop")
+    kill_session_with_reason(orch, call_run_id, "user_stop", TerminalPolicy::Finalize)
 }
 
 /// The stored run statuses that count as terminal (its process has exited).
@@ -892,7 +892,7 @@ fn stop_session_with_pause_intent(
                 run_id,
                 e
             );
-            return kill_session_with_reason(orch, run_id, "user_stop");
+            return kill_session_with_reason(orch, run_id, "user_stop", TerminalPolicy::Finalize);
         } else {
             log::warn!(
                 "Failed to send interrupt to run {}; preserving warm durable-wait state: {}",
@@ -969,8 +969,8 @@ fn cleanup_inline_commands(orch: &Orchestrator, run_id: &str) {
     }
 }
 
-/// Finalize background terminals associated with a run's job on hard kill (not
-/// interrupt).
+/// Finalize background terminals associated with a run's job on a hard kill
+/// whose caller chose [`TerminalPolicy::Finalize`].
 ///
 /// This runs on user-stop / GC eviction: the run stops but the issue/job
 /// persists and may resume, so terminals are marked `exited` (retained) rather
@@ -1001,7 +1001,7 @@ fn cleanup_job_terminals(orch: &Orchestrator, run_id: &str) {
 /// GC eviction, or cleanup). Unlike `stop_session`, this actually kills
 /// the process and cannot be resumed.
 pub fn kill_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
-    kill_session_with_reason(orch, run_id, "user_stop")
+    kill_session_with_reason(orch, run_id, "user_stop", TerminalPolicy::Finalize)
 }
 
 /// Exit reason for a provider turn deliberately interrupted immediately before
@@ -1014,10 +1014,21 @@ pub(crate) const WATCHDOG_ARM_FAILED_EXIT_REASON: &str = "watchdog_arm_failed";
 /// continuation to the Compact.
 pub(crate) const OPERATOR_COMPACT_EXIT_REASON: &str = "operator_compact";
 
-/// Whether ending a provider process also ends the job's tool processes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum TerminalPolicy {
+/// Whether ending a provider process also ends the work it started: the run's
+/// inline commands and its job's background terminals.
+///
+/// Both belong to the job, not to the process, so only the caller knows whether
+/// they outlive it. An inline command a kill spares runs to completion and
+/// unregisters itself when its call returns, so sparing one leaks nothing; a
+/// batch whose caller can no longer take its answer keeps running (tenet 1421).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalPolicy {
+    /// The job's work is being ended: an operator Stop, GC eviction, a reaped
+    /// one-shot call, a teardown. Inline commands and terminals end with it.
     Finalize,
+    /// The job continues past this kill (watchdog recovery, a provider change,
+    /// a restarted call, retiring an idle warm process), so its inline commands
+    /// and terminals stay up for whatever turn runs next.
     Keep,
 }
 
@@ -1108,11 +1119,13 @@ pub(super) fn teardown_process(
     Ok(())
 }
 
-/// Kill a session with a specific exit reason.
+/// Kill a session with a specific exit reason, ending the job's background
+/// terminals only when `terminals` says the job's work ends with it.
 pub fn kill_session_with_reason(
     orch: &Orchestrator,
     run_id: &str,
     exit_reason: &str,
+    terminals: TerminalPolicy,
 ) -> Result<(), String> {
     if exit_reason == RUNNER_SHUTDOWN_EXIT_REASON {
         // Persist the cause and the unfinished work BEFORE the interrupt can
@@ -1142,7 +1155,7 @@ pub fn kill_session_with_reason(
             }
         })?;
     }
-    teardown_process(orch, run_id, TerminalPolicy::Finalize)?;
+    teardown_process(orch, run_id, terminals)?;
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
     let final_status = if matches!(
@@ -1220,8 +1233,13 @@ pub async fn stop_agents_for_host_shutdown(
     for run_id in run_ids {
         let orch = orch.clone();
         stops.spawn_blocking(move || {
-            kill_session_with_reason(&orch, &run_id, RUNNER_SHUTDOWN_EXIT_REASON)
-                .map_err(|error| (run_id, error))
+            kill_session_with_reason(
+                &orch,
+                &run_id,
+                RUNNER_SHUTDOWN_EXIT_REASON,
+                TerminalPolicy::Finalize,
+            )
+            .map_err(|error| (run_id, error))
         });
     }
 

@@ -689,6 +689,21 @@ pub(crate) fn interrupt_exact_app_server_turn(
     app_stdin.interrupt_exact_and_wait(provider_turn_id)
 }
 
+/// Whether a Codex app-server thread is still serving `provider_turn_id`;
+/// `None` for a control that is not a Codex app-server's and so cannot say.
+pub(crate) fn app_server_serves_turn(
+    stdin: &mut dyn crate::agent_process::process::SessionControl,
+    provider_turn_id: &str,
+) -> Result<Option<bool>, String> {
+    let Some(app_stdin) = stdin
+        .as_any_mut()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
+    else {
+        return Ok(None);
+    };
+    app_stdin.serves_turn(provider_turn_id).map(Some)
+}
+
 /// Reconcile the thread's goal with its authoritative job state, if it has a goal.
 ///
 /// An objective-less `thread/goal/set` is an *update*: the app-server rejects

@@ -813,4 +813,81 @@ mod tests {
             "exactly one rebase ran, the plain sibling's: {since:?}"
         );
     }
+
+    /// A child cut from a merge-mode branch is not in the merge-mode set, so
+    /// once its parent catches up by merge it still replays onto the parent's
+    /// merge tip, carrying only its own commits and rewriting none of the
+    /// parent's.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_child_of_a_merge_mode_branch_still_replays_onto_its_merge_tip() {
+        let Some(bin) = jj_bin() else { return };
+        let fx = fixture(&bin);
+        let child = "agent/cairn-4114-builder-0";
+        let base = fx.tip("main");
+        fx.commit(&["main"], BRANCH, "one.rs", "one\n");
+        let parent_tip = fx.commit(&[BRANCH], BRANCH, "two.rs", "two\n");
+        let child_tip = fx.commit(&[BRANCH], child, "child.rs", "child\n");
+        let dest = fx.commit(&["main"], "main", "main-only.rs", "main\n");
+        let options = ReconcileOptions {
+            merge_mode: [BRANCH.to_string()].into_iter().collect(),
+            target_name: Some("main".to_string()),
+            ..ReconcileOptions::default()
+        };
+
+        let parent_pass = reconcile_siblings_with_options(
+            &fx.jj,
+            &fx.store,
+            &dest,
+            &[BRANCH.to_string()],
+            &options,
+        )
+        .unwrap();
+        let merge = parent_pass
+            .merged_clean
+            .get(BRANCH)
+            .expect("parent merged")
+            .merge
+            .clone();
+        assert_eq!(fx.parents(&merge), vec![parent_tip.clone(), dest.clone()]);
+
+        let ops = fx.operations();
+        let child_pass = reconcile_siblings_with_options(
+            &fx.jj,
+            &fx.store,
+            &merge,
+            &[child.to_string()],
+            &options,
+        )
+        .unwrap();
+        assert!(child_pass.rebased_clean.contains(&child.to_string()));
+        assert!(
+            !child_pass.merged_clean.contains_key(child),
+            "the child is not merged"
+        );
+        let rebased = fx.tip(child);
+        assert_ne!(rebased, child_tip, "the child was replayed");
+        assert_eq!(fx.parents(&rebased), vec![merge.clone()]);
+        assert_eq!(
+            revset_commit_ids(&fx.jj, &fx.store, &format!("{merge}..{rebased}")).unwrap(),
+            vec![rebased.clone()],
+            "only the child's own commit was carried"
+        );
+        assert_eq!(fx.file(child, "main-only.rs"), "main\n");
+        assert_eq!(fx.file(child, "child.rs"), "child\n");
+        assert_eq!(fx.tip(BRANCH), merge, "the parent did not move");
+        assert_eq!(
+            revset_commit_ids(&fx.jj, &fx.store, &format!("{base}..{parent_tip}"))
+                .unwrap()
+                .len(),
+            2,
+            "the parent's stack is intact"
+        );
+        let since = fx.operations_since(&ops);
+        assert_eq!(
+            since.iter().filter(|op| op.contains("rebase")).count(),
+            1,
+            "exactly one rebase ran, the child's: {since:?}"
+        );
+    }
 }

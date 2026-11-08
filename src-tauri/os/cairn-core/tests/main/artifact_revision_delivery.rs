@@ -87,7 +87,12 @@ async fn seed(db: &LocalDb) {
         Box::pin(async move {
             conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
             conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','arv','/tmp/p',1,1)", ()).await?;
-            conn.execute("INSERT INTO issues (id, project_id, number, title, description, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'Match crossings','Raise a crossing on permission errors','active','none',1,1)", ()).await?;
+            // Thread `lead` filed the issue, so it is the gate owner that
+            // confirms the plan, as a thread does before the builder launches.
+            conn.execute("INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at) VALUES ('thread-lead','p-1','lead','active','none',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, project_id, thread_id, node_name, status, uri_segment, created_at, updated_at) VALUES ('job-lead','p-1','thread-lead','Thread','running','thread',1,1)", ()).await?;
+            conn.execute("INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('run-lead','p-1','job-lead','live',1,1)", ()).await?;
+            conn.execute("INSERT INTO issues (id, project_id, number, title, description, status, attention, parent_thread_id, parent_job_id, created_at, updated_at) VALUES ('i-1','p-1',1,'Match crossings','Raise a crossing on permission errors','active','none','thread-lead','job-lead',1,1)", ()).await?;
             conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('exec-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot.as_str(),)).await?;
             for (id, node, segment, status) in [
                 ("job-planner", planner.as_str(), "planner", "running"),
@@ -137,6 +142,12 @@ async fn write(orch: &Orchestrator, changes: serde_json::Value) -> String {
     common::change_resource(orch, changes).await
 }
 
+/// A write made by thread `lead`, the issue's filing parent: the one agent
+/// that may confirm the plan.
+async fn write_as_lead(orch: &Orchestrator, changes: serde_json::Value) -> String {
+    common::change_resource_as_run(orch, changes, Some("run-lead")).await
+}
+
 fn plan(content: &str) -> serde_json::Value {
     json!({"title": "Match colon forms", "summary": "Crossing matcher", "content": content})
 }
@@ -157,7 +168,7 @@ async fn planner_writes_and_confirms(orch: &Orchestrator, content: &str) {
     )
     .await;
     assert!(created.contains("version 1"), "{created}");
-    let confirmed = write(
+    let confirmed = write_as_lead(
         orch,
         json!([{"target": PLAN_URI, "mode": "patch", "payload": {"confirmed": true}}]),
     )
@@ -427,7 +438,7 @@ async fn patch_and_confirm_in_one_batch_launches_the_patched_plan() {
     )
     .await;
     assert!(created.contains("awaiting user confirmation"), "{created}");
-    let batch = write(
+    let batch = write_as_lead(
         &orch,
         json!([
             {"target": PLAN_URI, "mode": "patch", "payload": {"content": plan_body("patched rule")}},

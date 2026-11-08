@@ -363,7 +363,7 @@ pub(crate) async fn recent_events(
 /// Set (or re-set) a branch's merge mode. The caller has established the
 /// operator's authority, resolved `reviewed_through` to a commit in the
 /// branch's and the default branch's shared history, and refused the default
-/// branch and store-owned integration branches.
+/// branch.
 pub(crate) async fn set(db: &LocalDb, request: SetCatchUpMode<'_>) -> Result<CatchUpMode, String> {
     validate_review_paths(request.review_paths)?;
     let at = now();

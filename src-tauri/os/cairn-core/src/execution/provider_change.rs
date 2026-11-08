@@ -158,6 +158,7 @@ pub async fn apply_for_job(
             orch,
             run_id,
             "provider_change",
+            crate::orchestrator::lifecycle::TerminalPolicy::Keep,
         ) {
             log::warn!(
                 "Provider change for job {job_id} committed, but tearing down run {run_id} failed: {error}"
@@ -283,6 +284,8 @@ pub(crate) mod tests {
             resolve(None, "inference/Qwen/Qwen3.6-35B-A3B"),
             pinned("inference", QWEN_LOCAL)
         );
+        // The exact real name reaches only inference's provider spelling.
+        assert_eq!(resolve(None, QWEN_LOCAL), pinned("inference", QWEN_LOCAL));
         // A bare id is narrowed by the provider the edit was made under.
         assert_eq!(
             resolve(Some("inference"), QWEN_LOCAL),
@@ -304,10 +307,10 @@ pub(crate) mod tests {
             ),
             "{unoffered}"
         );
-        let ambiguous = resolve(None, QWEN_LOCAL);
+        let ambiguous = resolve(None, QWEN_SLUG);
         assert_eq!(
             ambiguous,
-            "'Qwen/Qwen3.6-35B-A3B' is offered by inference (inference/Qwen/Qwen3.6-35B-A3B) and openrouter (openrouter/qwen/qwen3.6-35b-a3b): name one."
+            "'qwen/qwen3.6-35b-a3b' is offered by inference (inference/Qwen/Qwen3.6-35B-A3B) and openrouter (openrouter/qwen/qwen3.6-35b-a3b): name one."
         );
         // A pool is the allotment's vocabulary, never a pin.
         let pool = orch.effective_models(None).unwrap().pools[0].id.clone();

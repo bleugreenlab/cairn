@@ -24,8 +24,8 @@ use crate::agent_process::process::{GoalPause, PauseIntent};
 use crate::mcp::handlers::permission::{HandBackPolicy, Withdrawal, WithdrawalCause};
 use crate::models::Run;
 use crate::orchestrator::lifecycle::{
-    find_descendant_job_ids, kill_session_with_reason, settle_live_turn, TurnSettlement,
-    OPERATOR_COMPACT_EXIT_REASON,
+    find_descendant_job_ids, kill_session_with_reason, settle_live_turn, TerminalPolicy,
+    TurnSettlement, OPERATOR_COMPACT_EXIT_REASON,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
@@ -524,8 +524,13 @@ fn tear_down(
     // Sub-agents first, so no child outlives the parent it reports to.
     doomed.sort_by_key(|run| run.job_id == job_id);
     for run in &doomed {
-        kill_session_with_reason(orch, &run.id, OPERATOR_COMPACT_EXIT_REASON)
-            .map_err(|error| format!("failed to kill run {}: {error}", run.id))?;
+        kill_session_with_reason(
+            orch,
+            &run.id,
+            OPERATOR_COMPACT_EXIT_REASON,
+            TerminalPolicy::Finalize,
+        )
+        .map_err(|error| format!("failed to kill run {}: {error}", run.id))?;
         report.runs_killed += 1;
     }
 
@@ -545,8 +550,13 @@ fn tear_down(
     if !after.is_empty() {
         settle_asks_and_turns(orch, db, &after, &mut report)?;
         for run in &after.runs {
-            kill_session_with_reason(orch, &run.id, OPERATOR_COMPACT_EXIT_REASON)
-                .map_err(|error| format!("failed to kill run {}: {error}", run.id))?;
+            kill_session_with_reason(
+                orch,
+                &run.id,
+                OPERATOR_COMPACT_EXIT_REASON,
+                TerminalPolicy::Finalize,
+            )
+            .map_err(|error| format!("failed to kill run {}: {error}", run.id))?;
             report.runs_killed += 1;
         }
         let remaining = live_work_for_job(orch, job_id)?;

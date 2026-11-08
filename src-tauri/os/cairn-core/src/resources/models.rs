@@ -1219,7 +1219,7 @@ fn render_models(
     let mut out = String::from("# Model catalog — models\n\n");
     let _ = writeln!(
         out,
-        "{} model{} across the installed providers, each under its catalog id: the provider's canonical slug when it reports one, otherwise `provider/model`. Offers merge only on a shared slug. An offer Cairn can name without guessing also shows its canonical model id, the one benchmark results and the ladder share.{}\n",
+        "{} model{} across the installed providers, each under its canonical model id when known, otherwise `provider/model`. Offers merge only when identity resolves them to the same model, the one benchmark results and the ladder share. Aliases list provider spellings; names resolve by provider-qualified native id, then provider spelling, then canonical id.{}\n",
         models.len(),
         if models.len() == 1 { "" } else { "s" },
         serving
@@ -2237,23 +2237,15 @@ pub(crate) fn render_usage_history(
         out.push_str("No usage readings recorded for this account yet. A reading is written each time a usage refresh measures it; see cairn://models/accounts.\n");
         return out;
     }
-    type WindowReadings<'a> = (
-        (&'a str, &'a str, &'a str),
-        Vec<&'a cairn_db::storage::usage_readings::UsageWindowReadingRow>,
-    );
-    let mut windows: Vec<WindowReadings<'_>> = Vec::new();
+    let mut windows: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
     for row in rows {
         let key = (
             row.window_name.as_str(),
             row.window_id.as_str(),
             row.provider.as_str(),
         );
-        match windows.iter_mut().find(|(existing, _)| *existing == key) {
-            Some((_, group)) => group.push(row),
-            None => windows.push((key, vec![row])),
-        }
+        windows.entry(key).or_default().push(row);
     }
-    windows.sort_by(|a, b| a.0.cmp(&b.0));
     for ((name, id, provider), group) in windows {
         let _ = writeln!(out, "## {name} (`{id}`, {provider})\n");
         let shown = &group[group.len().saturating_sub(USAGE_HISTORY_ROWS_SHOWN)..];
@@ -2603,6 +2595,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_view_groups_canonical_identity_and_lists_provider_spellings() {
+        use cairn_models::interface::{Catalog, CatalogProvider};
+        use cairn_models::types::catalog::{claude_models, descriptor, ProviderModelCatalog};
+
+        let providers = [
+            ("openrouter", "z-ai/glm-5.2", Some("z-ai/glm-5.2-20261001")),
+            ("opencode-go", "glm-5.2", None),
+        ]
+        .into_iter()
+        .map(|(provider, native, slug)| {
+            let mut model = claude_models().remove(0);
+            model.id = native.into();
+            model.model = native.into();
+            model.display_name = native.into();
+            model.canonical_slug = slug.map(str::to_string);
+            CatalogProvider {
+                descriptor: descriptor(provider).unwrap().clone(),
+                installed: true,
+                models: Some(ProviderModelCatalog {
+                    backend: provider.into(),
+                    models: vec![model],
+                    options: vec![],
+                    refreshed_at: None,
+                    error: None,
+                }),
+                serves: vec![],
+                unable: vec![],
+                alias_resolutions: vec![],
+            }
+        })
+        .collect();
+        let rendered = super::render_models(&Catalog { providers }, None, None);
+        assert!(rendered.contains("1 model across"), "{rendered}");
+        assert!(rendered.contains("- `glm-5.2`"), "{rendered}");
+        assert!(
+            rendered.contains("  - openrouter `z-ai/glm-5.2`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  - opencode-go `glm-5.2`"), "{rendered}");
+        assert!(
+            rendered.contains("aliases: `z-ai/glm-5.2`, `z-ai/glm-5.2-20261001`"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("merge only on a shared slug"),
+            "{rendered}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_pages_say_what_settings_shows() {
         let orch = seeded_orchestrator().await;
@@ -2934,7 +2976,7 @@ mod tests {
         );
         assert!(
             models.contains(
-                "claude `opus` (1M context) · serves complete, session (claude-stream-json)"
+                "claude `opus` (alias opus has no observed identity; awaiting a Claude session, 1M context) · serves complete, session (claude-stream-json)"
             ),
             "{models}"
         );

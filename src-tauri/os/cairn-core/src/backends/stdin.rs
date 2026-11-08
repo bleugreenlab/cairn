@@ -114,6 +114,22 @@ pub(crate) fn interrupt_exact_codex_turn(
     })
 }
 
+/// Whether the run's provider is still serving `provider_turn_id`: `Some(false)`
+/// once its reader has observed that turn end. `None` when nothing here can
+/// answer: no process for the run, no control, or a provider that does not
+/// track its turns this way.
+pub(crate) fn provider_serves_turn(
+    process_state: &AgentProcessState,
+    run_id: &str,
+    provider_turn_id: &str,
+) -> Option<bool> {
+    with_session_control(process_state, run_id, |stdin, _claim| {
+        super::codex::app_server_serves_turn(stdin, provider_turn_id)
+    })
+    .ok()
+    .flatten()
+}
+
 /// Send a user message to a running agent process.
 pub(crate) fn send_user_message(
     process_state: &AgentProcessState,

@@ -338,7 +338,7 @@ pub(super) async fn dispatch(
                 }
                 if request.repaired == Some(true) {
                     planned.push(format!(
-                        "declare {name} repaired, re-arming every check suppressed on its environment"
+                        "declare {name} repaired, re-arming every check suppressed on its environment and forgetting the out-of-memory kills held against it"
                     ));
                 }
                 if let Some(build_root) = &request.build_root {
@@ -401,8 +401,12 @@ pub(super) async fn dispatch(
                         .clear_preparation_refusals(&executor_id)
                         .await
                         .map_err(|error| build_failure(index, item, error))?;
+                    let suites =
+                        crate::fleet::repair::forget_kills_on(&orch.db.local, &executor_id)
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?;
                     applied.push(format!(
-                        "declared repaired (repair {epoch}) — every check infrastructure-suppressed on this machine's environment runs again, and it is eligible again for projects it had failed to prepare; a MISSING build-prerequisite verdict still stands until the machine re-attaches"
+                        "declared repaired (repair {epoch}) — every check infrastructure-suppressed on this machine's environment runs again, it is eligible again for projects it had failed to prepare, and the out-of-memory kills it held against {suites} suite(s) and their commands are forgotten; a MISSING build-prerequisite verdict still stands until the machine re-attaches"
                     ));
                 }
                 // Renaming last: it moves the address the other controls were

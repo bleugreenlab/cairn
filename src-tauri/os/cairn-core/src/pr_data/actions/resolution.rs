@@ -37,7 +37,8 @@ pub struct StoredPrResolutionAttribution {
 ///
 /// Rows journaled before this shape also carry `execution.executionSnapshot`
 /// and each lane's full status (output tails, failure names). [`Self::parse`]
-/// reads both shapes and keeps only these fields.
+/// reads both shapes and keeps only these fields. A failed lane's failing
+/// tests are read through its cited observation when the row is rendered.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaneSnapshot {
@@ -91,6 +92,19 @@ pub struct LaneAtResolution {
     /// lanes cited their observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<LaneObservation>,
+    /// What the cited observation records about a failed verdict. Read when
+    /// the resolution is rendered ([`hydrate_lane_failures`]), never stored.
+    #[serde(skip)]
+    pub failure: Option<ObservedFailure>,
+}
+
+/// A failed verdict as its observation holds it: the failure kind and the
+/// first failing test names, with how many failed in all as the lane counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedFailure {
+    pub kind: Option<String>,
+    pub names: Vec<String>,
+    pub total: usize,
 }
 
 /// The evidence behind a lane's state at resolution. A cited observation
@@ -143,24 +157,99 @@ async fn lane_observation(
             reason: absent_observation_reason(state).to_string(),
         };
     };
-    let uri = db
-        .query_opt(
-            "SELECT p.key, o.public_handle
-               FROM check_result_observations o
-               JOIN projects p ON p.id = o.project_id
-              WHERE o.id = ?1",
-            (id.to_string(),),
-            |row| Ok((row.text(0)?, row.opt_text(1)?)),
-        )
-        .await
-        .ok()
-        .flatten()
-        .and_then(|(key, handle)| {
-            handle.map(|handle| format!("cairn://p/{key}/check-observations/{handle}"))
-        });
     LaneObservation::Cited {
         id: id.to_string(),
-        uri,
+        uri: observation_facts(db, id).await.and_then(|facts| facts.uri),
+    }
+}
+
+/// What one observation row says about itself, for a lane that cites it.
+struct ObservationFacts {
+    /// Its resolvable address, when it has a public handle.
+    uri: Option<String>,
+    failed: bool,
+    failure_kind: Option<String>,
+}
+
+async fn observation_facts(db: &LocalDb, id: &str) -> Option<ObservationFacts> {
+    db.query_opt(
+        "SELECT p.key, o.public_handle, o.verdict, o.failure_kind
+           FROM check_result_observations o
+           JOIN projects p ON p.id = o.project_id
+          WHERE o.id = ?1",
+        (id.to_string(),),
+        |row| {
+            let key = row.text(0)?;
+            Ok(ObservationFacts {
+                uri: row
+                    .opt_text(1)?
+                    .map(|handle| format!("cairn://p/{key}/check-observations/{handle}")),
+                failed: row.text(2)? == "failed",
+                failure_kind: row.opt_text(3)?,
+            })
+        },
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Fill each listed lane's citation from its observation: the address a row
+/// journaled without one lacks and, for a failed verdict, the failure kind and
+/// failing tests. Rows journaled before lanes cited observations, and lanes a
+/// migration relinked, carry nothing else that says why a lane was red.
+///
+/// Bounded like the block it feeds: only the lanes the table lists are read,
+/// a lane that was not red and already has its address is not read at all,
+/// and only as many names are read as the block shows, across all lanes. How
+/// many failed is the lane's own count, which the row kept.
+async fn hydrate_lane_failures(db: &LocalDb, snapshot: &mut LaneSnapshot) {
+    let mut names_left = PROVENANCE_LINE_NAMES;
+    for lane in snapshot
+        .systematic_checks
+        .iter_mut()
+        .take(PROVENANCE_LANE_ROWS)
+    {
+        // Only a lane that was red at resolution shows failures; a pending or
+        // running one shows no result, stale or not.
+        let red = lane.state == "failed";
+        let counted = lane.failed;
+        let Some(LaneObservation::Cited { id, uri }) = &mut lane.observation else {
+            continue;
+        };
+        if !red && uri.is_some() {
+            continue;
+        }
+        let Some(facts) = observation_facts(db, id).await else {
+            continue;
+        };
+        if uri.is_none() {
+            *uri = facts.uri;
+        }
+        if !red || !facts.failed {
+            continue;
+        }
+        let id = id.clone();
+        let names = if names_left == 0 {
+            Vec::new()
+        } else {
+            db.query_all(
+                "SELECT test_id FROM check_test_results
+                  WHERE observation_id = ?1 AND status = 'failed'
+                  ORDER BY test_id LIMIT ?2",
+                params![id.as_str(), names_left as i64],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap_or_default()
+        };
+        names_left -= names.len().min(names_left);
+        let total = counted.unwrap_or(0).max(names.len());
+        lane.failure = Some(ObservedFailure {
+            kind: facts.failure_kind,
+            names,
+            total,
+        });
     }
 }
 
@@ -184,11 +273,21 @@ impl LaneAtResolution {
     }
 
     fn verdict(&self) -> String {
-        let state = match self.state.as_str() {
+        let mut state = match self.state.as_str() {
             "pending" | "running" => format!("{}, no verdict", self.state),
             "notApplicable" => "not applicable".to_string(),
             state => state.to_string(),
         };
+        if !self.has_verdict() {
+            return state;
+        }
+        if let Some(kind) = self
+            .failure
+            .as_ref()
+            .and_then(|failure| failure.kind.as_ref())
+        {
+            state.push_str(&format!(" ({kind})"));
+        }
         let counts = [
             (self.passed, "passed"),
             (self.failed, "failed"),
@@ -287,6 +386,23 @@ fn bounded_list(items: &[String]) -> String {
     listed
 }
 
+/// Bytes of one failing test name a summary line shows.
+const PROVENANCE_NAME_BYTES: usize = 160;
+
+/// `text` cut to at most `bytes` on a character boundary, marked when cut.
+fn excerpt(text: &str, bytes: usize) -> String {
+    let end = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .find(|offset| *offset >= bytes)
+        .unwrap_or(text.len());
+    let mut shown = text[..end].to_string();
+    if end < text.len() {
+        shown.push('…');
+    }
+    shown
+}
+
 fn short_head(head: &str) -> &str {
     head.get(..12).unwrap_or(head)
 }
@@ -347,6 +463,7 @@ pub fn render_resolution_provenance(
     }
 
     let lanes = &snapshot.systematic_checks;
+    let tail = provenance_tail(lanes, links);
     if lanes.is_empty() {
         out.push_str("\nNo check lanes were recorded at resolution.\n");
     } else {
@@ -369,6 +486,7 @@ pub fn render_resolution_provenance(
             ));
         }
         out.push_str("\n| Lane | Verdict | Head | Observation |\n|---|---|---|---|\n");
+        let mut listed = 0;
         for lane in lanes.iter().take(PROVENANCE_LANE_ROWS) {
             let head = lane
                 .verified_on
@@ -377,19 +495,71 @@ pub fn render_resolution_provenance(
                 .or(snapshot.head.as_deref())
                 .map(|head| format!("`{}`", short_head(head)))
                 .unwrap_or_else(|| "—".to_string());
-            out.push_str(&format!(
+            let row = format!(
                 "| {} | {} | {head} | {} |\n",
                 table_cell(&lane.name),
                 table_cell(&lane.verdict()),
                 table_cell(&LaneObservation::cell(lane.observation.as_ref()))
-            ));
+            );
+            // Rows give way before the failures and links do: whatever is
+            // left out is counted, and every row shown is whole.
+            if out.len() + row.len() + OMITTED_LANES_LINE_BYTES + tail.len() >= PROVENANCE_BYTES {
+                break;
+            }
+            out.push_str(&row);
+            listed += 1;
         }
-        if lanes.len() > PROVENANCE_LANE_ROWS {
+        if lanes.len() > listed {
             out.push_str(&format!(
                 "\n{} more lanes are not listed.\n",
-                lanes.len() - PROVENANCE_LANE_ROWS
+                lanes.len() - listed
             ));
         }
+    }
+
+    out.push_str(&tail);
+    out
+}
+
+/// The byte budget the lane table's rows fill after the block's header and
+/// tail are reserved: rows give way first, so the failing tests and links
+/// still show however many lanes a project configures. The header and tail
+/// are bounded by their own name caps, not by this budget.
+const PROVENANCE_BYTES: usize = 8_192;
+
+/// Room the lane table keeps for its `N more lanes are not listed.` line.
+const OMITTED_LANES_LINE_BYTES: usize = 48;
+
+/// What follows the lane table: the failing tests, the links, and the close.
+fn provenance_tail(lanes: &[LaneAtResolution], links: &ProvenanceLinks) -> String {
+    let mut out = String::new();
+    // One budget across lanes bounds the failure detail of a very red merge.
+    let shown = lanes
+        .iter()
+        .flat_map(|lane| {
+            lane.failure
+                .iter()
+                .flat_map(move |failure| failure.names.iter().map(move |name| (lane, name)))
+        })
+        .take(PROVENANCE_LINE_NAMES)
+        .collect::<Vec<_>>();
+    for (lane, name) in &shown {
+        out.push_str(&format!(
+            "\nFailing test ({}): {}\n",
+            table_cell(&excerpt(&lane.name, PROVENANCE_NAME_BYTES)),
+            table_cell(&excerpt(name, PROVENANCE_NAME_BYTES))
+        ));
+    }
+    let failed_tests = lanes
+        .iter()
+        .filter_map(|lane| lane.failure.as_ref())
+        .map(|failure| failure.total.max(failure.names.len()))
+        .sum::<usize>();
+    if failed_tests > shown.len() {
+        out.push_str(&format!(
+            "\n{} more failing test names are not listed.\n",
+            failed_tests - shown.len()
+        ));
     }
 
     let mut rest = Vec::new();
@@ -606,7 +776,9 @@ pub async fn latest_resolution_attribution(
     // A Cairn merge can land on GitHub and be observed by a refresh before its
     // own resolution journals, inside the same second. The principal that acted
     // outranks the observation of its act.
-    db.query_opt("SELECT action, actor_kind, actor_identity, surface, created_at, lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1 ORDER BY created_at DESC, CASE WHEN actor_kind = 'unjournaled' THEN 1 ELSE 0 END LIMIT 1", (mr_id,), |row| Ok(StoredPrResolutionAttribution { action: row.text(0)?, actor_kind: row.text(1)?, actor_identity: row.opt_text(2)?, surface: row.text(3)?, created_at: row.i64(4)?, lane_snapshot: LaneSnapshot::parse(&row.text(5)?) })).await.ok().flatten()
+    let mut attribution = db.query_opt("SELECT action, actor_kind, actor_identity, surface, created_at, lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1 ORDER BY created_at DESC, CASE WHEN actor_kind = 'unjournaled' THEN 1 ELSE 0 END LIMIT 1", (mr_id,), |row| Ok(StoredPrResolutionAttribution { action: row.text(0)?, actor_kind: row.text(1)?, actor_identity: row.opt_text(2)?, surface: row.text(3)?, created_at: row.i64(4)?, lane_snapshot: LaneSnapshot::parse(&row.text(5)?) })).await.ok().flatten()?;
+    hydrate_lane_failures(db, &mut attribution.lane_snapshot).await;
+    Some(attribution)
 }
 
 /// Move a `merge_requests` row to its terminal status, returning whether this
@@ -2082,7 +2254,10 @@ mod tests {
 
         assert!(stored.len() < 2_048, "{} bytes: {stored}", stored.len());
         assert!(!stored.contains("xxxx"), "the output tail is not stored");
-        assert!(!stored.contains("a_failing_test"));
+        assert!(
+            !stored.contains("a_failing_test"),
+            "failing tests are read through the observation"
+        );
         assert_eq!(LaneSnapshot::parse(&stored), snapshot);
         let states = snapshot
             .systematic_checks
@@ -2209,18 +2384,46 @@ mod tests {
             systematic_checks: lanes
                 .iter()
                 .filter_map(LaneAtResolution::from_status)
+                .map(|mut lane| {
+                    if lane.state == "failed" {
+                        lane.failure = Some(ObservedFailure {
+                            kind: Some("timed_out".to_string()),
+                            names: vec![format!("module::failing_{}", "z".repeat(400))],
+                            total: 1_000,
+                        });
+                    }
+                    lane
+                })
                 .collect(),
         });
         let rendered = render_resolution_provenance(&attribution, &ProvenanceLinks::default());
         assert!(
-            rendered.len() < 8_192,
+            rendered.contains("99995 more failing test names are not listed."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.len() < PROVENANCE_BYTES,
             "{} bytes rendered for 200 lanes",
             rendered.len()
         );
+        // The byte budget lists fewer rows than the row cap once five long
+        // failing names and failure kinds share the block; the omitted count
+        // is exactly what the table left out, and the failures still show.
+        let rows = rendered
+            .lines()
+            .filter(|line| line.starts_with("| a-fairly-long-check-lane-name-"))
+            .count();
+        assert!(rows > 41 && rows < PROVENANCE_LANE_ROWS, "{rows} rows");
         assert!(
-            rendered.contains("136 more lanes are not listed."),
+            rendered.contains(&format!("\n{} more lanes are not listed.\n", 200 - rows)),
             "{rendered}"
         );
+        assert_eq!(
+            rendered.matches("Failing test (").count(),
+            PROVENANCE_LINE_NAMES
+        );
+        assert!(rendered.contains("failed (timed_out) ("), "{rendered}");
+        assert!(rendered.ends_with("</details>\n"));
         // A reader greps the artifact for a lane: every line stays short, and
         // the lane's own row is what the grep returns.
         let longest = rendered.lines().map(str::len).max().unwrap_or(0);
@@ -2235,6 +2438,153 @@ mod tests {
             "{hits:?}"
         );
         assert!(rendered.contains("and 95 more"), "{rendered}");
+    }
+
+    #[test]
+    fn lanes_without_verdict_do_not_render_stale_result_facts() {
+        for state in ["pending", "running"] {
+            let mut lane: LaneAtResolution = serde_json::from_value(serde_json::json!({
+                "name": "tests", "state": state,
+                "passed": 10000, "failed": 1000, "skipped": 100
+            }))
+            .unwrap();
+            lane.failure = Some(ObservedFailure {
+                kind: Some("infrastructure".to_string()),
+                ..ObservedFailure::default()
+            });
+            assert_eq!(lane.verdict(), format!("{state}, no verdict"));
+        }
+    }
+
+    /// A red lane's failing tests are read through the observation it cites,
+    /// one shared budget across lanes, each name cut short and escaped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cited_red_lane_renders_its_observations_failures_within_a_bound() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('p-obs', 'default', 'Project', 'proj', '/repo', 'main', 1, 1);
+             INSERT INTO check_result_observations
+               (id, project_id, commit_sha, tree_hash, check_name, input_hash, environment_fingerprint,
+                exit_code, verdict, failure_kind, complete, reusable, parser_version, result_schema_version,
+                ran_at, duration_ms, cadence, output_tail)
+             VALUES ('obs-red', 'p-obs', 'c', 't', 'rust-tests', 'i', 'env', 1, 'failed', 'test', 1, 0, 1, 1,
+                     1, 1, 'review', 'TAIL-NOT-RENDERED'),
+                    ('obs-two', 'p-obs', 'c', 't', 'api', 'i', 'env', 1, 'failed', NULL, 1, 0, 1, 1,
+                     1, 1, 'review', 'tail'),
+                    ('obs-green', 'p-obs', 'c', 't', 'lint', 'i', 'env', 0, 'passed', NULL, 1, 1, 1, 1,
+                     1, 1, 'review', 'ok');
+             INSERT INTO check_test_results (observation_id, test_id, status)
+               VALUES ('obs-red', 'passing_test', 'passed'),
+                      ('obs-two', 'another_lane', 'failed'),
+                      ('obs-green', 'green_test', 'passed');",
+        )
+        .await
+        .unwrap();
+        let names = (0..20)
+            .map(|n| format!("test_{n:02}|\n{}", "é".repeat(200)))
+            .collect::<Vec<_>>();
+        for name in &names {
+            db.execute(
+                "INSERT INTO check_test_results (observation_id, test_id, status, failure_excerpt)
+                 VALUES ('obs-red', ?1, 'failed', 'EXCERPT-NOT-RENDERED')",
+                params![name.as_str()],
+            )
+            .await
+            .unwrap();
+        }
+        let mut snapshot = LaneSnapshot::parse(
+            &serde_json::json!({"systematicChecks": [
+                {"name": "rust-tests", "state": "failed", "failed": 20,
+                 "observation": {"kind": "cited", "id": "obs-red"}},
+                {"name": "api", "state": "failed", "failed": 1,
+                 "observation": {"kind": "cited", "id": "obs-two"}},
+                {"name": "lint", "state": "passed",
+                 "observation": {"kind": "cited", "id": "obs-green"}},
+                {"name": "gone", "state": "failed",
+                 "observation": {"kind": "cited", "id": "no-such-observation"}},
+                {"name": "web", "state": "failed",
+                 "observation": {"kind": "absent", "reason": "explicit reason"}},
+                {"name": "stale", "state": "running",
+                 "observation": {"kind": "cited", "id": "obs-red"}}
+            ]})
+            .to_string(),
+        );
+        let stored = serde_json::to_string(&snapshot).unwrap();
+        hydrate_lane_failures(&db, &mut snapshot).await;
+
+        let lanes = &snapshot.systematic_checks;
+        assert_eq!(
+            lanes[0].failure,
+            Some(ObservedFailure {
+                kind: Some("test".to_string()),
+                names: names[..PROVENANCE_LINE_NAMES].to_vec(),
+                total: 20,
+            })
+        );
+        assert_eq!(
+            lanes[1].failure,
+            Some(ObservedFailure {
+                kind: None,
+                names: Vec::new(),
+                total: 1,
+            }),
+            "the name budget is spent, the count is not"
+        );
+        assert_eq!(
+            lanes[2].failure, None,
+            "a passed observation has no failure"
+        );
+        assert_eq!(lanes[3].failure, None);
+        assert_eq!(
+            lanes[3].observation,
+            Some(LaneObservation::Cited {
+                id: "no-such-observation".to_string(),
+                uri: None
+            })
+        );
+        assert_eq!(lanes[4].failure, None);
+        assert_eq!(
+            lanes[5].failure, None,
+            "a lane with no verdict shows no failure"
+        );
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            stored,
+            "hydrated detail is never written back"
+        );
+
+        let rendered =
+            render_resolution_provenance(&attribution_with(snapshot), &ProvenanceLinks::default());
+        assert!(
+            rendered.contains("| rust-tests | failed (test) (20 failed) |"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("observation `obs-red`"), "{rendered}");
+        assert!(rendered.contains("none: explicit reason"), "{rendered}");
+        assert_eq!(
+            rendered.matches("Failing test (rust-tests): ").count(),
+            PROVENANCE_LINE_NAMES,
+            "{rendered}"
+        );
+        assert!(rendered.contains("test_00\\| "), "{rendered}");
+        assert!(rendered.contains('…'), "{rendered}");
+        assert!(
+            rendered.contains("16 more failing test names are not listed."),
+            "{rendered}"
+        );
+        for absent in [
+            "test_05",
+            "another_lane",
+            "passing_test",
+            "green_test",
+            "EXCERPT-NOT-RENDERED",
+            "TAIL-NOT-RENDERED",
+        ] {
+            assert!(!rendered.contains(absent), "{absent} in {rendered}");
+        }
+        assert!(rendered.len() < 4_096, "{} bytes", rendered.len());
+        assert!(rendered.lines().all(|line| line.len() < 300));
     }
 
     /// A row journaled before the lane record existed still renders as a lane
@@ -2464,5 +2814,246 @@ mod tests {
         assert_eq!(execution.jobs.len(), 1);
         assert_eq!(stored("unavailable").await, unavailable);
         assert_eq!(stored("unreadable").await, "not json");
+    }
+
+    /// 0393 left each historical lane its name, `ranAt` and counts, and no
+    /// observation. The forward relink cites the one observation those facts
+    /// and the merge request's job name, and nothing where they name none or
+    /// several. Every other byte of a row is kept, and a second run is a no-op.
+    #[tokio::test]
+    async fn the_relink_cites_only_a_single_exact_observation() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        const RELINK: &str = "relink_pr_resolution_lane_observations";
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("lane-relinks.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != RELINK)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            before.len() < TURSO_MIGRATIONS.len(),
+            "the relink must be in the lineage"
+        );
+        assert!(
+            before
+                .iter()
+                .any(|migration| migration.name() == "trim_pr_resolution_lane_snapshot"),
+            "the relink runs over rows 0393 already trimmed"
+        );
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'P', 'p', '/tmp/p', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('i', 'p', 1, 'I', 'merged', 'merged', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+             VALUES('j', 'p', 'i', 'complete', 1, 1), ('k', 'p', 'i', 'complete', 1, 1);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr', 'j', 'p', 'i', 'PR', 'feature', 'main', 'merged', 1, 2),
+                   ('mr-k', 'k', 'p', 'i', 'PR', 'other', 'main', 'merged', 1, 2);
+            INSERT INTO check_result_observations
+              (id, project_id, commit_sha, tree_hash, check_name, input_hash, environment_fingerprint,
+               exit_code, verdict, failure_kind, complete, reusable, parser_version, result_schema_version,
+               ran_at, duration_ms, cadence, output_tail, job_id, public_handle)
+            VALUES ('exact', 'p', 'c', 't', 'rust-tests', 'i', 'env', 1, 'failed', 'timed_out', 1, 0, 1, 1,
+                    42, 1, 'review', 'tail', 'j', 'e884003b'),
+                   ('lint-a', 'p', 'c', 't', 'lint', 'i', 'env', 0, 'passed', NULL, 1, 1, 1, 1,
+                    41, 1, 'review', 'ok', 'j', NULL),
+                   ('lint-b', 'p', 'c', 't', 'lint', 'i', 'env', 0, 'passed', NULL, 1, 1, 1, 1,
+                    41, 1, 'review', 'ok', 'j', NULL),
+                   ('api-earlier', 'p', 'c', 't', 'api', 'i', 'env', 0, 'passed', NULL, 1, 1, 1, 1,
+                    39, 1, 'write', 'ok', 'j', NULL),
+                   ('api-other-job', 'p', 'c', 't', 'api', 'i', 'env', 0, 'passed', NULL, 1, 1, 1, 1,
+                    40, 1, 'write', 'ok', 'k', NULL),
+                   ('other-check', 'p', 'c', 't', 'other', 'i', 'env', 1, 'failed', NULL, 1, 0, 1, 1,
+                    42, 1, 'review', 'tail', 'j', NULL),
+                   ('k-rust-tests', 'p', 'c', 't', 'rust-tests', 'i', 'env', 1, 'failed', NULL, 1, 0, 1, 1,
+                    42, 1, 'review', 'tail', 'k', NULL);
+            INSERT INTO check_test_results (observation_id, test_id, status)
+             VALUES ('exact', 'crate::a_failing_test', 'failed'),
+                    ('exact', 'crate::b_failing_test', 'failed'),
+                    ('exact', 'crate::a_passing_test', 'passed');
+            ",
+        )
+        .await
+        .unwrap();
+
+        // Lanes as 0393 left them on the live store.
+        let red = serde_json::json!({
+            "name": "rust-tests", "state": "failed", "policy": "advisory", "when": "review",
+            "passed": 120, "failed": 3, "skipped": 0, "ranAt": 42, "cached": false,
+            "complete": true, "durationMs": 9, "suiteFailures": null, "suppressedAfter": null,
+            "verifiedOn": {"head": "0123456789abcdef"}
+        });
+        let with = |lane: &serde_json::Value, key: &str, value: serde_json::Value| {
+            let mut lane = lane.clone();
+            lane[key] = value;
+            lane
+        };
+        let applied_lanes = vec![
+            red.clone(),
+            serde_json::json!({"name": "lint", "state": "passed", "ranAt": 41}),
+            serde_json::json!({"name": "api", "state": "passed", "ranAt": 40}),
+            with(&red, "ranAt", serde_json::json!("42")),
+            with(&red, "ranAt", serde_json::json!(42.0)),
+            with(&red, "ranAt", serde_json::Value::Null),
+            serde_json::json!({"name": "frontend", "state": "pending"}),
+            with(
+                &red,
+                "observation",
+                serde_json::json!({"kind": "absent", "reason": "not captured"}),
+            ),
+            with(
+                &red,
+                "observation",
+                serde_json::json!({"kind": "cited", "id": "already"}),
+            ),
+            with(&red, "observationId", serde_json::json!("already-by-id")),
+            with(&red, "observation", serde_json::Value::Null),
+            serde_json::json!("a string sibling"),
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!(1.5),
+            serde_json::json!([1, false, null]),
+        ];
+        let applied = serde_json::json!({
+            "execution": {"executionStatus": "complete", "jobs": [{"node": "builder", "status": "complete"}]},
+            "head": "feedfacecafe0123",
+            "systematicChecks": applied_lanes
+        });
+        let cited = serde_json::json!({"kind": "cited", "id": "exact"});
+        let mut expected = applied.clone();
+        expected["systematicChecks"][0]["observation"] = cited.clone();
+        expected["systematicChecks"][10]["observation"] = cited;
+        let other_job = serde_json::json!({"systematicChecks": [{"name": "rust-tests", "state": "failed", "ranAt": 42}]});
+        let mut other_job_expected = other_job.clone();
+        other_job_expected["systematicChecks"][0]["observation"] =
+            serde_json::json!({"kind": "cited", "id": "k-rust-tests"});
+        let untouched = serde_json::json!({"systematicChecks": [
+            {"name": "api", "state": "passed", "ranAt": 40},
+            {"name": "lint", "state": "passed", "ranAt": 41},
+            "a string sibling", true
+        ]})
+        .to_string();
+        let unchanged = [
+            ("untouched", untouched.as_str()),
+            (
+                "unavailable",
+                r#"{"execution":{"state":"unavailable"},"systematicChecks":[]}"#,
+            ),
+            (
+                "object-checks",
+                r#"{"systematicChecks":{"name":"rust-tests","ranAt":42}}"#,
+            ),
+            ("unreadable", "not json"),
+        ];
+        let applied_text = applied.to_string();
+        let other_job_text = other_job.to_string();
+        let mut rows = vec![
+            ("applied", "mr", applied_text.as_str(), 3_i64),
+            ("other-job", "mr-k", other_job_text.as_str(), 2_i64),
+        ];
+        rows.extend(
+            unchanged
+                .iter()
+                .map(|(id, snapshot)| (*id, "mr", *snapshot, 1_i64)),
+        );
+        for (id, mr, lane_snapshot, created_at) in rows {
+            db.execute(
+                "INSERT INTO pr_resolution_attributions
+                   (id, merge_request_id, action, actor_kind, surface, lane_snapshot, created_at)
+                 VALUES (?1, ?2, 'merge', 'operator-ui', 'operator-ui', ?3, ?4)",
+                params![id, mr, lane_snapshot, created_at],
+            )
+            .await
+            .unwrap();
+        }
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        let stored = |id: &'static str| {
+            let db = &db;
+            async move {
+                db.query_opt_text(
+                    "SELECT lane_snapshot FROM pr_resolution_attributions WHERE id = ?1",
+                    params![id],
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+        let json = |text: String| serde_json::from_str::<serde_json::Value>(&text).unwrap();
+        let relinked = stored("applied").await;
+        assert_eq!(json(relinked.clone()), expected, "{relinked}");
+        assert_eq!(json(stored("other-job").await), other_job_expected);
+        for (id, snapshot) in unchanged {
+            assert_eq!(stored(id).await, snapshot, "{id} was rewritten");
+        }
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'pr_resolution_lane_relinks'",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(0),
+            "the staging table is dropped"
+        );
+
+        // A second run finds every relinked lane already cited.
+        db.execute(
+            "DELETE FROM cairn_schema_migrations WHERE name = ?1",
+            params![RELINK],
+        )
+        .await
+        .unwrap();
+        let relink = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == RELINK)
+            .copied()
+            .unwrap();
+        MigrationRunner::new(vec![relink]).run(&db).await.unwrap();
+        assert_eq!(stored("applied").await, relinked);
+        assert_eq!(json(stored("other-job").await), other_job_expected);
+        for (id, snapshot) in unchanged {
+            assert_eq!(stored(id).await, snapshot);
+        }
+
+        // The relinked citation is what the PR artifact reads its failures through.
+        let attribution = latest_resolution_attribution(&db, "mr")
+            .await
+            .expect("the newest resolution");
+        let rendered = render_resolution_provenance(&attribution, &ProvenanceLinks::default());
+        assert!(
+            rendered.contains(
+                "| rust-tests | failed (timed_out) (120 passed, 3 failed) | `0123456789ab` | cairn://p/p/check-observations/e884003b |"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| lint | passed | `feedfacecafe` | not recorded |"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Failing test (rust-tests): crate::a_failing_test"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Failing test (rust-tests): crate::b_failing_test"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("a_passing_test"), "{rendered}");
+        assert!(!rendered.contains("already-by-id"), "{rendered}");
     }
 }

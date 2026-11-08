@@ -290,3 +290,13 @@ statement = "fdda2e144e643cd7"
 kind = "debt"
 issue = "cairn://p/cairn/6128"
 reason = "The execution listing and its count walk the table."
+
+# SELECT e.id, e.run_id, e.session_id, e.sequence, e.timestamp, e.event_type, e.da
+[[allow]]
+file = "os/cairn-core/src/orchestrator/models_aliases.rs"
+rule = "wide-scan"
+table = "events"
+statement = "cdcc6743c2f18e92"
+kind = "debt"
+issue = "cairn://p/cairn/6390"
+reason = "Latest CLI version discovery pages wide initialization events until one reports a version; returned pages are bounded but historical scanning is not."

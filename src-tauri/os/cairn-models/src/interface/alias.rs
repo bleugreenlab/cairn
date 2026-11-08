@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_offers_annotate_aliases_without_changing_their_names() {
+    fn catalog_groups_observed_aliases_without_changing_their_native_names() {
         let now = chrono::Utc::now().timestamp();
         let claude = provider("claude", vec![observation("opus", "claude-opus-4-6", now)]);
         let models = Catalog {
@@ -319,7 +319,7 @@ mod tests {
         .models();
         let opus = models
             .iter()
-            .find(|model| model.catalog_id == "claude/opus")
+            .find(|model| model.catalog_id == "claude-opus-4.6")
             .unwrap();
         assert_eq!(opus.offers[0].model, "opus");
         assert_eq!(opus.offers[0].canonical.as_deref(), Some("claude-opus-4.6"));
@@ -359,6 +359,12 @@ mod tests {
         );
         assert_eq!(claude.canonical("opus"), None);
         assert!(claude.identity_note("opus").unwrap().contains("stale"));
+        assert!(Catalog {
+            providers: vec![claude]
+        }
+        .models()
+        .iter()
+        .any(|model| model.catalog_id == "claude/opus"));
         let missing = provider("claude", vec![]);
         assert_eq!(missing.canonical("opus"), None);
         assert!(missing

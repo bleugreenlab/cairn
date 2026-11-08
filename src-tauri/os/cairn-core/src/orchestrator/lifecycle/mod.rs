@@ -71,7 +71,8 @@ pub use stop::{
     operator_stop_run, stop_active_turn_for_run, stop_agents_for_host_shutdown, stop_call,
     stop_job, stop_session, stop_workflow, suspend_run_for_durable_wait,
     suspend_run_for_durable_wait_after_handoff, suspend_run_for_durable_wait_after_handoff_then,
-    HostShutdownStops, ParkSlots, RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
+    HostShutdownStops, ParkSlots, TerminalPolicy, RUNNER_SHUTDOWN_EXIT_REASON,
+    SUSPEND_HANDOFF_GRACE,
 };
 #[cfg(test)]
 pub(crate) use unanswered_calls::{

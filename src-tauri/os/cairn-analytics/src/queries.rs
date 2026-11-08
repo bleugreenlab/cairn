@@ -822,6 +822,7 @@ pub(crate) struct LocRow {
     pub billable: i64,
     pub lines: i64,
     pub model: Option<String>,
+    pub backend: String,
     pub node_name: Option<String>,
     #[cfg(test)]
     pub usage: TieredUsage,
@@ -847,6 +848,7 @@ fn loc_row(row: &impl RowExt) -> DbResult<LocRow> {
         #[cfg(test)]
         exact_cost_count: row.i64(15)?,
         unmetered_usage: usage_at(row, 16)?,
+        backend: row.text(24)?,
     })
 }
 
@@ -870,7 +872,8 @@ pub(crate) async fn tokens_per_loc(
                    {usage},
                    {unmetered_usage},
                    MAX(tr.model) AS model,
-                   MAX(tr.node_name) AS node_name
+                   MAX(tr.node_name) AS node_name,
+                   MAX(tr.backend) AS backend
             FROM token_rollup tr
             WHERE tr.job_id IS NOT NULL AND tr.token_event_count > 0
               AND (?1 IS NULL OR tr.project_id = ?1)
@@ -903,7 +906,8 @@ pub(crate) async fn tokens_per_loc(
                {usage_cols},
                COALESCE(jc.exact_cost, 0.0),
                COALESCE(jc.exact_cost_count, 0),
-               {unmetered_usage_cols}
+               {unmetered_usage_cols},
+               jt.backend
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
         LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
@@ -950,7 +954,8 @@ pub(crate) async fn tokens_per_loc_live(
                    {usage},
                    {unmetered_usage},
                    MAX(te.model) AS model,
-                   MAX(te.node_name) AS node_name
+                   MAX(te.node_name) AS node_name,
+                   MAX(te.backend) AS backend
             FROM token_events te
             WHERE te.job_id IS NOT NULL
               AND (?1 IS NULL OR te.project_id = ?1)
@@ -975,7 +980,8 @@ pub(crate) async fn tokens_per_loc_live(
                {usage_cols},
                COALESCE(jc.exact_cost, 0.0),
                COALESCE(jc.exact_cost_count, 0),
-               {unmetered_usage_cols}
+               {unmetered_usage_cols},
+               jt.backend
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
         LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
@@ -1389,6 +1395,7 @@ pub(crate) async fn provider_model_components_live(
 #[derive(Debug, Clone)]
 pub(crate) struct GranularRow {
     pub model: Option<String>,
+    pub backend: String,
     pub agent_config_id: Option<String>,
     pub usage: TieredUsage,
     pub unmetered_usage: TieredUsage,
@@ -1416,6 +1423,7 @@ fn granular_row(row: &impl RowExt) -> DbResult<GranularRow> {
         #[cfg(test)]
         exact_cost_count: row.i64(14)?,
         unmetered_usage: usage_at(row, 15)?,
+        backend: row.text(23)?,
     })
 }
 
@@ -1460,7 +1468,8 @@ pub(crate) async fn economics_granular(
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
                COALESCE(cost.exact_count, 0),
-               {unmetered_usage_cols}
+               {unmetered_usage_cols},
+               tok.backend
         FROM tok
         LEFT JOIN cost
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
@@ -1535,7 +1544,8 @@ pub(crate) async fn economics_granular_live(
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
                COALESCE(cost.exact_cost_count, 0),
-               {unmetered_usage_cols}
+               {unmetered_usage_cols},
+               tok.backend
         FROM tok
         LEFT JOIN cost
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
@@ -2326,6 +2336,7 @@ pub(crate) struct ProjectCostComponentRow {
     pub project_id: String,
     pub project_name: String,
     pub model: Option<String>,
+    pub backend: String,
     pub unmetered_usage: TieredUsage,
     pub billable: i64,
     pub exact_cost: f64,
@@ -2361,7 +2372,8 @@ pub(crate) async fn cost_by_project(
                tok.model,
                tok.billable,
                COALESCE(cost.exact_cost, 0.0),
-               {unmetered_usage_cols}
+               {unmetered_usage_cols},
+               tok.backend
         FROM tok
         LEFT JOIN cost
             ON cost.project_id = tok.project_id
@@ -2382,6 +2394,7 @@ pub(crate) async fn cost_by_project(
             billable: row.i64(3)?,
             exact_cost: row.opt_f64(4)?.unwrap_or(0.0),
             unmetered_usage: usage_at(row, 5)?,
+            backend: row.text(13)?,
         })
     })
     .await
@@ -2541,6 +2554,7 @@ const MERGED_PR_LINES_EXPR: &str = "CASE
 #[derive(Debug, Clone)]
 pub(crate) struct MergedPrEconRow {
     pub model: Option<String>,
+    pub backend: String,
     pub agent_config_id: Option<String>,
     pub pr_count: i64,
     pub billable: i64,
@@ -2565,7 +2579,8 @@ pub(crate) async fn merged_pr_economics_rows(
                SUM(jt.billable),
                SUM(jt.exact_cost),
                SUM({lines}),
-               {unmetered_usage}
+               {unmetered_usage},
+               jt.backend
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
             AND mr.status = 'merged' AND mr.merged_at IS NOT NULL
@@ -2586,6 +2601,7 @@ pub(crate) async fn merged_pr_economics_rows(
             exact_cost: row.opt_f64(4)?.unwrap_or(0.0),
             lines: row.opt_i64(5)?.unwrap_or(0),
             unmetered_usage: usage_at(row, 6)?,
+            backend: row.text(14)?,
         })
     })
     .await
@@ -2597,6 +2613,7 @@ pub(crate) async fn merged_pr_economics_rows(
 pub(crate) struct PrCostTrendRow {
     pub bucket_start: i64,
     pub model: Option<String>,
+    pub backend: String,
     pub pr_count: i64,
     pub billable: i64,
     pub exact_cost: f64,
@@ -2620,7 +2637,8 @@ pub(crate) async fn merged_pr_cost_trend_rows(
                SUM(jt.billable),
                SUM(jt.exact_cost),
                SUM({lines}),
-               {unmetered_usage}
+               {unmetered_usage},
+               jt.backend
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
             AND mr.status = 'merged' AND mr.merged_at IS NOT NULL
@@ -2642,6 +2660,7 @@ pub(crate) async fn merged_pr_cost_trend_rows(
             exact_cost: row.opt_f64(4)?.unwrap_or(0.0),
             lines: row.opt_i64(5)?.unwrap_or(0),
             unmetered_usage: usage_at(row, 6)?,
+            backend: row.text(14)?,
         })
     })
     .await

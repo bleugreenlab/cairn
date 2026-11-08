@@ -97,16 +97,13 @@ pub(crate) async fn rebase_authority(
     else {
         return None;
     };
-    Some(
-        match catch_up_authority(orch, &project, number, exec_seq, &node_id, payload).await {
-            Ok(authority) => Prepared::Authority(authority),
-            Err(error) => Prepared::Invalid(error),
-        },
-    )
+    Some(catch_up_authority(orch, &project, number, exec_seq, &node_id, payload).await)
 }
 
 /// Prepare and dispatch both derive the request here, so they name the same
-/// one.
+/// one. A branch that can never take the mode is refused here, which
+/// preparation turns into a refusal ahead of any card: no approval is spent on
+/// a request that could not succeed. Any read error fails closed as `Invalid`.
 async fn catch_up_authority(
     orch: &Orchestrator,
     project: &str,
@@ -114,25 +111,37 @@ async fn catch_up_authority(
     exec_seq: i32,
     node_id: &str,
     payload: &serde_json::Value,
-) -> Result<cairn_common::authorization::AuthorityRequest, String> {
-    let setting = parse_catch_up_setting(payload)?;
-    let db = orch.db.for_project(project).await;
-    let rows =
-        crate::resources::NodeRebaseRows::read(&db, project, number, exec_seq, node_id).await?;
-    let branch = rows
-        .branch
-        .clone()
-        .ok_or_else(|| "This node has no branch to set a catch-up mode on.".to_string())?;
-    let project_id = rows
-        .project_id()
-        .ok_or_else(|| "this node's project could not be read".to_string())?;
-    Ok(crate::authorization::normalize::branch_catch_up_request(
-        project_id,
-        &branch,
-        &setting.mode,
-        &setting.review_paths,
-        setting.reviewed_through.as_deref(),
-    ))
+) -> Prepared {
+    let prepared = async {
+        let setting = parse_catch_up_setting(payload)?;
+        let db = orch.db.for_project(project).await;
+        let rows =
+            crate::resources::NodeRebaseRows::read(&db, project, number, exec_seq, node_id).await?;
+        let branch = rows
+            .branch
+            .clone()
+            .ok_or_else(|| "This node has no branch to set a catch-up mode on.".to_string())?;
+        let project_id = rows
+            .project_id()
+            .ok_or_else(|| "this node's project could not be read".to_string())?;
+        if branch == project_default_branch(&db, project_id).await? {
+            return Ok(Prepared::Refused(format!(
+                "Refused: `{branch}` is the project's default branch, which never catches up with \
+                 anything. Nothing changed."
+            )));
+        }
+        Ok::<_, String>(Prepared::Authority(
+            crate::authorization::normalize::branch_catch_up_request(
+                project_id,
+                &branch,
+                &setting.mode,
+                &setting.review_paths,
+                setting.reviewed_through.as_deref(),
+            ),
+        ))
+    }
+    .await;
+    prepared.unwrap_or_else(Prepared::Invalid)
 }
 
 /// Who is writing: the run's node home, or `operator` for a write no run makes.
@@ -210,34 +219,22 @@ async fn set_catch_up_mode(
     dry_run: bool,
 ) -> Result<String, String> {
     let setting = parse_catch_up_setting(payload)?;
+    // Branches cut from this one are unaffected by its mode, finished or live:
+    // every consumer keys on the merge-mode bookmark itself, and a child is
+    // reconciled under its own name, so it still rebases onto this branch's
+    // tip, merge commit or not.
+    let (project, number, exec_seq, node_id) = resource;
+    let authority =
+        match catch_up_authority(orch, project, number, exec_seq, node_id, payload).await {
+            Prepared::Authority(authority) => authority,
+            Prepared::Invalid(error) | Prepared::Refused(error) => return Err(error),
+        };
     let project_id = rows
         .project_id()
         .ok_or_else(|| "this node's project could not be read".to_string())?
         .to_string();
     let store = rows.store_path(orch).await?;
     let default_branch = project_default_branch(db, &project_id).await?;
-    if branch == default_branch {
-        return Err(format!(
-            "Refused: `{branch}` is the project's default branch, which never catches up with \
-             anything. Nothing changed."
-        ));
-    }
-    if db
-        .query_opt_text(
-            "SELECT id FROM jobs WHERE project_id = ?1 AND base_branch = ?2 AND id != ?3 LIMIT 1",
-            (project_id.clone(), branch.to_string(), rows.job_id.clone()),
-        )
-        .await
-        .map_err(|error| error.to_string())?
-        .is_some()
-    {
-        return Err(format!(
-            "Refused: `{branch}` is an integration branch other work is cut from; the catch-up \
-             mode applies only to a branch nothing else is based on. Nothing changed."
-        ));
-    }
-    let (project, number, exec_seq, node_id) = resource;
-    let authority = catch_up_authority(orch, project, number, exec_seq, node_id, payload).await?;
     if dry_run {
         return Ok(format!("Would {}", authority.summary));
     }
@@ -1164,6 +1161,149 @@ mod tests {
             local.store_path(&orch).await.unwrap(),
             crate::jj::project_store_dir(root.path(), std::path::Path::new("/local/repository"))
         );
+    }
+
+    async fn catch_up_fixture(name: &str) -> (Arc<crate::storage::LocalDb>, Orchestrator) {
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        // `agent/one` is an issue parent: every job ever cut from it is still
+        // in `jobs`, as 4113's 295 finished children are.
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1', 'proj-1', 1, 'Issue', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('exec-1', 'recipe-default', 'issue-1', 'proj-1', 'running', 1, 1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+               VALUES ('job-1', 'exec-1', 'node', 'issue-1', 'proj-1', 'running', 'agent/one', 'main', 'builder', 1, 1);
+             INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+               VALUES ('done', 'exec-1', 'issue-1', 'proj-1', 'complete', 'agent/done', 'agent/one', 'done', 1, 1),
+                      ('gone', 'exec-1', 'issue-1', 'proj-1', 'cancelled', 'agent/gone', 'agent/one', 'gone', 1, 1),
+                      ('broke', 'exec-1', 'issue-1', 'proj-1', 'failed', 'agent/broke', 'agent/one', 'broke', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root,
+        )
+        .build();
+        (db, orch)
+    }
+
+    fn run_less_request() -> McpCallbackRequest {
+        McpCallbackRequest {
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "write".into(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+            answer_bound_ms: None,
+            origin: None,
+        }
+    }
+
+    fn catch_up_item() -> ChangeItem {
+        ChangeItem {
+            target: "cairn://p/proj/1/1/builder/rebase".into(),
+            mode: ChangeMode::Patch,
+            payload: Some(serde_json::json!({"action": "catch-up-mode", "mode": "merge"})),
+        }
+    }
+
+    fn builder_rebase() -> CairnResource {
+        CairnResource::NodeRebase {
+            project: "proj".into(),
+            number: 1,
+            exec_seq: 1,
+            node_id: "builder".into(),
+        }
+    }
+
+    /// 4113's case: a branch other jobs were cut from asks for the mode. It is
+    /// a question for the operator, never a refusal, whether those children
+    /// are long finished or still running.
+    #[tokio::test]
+    async fn catch_up_mode_is_open_to_a_branch_other_work_was_cut_from() {
+        let (db, orch) = catch_up_fixture("catch-up-with-children.db").await;
+        let (request, item, resource) = (run_less_request(), catch_up_item(), builder_rebase());
+
+        for live in [false, true] {
+            if live {
+                db.execute_script(
+                    "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+                       VALUES ('live', 'exec-1', 'issue-1', 'proj-1', 'running', 'agent/live', 'agent/one', 'live', 1, 1);",
+                )
+                .await
+                .unwrap();
+            }
+            match rebase_authority(&orch, &request, &item).await {
+                Some(Prepared::Authority(authority)) => {
+                    assert!(
+                        authority.summary.contains("agent/one"),
+                        "{}",
+                        authority.summary
+                    )
+                }
+                other => {
+                    panic!("preparation names the operator's authority (live={live}): {other:?}")
+                }
+            }
+            let preview = dispatch(&orch, &request, 0, &item, true, &resource)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                preview.starts_with("Would let `agent/one` catch up"),
+                "live={live}: {preview}"
+            );
+        }
+
+        // Accepted still means subject to authority: with no run to ask for it,
+        // nothing is set.
+        let error = dispatch(&orch, &request, 0, &item, false, &resource)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("catch-up mode is the operator's to approve"),
+            "{error:?}"
+        );
+        assert!(crate::orchestrator::catch_up::mode_for(
+            &db,
+            "proj-1",
+            &crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new("/repo")),
+            "agent/one"
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    /// The default branch can never take the mode, so it is refused while the
+    /// batch is prepared, before any approval card could be raised for it.
+    #[tokio::test]
+    async fn catch_up_mode_refuses_the_default_branch_before_any_card() {
+        let (db, orch) = catch_up_fixture("catch-up-default.db").await;
+        db.execute_script("UPDATE jobs SET branch = 'main' WHERE id = 'job-1';")
+            .await
+            .unwrap();
+        let (request, item, resource) = (run_less_request(), catch_up_item(), builder_rebase());
+        match rebase_authority(&orch, &request, &item).await {
+            Some(Prepared::Refused(reason)) => {
+                assert!(reason.contains("default branch"), "{reason}")
+            }
+            other => panic!("the default branch is refused in preparation: {other:?}"),
+        }
+        let error = dispatch(&orch, &request, 0, &item, true, &resource)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("default branch"), "{error:?}");
     }
 
     /// The 10-29 holder (cairn/5502): a replay request whose store lock is

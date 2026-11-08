@@ -150,7 +150,12 @@ pub async fn model_role_economics(
     for row in &rows {
         // Metered providers without list prices still contribute their exact
         // costs; list prices cover only rows without an exact settlement.
-        let cost = exact_or_priced(row.model.as_deref(), &row.unmetered_usage, row.exact_cost);
+        let cost = exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            &row.unmetered_usage,
+            row.exact_cost,
+        );
         let model_key = row
             .model
             .clone()
@@ -191,7 +196,12 @@ pub async fn merged_pr_economics(
     let mut by_model: HashMap<String, PrAcc> = HashMap::new();
     let mut by_role: HashMap<String, PrAcc> = HashMap::new();
     for row in &rows {
-        let cost = exact_or_priced(row.model.as_deref(), &row.unmetered_usage, row.exact_cost);
+        let cost = exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            &row.unmetered_usage,
+            row.exact_cost,
+        );
         let model_key = row
             .model
             .clone()
@@ -224,7 +234,12 @@ pub async fn merged_pr_cost_trend(
     // (pr_count, cost, billable, lines) accumulated per bucket.
     let mut buckets: HashMap<i64, (i64, f64, i64, i64)> = HashMap::new();
     for row in &rows {
-        let cost = exact_or_priced(row.model.as_deref(), &row.unmetered_usage, row.exact_cost);
+        let cost = exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            &row.unmetered_usage,
+            row.exact_cost,
+        );
         let e = buckets.entry(row.bucket_start).or_insert((0, 0.0, 0, 0));
         e.0 += row.pr_count;
         e.1 += cost;

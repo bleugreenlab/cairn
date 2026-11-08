@@ -90,7 +90,12 @@ async fn seed(db: &LocalDb) {
         Box::pin(async move {
             conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
             conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','csl','/tmp/p',1,1)", ()).await?;
-            conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+            // Thread `lead` filed the issue, so it is the gate owner that may
+            // confirm the worker's terminal output.
+            conn.execute("INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at) VALUES ('thread-lead','p-1','lead','active','none',1,1)", ()).await?;
+            conn.execute("INSERT INTO jobs (id, project_id, thread_id, node_name, status, uri_segment, created_at, updated_at) VALUES ('job-lead','p-1','thread-lead','Thread','running','thread',1,1)", ()).await?;
+            conn.execute("INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('run-lead','p-1','job-lead','live',1,1)", ()).await?;
+            conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, parent_thread_id, parent_job_id, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none','thread-lead','job-lead',1,1)", ()).await?;
             conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('exec-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot.as_str(),)).await?;
             conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-worker','exec-1',?1,'i-1','p-1','running','worker','worker',1,1)", (worker_id.as_str(),)).await?;
             conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-1','job-worker','codex','open',1,1,1)", ()).await?;
@@ -201,10 +206,12 @@ async fn ctx_self_living_doc_lifecycle_alongside_terminal_gate() {
     // Terminal present but unconfirmed -> still Blocked.
     assert_eq!(job_status(&db).await, "blocked");
 
-    // Confirm the gate (the reserved `confirmed` key on a patch).
-    let rc = common::change_resource(
+    // The filing thread confirms the gate (the reserved `confirmed` key on a
+    // patch).
+    let rc = common::change_resource_as_run(
         &orch,
         write_to(summary_uri, "patch", json!({"confirmed": true})),
+        Some("run-lead"),
     )
     .await;
     assert!(

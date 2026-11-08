@@ -694,8 +694,13 @@ async fn killing_a_pooled_run_releases_its_thread_and_spares_the_server() {
         .unwrap()
         .register("run-pooled".into(), handle);
 
-    crate::orchestrator::lifecycle::kill_session_with_reason(&orch, "run-pooled", "user_stopped")
-        .unwrap();
+    crate::orchestrator::lifecycle::kill_session_with_reason(
+        &orch,
+        "run-pooled",
+        "user_stopped",
+        crate::orchestrator::lifecycle::TerminalPolicy::Finalize,
+    )
+    .unwrap();
     assert!(server.settle_releases(std::time::Duration::from_secs(5)));
 
     let sent: Vec<(String, Value)> = requests

@@ -107,6 +107,7 @@ async fn orchestrator() -> Launched {
         }),
         managed,
         relay: Arc::new(cairn_models::complete::HttpComplete),
+        openrouter_zdr: Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
     };
     Launched {
         orch,
