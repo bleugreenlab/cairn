@@ -476,9 +476,13 @@ pub(super) fn make_room_for_head(orch: &Orchestrator, lane: &str, shortfall: &La
             orch.evict_one_warm_unit(&holders).into_iter().collect()
         }
         // Evicting frees memory or a unit, never a warm-up slot or readiness.
+        // Nor, as far as anything has measured, pipe capacity: no eviction is
+        // credited with relieving the fresh-pipe floor until an experiment
+        // shows idle sessions hold the budget (cairn/6023).
         LaneShortfall::Streams { .. }
         | LaneShortfall::Ramp { .. }
-        | LaneShortfall::StartupRecovery => Vec::new(),
+        | LaneShortfall::StartupRecovery
+        | LaneShortfall::PipeHealth { .. } => Vec::new(),
     };
     if !evicted.is_empty() {
         log::info!(
@@ -736,6 +740,10 @@ pub(crate) fn describe_shortfall(shortfall: &LaneShortfall) -> String {
         LaneShortfall::StartupRecovery => {
             "the host is still finishing startup recovery, and its agent callback gateway refuses calls until it does".to_string()
         }
+        LaneShortfall::PipeHealth { assessment } => format!(
+            "this host refuses new processes, whatever memory is free ({})",
+            assessment.describe()
+        ),
     }
 }
 

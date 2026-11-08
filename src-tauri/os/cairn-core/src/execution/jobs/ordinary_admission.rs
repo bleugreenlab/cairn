@@ -930,6 +930,19 @@ fn dispatch_team_promotion(
                     continue;
                 }
             }
+            // Held before asking the team's authority for a lease, so no grant
+            // is spent on a launch this host cannot start. Retried on the
+            // sampling cadence rather than the backoff: the floor clears on a
+            // reading, not on a retry.
+            if team_request_adds_process(&request) {
+                if let Some(floor) = orch.process_floor_refusal() {
+                    log::debug!("team ordinary admission {request_id} held: {}", floor.describe());
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        cairn_common::pipe_health::SAMPLE_INTERVAL_MS,
+                    ));
+                    continue;
+                }
+            }
             match enqueue_and_promote_team(&orch, request.clone()) {
                 Ok(true) => return,
                 Ok(false) => {}
@@ -943,6 +956,18 @@ fn dispatch_team_promotion(
                 .min(std::time::Duration::from_secs(60));
         }
     });
+}
+
+/// Whether a team launch would add a resident process on this host. An
+/// unreadable claim is read as adding one: the floor fails closed for a
+/// process it cannot rule out.
+fn team_request_adds_process(request: &crate::runtime_admission::EnqueueAdmissionRequest) -> bool {
+    request
+        .resource_claim
+        .get("residentProcessUnits")
+        .or_else(|| request.resource_claim.get("resident_process_units"))
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|units| units > 0)
 }
 
 fn enqueue_and_promote_team(
@@ -1085,6 +1110,7 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
             .then(|| orch.private_lanes.lock_ramp_admission());
         let spawn_window = super::private_lane::boot_ramp_window(orch);
         let budget = super::private_lane::private_lane_budget(orch);
+        let floor = orch.process_floor_refusal();
         let now = chrono::Utc::now().timestamp();
         let decision = run_db(async move {
             crate::storage::lease_next_admission_within(
@@ -1098,6 +1124,7 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
                 budget.memory,
                 spawn_window,
                 crate::storage::MemoryPriority::Interactive,
+                floor.as_ref(),
             )
             .await
             .map_err(|error| error.to_string())
@@ -1337,6 +1364,32 @@ fn start_leased_inner(
     let project_id = launch_state
         .expect("launchable state was checked")
         .project_id;
+    // The last boundary before the spawn: a lease granted on a healthy reading
+    // can arrive here after the fresh-pipe floor engaged. The row goes back to
+    // `queued` under its own generation, the prepared launch stays as it was,
+    // and the next pass records the shortfall and holds it.
+    if let OrdinaryLease::Private(private) = lease {
+        if private.resource_claim.spawns_dedicated_process() {
+            if let Some(floor) = orch.process_floor_refusal() {
+                transition(orch, lease, "leased", "queued")?;
+                orch.private_lanes.record(
+                    WORKSPACE,
+                    &private.resource_lane,
+                    super::private_lane::private_lane_budget(orch),
+                    Some(crate::storage::LaneShortfall::PipeHealth {
+                        assessment: floor.clone(),
+                    }),
+                );
+                log::info!(
+                    "ordinary admission {} returned to the queue before its spawn: {}",
+                    private.request_id,
+                    floor.describe()
+                );
+                drop(launch_guard);
+                return Ok(false);
+            }
+        }
+    }
     transition(orch, lease, "leased", "starting")?;
     let prompt = snapshot.prompt.clone();
     let session_start = match snapshot.session_start {
@@ -3526,6 +3579,7 @@ mod tests {
             None,
             None,
             crate::storage::MemoryPriority::Interactive,
+            None,
         )
         .await
         .unwrap()

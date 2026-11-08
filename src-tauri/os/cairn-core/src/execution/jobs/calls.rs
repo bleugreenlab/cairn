@@ -462,6 +462,7 @@ fn lease_next_call(
     let lane_owned = lane.to_string();
     let owner = call_lease_owner(orch);
     let budget = call_lane_budget(orch, concurrency);
+    let floor = orch.process_floor_refusal();
     let now = budget.measured_at;
     let decision = run_db(async move {
         crate::storage::lease_next_admission_within(
@@ -475,6 +476,7 @@ fn lease_next_call(
             budget.memory,
             None,
             crate::storage::MemoryPriority::YieldsTo(super::private_lane::WORKSPACE),
+            floor.as_ref(),
         )
         .await
         .map_err(|e| e.to_string())
@@ -542,6 +544,22 @@ fn start_leased_call(
             .map_err(|e| e.to_string())
         })
     };
+    // As for an ordinary launch: a lease that lost the race with the
+    // fresh-pipe floor goes back to the queue, never to a failed run.
+    if lease.resource_claim.spawns_dedicated_process() {
+        if let Some(floor) = orch.process_floor_refusal() {
+            if !transition("leased", "queued")? {
+                return Err("runtime admission lease was replaced before call start".into());
+            }
+            orch.private_lanes.record(
+                crate::storage::CALL_ADMISSION_WORKSPACE,
+                &lease.resource_lane,
+                call_lane_budget(orch, None),
+                Some(crate::storage::LaneShortfall::PipeHealth { assessment: floor }),
+            );
+            return Ok(());
+        }
+    }
     if !transition("leased", "starting")? {
         return Err("runtime admission lease was replaced before call start".into());
     }

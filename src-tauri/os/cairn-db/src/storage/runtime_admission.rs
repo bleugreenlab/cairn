@@ -950,6 +950,7 @@ pub async fn lease_next_admission_with_capacity(
             None,
             None,
             MemoryPriority::Interactive,
+            None,
         )
         .await?
         {
@@ -1018,6 +1019,16 @@ pub enum LaneShortfall {
     /// gateway would refuse every call the launch makes. Every queued launch
     /// waits, not only the head.
     StartupRecovery,
+    /// The host's fresh-pipe floor refuses new processes
+    /// ([`cairn_common::pipe_health`]): a new pipe there holds too little for a
+    /// process to start reliably, however much memory is free. Only a launch
+    /// that would add a process waits; one that reuses a resident server
+    /// leases as usual. Kept apart from memory and unit ceilings, which it
+    /// shares nothing with.
+    #[serde(rename_all = "camelCase")]
+    PipeHealth {
+        assessment: cairn_common::pipe_health::PipeHealthAssessment,
+    },
 }
 
 /// The boot ramp's warm-up window, passed by a promoter that bounds how many
@@ -1109,8 +1120,10 @@ pub async fn lease_next_admission_within(
     memory: Option<HostMemoryEnvelope>,
     spawn_window: Option<SpawnWindow>,
     priority: MemoryPriority<'_>,
+    process_floor: Option<&cairn_common::pipe_health::PipeHealthAssessment>,
 ) -> DbResult<LeaseDecision> {
     let (workspace, lane, owner) = (workspace.to_string(), lane.to_string(), owner.to_string());
+    let process_floor = process_floor.filter(|floor| !floor.admits()).cloned();
     let yields_to = match priority {
         MemoryPriority::Interactive => None,
         MemoryPriority::YieldsTo(interactive) => Some(interactive.to_string()),
@@ -1120,7 +1133,7 @@ pub async fn lease_next_admission_within(
         Empty,
         Blocked(String, LaneShortfall, u64),
     }
-    let outcome = db.write(move |conn| { let (workspace,lane,owner,yields_to)=(workspace.clone(),lane.clone(),owner.clone(),yields_to.clone()); Box::pin(async move {
+    let outcome = db.write(move |conn| { let (workspace,lane,owner,yields_to,process_floor)=(workspace.clone(),lane.clone(),owner.clone(),yields_to.clone(),process_floor.clone()); Box::pin(async move {
         conn.execute("INSERT OR IGNORE INTO runtime_admission_cursors(workspace_key,resource_lane) VALUES(?1,?2)", params![workspace.clone(),lane.clone()]).await?;
         let mut cursor = conn.query("SELECT urgent_streak FROM runtime_admission_cursors WHERE workspace_key=?1 AND resource_lane=?2", params![workspace.clone(),lane.clone()]).await?;
         let streak = cursor.next().await?.expect("cursor row").i64(0)?;
@@ -1232,6 +1245,10 @@ pub async fn lease_next_admission_within(
                 Some(LaneShortfall::Units { active: active_process_units, ceiling: capacity.resident_process_units })
             } else if active_stream_units + u64::from(candidate.logical_stream_units) > u64::from(capacity.logical_stream_units) {
                 Some(LaneShortfall::Streams { active: active_stream_units, ceiling: capacity.logical_stream_units })
+            } else if let Some(assessment) = process_floor.as_ref().filter(|_| candidate_process_units > 0) {
+                // Ahead of the empty-lane admission below: the floor binds the
+                // first launch as surely as the tenth.
+                Some(LaneShortfall::PipeHealth { assessment: assessment.clone() })
             } else if candidate_process_units == 0 || (occupied == 0 && yields_to.is_none()) {
                 None
             } else if memory_blocked {
@@ -2550,6 +2567,7 @@ mod tests {
             memory,
             None,
             MemoryPriority::Interactive,
+            None,
         )
         .await
         .unwrap()
@@ -2581,6 +2599,7 @@ mod tests {
             memory,
             None,
             MemoryPriority::YieldsTo(INTERACTIVE),
+            None,
         )
         .await
         .unwrap()
@@ -2598,6 +2617,7 @@ mod tests {
             None,
             Some(SpawnWindow { warming, window: 4 }),
             MemoryPriority::Interactive,
+            None,
         )
         .await
         .unwrap()
@@ -3036,6 +3056,69 @@ mod tests {
         assert!(matches!(
             lease_batch(&db, unbounded(), envelope(1_000 + 1_350 + 450, 1_000)).await,
             LeaseDecision::Leased(request) if request.request_id == "call"
+        ));
+    }
+
+    /// cairn/6023: the fresh-pipe floor holds a launch that would add a
+    /// process, even into an empty lane on a host with a terabyte free, while
+    /// work that adds none still leases. An admitting assessment (a named gap)
+    /// holds nothing.
+    #[tokio::test]
+    async fn the_pipe_floor_holds_process_launches_and_passes_the_rest() {
+        use cairn_common::executor_protocol::Measurement;
+        use cairn_common::pipe_health::{PipeCapacity, PipeHealth, PipeHealthAssessment};
+        let db = crate::storage::migrated_test_db("admission-pipe-floor.db").await;
+        enqueue_admission_request(&db, estimated("spawn", 1, Some(400 * MIB)))
+            .await
+            .unwrap();
+        let mut stream = request("stream", false, 2);
+        stream.resource_claim.resident_process_units = 0;
+        enqueue_admission_request(&db, stream).await.unwrap();
+        let mut health = PipeHealth::new(true);
+        health.observe(Measurement::measured(
+            0,
+            PipeCapacity {
+                accepted_bytes: 512,
+                at_least: false,
+            },
+        ));
+        let degraded = health.assess(0);
+        async fn lease_floored(db: &LocalDb, floor: Option<PipeHealthAssessment>) -> LeaseDecision {
+            lease_next_admission_within(
+                db,
+                "w",
+                "process",
+                "runner",
+                10,
+                300,
+                unbounded(),
+                envelope(1024 * 1024, 1),
+                None,
+                MemoryPriority::Interactive,
+                floor.as_ref(),
+            )
+            .await
+            .unwrap()
+        }
+        let lease = |floor| lease_floored(&db, floor);
+        assert!(matches!(
+            lease(Some(degraded.clone())).await,
+            LeaseDecision::Leased(request) if request.request_id == "stream"
+        ));
+        match lease(Some(degraded.clone())).await {
+            LeaseDecision::Blocked {
+                head_request_id,
+                shortfall: LaneShortfall::PipeHealth { assessment },
+                ..
+            } => {
+                assert_eq!(head_request_id, "spawn");
+                assert_eq!(assessment, degraded);
+            }
+            other => panic!("expected a pipe-health hold, got {other:?}"),
+        }
+        assert!(matches!(
+            lease(Some(PipeHealthAssessment::not_reported("never sampled"))).await,
+            LeaseDecision::Leased(request) if request.request_id == "spawn"
         ));
     }
 

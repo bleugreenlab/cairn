@@ -30,6 +30,7 @@ pub mod maintenance;
 pub mod memory;
 pub mod operator_stop;
 pub mod paths;
+pub mod pipe_health;
 pub mod process_identity;
 pub mod protocol;
 pub mod query;

@@ -117,6 +117,64 @@ pub(crate) fn render_session_admission(
     out
 }
 
+/// A host's fresh-pipe floor as one line (cairn/6023): whether new processes
+/// are admitted there, on what reading, and how it clears. Never part of the
+/// link line, which says only whether the machine is reachable, and never
+/// green without a measurement: an unsampled or unsupported host says why.
+pub(crate) fn pipe_floor_line(
+    assessment: &cairn_common::pipe_health::PipeHealthAssessment,
+) -> String {
+    use cairn_common::pipe_health::{
+        PipeAdmission, DEGRADED_BELOW_BYTES, RECOVERED_AT_BYTES, RECOVERY_SAMPLES,
+    };
+    let headline = match assessment.admission {
+        PipeAdmission::Healthy if assessment.degraded_latch => "admitting",
+        PipeAdmission::Healthy => "admitting (measured)",
+        PipeAdmission::Degraded => "refusing new processes (measured degraded)",
+        PipeAdmission::StaleHold => "refusing new processes (bounded stale hold)",
+        PipeAdmission::Unmeasured => "admitting with a gap (not currently measured)",
+    };
+    let mut line = format!(
+        "- New-work admission (fresh pipes): {headline}. {}",
+        assessment.describe()
+    );
+    if !matches!(assessment.admission, PipeAdmission::Healthy) || assessment.degraded_latch {
+        line.push_str(&format!(
+            ". Degrades below {DEGRADED_BELOW_BYTES} B; recovers after {RECOVERY_SAMPLES} spaced readings of at least {RECOVERED_AT_BYTES} B"
+        ));
+    }
+    if let Some(failure) = &assessment.last_failure {
+        line.push_str(&format!(". Latest attempt failed: {failure}"));
+    }
+    line.push_str(
+        "\n  - Pipe-driven warm reclamation: not enabled; nothing has yet shown that releasing idle sessions recovers pipe capacity (cairn/6023)\n",
+    );
+    line
+}
+
+fn executor_pipe_floor(
+    host: &cairn_common::executor_protocol::HostHealth,
+    captured_at_unix_ms: u64,
+) -> cairn_common::pipe_health::PipeHealthAssessment {
+    match host.pipe_health.as_ref() {
+        Some(evidence) => evidence.assess(captured_at_unix_ms),
+        None => cairn_common::pipe_health::PipeHealthAssessment::not_reported(
+            "this executor posted no fresh-pipe evidence (it may predate the probe)",
+        ),
+    }
+}
+
+/// The runner host's own floor, which gates its agent processes rather than
+/// any executor's work.
+pub(crate) fn render_runner_pipe_floor(
+    assessment: &cairn_common::pipe_health::PipeHealthAssessment,
+) -> String {
+    format!(
+        "\n## Runner host process floor\n\nNew agent processes on this runner's host (sessions, process-backed calls, new Codex app-servers) are admitted against its fresh-pipe capacity, independently of memory.\n\n{}",
+        pipe_floor_line(assessment)
+    )
+}
+
 /// The identity a bootstrap writes into every resident executor.
 ///
 /// Kept at collection scope because it belongs to the runner, not to any one
@@ -429,6 +487,10 @@ pub(crate) fn render_executors(
             }
         }
         out.push_str(&format!("- Link: {}\n", link_summary(executor)));
+        out.push_str(&pipe_floor_line(&executor_pipe_floor(
+            &executor.health.host,
+            executor.captured_at_unix_ms,
+        )));
         if executor.health.role != MachineRole::General {
             out.push_str(&machine_role_line(executor.health.role));
         }
@@ -1513,6 +1575,10 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push('\n');
 
     out.push_str("## Admission\n");
+    out.push_str(&pipe_floor_line(&executor_pipe_floor(
+        &health.host,
+        executor.captured_at_unix_ms,
+    )));
     let admission = &health.admission;
     let reserved = admission.active_reservation.concurrency_units;
     match admission.concurrency_capacity {
@@ -7496,6 +7562,47 @@ mod tests {
         assert!(
             !render_executor(&executor).contains("recovery"),
             "only macOS recovers a denied path out of band"
+        );
+    }
+
+    /// cairn/6023: the detail page names a host's fresh-pipe floor apart from
+    /// its link, never renders an unmeasured host as healthy, and says what
+    /// clears a degraded one.
+    #[test]
+    fn the_detail_page_names_the_fresh_pipe_floor_apart_from_the_link() {
+        use cairn_common::pipe_health::{PipeCapacity, PipeHealth};
+        let mut executor = inspection("local", true);
+        let unmeasured = render_executor(&executor);
+        assert!(
+            unmeasured.contains("New-work admission (fresh pipes): admitting with a gap"),
+            "{unmeasured}"
+        );
+        assert!(unmeasured.contains("posted no fresh-pipe evidence"));
+        assert!(!unmeasured.contains("admitting (measured)"));
+
+        let mut evidence = PipeHealth::new(true);
+        evidence.observe(Measurement::measured(
+            executor.captured_at_unix_ms - 2_000,
+            PipeCapacity {
+                accepted_bytes: 512,
+                at_least: false,
+            },
+        ));
+        executor.health.host.pipe_health = Some(evidence);
+        let degraded = render_executor(&executor);
+        assert!(
+            degraded.contains("refusing new processes (measured degraded)"),
+            "{degraded}"
+        );
+        assert!(
+            degraded.contains("fresh pipe held 512 B 2.0s ago"),
+            "{degraded}"
+        );
+        assert!(degraded.contains("recovers after 2 spaced readings of at least 16384 B"));
+        assert!(degraded.contains("Pipe-driven warm reclamation: not enabled"));
+        assert!(
+            degraded.contains("## Link"),
+            "the link keeps its own section, untouched by pipe health"
         );
     }
 

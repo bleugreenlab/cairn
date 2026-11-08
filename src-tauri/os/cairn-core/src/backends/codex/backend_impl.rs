@@ -852,6 +852,16 @@ fn acquire_pooled_server(
     let server = orch
         .codex_pool
         .ensure(&pool_key, move |server_id| {
+            // Only a new server is refused: `ensure` returns a running one
+            // without calling this, so calls on an existing pool go on. This
+            // is the one gate a provisional pooled call meets, since it starts
+            // without a lease (cairn/6023).
+            if let Some(floor) = orch.process_floor_refusal() {
+                return Err(format!(
+                    "not starting a new Codex app-server: {}",
+                    floor.describe()
+                ));
+            }
             let codex_path = runtime.host.resolve_cli(Cli::Codex).map_err(String::from)?;
             let login = codex_login(orch, &codex_auth, oauth_state.as_ref())?;
             // The home is hardened from a model catalog, which only a refresh

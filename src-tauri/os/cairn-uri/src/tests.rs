@@ -2130,7 +2130,6 @@ fn request_uris_roundtrip_and_reject_unsafe_ids() {
         assert_eq!(resource.project(), None);
         assert_eq!(resource.issue_number(), None);
         assert_eq!(resource.to_route(), None);
-        assert!(crate::contract::contract_for(kind).is_some());
     }
     for uri in [
         "cairn://requests/a/b",

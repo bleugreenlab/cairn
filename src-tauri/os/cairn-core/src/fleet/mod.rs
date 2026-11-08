@@ -5613,6 +5613,25 @@ impl Fleet {
             .map(|entry| entry.generation)
     }
 
+    /// Whether the colocated machine's fresh-pipe floor refuses new processes.
+    fn colocated_pipe_floor_refuses(&self, now_unix_ms: u64) -> bool {
+        self.lock_connections()
+            .values()
+            .find(|entry| entry.colocated)
+            .is_some_and(|entry| !pipe_health_assessment(entry, now_unix_ms).admits())
+    }
+
+    /// One attached machine's fresh-pipe floor, assessed now. `None` when no
+    /// machine with that id is attached.
+    pub fn executor_pipe_health(
+        &self,
+        executor_id: &str,
+    ) -> Option<cairn_common::pipe_health::PipeHealthAssessment> {
+        self.lock_connections()
+            .get(executor_id)
+            .map(|entry| pipe_health_assessment(entry, unix_time_ms()))
+    }
+
     pub fn executor_generation(&self) -> Option<u64> {
         self.lock_connections()
             .values()
@@ -14603,11 +14622,16 @@ impl Fleet {
                 .as_ref()
                 .filter(|evidence| evidence.state == ExecutorSubstrateState::GenerationHeld)
                 .and_then(|evidence| evidence.diagnostic.clone());
-            let transient = colocated.filter(|evidence| {
-                evidence.state != ExecutorSubstrateState::GenerationHeld
-                    && now.saturating_sub(evidence.last_progress_unix_ms)
-                        <= EXECUTOR_PROGRESS_FRESHNESS_MS
-            });
+            // A colocated machine whose pipe floor refuses new processes is not
+            // a transient to wait on: its beat stays fresh while it is unable
+            // to start anything, and untargeted work would sit out its horizon.
+            let transient = colocated
+                .filter(|evidence| {
+                    evidence.state != ExecutorSubstrateState::GenerationHeld
+                        && now.saturating_sub(evidence.last_progress_unix_ms)
+                            <= EXECUTOR_PROGRESS_FRESHNESS_MS
+                })
+                .filter(|_| !self.colocated_pipe_floor_refuses(now));
             let targeted = request.pinned_executor_id.is_some()
                 || request
                     .executor
@@ -16064,6 +16088,13 @@ fn candidate_rejection(
         Some(PlacementRejectionReason::BuildVolumeAbsent {
             path: volume.root.clone(),
         })
+    } else if let Some(reason) = pipe_health_rejection(entry, now_unix_ms) {
+        // Binds every pin, a residency's included, and an explicit name: a
+        // process started there may block forever on its first pipe write, so
+        // a pin is not a safety override. Structural, never waited on, so
+        // pinned work is refused at once with the reading, and movable work
+        // goes to a machine whose pipes are healthy.
+        Some(reason)
     } else if scope
         .avoided_executor_ids
         .iter()
@@ -16163,6 +16194,31 @@ fn candidate_rejection(
     } else {
         None
     }
+}
+
+/// This machine's fresh-pipe floor, assessed against the runner's clock now.
+///
+/// A machine that posted no evidence (an executor that predates the probe, or
+/// one that has not sampled yet) is a named gap and admits; so does every
+/// platform the floor does not apply to. Neither is ever read as healthy.
+fn pipe_health_assessment(
+    entry: &ExecutorConnectionState,
+    now_unix_ms: u64,
+) -> cairn_common::pipe_health::PipeHealthAssessment {
+    match entry.health.host.pipe_health.as_ref() {
+        Some(evidence) => evidence.assess(now_unix_ms),
+        None => cairn_common::pipe_health::PipeHealthAssessment::not_reported(
+            "this executor posted no fresh-pipe evidence",
+        ),
+    }
+}
+
+fn pipe_health_rejection(
+    entry: &ExecutorConnectionState,
+    now_unix_ms: u64,
+) -> Option<PlacementRejectionReason> {
+    let assessment = pipe_health_assessment(entry, now_unix_ms);
+    (!assessment.admits()).then_some(PlacementRejectionReason::PipeDegraded { assessment })
 }
 
 /// Every machine that could structurally take this work, and every one that
@@ -17140,6 +17196,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::UpdatePending => "updatePending",
         PlacementRejectionReason::ModelResident { .. } => "modelResident",
         PlacementRejectionReason::BuildVolumeAbsent { .. } => "buildVolumeAbsent",
+        PlacementRejectionReason::PipeDegraded { .. } => "pipeDegraded",
         PlacementRejectionReason::RoleExcluded { .. } => "roleExcluded",
         PlacementRejectionReason::AvoidedInfrastructure => "avoidedInfrastructure",
         PlacementRejectionReason::Declined { reason, .. } => return format!("declined:{reason:?}"),
@@ -31441,6 +31498,87 @@ mod tests {
                 measurement: MachineMeasurement::Volume,
                 gap: cairn_common::executor_protocol::MeasurementGap::SamplingFailed,
             }
+        );
+    }
+
+    fn pipes_reading(entry: &mut ExecutorConnectionState, at_unix_ms: u64, accepted_bytes: u64) {
+        let health = Arc::make_mut(&mut entry.health);
+        let evidence = health
+            .host
+            .pipe_health
+            .get_or_insert_with(|| cairn_common::pipe_health::PipeHealth::new(true));
+        evidence.observe(Measurement::measured(
+            at_unix_ms,
+            cairn_common::pipe_health::PipeCapacity {
+                accepted_bytes,
+                at_least: false,
+            },
+        ));
+    }
+
+    /// cairn/6023: a machine whose fresh pipes hold 512 B is passed over for
+    /// a healthy one, binds its own pins rather than being waited on, and is
+    /// never held shut by evidence that has outlived the bounded stale hold.
+    #[test]
+    fn a_pipe_degraded_machine_is_passed_over_and_binds_its_pins() {
+        use cairn_common::pipe_health::{FRESH_FOR_MS, STALE_HOLD_MS};
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(
+            &mut local,
+            0.01,
+            48 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured(
+            &mut remote,
+            0.85,
+            8 * 1024 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
+        );
+        assert!(
+            pipe_health_rejection(&local, NOW).is_none(),
+            "no evidence is a named gap that admits"
+        );
+        pipes_reading(&mut local, NOW, 512);
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+
+        let draft = place(&connections, &spillable_request()).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "bglab-ub");
+        let PlacementRejectionReason::PipeDegraded { assessment } =
+            rejection_for(&draft, COLOCATED_EXECUTOR_ID)
+        else {
+            panic!("the degraded machine is rejected for its pipes");
+        };
+        assert_eq!(
+            assessment.capacity.map(|capacity| capacity.accepted_bytes),
+            Some(512)
+        );
+        assert!(!waits_on_machine(&PlacementRejectionReason::PipeDegraded {
+            assessment: assessment.clone()
+        }));
+
+        let mut pinned = spillable_request();
+        pinned.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        pinned.placement_mobility = PlacementMobility::PinnedOrColocated;
+        assert!(matches!(
+            candidate_rejection(
+                &connections[COLOCATED_EXECUTOR_ID],
+                PlacementScope::of(&pinned),
+                NOW
+            ),
+            Some(PlacementRejectionReason::PipeDegraded { .. })
+        ));
+
+        let local = &connections[COLOCATED_EXECUTOR_ID];
+        assert!(matches!(
+            pipe_health_rejection(local, NOW + FRESH_FOR_MS + 1),
+            Some(PlacementRejectionReason::PipeDegraded { assessment })
+                if assessment.admission == cairn_common::pipe_health::PipeAdmission::StaleHold
+        ));
+        assert!(
+            pipe_health_rejection(local, NOW + FRESH_FOR_MS + STALE_HOLD_MS).is_none(),
+            "expired evidence admits with a gap rather than refusing forever"
         );
     }
 

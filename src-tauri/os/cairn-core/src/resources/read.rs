@@ -2394,6 +2394,9 @@ async fn render_resource_body(
                         |executor_id| orch.fleet.executor_name_for_text(executor_id),
                         captured_at,
                     ));
+                    rendered.push_str(&crate::resources::executors::render_runner_pipe_floor(
+                        &orch.process_floor(),
+                    ));
                     let lanes = match orch.private_lane_budgets().await {
                         Ok(sessions) => crate::execution::jobs::call_lane_budgets(orch)
                             .await

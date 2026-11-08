@@ -52,6 +52,7 @@ pub mod models;
 mod models_aliases;
 pub mod object_plane;
 pub mod parent_wake;
+mod pipe_floor;
 pub mod provider_pool;
 pub mod recipes;
 pub mod replay_base;
@@ -839,6 +840,7 @@ impl OrchestratorBuilder {
             host_scratch: Arc::default(),
             relay: Arc::default(),
             private_lanes,
+            pipe_health: cairn_common::pipe_health::PipeHealthMonitor::new(),
             provider_admission_cache,
             agent_memory: Arc::default(),
             startup_readiness: self.startup_readiness,
@@ -1577,6 +1579,9 @@ pub struct Orchestrator {
     /// The last admission decision each private ordinary-session lane made:
     /// the budget it measured and why its queue head waits, if it does.
     pub(crate) private_lanes: Arc<crate::execution::jobs::PrivateLaneLedger>,
+    /// This runner host's fresh-pipe evidence (cairn/6023), the floor every
+    /// process-adding launch here admits against. See `pipe_floor`.
+    pub(crate) pipe_health: cairn_common::pipe_health::PipeHealthMonitor,
     pub(crate) provider_admission_cache: Arc<crate::runtime_admission::ProviderAdmissionCache>,
     /// Live resident memory of every runner-hosted agent process tree,
     /// published by the shared process-tree sampler and read only from cache.
@@ -4195,6 +4200,7 @@ impl Orchestrator {
         self.register_hold_source(crate::config::keychain_read::health_source(
             self.services.emitter.clone(),
         ));
+        self.spawn_pipe_floor();
         tokio::spawn(async move {
             {
                 let orch = orch.clone();

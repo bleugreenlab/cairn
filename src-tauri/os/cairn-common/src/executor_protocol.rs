@@ -5609,6 +5609,22 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6023 does not move the number. It adds an optional `pipeHealth` field
+/// to [`HostHealth`] and to [`MachineSample`]: the executor's fresh-pipe
+/// evidence ([`crate::pipe_health::PipeHealth`]), which the runner assesses
+/// against its own clock and which excludes a macOS host whose fresh pipes hold
+/// under 4 KiB from new work. The executor's own refusals reuse existing codes:
+/// an offer declines as `pressure` with the assessment as its detail, a grant
+/// rechecked before any slot is leased ends as `slotUnhealthy` (nothing ran,
+/// so the runner re-places it), and a new resident process fails with the
+/// `admission` residency failure. No variant is added to an enum either peer
+/// decodes, and [`PlacementRejectionReason::PipeDegraded`] is the runner's own
+/// placement vocabulary, which no executor reads. What a runner gets wrong
+/// talking to an older executor: nothing; the field is absent, and the runner
+/// admits that machine under a named not-measured gap, never as zero or
+/// healthy. An older runner ignores the field, and the executor enforces its
+/// own floor whether or not the runner reads it.
+///
 /// cairn/5991 does not move the number. It removes the
 /// `cairn://executors/<name>/<verb>` address from the shared URI grammar and
 /// the run contract's host-clamped item list, and desktop automation becomes
@@ -13693,6 +13709,11 @@ pub struct HostHealth {
     /// a positive claim: the reader works and found no RDMA device.
     #[serde(default)]
     pub interconnects: Measurement<Vec<Interconnect>>,
+    /// Fresh-pipe evidence: what a new anonymous pipe on this host holds, and
+    /// the latched admission state over it (cairn/6023). `None` from an
+    /// executor too old to sample it, which the runner reads as not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe_health: Option<crate::pipe_health::PipeHealth>,
 }
 
 /// One RDMA port as the kernel's `infiniband` class describes it, with the
@@ -13792,6 +13813,10 @@ pub struct MachineSample {
     /// decide on it.
     #[serde(default)]
     pub live_usage: Measurement<Vec<LiveUsage>>,
+    /// As [`HostHealth::pipe_health`]. Rides the sample because placement
+    /// decides on it and it must not wait on pool state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe_health: Option<crate::pipe_health::PipeHealth>,
 }
 
 impl MachineSample {
@@ -13808,6 +13833,7 @@ impl MachineSample {
             cpu_admission: report.host.cpu_admission.clone(),
             memory_admission: report.host.memory_admission.clone(),
             live_usage: Measurement::default(),
+            pipe_health: report.host.pipe_health.clone(),
         }
     }
 
@@ -13963,6 +13989,19 @@ impl ExecutorSubstrateReport {
         adopted |= newer(&mut host.io_pressure, &sample.io_pressure);
         adopted |= newer(&mut host.memory_pressure, &sample.memory_pressure);
         adopted |= newer(&mut host.gpus, &sample.gpus);
+        // By the latest attempt's stamp, so a failed refresh still moves the
+        // evidence forward (its named failure is news) without ever re-stamping
+        // the last successful reading.
+        if let Some(candidate) = sample.pipe_health.as_ref() {
+            let take = host.pipe_health.as_ref().is_none_or(|current| {
+                candidate.last_attempt.measured_at_unix_ms
+                    > current.last_attempt.measured_at_unix_ms
+            });
+            if take {
+                host.pipe_health = Some(candidate.clone());
+                adopted = true;
+            }
+        }
         // Instrument by instrument, each by its own stamp. `None` orders before
         // every stamp, so an instrument that has never measured never displaces
         // one that has.
@@ -18193,6 +18232,15 @@ pub enum PlacementRejectionReason {
     /// keeps cells on is not mounted. Filtered rather than offered, the way a
     /// drain is: another machine taking the work records no failure here.
     BuildVolumeAbsent { path: String },
+    /// The machine's fresh pipes are measured degraded, or its measured
+    /// evidence has just expired and is inside the bounded stale hold
+    /// ([`crate::pipe_health`]). Any new process there may block forever on a
+    /// pipe write, so it is filtered for every kind of work, pins and residency
+    /// homes included, and never waited on: work free to move goes elsewhere,
+    /// and work that is not is refused at once by name.
+    PipeDegraded {
+        assessment: crate::pipe_health::PipeHealthAssessment,
+    },
     /// An operator gave this machine a role that does not accept this class of
     /// work. Permanent until an operator changes the role, so it is reported
     /// ahead of anything that could clear on its own, a drain included.
@@ -18333,6 +18381,10 @@ impl PlacementRejectionReason {
                 format!("does not serve project {project_id}")
             }
             Self::NotColocated => "not the runner's colocated executor".into(),
+            Self::PipeDegraded { assessment } => format!(
+                "new processes are held here: {}",
+                assessment.describe()
+            ),
             Self::RepositoryNotTransferable { locator } => {
                 format!("{locator} cannot be materialized from managed objects")
             }
@@ -23080,6 +23132,17 @@ mod tests {
                 measured_at_unix_ms: Some(4),
             },
             logical_cores: Some(10),
+            pipe_health: Some({
+                let mut evidence = crate::pipe_health::PipeHealth::new(true);
+                evidence.observe(Measurement::measured(
+                    7,
+                    crate::pipe_health::PipeCapacity {
+                        accepted_bytes: 512,
+                        at_least: false,
+                    },
+                ));
+                evidence
+            }),
             tokio_worker_count: Some(4),
             tokio_alive_tasks: Some(12),
             tokio_global_queue_depth: Some(0),
@@ -25453,6 +25516,60 @@ mod tests {
             tracked_modifications: None,
             node_scratch: None,
         }
+    }
+
+    /// cairn/6023: pipe evidence is additive. An older executor's frames carry
+    /// none and decode to `None`, which the runner assesses as a named gap; a
+    /// sample adopts newer evidence by its latest attempt and never older.
+    #[test]
+    fn pipe_evidence_is_additive_and_adopted_by_its_latest_attempt() {
+        use crate::pipe_health::{PipeCapacity, PipeHealth};
+        let older: MachineSample = serde_json::from_value(serde_json::json!({
+            "cpu": Measurement::<CpuPressure>::default(),
+            "memory": Measurement::<MachineMemory>::default(),
+            "volume": Measurement::<MachineVolume>::default(),
+        }))
+        .unwrap();
+        assert_eq!(older.pipe_health, None);
+        let host: HostHealth = serde_json::from_value(serde_json::json!({})).unwrap_or_default();
+        assert_eq!(host.pipe_health, None);
+
+        let evidence_at = |at: u64, bytes: u64| {
+            let mut evidence = PipeHealth::new(true);
+            evidence.observe(Measurement::measured(
+                at,
+                PipeCapacity {
+                    accepted_bytes: bytes,
+                    at_least: false,
+                },
+            ));
+            evidence
+        };
+        let mut report = ExecutorSubstrateReport::default();
+        let sample = MachineSample {
+            pipe_health: Some(evidence_at(10, 512)),
+            ..MachineSample::default()
+        };
+        let json = serde_json::to_value(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_value::<MachineSample>(json).unwrap(),
+            sample
+        );
+        assert!(report.adopt_newer_readings(&sample));
+        assert_eq!(report.host.pipe_health, sample.pipe_health);
+        let stale = MachineSample {
+            pipe_health: Some(evidence_at(5, 65_536)),
+            ..MachineSample::default()
+        };
+        report.adopt_newer_readings(&stale);
+        assert_eq!(
+            report.host.pipe_health, sample.pipe_health,
+            "older evidence never displaces newer"
+        );
+        assert_eq!(
+            MachineSample::of_report(&report).pipe_health,
+            sample.pipe_health
+        );
     }
 
     #[test]
