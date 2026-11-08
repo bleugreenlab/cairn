@@ -729,8 +729,15 @@ async fn check_preview(
         title: observation.check_name.clone(),
         status: Some(observation.verdict.clone()),
         line: Some(format!("at commit {commit}")),
-        at: Some(observation.evaluated_at),
+        at: Some(epoch_seconds_from_millis(observation.evaluated_at)),
     })
+}
+
+/// A preview's `at` is epoch seconds, as every other arm's source column is.
+/// Check observations are the exception at the store: their `ran_at`, which an
+/// alias copies as `evaluated_at`, is epoch milliseconds.
+fn epoch_seconds_from_millis(millis: i64) -> i64 {
+    millis.div_euclid(1_000)
 }
 
 fn executor_preview(orch: &Orchestrator, cite: &Cite, name: &str) -> Option<ReferenceEntry> {

@@ -131,26 +131,15 @@ fn agent_file_exists(roots: &LibraryRoots, id: &str, layer: &Origin) -> bool {
         .is_some_and(|dir| dir.join(format!("{id}.md")).exists())
 }
 
-/// The agent a write addresses: the project's own for an explicit project,
-/// else whatever the name resolves to.
+/// The agent a write addresses: the project's own, in force or not, for an
+/// explicit project, else whatever the name resolves to.
 fn addressed_agent(
     roots: &LibraryRoots,
     agent_id: &str,
     explicit_project: Option<&str>,
 ) -> Result<FileAgent, String> {
     let resolved = match (explicit_project, roots.project_origin()) {
-        (Some(_), Some(layer)) => {
-            config_agents::resolve_agent(roots, agent_id).and_then(|resolved| {
-                if resolved.origin == layer {
-                    Ok(resolved)
-                } else {
-                    Err(cairn_config::library::ResolveError::NotFound {
-                        kind: LibraryKind::Agent,
-                        name: agent_id.to_string(),
-                    })
-                }
-            })
-        }
+        (Some(_), Some(layer)) => config_agents::find_agent_in(roots, &layer, agent_id),
         _ => config_agents::resolve_agent(roots, agent_id),
     };
     match resolved {
@@ -210,7 +199,13 @@ pub(super) async fn apply_agent_create(
         Some(project) => build_project_agent_uri(project, &id),
         None => build_agent_uri(&id),
     };
-    Ok(super::created_resource_ack("agent", &id, &agent_uri))
+    Ok(super::library_write_ack(
+        super::created_resource_ack("agent", &id, &agent_uri),
+        &roots,
+        LibraryKind::Agent,
+        &agent.origin,
+        &agent,
+    ))
 }
 
 pub(super) async fn apply_agent_patch(
@@ -237,7 +232,13 @@ pub(super) async fn apply_agent_patch(
         &config_agents::agent_stage_paths(&roots, &path),
         &format!("cairn: update agent {agent_id}"),
     );
-    Ok(format!("Updated agent '{agent_id}'"))
+    Ok(super::library_write_ack(
+        format!("Updated agent '{agent_id}'"),
+        &roots,
+        LibraryKind::Agent,
+        layer.as_ref().unwrap_or(&agent.origin),
+        &agent,
+    ))
 }
 
 pub(super) async fn apply_agent_delete(

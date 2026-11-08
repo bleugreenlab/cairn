@@ -151,7 +151,34 @@ pub(super) async fn apply_skill_create(
         crate::embeddings::resources::skill_embed_text(description),
     );
 
-    Ok(super::created_resource_ack("skill", name, &skill_uri))
+    Ok(super::library_write_ack(
+        super::created_resource_ack("skill", name, &skill_uri),
+        &roots,
+        LibraryKind::Skill,
+        &skill.origin,
+        &skill,
+    ))
+}
+
+/// The skill a write addresses: the project's own, in force or not, for an
+/// explicit project, else whatever the id resolves to. `None` when nothing
+/// defines it there.
+fn addressed_skill(
+    roots: &LibraryRoots,
+    skill_id: &str,
+    explicit_project: Option<&str>,
+) -> Result<Option<FileSkill>, String> {
+    if explicit_project.is_none() {
+        return config_skills::get_skill(roots, skill_id);
+    }
+    let Some(layer) = roots.project_origin() else {
+        return Ok(None);
+    };
+    match config_skills::find_skill_in(roots, &layer, skill_id) {
+        Ok(found) => Ok(Some(found.item)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub(super) async fn apply_skill_patch(
@@ -179,14 +206,9 @@ pub(super) async fn apply_skill_patch(
     }
 
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
-    let mut skill = skills_resources::resolve_skill_for_scope(
-        &orch.config_dir,
-        skill_id,
-        explicit_project.is_some(),
-        project_path.as_deref(),
-    )?
-    .ok_or_else(|| skill_not_found_message(skill_id, explicit_project))?;
     let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
+    let mut skill = addressed_skill(&roots, skill_id, explicit_project)?
+        .ok_or_else(|| skill_not_found_message(skill_id, explicit_project))?;
     let layer = super::write_layer(payload, &roots, explicit_project)?
         .filter(|layer| *layer != skill.origin);
     let project_target = layer
@@ -242,7 +264,13 @@ pub(super) async fn apply_skill_patch(
         crate::embeddings::resources::skill_embed_text(&skill.description),
     );
 
-    Ok(format!("Updated skill '{skill_id}'"))
+    Ok(super::library_write_ack(
+        format!("Updated skill '{skill_id}'"),
+        &roots,
+        LibraryKind::Skill,
+        layer.as_ref().unwrap_or(&skill.origin),
+        &skill,
+    ))
 }
 
 pub(super) async fn apply_skill_delete(
@@ -253,19 +281,13 @@ pub(super) async fn apply_skill_delete(
     explicit_project: Option<&str>,
 ) -> Result<String, String> {
     let project_path = super::scope_project_path(orch, request, explicit_project).await?;
+    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
     // Enforce scope before deleting: an explicit project URI must not delete the
     // shared workspace skill via get_skill/delete_skill's workspace fallthrough.
-    let Some(skill) = skills_resources::resolve_skill_for_scope(
-        &orch.config_dir,
-        skill_id,
-        explicit_project.is_some(),
-        project_path.as_deref(),
-    )?
-    else {
+    let Some(skill) = addressed_skill(&roots, skill_id, explicit_project)? else {
         return Err(skill_not_found_message(skill_id, explicit_project));
     };
     reject_project_skill_write_from_agent(request, skill_id, skill.is_project_scoped())?;
-    let roots = LibraryRoots::at(&orch.config_dir, project_path.as_deref());
     let changed = config_skills::delete_skill(&roots, skill_id, Some(&skill.origin))?
         .ok_or_else(|| skill_not_found_message(skill_id, explicit_project))?;
     crate::config::commit_config_paths(

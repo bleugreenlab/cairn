@@ -26,7 +26,7 @@ mod inference;
 mod inference_generate;
 mod issue;
 mod labels;
-mod library_listing;
+pub(crate) mod library_listing;
 mod memories;
 mod messages;
 pub(crate) mod models;

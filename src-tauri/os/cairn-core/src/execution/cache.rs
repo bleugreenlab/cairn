@@ -3769,7 +3769,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Every statement that addresses one `(project, check, input hash)` lane of
@@ -3936,7 +3936,14 @@ mod tests {
         assert_eq!(rows, vec!["publication-source".to_string()]);
     }
 
-    fn observation(id: &str, commit: &str, environment: &str) -> FreshCheckObservationWrite {
+    /// A complete, reusable `rust` observation in `project-a`, ready for
+    /// [`record_fresh_check_observation`]. Its handle is `id` zero-padded to
+    /// 24 characters.
+    pub(crate) fn observation(
+        id: &str,
+        commit: &str,
+        environment: &str,
+    ) -> FreshCheckObservationWrite {
         let mut observation = FreshCheckObservationWrite {
             manual_handle: None,
             publication_id: None,

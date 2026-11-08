@@ -716,6 +716,59 @@ impl LibraryRoots {
         (!fields.is_empty()).then_some((fields, recorded.is_some()))
     }
 
+    /// The project's trust gate for one of its definitions: refused by name
+    /// while the project is untrusted, and while a trusted project's
+    /// definition carries authority the operator has not confirmed as it
+    /// stands. `item` is `None` for a definition that does not parse, which
+    /// only the trust half applies to. `path` is the definition's file.
+    fn project_gate<T: LibraryItem>(
+        &self,
+        kind: LibraryKind,
+        name: &str,
+        path: &Path,
+        item: Option<&T>,
+    ) -> Result<(), ResolveError> {
+        let Some(project) = &self.project else {
+            return Ok(());
+        };
+        if !project.trust.is_trusted() {
+            return Err(ResolveError::Untrusted {
+                kind,
+                name: name.to_string(),
+                project: project.key.clone(),
+                path: self.project_relative(path),
+            });
+        }
+        if let Some(item) = item {
+            if let Some((fields, previously_confirmed)) = self.unconfirmed_fields(kind, item) {
+                return Err(ResolveError::Unconfirmed {
+                    kind,
+                    name: item.library_id().to_string(),
+                    project: project.key.clone(),
+                    path: self.project_relative(path),
+                    fields,
+                    previously_confirmed,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Why `item`, a definition of `kind` in this project's layer, is not in
+    /// force: the refusal a read of it gives. `None` when it is in force, or
+    /// when the roots have no project. For a writer that just put the
+    /// definition there, so the act itself says what the read would.
+    pub fn not_in_force<T: LibraryItem>(
+        &self,
+        kind: LibraryKind,
+        item: &T,
+    ) -> Option<ResolveError> {
+        let root = self.project.as_ref()?.path.join(PROJECT_CONFIG_DIR);
+        let name = item.library_id();
+        self.project_gate(kind, name, &root.join(kind.item_rel_path(name)), Some(item))
+            .err()
+    }
+
     /// Resolve `name` in one layer only: the project (behind its trust gate,
     /// so an untrusted or unconfirmed definition is refused by name), the
     /// workspace, or one pack. For a caller that asserted where the item
@@ -726,6 +779,31 @@ impl LibraryRoots {
         layer: &Origin,
         name: &str,
         load: impl Fn(&Path, &str, &Origin) -> Option<ConfigResult<T>>,
+    ) -> Result<Resolved<T>, ResolveError> {
+        self.in_layer(kind, layer, name, load, true)
+    }
+
+    /// The definition of `name` in one layer as it stands on disk, in force
+    /// or not: what a write addressed to that layer edits. Nothing that runs
+    /// a definition reads through this; [`Self::resolve_in`] is the gated
+    /// read.
+    pub fn find_in<T: LibraryItem>(
+        &self,
+        kind: LibraryKind,
+        layer: &Origin,
+        name: &str,
+        load: impl Fn(&Path, &str, &Origin) -> Option<ConfigResult<T>>,
+    ) -> Result<Resolved<T>, ResolveError> {
+        self.in_layer(kind, layer, name, load, false)
+    }
+
+    fn in_layer<T: LibraryItem>(
+        &self,
+        kind: LibraryKind,
+        layer: &Origin,
+        name: &str,
+        load: impl Fn(&Path, &str, &Origin) -> Option<ConfigResult<T>>,
+        gated: bool,
     ) -> Result<Resolved<T>, ResolveError> {
         let not_found = || ResolveError::NotFound {
             kind,
@@ -758,34 +836,14 @@ impl LibraryRoots {
                 into(Origin::Workspace, entry)
             }
             Origin::Project { .. } => {
-                let (Some(project), Some(dir), Some(origin)) =
-                    (&self.project, self.project_dir(kind), self.project_origin())
+                let (Some(dir), Some(origin)) = (self.project_dir(kind), self.project_origin())
                 else {
                     return Err(not_found());
                 };
                 let entry = load(&dir, name, &origin).ok_or_else(not_found)?;
-                let path = entry_path(&entry, &dir, kind, name);
-                if !project.trust.is_trusted() {
-                    return Err(ResolveError::Untrusted {
-                        kind,
-                        name: name.to_string(),
-                        project: project.key.clone(),
-                        path: self.project_relative(&path),
-                    });
-                }
-                if let ConfigResult::Ok(item) = &entry {
-                    if let Some((fields, previously_confirmed)) =
-                        self.unconfirmed_fields(kind, item)
-                    {
-                        return Err(ResolveError::Unconfirmed {
-                            kind,
-                            name: item.library_id().to_string(),
-                            project: project.key.clone(),
-                            path: self.project_relative(&path),
-                            fields,
-                            previously_confirmed,
-                        });
-                    }
+                if gated {
+                    let path = entry_path(&entry, &dir, kind, name);
+                    self.project_gate(kind, name, &path, entry_item(&entry))?;
                 }
                 into(origin, entry)
             }
@@ -845,30 +903,16 @@ impl LibraryRoots {
         let mut shadows = Vec::new();
         let mut untrusted: Option<String> = None;
 
-        if let (Some(project), Some(dir)) = (&self.project, self.project_dir(kind)) {
-            let origin = Origin::Project {
-                key: project.key.clone(),
-            };
+        if let (Some(dir), Some(origin)) = (self.project_dir(kind), self.project_origin()) {
             if let Some(entry) = load(&dir, name, &origin) {
                 let path = entry_path(&entry, &dir, kind, name);
-                if !project.trust.is_trusted() {
-                    untrusted = Some(self.project_relative(&path));
-                } else {
-                    if let ConfigResult::Ok(item) = &entry {
-                        if let Some((fields, previously_confirmed)) =
-                            self.unconfirmed_fields(kind, item)
-                        {
-                            return Err(ResolveError::Unconfirmed {
-                                kind,
-                                name: item.library_id().to_string(),
-                                project: project.key.clone(),
-                                path: self.project_relative(&path),
-                                fields,
-                                previously_confirmed,
-                            });
-                        }
-                    }
-                    found = Some((origin, entry));
+                match self.project_gate(kind, name, &path, entry_item(&entry)) {
+                    Ok(()) => found = Some((origin, entry)),
+                    // An untrusted project is skipped: a nearer-first miss
+                    // falls through to the workspace and packs, and is
+                    // refused by name only when nothing else defines it.
+                    Err(ResolveError::Untrusted { path, .. }) => untrusted = Some(path),
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -1053,6 +1097,13 @@ impl LibraryRoots {
             }
         }
         Ok(rows)
+    }
+}
+
+fn entry_item<T>(entry: &ConfigResult<T>) -> Option<&T> {
+    match entry {
+        ConfigResult::Ok(item) => Some(item),
+        ConfigResult::Err { .. } => None,
     }
 }
 

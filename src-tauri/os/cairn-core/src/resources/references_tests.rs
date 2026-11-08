@@ -208,6 +208,37 @@ async fn previews_name_the_issue_node_thread_and_comment_in_one_line() {
     assert_eq!(references.more, 0);
 }
 
+/// A check observation stores `ran_at` in epoch milliseconds, the way the
+/// production writer stamps it, while a preview's `at` is epoch seconds. An
+/// observation written through the cache's own path must preview at the time it
+/// ran, not some fifty-eight thousand years later.
+#[tokio::test]
+async fn a_check_observation_previews_at_the_second_it_ran() {
+    let orch = fixture("references-check.db", &[]).await;
+    let mut observation =
+        crate::execution::cache::tests::observation("obs-preview", "commit-1", "env-a");
+    observation.project_id = "p".into();
+    observation.ran_at = chrono::Utc::now().timestamp_millis();
+    let ran_at_seconds = observation.ran_at / 1_000;
+    let uri = format!(
+        "cairn://p/proj/check-observations/{}",
+        observation.public_handle
+    );
+    crate::execution::cache::record_fresh_check_observation(orch.db.local.clone(), observation)
+        .unwrap();
+
+    let Some(ReferenceEntry::Preview { title, at, .. }) = resolve_reference(&orch, &uri).await
+    else {
+        panic!("{uri} resolves to a preview");
+    };
+    assert_eq!(title, "rust");
+    let at = at.expect("a check observation states when it ran");
+    assert!(
+        (at - ran_at_seconds).abs() <= 2,
+        "previewed at {at}, but the observation ran at {ran_at_seconds} (epoch seconds)"
+    );
+}
+
 #[tokio::test]
 async fn an_unresolvable_uri_gets_no_entry_and_the_cap_counts_the_rest() {
     let orch = fixture("references-caps.db", &[]).await;

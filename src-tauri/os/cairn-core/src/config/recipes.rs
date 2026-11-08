@@ -277,7 +277,7 @@ impl LibraryItem for FileRecipe {
 /// against the directory's entries rather than by joining `id` into a path, so
 /// the filesystem's own case folding never decides which file an id names, and
 /// the resolved file's stem is the recipe's canonical id on every platform.
-fn find_recipe_in(dir: &Path, id: &str) -> Result<Option<PathBuf>, String> {
+fn recipe_file_in(dir: &Path, id: &str) -> Result<Option<PathBuf>, String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(None);
     };
@@ -318,7 +318,7 @@ fn find_recipe_in(dir: &Path, id: &str) -> Result<Option<PathBuf>, String> {
 }
 
 fn load_recipe_in(dir: &Path, id: &str, origin: &Origin) -> Option<ConfigResult<FileRecipe>> {
-    match find_recipe_in(dir, id) {
+    match recipe_file_in(dir, id) {
         Ok(Some(path)) => Some(load_recipe_file(&path, origin.clone())),
         Ok(None) => None,
         Err(error) => Some(ConfigResult::Err {
@@ -440,6 +440,23 @@ pub fn resolve_recipe_in(
     roots.resolve_in(LibraryKind::Recipe, layer, id, load_recipe_in)
 }
 
+/// Recipe `id` in one layer as it stands on disk, in force or not: what a
+/// write addressed to that layer edits (see [`LibraryRoots::find_in`]).
+pub fn find_recipe_in(
+    roots: &LibraryRoots,
+    layer: &Origin,
+    id: &str,
+) -> Result<Resolved<FileRecipe>, ResolveError> {
+    if !is_recipe_id(id) {
+        return Err(ResolveError::Invalid {
+            path: PathBuf::new(),
+            error: recipe_id_refusal(roots, id),
+            origin: None,
+        });
+    }
+    roots.find_in(LibraryKind::Recipe, layer, id, load_recipe_in)
+}
+
 /// The recipe a reference resolves to, `None` when nothing defines it. A
 /// string that is not a recipe id ([`is_recipe_id`]) is refused rather than
 /// looked up, as is a name that does not resolve for any other reason.
@@ -519,7 +536,7 @@ pub fn delete_recipe(
                 let dir = roots
                     .layer_dir(LibraryKind::Recipe, layer)
                     .ok_or_else(|| format!("No {layer} layer to delete recipe `{id}` from"))?;
-                match find_recipe_in(&dir, id)? {
+                match recipe_file_in(&dir, id)? {
                     Some(path) => (layer.clone(), path),
                     None => return Ok(None),
                 }

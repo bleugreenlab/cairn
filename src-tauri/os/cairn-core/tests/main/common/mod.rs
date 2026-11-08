@@ -1207,6 +1207,72 @@ pub async fn project_resource_fixture(
     (temp, db, orch, repo)
 }
 
+fn library_operator() -> cairn_common::identity::PrincipalRef {
+    cairn_common::identity::PrincipalRef::Machine {
+        device_id: "test-desk".to_string(),
+    }
+}
+
+/// Load the resolver's trust registry from the store, as the runner does when
+/// a project is registered, so an untrusted project's layer carries its key.
+pub async fn register_project_library(orch: &Orchestrator) {
+    cairn_core::projects::library_trust::refresh(&orch.db, None)
+        .await
+        .unwrap();
+}
+
+/// The operator trusts the project's library definitions, as Settings →
+/// Project → Library definitions does. Definitions carrying authority still
+/// wait on [`confirm_project_library`].
+pub async fn trust_project_library(orch: &Orchestrator, project_id: &str) {
+    cairn_core::projects::library_trust::trust(
+        &orch.db,
+        &orch.config_dir,
+        project_id,
+        &library_operator(),
+    )
+    .await
+    .unwrap();
+}
+
+/// The operator confirms the authority of every definition the trusted
+/// project holds, as each stands now.
+pub async fn confirm_project_library(orch: &Orchestrator, project_id: &str) {
+    use cairn_core::projects::library_trust::{confirm, status, Confirmation};
+    let current = status(&orch.db, &orch.config_dir, project_id)
+        .await
+        .unwrap();
+    let items: Vec<Confirmation> = current
+        .definitions
+        .into_iter()
+        .filter_map(|definition| {
+            Some(Confirmation {
+                kind: definition.kind,
+                name: definition.name,
+                digest: definition.digest?,
+            })
+        })
+        .collect();
+    confirm(
+        &orch.db,
+        &orch.config_dir,
+        project_id,
+        &items,
+        &library_operator(),
+    )
+    .await
+    .unwrap();
+}
+
+/// The refusal a read of an untrusted project definition gives, which a write
+/// that leaves one behind repeats after `Not in force: `.
+pub fn untrusted_refusal(kind: &str, name: &str, project: &str, path: &str) -> String {
+    format!(
+        "{kind} `{name}` is defined only in project {project} ({path}), which has not been trusted on this install. The operator trusts it in {}.",
+        cairn_core::config::library::TRUST_SETTINGS_PLACE
+    )
+}
+
 pub async fn read_resource(orch: &Orchestrator, uri: impl AsRef<str>) -> String {
     let request = McpCallbackRequest {
         answer_bound_ms: None,

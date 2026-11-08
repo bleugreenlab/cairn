@@ -10,8 +10,9 @@ use crate::common;
 use std::sync::Arc;
 
 use crate::common::{
-    change_resource as change, config_dir, orchestrator, project_resource_fixture,
-    read_resource as read, resource_orchestrator_fixture,
+    change_resource as change, config_dir, confirm_project_library, orchestrator,
+    project_resource_fixture, read_resource as read, register_project_library,
+    resource_orchestrator_fixture, trust_project_library, untrusted_refusal,
 };
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
@@ -101,6 +102,7 @@ async fn recipe_create_rejects_malformed_yaml() {
 #[tokio::test]
 async fn recipe_project_scope_roundtrip_and_guard() {
     let (temp, _db, orch, repo) = project_resource_fixture("proj").await;
+    trust_project_library(&orch, "project-proj").await;
 
     let created = change(
         &orch,
@@ -110,9 +112,11 @@ async fn recipe_project_scope_roundtrip_and_guard() {
     assert!(created.contains("\"applied\""), "create: {created}");
     let file = repo.join(".cairn/recipes/deploy-flow.yaml");
     assert!(file.exists(), "project recipe file should exist");
+    confirm_project_library(&orch, "project-proj").await;
 
     let item = read(&orch, "cairn://p/proj/recipes/deploy-flow").await;
-    assert!(item.contains("[project]"), "read: {item}");
+    assert!(item.contains("Origin: @"), "read: {item}");
+    assert!(item.contains("A deploy recipe"), "read: {item}");
 
     // A workspace-only recipe must not resolve behind an explicit project URI.
     change(
@@ -133,6 +137,65 @@ async fn recipe_project_scope_roundtrip_and_guard() {
         config_dir(&temp).join("recipes/ws-only.yaml").exists(),
         "workspace recipe untouched"
     );
+}
+
+#[tokio::test]
+async fn recipe_project_scope_create_while_untrusted_says_not_in_force() {
+    let (_temp, _db, orch, repo) = project_resource_fixture("proj").await;
+    register_project_library(&orch).await;
+    let not_in_force = format!(
+        "Not in force: {}",
+        untrusted_refusal(
+            "recipe",
+            "deploy-flow",
+            "proj",
+            ".cairn/recipes/deploy-flow.yaml"
+        )
+    );
+
+    let created = change(
+        &orch,
+        json!([{ "target": "cairn://p/proj/recipes", "mode": "create", "payload": { "content": RECIPE_YAML } }]),
+    )
+    .await;
+    assert!(created.contains("\"applied\""), "create: {created}");
+    let file = repo.join(".cairn/recipes/deploy-flow.yaml");
+    assert!(file.exists(), "the untrusted create still writes");
+    assert!(created.contains(&not_in_force), "create: {created}");
+
+    let item = read(&orch, "cairn://p/proj/recipes/deploy-flow").await;
+    assert!(
+        item.contains(&untrusted_refusal(
+            "recipe",
+            "deploy-flow",
+            "proj",
+            ".cairn/recipes/deploy-flow.yaml"
+        )),
+        "read: {item}"
+    );
+    assert!(
+        !item.contains("A deploy recipe"),
+        "read shows no content: {item}"
+    );
+
+    let listing = read(&orch, "cairn://p/proj/recipes").await;
+    let (_, skipped) = listing
+        .split_once("## Not in force")
+        .unwrap_or_else(|| panic!("listing: {listing}"));
+    assert!(
+        skipped.contains("deploy-flow") && skipped.contains("untrusted: skipped"),
+        "listing: {listing}"
+    );
+
+    let patched = change(
+        &orch,
+        json!([{ "target": "cairn://p/proj/recipes/deploy-flow", "mode": "patch", "payload": { "content": RECIPE_YAML_V2 } }]),
+    )
+    .await;
+    assert!(patched.contains("\"applied\""), "patch: {patched}");
+    assert!(patched.contains(&not_in_force), "patch: {patched}");
+    let body = std::fs::read_to_string(&file).unwrap();
+    assert!(body.contains("An UPDATED deploy recipe"), "body: {body}");
 }
 
 // ============================================================================
@@ -245,6 +308,7 @@ async fn agent_project_scope_does_not_bleed_into_workspace() {
 #[tokio::test]
 async fn agent_project_scope_create_read_roundtrip() {
     let (_temp, _db, orch, repo) = project_resource_fixture("proj").await;
+    trust_project_library(&orch, "project-proj").await;
 
     let created = change(
         &orch,
@@ -260,9 +324,95 @@ async fn agent_project_scope_create_read_roundtrip() {
         repo.join(".cairn/agents/builder-helper.md").exists(),
         "project agent file"
     );
+    // Tools are authority: in a trusted project the new agent still waits on
+    // the operator's confirmation, and the create says so.
+    assert!(
+        created.contains("Not in force: ")
+            && created.contains("whose tools the operator has not confirmed"),
+        "create: {created}"
+    );
+    confirm_project_library(&orch, "project-proj").await;
 
     let item = read(&orch, "cairn://p/proj/agents/builder-helper").await;
-    assert!(item.contains("[project]"), "read: {item}");
+    assert!(item.contains("Origin: @"), "read: {item}");
+    assert!(item.contains("- tools: Read"), "read: {item}");
+
+    // Rewording is not authority: the agent stays in force with no note.
+    let reworded = change(
+        &orch,
+        json!([{ "target": "cairn://p/proj/agents/builder-helper", "mode": "patch", "payload": { "prompt": "p, carefully" } }]),
+    )
+    .await;
+    assert!(reworded.contains("\"applied\""), "reword: {reworded}");
+    assert!(!reworded.contains("Not in force"), "reword: {reworded}");
+
+    // Widening a confirmed grant writes, and says the change needs the
+    // operator's re-confirmation before it is used.
+    let widened = change(
+        &orch,
+        json!([{ "target": "cairn://p/proj/agents/builder-helper", "mode": "patch", "payload": { "tools": ["Read", "Bash"] } }]),
+    )
+    .await;
+    assert!(widened.contains("\"applied\""), "widen: {widened}");
+    assert!(
+        widened.contains("Not in force: ")
+            && widened.contains("whose tools changed since the operator confirmed them")
+            && widened.contains(cairn_core::config::library::TRUST_SETTINGS_PLACE),
+        "widen: {widened}"
+    );
+}
+
+#[tokio::test]
+async fn agent_project_scope_create_while_untrusted_says_not_in_force() {
+    let (_temp, _db, orch, repo) = project_resource_fixture("proj").await;
+    register_project_library(&orch).await;
+    let refusal = untrusted_refusal(
+        "agent",
+        "builder-helper",
+        "proj",
+        ".cairn/agents/builder-helper.md",
+    );
+    let not_in_force = format!("Not in force: {refusal}");
+
+    let created = change(
+        &orch,
+        json!([{
+            "target": "cairn://p/proj/agents",
+            "mode": "create",
+            "payload": { "name": "Builder Helper", "description": "proj", "prompt": "Untrusted helper prompt", "tools": ["Read"] }
+        }]),
+    )
+    .await;
+    assert!(created.contains("\"applied\""), "create: {created}");
+    let file = repo.join(".cairn/agents/builder-helper.md");
+    assert!(file.exists(), "the untrusted create still writes");
+    assert!(created.contains(&not_in_force), "create: {created}");
+
+    let item = read(&orch, "cairn://p/proj/agents/builder-helper").await;
+    assert!(item.contains(&refusal), "read: {item}");
+    assert!(
+        !item.contains("Untrusted helper prompt"),
+        "read shows no content: {item}"
+    );
+
+    let listing = read(&orch, "cairn://p/proj/agents").await;
+    let (_, skipped) = listing
+        .split_once("## Not in force")
+        .unwrap_or_else(|| panic!("listing: {listing}"));
+    assert!(
+        skipped.contains("builder-helper") && skipped.contains("untrusted: skipped"),
+        "listing: {listing}"
+    );
+
+    let patched = change(
+        &orch,
+        json!([{ "target": "cairn://p/proj/agents/builder-helper", "mode": "patch", "payload": { "description": "patched while untrusted" } }]),
+    )
+    .await;
+    assert!(patched.contains("\"applied\""), "patch: {patched}");
+    assert!(patched.contains(&not_in_force), "patch: {patched}");
+    let body = std::fs::read_to_string(&file).unwrap();
+    assert!(body.contains("patched while untrusted"), "body: {body}");
 }
 
 // ============================================================================

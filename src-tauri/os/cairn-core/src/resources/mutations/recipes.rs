@@ -27,15 +27,15 @@ fn recipe_file_exists(roots: &LibraryRoots, id: &str, layer: &Origin) -> bool {
         })
 }
 
-/// The recipe a write addresses: the project's own for an explicit project,
-/// else whatever the id resolves to.
+/// The recipe a write addresses: the project's own, in force or not, for an
+/// explicit project, else whatever the id resolves to.
 fn addressed_recipe(
     roots: &LibraryRoots,
     recipe_id: &str,
     explicit_project: Option<&str>,
 ) -> Result<FileRecipe, String> {
     let resolved = match (explicit_project, roots.project_origin()) {
-        (Some(_), Some(layer)) => config_recipes::resolve_recipe_in(roots, &layer, recipe_id),
+        (Some(_), Some(layer)) => config_recipes::find_recipe_in(roots, &layer, recipe_id),
         _ => config_recipes::resolve_recipe(roots, recipe_id),
     };
     match resolved {
@@ -106,7 +106,22 @@ pub(super) async fn apply_recipe_create(
         Some(project) => build_project_recipe_uri(project, &id),
         None => build_recipe_uri(&id),
     };
-    Ok(super::created_resource_ack("recipe", &id, &recipe_uri))
+    Ok(super::library_write_ack(
+        super::created_resource_ack("recipe", &id, &recipe_uri),
+        &roots,
+        LibraryKind::Recipe,
+        &file_recipe.origin,
+        &file_recipe,
+    ))
+}
+
+/// `ack` for a patch that left recipe `id` in `layer`, read back from disk so
+/// a targeted text edit is judged as it was saved.
+fn recipe_patch_ack(ack: String, roots: &LibraryRoots, layer: &Origin, id: &str) -> String {
+    match config_recipes::find_recipe_in(roots, layer, id) {
+        Ok(found) => super::library_write_ack(ack, roots, LibraryKind::Recipe, layer, &found.item),
+        Err(_) => ack,
+    }
 }
 
 /// Patch a recipe. Two forms are accepted:
@@ -173,7 +188,12 @@ pub(super) async fn apply_recipe_patch(
             std::slice::from_ref(&write_path),
             &format!("cairn: edit recipe {recipe_id}"),
         );
-        return Ok(format!("Edited recipe '{recipe_id}'"));
+        return Ok(recipe_patch_ack(
+            format!("Edited recipe '{recipe_id}'"),
+            &roots,
+            &target,
+            &existing.recipe.id,
+        ));
     }
 
     let content = super::payload_str(payload, "content", &[])
@@ -183,14 +203,19 @@ pub(super) async fn apply_recipe_patch(
         )?;
     let recipe_file = parse_and_validate(content)?;
 
-    let mut file_recipe = build_file_recipe(recipe_file, &existing.recipe.id, target);
+    let mut file_recipe = build_file_recipe(recipe_file, &existing.recipe.id, target.clone());
     file_recipe.file_path = write_path;
     let path = config_recipes::save_recipe(&roots, &file_recipe, None)?;
     crate::config::commit_config_paths(
         std::slice::from_ref(&path),
         &format!("cairn: update recipe {recipe_id}"),
     );
-    Ok(format!("Updated recipe '{recipe_id}'"))
+    Ok(recipe_patch_ack(
+        format!("Updated recipe '{recipe_id}'"),
+        &roots,
+        &target,
+        &existing.recipe.id,
+    ))
 }
 
 /// Apply a targeted text replacement to a recipe's on-disk YAML source and

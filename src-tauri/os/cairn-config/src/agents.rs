@@ -244,6 +244,19 @@ pub fn resolve_agent(
     Ok(resolved)
 }
 
+/// Agent `id` in one layer as it stands on disk, in force or not, with the
+/// user's pins applied: what a write addressed to that layer edits (see
+/// [`LibraryRoots::find_in`]).
+pub fn find_agent_in(
+    roots: &LibraryRoots,
+    layer: &Origin,
+    id: &str,
+) -> Result<Resolved<FileAgent>, ResolveError> {
+    let mut found = roots.find_in(LibraryKind::Agent, layer, id, load_agent_in)?;
+    apply_pin(&agent_pins::load_pins(&roots.workspace), &mut found.item);
+    Ok(found)
+}
+
 /// The agent a reference resolves to, `None` when nothing defines it. Any
 /// other failure (untrusted, unconfirmed, a collision) is an error naming why.
 pub fn get_agent(roots: &LibraryRoots, id: &str) -> Result<Option<FileAgent>, String> {

@@ -10,8 +10,10 @@
 //! This module also exposes the small scope-resolution helpers used by the
 //! `write` tool to route skill mutations (create/patch/delete).
 
-use cairn_config::library::LibraryRoots;
+use cairn_config::library::{LibraryKind, LibraryRoots, Listed};
 use std::path::{Path, PathBuf};
+
+use crate::resources::library_listing::{render_collection, Links};
 
 use crate::config::skills::FileSkill;
 use crate::config::{skills as config_skills, ConfigResult};
@@ -180,15 +182,49 @@ fn scope_label(skill: &FileSkill) -> &'static str {
     }
 }
 
-fn skill_link(skill: &FileSkill, project_key: Option<&str>, path: &[String]) -> String {
-    if skill.is_project_scoped() {
-        match project_key {
-            Some(project) => build_project_skill_uri(project, &skill.id, path),
-            None => build_skill_uri(&skill.id, path),
-        }
-    } else {
-        build_skill_uri(&skill.id, path)
-    }
+fn skill_root_uri(id: &str) -> String {
+    build_skill_uri(id, &[])
+}
+
+fn project_skill_root_uri(project: &str, id: &str) -> String {
+    build_project_skill_uri(project, id, &[])
+}
+
+const LINKS: Links = Links {
+    bare: skill_root_uri,
+    project: project_skill_root_uri,
+};
+
+/// The rows a project's contextual-package policy selects, rendered the way
+/// every library collection is: the rows in force with their layer and what
+/// they shadow, then the project definitions that are not in force and why.
+fn render_rows(
+    rows: Vec<Listed<FileSkill>>,
+    project_key: Option<&str>,
+    project_only: bool,
+    policy: &crate::config::contextual_packages::ContextualPackagesConfig,
+) -> String {
+    let rows = rows
+        .into_iter()
+        .filter(|row| match &row.entry {
+            ConfigResult::Ok(skill) => policy.is_selected(
+                crate::config::contextual_packages::ContextualPackageKind::Skill,
+                &row.name,
+                &skill.bundles,
+            ),
+            ConfigResult::Err { .. } => true,
+        })
+        .collect();
+    render_collection(
+        "Skills",
+        "skill",
+        LibraryKind::Skill,
+        rows,
+        project_key,
+        project_only,
+        &LINKS,
+        |skill: &FileSkill| skill.description.clone(),
+    )
 }
 
 /// Render the skills collection (workspace + project, project shadows workspace by id).
@@ -222,56 +258,21 @@ pub(crate) async fn read_skills_collection(
         }
     };
 
-    let skills = match config_skills::list_skills(&LibraryRoots::at(
+    let rows = match config_skills::list_skill_rows(&LibraryRoots::at(
         &orch.config_dir,
         project_path.as_deref(),
     )) {
-        Ok(skills) => skills,
+        Ok(rows) => rows,
         Err(e) => return format!("Error listing skills: {e}"),
     };
-
-    // Project shadows workspace by id; sort by id for deterministic output.
-    let mut by_id: std::collections::BTreeMap<String, FileSkill> =
-        std::collections::BTreeMap::new();
-    for result in skills {
-        if let ConfigResult::Ok(skill) = result {
-            // config_root_subdirs yields project first, so keep the first
-            // occurrence for each id to let project skills shadow workspace.
-            by_id.entry(skill.id.clone()).or_insert(skill);
-        }
-    }
-
     let policy =
         crate::config::contextual_packages::load_contextual_packages(project_path.as_deref());
-    by_id.retain(|id, skill| {
-        policy.is_selected(
-            crate::config::contextual_packages::ContextualPackageKind::Skill,
-            id,
-            &skill.bundles,
-        )
-    });
-
-    let header = match project_key.as_deref() {
-        Some(key) => format!("# Skills — {key} context\n\n"),
-        None => "# Skills — workspace\n\n".to_string(),
-    };
-    let mut out = header;
-    out.push_str(&format!("{} skill(s)\n\n", by_id.len()));
-
-    if by_id.is_empty() {
-        out.push_str("No skills found.\n\n");
-    } else {
-        for skill in by_id.values() {
-            out.push_str(&format!(
-                "- [{}]({}) [{}] — {}\n",
-                skill.id,
-                skill_link(skill, project_key.as_deref(), &[]),
-                scope_label(skill),
-                skill.description,
-            ));
-        }
-        out.push('\n');
-    }
+    let mut out = render_rows(
+        rows,
+        project_key.as_deref(),
+        explicit_project.is_some(),
+        &policy,
+    );
 
     let create_uri = match explicit_project {
         Some(project) => cairn_uri::build_project_skills_uri(project),
@@ -557,30 +558,15 @@ mod tests {
         .unwrap();
     }
 
-    /// Render the collection directly from loaded skills, bypassing run-context
+    /// Render the collection directly from listed rows, bypassing run-context
     /// resolution (which needs a DB). Mirrors `read_skills_collection`'s body.
-    fn render_collection(config_dir: &Path, project_path: Option<&Path>) -> String {
-        let skills =
-            config_skills::list_skills(&LibraryRoots::at(config_dir, project_path)).unwrap();
-        let mut by_id: std::collections::BTreeMap<String, FileSkill> =
-            std::collections::BTreeMap::new();
-        for result in skills {
-            if let ConfigResult::Ok(skill) = result {
-                by_id.entry(skill.id.clone()).or_insert(skill);
-            }
-        }
-
-        let mut out = String::new();
-        for skill in by_id.values() {
-            out.push_str(&format!(
-                "- [{}]({}) [{}] — {}\n",
-                skill.id,
-                skill_link(skill, Some("cairn"), &[]),
-                scope_label(skill),
-                skill.description,
-            ));
-        }
-        out
+    fn render(config_dir: &Path, project_path: Option<&Path>) -> String {
+        render_rows(
+            config_skills::list_skill_rows(&LibraryRoots::at(config_dir, project_path)).unwrap(),
+            Some("cairn"),
+            false,
+            &crate::config::contextual_packages::load_contextual_packages(project_path),
+        )
     }
 
     #[test]
@@ -593,11 +579,31 @@ mod tests {
         write_project_skill(&project_dir, "shared", "Project Version");
         crate::config::trust_for_test(&config_dir, &project_dir, "cairn");
 
-        let rendered = render_collection(&config_dir, Some(&project_dir));
+        let rendered = render(&config_dir, Some(&project_dir));
         // Project version wins and links project-scoped.
         assert!(rendered.contains("cairn://p/cairn/skills/shared"));
-        assert!(rendered.contains("[project] — Project Version"));
+        assert!(
+            rendered.contains("[@, shadows ~] — Project Version"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("Workspace Version"));
+    }
+
+    #[test]
+    fn untrusted_project_skill_is_listed_as_not_in_force() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(config_dir.join("skills")).unwrap();
+        write_project_skill(&project_dir, "helper", "Project helper");
+
+        let rendered = render(&config_dir, Some(&project_dir));
+        let (in_force, skipped) = rendered.split_once("## Not in force").expect(&rendered);
+        assert!(in_force.contains("No skills found."), "{rendered}");
+        assert!(
+            skipped.contains("[@, untrusted: skipped] — Project helper"),
+            "{rendered}"
+        );
     }
 
     #[test]

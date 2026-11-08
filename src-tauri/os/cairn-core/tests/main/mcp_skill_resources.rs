@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use crate::common::{
-    change_resource as change, config_dir, project_resource_fixture, read_resource as read,
-    resource_orchestrator_fixture,
+    change_resource as change, config_dir, confirm_project_library, project_resource_fixture,
+    read_resource as read, register_project_library, resource_orchestrator_fixture,
+    trust_project_library, untrusted_refusal,
 };
 use serde_json::json;
 
@@ -31,7 +32,7 @@ async fn reads_skill_collection_root_and_subpaths() {
     let collection = read(&orch, "cairn://skills").await;
     assert!(collection.contains("testing"), "collection: {collection}");
     assert!(collection.contains("cairn://skills/testing"));
-    assert!(collection.contains("[workspace]"));
+    assert!(collection.contains("[~]"), "collection: {collection}");
 
     // Skill root serves the SKILL.md body inline and links the references dir,
     // but not a SKILL.md sub-resource (it lives here) nor absent scripts/assets.
@@ -228,6 +229,7 @@ async fn explicit_project_mutation_does_not_bleed_into_workspace() {
 #[tokio::test]
 async fn project_scoped_skill_create_read_patch_delete_roundtrip() {
     let (_temp, _db, orch, repo) = project_resource_fixture("proj").await;
+    trust_project_library(&orch, "project-proj").await;
 
     let skill_md = repo.join(".cairn/skills/builder-helper/SKILL.md");
 
@@ -247,6 +249,7 @@ async fn project_scoped_skill_create_read_patch_delete_roundtrip() {
     .await;
     assert!(created.contains("\"applied\""), "create: {created}");
     assert!(skill_md.exists(), "project skill file should exist");
+    confirm_project_library(&orch, "project-proj").await;
 
     // Read it back via the explicit project URI; the body is served inline and
     // package links must be project-scoped (no SKILL.md sub-resource).
@@ -284,4 +287,62 @@ async fn project_scoped_skill_create_read_patch_delete_roundtrip() {
     .await;
     assert!(deleted.contains("\"applied\""), "delete: {deleted}");
     assert!(!skill_md.exists(), "project skill file should be gone");
+}
+
+#[tokio::test]
+async fn project_scoped_skill_create_while_untrusted_says_not_in_force() {
+    let (_temp, _db, orch, repo) = project_resource_fixture("proj").await;
+    register_project_library(&orch).await;
+    let refusal = untrusted_refusal(
+        "skill",
+        "builder-helper",
+        "proj",
+        ".cairn/skills/builder-helper/SKILL.md",
+    );
+    let not_in_force = format!("Not in force: {refusal}");
+    let skill_md = repo.join(".cairn/skills/builder-helper/SKILL.md");
+
+    let created = change(
+        &orch,
+        json!([{
+            "target": "cairn://p/proj/skills",
+            "mode": "create",
+            "payload": {
+                "name": "builder-helper",
+                "description": "Project helper",
+                "prompt": "# Helper\n\n## Body\n\nOriginal."
+            }
+        }]),
+    )
+    .await;
+    assert!(created.contains("\"applied\""), "create: {created}");
+    assert!(skill_md.exists(), "the untrusted create still writes");
+    assert!(created.contains(&not_in_force), "create: {created}");
+
+    let item = read(&orch, "cairn://p/proj/skills/builder-helper").await;
+    assert!(item.contains(&refusal), "read: {item}");
+    assert!(!item.contains("Original."), "read shows no content: {item}");
+
+    let listing = read(&orch, "cairn://p/proj/skills").await;
+    let (_, skipped) = listing
+        .split_once("## Not in force")
+        .unwrap_or_else(|| panic!("listing: {listing}"));
+    assert!(
+        skipped.contains("builder-helper") && skipped.contains("untrusted: skipped"),
+        "listing: {listing}"
+    );
+
+    let patched = change(
+        &orch,
+        json!([{
+            "target": "cairn://p/proj/skills/builder-helper",
+            "mode": "patch",
+            "payload": { "replaceSection": { "heading": "## Body", "content": "Updated." } }
+        }]),
+    )
+    .await;
+    assert!(patched.contains("\"applied\""), "patch: {patched}");
+    assert!(patched.contains(&not_in_force), "patch: {patched}");
+    let body = std::fs::read_to_string(&skill_md).unwrap();
+    assert!(body.contains("Updated."), "body: {body}");
 }

@@ -318,6 +318,18 @@ pub fn resolve_skill_in(
     })
 }
 
+/// Skill `id` in one layer as it stands on disk, in force or not: what a
+/// write addressed to that layer edits (see [`LibraryRoots::find_in`]).
+pub fn find_skill_in(
+    roots: &LibraryRoots,
+    layer: &Origin,
+    id: &str,
+) -> Result<Resolved<FileSkill>, ResolveError> {
+    resolve_with(roots, id, |load| {
+        roots.find_in(LibraryKind::Skill, layer, id, load)
+    })
+}
+
 /// The skill a reference resolves to, `None` when nothing defines it.
 pub fn get_skill(roots: &LibraryRoots, id: &str) -> Result<Option<FileSkill>, String> {
     match resolve_skill(roots, id) {

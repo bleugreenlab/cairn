@@ -148,6 +148,28 @@ pub(super) fn created_resource_ack(kind: &str, id: &str, uri: &str) -> String {
     format!("Created {kind} '{id}' at {uri}")
 }
 
+/// `ack` for a library write that left `item` in `layer`, followed, when the
+/// layer is a project's and the definition is not in force there, by the
+/// refusal a read of it gives: the project is untrusted, or the definition
+/// carries authority the operator has not confirmed as it now stands. The
+/// write is not refused, since anyone with a checkout can write `.cairn/`
+/// directly; the writer is told the truth at the point of the act.
+pub(super) fn library_write_ack<T: cairn_config::library::LibraryItem>(
+    ack: String,
+    roots: &cairn_config::library::LibraryRoots,
+    kind: cairn_config::library::LibraryKind,
+    layer: &cairn_config::library::Origin,
+    item: &T,
+) -> String {
+    if !layer.is_project() {
+        return ack;
+    }
+    match roots.not_in_force(kind, item) {
+        Some(refusal) => format!("{ack}. Not in force: {refusal}"),
+        None => ack,
+    }
+}
+
 async fn scope_project_path(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
