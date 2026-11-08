@@ -151,6 +151,16 @@ kind = "deliberate"
 issue = "cairn://p/cairn/5989"
 reason = "The security inventory reads every row of the table by design."
 
+# DELETE FROM archival_blobs
+[[allow]]
+file = "os/cairn-db/src/storage/events/history_tests.rs"
+rule = "wide-scan"
+table = "archival_blobs"
+statement = "b513421bd3a40932"
+kind = "deliberate"
+issue = "cairn://p/cairn/6203"
+reason = "A test empties its fixture's blob store to prove a packed read needs no blob; only test code defines it."
+
 # SELECT rowid, "id", "job_id", "artifact_type", "schema_version", "data", "versio
 [[allow]]
 file = "os/cairn-db/src/storage/reclaim.rs"

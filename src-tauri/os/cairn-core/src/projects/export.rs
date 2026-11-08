@@ -1739,12 +1739,19 @@ mod tests {
             )]),
         );
 
-        let rowids = db
-            .query_all("SELECT rowid FROM events ORDER BY rowid", (), |row| {
-                row.i64(0)
-            })
-            .await
-            .unwrap();
+        let mut rowids = Vec::new();
+        for run in ["run-1", "run-2"] {
+            rowids.extend(
+                db.query_all(
+                    "SELECT rowid FROM events WHERE run_id = ?1",
+                    vec![Value::Text(run.to_string())],
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        rowids.sort_unstable();
         let plan = export_plan().unwrap();
         let planned = plan.iter().find(|entry| entry.table == "events").unwrap();
         let table = ResolvedTable {

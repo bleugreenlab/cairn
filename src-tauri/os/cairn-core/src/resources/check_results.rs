@@ -484,6 +484,71 @@ fn render_observation(
     .body
 }
 
+/// The plan audit the lane's headline counts, with each non-report-only finding
+/// named by its identity and excerpt. Nothing for a lane that carries no audit.
+fn plan_audit_lines(observation: &CheckResultObservationProjection) -> Vec<String> {
+    let Some(state) = observation.plan_audit_state.as_deref() else {
+        return Vec::new();
+    };
+    let mut lines = vec![
+        String::new(),
+        "## Plan audit".to_string(),
+        String::new(),
+        format!("- State: {state}"),
+    ];
+    if let Some(note) = observation.plan_audit_note.as_deref() {
+        lines.push(format!("- Note: {note}"));
+    }
+    let mut tally: Vec<(&str, usize)> = Vec::new();
+    for finding in &observation.audit_findings {
+        match tally
+            .iter_mut()
+            .find(|(status, _)| *status == finding.status)
+        {
+            Some((_, count)) => *count += 1,
+            None => tally.push((finding.status.as_str(), 1)),
+        }
+    }
+    let mut counts: Vec<String> = tally
+        .iter()
+        .map(|(status, count)| format!("{count} {status}"))
+        .collect();
+    if observation.audit_reported > 0 {
+        counts.push(format!(
+            "{} reported (report-only, not listed)",
+            observation.audit_reported
+        ));
+    }
+    lines.push(format!(
+        "- Findings: {}",
+        if counts.is_empty() {
+            "none".to_string()
+        } else {
+            counts.join(", ")
+        }
+    ));
+    for finding in &observation.audit_findings {
+        lines.push(format!(
+            "- [{}] {} on {} · {} · statement {} · {}",
+            finding.status,
+            finding.rule,
+            finding.table_name,
+            finding.file,
+            finding.statement,
+            finding.issue.as_deref().unwrap_or("no issue")
+        ));
+        if let Some(shape) = finding.known_shape.as_deref() {
+            lines.push(format!("  - Known shape: {shape}"));
+        }
+        if let Some(excerpt) = finding.excerpt.as_deref() {
+            lines.push(String::new());
+            lines.extend(excerpt.lines().map(|line| format!("    {line}")));
+            lines.push(String::new());
+        }
+    }
+    lines
+}
+
 /// An observation as a page of its tests: the observation's facts, then one
 /// line per test on this page, then the retained output tail.
 fn render_observation_page(
@@ -656,6 +721,7 @@ fn render_observation_page(
             body.push(format!("- {label}: {value}"));
         }
     }
+    body.extend(plan_audit_lines(observation));
     let passed = observation
         .tests
         .iter()
@@ -1505,8 +1571,58 @@ mod tests {
             },
             verdict_result: None,
             public_handle: Some("0123456789abcdef01234567".into()),
+            plan_audit_state: None,
+            plan_audit_note: None,
+            audit_findings: Vec::new(),
+            audit_reported: 0,
             test_total: 3,
             test_offset: 0,
+        }
+    }
+
+    #[test]
+    fn the_page_shows_the_plan_audit_the_headline_cites() {
+        let mut observation = cached_observation();
+        assert!(!counts_page(&observation).contains("## Plan audit"));
+        observation.plan_audit_state = Some("evaluated".into());
+        observation.audit_reported = 264;
+        observation.audit_findings = vec![
+            crate::execution::cache::CheckAuditFindingRow {
+                finding_id: "os/a.rs|wide-scan|events|6d4e2243e5f87ddd".into(),
+                status: "failed".into(),
+                rule: "wide-scan".into(),
+                table_name: "events".into(),
+                file: "os/a.rs".into(),
+                statement: "6d4e2243e5f87ddd".into(),
+                issue: None,
+                known_shape: None,
+                excerpt: Some(
+                    "  1 OpenRead 0 38 0 table=events\n  2 Rewind 0 6 0 Rewind table events".into(),
+                ),
+            },
+            crate::execution::cache::CheckAuditFindingRow {
+                finding_id: "os/b.rs|wide-scan|agent_waits|0d49e84f6fbf10d8".into(),
+                status: "allowlisted".into(),
+                rule: "wide-scan".into(),
+                table_name: "agent_waits".into(),
+                file: "os/b.rs".into(),
+                statement: "0d49e84f6fbf10d8".into(),
+                issue: Some("cairn://p/cairn/6126".into()),
+                known_shape: None,
+                excerpt: None,
+            },
+        ];
+        let page = counts_page(&observation);
+        let audit = page.find("## Plan audit").expect("an audit section");
+        assert!(audit < page.find("## Tests").unwrap(), "{page}");
+        for line in [
+            "- State: evaluated",
+            "- Findings: 1 failed, 1 allowlisted, 264 reported (report-only, not listed)",
+            "- [failed] wide-scan on events · os/a.rs · statement 6d4e2243e5f87ddd · no issue",
+            "      2 Rewind 0 6 0 Rewind table events",
+            "- [allowlisted] wide-scan on agent_waits · os/b.rs · statement 0d49e84f6fbf10d8 · cairn://p/cairn/6126",
+        ] {
+            assert!(page.contains(line), "missing {line:?} in {page}");
         }
     }
 

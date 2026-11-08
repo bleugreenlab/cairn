@@ -943,8 +943,7 @@ impl<'db> HistoryReader<'db> {
     ) -> Result<Page, HistoryError> {
         match self.source_of_run(run_id).await? {
             Source::Hot => {
-                let (types, type_binds) = filter.type_clause(4);
-                debug_assert!(types.is_empty() == type_binds.is_empty());
+                let (_, type_binds) = filter.type_clause(4);
                 let mut binds = vec![
                     Value::Text(run_id.to_string()),
                     Value::Integer(after_rowid),
@@ -1651,12 +1650,18 @@ impl<'db> HistoryReader<'db> {
     }
 
     /// Run one hot statement in its own short read and build its rows.
+    ///
+    /// An empty type set matches no row, so it is answered here without a
+    /// statement: Turso plans `+event_type IN ()` as a walk of every event.
     async fn hot_page(
         &self,
         sql: String,
         binds: Vec<Value>,
         filter: EventFilter<'_>,
     ) -> Result<Page, HistoryError> {
+        if filter.event_types.is_some_and(<[_]>::is_empty) {
+            return Ok(HotPage::default().reconstruct(self.db, filter).await);
+        }
         let selected = self.db.query_all(sql, binds, select_hot_row).await?;
         let mut raw = HotPage::default();
         for row in selected {

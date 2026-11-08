@@ -1409,6 +1409,41 @@ async fn filtered_window_applies_types_before_limit_in_sequence_order() {
     }
 }
 
+/// An empty type set reads nothing and costs no statement. Issued, its
+/// `+event_type IN ()` rewinds the whole `events` table.
+#[tokio::test]
+async fn an_empty_type_filter_reads_nothing_and_runs_no_statement() {
+    let db = crate::storage::migrated_test_db("seam-empty-types").await;
+    seed_fixture_execution(&db, "seam-empty-types").await;
+    let none = EventFilter::types(&[]);
+    let mut reader = HistoryReader::new(&db);
+    let before = read_cost(&db);
+    let pages = [
+        reader
+            .run_events_window("run-1", i64::MAX, i64::MIN, 2, none)
+            .await
+            .unwrap(),
+        reader
+            .run_events_page("run-1", i64::MIN, 512, none)
+            .await
+            .unwrap(),
+        reader
+            .run_events_chat_page("run-1", None, 512, none)
+            .await
+            .unwrap(),
+        reader
+            .session_events_page("sess-1", None, i64::MIN, 512, none)
+            .await
+            .unwrap(),
+    ];
+    assert_read_cost(&db, before, (0, 0, 0));
+    for page in pages {
+        assert!(page.rows.is_empty());
+        assert_eq!(page.fetched, 0);
+        assert_eq!(page.last_rowid, None);
+    }
+}
+
 #[tokio::test]
 async fn filtered_window_keeps_the_run_sequence_plan() {
     let db = crate::storage::migrated_test_db("seam-filtered-window-plan").await;

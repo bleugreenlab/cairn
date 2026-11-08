@@ -2278,6 +2278,12 @@ pub(crate) struct CheckResultObservationProjection {
     /// The source observation's permalink handle, so a reused verdict cites the
     /// execution it came from. `None` on rows recorded before handles existed.
     pub public_handle: Option<String>,
+    /// The source observation's plan audit; `None` for a lane that carries none.
+    pub plan_audit_state: Option<String>,
+    pub plan_audit_note: Option<String>,
+    /// Every finding but the report-only ones, which are only counted.
+    pub audit_findings: Vec<CheckAuditFindingRow>,
+    pub audit_reported: usize,
     pub test_total: usize,
     pub test_offset: usize,
 }
@@ -2437,6 +2443,49 @@ fn observation_tests_sql() -> String {
 }
 
 /// Status counts over the whole observation, before any page/name/status filter.
+/// An observation's gating and allowlisted findings, and how many report-only
+/// ones it has.
+async fn observation_audit_findings(
+    conn: &crate::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<(Vec<CheckAuditFindingRow>, usize)> {
+    let mut rows = conn
+        .query(
+            "SELECT finding_id,status,rule,table_name,file,statement,issue,known_shape,excerpt
+               FROM check_audit_findings WHERE observation_id=?1 AND status<>'reported'
+              ORDER BY CASE status WHEN 'failed' THEN 0 WHEN 'stale' THEN 1 ELSE 2 END,
+                       file, statement",
+            params![id],
+        )
+        .await?;
+    let mut findings = Vec::new();
+    while let Some(row) = rows.next().await? {
+        findings.push(CheckAuditFindingRow {
+            finding_id: row.text(0)?,
+            status: row.text(1)?,
+            rule: row.text(2)?,
+            table_name: row.text(3)?,
+            file: row.text(4)?,
+            statement: row.text(5)?,
+            issue: row.opt_text(6)?,
+            known_shape: row.opt_text(7)?,
+            excerpt: row.opt_text(8)?,
+        });
+    }
+    let mut count = conn
+        .query(
+            "SELECT COUNT(*) FROM check_audit_findings
+              WHERE observation_id=?1 AND status='reported'",
+            params![id],
+        )
+        .await?;
+    let reported = match count.next().await? {
+        Some(row) => row.i64(0)? as usize,
+        None => 0,
+    };
+    Ok((findings, reported))
+}
+
 fn observation_test_totals_sql() -> String {
     format!("SELECT status,COUNT(*),COUNT(skip_reason) FROM {OBSERVATION_TEST_OUTCOMES} GROUP BY status")
 }
@@ -3261,7 +3310,8 @@ pub(crate) fn get_check_result_observation(
                             o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                             o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
                             o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count,
-                            {OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,o.public_handle
+                            {OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,o.public_handle,
+                            o.plan_audit_state,o.plan_audit_note
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
                       WHERE a.project_id=?1 AND a.commit_sha=?2 AND a.check_name=?3
@@ -3272,6 +3322,8 @@ pub(crate) fn get_check_result_observation(
                 let observation_id = row.text(4)?;
                 let (phases, execution_warmth, cell_origin, build_jobs) =
                     observation_phases(&row, 40)?;
+                let (audit_findings, audit_reported) =
+                    observation_audit_findings(conn, &observation_id).await?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: row.text(0)?,
                     defined_by_commit_sha: row.opt_text(34)?,
@@ -3300,6 +3352,8 @@ pub(crate) fn get_check_result_observation(
                     persisted_counts: observation_test_totals(conn, &observation_id).await?,
                     verdict_result: compact_result(row.opt_text(53)?),
                     public_handle: row.opt_text(54)?,
+                    plan_audit_state: row.opt_text(55)?, plan_audit_note: row.opt_text(56)?,
+                    audit_findings, audit_reported,
                     test_total: 0, test_offset: offset,
                 };
                 let mut totals = conn.query(
@@ -3331,7 +3385,8 @@ fn observation_by_handle_sql() -> String {
                 o.executor_lease_epoch,o.executor_started_at_unix_ms,
                 o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                 o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
-                o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS},o.verdict_result_json
+                o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,
+                o.plan_audit_state,o.plan_audit_note
            FROM check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
           WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
     )
@@ -3361,6 +3416,8 @@ pub(crate) fn get_check_result_observation_by_handle(
                 let id = row.text(0)?;
                 let (phases, execution_warmth, cell_origin, build_jobs) =
                     observation_phases(&row, 35)?;
+                let (audit_findings, audit_reported) =
+                    observation_audit_findings(conn, &id).await?;
                 let mut projection = CheckResultObservationProjection {
                     disposition: "fresh".into(),
                     defined_by_commit_sha: row.opt_text(30)?,
@@ -3410,6 +3467,10 @@ pub(crate) fn get_check_result_observation_by_handle(
                     persisted_counts: observation_test_totals(conn, &id).await?,
                     verdict_result: compact_result(row.opt_text(48)?),
                     public_handle: Some(keys.1.clone()),
+                    plan_audit_state: row.opt_text(49)?,
+                    plan_audit_note: row.opt_text(50)?,
+                    audit_findings,
+                    audit_reported,
                     test_total: 0,
                     test_offset: 0,
                 };
@@ -4173,8 +4234,41 @@ pub(crate) mod tests {
             known_shape: None,
             excerpt: Some("Rewind; Next".to_string()),
         });
+        write.audit_findings.push(CheckAuditFindingRow {
+            finding_id: "b.rs|range-past-blob|events|bb".to_string(),
+            status: "reported".to_string(),
+            rule: "range-past-blob".to_string(),
+            table_name: "events".to_string(),
+            file: "b.rs".to_string(),
+            statement: "bb".to_string(),
+            issue: None,
+            known_shape: None,
+            excerpt: None,
+        });
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+
+        // The page reads the audit through the projection, not the raw rows.
+        let projection = get_check_result_observation_by_handle(
+            db.clone(),
+            &write.project_id,
+            &write.public_handle,
+        )
+        .unwrap()
+        .expect("the observation is addressable by handle");
+        assert_eq!(
+            projection.plan_audit_state.as_deref(),
+            Some("not-evaluated")
+        );
+        assert_eq!(
+            projection.plan_audit_note.as_deref(),
+            Some("the allowlist did not parse")
+        );
+        assert_eq!(
+            projection.audit_findings,
+            vec![write.audit_findings[0].clone()]
+        );
+        assert_eq!(projection.audit_reported, 1);
 
         let state = db
             .query_opt_i64(
