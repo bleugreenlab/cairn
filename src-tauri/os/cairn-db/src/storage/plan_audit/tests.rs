@@ -48,6 +48,24 @@ async fn audit(
     .unwrap()
 }
 
+#[tokio::test]
+async fn inline_pack_remaining_probe_does_not_walk_wide_history() {
+    let (_temp, db) = private_db().await;
+    let sql = "SELECT execution_id FROM execution_history WHERE pack IS NOT NULL LIMIT ?1";
+    let (listing, classified) = audit(&db, sql, WIDE_ROW_TABLES).await;
+    assert!(
+        !subjects(&classified).contains(&"wide-scan on execution_history".to_string()),
+        "{}",
+        listing.render()
+    );
+    // A missing index must make this witness red, not silently unevaluated.
+    db.execute_batch("DROP INDEX idx_execution_history_inline_pack")
+        .await
+        .unwrap();
+    let (_, before) = audit(&db, sql, WIDE_ROW_TABLES).await;
+    assert!(subjects(&before).contains(&"wide-scan on execution_history".to_string()));
+}
+
 fn subjects(classified: &Classified) -> Vec<String> {
     classified.findings.iter().map(Finding::subject).collect()
 }

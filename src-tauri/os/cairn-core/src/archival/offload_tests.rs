@@ -93,6 +93,81 @@ async fn inline_pack_rows(db: &LocalDb) -> i64 {
     .unwrap()
 }
 
+async fn seed_history_rows(db: &LocalDb, count: usize, inline_every: Option<usize>) {
+    db.write(move |conn| {
+        Box::pin(async move {
+            for n in 0..count {
+                let id = format!("history-{n:05}");
+                conn.execute(
+                    "INSERT INTO executions(id, recipe_id, status, started_at)
+                     VALUES (?1, 'r', 'complete', 1)",
+                    (id.clone(),),
+                )
+                .await?;
+                let pack = if inline_every.is_some_and(|every| n % every == 0) {
+                    // Only the pending probe reads these placeholder bytes.
+                    SqlValue::Blob(vec![1])
+                } else {
+                    SqlValue::Null
+                };
+                conn.execute(
+                    "INSERT INTO execution_history(execution_id, base_sha, tip_sha, pack)
+                     VALUES (?1, 'base', 'tip', ?2)",
+                    (id, pack),
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn remaining_pack_probe_counts_only_pending_rows_and_caps_at_1001() {
+    let db = migrated_test_db("offload-pending-probe.db").await;
+    let sql = "SELECT execution_id FROM execution_history WHERE pack IS NOT NULL LIMIT ?1";
+    assert_eq!(probe(&db, sql).await, Some(0));
+
+    // Three NULL histories between candidates, including beyond the probe cap.
+    seed_history_rows(&db, 4020, Some(4)).await;
+    assert_eq!(inline_pack_rows(&db).await, 1005);
+    assert_eq!(probe(&db, sql).await, Some(1001));
+
+    db.execute(
+        "UPDATE execution_history SET pack = NULL WHERE execution_id < 'history-04008'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inline_pack_rows(&db).await, 3);
+    assert_eq!(probe(&db, sql).await, Some(3));
+
+    for (id, remaining) in [
+        ("history-04008", 2),
+        ("history-04012", 1),
+        ("history-04016", 0),
+    ] {
+        db.execute(
+            "UPDATE execution_history SET pack = NULL WHERE execution_id = ?1",
+            (id,),
+        )
+        .await
+        .unwrap();
+        assert_eq!(probe(&db, sql).await, Some(remaining));
+    }
+    assert_eq!(inline_pack_rows(&db).await, 0);
+    assert_eq!(
+        db.query_one("SELECT COUNT(*) FROM execution_history", (), |row| row
+            .i64(0))
+            .await
+            .unwrap(),
+        4020,
+        "completed histories remain after the pending set drains"
+    );
+}
+
 async fn pack_hash(db: &LocalDb) -> Option<String> {
     db.query_one(
         "SELECT pack_hash FROM execution_history WHERE execution_id = 'exec'",
@@ -163,6 +238,7 @@ async fn archived_fixture(name: &str) -> (Fixture, LocalDb) {
 #[tokio::test]
 async fn offload_moves_inline_packs_and_blobs_and_every_event_reads_the_same() {
     let (_fx, db) = archived_fixture("offload-roundtrip.db").await;
+    seed_history_rows(&db, 128, None).await;
     let expected = snapshot(&db).await;
     assert!(
         expected
@@ -186,6 +262,7 @@ async fn offload_moves_inline_packs_and_blobs_and_every_event_reads_the_same() {
     let report = run_offload_pass(&db, OffloadBudget::PRODUCTION).await;
     assert!(report.error.is_none(), "{report}");
     assert_eq!(report.packs_moved, 1, "{report}");
+    assert_eq!(report.remaining_packs, Some(0), "{report}");
     assert_eq!(report.blobs_moved as i64, legacy_blobs, "{report}");
     assert_eq!(report.packs_uncatalogued, 0, "{report}");
     assert!(report.drained(), "{report}");

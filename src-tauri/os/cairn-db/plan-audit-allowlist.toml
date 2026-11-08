@@ -41,16 +41,6 @@ kind = "debt"
 issue = "cairn://p/cairn/6130"
 reason = "The rollup's needing-fold read walks every event, inside its write transaction on the second run."
 
-# SELECT execution_id FROM execution_history WHERE pack IS NOT NULL LIMIT ?1
-[[allow]]
-file = "os/cairn-core/src/archival/offload.rs"
-rule = "wide-scan"
-table = "execution_history"
-statement = "801eaa8195cd54c5"
-kind = "debt"
-issue = "cairn://p/cairn/6132"
-reason = "The offload pass finds packs by scanning, which steps past more NULL rows as it succeeds."
-
 # SELECT id, job_id, COALESCE(output_name, artifact_type), version, created_at FRO
 [[allow]]
 file = "os/cairn-core/src/embeddings/resources.rs"

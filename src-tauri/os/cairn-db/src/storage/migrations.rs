@@ -5290,6 +5290,168 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inline_pack_index_covers_pending_probe_and_orders_worker() {
+        const PROBE: &str =
+            "SELECT execution_id FROM execution_history WHERE pack IS NOT NULL LIMIT ?1";
+        const WORKER: &str = "SELECT h.execution_id, h.base_sha, h.tip_sha, h.pack, h.pack_idx,
+                (SELECT j.project_id FROM jobs j JOIN projects p ON p.id = j.project_id
+                  WHERE j.execution_id = h.execution_id LIMIT 1),
+                COALESCE(h.repository_id,
+                         (SELECT COALESCE(p.repository_id, p.id) FROM jobs j
+                            JOIN projects p ON p.id = j.project_id
+                           WHERE j.execution_id = h.execution_id LIMIT 1))
+         FROM execution_history h
+         WHERE h.execution_id > ?1 AND h.pack IS NOT NULL
+         ORDER BY h.execution_id LIMIT 1";
+        let db = migrated_db().await.unwrap();
+        let (_team_temp, team) = migrated_team_db().await;
+        for lineage in [&db, &team] {
+            let sql = index_sql(lineage, "idx_execution_history_inline_pack")
+                .await
+                .expect("both lineages index pending inline packs");
+            let normalized = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace(" (", "(");
+            assert!(
+                normalized.contains("ON execution_history(execution_id)"),
+                "{sql}"
+            );
+            assert!(normalized.contains("WHERE pack IS NOT NULL"), "{sql}");
+        }
+
+        // The steady-state index is empty. Dropping it only in this disposable
+        // database supplies a measured before-plan from the same schema/engine.
+        db.execute_batch("DROP INDEX idx_execution_history_inline_pack")
+            .await
+            .unwrap();
+        let before = db
+            .query_all(format!("EXPLAIN QUERY PLAN {PROBE}"), (1001_i64,), |row| {
+                row.text(3)
+            })
+            .await
+            .unwrap();
+        println!("inline pack before EQP: {before:?}");
+        print_inline_pack_bytecode(&db, PROBE).await;
+        assert!(
+            before.iter().any(|step| step == "SCAN execution_history"),
+            "{before:?}"
+        );
+        db.execute_batch(
+            "CREATE INDEX idx_execution_history_inline_pack ON execution_history(execution_id) WHERE pack IS NOT NULL"
+        ).await.unwrap();
+
+        for population in ["empty", "sparse", "cleared"] {
+            match population {
+                "sparse" => {
+                    db.execute_batch(
+                        "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<199)
+                         INSERT INTO executions(id, recipe_id, status, started_at)
+                         SELECT printf('exec-%04d', x), 'r', 'complete', 1 FROM n;
+                         INSERT INTO execution_history(execution_id, base_sha, tip_sha, pack)
+                         SELECT id, 'base', 'tip', CASE WHEN id IN ('exec-0050', 'exec-0150') THEN X'01' ELSE NULL END
+                         FROM executions;"
+                    ).await.unwrap();
+                }
+                "cleared" => {
+                    db.execute_batch("UPDATE execution_history SET pack = NULL")
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+            println!("inline pack population={population}");
+            let probe = db
+                .query_all(format!("EXPLAIN QUERY PLAN {PROBE}"), (1001_i64,), |row| {
+                    row.text(3)
+                })
+                .await
+                .unwrap();
+            println!("inline pack after EQP: {probe:?}");
+            assert!(
+                probe
+                    .iter()
+                    .any(|step| step.contains("idx_execution_history_inline_pack")),
+                "{probe:?}"
+            );
+            let bytecode = print_inline_pack_bytecode(&db, PROBE).await;
+            assert_inline_pack_table_not_walked(&bytecode, true);
+            for cursor in ["", "exec-0100"] {
+                let plan = db
+                    .query_all(format!("EXPLAIN QUERY PLAN {WORKER}"), (cursor,), |row| {
+                        row.text(3)
+                    })
+                    .await
+                    .unwrap();
+                println!("inline pack worker cursor={cursor:?} EQP: {plan:?}");
+                assert!(
+                    plan.iter().any(|step| step
+                        .contains("SEARCH h USING INDEX idx_execution_history_inline_pack")),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|step| step.contains("SORT") || step.contains("TEMP B-TREE")),
+                    "{plan:?}"
+                );
+                let bytecode = print_inline_pack_bytecode(&db, WORKER).await;
+                assert_inline_pack_table_not_walked(&bytecode, false);
+                assert!(
+                    !bytecode
+                        .iter()
+                        .any(|(_, op, _, _)| op.starts_with("Sorter")),
+                    "{bytecode:?}"
+                );
+            }
+        }
+    }
+
+    async fn print_inline_pack_bytecode(
+        db: &LocalDb,
+        sql: &str,
+    ) -> Vec<(i64, String, i64, String)> {
+        let sql = sql.to_string();
+        let listing = db
+            .read(move |conn| {
+                let sql = sql.clone();
+                Box::pin(async move { crate::storage::plan_audit::explain(conn, &sql).await })
+            })
+            .await
+            .unwrap();
+        println!("{}", listing.render());
+        listing
+            .instrs()
+            .map(|row| (row.addr, row.opcode.clone(), row.p1, row.comment.clone()))
+            .collect()
+    }
+
+    fn assert_inline_pack_table_not_walked(rows: &[(i64, String, i64, String)], index_only: bool) {
+        let table_cursors: Vec<_> = rows
+            .iter()
+            .filter(|(_, op, _, comment)| {
+                op == "OpenRead" && comment.contains("table=execution_history,")
+            })
+            .map(|(_, _, p1, _)| *p1)
+            .collect();
+        for (_, opcode, p1, _) in rows {
+            if table_cursors.contains(p1) {
+                assert!(
+                    !["Rewind", "Next", "Prev", "Last"].contains(&opcode.as_str()),
+                    "{rows:?}"
+                );
+                if index_only {
+                    assert!(
+                        !["Column", "ColumnRange"].contains(&opcode.as_str()),
+                        "probe must not fetch history rows: {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Column names of `table`, in declaration order.
     async fn table_columns(db: &LocalDb, table: &str) -> Vec<String> {
         let sql = format!("PRAGMA table_info({table})");
