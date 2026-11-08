@@ -76,25 +76,36 @@ pub(crate) fn discover_catalog_blocking(
     orch: &Orchestrator,
 ) -> (Vec<DiscoveredModel>, Option<String>) {
     let codex = &orch.models_runtime().managed.codex;
-    let discovered =
-        (|| {
-            let Some(installed) = codex.installed() else {
-                return Err(match codex.status() {
+    let discovered = (|| {
+        let Some(installed) = codex.installed() else {
+            return Err(match codex.status() {
                 ManagedToolStatus::Failed(refusal) => refusal,
-                _ => "Cairn is still installing Codex; its models appear once the install finishes."
-                    .to_string(),
+                _ => {
+                    "Cairn is still installing Codex; its models appear once the install finishes."
+                        .to_string()
+                }
             });
-            };
-            let _guard = CODEX_START_LOCK
-                .lock()
-                .map_err(|_| "Codex start lock poisoned".to_string())?;
-            discover_codex_models(
-                &installed.path.to_string_lossy(),
-                &super::cairn_codex_home(),
-                None,
-                &HashMap::new(),
-            )
-        })();
+        };
+        let _guard = CODEX_START_LOCK
+            .lock()
+            .map_err(|_| "Codex start lock poisoned".to_string())?;
+        let auth = orch
+                .get_identity()
+                .and_then(|identity| identity.codex_auth)
+                .ok_or_else(|| "Codex models are not discovered yet. Sign in to Codex or add an OpenAI API key in Settings → Providers.".to_string())?;
+        let (state, _) = codex_oauth_state(orch, &auth)?;
+        let login = codex_login(orch, &auth, state.as_ref())?;
+        let models = discover_codex_models(
+            &installed.path.to_string_lossy(),
+            &super::cairn_codex_home(),
+            login.as_ref(),
+            &HashMap::new(),
+        )?;
+        if models.is_empty() {
+            return Err("Codex models are not discovered yet: the signed-in model/list returned no models. Retry discovery in Settings → Providers.".to_string());
+        }
+        Ok(models)
+    })();
     match discovered {
         Ok(mut models) => {
             // Codex's own listing is its chat models; the image offer is declared

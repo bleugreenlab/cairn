@@ -706,7 +706,8 @@ pub(super) async fn dispatch(
                 let (db, project_id) = project_id(orch, project)
                     .await
                     .map_err(|e| build_failure(index, item, e))?;
-                let thread = crate::threads::crud::create(
+                let thread = crate::threads::crud::create_with_admission(
+                    orch,
                     &db,
                     CreateThread {
                         project_id,

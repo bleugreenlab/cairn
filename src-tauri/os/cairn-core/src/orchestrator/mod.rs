@@ -4312,8 +4312,8 @@ impl Orchestrator {
     }
 
     /// Seed one backend's discovered catalog, for a test outside this module.
-    #[cfg(test)]
-    pub(crate) fn seed_model_catalog_for_test(&self, catalog: ProviderModelCatalog) {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn seed_model_catalog_for_test(&self, catalog: ProviderModelCatalog) {
         self.model_catalog
             .write()
             .unwrap()
@@ -4531,7 +4531,7 @@ impl Orchestrator {
                 Err(error) => (Vec::new(), Some(error)),
             }
         };
-        let mut refreshed_at = Some(chrono::Utc::now().timestamp());
+        let mut refreshed_at = error.is_none().then(|| chrono::Utc::now().timestamp());
         // A failed refresh must not erase the last usable catalog. The error is
         // retained so clients can label these models as stale and offer Retry;
         // the prior successful timestamp remains the truthful age of the data.

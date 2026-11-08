@@ -1739,6 +1739,150 @@ fi"#,
         .to_string()
     }
 
+    /// Discovery must log in even though the Cairn credential store, not the
+    /// isolated CLI home, owns the subscription.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_codex_catalog_follows_sign_in_not_an_ambient_home() {
+        use cairn_models::interface::{ModelScope, Models};
+        use cairn_models::managed::{testing::installed_release, ManagedTool, ManagedTools};
+
+        let mut orch = test_builder()
+            .await
+            .subscriptions(Arc::new(
+                cairn_models::subscription::testing::RenewingCodex::default(),
+            ))
+            .build();
+        let codex = installed_release(
+            &cairn_models::managed::codex::CODEX,
+            &orch.config_dir.join("managed"),
+            r#"logged_in=no
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"account/login/start"'*)
+      case "$line" in
+        *'"chatgptAccountId":"acct-catalog"'*) logged_in=yes ;;
+      esac
+      printf '%s\n' '{"id":3,"result":{}}' ;;
+    *'"method":"model/list"'*)
+      if [ "$logged_in" = yes ] && [ ! -f "$(dirname "$0")/empty-list" ]; then
+        printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-5.6-terra","model":"gpt-5.6-terra","displayName":"Terra"}]}}'
+      else
+        printf '%s\n' '{"id":2,"result":{"data":[]}}'
+      fi ;;
+  esac
+done"#,
+        );
+        let empty_listing = codex
+            .installed()
+            .unwrap()
+            .path
+            .parent()
+            .unwrap()
+            .join("empty-list");
+        orch.models_runtime = super::super::models::ModelRuntime::local(
+            orch.services.process.clone(),
+            ManagedTools {
+                codex: Arc::new(codex),
+                claude: Arc::new(ManagedTool::for_host(
+                    &cairn_models::managed::claude::CLAUDE,
+                )),
+            },
+        );
+        orch.update_settings(crate::models::UpdateSettings {
+            enabled_providers: Some(vec!["claude".into(), "codex".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let before = orch
+            .run_provider_model_catalog_refresh("codex")
+            .await
+            .unwrap();
+        assert!(
+            before.models.is_empty(),
+            "no unauthenticated inventory is offered"
+        );
+        assert!(before.error.is_some());
+        assert_eq!(before.refreshed_at, None, "no successful discovery yet");
+
+        let pending = crate::resources::models::render_catalog(&orch, &[]);
+        assert!(
+            pending.contains("Models: not discovered yet; still discovering"),
+            "{pending}"
+        );
+        let (settled, completed) = std::sync::mpsc::channel();
+        let mut emitter = crate::services::testing::MockEventEmitter::new();
+        emitter.expect_emit().returning(move |event, payload| {
+            if event == "config-changed" && payload["entity_type"] == "model_catalog" {
+                let _ = settled.send(());
+            }
+            Ok(())
+        });
+        orch.services = Arc::new(crate::services::Services {
+            emitter: Arc::new(emitter),
+            ..(*orch.services).clone()
+        });
+        orch.catalog_rediscovery = true;
+        orch.upsert_codex_oauth_account(
+            "Codex".into(),
+            codex_auth_json("acct-catalog", "catalog@example.com", "refresh-fixture"),
+            None,
+            &cairn_models::subscription::SignInTarget::NewOrMatching,
+        )
+        .unwrap();
+        tokio::task::spawn_blocking(move || {
+            completed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("sign-in must schedule and finish catalog rediscovery")
+        })
+        .await
+        .unwrap();
+        let after = orch
+            .get_model_catalog()
+            .into_iter()
+            .find(|catalog| catalog.backend == "codex")
+            .unwrap();
+        assert_eq!(after.error, None);
+        assert!(after.refreshed_at.is_some());
+        assert!(after
+            .models
+            .iter()
+            .any(|model| model.model == "gpt-5.6-terra"));
+        assert!(!after.models.iter().any(|model| model.model == "gpt-5.5"));
+        let catalog = orch.catalog(&ModelScope::workspace()).unwrap();
+        assert!(catalog
+            .providers
+            .iter()
+            .find(|p| p.descriptor.key == "codex")
+            .unwrap()
+            .models
+            .as_ref()
+            .unwrap()
+            .models
+            .iter()
+            .any(|model| model.model == "gpt-5.6-terra"));
+
+        // The same signed-in account returns an empty listing on its next
+        // request. This is an error, not a new, successfully empty inventory.
+        std::fs::write(empty_listing, "").unwrap();
+        let failed = orch
+            .run_provider_model_catalog_refresh("codex")
+            .await
+            .unwrap();
+        assert!(failed
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("returned no models"));
+        assert_eq!(failed.refreshed_at, after.refreshed_at);
+        assert!(failed
+            .models
+            .iter()
+            .any(|model| model.model == "gpt-5.6-terra"));
+    }
+
     /// The OpenAI subscription credentials the store currently holds. A store
     /// that was never written holds none, which is what a refused login leaves.
     fn openai_oauth_accounts(orch: &Orchestrator) -> Vec<ProviderAccount> {

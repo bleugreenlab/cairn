@@ -899,12 +899,39 @@ impl Catalog {
         /// is the catalog's to show.
         const SHOWN: usize = 12;
         let mut detail = format!("no installed provider offers '{requested}'");
-        if let Some(provider) = query.provider {
+        let provider = self.qualified_by(requested).0.or(query.provider);
+        if let Some(provider) = provider {
             let offers = self.candidates(&OfferQuery {
                 requested: None,
+                provider: Some(provider),
                 ..*query
             });
             let names = self.request_names(&offers);
+            if names.is_empty()
+                && self.installed().any(|known| {
+                    known.descriptor.key == provider
+                        && known.models.as_ref().is_none_or(|catalog| {
+                            catalog.models.is_empty()
+                                || catalog.refreshed_at.is_none()
+                                // Codex declares an image offer independently of its
+                                // live conversation inventory. It cannot make an early,
+                                // empty session listing count as discovered.
+                                || (provider == "codex"
+                                    && matches!(query.verb, VerbKind::Session | VerbKind::Complete)
+                                    && !catalog.models.iter().any(|model| {
+                                        best(
+                                            model.serves.as_deref().unwrap_or(&known.serves),
+                                            query.verb,
+                                        )
+                                        .is_some()
+                                    }))
+                        })
+                })
+            {
+                detail.push_str(&format!(
+                    "; {provider}'s catalog is not discovered yet; wait for discovery or retry in Settings → Providers"
+                ));
+            }
             if !names.is_empty() {
                 detail.push_str(&format!(
                     "; {provider} offers {}",
@@ -1940,10 +1967,41 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_waits_for_discovery_instead_of_accepting_an_unlisted_model() {
+        for models in [
+            None,
+            Some(Vec::new()),
+            Some(vec![crate::image::codex::discovered_model()]),
+        ] {
+            // An early listing used to be cached as a successful empty answer.
+            for refreshed_at in [None, Some(1)] {
+                let mut codex = conversing(provider("codex", models.clone()));
+                if let Some(catalog) = codex.models.as_mut() {
+                    catalog.refreshed_at = refreshed_at;
+                }
+                let catalog = Catalog {
+                    providers: vec![codex],
+                };
+                for (name, provider) in [("gpt-5.5", Some("codex")), ("codex/gpt-5.5", None)] {
+                    let refusal = pin(&catalog, name, provider).unwrap_err().to_string();
+                    assert!(
+                        refusal.contains("codex's catalog is not discovered yet"),
+                        "{refusal}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_pin_nothing_offers_is_refused_naming_the_providers_offers() {
         let catalog = pinnable();
         let refusal = pin(&catalog, "opus-9", Some("claude")).unwrap_err();
         assert!(!refusal.ambiguous);
+        let qualified = pin(&catalog, "claude/opus-9", Some("openrouter")).unwrap_err();
+        assert!(qualified
+            .to_string()
+            .contains("claude offers haiku, sonnet, opus, fable"));
         assert_eq!(
             refusal.to_string(),
             "No session-capable model serves 'opus-9': no installed provider offers 'opus-9'; claude offers haiku, sonnet, opus, fable. To fix it, install or configure a provider in Settings → Providers."

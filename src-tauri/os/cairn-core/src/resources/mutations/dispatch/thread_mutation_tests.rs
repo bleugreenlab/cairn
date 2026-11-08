@@ -125,6 +125,43 @@ async fn agent_thread_mutations_emit_scoped_db_changes_and_dry_runs_stay_silent(
     assert_eq!(deleted[3]["name"], "planning");
 }
 
+#[tokio::test]
+async fn thread_creation_resource_refuses_model_keys_without_persisting() {
+    let (orch, emitter) = seeded_orch_with_emitter().await;
+    for selection in [
+        serde_json::json!({"model": "gpt-5.5"}),
+        serde_json::json!({"model": {"backend": "codex", "model": "gpt-5.5"}}),
+        serde_json::json!({"backend": "codex"}),
+    ] {
+        let mut payload = selection.as_object().unwrap().clone();
+        payload.insert("name".into(), serde_json::json!("refused"));
+        let item = ChangeItem {
+            target: "cairn://p/prj/threads".into(),
+            mode: ChangeMode::Append,
+            payload: Some(serde_json::Value::Object(payload)),
+        };
+        let refusal = apply(&orch, &item).await.unwrap_err();
+        assert!(
+            refusal.error.contains("Unknown payload key"),
+            "{}",
+            refusal.error
+        );
+        assert!(crate::threads::crud::list(&orch.db.local, "p")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64("SELECT count(*) FROM jobs WHERE project_id = 'p'", (),)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert!(emitter.events_named("db-change").is_empty());
+    }
+}
+
 async fn seeded_orch_with_emitter() -> (Orchestrator, Arc<CapturingEmitter>) {
     let local = LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
         .await

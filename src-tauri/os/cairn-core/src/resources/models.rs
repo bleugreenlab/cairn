@@ -1043,6 +1043,9 @@ fn render_providers(
         match &provider.catalog {
             None => out.push_str("Models: not discovered yet\n"),
             Some(models) => {
+                if models.refreshed_at.is_none() {
+                    out.push_str("Models: not discovered yet; still discovering. Retry discovery in Settings → Providers if this persists.\n");
+                }
                 let refreshed = models
                     .refreshed_at
                     .map(|at| format!(", refreshed {}", when(at)))

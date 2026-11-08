@@ -122,11 +122,17 @@ pub(crate) async fn resolve_thread_model(
     requested: &str,
 ) -> Result<crate::models::ModelSelection, CairnError> {
     let project_id = get(db, thread_id).await?.map(|thread| thread.project_id);
+    resolve_model_for_project(orch, project_id.as_deref(), provider, requested)
+}
+
+fn resolve_model_for_project(
+    orch: &crate::orchestrator::Orchestrator,
+    project_id: Option<&str>,
+    provider: Option<&str>,
+    requested: &str,
+) -> Result<crate::models::ModelSelection, CairnError> {
     let resolved = crate::execution::provider_change::resolve_model_edit(
-        orch,
-        project_id.as_deref(),
-        provider,
-        requested,
+        orch, project_id, provider, requested,
     )
     .map_err(CairnError::Internal)?;
     let inferred = crate::backends::resolved_backend_for_model(resolved.model.as_str());
@@ -265,6 +271,25 @@ async fn allocate_placeholder_name(
     )
     .await?;
     Ok(format!("{PLACEHOLDER_PREFIX}{next}"))
+}
+
+/// Admit an explicit creation-time model before allocating any thread state.
+/// Host-facing creation uses the same catalog and runtime-representability
+/// checks as edits; trusted imports and fixtures use the persistence primitive.
+pub async fn create_with_admission(
+    orch: &crate::orchestrator::Orchestrator,
+    db: &LocalDb,
+    mut input: CreateThread,
+) -> Result<Thread, CairnError> {
+    if let Some(requested) = input.model.take() {
+        input.model = Some(resolve_model_for_project(
+            orch,
+            Some(&input.project_id),
+            Some(&requested.backend),
+            requested.model.as_str(),
+        )?);
+    }
+    create(db, input).await
 }
 
 pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnError> {
