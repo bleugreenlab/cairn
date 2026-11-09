@@ -1702,6 +1702,14 @@ pub(super) mod tests {
               VALUES ('project-delete', 'project', '', 1, 'attachment-hash', 'file', 'file.txt', 1);
             INSERT INTO check_result_observations(id, project_id, commit_sha, tree_hash, check_name, input_hash, environment_fingerprint, exit_code, verdict, complete, reusable, parser_version, result_schema_version, ran_at, duration_ms, cadence, output_tail)
               VALUES ('observation-delete', 'project-delete', 'commit', 'tree', 'check', 'input', 'env', 0, 'passed', 1, 1, 1, 1, 1, 1, 'write', 'ok');
+            INSERT INTO main_incident_budget(project_id, window_started, created_count)
+              VALUES ('project-delete', 1, 1);
+            INSERT INTO main_incidents(project_id, fingerprint, generation, identity, signature, class, issue_id, created_at)
+              VALUES ('project-delete', 'incident-delete', 1, 'check/test', 'signature', 'test', 'issue-delete', 1);
+            INSERT INTO main_incident_evidence(project_id, fingerprint, event_key, draft_json, body, observation_id, author_principal_json, appearance_snapshot_json, created_at, issue_id, issue_uri, generation, comment_id, filed_at)
+              VALUES ('project-delete', 'incident-delete', 'observation:observation-delete', '{}', 'incident evidence', 'observation-delete', '{}', '{}', 1, 'issue-delete', 'cairn://p/delete/1', 1, 'comment-delete', 2);
+            INSERT INTO main_incident_sources(project_id, event_key, observation_id, check_name, platform, commit_sha, created_at, processed_at)
+              VALUES ('project-delete', 'observation:observation-delete', 'observation-delete', 'check', 'linux', 'commit', 1, 2);
             INSERT INTO manual_check_handles(handle, project_id, observation_id, created_at)
               VALUES ('recorded-handle-delete', 'project-delete', 'observation-delete', 1),
                      ('unrecorded-handle-delete', 'project-delete', NULL, 1);
@@ -2280,6 +2288,40 @@ pub(super) mod tests {
         sweep_source(&db, "project-delete").await.unwrap();
 
         assert_project_graph_gone(&db, &tables).await;
+    }
+
+    #[tokio::test]
+    async fn export_includes_complete_project_incident_graph() {
+        let db =
+            Arc::new(migrated_db("project-export-incidents.db", TURSO_MIGRATIONS.to_vec()).await);
+        seed_complete_project_graph(&db).await;
+        let out = tempdir().unwrap();
+        let destination = out.path().join("export");
+        let report = crate::projects::export::export_project(
+            db.clone(),
+            db,
+            "delete".to_string(),
+            destination.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(report.vanished.is_empty(), "{:?}", report.vanished);
+
+        for table in [
+            "main_incident_budget",
+            "main_incidents",
+            "main_incident_evidence",
+            "main_incident_sources",
+        ] {
+            let content =
+                std::fs::read_to_string(destination.join(format!("tables/{table}.jsonl"))).unwrap();
+            let rows: Vec<serde_json::Value> = content
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 1, "{table} must export its seeded incident row");
+            assert_eq!(rows[0]["project_id"], "project-delete", "{table}");
+        }
     }
 
     #[tokio::test]

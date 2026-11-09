@@ -215,6 +215,195 @@ async fn drain_pending_scoped(
     }
 }
 
+/// Resolve a durable target before considering ownership claims. Delayed evidence
+/// belongs to the first generation covering its observation time, even if a
+/// newer generation is open.
+async fn linked_target_conn(
+    conn: &TrackedConnection,
+    project_id: &str,
+    fingerprint: &str,
+    observed_at: Option<i64>,
+) -> DbResult<(Option<(String, i64)>, i64)> {
+    let mut rows = conn
+        .query(
+            "SELECT generation, issue_id FROM main_incidents
+         WHERE project_id=?1 AND fingerprint=?2 ORDER BY generation DESC LIMIT 1",
+            params![project_id, fingerprint],
+        )
+        .await?;
+    let latest = rows
+        .next()
+        .await?
+        .map(|row| Ok::<_, DbError>((row.i64(0)?, row.text(1)?)))
+        .transpose()?;
+    drop(rows);
+    let generation = latest.as_ref().map_or(1, |(generation, _)| generation + 1);
+    if let Some(observed_at) = observed_at {
+        let mut rows = conn
+            .query(
+                "SELECT m.issue_id,m.generation FROM main_incidents m
+             JOIN issues i ON i.id=m.issue_id AND i.project_id=m.project_id
+             WHERE m.project_id=?1 AND m.fingerprint=?2
+             AND ((i.closed_at IS NOT NULL AND ?3<=i.closed_at)
+                  OR (i.merged_at IS NOT NULL AND ?3<=i.merged_at))
+             ORDER BY m.generation LIMIT 1",
+                params![project_id, fingerprint, observed_at],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            return Ok((Some((row.text(0)?, row.i64(1)?)), generation));
+        }
+    }
+    if let Some((linked_generation, issue_id)) = latest {
+        if issue_accepts_evidence(conn, project_id, &issue_id, observed_at).await? {
+            return Ok((Some((issue_id, linked_generation)), generation));
+        }
+    }
+    Ok((None, generation))
+}
+
+/// Test incidents are owned per test: while one is unresolved for a class and
+/// test identity, every later red of that test is evidence on it, whatever its
+/// signature. A changed signature is stated on the attached comment, not filed
+/// as a new issue; after resolution the fingerprint alone decides recurrence.
+/// Lane, infrastructure and disk-full incidents are not owned by identity here.
+fn identity_owned(class: &str) -> bool {
+    matches!(class, "test-failure" | "evidence-gap")
+}
+
+struct OpenIdentityIncident {
+    issue_id: String,
+    fingerprint: String,
+    signature: String,
+}
+
+/// The oldest unresolved issue holding an incident of this class and identity,
+/// with the most recent signature recorded on it.
+async fn open_identity_incident_conn(
+    conn: &TrackedConnection,
+    project_id: &str,
+    class: &str,
+    identity: &str,
+) -> DbResult<Option<OpenIdentityIncident>> {
+    if !identity_owned(class) {
+        return Ok(None);
+    }
+    let mut rows = conn
+        .query(
+            "SELECT m.issue_id, m.fingerprint, m.signature FROM main_incidents m
+             JOIN issues i ON i.id=m.issue_id AND i.project_id=m.project_id
+             WHERE m.project_id=?1 AND m.class=?2 AND m.identity=?3
+               AND i.status NOT IN ('closed','merged')
+               AND i.closed_at IS NULL AND i.merged_at IS NULL
+             ORDER BY i.number, m.created_at DESC, m.generation DESC LIMIT 1",
+            params![project_id, class, identity],
+        )
+        .await?;
+    rows.next()
+        .await?
+        .map(|row| {
+            Ok(OpenIdentityIncident {
+                issue_id: row.text(0)?,
+                fingerprint: row.text(1)?,
+                signature: row.text(2)?,
+            })
+        })
+        .transpose()
+}
+
+/// Attribution's view of the identity owner [`file_conn`] will attach to.
+pub(super) async fn open_identity_issue_uri(
+    db: &LocalDb,
+    project_id: &str,
+    class: &str,
+    identity: &str,
+) -> DbResult<Option<String>> {
+    if !identity_owned(class) {
+        return Ok(None);
+    }
+    let project_id = project_id.to_string();
+    let class = class.to_string();
+    let identity = identity.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        let class = class.clone();
+        let identity = identity.clone();
+        Box::pin(async move {
+            match open_identity_incident_conn(conn, &project_id, &class, &identity).await? {
+                Some(open) => Ok(Some(
+                    relations::issue_uri_for_id(conn, &open.issue_id).await?,
+                )),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+}
+
+fn signature_change_note(prior: &OpenIdentityIncident, draft: &IncidentDraft) -> String {
+    fn excerpt(signature: &str) -> String {
+        const LIMIT: usize = 2000;
+        match signature.char_indices().nth(LIMIT) {
+            Some((end, _)) => format!("{}\n[signature truncated]", &signature[..end]),
+            None => signature.to_string(),
+        }
+    }
+    let mut note = format!(
+        "\n\nThis red is attached to the open incident for `{}` ({}) rather than filed as a new issue: an open incident owns its test identity. Fingerprint changed from `{}` to `{}`.",
+        draft.identity, draft.class, prior.fingerprint, draft.fingerprint
+    );
+    if prior.signature == draft.signature {
+        note.push_str(" The assertion signature is unchanged.");
+    } else {
+        note.push_str(&format!(
+            "\n\nSignature changed from:\n~~~text\n{}\n~~~\nto:\n~~~text\n{}\n~~~",
+            excerpt(&prior.signature),
+            excerpt(&draft.signature)
+        ));
+    }
+    note
+}
+
+/// Attribution and filing share the same historical/current-link precedence.
+pub(super) async fn linked_issue_uri(
+    db: &LocalDb,
+    project_id: &str,
+    fingerprint: &str,
+    observed_at: Option<i64>,
+) -> DbResult<Option<String>> {
+    let project_id = project_id.to_string();
+    let fingerprint = fingerprint.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        let fingerprint = fingerprint.clone();
+        Box::pin(async move {
+            let (target, _) =
+                linked_target_conn(conn, &project_id, &fingerprint, observed_at).await?;
+            let Some((issue_id, _)) = target else {
+                return Ok(None);
+            };
+            let mut rows = conn
+                .query(
+                    "SELECT p.key,i.number FROM issues i JOIN projects p ON p.id=i.project_id
+                 WHERE i.id=?1 AND i.project_id=?2",
+                    params![issue_id, project_id],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| {
+                    Ok(format!(
+                        "cairn://p/{}/{}",
+                        row.text(0)?.to_ascii_lowercase(),
+                        row.i64(1)?
+                    ))
+                })
+                .transpose()
+        })
+    })
+    .await
+}
+
 async fn file_conn(
     conn: &TrackedConnection,
     project_id: &str,
@@ -247,47 +436,20 @@ async fn file_conn(
         .ok_or_else(|| DbError::Row("incident intent has no authorship".into()))?;
     drop(rows);
 
-    let mut rows = conn
-        .query(
-            "SELECT generation, issue_id FROM main_incidents
-         WHERE project_id=?1 AND fingerprint=?2 ORDER BY generation DESC LIMIT 1",
-            params![project_id, fingerprint],
-        )
-        .await?;
-    let latest = rows
-        .next()
-        .await?
-        .map(|row| Ok::<_, DbError>((row.i64(0)?, row.text(1)?)))
-        .transpose()?;
-    drop(rows);
-    let generation = latest.as_ref().map_or(1, |(generation, _)| generation + 1);
-    let mut target = None;
-    if let Some(observed_at) = draft.observed_at {
-        // Resolve old evidence against its historical generation even when a
-        // newer recurrence is already open.
-        let mut rows = conn
-            .query(
-                "SELECT m.issue_id,m.generation FROM main_incidents m
-             JOIN issues i ON i.id=m.issue_id AND i.project_id=m.project_id
-             WHERE m.project_id=?1 AND m.fingerprint=?2
-             AND ((i.closed_at IS NOT NULL AND ?3<=i.closed_at)
-                  OR (i.merged_at IS NOT NULL AND ?3<=i.merged_at))
-             ORDER BY m.generation LIMIT 1",
-                params![project_id, fingerprint, observed_at],
-            )
-            .await?;
-        target = rows
-            .next()
-            .await?
-            .map(|row| Ok::<_, DbError>((row.text(0)?, row.i64(1)?)))
-            .transpose()?;
+    let (mut target, generation) =
+        linked_target_conn(conn, project_id, fingerprint, draft.observed_at).await?;
+    // Decided here, not only when the draft was written: intents queued behind
+    // the creation budget were drafted before any of them had filed.
+    let mut identity_owner = None;
+    if target.is_none() {
+        identity_owner =
+            open_identity_incident_conn(conn, project_id, &draft.class, &draft.identity).await?;
+        if let Some(owner) = &identity_owner {
+            target = Some((owner.issue_id.clone(), generation));
+        }
     }
     if target.is_none() {
-        if let Some((generation, issue_id)) = &latest {
-            if issue_accepts_evidence(conn, project_id, issue_id, draft.observed_at).await? {
-                target = Some((issue_id.clone(), *generation));
-            }
-        } else if let Some(uri) = draft.existing_issue_uri.as_deref() {
+        if let Some(uri) = draft.existing_issue_uri.as_deref() {
             if let Some(issue) = relations::resolve_issue_uri(conn, uri).await? {
                 if issue_accepts_evidence(conn, project_id, &issue.issue_id, draft.observed_at)
                     .await?
@@ -367,7 +529,11 @@ async fn file_conn(
             (issue.id, generation)
         }
     };
-    if created || latest.is_none() {
+    let change = identity_owner
+        .as_ref()
+        .map(|owner| signature_change_note(owner, &draft))
+        .unwrap_or_default();
+    if target_generation == generation {
         conn.execute(
             "INSERT INTO main_incidents
              (project_id,fingerprint,generation,identity,signature,class,issue_id,created_at)
@@ -388,8 +554,8 @@ async fn file_conn(
     let issue_uri = relations::issue_uri_for_id(conn, &issue_id).await?;
     let comment_id = ids::mint_child(&issue_id);
     let content = match draft.observation_id.as_deref() {
-        Some(observation) => format!("{}\n\nObservation: `{}`", draft.body, observation),
-        None => draft.body,
+        Some(observation) => format!("{}{change}\n\nObservation: `{}`", draft.body, observation),
+        None => format!("{}{change}", draft.body),
     };
     comments::insert_conn(conn, &comment_id, &issue_id, &content, "agent", now).await?;
     conn.execute(
@@ -466,7 +632,7 @@ mod tests {
         IncidentDraft {
             fingerprint: fingerprint.into(),
             event_key: event.into(),
-            identity: "crate::test".into(),
+            identity: format!("crate::test_{fingerprint}"),
             signature: fingerprint.into(),
             class: "test-failure".into(),
             title: "Main test failure".into(),
@@ -528,19 +694,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_signature_has_its_own_fingerprint() {
+    async fn changed_signature_of_an_open_test_attaches_under_its_own_fingerprint() {
         let (_temp, db) = fixture().await;
+        let same_test = |fingerprint: &str, event: &str| IncidentDraft {
+            identity: "crate::test".into(),
+            ..draft(fingerprint, event)
+        };
         ingest(
             &db,
             "p",
-            vec![draft("sig-a", "e"), draft("sig-b", "e")],
+            vec![same_test("sig-a", "e"), same_test("sig-b", "e")],
             author(),
             2,
         )
         .await
         .unwrap();
-        assert_eq!(count(&db, "issues").await, 2);
+        assert_eq!(count(&db, "issues").await, 1);
         assert_eq!(count(&db, "main_incidents").await, 2);
+        let note = db
+            .query_one(
+                "SELECT content FROM comments WHERE content LIKE '%Signature changed from%'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert!(
+            note.contains("Fingerprint changed from `sig-a` to `sig-b`"),
+            "{note}"
+        );
+        // After resolution the fingerprint alone decides: a recurrence files anew.
+        db.execute("UPDATE issues SET status='closed',closed_at=3", ())
+            .await
+            .unwrap();
+        let recurrence = ingest(&db, "p", vec![same_test("sig-b", "later")], author(), 4)
+            .await
+            .unwrap();
+        assert!(recurrence[0].created);
+        assert_eq!(count(&db, "issues").await, 2);
+    }
+
+    #[tokio::test]
+    async fn intents_queued_behind_the_budget_for_one_test_file_one_incident() {
+        let (_temp, db) = fixture().await;
+        ingest(
+            &db,
+            "p",
+            (0..10).map(|n| draft(&format!("other-{n}"), "e")).collect(),
+            author(),
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&db, "issues").await, 10);
+        // Two main rows of one carried red, each drafted before either filed and
+        // each with a run nonce in its signature.
+        let carried = |fingerprint: &str| IncidentDraft {
+            identity: "crate::carried".into(),
+            ..draft(fingerprint, fingerprint)
+        };
+        ingest(&db, "p", vec![carried("row-1")], author(), 3)
+            .await
+            .unwrap();
+        ingest(&db, "p", vec![carried("row-2")], author(), 4)
+            .await
+            .unwrap();
+        assert_eq!(pending_status(&db, "p").await.unwrap().count, 2);
+        let links = drain_pending(&db, 3603).await.unwrap();
+        assert_eq!(links.iter().filter(|link| link.created).count(), 1);
+        assert_eq!(count(&db, "issues").await, 11);
+        assert_eq!(pending_status(&db, "p").await.unwrap().count, 0);
+        let owners = db
+            .query_all(
+                "SELECT DISTINCT issue_uri FROM main_incident_evidence
+                 WHERE fingerprint IN ('row-1','row-2')",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owners.len(), 1, "{owners:?}");
     }
 
     #[tokio::test]
@@ -666,6 +899,74 @@ mod tests {
         assert!(links[0].created);
         assert_eq!(count(&db, "issues").await, 1);
         assert_eq!(count(&db, "comments").await, 1);
+        assert_eq!(pending_status(&db, "p").await.unwrap().count, 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_generation_reuses_open_issue_naming_fingerprint() {
+        let (_temp, db) = fixture().await;
+        let first = ingest(&db, "p", vec![draft("F", "old")], author(), 2)
+            .await
+            .unwrap();
+        assert_eq!(first[0].issue_uri, "cairn://p/proj/1");
+        db.execute_script(
+            "UPDATE issues SET status='closed',closed_at=3;
+             INSERT INTO issues(id,project_id,number,title,description,status,progress,attention,created_at,updated_at)
+             VALUES('human-opened','p',2,'Recurring failure F','Fingerprint: F','backlog','backlog','none',4,4);
+             UPDATE projects SET next_issue_number=3 WHERE id='p';",
+        )
+        .await
+        .unwrap();
+
+        let mut recurrence = draft("F", "new");
+        recurrence.observed_at = Some(5);
+        recurrence.existing_issue_uri = Some("cairn://p/proj/2".into());
+        let links = ingest(&db, "p", vec![recurrence], author(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            links,
+            vec![IncidentLink {
+                issue_uri: "cairn://p/proj/2".into(),
+                created: false,
+            }]
+        );
+        assert_eq!(count(&db, "issues").await, 2);
+        assert_eq!(
+            db.query_all(
+                "SELECT generation,issue_id FROM main_incidents WHERE fingerprint='F' ORDER BY generation",
+                (),
+                |row| Ok((row.i64(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap(),
+            vec![
+                (1, db.query_one("SELECT id FROM issues WHERE number=1", (), |row| row.text(0)).await.unwrap()),
+                (2, "human-opened".into()),
+            ]
+        );
+
+        // Once linked, the new generation remains authoritative without a hint.
+        let followup = ingest(&db, "p", vec![draft("F", "followup")], author(), 6)
+            .await
+            .unwrap();
+        assert_eq!(followup, links);
+        assert_eq!(count(&db, "issues").await, 2);
+        assert_eq!(count(&db, "comments").await, 3);
+        assert_eq!(
+            db.query_all(
+                "SELECT event_key,issue_uri,generation FROM main_incident_evidence ORDER BY event_key",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)?)),
+            )
+            .await
+            .unwrap(),
+            vec![
+                ("followup".into(), "cairn://p/proj/2".into(), 2),
+                ("new".into(), "cairn://p/proj/2".into(), 2),
+                ("old".into(), "cairn://p/proj/1".into(), 1),
+            ]
+        );
         assert_eq!(pending_status(&db, "p").await.unwrap().count, 0);
     }
 

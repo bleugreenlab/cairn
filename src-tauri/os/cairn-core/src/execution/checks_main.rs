@@ -3535,6 +3535,7 @@ pub(crate) struct BracketMerge {
     pub(crate) commit: String,
     pub(crate) subject: String,
     pub(crate) pr: Option<i64>,
+    /// Canonical issue URI shared by report rendering and owner resolution.
     pub(crate) issue: Option<String>,
 }
 
@@ -3620,7 +3621,7 @@ fn subject_pr(subject: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
-/// The first `{key}/N` issue mention in a subject, rendered as `key/N`.
+/// The first `{key}/N` issue mention in a subject, rendered as a canonical issue URI.
 fn subject_issue(subject: &str, project_key: &str) -> Option<String> {
     let key = project_key.to_ascii_lowercase();
     let lower = subject.to_ascii_lowercase();
@@ -3637,7 +3638,7 @@ fn subject_issue(subject: &str, project_key: &str) -> Option<String> {
             .take_while(char::is_ascii_digit)
             .collect();
         if boundary && !digits.is_empty() {
-            return Some(format!("{key}/{digits}"));
+            return Some(format!("cairn://p/{key}/{digits}"));
         }
         from = at + needle.len();
     }
@@ -3689,7 +3690,18 @@ async fn merge_bracket(
             }
         }
     };
-    let entries = parse_log(&output);
+    bracket_from_log(db, project_id, project_key, &output, base, tip).await
+}
+
+async fn bracket_from_log(
+    db: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    output: &str,
+    base: &str,
+    tip: &str,
+) -> Bracket {
+    let entries = parse_log(output);
     let (chain, reached) = first_parent_chain(&entries, base, tip);
     let key = project_key.to_ascii_lowercase();
     let mut merges = Vec::with_capacity(chain.len());
@@ -3706,7 +3718,7 @@ async fn merge_bracket(
                 .await
                 .ok()
                 .flatten()
-                .map(|number| format!("{key}/{number}")),
+                .map(|number| format!("cairn://p/{key}/{number}")),
             None => None,
         };
         merges.push(BracketMerge {
@@ -6274,7 +6286,7 @@ mod tests {
                 commit: "4227422742274227".into(),
                 subject: "Seed clones from the store (cairn/5100) (#4227)".into(),
                 pr: Some(4227),
-                issue: Some("cairn/5100".into()),
+                issue: Some("cairn://p/cairn/5100".into()),
             }],
             ..Bracket::default()
         };
@@ -6312,7 +6324,7 @@ mod tests {
         );
         assert!(text.contains("**Still red:** 1 (not listed)"), "{text}");
         assert!(
-            text.contains("- `422742274227` #4227 · cairn/5100"),
+            text.contains("- `422742274227` #4227 · cairn://p/cairn/5100"),
             "the bracket names the landing that added them: {text}"
         );
     }
@@ -6925,7 +6937,7 @@ mod tests {
                     commit: "1111111111111111".into(),
                     subject: "Fix the index (cairn/5119) (#4115)".into(),
                     pr: Some(4115),
-                    issue: Some("cairn/5119".into()),
+                    issue: Some("cairn://p/cairn/5119".into()),
                 },
                 BracketMerge {
                     commit: "2222222222222222".into(),
@@ -6946,7 +6958,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "- `111111111111` #4115 · cairn/5119 — Fix the index (cairn/5119) (#4115)"
+                "- `111111111111` #4115 · cairn://p/cairn/5119 — Fix the index (cairn/5119) (#4115)"
             ),
             "{text}"
         );
@@ -7983,13 +7995,13 @@ mod tests {
         assert_eq!(subject_pr(subject), Some(4115));
         assert_eq!(
             subject_issue(subject, "cairn"),
-            Some("cairn/5119".to_string())
+            Some("cairn://p/cairn/5119".to_string())
         );
         assert_eq!(subject_pr("No number here"), None);
         assert_eq!(subject_issue("notcairn/12 only", "cairn"), None);
         assert_eq!(
             subject_issue("CAIRN/12 shouted", "cairn"),
-            Some("cairn/12".to_string())
+            Some("cairn://p/cairn/12".to_string())
         );
     }
 
@@ -8129,7 +8141,7 @@ mod tests {
                 commit: "bbbbbbbbbbbbbbbbbbbb".into(),
                 subject: "build fabric: strand detection (#4413)".into(),
                 pr: Some(4413),
-                issue: Some("cairn/5510".into()),
+                issue: Some("cairn://p/cairn/5510".into()),
             }],
             ..Bracket::default()
         };
@@ -8159,7 +8171,7 @@ mod tests {
             text.contains("cairn://p/cairn/check-observations/green, the previous cadence row"),
             "{text}"
         );
-        assert!(text.contains("#4413 · cairn/5510"), "{text}");
+        assert!(text.contains("#4413 · cairn://p/cairn/5510"), "{text}");
         assert!(!text.contains("MAIN CADENCE DID NOT COMPLETE"), "{text}");
     }
 
