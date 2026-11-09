@@ -685,6 +685,7 @@ impl Models for Orchestrator {
                         .lock()
                         .ok()
                         .and_then(|child| child.as_ref().map(|child| child.id())),
+                    cpu_priority: None,
                     started_at: None,
                 })
                 .collect(),
@@ -712,6 +713,7 @@ impl Models for Orchestrator {
 
         for view in &mut sessions {
             let found = facts.remove(&view.run_id).unwrap_or_default();
+            view.cpu_priority = view.pid.and_then(cairn_platform::priority::of_process);
             view.session_id = found.session_id;
             view.node_uri = found.node_uri;
             view.started_at = found.started_at;

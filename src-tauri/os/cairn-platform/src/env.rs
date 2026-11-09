@@ -13,7 +13,7 @@ use std::process::Command;
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// A PATH for finding CLI tools on this machine: common install locations, the
 /// user's shell PATH, the inherited process PATH, and the standard system

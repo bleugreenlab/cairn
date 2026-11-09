@@ -2389,6 +2389,25 @@ pub(crate) fn render_sessions(facet: &dyn Models) -> String {
     out
 }
 
+/// A session's process: its pid, and its CPU priority beside `runner`'s, so
+/// the lowering its launch applied can be checked without `ps`.
+fn process_facts(
+    session: &SessionView,
+    runner: Option<cairn_platform::priority::CpuPriority>,
+) -> String {
+    let mut out = String::new();
+    if let Some(pid) = session.pid {
+        let _ = write!(out, " · pid {pid}");
+    }
+    if let Some(priority) = session.cpu_priority {
+        let _ = write!(out, " · CPU priority {priority}");
+        if let Some(runner) = runner {
+            let _ = write!(out, " (this runner: {runner})");
+        }
+    }
+    out
+}
+
 pub(crate) fn render_session(facet: &dyn Models, id: &str) -> String {
     let Some(session) = facet
         .sessions()
@@ -2402,9 +2421,10 @@ pub(crate) fn render_session(facet: &dyn Models, id: &str) -> String {
     let mut out = format!("# Model session {}\n\n", session.key());
     out.push_str(&session_line(&session));
     let _ = write!(out, "\n\nRun: `{}`", session.run_id);
-    if let Some(pid) = session.pid {
-        let _ = write!(out, " · pid {pid}");
-    }
+    out.push_str(&process_facts(
+        &session,
+        cairn_platform::priority::of_current_process(),
+    ));
     if let Some(backend_session) = &session.backend_session_id {
         let _ = write!(
             out,
@@ -2423,6 +2443,36 @@ mod tests {
         seeded_orchestrator, API_KEY_SECRET, CUSTOM_KEY_SECRET, HEADER_SECRET, OAUTH_SECRET,
     };
     use crate::orchestrator::Orchestrator;
+
+    #[test]
+    fn a_session_shows_its_cpu_priority_beside_the_runners() {
+        use cairn_models::interface::{SessionState, SessionView, LOCAL_HOST};
+        use cairn_platform::priority::CpuPriority;
+        let mut view = SessionView {
+            session_id: Some("s1".into()),
+            run_id: "r1".into(),
+            node_uri: None,
+            provider: "claude".into(),
+            model: None,
+            account_id: None,
+            backend_session_id: None,
+            state: SessionState::Busy,
+            host: LOCAL_HOST.into(),
+            pid: Some(42),
+            cpu_priority: Some(CpuPriority::Nice(5)),
+            started_at: None,
+        };
+        assert_eq!(
+            super::process_facts(&view, Some(CpuPriority::Nice(0))),
+            " · pid 42 · CPU priority nice 5 (this runner: nice 0)"
+        );
+        // A process whose priority could not be read says nothing about it.
+        view.cpu_priority = None;
+        assert_eq!(
+            super::process_facts(&view, Some(CpuPriority::Nice(0))),
+            " · pid 42"
+        );
+    }
 
     const READS: &[&str] = &[
         "cairn://models",
@@ -2627,7 +2677,7 @@ mod tests {
             }
         })
         .collect();
-        let rendered = super::render_models(&Catalog { providers }, None, None);
+        let rendered = super::render_models(&Catalog { providers }, None, None, false);
         assert!(rendered.contains("1 model across"), "{rendered}");
         assert!(rendered.contains("- `glm-5.2`"), "{rendered}");
         assert!(

@@ -1252,6 +1252,9 @@ pub struct SessionView {
     pub host: String,
     /// The OS process id, when the session is a local process.
     pub pid: Option<u32>,
+    /// That process's CPU priority as the OS reports it when read, so what
+    /// the launch applied can be checked without `ps`.
+    pub cpu_priority: Option<cairn_platform::priority::CpuPriority>,
     pub started_at: Option<i64>,
 }
 
@@ -2731,9 +2734,14 @@ mod tests {
             state: SessionState::Warm,
             host: LOCAL_HOST.into(),
             pid: None,
+            cpu_priority: Some(cairn_platform::priority::CpuPriority::Nice(5)),
             started_at: None,
         };
         assert_eq!(view.key(), "s1");
+        assert_eq!(
+            serde_json::to_value(&view).unwrap()["cpuPriority"],
+            serde_json::json!({"kind": "nice", "value": 5})
+        );
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["host"], "local");
         assert!(json.get("pid").is_some());

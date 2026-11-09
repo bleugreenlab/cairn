@@ -231,6 +231,7 @@ mod unix {
             }
         })
         .map_err(io)?;
+        crate::services::process::apply_spawn_priority(pid as u32, config);
         // The child holds its copies now; this process keeps only its own ends.
         drop(secret_fd);
         let [stdin, stdout, stderr] = stdio.map(|entry| entry.map(|(_, parent)| parent));

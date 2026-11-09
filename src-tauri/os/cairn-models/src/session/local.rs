@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cairn_platform::services::process::{ChildProcess, ProcessSpawner, SpawnConfig};
+use cairn_platform::services::process::{ChildProcess, ProcessSpawner, SpawnConfig, SpawnPriority};
 
 use crate::interface::session::{Cli, CodexModels, SessionError, SessionHost};
 use crate::interface::LOCAL_HOST;
@@ -80,14 +80,16 @@ impl SessionHost for LocalSessionHost {
     /// Every Claude process and Codex app-server, per run or pooled, starts
     /// here. It inherits this runner's environment, so whatever credential
     /// that holds is removed here, after the launch's own overlay
-    /// (`cairn_common::auth::FORBIDDEN_LAUNCH_ENV`).
+    /// (`cairn_common::auth::FORBIDDEN_LAUNCH_ENV`). And it runs below this
+    /// runner, which every agent's tool calls go through
+    /// ([`SpawnPriority::Agent`]).
     fn spawn(&self, mut config: SpawnConfig) -> Result<Box<dyn ChildProcess>, String> {
         config.env_remove.extend(
             cairn_common::auth::FORBIDDEN_LAUNCH_ENV
                 .iter()
                 .map(|name| name.to_string()),
         );
-        self.process.spawn(config)
+        self.process.spawn(config.priority(SpawnPriority::Agent))
     }
 
     fn prepare_codex_home(&self, models: CodexModels<'_>) -> Result<String, SessionError> {
@@ -113,5 +115,25 @@ impl SessionHost for LocalSessionHost {
             .map_err(|e| format!("Failed to write file {path:?}: {e}"))?;
         log::debug!("Placed {:?} ({} bytes)", path, contents.len());
         Ok(path.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed::ManagedTools;
+    use cairn_platform::services::process::RecordingProcessSpawner;
+
+    #[test]
+    fn every_session_process_is_spawned_at_agent_priority() {
+        let recorder = RecordingProcessSpawner::new();
+        let home = tempfile::tempdir().unwrap();
+        let host = LocalSessionHost::new(
+            Arc::new(recorder.clone()),
+            home.path(),
+            ManagedTools::for_host(),
+        );
+        host.spawn(SpawnConfig::new("claude")).unwrap();
+        assert_eq!(recorder.spawned()[0].priority, SpawnPriority::Agent);
     }
 }

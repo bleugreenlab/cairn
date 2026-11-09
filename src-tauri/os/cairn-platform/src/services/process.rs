@@ -15,6 +15,8 @@ use std::os::unix::process::CommandExt;
 use mockall::automock;
 
 use cairn_sandbox::Confinement;
+
+pub use crate::priority::SpawnPriority;
 #[cfg(test)]
 use cairn_sandbox::SandboxPolicy;
 
@@ -44,6 +46,9 @@ pub struct SpawnConfig {
     /// environment. Only `spawn` delivers one, only on Unix, and only to an
     /// unconfined spawn; anything else that carries one is refused.
     pub inherited_secret: Option<InheritedSecret>,
+    /// The CPU priority the process starts at. Only `spawn` applies one; a
+    /// run to completion that asks for one is refused.
+    pub priority: SpawnPriority,
 }
 
 impl SpawnConfig {
@@ -59,7 +64,14 @@ impl SpawnConfig {
             confinement: Confinement::Unconfined,
             env_remove: Vec::new(),
             inherited_secret: None,
+            priority: SpawnPriority::Inherited,
         }
+    }
+
+    /// Start the process at `priority`.
+    pub fn priority(mut self, priority: SpawnPriority) -> Self {
+        self.priority = priority;
+        self
     }
 
     /// Hand the child `secret` on an inherited descriptor.
@@ -244,7 +256,33 @@ pub(super) fn build_command(config: &SpawnConfig) -> std::process::Command {
 
     config.confinement.install_pre_exec(&mut cmd);
 
+    // Windows takes a priority class at creation. Unix has no spawn attribute
+    // for a nice, so `spawn` applies it once the child exists
+    // (`priority::apply_to_spawned_group`).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let priority = crate::priority::creation_flags(config.priority);
+        if priority != 0 {
+            // Replaces the flags `command_on_path` set, so they are restated.
+            cmd.creation_flags(crate::env::CREATE_NO_WINDOW | priority);
+        }
+    }
+
     cmd
+}
+
+/// Lower the group a spawn just started to its configured priority. Best
+/// effort: a refusal leaves the child at this process's priority, which the
+/// session surface then shows, and is not worth failing a launch over.
+#[cfg(unix)]
+pub(super) fn apply_spawn_priority(pgid: u32, config: &SpawnConfig) {
+    if let Err(error) = crate::priority::apply_to_spawned_group(pgid, config.priority) {
+        log::warn!(
+            "could not lower {}'s CPU priority (pid {pgid}): {error}",
+            config.program
+        );
+    }
 }
 
 impl ProcessSpawner for RealProcessSpawner {
@@ -274,6 +312,8 @@ impl ProcessSpawner for RealProcessSpawner {
 
         let child = crate::process::observed_spawn(&mut cmd)
             .map_err(|e| format!("Failed to spawn process: {}", e))?;
+        #[cfg(unix)]
+        apply_spawn_priority(child.id(), &config);
 
         Ok(Box::new(RealChildProcess { child }))
     }
@@ -281,6 +321,9 @@ impl ProcessSpawner for RealProcessSpawner {
     fn run(&self, config: SpawnConfig) -> Result<CommandOutput, String> {
         if config.inherited_secret.is_some() {
             return Err("an inherited secret is delivered only by spawn".to_string());
+        }
+        if config.priority != SpawnPriority::Inherited {
+            return Err("a spawn priority is applied only by spawn".to_string());
         }
         let mut cmd = build_command(&config);
 
