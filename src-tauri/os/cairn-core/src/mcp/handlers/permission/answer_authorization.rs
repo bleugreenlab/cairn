@@ -3,6 +3,7 @@ use super::*;
 use cairn_common::authorization::{
     AuthorityAction, AuthorityAudience, AuthorityPlace, AuthorityPrincipal, AuthorityScope,
 };
+use cairn_db::lineage::FilingParent;
 
 /// Called before the first-answer claim and again when executing a recovered
 /// winner. Persisted edges, not URI prefixes or payload claims, confer ancestry.
@@ -152,15 +153,19 @@ async fn check_agent(
     Ok(())
 }
 
-async fn is_ancestor(db: &LocalDb, request_id: &str, answering_job: &str) -> Result<bool, String> {
+/// Whether `answering_job` is in the strict ancestor lineage of the job that
+/// raised `request_id`. Job edges are persisted parentage; an issue's parent
+/// edges count only where [`FilingParent::proof_sql`] proves them, checked at
+/// every hop the walk crosses.
+pub(crate) async fn is_ancestor(
+    db: &LocalDb,
+    request_id: &str,
+    answering_job: &str,
+) -> Result<bool, String> {
     let request_id = request_id.to_string();
     let answering_job = answering_job.to_string();
-    db.read(move |conn| {
-        let request_id = request_id.clone();
-        let answering_job = answering_job.clone();
-        Box::pin(async move {
-            let mut rows = conn.query(
-                "WITH RECURSIVE
+    let sql = format!(
+        "WITH RECURSIVE
                  requester AS (
                      SELECT COALESCE(pr.job_id, r.job_id) AS job_id,
                             COALESCE(j.issue_id, e.issue_id) AS issue_id
@@ -176,17 +181,13 @@ async fn is_ancestor(db: &LocalDb, request_id: &str, answering_job: &str) -> Res
                      WHERE COALESCE(j.issue_id, e.issue_id) IS NOT NULL
                      UNION ALL
                      SELECT 'issue', i.id, 'issue', i.parent_issue_id FROM issues i
-                     JOIN jobs j ON j.id = i.parent_job_id AND j.issue_id = i.parent_issue_id
-                     WHERE i.filing_parent_revoked_at IS NULL
+                     JOIN jobs j ON {issue_proof}
                      UNION ALL
                      SELECT 'issue', i.id, 'job', i.parent_job_id FROM issues i
-                     JOIN jobs j ON j.id = i.parent_job_id AND j.issue_id = i.parent_issue_id
-                     WHERE i.filing_parent_revoked_at IS NULL
+                     JOIN jobs j ON {issue_proof}
                      UNION ALL
                      SELECT 'issue', i.id, 'thread', i.parent_thread_id FROM issues i
-                     JOIN jobs j ON j.id = i.parent_job_id AND j.thread_id = i.parent_thread_id
-                         AND j.uri_segment = 'thread' AND j.parent_job_id IS NULL
-                     WHERE i.filing_parent_revoked_at IS NULL
+                     JOIN jobs j ON {thread_proof}
                  ),
                  lineage(kind, id) AS (
                      SELECT 'job', job_id FROM requester
@@ -203,11 +204,25 @@ async fn is_ancestor(db: &LocalDb, request_id: &str, answering_job: &str) -> Res
                      OR (a.parent_job_id IS NULL AND a.uri_segment = 'thread'
                          AND EXISTS (SELECT 1 FROM lineage WHERE kind = 'thread' AND id = a.thread_id))
                  ) LIMIT 1",
-                params![request_id.as_str(), answering_job.as_str()],
-            ).await?;
+        issue_proof = FilingParent::Issue.proof_sql(),
+        thread_proof = FilingParent::Thread.proof_sql(),
+    );
+    db.read(move |conn| {
+        let request_id = request_id.clone();
+        let answering_job = answering_job.clone();
+        let sql = sql.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    sql.as_str(),
+                    params![request_id.as_str(), answering_job.as_str()],
+                )
+                .await?;
             Ok(rows.next().await?.is_some())
         })
-    }).await.map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn owns_effect(

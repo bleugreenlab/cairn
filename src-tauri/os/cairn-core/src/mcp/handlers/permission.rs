@@ -8,7 +8,7 @@
 //! resolve through the same store/respond machinery via
 //! [`resolve_permission_request`].
 
-mod answer_authorization;
+pub(crate) mod answer_authorization;
 
 use crate::agent_process::process::GoalPauseOwner;
 use crate::backends::{stdin, AgentPermissions};

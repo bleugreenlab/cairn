@@ -12174,8 +12174,8 @@ fn format_check_detail(
     Some(block)
 }
 
-/// A red test lane's failures by what main at the base already fails: the
-/// lane's tally and how much of it is the branch's, then one line per bucket.
+/// A red test lane's failures by what main at the base observed: the lane's
+/// tally and the attribution's headline, then one line per bucket.
 fn attributed_failures(
     o: &CheckOutcome,
     attribution: &crate::execution::checks_base::BaseAttribution,
@@ -12190,8 +12190,8 @@ fn attributed_failures(
         Some(parsed.suite_failures),
         &names,
     )?;
-    let mut out = format!("{tally}; {}", attribution.charge_clause());
-    for line in attribution.bucket_lines() {
+    let mut out = format!("{tally}; {}", attribution.headline());
+    for line in attribution.line_texts() {
         out.push_str("\n    ");
         out.push_str(&line);
     }
@@ -12263,7 +12263,7 @@ async fn write_check_attributions(
             return HashMap::new();
         }
     };
-    attribute_outcomes(orch, &db, &coords, &base, results).await
+    attribute_outcomes(orch, &db, &coords, job_id, &base, results).await
 }
 
 async fn submit_review_check(
@@ -17619,11 +17619,14 @@ cairn-common = { path = "../cairn-common" }
     }
 
     /// A write-cadence test lane's red is split by what main at the base
-    /// already fails, as the turn-checks wake splits it: the tally says how
-    /// much is the branch's, and each bucket is named beneath it.
+    /// observed, as the turn-checks wake splits it: the tally carries the
+    /// headline, and each bucket is named beneath it.
     #[test]
     fn summary_splits_a_red_test_lane_by_main_at_the_base() {
-        use crate::execution::checks_base::{partition, tests::main_row};
+        use crate::execution::checks_base::{
+            partition,
+            tests::{failures, main_row},
+        };
         use crate::execution::checks_main::TestRate;
         let parsed: crate::execution::check_parsers::ParsedCheckResult =
             serde_json::from_value(serde_json::json!({
@@ -17655,37 +17658,39 @@ cairn-common = { path = "../cairn-common" }
         );
         let attribution = partition(
             "base0000",
-            &[
-                "core mine".to_string(),
-                "core main".to_string(),
-                "core flaky".to_string(),
-            ],
+            "linux",
+            &failures(&["core mine", "core main", "core flaky"]),
             Some(&main),
+            Some(0),
         )
-        .with_main_rates(&HashMap::from([(
+        .with_main_rates(Ok(HashMap::from([(
             "core flaky".to_string(),
             TestRate { red: 3, ran: 10 },
-        )]));
+        )])));
         let attributions = HashMap::from([("rust-tests".to_string(), attribution)]);
 
         let s = format_check_summary(&[red], &attributions);
 
         assert!(
-            s.contains("\u{2717} rust-tests \u{2014} 3 of 900 failed; 1 is this branch's\n"),
-            "{s}"
-        );
-        assert!(
-            s.contains("\n    1 red on main at `base0000`")
-                && s.contains("charged to the base: core main"),
-            "{s}"
-        );
-        assert!(s.contains("this branch's: core mine"), "{s}");
-        assert!(
             s.contains(
-                "charged to neither: core flaky (red on 3 of the last 10 main rows that ran it)"
+                "\u{2717} rust-tests \u{2014} 3 of 900 failed; 1 passed at base and failed here, \
+                 1 red at base too, 1 intermittent on main\n"
             ),
             "{s}"
         );
+        assert!(
+            s.contains("\n    1 also red at base `base0000` on linux")
+                && s.contains("e884003b): core main"),
+            "{s}"
+        );
+        assert!(s.contains("not proof of cause: core mine"), "{s}");
+        assert!(
+            s.contains(
+                "(intermittent on main): core flaky (red on 3 of the last 10 main rows that ran it)"
+            ),
+            "{s}"
+        );
+        assert!(!s.contains("this branch's"), "{s}");
         assert!(
             !s.contains("3 failed: "),
             "the unattributed list is replaced: {s}"
@@ -17918,10 +17923,17 @@ cairn-common = { path = "../cairn-common" }
                     message: None,
                 })
                 .collect();
-            let names: Vec<String> = parse.failures.iter().map(|f| f.name.clone()).collect();
+            let names: Vec<crate::execution::checks_base::BranchFailure> = parse
+                .failures
+                .iter()
+                .map(|f| crate::execution::checks_base::BranchFailure {
+                    name: f.name.clone(),
+                    signature: None,
+                })
+                .collect();
             let attributions = HashMap::from([(
                 "rust-tests".to_string(),
-                partition("4a52d52e0000", &names, None),
+                partition("4a52d52e0000", "linux", &names, None, None),
             )]);
             let o = parsed_outcome("rust-tests", false, Some(1), parse, false);
             format_check_summary(&[o], &attributions)

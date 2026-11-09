@@ -1239,6 +1239,7 @@ async fn live_statuses(
         orch,
         db,
         coords,
+        job_id,
         &plan.base,
         rows.iter().map(|lane| &lane.row),
     )
@@ -1400,6 +1401,7 @@ async fn retired_statuses(
         orch,
         db,
         coords,
+        job_id,
         &plan.base,
         rows.iter().map(|lane| &lane.row),
     )
@@ -1626,6 +1628,7 @@ async fn settled_statuses(
                 orch,
                 db,
                 coords,
+                job_id,
                 base,
                 rows_by_name.values().map(|lane| &lane.row),
             )
@@ -2262,7 +2265,15 @@ async fn wake_attributions(
     let Ok(Some(coords)) = resolve_job_coords(db, job_id).await else {
         return HashMap::new();
     };
-    attribute_lanes(orch, db, &coords, &base, lanes.iter().map(|lane| &lane.row)).await
+    attribute_lanes(
+        orch,
+        db,
+        &coords,
+        job_id,
+        &base,
+        lanes.iter().map(|lane| &lane.row),
+    )
+    .await
 }
 
 /// The checks the newest recorded wave plan for `job_id` declared that this
@@ -2299,9 +2310,10 @@ async fn latest_planned_unsupported(
 /// and counted in neither. The headline's failing count is therefore only ever
 /// reds about the change, and the passing list only ever greens that judged it.
 ///
-/// A red test lane in `attributions` is counted by its failures charged to the
-/// branch: one with none (every failure red on main at the base, or observed
-/// by no main row) is red, and listed, but not counted as failing.
+/// A red test lane in `attributions` whose every failure the exact base
+/// accounts for (red there too, or intermittent on main) is red, and listed,
+/// but not counted as failing. One with any failure that passed at base, that
+/// a stale row or no row answered, is counted as failing.
 ///
 /// A check in `unsupported` is listed by its notice, exactly as `/checks` lists
 /// it, and whatever row it last recorded is set aside: that row is about a tree
@@ -2341,7 +2353,7 @@ pub(crate) fn format_check_wake_body(
         match entry_existence(row) {
             LaneExistence::Complete if row.passed => passing.push(row.check_name.clone()),
             LaneExistence::Complete => match attributions.get(&row.check_name) {
-                Some(attribution) if attribution.charged() == 0 => uncharged.push(row),
+                Some(attribution) if attribution.accounted_by_base() => uncharged.push(row),
                 _ => failing.push(row),
             },
             LaneExistence::NoSelectableWork => not_applicable.push(row.check_name.clone()),
@@ -2365,8 +2377,8 @@ pub(crate) fn format_check_wake_body(
                 red => format!("{red} lanes"),
             };
             format!(
-                "Project checks on this node: {failed}{silent}; {lanes} red with no failure \
-                 charged to this branch.\n"
+                "Project checks on this node: {failed}{silent}; {lanes} red only with failures \
+                 the exact base also fails or main fails now and then.\n"
             )
         }
         (0, 0) if passing.is_empty() => "Project checks on this node: no lane holds a verdict.".to_string(),
@@ -2548,8 +2560,8 @@ fn wake_failure_detail(
     let named = kind != Some(CheckFailureKind::TimedOut) && !names.is_empty();
     let header = match attribution.filter(|_| named) {
         Some(attribution) => {
-            let mut header = format!("{annotation}; {}", attribution.charge_clause());
-            for line in attribution.bucket_lines() {
+            let mut header = format!("{annotation}; {}", attribution.headline());
+            for line in attribution.line_texts() {
                 header.push_str(&format!("\n    {line}"));
             }
             header
@@ -3635,10 +3647,13 @@ mod tests {
 
     /// A test lane's failures are read against main at the branch's base: the
     /// wake names each bucket with the base commit and the main row's URI, and
-    /// counts only the failure that was green on main as the branch's.
+    /// says what was observed rather than whose the failure is.
     #[test]
-    fn a_wake_charges_the_branch_only_with_failures_main_passed_at_its_base() {
-        use crate::execution::checks_base::{partition, tests::main_row};
+    fn a_wake_splits_a_red_lane_by_what_the_exact_base_observed() {
+        use crate::execution::checks_base::{
+            partition,
+            tests::{failures, main_row},
+        };
         let mut failing = verdict_row("rust-tests", false);
         failing.target_results_json = Some(parsed_json(
             897,
@@ -3652,12 +3667,10 @@ mod tests {
                 ("core mine::broke", "passed"),
             ],
         );
-        let failures: Vec<String> = ["core decide::flaky", "core mine::broke", "core mine::new"]
-            .map(String::from)
-            .to_vec();
+        let lane = failures(&["core decide::flaky", "core mine::broke", "core mine::new"]);
         let attributions = HashMap::from([(
             "rust-tests".to_string(),
-            partition(base, &failures, Some(&main)),
+            partition(base, "linux", &lane, Some(&main), Some(0)),
         )]);
         let lanes: Vec<LaneRow> = [failing, verdict_row("lint", true)]
             .into_iter()
@@ -3671,18 +3684,24 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("✗ rust-tests — 3 of 900 failed; 1 is this branch's"),
+            body.contains(
+                "✗ rust-tests — 3 of 900 failed; 1 passed at base and failed here, 1 not \
+                 observed on main, 1 red at base too"
+            ),
             "{body}"
         );
+        let at = "base `4a52d52e5f5f` on linux (cairn://p/cairn/check-observations/e884003b)";
         for line in [
-            "    1 red on main at `4a52d52e5f5f` (cairn://p/cairn/check-observations/e884003b), \
-             charged to the base: core decide::flaky",
-            "    1 not red on main at `4a52d52e5f5f` (cairn://p/cairn/check-observations/e884003b), \
-             this branch's: core mine::broke",
-            "    1 not observed by main's row at `4a52d52e5f5f` \
-             (cairn://p/cairn/check-observations/e884003b) (new, or skipped there): core mine::new",
+            format!("    1 also red at {at}: core decide::flaky"),
+            format!(
+                "    1 passed at {at} and failed here, an observed difference and not proof of \
+                 cause: core mine::broke"
+            ),
+            format!(
+                "    1 not observed by the row at {at} (new, or skipped there): core mine::new"
+            ),
         ] {
-            assert!(body.contains(line), "missing {line:?} in {body}");
+            assert!(body.contains(line.as_str()), "missing {line:?} in {body}");
         }
     }
 
@@ -3690,13 +3709,17 @@ mod tests {
     /// headline does not count it as failing the branch.
     #[test]
     fn a_lane_red_only_where_main_is_is_not_counted_as_failing() {
-        use crate::execution::checks_base::{partition, tests::main_row};
+        use crate::execution::checks_base::{
+            partition,
+            tests::{failures, main_row},
+        };
         let mut failing = verdict_row("rust-tests", false);
         failing.target_results_json = Some(parsed_json(10, &["core decide::flaky"]));
         let main = main_row("base", &[("core decide::flaky", "failed")]);
+        let lane = failures(&["core decide::flaky"]);
         let attributions = HashMap::from([(
             "rust-tests".to_string(),
-            partition("base", &["core decide::flaky".to_string()], Some(&main)),
+            partition("base", "linux", &lane, Some(&main), Some(0)),
         )]);
         let lanes: Vec<LaneRow> = [failing, verdict_row("lint", true)]
             .into_iter()
@@ -3707,16 +3730,33 @@ mod tests {
 
         assert!(
             body.starts_with(
-                "Project checks on this node: none failing; 1 lane red with no failure charged \
-                 to this branch."
+                "Project checks on this node: none failing; 1 lane red only with failures the \
+                 exact base also fails or main fails now and then."
             ),
             "{body}"
         );
         assert!(
-            body.contains("✗ rust-tests — 1 of 11 failed; none is this branch's"),
+            body.contains("✗ rust-tests — 1 of 11 failed; 1 red at base too"),
             "{body}"
         );
         assert!(body.contains("✓ passing: lint"), "{body}");
+
+        // The same red read against a row older than the base is not
+        // accounted for: the lane counts as failing and says why.
+        let stale = HashMap::from([(
+            "rust-tests".to_string(),
+            partition("newbase", "linux", &lane, Some(&main), Some(256)),
+        )]);
+        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &stale).unwrap();
+        assert!(
+            body.starts_with("Project checks on this node: 1 of 2 failing."),
+            "{body}"
+        );
+        assert!(
+            body.contains("1 of 11 failed; 1 unattributed (base unobserved on linux)"),
+            "{body}"
+        );
+        assert!(body.contains("is 256 commits older"), "{body}");
     }
 
     /// A compiler or linter names no test, so without its output tail the lane

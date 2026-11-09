@@ -94,6 +94,45 @@ pub async fn is_dormant_thread_session(db: &crate::storage::LocalDb, job_id: &st
 
 pub const SESSION_JOB_SHAPE: &str = "j.parent_job_id IS NULL AND j.uri_segment = 'thread'";
 
+/// One of an issue's two parent edges, as filing proof names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilingParent {
+    /// `issues.parent_issue_id`.
+    Issue,
+    /// `issues.parent_thread_id`.
+    Thread,
+}
+
+impl FilingParent {
+    /// The filing-proof rule for this parent edge: the one definition of "this
+    /// edge was created by filing and has not changed since", which every
+    /// authority derived from issue parentage applies (permission-answer
+    /// ancestry, gated-artifact confirmation).
+    ///
+    /// A SQL predicate over `i` (an `issues` row) and `j` (a `jobs` row), meant
+    /// as a join condition (`issues i JOIN jobs j ON {proof}`). It holds exactly
+    /// when `j` is the issue's recorded filing job (`i.parent_job_id`), that job
+    /// sits on the parent this edge names (it ran on the parent issue, or it is
+    /// the parent thread's session job), and `i.filing_parent_revoked_at` is
+    /// unset. Migration `0406_issue_filing_parent_revocation` stamps that column
+    /// on every pre-existing edge and on the first change to any edge, so a
+    /// legacy, adopted, or reparented edge never satisfies it. A missing filing
+    /// job or parent compares as NULL and fails the predicate: an edge whose
+    /// proof cannot be determined is unproven.
+    ///
+    /// It proves a single edge. A walk across several hops joins it at every
+    /// hop it crosses.
+    pub fn proof_sql(self) -> String {
+        let parent = match self {
+            FilingParent::Issue => "j.issue_id = i.parent_issue_id".to_string(),
+            FilingParent::Thread => {
+                format!("j.thread_id = i.parent_thread_id AND {SESSION_JOB_SHAPE}")
+            }
+        };
+        format!("j.id = i.parent_job_id AND i.filing_parent_revoked_at IS NULL AND {parent}")
+    }
+}
+
 /// The job's canonical home URI. Issue jobs resolve to their node URI
 /// (`cairn://p/{KEY}/{number}/{seq}/{segment}`, nesting sub-agent tasks under
 /// their parent); a thread's session resolves to `cairn://p/{KEY}/{thread-name}`

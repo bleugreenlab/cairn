@@ -11,6 +11,7 @@ use cairn_attention::wakes::GateOwner;
 use cairn_common::authorization::{
     AuthorityAction, AuthorityAudience, AuthorityPlace, AuthorityPrincipal, AuthorityScope,
 };
+use cairn_db::lineage::FilingParent;
 use cairn_db::turso::params;
 
 use crate::models::Job;
@@ -240,11 +241,11 @@ async fn gate_facts(db: &LocalDb, job_id: &str) -> Result<GateFacts, ConfirmErro
                 crate::orchestrator::wakes::gate_owner_for_child_conn(conn, &issue_id).await?;
             let (edge_proven, owner_label) = match &owner {
                 GateOwner::Job(owner_job) => (
-                    filing_edge_proven_conn(conn, &issue_id, ParentArm::Issue).await?,
+                    filing_edge_proven_conn(conn, &issue_id, FilingParent::Issue).await?,
                     cairn_db::lineage::home_uri_for_job_conn(conn, owner_job).await?,
                 ),
                 GateOwner::Thread(thread_id) => (
-                    filing_edge_proven_conn(conn, &issue_id, ParentArm::Thread).await?,
+                    filing_edge_proven_conn(conn, &issue_id, FilingParent::Thread).await?,
                     thread_uri_conn(conn, thread_id).await?,
                 ),
                 GateOwner::Operator => (false, None),
@@ -319,39 +320,27 @@ async fn chain_root_conn(conn: &TrackedConnection, job_id: &str) -> DbResult<Opt
     crate::storage::next_text(&mut rows, 0).await
 }
 
-/// Which parent edge gate routing followed.
-enum ParentArm {
-    Issue,
-    Thread,
-}
-
-/// Whether the child's parent edge on `arm` still confers authority: its
-/// immutable filing job sits on that parent issue (or is that thread's own
-/// session job) and the edge has never changed since filing. This is the
-/// filing-proof rule permission answers apply (migration
-/// `0406_issue_filing_parent_revocation`); a merely routed or adopted edge
+/// Whether the child's parent edge on `arm`, the one gate routing followed,
+/// still confers authority under the filing-proof rule permission answers
+/// also apply ([`FilingParent::proof_sql`]). A merely routed or adopted edge
 /// confers nothing.
 async fn filing_edge_proven_conn(
     conn: &TrackedConnection,
     issue_id: &str,
-    arm: ParentArm,
+    arm: FilingParent,
 ) -> DbResult<bool> {
-    let edge = match arm {
-        ParentArm::Issue => {
-            "i.parent_issue_id IS NOT NULL AND f.issue_id = i.parent_issue_id".to_string()
-        }
-        ParentArm::Thread => format!(
-            "i.parent_issue_id IS NULL AND i.parent_thread_id IS NOT NULL
-             AND f.thread_id = i.parent_thread_id
-             AND f.id IN (SELECT j.id FROM jobs j WHERE {})",
-            cairn_db::lineage::SESSION_JOB_SHAPE
-        ),
+    // Routing reaches a parent thread only when the child has no parent issue,
+    // so the thread edge speaks for the gate only on such a child.
+    let routed = match arm {
+        FilingParent::Issue => "",
+        FilingParent::Thread => " AND i.parent_issue_id IS NULL",
     };
     let mut rows = conn
         .query(
             &format!(
-                "SELECT 1 FROM issues i JOIN jobs f ON f.id = i.parent_job_id
-                 WHERE i.id = ?1 AND i.filing_parent_revoked_at IS NULL AND {edge} LIMIT 1"
+                "SELECT 1 FROM issues i JOIN jobs j ON {proof}
+                 WHERE i.id = ?1{routed} LIMIT 1",
+                proof = arm.proof_sql()
             ),
             params![issue_id],
         )
@@ -445,3 +434,7 @@ async fn journal_refusal(
             ))
         })
 }
+
+#[cfg(test)]
+#[path = "checkpoints_filing_proof_tests.rs"]
+mod filing_proof_tests;

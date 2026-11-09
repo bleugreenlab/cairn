@@ -308,13 +308,13 @@ impl ChecksSnapshot {
                     Some(annotation) => format!("- {} [{state}] {annotation}", status.name),
                     None => format!("- {} [{state}]", status.name),
                 };
-                // The buckets themselves are on `/checks`; the resume says only
-                // how much of the red is the branch's.
+                // The buckets themselves are on `/checks`; the resume carries
+                // only the headline of what the base's rows observed.
                 match &status.base_attribution {
                     Some(attribution) => format!(
-                        "{line}; {} at base `{}`",
-                        attribution.charge_clause(),
-                        attribution.base.get(..12).unwrap_or(&attribution.base)
+                        "{line}; against base `{}`: {}",
+                        attribution.base.get(..12).unwrap_or(&attribution.base),
+                        attribution.headline()
                     ),
                     None => line,
                 }
@@ -947,6 +947,41 @@ mod tests {
             retired: None,
         };
         assert_eq!(moving.lane_lines(), vec!["- rust-lint [pending]"]);
+    }
+
+    /// The resume carries the attribution's headline after the base it was
+    /// read against: a stale row's pass is unattributed, never the branch's.
+    #[test]
+    fn a_resume_carries_the_attribution_headline_against_its_base() {
+        use crate::execution::checks_base::{
+            partition,
+            tests::{failures, main_row},
+        };
+        let mut red = lane("rust-tests", NodeCheckState::Failed);
+        let main = main_row("79401a191cd5aaaa", &[("core a", "passed")]);
+        red.base_attribution = Some(partition(
+            "7b8e6c41f471bbbb",
+            "macos",
+            &failures(&["core a"]),
+            Some(&main),
+            Some(256),
+        ));
+        let statuses = vec![red];
+        let snapshot = ChecksSnapshot {
+            settlement: classify(&statuses, HeadTurn::Idle, false),
+            statuses,
+            terminal_reason: None,
+            retired: None,
+        };
+        let lines = snapshot.lane_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].ends_with(
+                "; against base `7b8e6c41f471`: 1 unattributed (base unobserved on macos)"
+            ),
+            "{lines:?}"
+        );
+        assert!(!lines[0].contains("this branch's"), "{lines:?}");
     }
 
     #[test]

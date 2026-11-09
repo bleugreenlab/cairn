@@ -2827,8 +2827,8 @@ fn push_check_lines(
                     .unwrap_or_default();
                 out.push_str(&format!("- \u{2717} {}{annotation}\n", status.name));
                 if let Some(attribution) = &status.base_attribution {
-                    out.push_str(&format!("  - of these, {}\n", attribution.charge_clause()));
-                    for line in attribution.bucket_lines() {
+                    out.push_str(&format!("  - of these, {}\n", attribution.headline()));
+                    for line in attribution.line_texts() {
                         out.push_str(&format!("  - {line}\n"));
                     }
                 }
@@ -4963,11 +4963,20 @@ mod tests {
     /// merge's verdict gate refuses with.
     #[test]
     fn section_lists_a_red_test_lanes_failures_by_their_status_on_main() {
-        use crate::execution::checks_base::{partition, tests::main_row};
+        use crate::execution::checks_base::{
+            partition,
+            tests::{failures, main_row},
+        };
         let mut red = status("rust-tests", NodeCheckState::Failed);
         red.failure_names = vec!["core a".to_string(), "core b".to_string()];
         let main = main_row("base", &[("core a", "failed"), ("core b", "passed")]);
-        red.base_attribution = Some(partition("base", &red.failure_names, Some(&main)));
+        red.base_attribution = Some(partition(
+            "base",
+            "linux",
+            &failures(&["core a", "core b"]),
+            Some(&main),
+            Some(0),
+        ));
 
         let section = format_checks_section(
             &[red],
@@ -4976,17 +4985,21 @@ mod tests {
         .unwrap();
 
         assert!(
-            section.contains("  - of these, 1 is this branch's\n"),
+            section.contains("  - of these, 1 passed at base and failed here, 1 red at base too\n"),
             "{section}"
         );
         assert!(
             section.contains(
-                "  - 1 red on main at `base` (cairn://p/cairn/check-observations/e884003b), \
-                 charged to the base: core a\n"
+                "  - 1 also red at base `base` on linux \
+                 (cairn://p/cairn/check-observations/e884003b): core a\n"
             ),
             "{section}"
         );
-        assert!(section.contains("this branch's: core b\n"), "{section}");
+        assert!(
+            section.contains("not proof of cause: core b\n"),
+            "{section}"
+        );
+        assert!(!section.contains("this branch's"), "{section}");
     }
 
     #[test]

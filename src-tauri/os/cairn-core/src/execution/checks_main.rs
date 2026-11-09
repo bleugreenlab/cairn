@@ -2621,7 +2621,7 @@ pub(crate) struct MainChain {
 
 impl MainChain {
     /// One commit per line, tip first.
-    fn from_log(output: &str) -> Self {
+    pub(crate) fn from_log(output: &str) -> Self {
         Self {
             depth: output
                 .lines()
@@ -2634,7 +2634,7 @@ impl MainChain {
     }
 
     /// How many landings behind the tip `commit` sits; `None` off the chain.
-    fn depth(&self, commit: &str) -> Option<usize> {
+    pub(crate) fn depth(&self, commit: &str) -> Option<usize> {
         self.depth.get(commit).copied()
     }
 
@@ -2729,7 +2729,7 @@ const BASE_CANDIDATE_SCAN: i64 = 256;
 /// A per-test row observed the whole suite: a fast, filtered, or empty
 /// selection is not the suite (tenet 695), and a tiered run's deferred tests
 /// are unobserved.
-const PER_TEST_WHOLE_SUITE: &str = "selection = 'full' AND deferred_count = 0";
+pub(crate) const PER_TEST_WHOLE_SUITE: &str = "selection = 'full' AND deferred_count = 0";
 
 /// The newest whole-suite row for `lane` that classifies as complete and
 /// passes `filter`.
@@ -3315,7 +3315,7 @@ async fn comparison_for(
 /// test — and states the failure on the next line, so that line is the
 /// signature. Tests that fail the same way share a signature, which is what
 /// lets one intermittent race that flips a dozen tests read as one group.
-fn failure_signature(excerpt: &str) -> String {
+pub(crate) fn failure_signature(excerpt: &str) -> String {
     let mut lines = excerpt
         .lines()
         .map(str::trim)
