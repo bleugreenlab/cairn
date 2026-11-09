@@ -24,7 +24,7 @@ use cairn_models::types::pool::{
     ProviderPoolAccountResets, ProviderPoolAccountState, ProviderPoolConstraintReach,
     ProviderPoolSegmentState, ProviderPoolSnapshot,
 };
-use cairn_models::types::usage::ProviderUsageWindow;
+use cairn_models::types::usage::{agent_account_name, ProviderUsageWindow};
 use cairn_models::types::usage::{BillingUnit, Charge};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -718,7 +718,11 @@ pub(crate) fn render_selection(
         let _ = write!(chosen, " @ {effort}");
     }
     if let Some(account) = &record.account {
-        let _ = write!(chosen, " on {}", account.label);
+        let _ = write!(
+            chosen,
+            " on {}",
+            agent_account_name(&account.id, &account.label)
+        );
     }
     if let Some(maker) = &record.maker {
         let _ = write!(chosen, ", by {maker}");
@@ -1396,11 +1400,15 @@ fn account_block(
     resets: &HashMap<String, ProviderPoolAccountResets>,
     out: &mut String,
 ) {
-    let label = account["label"].as_str().unwrap_or("(unnamed)");
+    let label = account["label"].as_str().unwrap_or_default();
     let id = account["id"].as_str().unwrap_or_default();
-    let _ = write!(out, "- **{label}** `{id}` — {}", credential_kind(account));
-    if let Some(email) = account["email"].as_str() {
-        let _ = write!(out, " · email {email}");
+    // Agents read this, so the account's email (and a label that is one)
+    // stays out of it; Settings shows the operator who it is.
+    let name = agent_account_name(id, label);
+    if name == id {
+        let _ = write!(out, "- `{id}` — {}", credential_kind(account));
+    } else {
+        let _ = write!(out, "- **{name}** `{id}` — {}", credential_kind(account));
     }
     out.push_str(&plan_text(account));
     match account["projectId"].as_str() {
@@ -1431,11 +1439,10 @@ fn account_block(
         if let Ok(hold) =
             serde_json::from_value::<crate::credentials::AccountHold>(health["held"].clone())
         {
-            let signed_in_as = account["email"].as_str().unwrap_or(label);
             let _ = writeln!(
                 out,
                 "  - blocked: {}",
-                hold.describe(&when(hold.since), signed_in_as)
+                hold.describe(&when(hold.since), name)
             );
         }
         // Only a block still in force is one; a past block is history, as the
@@ -1503,11 +1510,11 @@ fn sign_in_line(account: &Value, now: i64) -> Option<String> {
 /// or refused account outranks any deadline still ahead.
 fn reconnect_headline(accounts: &[Value], now: i64) -> Option<String> {
     let name = |account: &Value| {
-        account["email"]
-            .as_str()
-            .or(account["label"].as_str())
-            .unwrap_or("(unnamed)")
-            .to_string()
+        agent_account_name(
+            account["id"].as_str().unwrap_or("(unnamed)"),
+            account["label"].as_str().unwrap_or_default(),
+        )
+        .to_string()
     };
     let refused: Vec<String> = accounts
         .iter()
@@ -1634,10 +1641,8 @@ fn history_line(event: &CredentialEvent) -> String {
             initiator_line(event.initiator.as_ref())
         ),
         CredentialEventKind::Completed => {
+            // Never the login's email: agents read this.
             let mut line = format!("{at} — completed");
-            if let Some(email) = &event.email {
-                let _ = write!(line, " as {email}");
-            }
             if let Some(plan) = &event.plan {
                 let _ = write!(line, " ({plan})");
             }
@@ -1786,16 +1791,14 @@ fn pool_block(pool: &ProviderPoolSnapshot, label: &str, out: &mut String) {
         out.push('\n');
     }
     for account in &pool.accounts {
+        // The pool's label is the account's email where it has one, which
+        // the operator's usage views show; agents read the account's id.
+        let name = agent_account_name(&account.account_id, &account.label);
         let state = match account.state {
             ProviderPoolAccountState::Measured => "measured".to_string(),
             ProviderPoolAccountState::Unknown => "not measured yet".to_string(),
-            // The pool's label is the account's email where it has one, the
-            // name its owner signs in with.
             ProviderPoolAccountState::Blocked => match (&account.held, account.blocked_until) {
-                (Some(hold), _) => format!(
-                    "blocked: {}",
-                    hold.describe(&when(hold.since), &account.label)
-                ),
+                (Some(hold), _) => format!("blocked: {}", hold.describe(&when(hold.since), name)),
                 (None, Some(until)) => format!("blocked until {}", when(until)),
                 (None, None) => "blocked".to_string(),
             },
@@ -1804,7 +1807,7 @@ fn pool_block(pool: &ProviderPoolSnapshot, label: &str, out: &mut String) {
                 account.error.as_deref().unwrap_or("unknown error")
             ),
         };
-        let _ = write!(out, "- Account {}: {state}", account.label);
+        let _ = write!(out, "- Account {name}: {state}");
         if let Some(captured) = account.captured_at {
             let _ = write!(out, ", measured {}", when(captured));
         }
@@ -3374,6 +3377,50 @@ mod tests {
         );
     }
 
+    /// A signed-in account's label is its login's email; the accounts page
+    /// names it by id and shows neither, while an operator's own label stays.
+    #[test]
+    fn the_accounts_page_never_shows_an_account_email() {
+        let held = serde_json::json!({
+            "since": 1_790_000_000,
+            "kind": "terms_acceptance",
+            "detail": "Please accept the updated Consumer Terms.",
+        });
+        let signed_in = serde_json::json!({
+            "id": "acc_1",
+            "label": "work@example.com",
+            "email": "work@example.com",
+            "apiProvider": "anthropic",
+            "sortOrder": 0,
+            "health": {"held": held},
+        });
+        let mut out = String::new();
+        super::account_block(
+            &signed_in,
+            1_790_000_100,
+            &[],
+            &std::collections::HashMap::new(),
+            &mut out,
+        );
+        assert!(out.starts_with("- `acc_1` — "), "{out}");
+        assert!(out.contains("signed in as acc_1"), "{out}");
+        assert!(!out.contains('@'), "{out}");
+        assert!(!super::reconnect_headline(&[signed_in], 1_790_000_100)
+            .unwrap_or_default()
+            .contains('@'));
+
+        let keyed = serde_json::json!({"id": "acc_2", "label": "Team key", "sortOrder": 1});
+        let mut out = String::new();
+        super::account_block(
+            &keyed,
+            1_790_000_100,
+            &[],
+            &std::collections::HashMap::new(),
+            &mut out,
+        );
+        assert!(out.starts_with("- **Team key** `acc_2` — "), "{out}");
+    }
+
     #[test]
     fn a_held_pool_account_names_its_hold_and_the_act_that_lifts_it() {
         use cairn_models::types::pool::{build_provider_pool, PoolAccountInput};
@@ -3398,11 +3445,13 @@ mod tests {
         );
         let mut out = String::new();
         super::pool_block(&pool, "Claude (`claude`)", &mut out);
+        // Agents read this page, so the account is its id, never its email.
         let line = format!(
-            "- Account work@example.com: blocked: {}",
-            hold.describe(&super::when(hold.since), "work@example.com")
+            "- Account acc_1: blocked: {}",
+            hold.describe(&super::when(hold.since), "acc_1")
         );
         assert!(out.contains(&line), "{out}");
+        assert!(!out.contains("work@example.com"), "{out}");
         // A hold is not lifted by the timer beneath it.
         assert!(!out.contains("blocked until"), "{out}");
         assert!(
@@ -3570,7 +3619,7 @@ mod tests {
 
     fn signed_in(email: &str, expires_at: i64, source: &str) -> serde_json::Value {
         serde_json::json!({
-            "id": format!("acc_{email}"),
+            "id": format!("acc_{}", email.split('@').next().unwrap_or(email)),
             "label": email,
             "email": email,
             "signInExpiry": {"expiresAt": expires_at, "source": source},
@@ -3588,7 +3637,7 @@ mod tests {
         ];
         let headline = super::reconnect_headline(&accounts, now).unwrap();
         assert!(
-            headline.starts_with("**Next reconnect:** soon@example.com by "),
+            headline.starts_with("**Next reconnect:** acc_soon by "),
             "{headline}"
         );
         assert!(headline.contains("in 5 days"), "{headline}");
@@ -3603,7 +3652,7 @@ mod tests {
         accounts.push(signed_in("gone@example.com", now - 1, "inferred"));
         let headline = super::reconnect_headline(&accounts, now).unwrap();
         assert!(
-            headline.starts_with("**Reconnect now:** gone@example.com."),
+            headline.starts_with("**Reconnect now:** acc_gone."),
             "{headline}"
         );
         let gone = super::sign_in_line(&accounts[3], now).unwrap();

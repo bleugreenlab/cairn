@@ -35,7 +35,7 @@ pub const DEFINITIONS: &[KindDefinition] = &[
     KindDefinition {
         name: "rebuild",
         actor: "devops.rebuild",
-        dependency: "cairn/6386 request-driven rebuild adapter, cairn/6384 protected rebuild ledger/floor, cairn/6230 source stamp and cairn/6385 fleet phases",
+        dependency: "the macOS rebuild consumer, which only a macOS runner registers",
         acceptance_policy: AcceptancePolicy::OperatorCredential,
     },
     KindDefinition {
@@ -202,6 +202,17 @@ pub(crate) trait RequestConsumer: Send + Sync {
         orch: &Orchestrator,
         context: &AcceptedRequestContext,
     ) -> Result<(), String>;
+    /// A bounded, operator-proven request to stop an acting attempt. Consumers
+    /// without a safe stop point refuse; a cancel never settles the attempt by
+    /// itself, the actor's own outcome does.
+    async fn cancel(
+        &self,
+        _orch: &Orchestrator,
+        _context: &AcceptedRequestContext,
+        _operator: &cairn_common::identity::PrincipalRef,
+    ) -> Result<(), String> {
+        Err(format!("{} has no bounded cancel", self.kind()))
+    }
 }
 
 /// Registration is runner code, never a resource mutation, plugin payload or

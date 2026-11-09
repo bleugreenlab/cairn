@@ -1559,3 +1559,213 @@ pub fn planted_cwd_config_isolation(env: &ContractEnv, file: &str) -> CaseResult
         format!("{file}: planted process executed: {markers:?}")
     })
 }
+
+/// The account profile the CLI keeps under `oauthAccount` in its home's
+/// `.claude.json`, each identity field planted with its own canary.
+pub const EMAIL_CANARY: &str = "canary-email-5c1e@contract.invalid";
+pub const DISPLAY_NAME_CANARY: &str = "CANARY-display-name-93ab";
+pub const ORGANIZATION_CANARY: &str = "CANARY-organization-d07f";
+const IDENTITY_CANARIES: [(&str, &str); 3] = [
+    ("emailAddress", EMAIL_CANARY),
+    ("displayName", DISPLAY_NAME_CANARY),
+    ("organizationName", ORGANIZATION_CANARY),
+];
+
+/// How the CLI introduces the email: a `# userEmail` context block reading
+/// "The user's email address is …", in the first user message.
+const EMAIL_PARAGRAPH: [&str; 2] = ["# userEmail", "user's email address"];
+
+/// How a case's home holds the account profile.
+#[derive(Clone, Copy, Debug)]
+pub enum Identity {
+    /// Every identity field holds its canary.
+    Planted,
+    /// Every identity field is the empty string.
+    Blanked,
+    /// There is no `oauthAccount` at all.
+    Absent,
+}
+
+fn planted_cli_state(identity: Identity) -> Value {
+    let mut root = json!({
+        "numStartups": 3,
+        "userID": "contract-user-id-0000",
+        "hasCompletedOnboarding": true,
+    });
+    if !matches!(identity, Identity::Absent) {
+        let mut profile = json!({
+            "accountUuid": "00000000-0000-4000-8000-00000000c0de",
+            "organizationUuid": "00000000-0000-4000-8000-0000000000a1",
+            "profileFetchedAt": 1_762_000_000_000i64,
+        });
+        for (field, canary) in IDENTITY_CANARIES {
+            profile[field] = json!(match identity {
+                Identity::Blanked => "",
+                _ => canary,
+            });
+        }
+        root["oauthAccount"] = profile;
+    }
+    root
+}
+
+/// What one turn on a home planted with an account profile came to.
+struct IdentityTurn {
+    /// Which canaries any request sent the model.
+    sent: Vec<&'static str>,
+    paragraph: bool,
+    egress: Vec<String>,
+    /// Requests to the fake's own host that could fetch a profile.
+    profile_routes: Vec<String>,
+    /// The profile as the case planted it, and as the CLI left it.
+    before: Value,
+    after: Value,
+}
+
+impl IdentityTurn {
+    fn profile_unchanged(&self) -> bool {
+        self.before.get("oauthAccount") == self.after.get("oauthAccount")
+    }
+}
+
+/// Plant `identity` in the case's home, let `prepare` do to the home what a
+/// launch does, then run one turn and drain long enough for the CLI's
+/// delayed startup traffic (see [`no_egress`]).
+fn identity_turn(
+    c: Check,
+    env: &ContractEnv,
+    identity: Identity,
+    prepare: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<IdentityTurn, CaseFailure> {
+    let file = env.config.join(".claude.json");
+    let planted = serde_json::to_string_pretty(&planted_cli_state(identity)).unwrap();
+    c.setup(std::fs::write(&file, &planted), "planting .claude.json")?;
+    c.setup(prepare(&env.config), "preparing the home for launch")?;
+    let read = |what| {
+        c.setup(
+            std::fs::read_to_string(&file)
+                .map_err(|e| e.to_string())
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string())),
+            what,
+        )
+    };
+    let before = read("reading the prepared .claude.json")?;
+    env.fake.queue([Mode::Text]);
+    let mut session = launch(c, env, Launch::new())?;
+    session.ok_turn(c, "Say hello.")?;
+    session.drain(Duration::from_secs(14));
+    session.close();
+    let after = read("reading .claude.json after the turn")?;
+    let bodies: Vec<String> = env
+        .fake
+        .inference()
+        .iter()
+        .map(|served| served.body.to_string())
+        .collect();
+    Ok(IdentityTurn {
+        sent: IDENTITY_CANARIES
+            .iter()
+            .filter(|(_, canary)| env.fake.sent_to_the_model(canary))
+            .map(|(field, _)| *field)
+            .collect(),
+        paragraph: bodies
+            .iter()
+            .any(|body| EMAIL_PARAGRAPH.iter().any(|words| body.contains(words))),
+        egress: env.fake.egress(),
+        profile_routes: env
+            .fake
+            .served()
+            .iter()
+            .filter(|served| !served.is_inference())
+            .map(|served| format!("{} {}", served.method, served.target))
+            .filter(|route| {
+                let route = route.to_ascii_lowercase();
+                ["oauth", "profile", "account"]
+                    .iter()
+                    .any(|word| route.contains(word))
+            })
+            .collect(),
+        before,
+        after,
+    })
+}
+
+/// What the pinned CLI does with the account profile in its home, as measured
+/// for cairn/6338 (2.1.311, macOS):
+///
+/// | profile | turn | sent to the model | email paragraph | profile fetched | profile rewritten |
+/// |---|---|---|---|---|---|
+/// | planted | completes | `emailAddress` only | yes | no | no |
+/// | blanked | completes | nothing | no | no | no (stays blank) |
+/// | absent | completes | nothing | no | no | no (not recreated) |
+///
+/// The CLI rewrites `.claude.json` at every launch with its own bookkeeping
+/// (`firstStartTime`, `userID`, `machineID`, migrations, plugin usage), but
+/// carries `oauthAccount` through as it found it. So removing the email
+/// before launch holds for the whole session. A red here means a CLI bump
+/// changed one of those facts: re-measure before trusting
+/// `cairn_models::claude::home`.
+pub fn account_identity_probe(env: &ContractEnv, identity: Identity) -> CaseResult {
+    let c = Check("account_identity_probe");
+    let turn = identity_turn(c, env, identity, |_| Ok(()))?;
+    let sent = &turn.sent;
+    match identity {
+        Identity::Planted => {
+            c.that(sent == &["emailAddress"] && turn.paragraph, || {
+                format!(
+                    "planted: the CLI sent {sent:?} (paragraph: {}), not the email paragraph alone",
+                    turn.paragraph
+                )
+            })?;
+        }
+        Identity::Blanked | Identity::Absent => {
+            c.that(sent.is_empty() && !turn.paragraph, || {
+                format!(
+                    "{identity:?}: the CLI sent {sent:?} (paragraph: {})",
+                    turn.paragraph
+                )
+            })?;
+        }
+    }
+    c.that(
+        turn.egress.is_empty() && turn.profile_routes.is_empty(),
+        || {
+            format!(
+                "{identity:?}: the CLI reached for a profile: egress {:?}, routes {:?}",
+                turn.egress, turn.profile_routes
+            )
+        },
+    )?;
+    c.that(turn.profile_unchanged(), || {
+        format!(
+            "{identity:?}: the CLI rewrote oauthAccount from {} to {}",
+            turn.before["oauthAccount"], turn.after["oauthAccount"]
+        )
+    })
+}
+
+/// The gate on `cairn_models::claude::home`: a home planted with the whole
+/// account profile, prepared the way every managed launch prepares it, sends
+/// the model none of its identity, and the CLI does not write the email back.
+/// `prepare` is false only for the gate negative, which proves the case sees
+/// the paragraph when it is there.
+pub fn account_email_never_reaches_the_model(env: &ContractEnv, prepare: bool) -> CaseResult {
+    let c = Check("account_email_never_reaches_the_model");
+    let turn = identity_turn(c, env, Identity::Planted, |home| {
+        if prepare {
+            cairn_models::claude::home::strip_account_identity(home)?;
+        }
+        Ok(())
+    })?;
+    let sent = &turn.sent;
+    c.that(sent.is_empty() && !turn.paragraph, || {
+        format!(
+            "the model was sent the account's {sent:?} (email paragraph: {})",
+            turn.paragraph
+        )
+    })?;
+    let profile = &turn.after["oauthAccount"];
+    c.that(profile.get("emailAddress").is_none(), || {
+        format!("the CLI wrote the email back into its home: {profile}")
+    })
+}

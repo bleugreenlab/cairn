@@ -81,19 +81,20 @@ impl StepPreview {
     }
 
     /// The reply's line for this step. `now` marks a prediction, which each
-    /// step makes for itself at its own launch.
+    /// step makes for itself at its own launch. It names the model and effort
+    /// only, never the account or its usage.
     pub(crate) fn line(&self) -> String {
         let name = &self.name;
         match (&self.pick, &self.pin) {
-            (Ok(StepPick::Chosen(record)), _) => format!("{name} chose: {}", record.provenance),
+            (Ok(StepPick::Chosen(record)), _) => format!("{name} chose: {}", record.pick_line()),
             (Ok(_), Some(pin)) => format!("{name} pinned: {}", model_ref(pin)),
             (Ok(StepPick::Predicted(record)), None) => match self.allotment.as_slice() {
                 [AllotmentEntry::Model(model)] => format!("{name} = {} (exact)", model_ref(model)),
-                _ if self.depends_on.is_empty() => format!("{name} now: {}", record.provenance),
+                _ if self.depends_on.is_empty() => format!("{name} now: {}", record.pick_line()),
                 _ => format!(
                     "{name} now, after {}: {}",
                     self.depends_on.join(", "),
-                    record.provenance
+                    record.pick_line()
                 ),
             },
             (Ok(StepPick::PinnedUnplaced), None) => format!("{name} pinned"),

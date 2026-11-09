@@ -1348,31 +1348,51 @@ mod tests {
         );
     }
 
-    /// Once its retries are spent, a delegated agent fails terminally, which is
-    /// what tells the waiting parent.
+    /// Once its retries are spent, a delegated agent holds rather than failing
+    /// its parent (cairn/6069): at capacity is a want of supply that waiting
+    /// cures. Codex declares no reset and none is inferred, so the hold
+    /// re-checks on the bounded clock, and its parent stays parked on it,
+    /// counting it as pending rather than gone, until that re-check (or a
+    /// change to the accounts) releases it onto the same session.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_delegated_agent_whose_capacity_retries_are_spent_fails_for_its_parent() {
+    async fn a_delegated_agent_whose_capacity_retries_are_spent_holds_and_its_parent_waits() {
+        use crate::messages::delivery::{describe_hold, Hold};
+        use crate::orchestrator::wakes::{
+            load_active_provider_limit_holds, resolve_provider_limit_hold, SUPPLY_RECHECK_SECS,
+        };
+
         let (db, orch) = persistent_codex_turn(
             "codex-capacity-delegated-spent",
             "UPDATE jobs SET parent_job_id='pj' WHERE id='j';",
         )
         .await;
-        // `t` is already the third retry in a row.
+        // `t` is already the third retry in a row, and the parent is parked on
+        // the child's packet.
         db.execute_script(
             "INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('t0','s','j',-2,'interrupted','initial',0,0);
              INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at) VALUES('ta','s','j',-1,'t0','interrupted','retry',0,0);
              INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at) VALUES('tb','s','j',0,'ta','interrupted','retry',0,0);
-             UPDATE turns SET start_reason='retry', predecessor_id='tb' WHERE id='t';",
+             UPDATE turns SET start_reason='retry', predecessor_id='tb' WHERE id='t';
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e','recipe','i','p','running',1,1);
+             INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('ps','pj','codex','open',1,1,1);
+             INSERT INTO turns(id,session_id,job_id,sequence,state,yield_reason,start_reason,created_at,updated_at) VALUES('pt','ps','pj',1,'yielded','dependency_wait','initial',1,1);
+             UPDATE jobs SET current_turn_id='pt',current_session_id='ps' WHERE id='pj';
+             INSERT INTO delegated_packets(execution_id,id,seq,parent_job_id,parent_turn_id,result_artifact_job_id,status,spec,created_at) VALUES('e','packet','1','pj','pt','j','running','{}',1);",
         )
         .await
         .unwrap();
         read_notifications(&orch, &db, vec![provider_error(CAPACITY)]);
 
         assert_eq!(
-            text(&db, "SELECT state FROM turns WHERE id='t'")
-                .await
-                .as_deref(),
-            Some("failed")
+            text(
+                &db,
+                "SELECT state || '/' || COALESCE(yield_reason,'') FROM turns WHERE id='t'"
+            )
+            .await
+            .as_deref(),
+            Some("yielded/provider_limit"),
+            "spent retries hold the turn, not fail it"
         );
         assert_eq!(
             db.query_opt_i64("SELECT COUNT(*) FROM turns WHERE predecessor_id='t'", ())
@@ -1381,13 +1401,79 @@ mod tests {
             Some(0),
             "no fourth retry"
         );
-        let errors = text(
-            &db,
-            "SELECT group_concat(json_extract(data,'$.content'), ' | ') FROM events WHERE event_type='system:error'",
-        )
-        .await
-        .unwrap_or_default();
-        assert!(errors.contains("remained at capacity"), "{errors}");
+        assert_ne!(
+            text(&db, "SELECT status FROM jobs WHERE id='j'")
+                .await
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            text(
+                &db,
+                "SELECT status FROM delegated_packets WHERE id='packet'"
+            )
+            .await
+            .as_deref(),
+            Some("running"),
+            "the packet is not resolved, so the parent is not told the child is gone"
+        );
+        assert!(orch.process_state.is_warm("r"), "the process stays warm");
+
+        let holds = load_active_provider_limit_holds(&db).await.unwrap();
+        let [hold] = holds.as_slice() else {
+            panic!("one active hold owns the yielded head: {holds:?}");
+        };
+        assert_eq!(
+            (hold.job_id.as_str(), hold.turn_id.as_deref()),
+            ("j", Some("t"))
+        );
+        assert_eq!(hold.retry_not_before, None, "no reset is inferred");
+        let due = hold.updated_at + SUPPLY_RECHECK_SECS;
+        assert_eq!(hold.next_due_at(), Some(due), "a bounded re-check");
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE data LIKE '%selected_model_capacity_hold%'",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1),
+            "the hold says what it waits for and when it asks again"
+        );
+
+        assert_eq!(
+            describe_hold(&db, "j").await,
+            Some(Hold::ProviderLimit {
+                retry_not_before: None
+            }),
+            "the child reads as held"
+        );
+        assert_eq!(
+            describe_hold(&db, "pj").await,
+            Some(Hold::Tasks { pending: 1 }),
+            "the parent reads as waiting on it"
+        );
+
+        assert!(
+            !resolve_provider_limit_hold(&orch, hold, due - 1)
+                .await
+                .unwrap(),
+            "nothing releases it before the re-check"
+        );
+        assert!(
+            resolve_provider_limit_hold(&orch, hold, due).await.unwrap(),
+            "the re-check releases it"
+        );
+        assert_eq!(
+            text(
+                &db,
+                "SELECT t.start_reason || '/' || t.session_id FROM jobs j JOIN turns t ON t.id=j.current_turn_id WHERE j.id='j'"
+            )
+            .await
+            .as_deref(),
+            Some("wait_resolved/s"),
+            "it resumes on the same session"
+        );
     }
 
     /// Any other fatal provider error on a top-level job ends the turn, not the

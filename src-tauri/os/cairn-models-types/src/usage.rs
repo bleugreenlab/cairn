@@ -125,6 +125,20 @@ impl AccountHoldKind {
     }
 }
 
+/// How text an agent reads names a provider account: by the label its
+/// operator gave it, or by its id when that label is an email address, as a
+/// signed-in account's is (sign-in labels it with the login's email). An
+/// agent never needs to know who an account belongs to, and an address in a
+/// model's context is one it can write into a request it composes; the
+/// operator's own surfaces (Settings) keep showing the email.
+pub fn agent_account_name<'a>(id: &'a str, label: &'a str) -> &'a str {
+    if label.trim().is_empty() || label.contains('@') {
+        id
+    } else {
+        label
+    }
+}
+
 impl AccountHold {
     /// The hold as one operator-facing line: what stands in the way, since
     /// when, the provider's own words, and the act that lifts it. `since` is
@@ -516,6 +530,14 @@ impl MeteredUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_reads_an_email_labelled_account_by_its_id() {
+        assert_eq!(agent_account_name("acc_1", "ada@example.com"), "acc_1");
+        assert_eq!(agent_account_name("acc_1", "work: ada@x"), "acc_1");
+        assert_eq!(agent_account_name("acc_1", " "), "acc_1");
+        assert_eq!(agent_account_name("acc_1", "Team key"), "Team key");
+    }
 
     #[test]
     fn a_meter_serializes_its_modality_only_when_it_names_one() {

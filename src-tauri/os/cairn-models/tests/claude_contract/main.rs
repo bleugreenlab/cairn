@@ -143,3 +143,40 @@ fn planted_cwd_local_settings() {
 fn planted_cwd_mcp() {
     pass(cases::planted_cwd_config_isolation(&env(), ".mcp.json"));
 }
+
+#[test]
+fn account_email_never_reaches_the_model() {
+    pass(cases::account_email_never_reaches_the_model(&env(), true));
+}
+
+/// Not a relay surface: the home keeps the email Cairn's launch preparation
+/// would remove, which the pinned CLI sends.
+#[test]
+fn negative_account_email_kept() {
+    red(
+        "account_email_never_reaches_the_model",
+        cases::account_email_never_reaches_the_model(&env(), false),
+    );
+}
+
+#[test]
+fn account_identity_probe_planted() {
+    pass(cases::account_identity_probe(
+        &env(),
+        cases::Identity::Planted,
+    ));
+}
+#[test]
+fn account_identity_probe_blanked() {
+    pass(cases::account_identity_probe(
+        &env(),
+        cases::Identity::Blanked,
+    ));
+}
+#[test]
+fn account_identity_probe_absent() {
+    pass(cases::account_identity_probe(
+        &env(),
+        cases::Identity::Absent,
+    ));
+}

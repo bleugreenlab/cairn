@@ -91,6 +91,19 @@ pub struct SelectionRecord {
     pub subject: SelectionSubject,
 }
 
+impl SelectionRecord {
+    /// What was asked for and what was chosen at what effort, without the
+    /// supply clause: the account a launch will run on is decided at the
+    /// launch, and an agent filing work has no use for it.
+    pub fn pick_line(&self) -> String {
+        supply::pick_line(
+            &self.requirement.note,
+            &model_ref(&self.chosen),
+            self.extras.reasoning_effort.as_deref(),
+        )
+    }
+}
+
 /// Where a selection was made. Set by the launch that stores the record.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

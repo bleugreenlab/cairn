@@ -701,6 +701,49 @@ pub async fn decline(
     require_request(orch, id).await
 }
 
+/// Operator-proven bounded cancel of an acting attempt. The consumer decides
+/// whether its actor can still stop safely; the attempt settles only through
+/// the actor's own reported outcome.
+pub async fn cancel(
+    orch: &Orchestrator,
+    id: &str,
+    principal: &PrincipalRef,
+    appearance: &AppearanceSnapshot,
+) -> Result<OperatorRequest, String> {
+    validate_operator(principal, appearance)?;
+    let request = require_request(orch, id).await?;
+    if request.state != RequestState::Acting {
+        return Err("Only an acting operator request can be cancelled".into());
+    }
+    let attempt = request
+        .attempts
+        .iter()
+        .find(|attempt| {
+            attempt.state == RequestState::Acting
+                && request.current_attempt.as_deref() == Some(attempt.id.as_str())
+        })
+        .or_else(|| {
+            request
+                .attempts
+                .iter()
+                .find(|attempt| attempt.state == RequestState::Acting)
+        })
+        .ok_or("The request has no acting attempt to cancel")?;
+    let adapter = orch.operator_requests.consumer(request.kind.as_str())?;
+    let context = recover_claimed_request(
+        orch,
+        &attempt.authorization_event_id,
+        &attempt.acceptance,
+        adapter.clone(),
+    )
+    .await?;
+    adapter
+        .cancel(orch, &context, principal)
+        .await
+        .map_err(scrub_text)?;
+    require_request(orch, id).await
+}
+
 /// A runner-owned checked reference, deliberately neither serializable nor
 /// constructible outside this module. Rechecking is required before each live
 /// privileged operation; owning this value does not freeze live policy.
@@ -724,6 +767,13 @@ impl AcceptedRequestContext {
     #[allow(dead_code)] // Runner adapter API, not an agent resource.
     pub(crate) fn acceptance(&self) -> &RequestAcceptance {
         &self.acceptance
+    }
+
+    /// The journal record this context was checked against; a consumer names
+    /// it in its own physical records, never presents it as authority.
+    #[allow(dead_code)] // Read by the macOS rebuild consumer.
+    pub(crate) fn authorization_event_id(&self) -> &str {
+        &self.event_id
     }
 
     pub(crate) async fn recheck(&self, orch: &Orchestrator) -> Result<(), String> {

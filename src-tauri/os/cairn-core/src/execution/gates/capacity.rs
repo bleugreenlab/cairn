@@ -2550,32 +2550,33 @@ pub(crate) mod tests {
             .execute("UPDATE jobs SET status = 'complete' WHERE id = 'sj100'", ())
             .await
             .unwrap();
-        held_launch(&env, 101).await;
+        // `full_fleet` already holds issues 100 through 104.
+        held_launch(&env, 110).await;
         env.db
             .execute_script(
                 "UPDATE issues SET
-                   parent_issue_id = (SELECT parent_issue_id FROM issues WHERE id = 'si1'),
-                   parent_thread_id = (SELECT parent_thread_id FROM issues WHERE id = 'si1')
-                 WHERE id = 'si101';",
+                   parent_issue_id = (SELECT parent_issue_id FROM issues WHERE id = 'i1'),
+                   parent_thread_id = (SELECT parent_thread_id FROM issues WHERE id = 'i1')
+                 WHERE id = 'si110';",
             )
             .await
             .unwrap();
         assert!(
-            !fits(&env, 101, true).await,
+            !fits(&env, 110, true).await,
             "new work keeps the order its lane's owner set"
         );
-        assert!(fits(&env, 101, false).await, "interrupted work goes ahead");
+        assert!(fits(&env, 110, false).await, "interrupted work goes ahead");
 
         add_issue(&env, 200, None).await;
         env.db
             .execute_script(
                 "UPDATE issues SET parent_issue_id = 'si200', parent_thread_id = NULL
-                 WHERE id = 'si101';",
+                 WHERE id = 'si110';",
             )
             .await
             .unwrap();
         assert!(
-            fits(&env, 101, true).await,
+            fits(&env, 110, true).await,
             "another lane's queue is not its own"
         );
     }

@@ -24,6 +24,9 @@ use crate::interface::CatalogProvider;
 #[serde(rename_all = "camelCase")]
 pub struct SupplyAccount {
     pub id: String,
+    /// The account as agents read it
+    /// ([`cairn_models_types::usage::agent_account_name`]): this rides the
+    /// provenance line and the stored selection, both agent-facing.
     pub label: String,
 }
 
@@ -200,7 +203,11 @@ pub fn supply_for(
                 cost: first.cost,
                 account: Some(SupplyAccount {
                     id: first.account.id.clone(),
-                    label: first.account.label.clone(),
+                    label: cairn_models_types::usage::agent_account_name(
+                        &first.account.id,
+                        &first.account.label,
+                    )
+                    .to_string(),
                 }),
             });
         }
@@ -283,15 +290,21 @@ pub fn provenance_line(
     clause: &str,
     notes: &[String],
 ) -> String {
-    let mut line = format!("{asked} → {chosen}");
-    if let Some(effort) = effort {
-        line.push_str(&format!(" @ {effort}"));
-    }
+    let mut line = pick_line(asked, chosen, effort);
     line.push_str(&format!(": {clause}"));
     for note in notes {
         line.push_str(&format!("; {note}"));
     }
     line
+}
+
+/// What was asked for and what was chosen at what effort, without the supply
+/// clause: `lg = top of [sm, md, lg] → claude/opus @ medium`.
+pub fn pick_line(asked: &str, chosen: &str, effort: Option<&str>) -> String {
+    match effort {
+        Some(effort) => format!("{asked} → {chosen} @ {effort}"),
+        None => format!("{asked} → {chosen}"),
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +367,10 @@ mod tests {
                 &["band relaxed md→lg (no non-Anthropic md model in allotment)".into()],
             ),
             "md (band relaxed) → openrouter/anthropic/claude-sonnet-4.5: OpenRouter: metered $3.00/$15.00 per Mtok; band relaxed md→lg (no non-Anthropic md model in allotment)"
+        );
+        assert_eq!(
+            pick_line("lg = top of [sm, md, lg]", "claude/opus", Some("medium")),
+            "lg = top of [sm, md, lg] → claude/opus @ medium"
         );
         let claude = subscription("mitch", week(22.0, 72.0, None));
         assert_eq!(

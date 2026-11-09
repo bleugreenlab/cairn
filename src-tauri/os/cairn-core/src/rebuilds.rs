@@ -484,7 +484,7 @@ fn job_state(code: Option<i32>, stderr: &str) -> ActorState {
 }
 
 #[cfg(target_os = "macos")]
-async fn actor_state() -> ActorState {
+pub(crate) async fn actor_state() -> ActorState {
     // SAFETY: geteuid has no preconditions.
     let target = format!("gui/{}/computer.cairn.rebuild", unsafe { libc::geteuid() });
     let mut command = tokio::process::Command::new("/bin/launchctl");
@@ -517,6 +517,10 @@ pub async fn start(db: std::sync::Arc<LocalDb>, root: PathBuf) {
         }
     });
 }
+
+// Requests drive only the macOS desktop rebuild; other runners never register it.
+#[cfg(target_os = "macos")]
+pub(crate) mod consumer;
 
 #[cfg(test)]
 mod tests;

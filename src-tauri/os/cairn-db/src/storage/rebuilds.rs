@@ -1,7 +1,8 @@
 //! Private, per-install rebuild history. Filesystem trust and strict JournalEvent
 //! validation belong to the runner; this module consumes only validated events.
-use super::{DbError, DbResult, LocalDb, RowExt};
+use super::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
 use crate::turso::params;
+use cairn_common::requests::RequestAttemptOutcome;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -56,6 +57,43 @@ pub struct RebuildRecord {
     pub facts: Value,
     pub events: Vec<Value>,
     pub faults: Vec<IngestionFault>,
+    /// The request consumer's launch record; absent for a rebuild no request launched.
+    #[serde(default)]
+    pub launch: Option<LaunchIntent>,
+    /// The report the consumer froze before handing it to the request primitive.
+    #[serde(default)]
+    pub consumer_report: Option<FrozenReport>,
+}
+
+/// What the runner commits to before it stages an actor: the checked attempt it
+/// launches under. It is the consumer's record of its own act, never authority;
+/// authority stays in the request acceptance journal it names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaunchIntent {
+    pub request_ids: Vec<String>,
+    pub attempt_id: String,
+    pub authorization_event_id: String,
+    pub kind: String,
+    pub target: Option<String>,
+    pub commit: String,
+    pub facts_version: i64,
+    pub recorded_at: i64,
+    /// Recorded durably immediately before `launchctl bootstrap`. Absent means
+    /// no actor was ever launched under this attempt, whatever launchd shows.
+    pub bootstrap_requested_at: Option<i64>,
+}
+
+/// A consumer report frozen before it is sent, so a crash between the request
+/// primitive's commit and this ledger's acknowledgement replays the same bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FrozenReport {
+    pub receipt_id: String,
+    pub outcome: RequestAttemptOutcome,
+    pub document: Value,
+    pub settled: bool,
+    pub built_commit: Option<String>,
+    pub frozen_at: i64,
+    pub acknowledged_at: Option<i64>,
 }
 
 impl RebuildRecord {
@@ -95,6 +133,8 @@ impl RebuildRecord {
             facts: json!({}),
             events: vec![],
             faults: vec![],
+            launch: None,
+            consumer_report: None,
         }
     }
 
@@ -330,6 +370,186 @@ pub async fn list(db: &LocalDb, limit: usize, offset: usize) -> DbResult<Vec<Reb
         |row| Ok(decode(row)?.row),
     )
     .await
+}
+
+async fn load(conn: &TrackedConnection, id: &str) -> DbResult<Option<Ledger>> {
+    let mut rows = conn
+        .query(
+            &format!("SELECT {COLUMNS} FROM rebuilds WHERE id=?1"),
+            (id.to_string(),),
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(decode(&row)?)),
+        None => Ok(None),
+    }
+}
+
+async fn save(conn: &TrackedConnection, id: &str, ledger: &Ledger) -> DbResult<()> {
+    let serialized = serde_json::to_string(ledger).map_err(|e| DbError::Row(e.to_string()))?;
+    conn.execute(
+        "UPDATE rebuilds SET record_json=?2 WHERE id=?1",
+        params![id.to_string(), serialized],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Create the ledger row a request launch acts under. One attempt has one row:
+/// an existing row is refused, never adopted, so no second launch can share it.
+pub async fn record_launch_intent(
+    db: &LocalDb,
+    id: &str,
+    intent: LaunchIntent,
+) -> DbResult<RebuildRecord> {
+    let id = id.to_string();
+    db.write(move |conn| {
+        let id = id.clone();
+        let intent = intent.clone();
+        Box::pin(async move {
+            if load(conn, &id).await?.is_some() {
+                return Err(DbError::Row(format!(
+                    "rebuild {id} already has a ledger row; a launch is never repeated"
+                )));
+            }
+            let mut row = RebuildRecord::new(id.clone());
+            row.launch = Some(intent.clone());
+            let ledger = Ledger {
+                row,
+                receipts: vec![],
+            };
+            let serialized =
+                serde_json::to_string(&ledger).map_err(|e| DbError::Row(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO rebuilds (id,record_json,request_id,attempt_id,authorization_event_id) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    id.clone(),
+                    serialized,
+                    intent.request_ids.first().cloned(),
+                    intent.attempt_id.clone(),
+                    intent.authorization_event_id.clone()
+                ],
+            )
+            .await?;
+            Ok(load(conn, &id).await?.expect("inserted row").row)
+        })
+    })
+    .await
+}
+
+/// Record that bootstrap is about to be requested. Written before the call, so
+/// a crash mid-call leaves liveness to launchd rather than to an assumption.
+pub async fn mark_bootstrap_requested(db: &LocalDb, id: &str, at: i64) -> DbResult<()> {
+    let id = id.to_string();
+    db.write(move |conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            let mut ledger = load(conn, &id)
+                .await?
+                .ok_or_else(|| DbError::Row(format!("rebuild {id} has no ledger row")))?;
+            let launch = ledger
+                .row
+                .launch
+                .as_mut()
+                .ok_or_else(|| DbError::Row(format!("rebuild {id} has no launch intent")))?;
+            if launch.bootstrap_requested_at.is_some() {
+                return Err(DbError::Row(format!(
+                    "rebuild {id} was already bootstrapped; a launch is never repeated"
+                )));
+            }
+            launch.bootstrap_requested_at = Some(at);
+            save(conn, &id, &ledger).await
+        })
+    })
+    .await
+}
+
+/// Freeze the consumer's report once. A second freeze returns the first one
+/// unchanged, so replay after a crash always sends identical bytes.
+pub async fn freeze_report(db: &LocalDb, id: &str, report: FrozenReport) -> DbResult<FrozenReport> {
+    let id = id.to_string();
+    db.write(move |conn| {
+        let id = id.clone();
+        let report = report.clone();
+        Box::pin(async move {
+            let mut ledger = load(conn, &id)
+                .await?
+                .ok_or_else(|| DbError::Row(format!("rebuild {id} has no ledger row")))?;
+            if let Some(existing) = &ledger.row.consumer_report {
+                return Ok(existing.clone());
+            }
+            ledger.row.consumer_report = Some(report.clone());
+            save(conn, &id, &ledger).await?;
+            Ok(report)
+        })
+    })
+    .await
+}
+
+/// The request primitive holds this exact receipt; the consumer is finished.
+pub async fn acknowledge_report(db: &LocalDb, id: &str, receipt: &str, at: i64) -> DbResult<()> {
+    let id = id.to_string();
+    let receipt = receipt.to_string();
+    db.write(move |conn| {
+        let id = id.clone();
+        let receipt = receipt.clone();
+        Box::pin(async move {
+            let mut ledger = load(conn, &id)
+                .await?
+                .ok_or_else(|| DbError::Row(format!("rebuild {id} has no ledger row")))?;
+            let report = ledger
+                .row
+                .consumer_report
+                .as_mut()
+                .filter(|report| report.receipt_id == receipt)
+                .ok_or_else(|| DbError::Row(format!("rebuild {id} froze no report {receipt}")))?;
+            if report.acknowledged_at.is_none() {
+                report.acknowledged_at = Some(at);
+                save(conn, &id, &ledger).await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// Rows a request launched whose report the primitive has not acknowledged.
+pub async fn unacknowledged_launches(db: &LocalDb) -> DbResult<Vec<RebuildRecord>> {
+    let rows = db
+        .query_all(
+            format!("SELECT {COLUMNS} FROM rebuilds WHERE attempt_id IS NOT NULL ORDER BY created_at,id"),
+            (),
+            |row| Ok(decode(row)?.row),
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            row.launch.is_some()
+                && row
+                    .consumer_report
+                    .as_ref()
+                    .is_none_or(|report| report.acknowledged_at.is_none())
+        })
+        .collect())
+}
+
+/// Completed `build` phase durations, newest rebuilds first, in seconds.
+pub async fn build_durations(db: &LocalDb, limit: usize) -> DbResult<Vec<i64>> {
+    let rows = list(db, limit, 0).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let phase =
+                row.phases.iter().rev().find(|phase| {
+                    phase.name == "build" && phase.outcome.as_deref() == Some("ok")
+                })?;
+            let started = chrono::DateTime::parse_from_rfc3339(phase.started.as_deref()?).ok()?;
+            let ended = chrono::DateTime::parse_from_rfc3339(phase.ended.as_deref()?).ok()?;
+            let seconds = (ended - started).num_seconds();
+            (seconds >= 0).then_some(seconds)
+        })
+        .collect())
 }
 
 impl LocalDb {
@@ -587,6 +807,153 @@ mod tests {
         assert!(row.old_commit.is_none() && row.new_commit.is_none());
         assert_eq!(row.facts["request_id"], "forged");
         assert_eq!(db.get_rebuild("r").await.unwrap().unwrap(), row);
+    }
+
+    fn launch_intent(attempt: &str) -> LaunchIntent {
+        LaunchIntent {
+            request_ids: vec!["request".into()],
+            attempt_id: attempt.into(),
+            authorization_event_id: "event".into(),
+            kind: "rebuild".into(),
+            target: None,
+            commit: "b".repeat(40),
+            facts_version: 3,
+            recorded_at: 1,
+            bootstrap_requested_at: None,
+        }
+    }
+
+    fn frozen(receipt: &str, outcome: RequestAttemptOutcome) -> FrozenReport {
+        FrozenReport {
+            receipt_id: receipt.into(),
+            outcome,
+            document: json!({"rebuild":"cairn://rebuilds/r"}),
+            settled: true,
+            built_commit: None,
+            frozen_at: 2,
+            acknowledged_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_attempt_has_one_launch_row_and_one_bootstrap() {
+        let db = migrated_test_db("rebuild-launch").await;
+        let row = record_launch_intent(&db, "r", launch_intent("attempt"))
+            .await
+            .unwrap();
+        assert_eq!(row.status, "acting");
+        assert_eq!(row.attempt_id.as_deref(), Some("attempt"));
+        assert_eq!(row.request_id.as_deref(), Some("request"));
+        assert_eq!(row.authorization_event_id.as_deref(), Some("event"));
+        assert!(record_launch_intent(&db, "r", launch_intent("attempt"))
+            .await
+            .is_err());
+        mark_bootstrap_requested(&db, "r", 5).await.unwrap();
+        assert!(mark_bootstrap_requested(&db, "r", 6).await.is_err());
+        let row = get(&db, "r").await.unwrap().unwrap();
+        assert_eq!(row.launch.unwrap().bootstrap_requested_at, Some(5));
+        // A journal-only row (an operator-era rebuild) cannot be bootstrapped.
+        ingest(
+            &db,
+            "plain",
+            vec![phase("p", "build", "started")],
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(mark_bootstrap_requested(&db, "plain", 1).await.is_err());
+        // Ingestion keeps the consumer's launch record.
+        ingest(
+            &db,
+            "r",
+            vec![phase("s", "build", "started")],
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(get(&db, "r").await.unwrap().unwrap().launch.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_frozen_report_replays_unchanged_until_acknowledged() {
+        let db = migrated_test_db("rebuild-frozen").await;
+        record_launch_intent(&db, "r", launch_intent("attempt"))
+            .await
+            .unwrap();
+        record_launch_intent(&db, "s", launch_intent("other"))
+            .await
+            .unwrap();
+        ingest(
+            &db,
+            "plain",
+            vec![phase("p", "build", "started")],
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        let ids = |rows: Vec<RebuildRecord>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(ids(unacknowledged_launches(&db).await.unwrap()), ["r", "s"]);
+        let first = freeze_report(&db, "r", frozen("receipt", RequestAttemptOutcome::Failed))
+            .await
+            .unwrap();
+        // A second decision never replaces the first.
+        let again = freeze_report(&db, "r", frozen("other", RequestAttemptOutcome::Done))
+            .await
+            .unwrap();
+        assert_eq!(again, first);
+        assert!(acknowledge_report(&db, "r", "other", 3).await.is_err());
+        acknowledge_report(&db, "r", "receipt", 3).await.unwrap();
+        acknowledge_report(&db, "r", "receipt", 4).await.unwrap();
+        let row = get(&db, "r").await.unwrap().unwrap();
+        assert_eq!(row.consumer_report.unwrap().acknowledged_at, Some(3));
+        assert_eq!(ids(unacknowledged_launches(&db).await.unwrap()), ["s"]);
+    }
+
+    #[tokio::test]
+    async fn expected_duration_reads_completed_build_phases() {
+        let db = migrated_test_db("rebuild-durations").await;
+        let at = |id: &str, name: &str, state: &str, at: &str, outcome: Option<&str>| {
+            let mut value =
+                json!({"event":id,"rebuild":"r","at":at,"type":"phase","name":name,"state":state});
+            if let Some(outcome) = outcome {
+                value["outcome"] = json!(outcome);
+            }
+            (id.to_string(), value.to_string(), value)
+        };
+        ingest(
+            &db,
+            "r",
+            vec![
+                at("a", "build", "started", "2026-11-07T14:00:00Z", None),
+                at("b", "build", "ended", "2026-11-07T14:10:00Z", Some("ok")),
+            ],
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        ingest(
+            &db,
+            "failed-build",
+            vec![
+                at("c", "build", "started", "2026-11-07T14:00:00Z", None),
+                at(
+                    "d",
+                    "build",
+                    "ended",
+                    "2026-11-07T14:01:00Z",
+                    Some("failed"),
+                ),
+            ],
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(build_durations(&db, 10).await.unwrap(), [600]);
     }
 
     #[tokio::test]
