@@ -249,6 +249,111 @@ pub(super) async fn journal_publication_outcome(
     .await
 }
 
+/// Journal the outcome of a publication origin accepted, as the merge that
+/// drove it records it. Recovery settles a publication only once nothing in
+/// this process drives it, so finding its outcome already written means a
+/// recovery pass got there first (another process, or a mark that lapsed).
+/// The same landed commit is the same fact, recorded once: not an error. Any
+/// other settlement contradicts what this merge landed, and is returned.
+pub(super) async fn journal_accepted_publication(
+    db: &LocalDb,
+    attempt: &MergeAttemptJournal<'_>,
+    publication: &Publication,
+    detail: Option<String>,
+) -> Result<(), String> {
+    let outcome = PublicationOutcome::Accepted { detail };
+    let Err(error) = journal_publication_outcome(db, attempt, publication, &outcome).await else {
+        return Ok(());
+    };
+    let settled = db
+        .query_opt(
+            "SELECT state, detail FROM merge_attempt_events
+              WHERE attempt_id = ?1 AND sequence = ?2",
+            params![attempt.attempt_id, OUTCOME_SEQUENCE],
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .map_err(|read| format!("{error} (and its existing outcome is unreadable: {read})"))?;
+    let Some((state, settled_detail)) = settled else {
+        return Err(error);
+    };
+    let landed = settled_detail
+        .as_deref()
+        .and_then(|detail| serde_json::from_str::<serde_json::Value>(detail).ok())
+        .and_then(|detail| detail.get("landedCommit")?.as_str().map(str::to_string));
+    let ours = &publication.landing_commit;
+    match (state.as_str(), landed.as_deref()) {
+        ("succeeded", Some(commit)) if commit == ours => {
+            log::info!(
+                "landing: publication {} of {ours} was already settled as landed by recovery; \
+                 its outcome stands as recorded",
+                attempt.attempt_id
+            );
+            Ok(())
+        }
+        (state, landed) => Err(format!(
+            "The merge landed {ours} on `{}`, but the journal already settles its publication {} \
+             as `{state}` with landed commit {}. The two records contradict each other; the \
+             landing on origin is what to check.",
+            publication.target_branch,
+            attempt.attempt_id,
+            landed.unwrap_or("(none)"),
+        )),
+    }
+}
+
+/// The merge attempt an ordinary publication belongs to: the landing loop
+/// journals each publication as `{attempt}-publication-{n}`. Any other attempt
+/// (an approval ceremony's) publishes under its own id.
+fn base_attempt_id(attempt_id: &str) -> &str {
+    attempt_id
+        .rsplit_once("-publication-")
+        .filter(|(_, n)| n.parse::<u32>().is_ok())
+        .map_or(attempt_id, |(base, _)| base)
+}
+
+/// Who a recovered landing is attributed to: the principal that started the
+/// merge, as the merge command journaled it at sequence 0 of the base attempt,
+/// under the recovery surface. Only when that is unreadable does the attempt
+/// itself stand in.
+async fn recovery_attribution(db: &LocalDb, attempt_id: &str) -> PrResolutionAttribution {
+    let decision = db
+        .query_opt(
+            "SELECT authority_decision_json FROM merge_attempt_events
+              WHERE attempt_id = ?1 AND sequence = 0",
+            params![base_attempt_id(attempt_id).to_string()],
+            |row| row.opt_text(0),
+        )
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    decision
+        .as_deref()
+        .and_then(initiating_attribution)
+        .unwrap_or_else(|| PrResolutionAttribution::internal(RECOVERY_SURFACE, attempt_id))
+}
+
+/// The initiating actor of a sequence-0 `authority_decision_json`.
+fn initiating_attribution(decision: &str) -> Option<PrResolutionAttribution> {
+    let decision: serde_json::Value = serde_json::from_str(decision).ok()?;
+    let actor_kind = match decision.get("legacyActorKind")?.as_str()? {
+        "operator-ui" => "operator-ui",
+        "operator-cli" => "operator-cli",
+        "agent" => "agent",
+        "internal" => "internal",
+        _ => return None,
+    };
+    Some(PrResolutionAttribution {
+        actor_kind,
+        actor_identity: decision
+            .get("legacyActorIdentity")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        surface: RECOVERY_SURFACE,
+    })
+}
+
 /// What settling GitHub after a landing did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitHubSettlement {
@@ -734,10 +839,7 @@ async fn settle_publication(
             resolve_pr_node_landed(
                 orch,
                 &pending.job_id,
-                Some(PrResolutionAttribution::internal(
-                    RECOVERY_SURFACE,
-                    pending.attempt_id.clone(),
-                )),
+                Some(recovery_attribution(db, &pending.attempt_id).await),
                 Landed {
                     commit: Some(&commit),
                     source: Some(source),
@@ -1055,6 +1157,7 @@ pub(super) async fn reconcile_landing_for(
 
 #[cfg(test)]
 mod tests {
+    use super::super::default_landing::PublicationInFlight;
     use super::*;
     use crate::db::DbState;
     use crate::execution::gates::vocabulary::{
@@ -1339,10 +1442,14 @@ mod tests {
         }
 
         async fn journal_states(&self) -> Vec<String> {
+            self.journal_states_of("attempt-1").await
+        }
+
+        async fn journal_states_of(&self, attempt_id: &str) -> Vec<String> {
             self.db
                 .query_all(
-                    "SELECT state FROM merge_attempt_events WHERE attempt_id = 'attempt-1' ORDER BY sequence",
-                    (),
+                    "SELECT state FROM merge_attempt_events WHERE attempt_id = ?1 ORDER BY sequence",
+                    params![attempt_id.to_string()],
                     |row| row.text(0),
                 )
                 .await
@@ -1359,8 +1466,14 @@ mod tests {
         }
 
         async fn journal_intent(&self, publication: &Publication) {
+            self.journal_intent_as("attempt-1", publication).await;
+        }
+
+        /// The in-flight set is process-wide, so a test that holds an attempt
+        /// in flight journals it under an id no other test uses.
+        async fn journal_intent_as(&self, attempt_id: &str, publication: &Publication) {
             let attempt = MergeAttemptJournal {
-                attempt_id: "attempt-1",
+                attempt_id,
                 project_id: "proj-gh",
                 merge_request_id: "mr-gh",
                 job_id: self.job,
@@ -1842,6 +1955,145 @@ mod tests {
         assert_eq!(fx.mr().await.0, "closed");
         assert_eq!(fx.issue().await, "closed");
         assert!(github.posted_comments().is_empty());
+    }
+
+    /// A landing still driven by its merge command (intent journaled, outcome
+    /// not yet) is left to that command: recovery reports it `Busy` and writes
+    /// nothing, even with the PR closed on GitHub. Once the mark is released,
+    /// recovery takes the attempt up again.
+    #[tokio::test]
+    async fn a_publication_its_landing_still_drives_is_left_alone_by_recovery() {
+        let fx = fixture("landing-record-in-flight.db").await;
+        let attempt = "in-flight-merge-publication-1";
+        fx.journal_intent_as(attempt, &publication()).await;
+        let github = World {
+            pr_state: "closed",
+            pr_merged: false,
+            comments: Vec::new(),
+            origin_main: None,
+            commits: Vec::new(),
+        }
+        .github();
+        let orch = fx.orch(&github);
+
+        let driving = PublicationInFlight::enter(attempt).unwrap();
+        assert_eq!(
+            reconcile_pending_landings(&orch).await,
+            [LandingRecovery::Busy]
+        );
+        assert_eq!(fx.journal_states_of(attempt).await, ["executing"]);
+        assert_eq!(fx.mr().await, ("open".to_string(), None));
+        assert_eq!(fx.close_attributions().await, "0");
+        assert!(
+            PublicationInFlight::enter(attempt).is_err(),
+            "a second driver of the same publication is refused"
+        );
+
+        drop(driving);
+        assert!(
+            matches!(
+                reconcile_pending_landings(&orch).await[..],
+                [LandingRecovery::Undetermined(_)]
+            ),
+            "released, the attempt is recovery's again"
+        );
+    }
+
+    /// Recovery records a landing as merged by whoever started the merge (the
+    /// principal journaled at sequence 0 of the base attempt), through the
+    /// recovery surface, not by the publication's attempt id.
+    #[tokio::test]
+    async fn a_recovered_landing_is_attributed_to_the_principal_that_started_the_merge() {
+        let fx = fixture("landing-record-attribution.db").await;
+        let (old, landing, tree) = (sha('t'), sha('l'), sha('e'));
+        let publication = Publication {
+            expected_old: old.clone(),
+            landing_commit: landing.clone(),
+            landing_tree: tree.clone(),
+            source_after: landing.clone(),
+            ..publication()
+        };
+        fx.db
+            .execute(
+                "INSERT INTO merge_attempt_events (
+                    event_id, attempt_id, sequence, project_id, merge_request_id, job_id, state,
+                    target_ref, source_ref, policy_json, authority_decision_json, created_at
+                 ) VALUES ('attributed-merge', 'attributed-merge', 0, 'proj-gh', 'mr-gh',
+                           'job-gh', 'policy_disabled', 'main', 'feature', '{}', ?1, 1)",
+                params![serde_json::json!({
+                    "legacyActorKind": "operator-ui",
+                    "legacyActorIdentity": null,
+                    "surface": "operator-ui",
+                })
+                .to_string()],
+            )
+            .await
+            .unwrap();
+        fx.journal_intent_as("attributed-merge-publication-1", &publication)
+            .await;
+        let github = World {
+            pr_state: "closed",
+            pr_merged: false,
+            comments: Vec::new(),
+            origin_main: Some(landing.clone()),
+            commits: vec![(landing.clone(), vec![old], tree)],
+        }
+        .github();
+        let orch = fx.orch(&github);
+
+        assert_eq!(
+            reconcile_pending_landings(&orch).await,
+            [LandingRecovery::Recorded(landing.clone())]
+        );
+        let attribution = fx
+            .db
+            .query_opt(
+                "SELECT actor_kind, actor_identity, surface FROM pr_resolution_attributions
+                  WHERE merge_request_id = 'mr-gh' AND action = 'merge'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attribution,
+            (
+                "operator-ui".to_string(),
+                None,
+                RECOVERY_SURFACE.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_publication_attempt_names_the_merge_attempt_it_belongs_to() {
+        assert_eq!(base_attempt_id("b767751a-publication-1"), "b767751a");
+        assert_eq!(base_attempt_id("b767751a-publication-12"), "b767751a");
+        assert_eq!(base_attempt_id("attempt-1"), "attempt-1");
+        assert_eq!(
+            base_attempt_id("x-publication-final"),
+            "x-publication-final"
+        );
+    }
+
+    #[test]
+    fn an_unknown_initiating_actor_is_not_attributed() {
+        assert_eq!(
+            initiating_attribution(
+                r#"{"legacyActorKind":"agent","legacyActorIdentity":"cairn://p/x/1/1/builder"}"#
+            ),
+            Some(PrResolutionAttribution {
+                actor_kind: "agent",
+                actor_identity: Some("cairn://p/x/1/1/builder".into()),
+                surface: RECOVERY_SURFACE,
+            })
+        );
+        assert_eq!(
+            initiating_attribution(r#"{"legacyActorKind":"someone"}"#),
+            None
+        );
+        assert_eq!(initiating_attribution("not json"), None);
     }
 
     fn publication() -> Publication {

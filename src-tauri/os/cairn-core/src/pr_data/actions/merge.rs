@@ -268,7 +268,7 @@ use uuid::Uuid;
 
 use super::context::{db_error, resolve_merge_mr_context_for_job, MergeMrContext};
 use super::default_landing::PublishedLanding;
-use super::landing_record::{journal_publication_outcome, PublicationOutcome};
+use super::landing_record::journal_accepted_publication;
 use super::refresh::refresh_pr_for_job;
 use super::resolution::{resolve_pr_node_landed, Landed};
 
@@ -1104,52 +1104,65 @@ async fn merge_pr_for_job_past_barrier(
         super::landing_record::settle_github_best_effort(orch, job_id).await;
     }
     let _journal = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
-    // A publication origin accepted journals its own outcome under its own
-    // attempt, and only once the merge is recorded; until then its intent is
-    // what recovery records it from.
-    if let (Some(published), Ok(_)) = (&published, &merge_result) {
-        let attempt = MergeAttemptJournal {
-            attempt_id: &published.attempt_id,
+    journal_merge_outcomes(
+        &db,
+        MergeAttemptJournal {
+            attempt_id: &attempt_id,
             project_id: &journal_project_id,
             merge_request_id: &journal_merge_request_id,
             job_id,
             target_ref: &journal_target_ref,
             source_ref: &journal_source_ref,
             policy_json: &stored_policy,
-        };
-        journal_publication_outcome(
-            &db,
-            &attempt,
-            &published.publication,
-            &PublicationOutcome::Accepted {
-                detail: merge_journal_detail(&[
-                    pin_bump_detail.as_deref(),
-                    config_notice.as_deref(),
-                ]),
-            },
-        )
-        .await?;
+        },
+        published,
+        merge_result,
+        merge_journal_detail(&[pin_bump_detail.as_deref(), config_notice.as_deref()]),
+        // An approval-gated attempt's ceremony journals its own outcome,
+        // which only a proven landing makes `succeeded`.
+        approval_enrollment.is_none() || !ceremony_started,
+    )
+    .await
+}
+
+/// Journal how a merge ended, then answer with its result.
+///
+/// A publication origin accepted journals its own outcome under its own
+/// attempt, and only once the merge is recorded; until then its intent is what
+/// recovery records it from, and `published` keeps it in flight so recovery
+/// leaves it to this call. The base attempt's terminal outcome is written
+/// whatever the publication's journal said: a merge that landed always has
+/// one. Only a publication outcome that contradicts the landing is an error.
+async fn journal_merge_outcomes(
+    db: &LocalDb,
+    attempt: MergeAttemptJournal<'_>,
+    published: Option<PublishedLanding>,
+    merge_result: Result<String, String>,
+    success_detail: Option<String>,
+    journals_base: bool,
+) -> Result<String, String> {
+    let publication = match (&published, &merge_result) {
+        (Some(published), Ok(_)) => {
+            journal_accepted_publication(
+                db,
+                &MergeAttemptJournal {
+                    attempt_id: &published.attempt_id,
+                    ..attempt
+                },
+                &published.publication,
+                success_detail.clone(),
+            )
+            .await
+        }
+        _ => Ok(()),
+    };
+    // Settled, or left unsettled for recovery: no longer driven here.
+    drop(published);
+    if journals_base {
+        journal_merge_attempt_outcome(db, attempt, &merge_result, success_detail.as_deref())
+            .await?;
     }
-    // An approval-gated attempt's ceremony journals its own outcome, which
-    // only a proven landing makes `succeeded`.
-    if approval_enrollment.is_none() || !ceremony_started {
-        journal_merge_attempt_outcome(
-            &db,
-            MergeAttemptJournal {
-                attempt_id: &attempt_id,
-                project_id: &journal_project_id,
-                merge_request_id: &journal_merge_request_id,
-                job_id,
-                target_ref: &journal_target_ref,
-                source_ref: &journal_source_ref,
-                policy_json: &stored_policy,
-            },
-            &merge_result,
-            merge_journal_detail(&[pin_bump_detail.as_deref(), config_notice.as_deref()])
-                .as_deref(),
-        )
-        .await?;
-    }
+    publication?;
     merge_result
 }
 
@@ -1323,6 +1336,183 @@ mod tests {
             );
             assert_eq!(journal_rows(&db, &attempt_id).await, rows);
         }
+    }
+
+    const DISABLED: &str = r#"{"version":1,"state":"disabled"}"#;
+
+    fn attempt_journal(attempt_id: &str) -> MergeAttemptJournal<'_> {
+        MergeAttemptJournal {
+            attempt_id,
+            project_id: "project",
+            merge_request_id: "mr",
+            job_id: "job",
+            target_ref: "main",
+            source_ref: "feature",
+            policy_json: DISABLED,
+        }
+    }
+
+    /// An ordinary merge attempt whose landing origin accepted as `landing`:
+    /// its gate event, and its publication's intent, still driven.
+    async fn landed_attempt(db: &LocalDb, landing: &str) -> (String, PublishedLanding) {
+        let attempt_id = journal_policy_gate_event(
+            db,
+            &merge_context(false, false),
+            "job",
+            "policy_disabled",
+            DISABLED,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let publication = super::super::landing_record::Publication {
+            target_branch: "main".into(),
+            expected_old: "t".repeat(40),
+            target_before: "t".repeat(40),
+            landing_commit: landing.to_string(),
+            landing_tree: "e".repeat(40),
+            source_branch: "feature".into(),
+            source_before: "h".repeat(40),
+            source_after: landing.to_string(),
+            shape: super::super::landing_record::PublicationShape::Squash,
+        };
+        let publication_id = format!("{attempt_id}-publication-1");
+        super::super::landing_record::journal_publication_intent(
+            db,
+            &attempt_journal(&publication_id),
+            &publication,
+        )
+        .await
+        .unwrap();
+        let published = PublishedLanding {
+            publication,
+            driving: super::super::default_landing::PublicationInFlight::enter(&publication_id)
+                .unwrap(),
+            attempt_id: publication_id,
+        };
+        (attempt_id, published)
+    }
+
+    /// The outcome a landing-recovery pass journals for a publication it
+    /// finds landed.
+    async fn settle_by_recovery(db: &LocalDb, publication_id: &str, landed: &str) {
+        journal_merge_attempt_event(
+            db,
+            &attempt_journal(publication_id),
+            2,
+            "succeeded",
+            &JournalEntry {
+                detail: Some(
+                    serde_json::json!({"reconciled": true, "landedCommit": landed}).to_string(),
+                ),
+                ..JournalEntry::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn states(rows: &[(i64, String, String, Option<String>)]) -> Vec<(i64, &str)> {
+        rows.iter()
+            .map(|(sequence, _, state, _)| (*sequence, state.as_str()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_landed_merge_journals_its_publication_then_its_attempt() {
+        let db = merge_journal_test_db().await;
+        let landing = "l".repeat(40);
+        let (attempt_id, published) = landed_attempt(&db, &landing).await;
+        let publication_id = published.attempt_id.clone();
+
+        let reply = journal_merge_outcomes(
+            &db,
+            attempt_journal(&attempt_id),
+            Some(published),
+            Ok("PR merged successfully".to_string()),
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(reply, Ok("PR merged successfully".to_string()));
+        let publication_rows = journal_rows(&db, &publication_id).await;
+        assert_eq!(
+            states(&publication_rows),
+            [(1, "executing"), (2, "succeeded")]
+        );
+        assert_eq!(publication_rows[1].3, None);
+        assert_eq!(
+            states(&journal_rows(&db, &attempt_id).await),
+            [(0, "policy_disabled"), (1, "succeeded")]
+        );
+        assert!(
+            super::super::default_landing::PublicationInFlight::enter(&publication_id).is_ok(),
+            "the publication is no longer driven once its outcome is journaled"
+        );
+    }
+
+    /// Recovery settled the publication as the same landing before the
+    /// command journaled it: one fact, recorded once. The merge still answers
+    /// success and its attempt still gets its terminal outcome.
+    #[tokio::test]
+    async fn a_publication_recovery_already_settled_as_this_landing_does_not_fail_the_merge() {
+        let db = merge_journal_test_db().await;
+        let landing = "l".repeat(40);
+        let (attempt_id, published) = landed_attempt(&db, &landing).await;
+        let publication_id = published.attempt_id.clone();
+        settle_by_recovery(&db, &publication_id, &landing).await;
+        let settled = journal_rows(&db, &publication_id).await;
+
+        let reply = journal_merge_outcomes(
+            &db,
+            attempt_journal(&attempt_id),
+            Some(published),
+            Ok("PR merged successfully".to_string()),
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(reply, Ok("PR merged successfully".to_string()));
+        assert_eq!(
+            journal_rows(&db, &publication_id).await,
+            settled,
+            "recovery's outcome stands"
+        );
+        assert_eq!(
+            states(&journal_rows(&db, &attempt_id).await),
+            [(0, "policy_disabled"), (1, "succeeded")]
+        );
+    }
+
+    /// A settlement naming another commit contradicts what this merge landed:
+    /// it is returned, naming both, after the attempt's own outcome is written.
+    #[tokio::test]
+    async fn a_publication_settled_as_a_different_landing_is_surfaced() {
+        let db = merge_journal_test_db().await;
+        let (landing, other) = ("l".repeat(40), "m".repeat(40));
+        let (attempt_id, published) = landed_attempt(&db, &landing).await;
+        settle_by_recovery(&db, &published.attempt_id, &other).await;
+
+        let error = journal_merge_outcomes(
+            &db,
+            attempt_journal(&attempt_id),
+            Some(published),
+            Ok("PR merged successfully".to_string()),
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains(&landing), "{error}");
+        assert!(error.contains(&other), "{error}");
+        assert_eq!(
+            states(&journal_rows(&db, &attempt_id).await),
+            [(0, "policy_disabled"), (1, "succeeded")]
+        );
     }
 
     #[tokio::test]

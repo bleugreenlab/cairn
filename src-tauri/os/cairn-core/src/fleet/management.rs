@@ -805,14 +805,19 @@ pub fn resolve_executor_reference(orch: &Orchestrator, reference: &str) -> Resul
     ))
 }
 
-/// The public name a machine is addressed by, for messages about it.
+/// The public name a machine is addressed by: the one placement matches a
+/// `{name}` selector against. A connected machine answers to its live name,
+/// which for an enrolled remote is its enrolled name; one that is away falls
+/// back to its configuration.
 pub fn public_name(orch: &Orchestrator, executor_id: &str) -> String {
+    if let Some(live) = orch.fleet.executor_public_name(executor_id) {
+        return live;
+    }
     let configured = crate::config::settings::load_fleet(&orch.config_dir);
     configured
         .remote_executors
         .get(executor_id)
         .and_then(|config| normalize_executor_name(&config.display_name))
-        .or_else(|| orch.fleet.executor_public_name(executor_id))
         .unwrap_or_else(|| executor_id.to_string())
 }
 
@@ -1075,6 +1080,12 @@ pub async fn rename(
         .lifecycle()?
         .rename(&executor_id, new_name)
         .await?;
+    crate::fleet::placement_default::follow_rename_everywhere(
+        orch,
+        &executor_id,
+        &public_name(orch, &executor_id),
+    )
+    .await;
     let _ = orch.services.emitter.emit_empty(ENROLLMENT_CHANGED_EVENT);
     Ok(result)
 }
@@ -2400,6 +2411,136 @@ mod tests {
             config_dir.to_path_buf(),
         )
         .build()
+    }
+
+    /// cairn/6637's specimen: settings enroll machine `fedora` as `bginf-halo`,
+    /// while its own executor.json, written before that rename, still says
+    /// `fedora`. A default set by the name the fleet addresses it by stores that
+    /// name, and placement matches it; one set by its other name is refused
+    /// naming both, never stored as a dead name or quietly rewritten.
+    #[tokio::test]
+    async fn a_default_set_by_any_name_of_a_renamed_machine_places_on_it() {
+        use cairn_common::executor_protocol::{
+            ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let mut remote = drain_remote_config();
+        remote.host = "fedora".into();
+        remote.executor_id = "fedora".into();
+        remote.device_id = "fedora-device".into();
+        remote.display_name = "bginf-halo".into();
+        mutate_fleet(&orch, |config| {
+            config
+                .remote_executors
+                .insert("fedora".into(), remote.clone());
+            Ok(())
+        })
+        .unwrap();
+        orch.fleet
+            .declare_enrolled_remote("fedora", "bginf-halo", "linux", "x86_64");
+        let advertisement = ExecutorAdvertisement {
+            identity: ExecutorIdentity {
+                device_id: "fedora-device".into(),
+                executor_id: "fedora".into(),
+                display_name: "fedora".into(),
+            },
+            capabilities: ExecutorCapabilities {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                logical_cores: 32,
+                concurrency_capacity: None,
+                toolchains: Vec::new(),
+                projects_served: Vec::new(),
+                disk_budget_bytes: None,
+                memory_budget_bytes: None,
+                sandbox: None,
+                toolchain_detection: None,
+                build_prerequisites: None,
+                containment: None,
+                page_call_programs: None,
+                github_credential: None,
+                machine_services: Vec::new(),
+            },
+            current_load: 0,
+            warm_roots: Vec::new(),
+            observed_at_unix_ms: 0,
+            liveness_observed_at_unix_ms: None,
+            facts_stale_refresh_blocked: None,
+            last_refresh: None,
+            node_scratches: Vec::new(),
+        };
+        let (sender, _link) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet
+            .attach_advertised_executor(advertisement, sender, false, None, None)
+            .unwrap();
+
+        let stored_for = |typed: &str| {
+            let resolved = crate::fleet::placement_default::resolve(
+                &orch,
+                &serde_json::json!({ "name": typed }),
+            )
+            .unwrap();
+            assert_eq!(resolved.executor_id.as_deref(), Some("fedora"));
+            resolved.selector.name.unwrap()
+        };
+        let stored = stored_for("bginf-halo");
+        assert_eq!(stored, "bginf-halo");
+        assert_eq!(
+            orch.fleet.executor_public_name("fedora"),
+            Some(stored.clone())
+        );
+        assert_eq!(orch.fleet.executor_ids_named(&stored), ["fedora"]);
+        let refusal = crate::fleet::placement_default::resolve(
+            &orch,
+            &serde_json::json!({ "name": "fedora" }),
+        )
+        .expect_err("the machine's other name is refused, not rewritten");
+        assert!(
+            refusal.starts_with("fedora is not a name placement reaches"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("enrolled as bginf-halo"), "{refusal}");
+        assert!(
+            refusal.contains("`cairn executor rename bginf-halo fedora`"),
+            "{refusal}"
+        );
+        assert!(
+            orch.fleet.executor_ids_named("fedora").is_empty(),
+            "the machine's own label is not a second address"
+        );
+        let page = orch
+            .fleet
+            .inspect_executors(0)
+            .into_iter()
+            .find(|inspection| inspection.health.identity.executor_id == "fedora")
+            .map(|inspection| crate::resources::executors::render_executor(&inspection))
+            .unwrap();
+        assert!(page.contains("- Name: bginf-halo\n"), "{page}");
+        assert!(
+            page.contains("- Advertised name: fedora (this machine's own executor.json"),
+            "{page}"
+        );
+        assert!(
+            page.contains("`cairn executor rename bginf-halo fedora`"),
+            "{page}"
+        );
+
+        // The heal: renaming it back to the name its executor.json carries
+        // re-declares it, and the live connection follows without a redial.
+        orch.fleet
+            .declare_enrolled_remote("fedora", "fedora", "linux", "x86_64");
+        assert_eq!(stored_for("fedora"), "fedora");
+        assert_eq!(orch.fleet.executor_ids_named("fedora"), ["fedora"]);
+        assert!(orch.fleet.executor_ids_named("bginf-halo").is_empty());
+        let page = orch
+            .fleet
+            .inspect_executors(0)
+            .into_iter()
+            .find(|inspection| inspection.health.identity.executor_id == "fedora")
+            .map(|inspection| crate::resources::executors::render_executor(&inspection))
+            .unwrap();
+        assert!(!page.contains("Advertised name"), "{page}");
     }
 
     #[test]

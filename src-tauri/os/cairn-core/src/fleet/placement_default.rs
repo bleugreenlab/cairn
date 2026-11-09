@@ -221,8 +221,8 @@ pub(crate) fn parse_selector(value: &serde_json::Value) -> Result<ExecutorSelect
 /// A patch's `executor` object, validated and resolved, not yet stored.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedDefault {
-    selector: ExecutorSelector,
-    executor_id: Option<String>,
+    pub(crate) selector: ExecutorSelector,
+    pub(crate) executor_id: Option<String>,
     warning: Option<String>,
 }
 
@@ -230,7 +230,10 @@ pub(crate) struct ResolvedDefault {
 ///
 /// A `{name}` is resolved to the machine it addresses now and stored under its
 /// public name and identity; a name that addresses nothing is refused with the
-/// ones that do. A machine that exists but cannot take work right now is
+/// ones that do. So is a name that reaches a machine only as one of its other
+/// handles (its host, its identity, the label its own executor.json carries):
+/// the refusal names both, because a default is a name placement matches, and
+/// rewriting it quietly would hide the disagreement. A machine that exists but cannot take work right now is
 /// accepted, and the outcome says so: the default is a declaration about where
 /// the work belongs, and its refusals will say the same thing every time.
 pub(crate) fn resolve(
@@ -243,6 +246,11 @@ pub(crate) fn resolve(
     if let Some(name) = selector.name.clone() {
         let id = crate::fleet::management::resolve_executor_reference(orch, &name)?;
         let public = crate::fleet::management::public_name(orch, &id);
+        if !cairn_common::executor_protocol::executor_names_match(&name, &public) {
+            return Err(format!(
+                "{name} is not a name placement reaches: that machine is enrolled as {public}, and the fleet addresses it as {public}. Use `executor:{{name:\"{public}\"}}`, or rename the machine with `cairn executor rename {public} {name}`."
+            ));
+        }
         if orch.fleet.is_drained(&id) {
             warning = Some(format!(
                 "{public} is drained now; batches will be refused until an operator clears the drain or this default changes."
@@ -618,6 +626,67 @@ pub(crate) async fn clear_everywhere_for_removed_executor(
     }
 }
 
+/// Carry every active default that resolved to `executor_id` onto the name the
+/// machine now answers to, because an operator renamed it. A default is a
+/// declaration about a machine, and the name is only how placement reaches it.
+/// Answers how many it moved.
+pub(crate) async fn follow_rename(
+    db: &LocalDb,
+    executor_id: &str,
+    name: &str,
+) -> Result<u64, String> {
+    let (executor_id, name) = (executor_id.to_string(), name.to_string());
+    db.write(move |conn| {
+        let (executor_id, name) = (executor_id.clone(), name.clone());
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, selector FROM placement_defaults
+                      WHERE executor_id = ?1 AND cleared_at IS NULL",
+                    params![executor_id.as_str()],
+                )
+                .await?;
+            let mut renamed = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let Ok(mut selector) = serde_json::from_str::<ExecutorSelector>(&row.text(1)?)
+                else {
+                    continue;
+                };
+                if selector.name.is_none() || selector.name.as_deref() == Some(name.as_str()) {
+                    continue;
+                }
+                selector.name = Some(name.clone());
+                if let Ok(json) = serde_json::to_string(&selector) {
+                    renamed.push((row.text(0)?, json));
+                }
+            }
+            drop(rows);
+            let mut moved = 0;
+            for (id, selector) in renamed {
+                moved += conn
+                    .execute(
+                        "UPDATE placement_defaults SET selector = ?2 WHERE id = ?1",
+                        params![id.as_str(), selector.as_str()],
+                    )
+                    .await?;
+            }
+            Ok(moved)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Carry the defaults naming a renamed machine in every database this runner
+/// holds. A failure in one is logged and the rest still move.
+pub(crate) async fn follow_rename_everywhere(orch: &Orchestrator, executor_id: &str, name: &str) {
+    for db in orch.db.all_dbs().await {
+        if let Err(error) = follow_rename(&db, executor_id, name).await {
+            log::warn!("could not carry placement defaults onto renamed executor {name}: {error}");
+        }
+    }
+}
+
 /// Mark a create result's machine as the node default's choice: ` on **bbs**`
 /// becomes ` on **bbs** (node default)`. A result naming no machine is left
 /// as it is.
@@ -885,6 +954,47 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_rename_carries_the_defaults_that_resolved_to_the_machine() {
+        let db = seeded_db().await;
+        let node = DefaultOwner::Job("j-node".into());
+        let task = DefaultOwner::Job("j-task".into());
+        let thread = DefaultOwner::Thread("t-exec".into());
+        store(
+            &db,
+            &node,
+            &named("bginf-halo"),
+            Some("fedora"),
+            "operator",
+            100,
+        )
+        .await
+        .unwrap();
+        store(&db, &task, &named("bbs"), Some("exec-bbs"), "operator", 100)
+            .await
+            .unwrap();
+        let os = ExecutorSelector {
+            os: Some("linux".into()),
+            ..ExecutorSelector::default()
+        };
+        store(&db, &thread, &os, None, "operator", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(follow_rename(&db, "fedora", "fedora").await.unwrap(), 1);
+        let moved = load(&db, &node).await.unwrap().unwrap();
+        assert_eq!(moved.selector, named("fedora"));
+        assert_eq!(moved.executor_id.as_deref(), Some("fedora"));
+        assert_eq!(moved.set_at, 100, "a rename is not a new declaration");
+        assert_eq!(
+            load(&db, &task).await.unwrap().unwrap().selector,
+            named("bbs")
+        );
+        assert_eq!(load(&db, &thread).await.unwrap().unwrap().selector, os);
+        // Already on the new name: nothing to move.
+        assert_eq!(follow_rename(&db, "fedora", "fedora").await.unwrap(), 0);
     }
 
     #[test]

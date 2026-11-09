@@ -442,9 +442,11 @@ pub async fn accept(
 /// of the claim share one transaction, so two executors presenting the same name
 /// at once cannot both win.
 ///
-/// A reconnecting executor that has changed its advertised label simply moves
-/// its own claim — the row is keyed by executor identity, and an operator
-/// renaming a machine is exactly that case.
+/// `identity` carries the name the runner addresses the machine by, which for
+/// an enrolled remote is its declared name rather than the label its own
+/// executor.json advertises (`Fleet::addressed_identity`). A machine whose name
+/// changed simply moves its own claim, because the row is keyed by executor
+/// identity.
 async fn claim_executor_name(
     db: &LocalDb,
     identity: &ExecutorIdentity,

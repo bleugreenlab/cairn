@@ -54,8 +54,8 @@ use crate::storage::LocalDb;
 
 use super::context::MergeMrContext;
 use super::human_approval::{
-    self, approval_strategy, gate_checks, Ceremony, Execution, LandedShape, LandingEvidence,
-    LandingWorld, Observation, SystemClock,
+    self, approval_strategy, gate_checks, Ceremony, Execution, InFlight, LandedShape,
+    LandingEvidence, LandingWorld, Observation, SystemClock,
 };
 use super::landing_record::{
     journal_publication_intent, journal_publication_outcome, Publication, PublicationOutcome,
@@ -106,6 +106,35 @@ pub(super) struct DefaultLanding {
 pub(super) struct PublishedLanding {
     pub publication: Publication,
     pub attempt_id: String,
+    /// Keeps the attempt in flight until the last copy is dropped, which the
+    /// merge command does only after it has journaled the outcome.
+    pub driving: PublicationInFlight,
+}
+
+/// A publication attempt this process is driving, from its intent to its
+/// outcome: landing recovery leaves it alone (`Busy`) for as long as any copy
+/// is held. Without it, recovery reads a live publication's missing outcome as
+/// a lost one and settles it under the command that is still recording it.
+#[derive(Clone)]
+pub(super) struct PublicationInFlight(Arc<InFlight>);
+
+impl PublicationInFlight {
+    /// Refused when something in this process already drives the attempt: a
+    /// publication's attempt id is minted fresh, so that is a defect, and
+    /// nothing has been pushed yet.
+    pub(super) fn enter(attempt_id: &str) -> Result<Self, String> {
+        InFlight::try_enter(attempt_id)
+            .map(|driving| Self(Arc::new(driving)))
+            .ok_or_else(|| {
+                format!("publication attempt {attempt_id} is already being driven in this process")
+            })
+    }
+}
+
+impl std::fmt::Debug for PublicationInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PublicationInFlight")
+    }
 }
 
 /// What one landing attempt put on its target.
@@ -1450,6 +1479,12 @@ pub(super) async fn publish_pinned(
             unpin_landing(repo_path, journal.attempt_id);
             format!("the project's database is unavailable: {error}")
         })?;
+    // In flight before its intent is visible, so no recovery pass can find
+    // the intent without also finding it driven.
+    let driving = PublicationInFlight::enter(journal.attempt_id).map_err(|error| {
+        unpin_landing(repo_path, journal.attempt_id);
+        format!("Refusing to merge `{source}`: {error}. Nothing was pushed.")
+    })?;
     // A publication no recovery could find is never pushed.
     journal_publication_intent(&db, journal, &publication)
         .await
@@ -1499,9 +1534,12 @@ pub(super) async fn publish_pinned(
             }
             Ok(Some(Landed {
                 commit: Some(commit),
+                // The caller journals the outcome once the landing is
+                // recorded; the attempt stays driven until then.
                 published: Some(PublishedLanding {
                     publication,
                     attempt_id: journal.attempt_id.to_string(),
+                    driving,
                 }),
             }))
         }

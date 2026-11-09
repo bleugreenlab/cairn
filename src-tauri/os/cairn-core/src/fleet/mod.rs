@@ -4382,6 +4382,18 @@ impl Fleet {
         last_update: Option<UpdateReport>,
     ) -> Result<u64, String> {
         let executor_id = advertisement.identity.executor_id.clone();
+        // The connection is addressed by the name this runner enrolled the
+        // machine under, not by the label its own executor.json carries. The
+        // advertisement keeps the machine's own words for diagnostics.
+        let identity = self.addressed_identity(&advertisement.identity, colocated);
+        if !executor_names_match(&identity.display_name, &advertisement.identity.display_name) {
+            log::warn!(
+                "executor_id={executor_id} advertises the name {:?} but is enrolled as {:?}; addressing it as {:?} (its executor.json predates a rename)",
+                advertisement.identity.display_name,
+                identity.display_name,
+                identity.display_name
+            );
+        }
         // Before anything else this function does, and so before the caller can
         // send this machine a single frame. A non-colocated connection is about
         // to become a recipient of the staged listener advertisement: the
@@ -4391,7 +4403,7 @@ impl Fleet {
         // Resolved here, before the advertisement is moved into the connection,
         // and the same way `executor_public_name` resolves it, so a hold names
         // the machine exactly as every other surface does.
-        let public_name = normalize_executor_name(&advertisement.identity.display_name)
+        let public_name = normalize_executor_name(&identity.display_name)
             .or_else(|| normalize_executor_name(&executor_id))
             .unwrap_or_else(|| executor_id.clone());
         if let Some(policy) = self
@@ -4427,7 +4439,7 @@ impl Fleet {
         }
         let advertised_scratches = advertisement.node_scratches.clone();
         let mut connection = ExecutorConnectionState {
-            identity: advertisement.identity.clone(),
+            identity,
             advertisement: Arc::new(advertisement),
             generation,
             sender,
@@ -5115,7 +5127,47 @@ impl Fleet {
         record.os = os.to_string();
         record.arch = arch.to_string();
         drop(enrolled);
+        // A rename re-declares while the machine stays connected, and nothing
+        // reaches the machine, so the live connection takes the new name here.
+        if let Some(entry) = self.lock_connections().get_mut(executor_id) {
+            if !entry.colocated {
+                entry.identity.display_name = name.to_string();
+            }
+        }
         self.enrollment_gate_changed.notify_waiters();
+    }
+
+    /// The name this runner enrolled `executor_id` under, when it is an
+    /// enrolled remote.
+    pub fn enrolled_remote_name(&self, executor_id: &str) -> Option<String> {
+        self.enrolled_remotes
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .map(|record| record.name.clone())
+    }
+
+    /// `advertised` as this runner addresses it: an enrolled remote answers to
+    /// the name it was enrolled under (and renamed to), whatever label its own
+    /// executor.json carries, because a rename moves the runner's records and
+    /// never reaches the machine. The colocated executor and a machine with no
+    /// enrollment record keep their own label.
+    pub fn addressed_identity(
+        &self,
+        advertised: &ExecutorIdentity,
+        colocated: bool,
+    ) -> ExecutorIdentity {
+        let mut identity = advertised.clone();
+        if colocated {
+            return identity;
+        }
+        if let Some(enrolled) = self
+            .enrolled_remote_name(&advertised.executor_id)
+            .filter(|name| normalize_executor_name(name).is_some())
+        {
+            identity.display_name = enrolled;
+        }
+        identity
     }
 
     /// Record what the runner's most recent attempt on a machine did.
@@ -21535,12 +21587,38 @@ fn no_matching_executor_diagnostic(
         .and_then(|selector| containment_refusal_inventory(connections, selector))
         .map(|rows| format!(" Containment evidence: {rows}."))
         .unwrap_or_default();
+    let other_name = request
+        .executor
+        .as_ref()
+        .and_then(|selector| selector.name.as_deref())
+        .and_then(|wanted| own_label_refusal(connections, wanted))
+        .unwrap_or_default();
     format!(
-        "no live enrolled executor satisfies {wanted} for project {}.{account} Known executors: {}. {}{containment} Read cairn://executors for live state.",
+        "no live enrolled executor satisfies {wanted} for project {}.{account}{other_name} Known executors: {}. {}{containment} Read cairn://executors for live state.",
         request.project_id,
         known_executor_inventory(connections),
         absent_enrolled_inventory(connections, unattached, request),
     )
+}
+
+/// The sentence a refusal owes a request that named a machine by the label its
+/// own executor.json carries rather than the name this runner addresses it by,
+/// naming both. `None` when no attached machine carries `wanted` as its label.
+fn own_label_refusal(
+    connections: &HashMap<String, ExecutorConnectionState>,
+    wanted: &str,
+) -> Option<String> {
+    connections.values().find_map(|entry| {
+        let public = executor_public_name(entry);
+        (!entry.colocated
+            && executor_names_match(wanted, &entry.advertisement.identity.display_name)
+            && !executor_names_match(wanted, &public))
+        .then(|| {
+            format!(
+                " {wanted} is the name {public}'s own executor.json carries, not its address: this runner has it enrolled as {public}, and the fleet addresses it as {public}. Name {public}, or rename it with `cairn executor rename {public} {wanted}`."
+            )
+        })
+    })
 }
 
 /// Whether this batch runs JavaScript, and so needs the Cairn packages to travel
@@ -27728,6 +27806,85 @@ mod tests {
         request.executor = None;
         request.placement_mobility = PlacementMobility::SpillEligible;
         request
+    }
+
+    /// An enrolled machine answers to the name this runner enrolled it under,
+    /// not the label its own executor.json carries, and a rename re-declaring it
+    /// moves the live connection's name with no redial (cairn/6637).
+    #[test]
+    fn an_enrolled_machine_is_selected_by_its_enrolled_name_and_follows_a_rename() {
+        let fleet = Fleet::default();
+        fleet.declare_enrolled_remote("fedora", "bginf-halo", "linux", "x86_64");
+        let (_, entry) = fleet_entry("fedora", "linux", 0, &[]);
+        assert_eq!(entry.advertisement.identity.display_name, "fedora");
+        fleet
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(entry.advertisement),
+                entry.sender,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let selects = |name: &str| {
+            let connections = fleet.lock_connections();
+            matches_selector(
+                &connections["fedora"],
+                &ExecutorSelector {
+                    name: Some(name.into()),
+                    ..ExecutorSelector::default()
+                },
+            )
+        };
+
+        assert_eq!(
+            fleet.executor_public_name("fedora").as_deref(),
+            Some("bginf-halo")
+        );
+        assert!(selects("bginf-halo"));
+        assert!(!selects("fedora"), "one machine, one address");
+        let refusal = own_label_refusal(&fleet.lock_connections(), "fedora")
+            .expect("a selector naming the machine's own label is told both names");
+        assert!(
+            refusal.contains("this runner has it enrolled as bginf-halo"),
+            "{refusal}"
+        );
+        assert_eq!(
+            own_label_refusal(&fleet.lock_connections(), "bginf-halo"),
+            None
+        );
+        assert_eq!(
+            fleet.lock_connections()["fedora"]
+                .advertisement
+                .identity
+                .display_name,
+            "fedora",
+            "the advertisement keeps the machine's own words"
+        );
+
+        fleet.declare_enrolled_remote("fedora", "fedora", "linux", "x86_64");
+        assert_eq!(
+            fleet.executor_public_name("fedora").as_deref(),
+            Some("fedora")
+        );
+        assert!(selects("fedora"));
+        assert!(!selects("bginf-halo"));
+
+        // A machine with no enrollment record keeps its own label.
+        let (_, stray) = fleet_entry("dialed-in", "linux", 0, &[]);
+        fleet
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(stray.advertisement),
+                stray.sender,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            fleet.executor_public_name("dialed-in").as_deref(),
+            Some("dialed-in")
+        );
     }
 
     /// cairn/5360's acceptance at placement: a job's environment is on

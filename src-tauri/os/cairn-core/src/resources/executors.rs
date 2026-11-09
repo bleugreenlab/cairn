@@ -462,6 +462,7 @@ pub(crate) fn render_executors(
     out.push_str(&stranded_summary(enrolled));
     for executor in executors {
         out.push_str(&format!("## {}\n", executor.name));
+        out.push_str(&advertised_name_line(executor));
         let capabilities = &executor.health.advertisement.capabilities;
         out.push_str(&format!(
             "- Platform: {} / {} ({} logical cores)\n",
@@ -1280,6 +1281,23 @@ fn restart_cycles(cycles: &[String]) -> String {
     }
 }
 
+/// The line saying an enrolled machine's own executor.json names it
+/// differently from the name this runner addresses it by, or nothing when they
+/// agree. Only the runner's name is an address; the machine's is what a rename
+/// left behind on the host, which re-enrolling rewrites.
+fn advertised_name_line(executor: &ExecutorInspection) -> String {
+    let advertised = &executor.health.advertisement.identity.display_name;
+    if executor.colocated
+        || cairn_common::executor_protocol::executor_names_match(advertised, &executor.name)
+    {
+        return String::new();
+    }
+    format!(
+        "- Advertised name: {advertised} (this machine's own executor.json; it predates a rename). This runner addresses it as {name}, the name its enrollment holds, and every selector, listing and refusal uses that name. To address it as {advertised} instead: `cairn executor rename {name} {advertised}`\n",
+        name = executor.name
+    )
+}
+
 /// Render one machine's compact operational status.
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     let health = &executor.health;
@@ -1288,6 +1306,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
 
     out.push_str("## Identity\n");
     out.push_str(&format!("- Name: {}\n", executor.name));
+    out.push_str(&advertised_name_line(executor));
     out.push_str(&format!(
         "- Attachment: {}\n",
         if executor.colocated {

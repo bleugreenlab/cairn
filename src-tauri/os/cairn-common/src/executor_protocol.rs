@@ -7343,6 +7343,13 @@ pub struct LearnedResourceEstimate {
 /// An older executor never sends it, so the field defaults to absent and the
 /// page leaves the count out, as it did before; an older runner ignores the
 /// field. What a runner gets wrong talking to an older executor: nothing.
+///
+/// cairn/6637 does not move the number. No frame, variant or field changes:
+/// the runner now addresses an enrolled machine by the name it enrolled it
+/// under rather than the `displayName` its Hello carries, a choice the runner
+/// alone makes. `Ready` still echoes the identity exactly as the executor sent
+/// it, so an executor of any age reads the same frame it always did. What a
+/// runner gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
