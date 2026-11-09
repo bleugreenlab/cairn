@@ -45,6 +45,12 @@ use crate::storage::RowExt;
 /// `codex`, on `host`. The builder installs the implementations that
 /// reach providers, with sessions on this machine; a test replaces them to
 /// observe or script every launch without touching a network or a CLI.
+///
+/// A test builds one by struct update from a real runtime, naming only the
+/// fields it replaces (`ModelRuntime { complete, ..orch.models_runtime().clone() }`),
+/// never as a full literal: a full literal stops compiling whenever a field
+/// is added. `model_runtime_literals_fill_the_rest_by_struct_update` holds
+/// the crate to this.
 #[derive(Clone)]
 pub struct ModelRuntime {
     pub complete: Arc<dyn Complete>,
@@ -792,6 +798,75 @@ pub(crate) mod tests {
         OrchestratorBuilder::new(db_state, services, config_dir)
             .subscriptions(subscriptions)
             .build()
+    }
+
+    /// Every `ModelRuntime` struct expression in this crate, outside the
+    /// constructors that build it with `Self`, ends in `..` and fills the
+    /// fields it does not name from a real runtime, so adding a field breaks
+    /// no test.
+    #[test]
+    fn model_runtime_literals_fill_the_rest_by_struct_update() {
+        // Split so this test's own source holds no match.
+        let needle = concat!("ModelRuntime", " {");
+        let mut full = Vec::new();
+        let mut dirs = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension() != Some(std::ffi::OsStr::new("rs")) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (at, _) in text.match_indices(needle) {
+                    let lead = &text[text[..at].rfind('\n').map_or(0, |i| i + 1)..at];
+                    // The definition, its impl, a signature returning it, a comment.
+                    if lead.contains("struct ")
+                        || lead.contains("impl ")
+                        || lead.contains("->")
+                        || lead.trim_start().starts_with("//")
+                    {
+                        continue;
+                    }
+                    if !fills_the_rest(&text[at + needle.len()..]) {
+                        let line = text[..at].matches('\n').count() + 1;
+                        full.push(format!("{}:{line}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            full.is_empty(),
+            "full ModelRuntime literals; name only the fields the test replaces and fill \
+             the rest with `..orch.models_runtime().clone()`: {full:?}"
+        );
+    }
+
+    /// Whether the struct body `rest` opens (just past its `{`) has a `..`
+    /// line at its own depth before it closes.
+    fn fills_the_rest(rest: &str) -> bool {
+        let mut depth = 0i32;
+        for line in rest.lines() {
+            if depth == 0 && line.trim_start().starts_with("..") {
+                return true;
+            }
+            for c in line.chars() {
+                match c {
+                    '{' | '(' | '[' => depth += 1,
+                    '}' | ')' | ']' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
     }
 
     fn window(id: &str, scope: ProviderUsageScope, remaining: f64) -> ProviderUsageWindow {

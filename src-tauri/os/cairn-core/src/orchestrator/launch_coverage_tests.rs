@@ -651,14 +651,10 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
     let mut orch = seeded_orchestrator().await;
     orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
-        images: Arc::new(cairn_models::image::http::HttpImages),
-        speech: Arc::new(cairn_models::speak::HttpSpeech),
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        managed: cairn_models::managed::ManagedTools::for_host(),
-        relay: Arc::new(cairn_models::complete::HttpComplete),
-        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
+        ..orch.models_runtime.clone()
     };
     for (provider, label, auth) in [
         (
@@ -1325,14 +1321,10 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
     let mut orch = super::models::tests::bare_orchestrator().await;
     orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
-        images: Arc::new(cairn_models::image::http::HttpImages),
-        speech: Arc::new(cairn_models::speak::HttpSpeech),
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        managed: cairn_models::managed::ManagedTools::for_host(),
-        relay: Arc::new(cairn_models::complete::HttpComplete),
-        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
+        ..orch.models_runtime.clone()
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -1578,14 +1570,10 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
     let mut orch = super::models::tests::bare_orchestrator().await;
     orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
-        images: Arc::new(cairn_models::image::http::HttpImages),
-        speech: Arc::new(cairn_models::speak::HttpSpeech),
         claude: Arc::new(TermsRefusingClaude(recorder.clone(), None)),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        managed: cairn_models::managed::ManagedTools::for_host(),
-        relay: Arc::new(cairn_models::complete::HttpComplete),
-        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
+        ..orch.models_runtime.clone()
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -1711,14 +1699,10 @@ async fn a_terms_refused_claude_one_shot_is_served_on_the_next_account() {
     let healthy = add("Healthy", 10.0);
     orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
-        images: Arc::new(cairn_models::image::http::HttpImages),
-        speech: Arc::new(cairn_models::speak::HttpSpeech),
         claude: Arc::new(TermsRefusingClaude(recorder.clone(), Some(fresh.clone()))),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        managed: cairn_models::managed::ManagedTools::for_host(),
-        relay: Arc::new(cairn_models::complete::HttpComplete),
-        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
+        ..orch.models_runtime.clone()
     };
 
     let served = complete_on(&orch, "claude", one_shot_request("haiku", None))
@@ -1759,14 +1743,10 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
     let mut orch = super::models::tests::bare_orchestrator().await;
     orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
-        images: Arc::new(cairn_models::image::http::HttpImages),
-        speech: Arc::new(cairn_models::speak::HttpSpeech),
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
-        managed: cairn_models::managed::ManagedTools::for_host(),
-        relay: Arc::new(cairn_models::complete::HttpComplete),
-        openrouter_zdr: std::sync::Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
+        ..orch.models_runtime.clone()
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());

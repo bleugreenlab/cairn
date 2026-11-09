@@ -91,12 +91,9 @@ async fn orchestrator() -> Launched {
         &stand_in(&codex),
     );
     let mut orch = seeded_orchestrator().await;
+    // Every facet but the host and its CLIs stays the real one the builder
+    // installs, Claude and Codex included.
     orch.models_runtime = ModelRuntime {
-        complete: Arc::new(cairn_models::complete::HttpComplete),
-        images: Arc::new(cairn_models::image::http::HttpImages),
-        speech: Arc::new(cairn_models::speak::HttpSpeech),
-        claude: Arc::new(cairn_models::session::claude::ClaudeCli),
-        codex: Arc::new(cairn_models::session::codex::CodexAppServer),
         host: Arc::new(StandInHost {
             local: LocalSessionHost::new(
                 Arc::new(RealProcessSpawner),
@@ -106,8 +103,7 @@ async fn orchestrator() -> Launched {
             codex_home: temp.path().join("codex-home"),
         }),
         managed,
-        relay: Arc::new(cairn_models::complete::HttpComplete),
-        openrouter_zdr: Arc::new(cairn_models::openrouter::ZdrDirectory::http()),
+        ..orch.models_runtime.clone()
     };
     Launched {
         orch,
