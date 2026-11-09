@@ -76,7 +76,9 @@ use store_lock::JJ_STORE_LOCK_SAMPLE_CAPACITY;
 pub(crate) use store_lock::{
     branch_preparation_operation, describe_preparation_wait, StoreLockStatus,
 };
-pub(crate) use store_lock::{BranchReservation, BranchReservations, GuardOperation};
+pub(crate) use store_lock::{
+    BranchReservation, BranchReservations, GuardOperation, ReservedElsewhere,
+};
 pub use store_lock::{
     EdgeHold, JjStoreGuard, JjStoreLockMetrics, JjStoreOperationTrace, JjStorePhaseTimer,
     StoreLockClass,

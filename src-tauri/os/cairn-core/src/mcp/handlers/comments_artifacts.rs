@@ -820,6 +820,12 @@ pub(crate) async fn write_artifact_change(
         .await;
     }
 
+    // A workflow script has no turn to end: its exit is its boundary, and its
+    // supervisor reads success from the stored artifact itself.
+    let should_arm_terminal_interrupt = should_arm_terminal_interrupt
+        && !crate::execution::jobs::is_workflow_job(&db, &job_id)
+            .await
+            .unwrap_or(false);
     if should_arm_terminal_interrupt {
         arm_terminal_interrupt_for_job(orch, &job_id);
     }

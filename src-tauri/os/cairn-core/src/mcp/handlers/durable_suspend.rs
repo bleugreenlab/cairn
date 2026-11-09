@@ -1469,10 +1469,12 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
                     params![id, result, now],
                 )
                 .await?;
-            // Abandoning the wait never abandons its batch: a run batch that may
-            // still be running becomes a detached one in this same write, so its
-            // resolver hands the result to the job and the branch stays held.
-            if let (true, Some((job_id, run_id, condition))) = (marked > 0, row) {
+            // Supersession ends only the wait: keep the batch's result and branch
+            // hold durable. Operator Compact instead cancels session-owned work,
+            // so it must not leave a detached row claiming the batch still runs.
+            if let (AbandonCause::Superseded, true, Some((job_id, run_id, condition))) =
+                (cause, marked > 0, row)
+            {
                 if let Ok(condition) = serde_json::from_str::<Condition>(&condition) {
                     super::run::detached::insert_converted(
                         c,
@@ -1512,9 +1514,10 @@ async fn deliver_abandonment(
             return;
         }
     }
-    // A run batch's call is told its batch carries on, not to reissue it.
-    let text = match &call.condition {
-        Some(Condition::RunBatch { request_id, .. }) => serde_json::json!({
+    // Only supersession leaves the batch running. Compact answers with its
+    // typed cancellation cause, just like the other session-owned waits.
+    let text = match (cause, &call.condition) {
+        (AbandonCause::Superseded, Some(Condition::RunBatch { request_id, .. })) => serde_json::json!({
             "outcome": ABANDONED_OUTCOME,
             "error": format!(
                 "This call's wait ended before its batch finished, but the batch keeps running. Cairn delivers its result to this job as a notice, and `{}` shows it now. Do not re-run it.",
@@ -1860,10 +1863,27 @@ async fn divert_to_job(
         r.run_id.clone(),
         r.condition.clone(),
     );
-    db.write(|c| {
+    let diverted = db.write(|c| {
         let (id, job_id, run_id, condition) =
             (id.clone(), job_id.clone(), run_id.clone(), condition.clone());
         Box::pin(async move {
+            // Compact or supersession may have overtaken the resolver since its
+            // state read. The abandonment owns the answer and terminal state;
+            // never convert it back into an ordinary detached result.
+            let mut rows = c.query(
+                "SELECT state,resolution_json,successor_turn_id FROM agent_waits WHERE id=?1",
+                params![id.clone()],
+            ).await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(false);
+            };
+            let state = row.text(0)?;
+            let resolution = row.opt_text(1)?;
+            let successor = row.opt_text(2)?;
+            drop(rows);
+            if state != "resolving" || successor.is_some() || is_abandonment(resolution.as_deref()) {
+                return Ok(false);
+            }
             let now = chrono::Utc::now().timestamp_millis();
             super::run::detached::insert_converted(
                 c,
@@ -1879,11 +1899,14 @@ async fn divert_to_job(
                 params![id, now],
             )
             .await?;
-            Ok(())
+            Ok(true)
         })
     })
     .await
     .map_err(|e| e.to_string())?;
+    if !diverted {
+        return Ok(());
+    }
     log::info!(
         "run batch suspension {} resolved after its turn ended; its result goes to job {} as a notice",
         r.id,
@@ -4443,7 +4466,7 @@ mod tests {
         assert!(!record.condition.holds_branch());
         insert(&orch.db.local, &record).await.unwrap();
         assert!(
-            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::OperatorCompact)
+            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::Superseded)
                 .await
                 .unwrap()
         );
@@ -8170,6 +8193,65 @@ mod tests {
             wait_row(&orch, "wait-1").await.1.as_deref(),
             Some(abandoned_result(AbandonCause::Superseded).as_str())
         );
+    }
+
+    /// Supersession leaves the batch running, whereas Compact cancels session
+    /// work. Replaying either abandonment must answer once without resuming.
+    #[tokio::test]
+    async fn run_batch_abandonment_preserves_only_superseded_work() {
+        for cause in AbandonCause::ALL {
+            let (orch, base, _) = durable_env().await;
+            let record = run_batch_record(&base, true);
+            insert(&orch.db.local, &record).await.unwrap();
+            let call = SuspendedCall::of(&record);
+
+            // Crash after the decision, before answering or closing the wait.
+            assert!(mark_abandoned(&orch.db.local, &record.id, cause)
+                .await
+                .unwrap());
+            // A resolver that already decided to divert a result must lose to
+            // the decision too, even before abandonment closes the row.
+            divert_to_job(&orch, &orch.db.local, &record, "late batch result", true)
+                .await
+                .unwrap();
+            assert_eq!(wait_state(&orch).await, "resolving");
+            finish_abandonment(&orch, &orch.db.local, &call, cause)
+                .await
+                .unwrap();
+            finish_abandonment(&orch, &orch.db.local, &call, cause)
+                .await
+                .unwrap();
+            // A late batch resolver cannot replace the abandonment or resume.
+            resolve(&orch, &orch.db.local, &record, "late batch result", true)
+                .await
+                .unwrap();
+
+            assert_eq!(wait_state(&orch).await, "cancelled");
+            assert!(wait_resolved_turns(&orch).await.is_empty());
+            let results = tool_results(&orch).await;
+            assert_eq!(results.len(), 1, "{cause:?}: {results:?}");
+            assert!(!results[0].1.contains("late batch result"));
+            let detached = super::super::run::detached::load(&orch.db.local, "request-1")
+                .await
+                .unwrap();
+            match cause {
+                AbandonCause::Superseded => {
+                    assert_eq!(
+                        detached.unwrap().state,
+                        super::super::run::detached::DetachedState::Running
+                    );
+                    assert!(results[0].1.contains("cairn:~/batches/request-1"));
+                    assert!(results[0].1.contains("keeps running"));
+                }
+                AbandonCause::OperatorCompact => {
+                    assert!(detached.is_none(), "Compact must not detach cancelled work");
+                    assert!(results[0].1.contains("operator_compact"));
+                    assert!(results[0].1.contains("operator compacted"));
+                    assert!(!results[0].1.contains("keeps running"));
+                    assert!(!results[0].1.contains("cairn:~/batches/"));
+                }
+            }
+        }
     }
 
     /// An operator Compact's abandonment carries its cause in the payload, so

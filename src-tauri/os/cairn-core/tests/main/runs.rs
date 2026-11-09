@@ -2310,6 +2310,21 @@ async fn reconcile_stale_runs_delivers_a_repaired_batch_and_the_held_message_onc
             "{job}"
         );
     }
+    // Settlement also dispatches a resume off-thread. Its successor claim wins
+    // before it stores the results or drains pushes, so neither the claim nor
+    // reconciliation returning is the delivery boundary. Wait for the complete
+    // prompt on the warm process, not for any particular result or notice text.
+    let stdin = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let bytes = delivered.lock().unwrap().clone();
+            if bytes.last() == Some(&b'\n') {
+                break String::from_utf8(bytes).unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the repaired batch resumes the warm process with a complete prompt");
     assert_eq!(anchor_unblock_count(db).await, 1);
 
     let tool_results: Vec<String> = {
@@ -2334,23 +2349,43 @@ async fn reconcile_stale_runs_delivers_a_repaired_batch_and_the_held_message_onc
         rows.sort();
         rows
     };
-    let delivered_result = tool_results.join("\n");
+    assert_eq!(
+        tool_results.len(),
+        1,
+        "one answer to the shared spawning call"
+    );
+    let event: Value = serde_json::from_str(&tool_results[0]).unwrap();
+    assert_eq!(event["toolUseId"], "tool-1");
+    let report: Value = serde_json::from_str(event["toolResult"].as_str().unwrap()).unwrap();
+    let delivered_result = report["blocking"]["text"].as_str().unwrap();
     assert_eq!(
         delivered_result.matches("Delayed delivery:").count(),
         3,
         "each task's result leads with its notice: {delivered_result}"
     );
-    for when in [
-        "2025-09-04 15:33 UTC",
-        "2025-09-04 15:43 UTC",
-        "2025-09-04 15:53 UTC",
-    ] {
-        assert!(
-            delivered_result.contains(when),
-            "missing {when}: {delivered_result}"
+    let mut previous_finding = 0;
+    for (index, (packet, when)) in [
+        ("pkt-quic", "2025-09-04 15:33 UTC"),
+        ("pkt-tar", "2025-09-04 15:43 UTC"),
+        ("pkt-jwt", "2025-09-04 15:53 UTC"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let prefix = format!(
+            "## Task {}: {packet}\n\nDelayed delivery: this task finished at {when}",
+            index + 1
         );
+        let notice = delivered_result.find(&prefix).expect(delivered_result);
+        let finding = format!("{packet} finding");
+        assert_eq!(delivered_result.matches(&finding).count(), 1);
+        let finding = delivered_result.find(&finding).unwrap();
+        assert!(
+            previous_finding <= notice && notice < finding,
+            "{delivered_result}"
+        );
+        previous_finding = finding;
     }
-    assert!(delivered_result.contains("pkt-quic finding"));
 
     assert!(
         db.query_opt_text(
@@ -2362,11 +2397,28 @@ async fn reconcile_stale_runs_delivers_a_repaired_batch_and_the_held_message_onc
         .is_some(),
         "the held operator message is delivered with the unblock"
     );
-    let stdin = String::from_utf8_lossy(&delivered.lock().unwrap()).to_string();
-    assert!(
-        stdin.contains("Held operator note for security"),
-        "the resumed session receives the held message: {stdin}"
+    assert_eq!(
+        stdin.matches("Held operator note for security").count(),
+        1,
+        "the resumed session receives the held message once: {stdin}"
     );
+    assert_eq!(stdin.matches("Delayed delivery:").count(), 3, "{stdin}");
+    assert_eq!(stdin.lines().count(), 1, "one resume prompt: {stdin}");
+    let carrying_event = db
+        .query_opt_text(
+            "SELECT e.id FROM attention_pushes p
+             JOIN events e ON e.id = p.delivered_event_id
+             JOIN turns t ON t.id = e.turn_id
+             JOIN turns unblock ON unblock.id = t.predecessor_id
+             WHERE p.id = 'push-held' AND e.run_id = 'run-1'
+               AND e.event_type = 'attention:briefing'
+               AND unblock.predecessor_id = 'anchor'
+               AND unblock.start_reason = 'dependency_unblock'",
+            (),
+        )
+        .await
+        .unwrap()
+        .expect("the held message's receipt belongs to the work turn after the claimed unblock");
 
     let again = orch.clone();
     std::thread::spawn(move || queries::reconcile_stale_runs(&again, &NoopEmitter, STALE_BOOT_AT))
@@ -2376,6 +2428,32 @@ async fn reconcile_stale_runs_delivers_a_repaired_batch_and_the_held_message_onc
         anchor_unblock_count(db).await,
         1,
         "a second boot delivers nothing again"
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT COUNT(*) FROM events WHERE run_id = 'run-1' AND event_type = 'tool_result'",
+            (),
+            |row| Ok(row.get::<i64>(0)?),
+        )
+        .await
+        .unwrap(),
+        1,
+        "the spawning call is not answered again"
+    );
+    assert_eq!(
+        db.query_opt_text(
+            "SELECT delivered_event_id FROM attention_pushes WHERE id = 'push-held'",
+            (),
+        )
+        .await
+        .unwrap(),
+        Some(carrying_event),
+        "the held message keeps its original delivery receipt"
+    );
+    assert_eq!(
+        String::from_utf8(delivered.lock().unwrap().clone()).unwrap(),
+        stdin,
+        "a second boot sends neither the task results nor the held message again"
     );
 }
 

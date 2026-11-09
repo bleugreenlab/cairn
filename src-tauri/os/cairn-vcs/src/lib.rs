@@ -1746,7 +1746,8 @@ pub(crate) fn prepare_git_import_preserving_bookmarks(
             .map_err(|error| format!("rebase imported descendants: {error}"))?;
         if preserved_state(tx.repo_mut().view()) != before {
             return Err(
-                "scoped git import would change a recovery-fenced bookmark or recorded input"
+                "scoped git import would change a preserved bookmark (recovery-fenced or \
+                 reserved for publication) or its recorded input"
                     .to_string(),
             );
         }

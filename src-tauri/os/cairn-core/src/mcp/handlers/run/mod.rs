@@ -13973,6 +13973,7 @@ pub(crate) mod host_batch_tests {
     use super::*;
     use crate::backends::{CompletionOutcome, CompletionRequest};
     use crate::db::DbState;
+    use crate::mcp::handlers::durable_suspend;
     use crate::responses::ResponseError;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, SearchIndex};
@@ -16027,50 +16028,92 @@ pub(crate) mod host_batch_tests {
         assert_eq!(verdict, "it was cancelled");
     }
 
-    /// A wait abandoned while its batch ran (an operator compact) converts the
-    /// batch with its identity, so an identical call from the next turn is
-    /// refused rather than starting the work a second time.
+    /// Supersession retains the identity of work still running, so a reissue
+    /// is refused. Compact cancels that work and must not leave a stale refusal.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_reissue_after_its_wait_was_abandoned_is_refused() {
-        let orch = env().await;
-        let payload = declared_payload();
-        let condition = json!({
-            "kind": "run_batch",
-            "request_id": "req-compacted",
-            "commits": false,
-            "label": "cargo test",
-            "host": false,
-            "identity": batch_identity(&payload).unwrap().to_string(),
-        })
-        .to_string();
-        orch.db
-            .local
-            .execute(
-                "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at) VALUES('wait-c','job-1','run-1','session-1','pred-turn','tool-1',?1,NULL,'pending',1)",
-                (condition,),
-            )
-            .await
-            .unwrap();
-        crate::mcp::handlers::durable_suspend::abandon_job_waits_for_operator_compact(
-            &orch,
-            &orch.db.local,
-            "job-1",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            detached_state(&orch, "req-compacted").await.as_deref(),
-            Some("running")
-        );
-        let mut reissue = call_request(payload);
-        reissue.tool_use_id = Some("tool-2".into());
-        assert_eq!(
-            reissue_refusal(&orch, &reissue).await.as_deref(),
-            Some(
-                detached::reissue_refusal_text("req-compacted", &detached::LiveState::Untracked)
-                    .as_str()
-            )
-        );
+    async fn a_reissue_after_abandonment_is_refused_only_for_superseded_work() {
+        for compact in [false, true] {
+            let orch = env().await;
+            let payload = declared_payload();
+            let condition = json!({
+                "kind": "run_batch",
+                "request_id": "req-abandoned",
+                "commits": false,
+                "label": "cargo test",
+                "host": false,
+                "identity": batch_identity(&payload).unwrap().to_string(),
+            })
+            .to_string();
+            // A reconstructed call has a new run: provider call IDs are unique
+            // within a run even after its previous wait becomes terminal.
+            orch.db
+                .local
+                .execute(
+                    "INSERT INTO runs(id,issue_id,project_id,job_id,status,session_id,created_at,updated_at) VALUES('old-run','i','p','job-1','exited','session-1',1,1)",
+                    (),
+                )
+                .await
+                .unwrap();
+            orch.db
+                .local
+                .execute(
+                    "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('old-turn','session-1','old-run','job-1',0,'yielded','initial',1,1)",
+                    (),
+                )
+                .await
+                .unwrap();
+            orch.db
+                .local
+                .execute(
+                    "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at) VALUES('wait-c','job-1','old-run','session-1','old-turn','tool-1',?1,NULL,'pending',1)",
+                    (condition,),
+                )
+                .await
+                .unwrap();
+            if compact {
+                durable_suspend::abandon_job_waits_for_operator_compact(
+                    &orch,
+                    &orch.db.local,
+                    "job-1",
+                )
+                .await
+                .unwrap();
+            } else {
+                // The same provider call held on a later turn is direct
+                // evidence of supersession, even if its batch is still live.
+                let next = durable_suspend::Record {
+                    id: "wait-next".into(),
+                    job_id: "job-1".into(),
+                    run_id: "run-1".into(),
+                    session_id: "session-1".into(),
+                    turn_id: "pred-turn".into(),
+                    tool_use_id: "tool-1".into(),
+                    condition: durable_suspend::Condition::Duration,
+                    deadline: None,
+                    created: 2,
+                };
+                durable_suspend::hold(&orch, &orch.db.local, &next)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                detached_state(&orch, "req-abandoned").await.as_deref(),
+                if compact { None } else { Some("running") }
+            );
+            let mut reissue = call_request(payload);
+            reissue.tool_use_id = Some("tool-2".into());
+            assert_eq!(
+                reissue_refusal(&orch, &reissue).await,
+                if compact {
+                    None
+                } else {
+                    Some(detached::reissue_refusal_text(
+                        "req-abandoned",
+                        &detached::LiveState::Untracked,
+                    ))
+                }
+            );
+        }
     }
 
     /// The only cancel left: a batch that can neither park nor be recorded as

@@ -5319,3 +5319,325 @@ async fn repl_funnel_dead_session_unregisters_and_emits_exited() {
         "a dead send must emit repl-state exited: {states:?}"
     );
 }
+
+// ---- A workflow run across waves (CAIRN-5367) -----------------------------
+
+/// The script a two-wave workflow runs. Each wave is three concurrent host
+/// calls; `write` throws on a refused one, which exits the script non-zero.
+/// Between the waves it marks that the first landed and waits to be released.
+const TWO_WAVE_SCRIPT: &str = r#"import { parallel, output } from "@cairn/harness";
+import { write } from "@cairn/sdk";
+import { existsSync, writeFileSync } from "node:fs";
+
+const wave = (n: number) =>
+  parallel(
+    [0, 1, 2].map((i) => () =>
+      write({ target: "cairn:~/progress", mode: "append", payload: { kind: "log", text: `wave-${n}-${i}` } }),
+    ),
+  );
+
+await wave(1);
+writeFileSync(MARKER, "");
+while (!existsSync(RELEASE)) await Bun.sleep(100);
+await wave(2);
+await output("both waves landed");
+"#;
+
+/// Whether this host can confine a workflow runtime, which starts under the
+/// credential floor's profile. On macOS the only cause it cannot is a test
+/// process already inside a Seatbelt profile, the declared
+/// `nested-sandbox-exec` gap, recorded as a skip.
+fn workflow_confines_here(test: &str) -> bool {
+    match cairn_sandbox::IsolatedChild::availability() {
+        Ok(()) => true,
+        Err(why) if cfg!(target_os = "macos") => {
+            eprintln!("skipping {test}: {why}");
+            cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
+            false
+        }
+        Err(why) => panic!("{test} needs a host that can confine a workflow runtime: {why}"),
+    }
+}
+
+/// What became of a run, for a failure message.
+async fn run_story(db: &LocalDb, run_id: &str) -> String {
+    db.query_opt_text(
+        "SELECT COALESCE(r.status, '') || ' / ' || COALESCE(r.exit_reason, '') || ' / ' ||
+                COALESCE(r.error_message, '') || ' / ' ||
+                COALESCE((SELECT group_concat(data, ' | ') FROM events WHERE run_id = r.id), '')
+         FROM runs r WHERE r.id = ?1",
+        (run_id.to_string(),),
+    )
+    .await
+    .unwrap()
+    .unwrap_or_default()
+}
+
+async fn progress_entries(db: &LocalDb, job_id: &str, wave: &str) -> i64 {
+    db.query_opt_i64(
+        "SELECT COUNT(*) FROM workflow_progress WHERE job_id = ?1 AND text LIKE ?2",
+        (job_id.to_string(), format!("{wave}-%")),
+    )
+    .await
+    .unwrap()
+    .unwrap_or(0)
+}
+
+/// A two-wave workflow, end to end on a real Bun runtime. Its host calls are
+/// answered in both waves, a delegated child settling between them wakes
+/// nothing, the stale-run reaper leaves it alone however old it looks, and its
+/// clean exit with its output stored completes the run and answers its caller.
+///
+/// The run this pins lost on all three counts: the reaper settled it because a
+/// workflow runtime was invisible to the liveness check, each settled child
+/// queued a wake that tried to resume the script as an agent, and its exit read
+/// as having written nothing because only an agent's write was ever marked.
+///
+/// No provider can run a real child agent under test, so the child an
+/// `agent()` call would have spawned is stood in for by a background packet on
+/// the workflow job, settled through the completion path a finished child
+/// takes. That path is where the wake came from.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_two_wave_workflow_survives_its_children_settling_and_the_reaper() {
+    use cairn_core::internal::runs::reap::{
+        reap_stale_runs_for_job, STALE_RUN_EXIT_REASON, STALE_RUN_GRACE_SECS,
+    };
+    use cairn_workflow::delegated_packets;
+
+    if !workflow_confines_here("a_two_wave_workflow_survives_its_children_settling_and_the_reaper")
+    {
+        return;
+    }
+    let (temp, db, orch, cwd) = setup("run-two-wave").await;
+    let marker = temp.path().join("wave-1.done");
+    let release = temp.path().join("wave-2.release");
+    let package = temp
+        .path()
+        .join("config")
+        .join("workflows")
+        .join("two-wave");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("workflow.yaml"),
+        "name: Two Wave\ndescription: Two waves of host calls.\nscript: main.ts\n",
+    )
+    .unwrap();
+    std::fs::write(package.join("package.json"), "{}").unwrap();
+    let js_path = |path: &Path| json!(path.display().to_string()).to_string();
+    std::fs::write(
+        package.join("main.ts"),
+        TWO_WAVE_SCRIPT
+            .replace("MARKER", &js_path(&marker))
+            .replace("RELEASE", &js_path(&release)),
+    )
+    .unwrap();
+    let invoke = request(
+        &cwd,
+        Some("run-two-wave"),
+        json!({ "commands": [{ "target": "cairn://workflows/two-wave" }] }),
+    );
+
+    let drive = async {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (job_id, run_id) = loop {
+            let node = db
+                .query_opt_text(
+                    "SELECT j.id || ' ' || r.id FROM jobs j JOIN runs r ON r.job_id = j.id
+                     WHERE j.agent_config_id = 'workflow'",
+                    (),
+                )
+                .await
+                .unwrap();
+            if let Some((job, run)) = node.as_deref().and_then(|ids| ids.split_once(' ')) {
+                break (job.to_string(), run.to_string());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the workflow node never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        while !marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "the first wave never landed; the run: {}",
+                run_story(&db, &run_id).await
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(progress_entries(&db, &job_id, "wave-1").await, 3);
+        // The runtime can be answering calls before its spawn returns, while
+        // the spawn's launch claim still covers the run. Once the run reads
+        // live the claim is gone and the bound lease alone stands behind it,
+        // which is the cover the reaper must see.
+        loop {
+            let status = db
+                .query_opt_text("SELECT status FROM runs WHERE id = ?1", (run_id.clone(),))
+                .await
+                .unwrap();
+            if status.as_deref() == Some("live") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the run never went live; the run: {}",
+                run_story(&db, &run_id).await
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            orch.claimed_launch_run(&job_id),
+            None,
+            "a live workflow run holds no launch claim"
+        );
+
+        // A background child of the workflow finishes.
+        let execution_id = db
+            .query_opt_text(
+                "SELECT execution_id FROM jobs WHERE id = ?1",
+                (job_id.clone(),),
+            )
+            .await
+            .unwrap()
+            .expect("the workflow node has an execution");
+        let turn_id = db
+            .query_opt_text(
+                "SELECT current_turn_id FROM jobs WHERE id = ?1",
+                (job_id.clone(),),
+            )
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, uri_segment,
+                               agent_config_id, parent_job_id, status, created_at, updated_at)
+             SELECT 'wave-child', execution_id, issue_id, project_id, 'Explore', 'wave-child',
+                    'Explore', id, 'complete', 1, 1
+             FROM jobs WHERE id = ?1",
+            params![job_id.as_str()],
+        )
+        .await
+        .unwrap();
+        delegated_packets::insert_db(
+            &db,
+            &execution_id,
+            &serde_json::from_value(json!({
+                "id": "wave-child-packet",
+                "parentJobId": job_id,
+                "parentTurnId": turn_id,
+                "origin": "task_tool",
+                "title": "Explore",
+                "problemStatement": "x",
+                "agentConfigId": "Explore",
+                "ownership": { "cwd": "/tmp" },
+                "outputContract": { "schemaType": "return" },
+                "status": "running",
+                "resultArtifactJobId": "wave-child",
+                "background": true,
+                "createdAt": 0
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        cairn_core::internal::resume_parent_after_task_completion(&orch, "wave-child").unwrap();
+        let child = delegated_packets::find_by_result_job_db(&db, &execution_id, "wave-child")
+            .await
+            .unwrap()
+            .expect("the child's packet");
+        assert_eq!(delegated_packets::status_str(&child.status), "completed");
+
+        // Long past the reaper's grace, with a process behind it all along.
+        let long_ago = chrono::Utc::now().timestamp() - STALE_RUN_GRACE_SECS - 60;
+        db.execute(
+            "UPDATE runs SET created_at = ?1, started_at = ?1 WHERE id = ?2",
+            params![long_ago, run_id.as_str()],
+        )
+        .await
+        .unwrap();
+        // Swept for the workflow's job alone: the caller is a fixture run with
+        // no process behind it, which a full sweep would rightly settle.
+        assert_eq!(
+            reap_stale_runs_for_job(&orch, &db, &job_id),
+            0,
+            "a workflow run with its runtime alive is not stale"
+        );
+
+        std::fs::write(&release, "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            let status = db
+                .query_opt_text("SELECT status FROM runs WHERE id = ?1", (run_id.clone(),))
+                .await
+                .unwrap()
+                .unwrap_or_default();
+            if !["starting", "live"].contains(&status.as_str()) {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the workflow never finished; the run: {}",
+                run_story(&db, &run_id).await
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let story = run_story(&db, &run_id).await;
+        assert_eq!(status, "exited", "the run: {story}");
+        let exit_reason = db
+            .query_opt_text(
+                "SELECT exit_reason FROM runs WHERE id = ?1",
+                (run_id.clone(),),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            exit_reason.as_deref(),
+            Some(STALE_RUN_EXIT_REASON),
+            "{story}"
+        );
+        assert_eq!(progress_entries(&db, &job_id, "wave-2").await, 3, "{story}");
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM artifacts WHERE job_id = ?1 AND output_name = 'return'",
+                (job_id.clone(),),
+            )
+            .await
+            .unwrap(),
+            Some(1),
+            "the output artifact is stored"
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM runs WHERE job_id = ?1",
+                (job_id.clone(),)
+            )
+            .await
+            .unwrap(),
+            Some(1),
+            "nothing resumed the script as an agent"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let workflow = delegated_packets::find_by_result_job_db(&db, &execution_id, &job_id)
+                .await
+                .unwrap()
+                .expect("the caller's packet for the workflow");
+            if delegated_packets::status_str(&workflow.status) == "completed" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the caller's packet never completed: {:?}",
+                workflow.status
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let (answer, ()) = tokio::join!(handle_run(&orch, &invoke), drive);
+    // The caller answers inline unless the waves outlasted its inline budget,
+    // in which case the completed packet above is the answer it resumes with.
+    let answer = run_text(&answer);
+    assert!(
+        answer.contains("both waves landed") || answer.contains(DURABLE_SUSPEND),
+        "{answer}"
+    );
+}

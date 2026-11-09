@@ -1144,17 +1144,24 @@ impl AgentProcessState {
             .unwrap_or(false)
     }
 
-    /// Whether this host holds a process handle for `run_id` at all — serving,
-    /// awaiting the host, or parked warm — or `None` when the registry could not
-    /// be inspected at all.
+    /// Whether this host holds a process for `run_id` at all, or `None` when the
+    /// registry could not be inspected at all.
+    ///
+    /// A run's process is either an agent handle (serving, awaiting the host, or
+    /// parked warm) or a bound workflow runtime, the Bun script a workflow run
+    /// is. Both register before their run can produce anything: an agent backend
+    /// registers its handle, and a workflow binds its residency lease before the
+    /// run goes live. Presence in either registry is therefore the authoritative
+    /// answer to "is there still a process behind this run row?"
+    /// (`crate::runs::reap`). A workflow runtime gets no `RunHandle`, because a
+    /// handle carries agent-loop state (turn, provider, occupancy) that a script
+    /// does not own.
     ///
     /// The run-level sibling of [`Self::is_active`], which asks the narrower
-    /// question of whether that handle is currently mid-turn. The two answers
-    /// diverge for every warm process, so a caller reasoning about whether a run
-    /// is *alive* (rather than *busy*) must ask this one: the registry is
-    /// in-memory and every backend registers before its run can produce
-    /// anything, which makes handle presence the authoritative answer to "is
-    /// there still a process behind this run row?" (`crate::runs::reap`).
+    /// question of whether an agent handle is currently mid-turn. The two
+    /// answers diverge for every warm process and every workflow runtime, so a
+    /// caller reasoning about whether a run is *alive* (rather than *busy*) must
+    /// ask this one.
     ///
     /// The three-valued answer is the load-bearing difference from `is_active`,
     /// which collapses a poisoned lock into `false`. That collapse is survivable
@@ -1165,8 +1172,10 @@ impl AgentProcessState {
     /// crash for every live and warm process on this host at once. So a caller
     /// on a destructive path must act only on `Some(false)`.
     pub fn has_process(&self, run_id: &str) -> Option<bool> {
-        let processes = self.processes.lock().ok()?;
-        Some(processes.contains_key(run_id))
+        if self.processes.lock().ok()?.contains_key(run_id) {
+            return Some(true);
+        }
+        Some(self.workflow_leases.lock().ok()?.contains_key(run_id))
     }
 
     /// Transition a process to warm state.
@@ -1874,6 +1883,28 @@ mod tests {
             generation,
             team_workspace_id: None,
         }
+    }
+
+    /// A workflow runtime holds no agent handle; its bound lease is what
+    /// answers for its run, until the supervisor clears it on exit.
+    #[test]
+    fn a_bound_workflow_runtime_is_its_runs_process() {
+        let state = AgentProcessState::default();
+        assert_eq!(state.has_process("workflow-run"), Some(false));
+        state.bind_workflow_lease(
+            "workflow-run".into(),
+            cairn_common::executor_protocol::ResidencyFence {
+                holder: cairn_common::executor_protocol::ResidencyHolder::Workflow {
+                    run_id: "workflow-run".into(),
+                },
+                incarnation_id: "incarnation-1".into(),
+                cell_epoch: 1,
+            },
+        );
+        assert_eq!(state.has_process("workflow-run"), Some(true));
+        assert_eq!(state.has_process("other-run"), Some(false));
+        state.clear_workflow_lease("workflow-run");
+        assert_eq!(state.has_process("workflow-run"), Some(false));
     }
 
     #[test]

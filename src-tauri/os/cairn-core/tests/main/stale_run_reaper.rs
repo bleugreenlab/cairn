@@ -261,6 +261,71 @@ async fn leaves_a_claimed_launch_alone() {
     );
 }
 
+/// A workflow run's process is its Bun runtime, which holds no agent handle.
+/// Its bound residency lease is what stands behind the row, however long the
+/// script runs (CAIRN-5367: a two-wave workflow was settled as crashed between
+/// its waves).
+#[tokio::test(flavor = "current_thread")]
+async fn leaves_a_live_workflow_runtime_alone_however_old() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = orch.db.local.clone();
+    seed_job(&db).await;
+    insert_run(&db, "run-workflow", "live", seconds_ago(7200)).await;
+    insert_turn(&db, "turn-1", "run-workflow", "running", true).await;
+    orch.process_state.bind_workflow_lease(
+        "run-workflow".into(),
+        cairn_common::executor_protocol::ResidencyFence {
+            holder: cairn_common::executor_protocol::ResidencyHolder::Workflow {
+                run_id: "run-workflow".into(),
+            },
+            incarnation_id: "incarnation-1".into(),
+            cell_epoch: 1,
+        },
+    );
+
+    assert_eq!(reap_stale_runs(&orch), 0);
+    assert_eq!(
+        run_status(&db, "run-workflow").await.as_deref(),
+        Some("live")
+    );
+    assert_eq!(turn_state(&db, "turn-1").await.as_deref(), Some("running"));
+
+    // The supervisor clears the lease only after it has finalized the run, so a
+    // row still live once the lease is gone has nothing behind it.
+    orch.process_state.clear_workflow_lease("run-workflow");
+    assert_eq!(reap_stale_runs(&orch), 1);
+    assert_eq!(
+        run_status(&db, "run-workflow").await.as_deref(),
+        Some("crashed")
+    );
+}
+
+/// A workflow spawn has a run row and no lease until residency acquisition
+/// finishes, which on a cold machine outlasts the grace. Its launch claim is
+/// the cover; this run is a re-dispatched one whose row is old.
+#[tokio::test(flavor = "current_thread")]
+async fn leaves_a_workflow_spawn_awaiting_its_lease_alone() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = orch.db.local.clone();
+    seed_job(&db).await;
+    insert_run(&db, "run-workflow", "starting", seconds_ago(7200)).await;
+    insert_turn(&db, "turn-1", "run-workflow", "pending", true).await;
+
+    let claim = orch.claim_job_launch("job-1", "run-workflow");
+    assert_eq!(reap_stale_runs(&orch), 0);
+    assert_eq!(
+        run_status(&db, "run-workflow").await.as_deref(),
+        Some("starting")
+    );
+
+    drop(claim);
+    assert_eq!(reap_stale_runs(&orch), 1);
+    assert_eq!(
+        run_status(&db, "run-workflow").await.as_deref(),
+        Some("crashed")
+    );
+}
+
 /// A crashed run must not leave live turns behind it: `running` was interrupted
 /// by the loss, `pending` never got to start.
 #[tokio::test(flavor = "current_thread")]

@@ -129,8 +129,8 @@ pub use snapshots::{store_tool_result_event_with_resolution, store_tool_result_e
 pub use snapshots::store_continuation_event_with_turn;
 pub use snapshots::store_launch_event_with_turn;
 pub(crate) use workflow::{
-    delete_workflow_run_row, prepare_workflow_run, redispatch_crashed_workflows,
-    start_workflow_run, CreateWorkflowRunInput,
+    delete_workflow_run_row, is_workflow_agent_config, is_workflow_job, prepare_workflow_run,
+    redispatch_crashed_workflows, start_workflow_run, CreateWorkflowRunInput,
 };
 // The header Restart action reaches this from the host crates via
 // `cairn_core::internal::execution::jobs::restart_workflow`.
@@ -157,6 +157,120 @@ use turns::*;
 // persistence path (`load_run`, `create_run`) reuses them instead of keeping a
 // duplicate column list, so the `runs` projection has one source of truth.
 use crate::runs::queries::{run_from_row, RUN_COLUMNS};
+
+/// Exit reason of a run whose launch was held because the store-wide step of
+/// its preparation could move a branch another operation reserved for
+/// publication. Not a verdict on the work: the job projection never reads it
+/// as failed, and the job is started again once the reservation is released.
+pub const RESERVATION_HELD_EXIT_REASON: &str = "reservation_held";
+
+/// Hold `job_id`, whose start `reserved` refused, until those reservations are
+/// released, then start it again.
+///
+/// In one transaction the job returns to `pending` and a run records the
+/// refusal's text under [`RESERVATION_HELD_EXIT_REASON`], so the node says
+/// why it waits and keeps its place. The execution's advancement is then
+/// written to the effect outbox and delivered only when the reservations
+/// drop: the advance finds the job ready and starts it like any other. A
+/// reservation lives no longer than this process, so a restart's outbox
+/// replay releases a hold whose wake was lost with it.
+fn hold_start_for_reservation(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job_id: &str,
+    execution_id: &str,
+    reserved: crate::orchestrator::ReservedElsewhere,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    let reason = reserved.to_string();
+    let run_id = run_db({
+        let db = owning_db.clone();
+        let (job_id, reason) = (job_id.to_string(), reason.clone());
+        async move {
+            db.write(move |conn| {
+                let (job_id, reason) = (job_id.clone(), reason.clone());
+                Box::pin(async move {
+                    let run_id = ids::mint_child(&job_id);
+                    conn.execute(
+                        "INSERT INTO runs (id, job_id, status, error_message, exit_reason, exited_at, created_at, updated_at, start_mode)
+                         VALUES (?1, ?2, 'crashed', ?3, ?4, ?5, ?5, ?5, 'fresh')",
+                        params![run_id.as_str(), job_id.as_str(), reason.as_str(), RESERVATION_HELD_EXIT_REASON, now],
+                    )
+                    .await?;
+                    conn.execute(
+                        "UPDATE jobs SET status = 'pending', updated_at = ?2
+                         WHERE id = ?1 AND status IN ('pending', 'running')",
+                        params![job_id.as_str(), now],
+                    )
+                    .await?;
+                    Ok(run_id)
+                })
+            })
+            .await
+            .map_err(|error: DbError| error.to_string())
+        }
+    })?;
+    let outbox_entry_id = run_db({
+        let db = orch.db.local.clone();
+        let execution_id = execution_id.to_string();
+        async move {
+            crate::effects::outbox::insert_pending_with_payload_async(
+                &db,
+                "advance_dag",
+                &execution_id,
+                "{}",
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+    })?;
+    log::info!(
+        "[prepare_job] job {job_id}: held on run {run_id} until {} of {} {} released: {reason}",
+        reserved.names.join(", "),
+        reserved.store.display(),
+        if reserved.names.len() == 1 {
+            "is"
+        } else {
+            "are"
+        },
+    );
+    if let Err(error) = crate::execution::advancement::recompute_job(orch, job_id) {
+        log::warn!("[prepare_job] job {job_id}: re-deriving the held job failed: {error}");
+    }
+    let waker = orch.clone();
+    let (job, execution) = (job_id.to_string(), execution_id.to_string());
+    orch.spawn_detached(async move {
+        waker
+            .reservations_released(&reserved.store, &reserved.names)
+            .await;
+        log::info!("[prepare_job] job {job}: the reservation that held it is released; advancing {execution}");
+        match &waker.effect_tx {
+            Some(tx) => {
+                let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
+                    execution_id: execution,
+                    outbox_entry_id: Some(outbox_entry_id),
+                });
+            }
+            None => log::warn!(
+                "[prepare_job] job {job}: no effect loop to advance {execution}; the outbox \
+                 entry {outbox_entry_id} replays at the next start"
+            ),
+        }
+    });
+    let (run_change, job_change) = run_db({
+        let db = owning_db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            Ok::<_, String>((
+                crate::notify::run_db_change_for_id(&db, &run_id, "update").await,
+                crate::notify::job_db_change_for_id(&db, &job_id, "update").await,
+            ))
+        }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", run_change);
+    let _ = orch.services.emitter.emit("db-change", job_change);
+    Ok(())
+}
 
 /// Hold `job_id` because nothing can serve its launch now (see
 /// [`crate::orchestrator::wakes::arm_supply_hold`]). The refused launch still
@@ -545,6 +659,10 @@ pub enum JobPreparation {
     /// Another launch of this job already holds the run and active turn this
     /// start would have created. Nothing was prepared and nothing failed.
     AlreadyLaunching { run_id: String },
+    /// Preparation would have moved a branch another operation reserves for
+    /// publication. The job is back to `pending` with `reason` on its held
+    /// run, and starts again once the reservation is released. Nothing failed.
+    HeldForReservation { reason: String },
 }
 
 fn run_start_mode(session_start: &crate::backends::SessionStart) -> &'static str {

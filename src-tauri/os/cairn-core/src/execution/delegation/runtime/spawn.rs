@@ -841,16 +841,17 @@ pub async fn spawn_call_packets(
     // detection is gated on `background` so an ordinary inline call never pays
     // for it and its response shape stays bit-for-bit unchanged.
     let parent_is_workflow = input.background
-        && select_optional_text(
-            &db,
-            "SELECT agent_config_id FROM jobs WHERE id = ?1",
-            &parent_ctx.job_id,
-        )
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-            == Some("workflow");
+        && crate::execution::jobs::is_workflow_agent_config(
+            select_optional_text(
+                &db,
+                "SELECT agent_config_id FROM jobs WHERE id = ?1",
+                &parent_ctx.job_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+        );
     // The journal is per-machine private state, so it always reads/writes the
     // private DB even when the workflow run itself lives in a team replica.
     let journal_db = orch.db.local.clone();

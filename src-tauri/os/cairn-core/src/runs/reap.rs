@@ -20,10 +20,13 @@
 //! Three pieces of evidence that must all agree, because the cost of being wrong
 //! is crashing a run that is legitimately mid-spawn:
 //!
-//! 1. **No process handle.** The registry is in-memory and every backend
-//!    registers its process before the run can produce anything, so handle
-//!    presence ([`crate::agent_process::process::AgentProcessState::has_process`])
-//!    is the authoritative "is something behind this row?". Presence, not
+//! 1. **No process.** The registry is in-memory and every backend registers its
+//!    process before the run can produce anything, so presence
+//!    ([`crate::agent_process::process::AgentProcessState::has_process`]) is the
+//!    authoritative "is something behind this row?". A run's process is an
+//!    agent handle or, for a workflow run, its bound residency lease: the Bun
+//!    runtime holds no agent handle, and the lease stays bound until its run's
+//!    row is terminal. Presence, not
 //!    occupancy — a warm idle process is very much alive. And *presence*, not
 //!    the absence of an answer: a registry that cannot be read at all (a
 //!    poisoned lock) proves nothing about any run, so it settles none of them
@@ -42,7 +45,9 @@
 //!    host that is still reconciling after boot, and that wait is covered by
 //!    the row, not by the grace. An `active` row is not cover, because it means
 //!    a process registered, so a run holding one with no handle really is
-//!    stale.
+//!    stale. A workflow run takes no admission row: its spawn holds the
+//!    in-memory claim from before residency acquisition until its lease binds,
+//!    which covers a cold provision however long it takes.
 //!
 //! ## What settling releases
 //!

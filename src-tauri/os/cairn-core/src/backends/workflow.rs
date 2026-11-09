@@ -12,7 +12,7 @@
 //! Finalize mapping (the run's turn was started at spawn):
 //! - a deliberate user stop (marker set) -> Exited with `exit_reason=user_stop`
 //!   (reads as Stopped), record KEPT for Restart (CAIRN-2516).
-//! - exit 0 with the output artifact written (terminal-tool armed) -> Exited
+//! - exit 0 with the output artifact stored for the run's job -> Exited
 //!   (turn Complete, job Complete, the suspended caller resumes with the
 //!   artifact); the ONLY outcome that drops the re-dispatch record.
 //! - exit 0 WITHOUT the output artifact -> Failed (ran to completion but never
@@ -69,6 +69,21 @@ pub(crate) async fn spawn_workflow_process(
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let run_db = resolve_run_db(WORKFLOW_BACKEND_NAME, orch, &params.run_id)?;
+    // Until its lease binds, the run has a row and no process, and residency
+    // acquisition alone can take minutes on a cold machine. The launch claim is
+    // what tells the stale-run reaper, and a concurrent resume of the job, that
+    // a launch is in flight. Every early return below drops it.
+    let launch_claim = match run_job_id(&run_db, &params.run_id).await? {
+        Some(job_id) => {
+            let launch_lock = orch.job_launch_lock(&job_id);
+            let _launch_guard = launch_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Some(orch.claim_job_launch(&job_id, &params.run_id))
+        }
+        None => None,
+    };
+    let output_name = params.output_name.clone();
     let tip = crate::fleet::residency::resolve_logical_commit(
         orch,
         &params.repository_path,
@@ -140,6 +155,7 @@ pub(crate) async fn spawn_workflow_process(
     let (event_generation, event_finished) = (generation.clone(), finished.clone());
     let event_early_exit = early_exit.clone();
     let session_id = params.session_id.clone();
+    let event_output_name = output_name.clone();
     // The subscription must outlive this function, until the runtime exits, so
     // a started run parks it here and whichever side finalizes the run drops it.
     let subscription_slot = Arc::new(Mutex::new(
@@ -189,22 +205,27 @@ pub(crate) async fn spawn_workflow_process(
                         ..
                     },
             } if !event_finished.swap(true, Ordering::AcqRel) => {
-                let (orch, fence, run_id, session_id) = (
+                let (orch, fence, run_id, session_id, output_name) = (
                     event_orch.clone(),
                     event_fence.clone(),
                     event_key.clone(),
                     session_id.clone(),
+                    event_output_name.clone(),
                 );
                 let subscription = event_subscription.clone();
                 tokio::spawn(async move {
                     drop(subscription.lock().unwrap().take());
-                    orch.process_state.clear_workflow_lease(&run_id);
                     finalize_workflow_run(
                         &orch,
                         &run_id,
                         session_id.as_deref(),
+                        &output_name,
                         if executor_lost { None } else { exit_code },
                     );
+                    // Only once the row is terminal: until then the lease is
+                    // what keeps the stale-run reaper from settling the run as
+                    // crashed, a status finalize would then refuse to correct.
+                    orch.process_state.clear_workflow_lease(&run_id);
                     let _ = crate::fleet::residency::release(&orch, &fence).await;
                 });
             }
@@ -309,6 +330,8 @@ pub(crate) async fn spawn_workflow_process(
     generation.store(process_generation, Ordering::Release);
     orch.process_state
         .bind_workflow_lease(params.run_id.clone(), fence.clone());
+    // The bound lease now answers for the run's process.
+    drop(launch_claim);
     let _ = transition_run_to_live(WORKFLOW_BACKEND_NAME, orch, &run_db, &params.run_id);
     let _ = crate::execution::jobs::start_turn(orch, &params.turn_id, &params.run_id);
     if let Some((event_generation, exit_code, executor_lost)) = early_exit
@@ -317,13 +340,14 @@ pub(crate) async fn spawn_workflow_process(
         .and_then(|mut pending| pending.take())
     {
         if event_generation == process_generation && !finished.swap(true, Ordering::AcqRel) {
-            orch.process_state.clear_workflow_lease(&params.run_id);
             finalize_workflow_run(
                 orch,
                 &params.run_id,
                 params.session_id.as_deref(),
+                &output_name,
                 if executor_lost { None } else { exit_code },
             );
+            orch.process_state.clear_workflow_lease(&params.run_id);
             let _ = crate::fleet::residency::release(orch, &fence).await;
             return Ok(());
         }
@@ -414,6 +438,62 @@ fn clear_workflow_run_record(orch: &Orchestrator, run_id: &str) {
     }
 }
 
+/// The job a run belongs to, read from the run's owning database. `None` for a
+/// run with no job.
+async fn run_job_id(
+    run_db: &crate::storage::LocalDb,
+    run_id: &str,
+) -> Result<Option<String>, String> {
+    run_db
+        .query_opt_text(
+            "SELECT job_id FROM runs WHERE id = ?1",
+            (run_id.to_string(),),
+        )
+        .await
+        .map_err(|error| format!("failed to read the job of run {run_id}: {error}"))
+}
+
+/// Whether the run's job has stored its declared output artifact.
+///
+/// Read from the job's owning database, where the artifact write landed, so the
+/// answer is the durable record rather than any in-memory trace of the write: a
+/// workflow runtime holds no agent handle for a write to mark. An unreadable
+/// database reads as not written, which fails the run (Restart can retry it)
+/// rather than completing one whose output nobody can see.
+fn workflow_output_written(orch: &Orchestrator, run_id: &str, output_name: &str) -> bool {
+    let result = crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        let output_name = output_name.to_string();
+        move || async move {
+            let run_db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(job_id) = run_job_id(&run_db, &run_id).await? else {
+                return Ok(false);
+            };
+            let job_db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let latest = job_db
+                .query_opt_text(
+                    "SELECT id FROM artifacts WHERE job_id = ?1 AND output_name = ?2 \
+                     ORDER BY version DESC LIMIT 1",
+                    (job_id, output_name),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(latest.is_some())
+        }
+    });
+    result.unwrap_or_else(|error| {
+        log::warn!(
+            "workflow run {run_id}: could not read whether its `{output_name}` artifact was written, so it reads as unwritten: {error}"
+        );
+        false
+    })
+}
+
 /// Map the process exit to a run outcome and finalize (resuming the suspended
 /// caller), then deregister the process.
 ///
@@ -428,6 +508,7 @@ fn finalize_workflow_run(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
+    output_name: &str,
     exit_code: Option<i32>,
 ) {
     // Check-and-clear the deliberate-stop marker first: a workflow Stop hard-kills
@@ -435,7 +516,7 @@ fn finalize_workflow_run(
     // read as a crash — which startup re-dispatch resurrects. This is the trap the
     // whole issue turns on.
     let deliberate_stop = orch.process_state.take_workflow_stop_requested(run_id);
-    let artifact_written = orch.process_state.terminal_tool_armed(run_id);
+    let artifact_written = workflow_output_written(orch, run_id, output_name);
 
     if deliberate_stop {
         // Terminal + non-crashed (reads as Stopped via `exit_reason`), record
@@ -484,6 +565,145 @@ fn finalize_workflow_run(
 
     if let Ok(mut processes) = orch.process_state.processes.lock() {
         processes.remove(run_id);
+    }
+}
+
+/// A workflow run's success is the stored artifact, not any in-memory mark of
+/// its write: the runtime holds no agent handle for a write to arm, which made
+/// every workflow that exited 0 read as having written nothing (CAIRN-5367).
+#[cfg(test)]
+mod finalize_tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+
+    async fn orchestrator() -> (Orchestrator, Arc<LocalDb>) {
+        let local = Arc::new(
+            LocalDb::open_migrated_for_test(
+                tempfile::tempdir().unwrap().keep().join("finalize.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(local.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        (orch, local)
+    }
+
+    /// A live workflow run mid-turn, with its re-dispatch record.
+    async fn seed_live_workflow(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','w','P','prj','/tmp/p',1,1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('i','p',4,'T','active',1,1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e','recipe','i','p','running',1,1);
+             INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at)
+               VALUES ('j-wf','e','i','p','running','flow','Flow','workflow',1,1);
+             INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('sess','j-wf',1,1);
+             UPDATE jobs SET current_session_id = 'sess' WHERE id = 'j-wf';
+             INSERT INTO runs (id, job_id, issue_id, project_id, session_id, status, created_at, started_at, updated_at)
+               VALUES ('wf-run','j-wf','i','p','sess','live',1,1,1);
+             INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, started_at, updated_at)
+               VALUES ('t-run','sess','wf-run','j-wf',1,'running','initial',1,1,1);
+             UPDATE jobs SET current_turn_id = 't-run' WHERE id = 'j-wf';
+             INSERT INTO workflow_run (run_id, job_id, session_id, workflow_id, project_id, execution_id,
+                                       anchor_branch, branch_mode, package_path, script_path, args_json,
+                                       output_name, node_path, created_at)
+               VALUES ('wf-run','j-wf','sess','fan-out','p','e','main','none','/wf','/wf/main.ts','{}',
+                       'return',NULL,1);",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn text(db: &LocalDb, sql: &str) -> Option<String> {
+        db.query_opt_text(sql, ()).await.unwrap()
+    }
+
+    async fn record_count(db: &LocalDb) -> Option<i64> {
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM workflow_run WHERE run_id = 'wf-run'",
+            (),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clean_exit_with_its_artifact_stored_completes_the_run() {
+        let (orch, db) = orchestrator().await;
+        seed_live_workflow(&db).await;
+        // Another name's artifact is not this run's output.
+        db.execute_script(
+            "INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, created_at, updated_at)
+               VALUES ('a-scratch','j-wf','scratch','{}',1,'scratch',1,1),
+                      ('a-return','j-wf','return','{\"content\":\"done\"}',1,'return',1,1);",
+        )
+        .await
+        .unwrap();
+
+        finalize_workflow_run(&orch, "wf-run", Some("sess"), "return", Some(0));
+
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id = 'wf-run'")
+                .await
+                .as_deref(),
+            Some("exited")
+        );
+        assert_eq!(
+            record_count(&db).await,
+            Some(0),
+            "a completed workflow is not restartable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clean_exit_without_its_artifact_fails_the_run() {
+        let (orch, db) = orchestrator().await;
+        seed_live_workflow(&db).await;
+        db.execute_script(
+            "INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, created_at, updated_at)
+               VALUES ('a-scratch','j-wf','scratch','{}',1,'scratch',1,1);",
+        )
+        .await
+        .unwrap();
+
+        finalize_workflow_run(&orch, "wf-run", Some("sess"), "return", Some(0));
+
+        // `fail_run` settles the run row `crashed` and fails its turn
+        // terminally, which is what the job and the suspended caller derive
+        // the failure from.
+        assert_eq!(
+            text(&db, "SELECT state FROM turns WHERE id = 't-run'")
+                .await
+                .as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id = 'wf-run'")
+                .await
+                .as_deref(),
+            Some("crashed")
+        );
+        let reason = text(&db, "SELECT exit_reason FROM runs WHERE id = 'wf-run'")
+            .await
+            .unwrap_or_default();
+        assert!(
+            reason.contains("without writing its output artifact"),
+            "{reason}"
+        );
+        assert_eq!(record_count(&db).await, Some(1), "Restart can retry it");
     }
 }
 

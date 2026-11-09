@@ -43,6 +43,16 @@ pub fn workflow_runtime(
     crate::workflow_host::runtime(orch)
 }
 
+/// Settle a finished delegated child into its spawner, as the child's own
+/// completion does, for integration tests of what that completion wakes.
+#[cfg(feature = "test-utils")]
+pub fn resume_parent_after_task_completion(
+    orch: &crate::orchestrator::Orchestrator,
+    child_job_id: &str,
+) -> Result<(), String> {
+    crate::execution::delegation::resume_suspended_parent_after_task_completion(orch, child_job_id)
+}
+
 /// The one stack budget every headroom guard runs its path within.
 #[cfg(feature = "test-utils")]
 pub mod stack_headroom {

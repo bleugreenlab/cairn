@@ -7982,6 +7982,37 @@ where
     }
 }
 
+/// Exercise the real timeout path without depending on fleet load or waiting
+/// for the production bound. The held wave is released and joined before return.
+#[cfg(feature = "test-utils")]
+pub async fn expire_write_check_wait_for_test(orch: &Orchestrator) -> String {
+    let guard = WriteChecksInFlightGuard::new(orch, "test-expired-write");
+    let (_progress, seen) = tokio::sync::watch::channel(WaveProgress::default());
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let (finished, joined) = tokio::sync::oneshot::channel();
+    let summary = await_write_check_wave(
+        guard,
+        InlineWaitBounds {
+            start: std::time::Duration::ZERO,
+            total: std::time::Duration::ZERO,
+        },
+        seen,
+        async move {
+            let _ = released.await;
+            Some("Checks: ✓ held test wave".to_string())
+        },
+        move |_| async move {
+            let _ = finished.send(());
+        },
+    )
+    .await
+    .expect("a held wave must outlive the zero inline bound");
+    release.send(()).expect("the wave is still held");
+    joined.await.expect("the detached wave must finish");
+    assert!(!orch.write_checks_in_flight("test-expired-write"));
+    summary
+}
+
 fn record_inline_wait(
     span: &tracing::Span,
     outcome: &str,

@@ -21,6 +21,30 @@ use super::turns::create_initial_turn_db;
 use super::*;
 use crate::models::DelegatedOutputContract;
 
+/// The synthetic `agent_config_id` that marks a job as a workflow node. No
+/// agent config by this name exists: a workflow job's process is a script that
+/// takes no conversational turns, so nothing may load a config for it or
+/// resume it as an agent.
+pub(crate) const WORKFLOW_AGENT_CONFIG_ID: &str = "workflow";
+
+/// Whether a job's `agent_config_id` marks it as a workflow node.
+pub(crate) fn is_workflow_agent_config(agent_config_id: Option<&str>) -> bool {
+    agent_config_id == Some(WORKFLOW_AGENT_CONFIG_ID)
+}
+
+/// Whether `job_id` is a workflow node in `db`. A job that is not there reads
+/// as not one.
+pub(crate) async fn is_workflow_job(db: &LocalDb, job_id: &str) -> Result<bool, String> {
+    let agent_config_id = db
+        .query_opt_text(
+            "SELECT agent_config_id FROM jobs WHERE id = ?1",
+            (job_id.to_string(),),
+        )
+        .await
+        .map_err(|error| format!("failed to read agent config of job {job_id}: {error}"))?;
+    Ok(is_workflow_agent_config(agent_config_id.as_deref()))
+}
+
 pub(crate) struct CreateWorkflowRunInput {
     /// The delegating caller job, or `None` for a standalone launch (CAIRN-2651)
     /// whose anchor context is provided explicitly below. A standalone workflow
@@ -196,7 +220,7 @@ pub(crate) fn prepare_workflow_run(
             branch,
             // A workflow has no agent; the synthetic id marks the job as a workflow
             // node without loading an agent config.
-            agent_config_id: "workflow".to_string(),
+            agent_config_id: WORKFLOW_AGENT_CONFIG_ID.to_string(),
             project_id: project_id.clone(),
             issue_id: issue_id.clone(),
             execution_id: execution_id.clone(),
@@ -773,9 +797,12 @@ async fn reset_run_for_redispatch(db: &LocalDb, run_id: &str, job_id: &str) -> R
                 params![now, job_id.as_str()],
             )
             .await?;
+            // `started_at` restarts with the run: the stale-run reaper measures
+            // its grace from it, and the old value would leave a re-dispatched
+            // run looking long dead before its spawn claims the launch.
             conn.execute(
                 "UPDATE runs SET status = 'starting', exit_reason = NULL, exited_at = NULL, \
-                 updated_at = ?1 WHERE id = ?2",
+                 started_at = ?1, updated_at = ?1 WHERE id = ?2",
                 params![now, run_id.as_str()],
             )
             .await?;

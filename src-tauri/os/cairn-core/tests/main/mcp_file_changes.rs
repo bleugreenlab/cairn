@@ -914,8 +914,104 @@ fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackReq
 }
 
 fn parse_report(result: &str) -> serde_json::Value {
-    serde_json::from_str(result)
-        .unwrap_or_else(|_| panic!("Expected JSON ChangeReport, got: {}", result))
+    let mut values = serde_json::Deserializer::from_str(result).into_iter::<serde_json::Value>();
+    let report = values
+        .next()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| panic!("Expected JSON ChangeReport, got: {result}"));
+    let trailing = result[values.byte_offset()..].trim();
+    // These fixtures normally arm no checks, but planning can outlive the
+    // inline wait on a loaded host even when the wave eventually finds none.
+    // Match the whole pending envelope, not just "Checks:", so unrelated text
+    // or a second JSON value cannot be silently discarded.
+    let pending = trailing
+        .strip_prefix("Checks: ⋯ pending (")
+        .and_then(|rest| {
+            rest.strip_suffix(
+                ") — the commit above landed; its when:write checks continue \
+                 in the background. Their verdicts (and any formatter fix, which lands as its own commit) appear \
+                 at cairn:~/checks, and a [Write checks] message follows when they finish.",
+            )
+        })
+        .is_some_and(|why| {
+            !why.contains(['\n', '\r'])
+                && [
+                    "not admitted after ",
+                    "running on ",
+                    "running since ",
+                    "running, still running after ",
+                    "admitted but not running after ",
+                ]
+                    .iter()
+                    .any(|prefix| why.strip_prefix(prefix).is_some_and(|reason| !reason.is_empty()))
+        });
+    assert!(
+        trailing.is_empty() || pending,
+        "Unexpected text after JSON ChangeReport: {trailing}"
+    );
+    report
+}
+
+#[test]
+fn parse_report_accepts_plain_json_and_rejects_unknown_trailing_text() {
+    let report = json!({"applied": [], "failures": []});
+    assert_eq!(parse_report(&format!("  {report} \n\t")), report);
+    for trailing in [
+        "unexpected diagnostic",
+        "{}",
+        "Checks: unknown summary",
+        "Checks: ⋯ pending (not admitted after 0s)",
+        "Checks: ⋯ pending (not admitted after 0s) — the commit above landed;",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_report(&format!("{report}\n\n{trailing}"))).is_err(),
+            "must reject unrecognised trailing text: {trailing}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn parse_report_accepts_an_expired_write_check_wait() {
+    let orch = test_file_change_orchestrator().await;
+    let project = tempfile::tempdir().unwrap();
+    common::insert_project_with_repo(&orch.db.local, "mcp", project.path()).await;
+    let summary =
+        cairn_core::internal::execution::checks::expire_write_check_wait_for_test(&orch).await;
+    assert!(
+        summary.starts_with("Checks: ⋯ pending (not admitted after "),
+        "{summary}"
+    );
+    assert!(
+        summary.ends_with("a [Write checks] message follows when they finish."),
+        "{summary}"
+    );
+
+    let raw = handle_write(
+        &orch,
+        &make_request(
+            "/tmp/test-repo",
+            json!({"changes": [{
+                "target": "cairn://p/mcp/messages",
+                "mode": "append",
+                "payload": {"content": "report with pending checks"}
+            }]}),
+        ),
+    )
+    .await;
+    let expected = parse_report(&raw);
+    assert_successful_change(&expected, 1);
+    let with_summary = format!("{raw}\n\n{summary}");
+    assert_eq!(parse_report(&with_summary), expected);
+    for malformed in [
+        format!("{with_summary}\nunknown diagnostic"),
+        with_summary.replace("not admitted after ", "unknown state "),
+        with_summary.replace("not admitted after ", "not admitted after \n"),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_report(&malformed)).is_err(),
+            "must reject malformed pending footer: {malformed}"
+        );
+    }
 }
 
 fn failure_count(report: &serde_json::Value) -> usize {
@@ -1227,9 +1323,10 @@ async fn a_builder_commits_and_repairs_main_while_the_project_config_does_not_pa
     )
     .await
     .expect("a write under a broken config must not hang");
-    // A wave that armed would append its summary after the report, and this
-    // parse would refuse it: a commit whose own config does not parse arms none.
-    let report = parse_report(&raw);
+    // A commit whose own config does not parse arms no wave. Keep that
+    // assertion explicit even though parse_report accepts pending checks.
+    let report: serde_json::Value =
+        serde_json::from_str(&raw).expect("a broken config must not append a check summary");
     assert_successful_change(&report, 1);
     assert_eq!(repo.read("unrelated.txt"), "lands under a broken config\n");
     assert_eq!(repo.read(".cairn/config.yaml"), UNPARSEABLE);
@@ -3558,6 +3655,7 @@ async fn handler_revert_overlap_failure_leaves_head_and_ledger_unchanged() {
             "commit_msg": "selected change"
         }))
         .await;
+    assert_successful_change(&selected, 1);
     let selected_sha = selected["commit"]["sha"].as_str().unwrap();
     let later = repo
         .change_report(json!({

@@ -609,12 +609,14 @@ async fn node_job_facts_conn(
     // Only a job that never had a turn row at all: a job whose only turn was
     // a refused launch has no work state either, and its launch's run ended
     // without attaching, which is not the job failing. Nor is a launch held
-    // for want of supply (`supply_held`): nothing has been decided about it.
+    // for want of supply (`supply_held`) or until another operation's branch
+    // reservation is released (`reservation_held`): nothing has been decided
+    // about it.
     let run_failed_without_turn = if turn.work_state.is_none() {
         let mut rows = conn
             .query(
                 "SELECT status IN ('failed', 'crashed')
-                    AND COALESCE(exit_reason, '') NOT IN ('user_stop', 'supply_held')
+                    AND COALESCE(exit_reason, '') NOT IN ('user_stop', 'supply_held', 'reservation_held')
                     AND NOT EXISTS (SELECT 1 FROM turns WHERE job_id = ?1)
              FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (job_id,),

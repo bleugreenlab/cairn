@@ -118,7 +118,11 @@ async fn run_complete(
 ) -> ItemOutcome {
     let project_id = run_context.map(|context| context.project_id.clone());
     let caller = match run_context {
-        Some(context) if context.agent_config_id.as_deref() == Some("workflow") => {
+        Some(context)
+            if crate::execution::jobs::is_workflow_agent_config(
+                context.agent_config_id.as_deref(),
+            ) =>
+        {
             crate::responses::ResponseCaller::Workflow {
                 label: context.job_name.clone(),
                 run_id: context.run_id.clone(),
@@ -348,7 +352,9 @@ pub(crate) async fn run_one(
                     )
                 },
                 |context| {
-                    if context.agent_config_id.as_deref() == Some("workflow") {
+                    if crate::execution::jobs::is_workflow_agent_config(
+                        context.agent_config_id.as_deref(),
+                    ) {
                         crate::responses::ResponseCaller::Workflow {
                             label: context.job_name.clone(),
                             run_id: context.run_id.clone(),

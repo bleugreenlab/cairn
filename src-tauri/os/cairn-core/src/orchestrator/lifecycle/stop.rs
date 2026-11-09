@@ -590,7 +590,7 @@ fn is_terminal_run_status(status: &str) -> bool {
 fn is_workflow_child_run(orch: &Orchestrator, run_id: &str) -> bool {
     let dbs = orch.db.clone();
     let run_id = run_id.to_string();
-    run_db_blocking(move || async move {
+    let parent_agent_config_id = run_db_blocking(move || async move {
         let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -612,9 +612,8 @@ fn is_workflow_child_run(orch: &Orchestrator, run_id: &str) -> bool {
         .await
         .map_err(|e| e.to_string())
     })
-    .unwrap_or(None)
-    .as_deref()
-        == Some("workflow")
+    .unwrap_or(None);
+    crate::execution::jobs::is_workflow_agent_config(parent_agent_config_id.as_deref())
 }
 
 /// The operator pressed Stop on a run. A user interrupt suppresses autonomous

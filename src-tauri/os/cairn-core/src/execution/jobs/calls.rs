@@ -1462,7 +1462,7 @@ fn job_parent_is_workflow(orch: &Orchestrator, call_job_id: &str) -> Result<bool
             .await
             .map_err(|e| e.to_string())
     })?;
-    Ok(aid.as_deref() == Some("workflow"))
+    Ok(super::is_workflow_agent_config(aid.as_deref()))
 }
 
 /// `(run_id, label, phase)` of the latest run for a job (by `created_at`), or

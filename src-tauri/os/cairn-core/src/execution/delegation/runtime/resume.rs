@@ -357,7 +357,8 @@ enum TaskCompletionOutcome {
 /// fire-and-forget tasks settled, passively while the batch is still in flight
 /// and with a single `wake` when the last sibling settles. This is the
 /// background sibling of the blocking successor-resume path; it never touches a
-/// successor turn or `continue_job_impl`.
+/// successor turn or `continue_job_impl`. A workflow spawner is told nothing:
+/// it is not an agent, and it already holds its own wait on each child.
 async fn notify_spawner_after_background_task_completion(
     db: &LocalDb,
     execution_id: &str,
@@ -379,6 +380,16 @@ async fn notify_spawner_after_background_task_completion(
     }
 
     let recipient = trigger.parent_job_id.clone();
+    // A workflow script awaits each `agent()` child through the task artifact's
+    // own long-poll, so a completion push tells it nothing, and the wake that
+    // follows one would try to resume the script as an agent. A read failure
+    // pushes as before; the delivery gate still refuses the wake.
+    if matches!(
+        crate::execution::jobs::is_workflow_job(db, &recipient).await,
+        Ok(true)
+    ) {
+        return Ok(None);
+    }
     // The anchor turn groups the batch (the same anchor `delegated_sibling_ids`
     // keys on); fall back to the packet id for an unanchored single task so the
     // supersession key is still stable.
@@ -1867,6 +1878,45 @@ pub(super) mod background_completion_tests {
         let pushes = parent_pushes(&orch).await;
         assert_eq!(pushes.len(), 1);
         assert_eq!(pushes[0].wake, Wake::Wake);
+    }
+
+    /// A workflow's `agent()` calls are background packets parented on the
+    /// workflow job. The script awaits each one through the task artifact's own
+    /// long-poll, so a settled child must not leave a `tasks:` push for it: the
+    /// wake that followed one tried to resume the script as an agent
+    /// (CAIRN-5367). The packet still settles, which is what that long-poll and
+    /// journal replay read.
+    #[tokio::test]
+    async fn a_workflow_spawner_gets_no_completion_push() {
+        let db = crate::storage::migrated_test_db("bg-workflow.db").await;
+        seed(&db, &[("pkt-1", "j-c1", true, "complete")]).await;
+        db.execute_script(
+            "UPDATE jobs SET agent_config_id='workflow' WHERE id='j-parent';
+             INSERT INTO runs(id,job_id,issue_id,project_id,status,start_mode,created_at,updated_at)
+               VALUES('run-workflow','j-parent','i','p','live','resume',1,1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+
+        assert!(parent_pushes(&orch).await.is_empty());
+        let packet =
+            cairn_workflow::delegated_packets::find_by_result_job_db(&orch.db.local, "e", "j-c1")
+                .await
+                .unwrap()
+                .expect("the packet is still there");
+        assert_eq!(packet.status, super::DelegatedStatus::Completed);
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64("SELECT COUNT(*) FROM runs WHERE job_id = 'j-parent'", ())
+                .await
+                .unwrap(),
+            Some(1),
+            "nothing resumed the workflow job"
+        );
     }
 
     /// A non-background batch takes the blocking successor path and never creates

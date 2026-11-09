@@ -1453,25 +1453,20 @@ impl BranchReservations {
     }
 }
 
-impl Orchestrator {
-    /// Admission for a mutation that may move bookmarks it does not name (an
-    /// import, a store initialisation, a name repair). Under the store lock
-    /// `guard`, it refuses before anything is mutated while any bookmark of
-    /// that store is reserved by someone other than `owned`: such a mutation
-    /// could move a branch a publication is holding across network I/O.
-    /// Never waits. Callers that name the one branch they move check
-    /// [`BranchReservation::covers`] instead.
-    pub(crate) fn refuse_foreign_reservations(
-        &self,
-        guard: &JjStoreGuard,
-        owned: Option<&BranchReservation>,
-    ) -> Result<(), String> {
-        let store = Path::new(guard.trace.store.as_ref());
-        let foreign = self.branch_reservations.foreign(store, owned);
-        if foreign.is_empty() {
-            return Ok(());
-        }
-        Err(format!(
+/// Bookmarks of one store reserved by someone else, as a store-wide
+/// admission found them under the store lock. Its text is the refusal; the
+/// store and names say what to wait on ([`Orchestrator::reservations_released`]).
+#[derive(Debug, Clone)]
+pub(crate) struct ReservedElsewhere {
+    pub(crate) store: std::path::PathBuf,
+    /// Sorted and distinct.
+    pub(crate) names: Vec<String>,
+    reason: String,
+}
+
+impl ReservedElsewhere {
+    fn new(store: &Path, foreign: Vec<(String, String)>) -> Self {
+        let reason = format!(
             "deferred: {} reserved for publication ({}), and this operation could move it; \
              retry once the reservation is released",
             if foreign.len() == 1 {
@@ -1484,7 +1479,107 @@ impl Orchestrator {
                 .map(|(name, purpose)| format!("`{name}` by {purpose}"))
                 .collect::<Vec<_>>()
                 .join(", ")
-        ))
+        );
+        Self {
+            store: store.to_path_buf(),
+            names: foreign.into_iter().map(|(name, _)| name).collect(),
+            reason,
+        }
+    }
+}
+
+impl std::fmt::Display for ReservedElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl From<ReservedElsewhere> for String {
+    fn from(reserved: ReservedElsewhere) -> Self {
+        reserved.reason
+    }
+}
+
+impl Orchestrator {
+    /// Admission for a mutation that may move bookmarks it does not name (a
+    /// store initialisation, an operation-head settlement, a name repair).
+    /// Under the store lock `guard`, it refuses before anything is mutated
+    /// while any bookmark of that store is reserved by someone other than
+    /// `owned`: such a mutation could move a branch a publication is holding
+    /// across network I/O. Never waits. Callers that name the one branch they
+    /// move check [`BranchReservation::covers`] instead, and a git import
+    /// spares what is reserved rather than refusing ([`Self::admit_store_import`]).
+    pub(crate) fn refuse_foreign_reservations(
+        &self,
+        guard: &JjStoreGuard,
+        owned: Option<&BranchReservation>,
+    ) -> Result<(), String> {
+        self.reserved_elsewhere(guard, owned).map_err(String::from)
+    }
+
+    /// [`Self::refuse_foreign_reservations`], typed: the refusal names the
+    /// store and bookmarks a caller may wait on.
+    pub(crate) fn reserved_elsewhere(
+        &self,
+        guard: &JjStoreGuard,
+        owned: Option<&BranchReservation>,
+    ) -> Result<(), ReservedElsewhere> {
+        let store = Path::new(guard.trace.store.as_ref());
+        let foreign = self.branch_reservations.foreign(store, owned);
+        if foreign.is_empty() {
+            return Ok(());
+        }
+        Err(ReservedElsewhere::new(store, foreign))
+    }
+
+    /// Admission for a git import into `guard`'s store. Returns the bookmarks
+    /// the import must preserve ([`crate::jj::JjEnv::preserving_import_bookmarks`]):
+    /// every one reserved by someone other than `owned`.
+    ///
+    /// A preserving import neither reads a preserved name's Git ref nor
+    /// publishes a view that changes its local bookmark, remote bookmarks or
+    /// recorded Git ref; it refuses instead. So it cannot move a reserved
+    /// branch, and a reservation elsewhere does not hold it up: the next
+    /// import after the release observes whatever Git did meanwhile. A store
+    /// that does not exist yet is created by `jj git init`, which imports
+    /// every ref unscoped, so its creation is still refused while anything of
+    /// that store is reserved.
+    pub(crate) fn admit_store_import(
+        &self,
+        guard: &JjStoreGuard,
+        owned: Option<&BranchReservation>,
+    ) -> Result<Vec<String>, ReservedElsewhere> {
+        let store = guard.store_path();
+        if !crate::jj::is_jj_dir(store) {
+            self.reserved_elsewhere(guard, owned)?;
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .branch_reservations
+            .foreign(store, owned)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// Resolves once nobody reserves any of `names` of `store`. Waits on the
+    /// reservations themselves, not a clock; a name nobody reserves is
+    /// released already. A later reservation of the same names is not waited
+    /// for: the caller re-admits, and a new holder refuses it again.
+    pub(crate) async fn reservations_released(&self, store: &Path, names: &[String]) {
+        let key = canonical_store_key(store);
+        for name in names {
+            let slot = self
+                .branch_reservations
+                .slots
+                .lock()
+                .unwrap()
+                .get(&(key.clone(), name.clone()))
+                .cloned();
+            if let Some(slot) = slot {
+                drop(slot.lock.clone().lock_owned().await);
+            }
+        }
     }
 
     /// The purpose of whoever reserves `branch` of `store` now, if anyone.
@@ -2027,6 +2122,24 @@ impl Orchestrator {
         F: FnOnce() -> Result<T, String> + Send + 'static,
     {
         self.refuse_foreign_reservations(&guard, owned)?;
+        self.bracket_admitted_store_mutation(guard, db, project_id, mutation)
+            .await
+    }
+
+    /// [`Self::bracket_store_mutation`] for a mutation already admitted under
+    /// `guard`: a git import that preserves every bookmark
+    /// [`Self::admit_store_import`] returned.
+    pub(crate) async fn bracket_admitted_store_mutation<T, F>(
+        &self,
+        guard: JjStoreGuard,
+        db: Arc<LocalDb>,
+        project_id: &str,
+        mutation: F,
+    ) -> Result<(JjStoreGuard, T), String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
         let project_id = project_id.to_string();
         tokio::spawn(async move {
             let store = guard.store_path().to_path_buf();

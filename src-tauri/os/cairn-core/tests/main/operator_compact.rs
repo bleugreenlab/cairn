@@ -347,6 +347,24 @@ async fn cold_compact_abandons_parked_wait_and_cancels_batch() {
     assert_eq!(
         count(
             &db,
+            "SELECT COUNT(*) FROM run_batch_detached WHERE request_id = 'req-1'"
+        )
+        .await,
+        0,
+        "Compact cancels session work rather than detaching it"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM events WHERE run_id = 'run-1' AND event_type = 'tool_result'"
+        )
+        .await,
+        1,
+        "the parked call has exactly one answer, not a cancellation and a detached answer"
+    );
+    assert_eq!(
+        count(
+            &db,
             "SELECT COUNT(*) FROM events WHERE run_id = 'run-1' AND event_type = 'tool_result'
                AND data LIKE '%operator compacted%'"
         )

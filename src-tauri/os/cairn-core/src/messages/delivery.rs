@@ -168,9 +168,11 @@ fn session_refuses_turns_sync(db: &LocalDb, job_id: &str) -> bool {
 /// before writing anything, the idle flush consults it before deciding to
 /// resume, and the pending list consults it before showing anything as
 /// pending, so the composer can never promise a delivery the flush would
-/// decline and the funnel would refuse. Every refusal is reversible (reopening
-/// the issue or the thread, or lifting a cancel), which is why callers filter
-/// on it rather than retiring the rows it covers.
+/// decline and the funnel would refuse. Every refusal but
+/// [`Self::WorkflowRuntime`] is reversible (reopening the issue or the thread,
+/// or lifting a cancel), which is why callers filter on it rather than
+/// retiring the rows it covers. A workflow job is kept from accruing such rows
+/// at their source instead.
 ///
 /// The variants are checked in declaration order and the first that holds is
 /// the answer. That order is what lets the funnel name a specific next step: a
@@ -179,6 +181,11 @@ fn session_refuses_turns_sync(db: &LocalDb, job_id: &str) -> bool {
 /// than the bare [`Self::Cancelled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryRefusal {
+    /// The job is a workflow node, whose process is a script that takes no
+    /// conversational turns. The one refusal that is not reversible: the script
+    /// receives its children's results through its own long-polls, and a
+    /// stopped or failed workflow is re-dispatched by Restart, never resumed.
+    WorkflowRuntime,
     /// The job is a closed thread's session.
     DormantThread,
     /// The job's execution was superseded by another attempt on its issue.
@@ -196,6 +203,7 @@ pub enum DeliveryRefusal {
 impl DeliveryRefusal {
     pub fn describe(self) -> &'static str {
         match self {
+            Self::WorkflowRuntime => "it is a workflow script, which takes no turns",
             Self::DormantThread => "its thread is closed",
             Self::Superseded => "its execution was superseded",
             Self::Cancelled => "it is cancelled",
@@ -213,6 +221,27 @@ pub(crate) async fn delivery_refusal(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Option<DeliveryRefusal>, String> {
+    let (status, agent_config_id) = db
+        .read(|conn| {
+            let job_id = job_id.to_string();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT status, agent_config_id FROM jobs WHERE id = ?1",
+                        params![job_id.as_str()],
+                    )
+                    .await?;
+                Ok(match rows.next().await? {
+                    Some(row) => (row.opt_text(0)?, row.opt_text(1)?),
+                    None => (None, None),
+                })
+            })
+        })
+        .await
+        .map_err(|error| format!("failed to read job {job_id}: {error}"))?;
+    if crate::execution::jobs::is_workflow_agent_config(agent_config_id.as_deref()) {
+        return Ok(Some(DeliveryRefusal::WorkflowRuntime));
+    }
     if crate::threads::is_dormant_thread_session(db, job_id).await {
         return Ok(Some(DeliveryRefusal::DormantThread));
     }
@@ -225,13 +254,6 @@ pub(crate) async fn delivery_refusal(
     if crate::execution::jobs::current_session_refuses_turns(db, job_id).await {
         return Ok(Some(DeliveryRefusal::SessionRefusesTurns));
     }
-    let status = db
-        .query_opt_text(
-            "SELECT status FROM jobs WHERE id = ?1",
-            (job_id.to_string(),),
-        )
-        .await
-        .map_err(|error| format!("failed to read status of job {job_id}: {error}"))?;
     if status.as_deref() == Some("cancelled") {
         return Ok(Some(DeliveryRefusal::Cancelled));
     }
@@ -1141,6 +1163,7 @@ impl FlushDecline {
     fn reason(&self) -> &'static str {
         match self {
             Self::NoJob => "no_job",
+            Self::Refused(DeliveryRefusal::WorkflowRuntime) => "refused_workflow_runtime",
             Self::Refused(DeliveryRefusal::DormantThread) => "refused_dormant_thread",
             Self::Refused(DeliveryRefusal::Superseded) => "refused_superseded",
             Self::Refused(DeliveryRefusal::Cancelled) => "refused_cancelled",
@@ -1361,6 +1384,21 @@ fn nudge_unobserved(
             &job_id[..job_id.len().min(8)]
         );
         return Ok(NudgeOutcome::Refused(DeliveryRefusal::SessionRefusesTurns));
+    }
+
+    // Ahead of every rung below, because each of them acts on the job as an
+    // agent: an interrupt would stop the running script, and every other rung
+    // ends in a resume, for which there is no agent config to load. A read
+    // failure falls through to the rungs, whose flush asks the full gate and
+    // fails closed.
+    if run_db_blocking({
+        let job_id = job_id.to_string();
+        let db = db.clone();
+        move || async move { crate::execution::jobs::is_workflow_job(&db, &job_id).await }
+    })
+    .unwrap_or(false)
+    {
+        return Ok(NudgeOutcome::Refused(DeliveryRefusal::WorkflowRuntime));
     }
 
     let live_run_id = crate::orchestrator::lifecycle::live_run_id_for_job(orch, job_id);
@@ -2384,6 +2422,136 @@ mod tests {
             .await,
             event_count
         );
+    }
+
+    /// A workflow job, its session open, its run live, and something queued for
+    /// it: every reason the ladder has to resume an agent, on a job that is not
+    /// one.
+    async fn seed_workflow_job_with_pending(db: &LocalDb, with_run: bool) {
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-1','default','Test Project','proj','/tmp/test-repo',1,1);
+             INSERT INTO jobs (id, project_id, node_name, uri_segment, status, agent_config_id, created_at, updated_at)
+               VALUES ('job-wf','proj-1','Flow','flow','running','workflow',1,1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('sess-wf','job-wf','claude','open',1,1,1);
+             UPDATE jobs SET current_session_id='sess-wf' WHERE id='job-wf';",
+        )
+        .await
+        .unwrap();
+        if with_run {
+            db.execute_script(
+                "INSERT INTO runs (id, project_id, job_id, session_id, status, created_at, updated_at)
+                   VALUES ('run-wf','proj-1','job-wf','sess-wf','live',1,1);",
+            )
+            .await
+            .unwrap();
+        }
+        crate::messages::queued::enqueue_async(
+            db,
+            "job-wf",
+            "a background agent() child settled",
+            DeliveryUrgency::Steer,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn workflow_job_untouched(db: &LocalDb, runs: i64) {
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM runs WHERE job_id='job-wf'").await,
+            runs,
+            "no successor run is minted for a workflow job"
+        );
+        assert_eq!(
+            count(
+                db,
+                "SELECT COUNT(*) FROM queued_messages WHERE job_id='job-wf' AND delivered_at IS NULL"
+            )
+            .await,
+            1,
+            "nothing queued for it is claimed"
+        );
+    }
+
+    /// CAIRN-5367: a workflow's completion wake reached `continue_job_impl`,
+    /// which went looking for an agent config named `workflow`. The idle flush
+    /// and every urgency of nudge refuse a workflow job by name instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workflow_job_is_refused_by_the_flush_and_every_nudge() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_workflow_job_with_pending(&db, true).await;
+
+        assert_eq!(
+            delivery_refusal(&db, "job-wf").await.unwrap(),
+            Some(DeliveryRefusal::WorkflowRuntime)
+        );
+        assert!(matches!(
+            flush_on_idle(&orch, "run-wf"),
+            Ok(FlushOutcome::Declined(FlushDecline::Refused(
+                DeliveryRefusal::WorkflowRuntime
+            )))
+        ));
+        assert_eq!(
+            nudge_job_for_urgency(&orch, "job-wf", DeliveryUrgency::Steer).unwrap(),
+            NudgeOutcome::Refused(DeliveryRefusal::WorkflowRuntime)
+        );
+        workflow_job_untouched(&db, 1).await;
+
+        // An interrupt must not stop the script mid-turn either.
+        db.execute_script(
+            "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, started_at, updated_at)
+               VALUES('turn-wf','sess-wf','run-wf','job-wf',1,'running','initial',1,1,1);
+             UPDATE jobs SET current_turn_id='turn-wf' WHERE id='job-wf';",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            nudge_job_for_urgency(&orch, "job-wf", DeliveryUrgency::Interrupt).unwrap(),
+            NudgeOutcome::Refused(DeliveryRefusal::WorkflowRuntime)
+        );
+        assert_eq!(
+            db.query_one("SELECT state FROM turns WHERE id='turn-wf'", (), |row| row
+                .text(0))
+                .await
+                .unwrap(),
+            "running"
+        );
+        workflow_job_untouched(&db, 1).await;
+    }
+
+    /// With no run to flush, nudge falls back to resuming the job outright; for
+    /// a workflow job that fallback must refuse too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_workflow_job_without_a_run_is_not_resumed_by_a_nudge() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_workflow_job_with_pending(&db, false).await;
+
+        assert_eq!(
+            nudge_job_for_urgency(&orch, "job-wf", DeliveryUrgency::Steer).unwrap(),
+            NudgeOutcome::Refused(DeliveryRefusal::WorkflowRuntime)
+        );
+        workflow_job_untouched(&db, 0).await;
+    }
+
+    /// The launch funnel is the backstop every resume path shares: it names why
+    /// a workflow job takes no turn and what re-runs one, rather than failing on
+    /// the missing agent config, and it puts back what it claimed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_launch_funnel_refuses_a_workflow_job_by_name() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_workflow_job_with_pending(&db, true).await;
+
+        let refused = crate::execution::jobs::continue_job_impl(&orch, "job-wf", None, None, None)
+            .expect_err("a workflow job is not resumed");
+        assert!(
+            refused.contains("re-dispatched by Restart") && !refused.contains("not found"),
+            "the refusal names the workflow and its Restart: {refused}"
+        );
+        workflow_job_untouched(&db, 1).await;
     }
 
     /// A cancelled job whose session is closed reports the closed session, so

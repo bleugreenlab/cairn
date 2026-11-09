@@ -3104,7 +3104,9 @@ pub(crate) async fn resolve_job_coords(
                     exec_seq: row.i64(6)? as i32,
                     node_segment: row.opt_text(7)?.unwrap_or_default(),
                     parent_segment: row.opt_text(8)?,
-                    is_workflow: row.opt_text(9)?.as_deref() == Some("workflow"),
+                    is_workflow: crate::execution::jobs::is_workflow_agent_config(
+                        row.opt_text(9)?.as_deref(),
+                    ),
                 })),
                 None => Ok(None),
             }

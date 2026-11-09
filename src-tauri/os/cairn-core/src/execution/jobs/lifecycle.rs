@@ -540,6 +540,9 @@ fn launch_refusal(
     use crate::messages::delivery::DeliveryRefusal;
     const CLOSED_SESSION: &str = "This node's session has been closed, so it cannot take another turn. Start a new execution on the issue to carry the work forward.";
     match refusal {
+        DeliveryRefusal::WorkflowRuntime => format!(
+            "Workflow job {job_id} is a script, not an agent, so it takes no turns: a stopped or failed workflow is re-dispatched by Restart, not resumed."
+        ),
         DeliveryRefusal::DormantThread => crate::threads::dormant_thread_refusal(),
         DeliveryRefusal::Superseded => crate::execution::canonical::job_refusal(owning_db, job_id)
             .unwrap_or_else(|| {
@@ -1319,9 +1322,39 @@ pub(crate) struct StoreCoordinate {
     pub(crate) continuation: crate::execution::continuity::Continuation,
 }
 
+/// Why job preparation could not resolve a store coordinate.
+#[derive(Debug)]
+pub(crate) enum CoordinateRefusal {
+    /// The store-wide step could move a branch another operation reserves for
+    /// publication. Not a verdict on the job: it is held, and started again
+    /// once those reservations are released.
+    Reserved(crate::orchestrator::ReservedElsewhere),
+    Failed(String),
+}
+
+impl From<String> for CoordinateRefusal {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl std::fmt::Display for CoordinateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reserved(reserved) => reserved.fmt(f),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
 /// Everything job preparation does to the shared project store (the import
 /// that syncs it with the project's git, the continuity read, and the branch
 /// mint) as one critical section under the per-store lock.
+///
+/// The import spares every branch another operation reserves for publication
+/// (see [`Orchestrator::admit_store_import`]), so a retirement or landing of an
+/// unrelated branch never holds up a mint. Only creating a store that does not
+/// exist yet is refused while one is reserved, as [`CoordinateRefusal::Reserved`].
 ///
 /// The lock is what keeps the mint from being silently undone. A store writer
 /// that fails partway (a base-advance rebase that conflicts, a merge fold, a
@@ -1344,7 +1377,7 @@ pub(crate) fn prepare_store_coordinate<F, P, M>(
     git_rev_parse: F,
     load_parent: P,
     mint_name: M,
-) -> Result<StoreCoordinate, String>
+) -> Result<StoreCoordinate, CoordinateRefusal>
 where
     F: Fn(&str) -> Option<String> + Clone,
     P: FnOnce(&str) -> Result<ParentCoordinate, String>,
@@ -1369,14 +1402,20 @@ where
     if let Some(branch) = job.branch.as_deref() {
         refuse_fenced_coordinate(orch, store, branch)?;
     }
-    let scoped = jj.preserving_import_bookmarks(preserved);
+    let reserved = orch
+        .admit_store_import(&store_guard, None)
+        .map_err(CoordinateRefusal::Reserved)?;
+    // The import preserves reserved names; the mint and continuity read below
+    // use the same scope, and never name a reserved branch of their own.
+    let scoped = jj
+        .preserving_import_bookmarks(preserved)
+        .preserving_import_bookmarks(reserved);
     let jj = &scoped;
     let journal = db.clone();
     let (import_jj, import_store, import_repo) =
         (jj.clone(), store.to_path_buf(), repo_path.to_path_buf());
-    let (store_guard, ()) = run_db_borrowed(orch.bracket_store_mutation(
+    let (store_guard, ()) = run_db_borrowed(orch.bracket_admitted_store_mutation(
         store_guard,
-        None,
         db,
         &job.project_id,
         move || crate::jj::ensure_project_store(&import_jj, &import_store, &import_repo),
@@ -1418,7 +1457,7 @@ where
         crate::execution::continuity::Continuation::NotApplicable
     };
     if let Some(refusal) = continuation.refusal() {
-        return Err(refusal);
+        return Err(refusal.into());
     }
     if let crate::execution::continuity::Continuation::Adopt { adopted, .. } = &continuation {
         refuse_fenced_coordinate(orch, store, &adopted.branch)?;
@@ -1493,14 +1532,15 @@ pub(crate) fn import_project_store_locked(
         store,
         &format!("Importing the project store ({operation})"),
     )?;
+    let reserved = orch.admit_store_import(&store_guard, None)?;
     let (import_jj, import_store, import_repo) = (
-        jj.preserving_import_bookmarks(preserved),
+        jj.preserving_import_bookmarks(preserved)
+            .preserving_import_bookmarks(reserved),
         store.to_path_buf(),
         repo_path.to_path_buf(),
     );
-    run_db_borrowed(orch.bracket_store_mutation(
+    run_db_borrowed(orch.bracket_admitted_store_mutation(
         store_guard,
-        None,
         db.clone(),
         project_id,
         move || crate::jj::ensure_project_store(&import_jj, &import_store, &import_repo),
@@ -1679,11 +1719,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
             .filter(|sha| !sha.is_empty())
     };
 
-    let StoreCoordinate {
-        branch,
-        base_commit,
-        continuation,
-    } = prepare_store_coordinate(
+    let prepared = prepare_store_coordinate(
         orch,
         &jj,
         &store,
@@ -1719,7 +1755,20 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<JobPreparation, 
                 "agent/{project_key}-{display_id}-{safe_step_name}-{seq}"
             ))
         },
-    )?;
+    );
+    let StoreCoordinate {
+        branch,
+        base_commit,
+        continuation,
+    } = match prepared {
+        Ok(coordinate) => coordinate,
+        Err(CoordinateRefusal::Reserved(reserved)) => {
+            let reason = reserved.to_string();
+            super::hold_start_for_reservation(orch, &owning_db, job_id, execution_id, reserved)?;
+            return Ok(JobPreparation::HeldForReservation { reason });
+        }
+        Err(CoordinateRefusal::Failed(error)) => return Err(error),
+    };
 
     run_db(update_job_coordinate(
         owning_db.clone(),
@@ -2762,7 +2811,7 @@ fn continue_job_launch_locked(
     if let Some(retry_turn_id) = preclaimed_retry_turn_id.as_deref() {
         // A recipe node or delegated agent retries on its own warm conversation
         // like any other job; a workflow's run is one-shot and never retried.
-        if job.agent_config_id.as_deref() == Some("workflow")
+        if super::is_workflow_agent_config(job.agent_config_id.as_deref())
             || !pending_retry_head_matches(owning_db.clone(), job_id, retry_turn_id)?
         {
             return Err("automatic retry was superseded or is ineligible".to_string());
@@ -10441,6 +10490,9 @@ mod tests {
             super::super::JobPreparation::AlreadyLaunching { run_id } => {
                 panic!("expected a prepared launch; run {run_id} already owns it")
             }
+            super::super::JobPreparation::HeldForReservation { reason } => {
+                panic!("expected a prepared launch; it was held: {reason}")
+            }
         }
     }
 
@@ -10462,6 +10514,9 @@ mod tests {
             }
             super::super::JobPreparation::Prepared(prepared) => {
                 panic!("a second launch was prepared as run {}", prepared.run_id)
+            }
+            super::super::JobPreparation::HeldForReservation { reason } => {
+                panic!("a duplicate start was held: {reason}")
             }
         }
 
@@ -11195,9 +11250,15 @@ mod tests {
         );
     }
 
+    /// A branch reserved for publication elsewhere in the store holds up
+    /// neither a bulk import nor a mint off main: both spare it. On the
+    /// 11-09 specimen (cairn/6681) the retirement of a merged branch failed
+    /// three unrelated builders at this import. The reserved branch stays
+    /// exactly where the reservation found it while Git moves underneath, and
+    /// the first import after the release observes the move.
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn a_bulk_import_and_mint_refuse_before_mutating_a_reserved_landing_source() {
+    async fn an_import_and_a_mint_spare_a_branch_reserved_for_publication() {
         let Some(fx) = successor_fixture() else {
             return;
         };
@@ -11208,7 +11269,7 @@ mod tests {
             .reserve_branches(
                 &fx.store,
                 &[DEAD_BRANCH],
-                "landing paused before remote publication",
+                "retire a resolved issue's branch",
                 std::time::Duration::from_secs(1),
             )
             .await
@@ -11228,33 +11289,37 @@ mod tests {
         let incoming = git_stdout(fx.project.path(), &["rev-parse", "HEAD"]);
         git(fx.project.path(), &["checkout", "-q", "main"]);
         const ARRIVED: &str = "feature/arrived-during-reservation";
-        const MINTED: &str = "agent/reserved-mint";
+        const MINTED: &str = "agent/unrelated-mint";
         git(fx.project.path(), &["branch", ARRIVED, &incoming]);
-        let before = crate::jj::operation_id(&fx.jj, &fx.store).unwrap();
 
-        let refused = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    import_project_store_locked(
-                        &orch,
-                        &orch.db.local,
-                        "fixture-project",
-                        &fx.jj,
-                        &fx.store,
-                        fx.project.path(),
-                        "reservation fixture",
-                    )
-                })
-                .join()
-                .unwrap()
-        })
-        .unwrap_err();
-        assert!(
-            refused.contains(DEAD_BRANCH) && refused.contains("landing paused"),
-            "{refused}"
+        let import = |operation: &str| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        import_project_store_locked(
+                            &orch,
+                            &orch.db.local,
+                            "fixture-project",
+                            &fx.jj,
+                            &fx.store,
+                            fx.project.path(),
+                            operation,
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            })
+        };
+        import("while reserved").expect("an import spares a reserved branch");
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&fx.store, ARRIVED)
+                .await
+                .unwrap(),
+            incoming,
+            "everything else imports"
         );
         let base = fx.base.clone();
-        let refused = std::thread::scope(|scope| {
+        let prepared = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     prepare_store_coordinate(
@@ -11272,10 +11337,12 @@ mod tests {
                 .join()
                 .unwrap()
         })
-        .err()
-        .expect("the mint's bulk import is refused");
-        assert!(refused.contains(DEAD_BRANCH), "{refused}");
-        assert_eq!(crate::jj::operation_id(&fx.jj, &fx.store).unwrap(), before);
+        .expect("a mint off main is not held up by an unrelated reservation");
+        assert_eq!(prepared.branch.as_deref(), Some(MINTED));
+        assert_eq!(
+            crate::jj::bookmark_commit(&fx.jj, &fx.store, MINTED).as_deref(),
+            Some(fx.base.as_str())
+        );
         assert_eq!(
             cairn_vcs::resolve_coordinate(&fx.store, DEAD_BRANCH)
                 .await
@@ -11283,53 +11350,204 @@ mod tests {
             fx.dead_head,
             "the reservation protects the literal source, not only its export",
         );
-        for name in [ARRIVED, MINTED] {
-            assert!(
-                cairn_vcs::resolve_coordinate(&fx.store, name)
-                    .await
-                    .is_err(),
-                "a refused bulk operation must not partially import or mint {name}"
-            );
-        }
         assert_eq!(
             git_stdout(
                 fx.project.path(),
                 &["rev-parse", &format!("refs/heads/{DEAD_BRANCH}")]
             ),
             incoming,
-            "refusal must not erase the external commit waiting in Git",
+            "sparing must not erase the external commit waiting in Git",
         );
 
         drop(reservation);
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    import_project_store_locked(
-                        &orch,
-                        &orch.db.local,
-                        "fixture-project",
-                        &fx.jj,
-                        &fx.store,
-                        fx.project.path(),
-                        "retry after reservation",
-                    )
-                })
-                .join()
-                .unwrap()
-        })
-        .unwrap();
+        import("after the release").unwrap();
         assert_eq!(
             cairn_vcs::resolve_coordinate(&fx.store, DEAD_BRANCH)
                 .await
                 .unwrap(),
             incoming
         );
+    }
+
+    /// Creating a store is blind (`jj git init` imports every ref unscoped),
+    /// so it is still refused while a branch of that store is reserved, typed
+    /// so job preparation holds rather than fails, and goes ahead once the
+    /// reservation is released.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn creating_a_store_is_refused_while_one_of_its_branches_is_reserved() {
+        let Some(fx) = successor_fixture() else {
+            return;
+        };
+        let orch = test_orchestrator(migrated_test_db("reserved-store-init.db").await);
+        let repo = fx.project.path().to_string_lossy().to_string();
+        let job = seed_successor(&orch, &repo, Continuity::Clean, false).await;
+        let fresh = fx.store.parent().unwrap().join("fresh");
+        const MINTED: &str = "agent/first-mint";
+        let reservation = orch
+            .reserve_branches(
+                &fresh,
+                &[DEAD_BRANCH],
+                "landing paused before remote publication",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let base = fx.base.clone();
+        let prepare = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        prepare_store_coordinate(
+                            &orch,
+                            &fx.jj,
+                            &fresh,
+                            fx.project.path(),
+                            &job,
+                            &mints(),
+                            |revision| (revision == "main").then(|| base.clone()),
+                            |_| unreachable!("a minting job reads no parent"),
+                            || Ok(MINTED.to_string()),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            })
+        };
+        match prepare() {
+            Err(super::CoordinateRefusal::Reserved(reserved)) => {
+                assert_eq!(reserved.names, vec![DEAD_BRANCH.to_string()]);
+                assert!(
+                    reserved.to_string().contains("landing paused"),
+                    "{reserved}"
+                );
+            }
+            Err(super::CoordinateRefusal::Failed(error)) => panic!("refused untyped: {error}"),
+            Ok(_) => panic!("a store was created while one of its branches is reserved"),
+        }
+        assert!(!crate::jj::is_jj_dir(&fresh), "nothing was created");
+
+        drop(reservation);
+        let prepared = prepare().expect("the store is created once the reservation is released");
+        assert_eq!(prepared.branch.as_deref(), Some(MINTED));
+    }
+
+    /// A start refused for a reservation is held, never failed: the job goes
+    /// back to `pending` with the refusal on its held run (which no projection
+    /// reads as failure), the execution's advance is durably owed, and it is
+    /// delivered exactly when the reservation is released.
+    #[tokio::test]
+    async fn a_start_refused_for_a_reservation_is_held_and_advanced_on_release() {
+        let (effects, mut advanced) = tokio::sync::mpsc::unbounded_channel();
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = Arc::new(DbState::new(
+            Arc::new(migrated_test_db("reservation-hold.db").await),
+            Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
+        ));
+        let orch = Orchestrator::builder(
+            state,
+            Arc::new(TestServicesBuilder::new().build()),
+            root.clone(),
+        )
+        .effect_tx(Some(effects))
+        .build();
+        seed_successor(&orch, "/unused", Continuity::Clean, false).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE jobs SET status = 'running' WHERE id = 'job-next'",
+                (),
+            )
+            .await
+            .unwrap();
+        let store = root.join("store");
+        let reservation = orch
+            .reserve_branches(
+                &store,
+                &["agent/retiring"],
+                "retire a resolved issue's branch",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let reserved = {
+            let guard = orch
+                .acquire_jj_store_lock(
+                    &store,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    "admission (test)",
+                )
+                .await;
+            orch.reserved_elsewhere(&guard, None).unwrap_err()
+        };
+        let reason = reserved.to_string();
+        let owning = orch.db.local.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    super::super::hold_start_for_reservation(
+                        &orch, &owning, "job-next", "exec-2", reserved,
+                    )
+                })
+                .join()
+                .unwrap()
+        })
+        .unwrap();
+
+        let db = &orch.db.local;
         assert_eq!(
-            cairn_vcs::resolve_coordinate(&fx.store, ARRIVED)
+            db.query_opt_text("SELECT status FROM jobs WHERE id = 'job-next'", ())
                 .await
-                .unwrap(),
-            incoming
+                .unwrap()
+                .as_deref(),
+            Some("pending"),
+            "held, not failed"
         );
+        let (exit_reason, error) = db
+            .query_opt(
+                "SELECT exit_reason, error_message FROM runs WHERE job_id = 'job-next'
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (),
+                |row| {
+                    use crate::storage::RowExt;
+                    Ok((row.text(0)?, row.text(1)?))
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the hold records its run");
+        assert_eq!(exit_reason, super::super::RESERVATION_HELD_EXIT_REASON);
+        assert_eq!(error, reason, "the node keeps the refusal's text");
+        let owed = db
+            .query_opt_text(
+                "SELECT id FROM effect_outbox WHERE kind = 'advance_dag' AND dedupe_key = 'exec-2' AND state = 'pending'",
+                (),
+            )
+            .await
+            .unwrap()
+            .expect("the advance is owed durably, for a restart to replay");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), advanced.recv())
+                .await
+                .is_err(),
+            "nothing advances while the reservation is held"
+        );
+
+        drop(reservation);
+        match tokio::time::timeout(std::time::Duration::from_secs(10), advanced.recv())
+            .await
+            .expect("the release advances the execution")
+            .unwrap()
+        {
+            crate::effects::types::WorkflowEffect::AdvanceDag {
+                execution_id,
+                outbox_entry_id,
+            } => {
+                assert_eq!(execution_id, "exec-2");
+                assert_eq!(outbox_entry_id.as_deref(), Some(owed.as_str()));
+            }
+            other => panic!("unexpected effect {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -11423,6 +11641,7 @@ mod tests {
                 |_| unreachable!(),
                 || unreachable!(),
             )
+            .map_err(|refusal| refusal.to_string())
         };
         for deleted in [false, true] {
             if deleted {
@@ -11461,7 +11680,8 @@ mod tests {
                 })
             },
             || unreachable!(),
-        );
+        )
+        .map_err(|refusal| refusal.to_string());
         assert!(inherited
             .err()
             .expect("fenced inheritance must refuse")
