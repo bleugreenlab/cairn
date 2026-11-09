@@ -308,6 +308,7 @@ fn claim_shutdown_restart_resume(
     turn_id: &str,
 ) -> Result<bool, String> {
     use crate::storage::RowExt as _;
+    use cairn_session::agent_process::stream::TranscriptJson as _;
     let db = orch.db.local.clone();
     let turn_id = turn_id.to_string();
     crate::storage::run_db_blocking(move || async move {
@@ -331,13 +332,31 @@ fn claim_shutdown_restart_resume(
                 if attempted.next().await?.is_some() { return Ok(false); }
                 drop(attempted);
                 let now = chrono::Utc::now().timestamp() as i32;
+                let data = crate::agent_process::stream::TranscriptEvent {
+                    event_type: "system:restart_resume_attempt".to_string(),
+                    session_id: Some(session_id.clone()),
+                    parent_tool_use_id: None,
+                    content: None,
+                    thinking: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_uses: None,
+                    tool_use_id: None,
+                    tool_result: None,
+                    is_error: false,
+                    thinking_ms: None,
+                    queued_message_id: None,
+                    raw: None,
+                }
+                .observed()
+                .to_event_json();
                 crate::transcripts::stream_store::insert_event_conn(conn,
                     &crate::transcripts::stream_store::EventInsert {
                         id: uuid::Uuid::new_v4().to_string(),
                         run_id, session_id: Some(session_id), turn_id: Some(turn_id),
                         timestamp: now, created_at: now, selected_model: None,
                         event_type: "system:restart_resume_attempt".into(),
-                        data: serde_json::json!({"eventType":"system:restart_resume_attempt"}).to_string(),
+                        data,
                         parent_tool_use_id: None, input_tokens: None, cache_read_tokens: None,
                         cache_create_tokens: None, output_tokens: None, thinking_tokens: None, cost_usd: None,
                     },

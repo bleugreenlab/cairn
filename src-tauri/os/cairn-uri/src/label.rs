@@ -35,6 +35,7 @@ use crate::{build_thread_uri, AttachmentRef, AttachmentScopeRef, CairnResource, 
     derive(serde::Deserialize),
     serde(rename_all = "camelCase", default, deny_unknown_fields)
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LabelContext {
     /// Replaces the node segment (`builder`) of a node-family address.
     pub node_label: Option<String>,

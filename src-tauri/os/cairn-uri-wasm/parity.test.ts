@@ -16,7 +16,10 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const dir = join(import.meta.dir, "..", "..", "target", "uri-wasm");
+// The committed module the frontend imports, not the fresh build beside it:
+// across architectures only the committed one is bound (by digest) to these
+// inputs, and its behaviour is what this holds to the native build.
+const dir = join(import.meta.dir, "..", "..", "..", "packages", "ui", "src", "uri-wasm");
 const grammar = await import(join(dir, "cairn_uri.js"));
 grammar.initSync({ module: readFileSync(join(dir, "cairn_uri_bg.wasm")) });
 
@@ -27,6 +30,7 @@ interface Sample {
   label: string;
   namedLabel: string;
   surface: string;
+  canonical: string;
 }
 interface Fixture {
   named: string;
@@ -47,6 +51,7 @@ describe("cairn-uri-wasm parity with the native grammar", () => {
     expect(grammar.label(uri)).toBe(sample.label);
     expect(grammar.label(uri, fixture.named)).toBe(sample.namedLabel);
     expect(grammar.surface(uri)).toBe(sample.surface);
+    expect(grammar.canonical(uri)).toBe(sample.canonical);
   });
 
   test("addresses that name nothing resolve to nothing", () => {
@@ -54,6 +59,7 @@ describe("cairn-uri-wasm parity with the native grammar", () => {
       expect(grammar.parse(uri), uri).toBeUndefined();
       expect(grammar.label(uri), uri).toBeUndefined();
       expect(grammar.surface(uri), uri).toBeUndefined();
+      expect(grammar.canonical(uri), uri).toBeUndefined();
     }
   });
 

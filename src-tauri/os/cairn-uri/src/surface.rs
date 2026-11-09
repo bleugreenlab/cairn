@@ -21,6 +21,7 @@ use crate::{CairnResource, NodeAddress};
     derive(serde::Serialize),
     serde(tag = "surface", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum Surface {
     /// The project's issue list.
     ProjectIssues {

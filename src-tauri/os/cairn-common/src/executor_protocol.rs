@@ -7295,6 +7295,15 @@ pub struct LearnedResourceEstimate {
 /// executor keeps resetting between an agent batch's items as before. An older
 /// runner reads the batch-level field it always read. The build-hash rollout
 /// delivers it.
+///
+/// cairn/5364 does not move the number. Undoing a verdict-only bracket now
+/// also restores the cell's real index. `TrackedModificationEvidence` may name
+/// a path the batch only staged, keeping `paths` and `filesChanged` as "tracked
+/// paths the batch changed and had undone", and it gains an optional
+/// `indexRestoreFailure` the executor sets when the index half could not be
+/// put back. A runner talking to an older executor gets nothing wrong: that
+/// executor never undid staging, never names staged-only paths, and never
+/// sends the field, which defaults to absent.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -10101,6 +10110,11 @@ pub struct TrackedModificationEvidence {
     pub files_changed: usize,
     pub lines_added: u64,
     pub lines_deleted: u64,
+    /// Set when the worktree half of the discard succeeded but the index half
+    /// could not be put back (typically another process holding
+    /// `.git/index.lock`), naming what may still be staged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_restore_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

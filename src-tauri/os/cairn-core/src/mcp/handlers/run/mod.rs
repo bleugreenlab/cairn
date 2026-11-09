@@ -9333,6 +9333,110 @@ fn environment_rebuild_text(eviction: &crate::fleet::EnvironmentEviction) -> Str
     )
 }
 
+/// Every path the batch's tracked-modification evidence says was undone, and
+/// every index restore that did not land, across the routed batch and its items.
+fn discarded_tracked_work<'a>(
+    evidence: impl IntoIterator<Item = &'a cairn_common::executor_protocol::TrackedModificationEvidence>,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut index_restore_failures = std::collections::BTreeSet::new();
+    for evidence in evidence {
+        paths.extend(evidence.paths.iter().cloned());
+        index_restore_failures.extend(evidence.index_restore_failure.iter().cloned());
+    }
+    (paths, index_restore_failures)
+}
+
+/// Staging the executor could not undo outlives the batch, and the next
+/// `git apply -3` fails on "does not match index" unless the agent knows.
+fn index_restore_failure_note(failure: &str) -> String {
+    format!(
+        "The worktree was restored but its staging was not ({failure}); check `git diff --cached` before the next batch."
+    )
+}
+
+/// The discard report for a home batch with no `commit_msg`: what it undid,
+/// and any staging that survived the undo.
+fn home_discard_message(
+    paths: &std::collections::BTreeSet<String>,
+    index_restore_failures: &std::collections::BTreeSet<String>,
+) -> String {
+    let mut message =
+        "Executor changes were discarded because this run batch had no commit_msg".to_string();
+    if !paths.is_empty() {
+        message.push_str(": ");
+        message.push_str(&paths.iter().cloned().collect::<Vec<_>>().join(", "));
+    }
+    for failure in index_restore_failures {
+        message.push_str("\n\n");
+        message.push_str(&index_restore_failure_note(failure));
+    }
+    message
+}
+
+#[cfg(test)]
+mod discard_report_tests {
+    use super::{discarded_tracked_work, home_discard_message};
+    use cairn_common::executor_protocol::TrackedModificationEvidence;
+
+    fn evidence(paths: &[&str], failure: Option<&str>) -> TrackedModificationEvidence {
+        TrackedModificationEvidence {
+            paths: paths.iter().map(|path| path.to_string()).collect(),
+            files_changed: paths.len(),
+            lines_added: 1,
+            lines_deleted: 0,
+            index_restore_failure: failure.map(str::to_string),
+        }
+    }
+
+    /// The incident's own shape: an agent's home batch with no `commit_msg`
+    /// runs fenced and verdict-only, and its report is the barrier's sentence.
+    /// Staging the executor could not undo has to reach the agent there.
+    #[test]
+    fn a_home_discard_names_what_it_undid_and_what_stayed_staged() {
+        let routed = evidence(
+            &["tracked.txt", "patched.txt"],
+            Some("index restore failed: Unable to create '.git/index.lock': File exists; 2 path(s) may still be staged"),
+        );
+        let (paths, failures) = discarded_tracked_work([&routed]);
+        let message = home_discard_message(&paths, &failures);
+
+        assert!(
+            message.starts_with(
+                "Executor changes were discarded because this run batch had no commit_msg: patched.txt, tracked.txt"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("staging was not (index restore failed: Unable to create '.git/index.lock': File exists; 2 path(s) may still be staged)"),
+            "{message}"
+        );
+        assert!(message.contains("git diff --cached"), "{message}");
+    }
+
+    /// Item evidence and the routed batch's evidence fold into one report, and
+    /// a clean undo adds nothing beyond the paths.
+    #[test]
+    fn evidence_from_every_source_folds_into_one_report() {
+        let routed = evidence(&["a.txt"], None);
+        let item = evidence(&["a.txt", "b.txt"], None);
+        let (paths, failures) = discarded_tracked_work([&routed, &item]);
+
+        assert_eq!(
+            home_discard_message(&paths, &failures),
+            "Executor changes were discarded because this run batch had no commit_msg: a.txt, b.txt"
+        );
+        assert_eq!(
+            home_discard_message(&Default::default(), &Default::default()),
+            "Executor changes were discarded because this run batch had no commit_msg",
+            "a declined delta with no evidence keeps its sentence"
+        );
+    }
+}
+
 /// The batch tail: the verdict-only modification report, the commit barrier and
 /// logical-head publication, the synchronous when:write checks, and the composed
 /// output with its advisories.
@@ -9390,18 +9494,18 @@ async fn settle_run_batch(
         result = format!("{line}\n\n{body}");
     }
     let residence_note = notes.and_then(PlacementNotes::executed);
+    // Read once for both reports below: the verdict-only one, and the commit
+    // barrier's for a home batch with no `commit_msg`, which the executor also
+    // ran verdict-only because the job's residency fences it.
+    let (modified_paths, index_restore_failures) = discarded_tracked_work(
+        routed_tracked_modifications.iter().chain(
+            outcomes
+                .iter()
+                .filter_map(|outcome| outcome.tracked_modifications.as_ref()),
+        ),
+    );
 
     if s.discards_tracked_changes(residence) {
-        let mut modified_paths = std::collections::BTreeSet::new();
-        if let Some(evidence) = routed_tracked_modifications {
-            modified_paths.extend(evidence.paths);
-        }
-        for evidence in outcomes
-            .iter()
-            .filter_map(|outcome| outcome.tracked_modifications.as_ref())
-        {
-            modified_paths.extend(evidence.paths.iter().cloned());
-        }
         if !modified_paths.is_empty() {
             if !result.is_empty() {
                 result.push_str("\n\n");
@@ -9409,8 +9513,14 @@ async fn settle_run_batch(
             result.push_str(&format!(
                 "Verdict-only run modified {} tracked path(s); the mutation was discarded when the batch ended: {}",
                 modified_paths.len(),
-                modified_paths.into_iter().collect::<Vec<_>>().join(", ")
+                modified_paths.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
+        }
+        for failure in &index_restore_failures {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(&index_restore_failure_note(failure));
         }
         if let Some(note) = environment_rebuild_note(orch, s) {
             if !result.is_empty() {
@@ -9584,7 +9694,7 @@ async fn settle_run_batch(
                         || routed_tracked_modifications.is_some())
                         && s.commit_msg.is_none()
                     {
-                        "Executor changes were discarded because this run batch had no commit_msg".to_string()
+                        home_discard_message(&modified_paths, &index_restore_failures)
                     } else {
                         String::new()
                     },

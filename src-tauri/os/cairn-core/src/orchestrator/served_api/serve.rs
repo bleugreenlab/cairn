@@ -202,7 +202,9 @@ pub fn serve_blocking(
                     "invalid_request_error",
                     format!("{model} does not serve /v1/{}: {detail}", door.path()),
                 ),
-                ServedRefusal::Ambiguous { model, offers } => ambiguous_model(model, offers),
+                ServedRefusal::Ambiguous { message } => {
+                    ServedError::new(400, "invalid_request_error", message.clone())
+                }
                 ServedRefusal::RemoteNotGranted { model, provider } => {
                     ledger.provider(provider);
                     remote_refusal(model, provider, &client)
@@ -366,31 +368,6 @@ pub fn serve_blocking(
     }
 }
 
-fn ambiguous_model(model: &str, offers: &[String]) -> ServedError {
-    let mut providers = std::collections::BTreeMap::<&str, Vec<&str>>::new();
-    for offer in offers {
-        if let Some((provider, _)) = offer.split_once('/') {
-            let names = providers.entry(provider).or_default();
-            if !names.contains(&offer.as_str()) {
-                names.push(offer);
-            }
-        }
-    }
-    let named: Vec<String> = providers
-        .into_iter()
-        .map(|(provider, names)| format!("{provider} ({})", names.join(", ")))
-        .collect();
-    let offered = match named.split_last() {
-        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-        _ => named.join(", "),
-    };
-    ServedError::new(
-        400,
-        "invalid_request_error",
-        format!("'{model}' is offered by {offered}: name one"),
-    )
-}
-
 fn remote_refusal(model: &str, provider: &str, client: &ServedApiClient) -> ServedError {
     ServedError::new(
         403,
@@ -447,27 +424,4 @@ fn journal_remote_denial(
             cairn_common::authorization::AuthorityReason::ServedApiRemoteUse,
         ),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_ambiguous_model_is_an_invalid_request_naming_each_offer() {
-        let error = ambiguous_model(
-            "claude-opus-4.6",
-            &[
-                "openrouter/anthropic/claude-opus-4.6".into(),
-                "opencode-go/claude-opus-4-6".into(),
-            ],
-        );
-        assert_eq!(error.status, 400);
-        assert_eq!(error.kind, "invalid_request_error");
-        assert_eq!(
-            error.message,
-            "'claude-opus-4.6' is offered by opencode-go (opencode-go/claude-opus-4-6) and openrouter (openrouter/anthropic/claude-opus-4.6): name one"
-        );
-        assert_eq!(error.retry_after, None);
-    }
 }

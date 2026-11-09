@@ -394,6 +394,19 @@ impl<'a> OfferQuery<'a> {
                     || offer.serving_account_ids.iter().any(|id| id == account)
             })
     }
+
+    /// What `provider` and `account` narrow offers to, as a refusal names it,
+    /// when either is set.
+    fn narrowing(&self) -> Option<String> {
+        match (self.provider, self.account) {
+            (Some(provider), Some(account)) => {
+                Some(format!("provider {provider} and account {account}"))
+            }
+            (Some(provider), None) => Some(format!("provider {provider}")),
+            (None, Some(account)) => Some(format!("account {account}")),
+            (None, None) => None,
+        }
+    }
 }
 
 /// The offer a verb will be served by, as the catalog chose it.
@@ -511,6 +524,17 @@ fn preference(served: &ServedVerb) -> u8 {
     }
 }
 
+/// The tier of [`matching_offers`] a name resolved at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// `provider/native-id`.
+    Qualified,
+    /// A provider's native id or reported slug.
+    Spelled,
+    /// A canonical id no provider spells.
+    Canonical,
+}
+
 /// Resolve the most specific spelling before applying any capability or grant
 /// filters: a qualified native id, a provider's native id or slug, then a
 /// canonical id. A spelling reaches only the offers spelled that way.
@@ -519,37 +543,41 @@ fn matching_offers(
     requested: &str,
     qualifier: Option<&str>,
     native: &str,
-) -> Vec<CatalogOffer> {
+) -> (Tier, Vec<CatalogOffer>) {
     let names_offer = |offer: &CatalogOffer| {
         qualifier.is_some_and(|key| offer.provider == key && offer.model == native)
     };
-    let qualified = models
-        .iter()
-        .flat_map(|model| &model.offers)
-        .any(names_offer);
-    let spelled = models
-        .iter()
-        .flat_map(|model| &model.offers)
-        .any(|offer| offer.model == requested || offer.slug.as_deref() == Some(requested));
-    models
+    let spells =
+        |offer: &CatalogOffer| offer.model == requested || offer.slug.as_deref() == Some(requested);
+    let offers = || models.iter().flat_map(|model| &model.offers);
+    let tier = if offers().any(names_offer) {
+        Tier::Qualified
+    } else if offers().any(spells) {
+        Tier::Spelled
+    } else {
+        Tier::Canonical
+    };
+    let matching = models
         .iter()
         .flat_map(|model| {
-            model.offers.iter().filter(move |offer| {
-                if qualified {
-                    names_offer(offer)
-                } else if spelled {
-                    offer.model == requested || offer.slug.as_deref() == Some(requested)
-                } else {
-                    model.catalog_id == requested
-                }
+            model.offers.iter().filter(move |offer| match tier {
+                Tier::Qualified => names_offer(offer),
+                Tier::Spelled => spells(offer),
+                Tier::Canonical => model.catalog_id == requested,
             })
         })
         .cloned()
-        .collect()
+        .collect();
+    (tier, matching)
 }
 
 /// Offers named by the shared three tiers, narrowed by the query, then by
 /// capability. A more general tier never substitutes for an incapable offer.
+///
+/// A provider's spelling names the model that provider offers. When the
+/// query's provider or account excludes every offer so spelled, the name
+/// still means that model, so it reaches the model's other offers the query
+/// admits. A qualified name names one provider, and is never widened.
 fn exact_offers(
     models: &[CatalogModel],
     query: &OfferQuery<'_>,
@@ -557,10 +585,22 @@ fn exact_offers(
     qualifier: Option<&str>,
     native: &str,
 ) -> (Vec<CatalogOffer>, Vec<SelectedOffer>) {
-    let matching: Vec<CatalogOffer> = matching_offers(models, requested, qualifier, native)
-        .into_iter()
-        .filter(|offer| query.admits_offer(offer))
-        .collect();
+    let (tier, named) = matching_offers(models, requested, qualifier, native);
+    let admitted = |offers: &mut dyn Iterator<Item = &CatalogOffer>| -> Vec<CatalogOffer> {
+        offers
+            .filter(|offer| query.admits_offer(offer))
+            .cloned()
+            .collect()
+    };
+    let mut matching = admitted(&mut named.iter());
+    if matching.is_empty() && tier == Tier::Spelled {
+        matching = admitted(
+            &mut models
+                .iter()
+                .filter(|model| model.offers.iter().any(|offer| named.contains(offer)))
+                .flat_map(|model| &model.offers),
+        );
+    }
     let mut capable: Vec<SelectedOffer> = matching
         .iter()
         .filter_map(|offer| offer.selected(query.verb))
@@ -600,6 +640,18 @@ fn ambiguity(requested: &str, capable: &[SelectedOffer]) -> Option<String> {
         "'{requested}' is offered by {} and {last}: name one",
         rest.join(", ")
     ))
+}
+
+/// The refusal of `requested` when the offers serving `verb` it reaches,
+/// `capable`, sit on more than one provider: the one text every door that
+/// resolves a name refuses an ambiguous one with.
+pub fn ambiguous(verb: VerbKind, requested: &str, capable: &[SelectedOffer]) -> Option<NoOffer> {
+    ambiguity(requested, capable).map(|detail| NoOffer {
+        verb,
+        requested: Some(requested.to_string()),
+        detail: Some(detail),
+        ambiguous: true,
+    })
 }
 
 /// The best way `serves` serves `verb`, when it does: the first of the best
@@ -740,7 +792,7 @@ impl Catalog {
             return Vec::new();
         }
         let (qualifier, native) = self.qualified_by(name);
-        matching_offers(&self.models(), name, qualifier, native)
+        matching_offers(&self.models(), name, qualifier, native).1
     }
 
     /// The installed provider whose key is `key`.
@@ -764,7 +816,9 @@ impl Catalog {
     /// serve the verb is refused, never served by something that does, and an
     /// unqualified one that lands on offers serving the verb on more than one
     /// provider is refused naming each `provider/native-id`, never decided
-    /// for the caller. `provider` and `account` narrow every branch.
+    /// for the caller. `provider` and `account` narrow every branch; a
+    /// provider's spelling they exclude reaches the same model's offers they
+    /// admit instead ([`exact_offers`]).
     pub fn offer_for(&self, query: OfferQuery<'_>) -> Result<SelectedOffer, NoOffer> {
         self.ranked(&query).map(|mut offers| offers.remove(0))
     }
@@ -1083,19 +1137,39 @@ impl Catalog {
 
         let (qualifier, native) = self.qualified_by(requested);
 
-        let (matching, capable) =
-            exact_offers(&self.models(), &query, requested, qualifier, native);
+        let models = self.models();
+        let (matching, capable) = exact_offers(&models, &query, requested, qualifier, native);
         if matching.is_empty() {
-            return Err(refuse(Some(format!(
-                "no installed provider offers '{requested}'"
-            ))));
+            // Name what the name reached outside the narrowing, so the caller
+            // sees which provider spells it that way.
+            let mut outside: Vec<String> = matching_offers(&models, requested, qualifier, native)
+                .1
+                .iter()
+                .map(|offer| format!("{}/{}", offer.provider, offer.model))
+                .collect();
+            outside.dedup();
+            return Err(refuse(Some(match query.narrowing() {
+                Some(narrowing) if !outside.is_empty() => format!(
+                    "'{requested}' names {}, outside {narrowing}, and that model has no offer within it",
+                    outside.join(" and ")
+                ),
+                _ => format!("no installed provider offers '{requested}'"),
+            })));
         }
         if capable.is_empty() {
-            let mut providers: Vec<&str> = matching
-                .iter()
-                .map(|offer| offer.provider.as_str())
-                .collect();
-            providers.dedup();
+            // Each provider, with the spelling it uses where that is not the
+            // name asked for.
+            let mut providers: Vec<String> = Vec::new();
+            for offer in &matching {
+                let named = if offer.model == native || offer.slug.as_deref() == Some(requested) {
+                    offer.provider.clone()
+                } else {
+                    format!("{} (as '{}')", offer.provider, offer.model)
+                };
+                if !providers.contains(&named) {
+                    providers.push(named);
+                }
+            }
             return Err(refuse(Some(format!(
                 "'{requested}' is offered only by {}, which {}{}",
                 providers.join(", "),
@@ -1112,13 +1186,8 @@ impl Catalog {
         // two providers may be two servings (another quantization, another
         // pooling), whose answers and vectors differ. Ranking them is model
         // selection, which belongs to allotments.
-        if let Some(detail) = ambiguity(requested, &capable) {
-            return Err(NoOffer {
-                verb,
-                requested: Some(requested.to_string()),
-                detail: Some(detail),
-                ambiguous: true,
-            });
+        if let Some(refusal) = ambiguous(verb, requested, &capable) {
+            return Err(refusal);
         }
         Ok(capable)
     }
@@ -2544,14 +2613,6 @@ mod tests {
             pin(&catalog, "Z-AI/GLM-5.2-20261001", None).unwrap(),
             ("openrouter".into(), "z-ai/glm-5.2".into())
         );
-        // Narrowing cannot fall through to a less specific canonical tier.
-        assert!(catalog
-            .offer_for(OfferQuery {
-                requested: Some("glm-5.2"),
-                provider: Some("openrouter"),
-                ..OfferQuery::new(VerbKind::Complete)
-            })
-            .is_err());
         let mut incapable = catalog;
         incapable.providers[1].serves.clear();
         assert!(incapable
@@ -2560,6 +2621,87 @@ mod tests {
                 ..OfferQuery::new(VerbKind::Complete)
             })
             .is_err());
+    }
+
+    #[test]
+    fn a_spelling_its_provider_is_filtered_out_of_resolves_in_its_model() {
+        let complete =
+            |catalog: &Catalog, name: &str, provider: Option<&str>, account: Option<&str>| {
+                catalog.offer_for(OfferQuery {
+                    verb: VerbKind::Complete,
+                    requested: Some(name),
+                    provider,
+                    account,
+                })
+            };
+        let catalog = glm_catalog();
+        // Each provider's spelling, under the other provider, reaches that
+        // provider's offer of the same model.
+        for (name, provider, expected) in [
+            ("glm-5.2", "openrouter", "z-ai/glm-5.2"),
+            ("z-ai/glm-5.2", "opencode-go", "glm-5.2"),
+            ("z-ai/glm-5.2-20261001", "opencode-go", "glm-5.2"),
+        ] {
+            let offer = complete(&catalog, name, Some(provider), None).unwrap();
+            assert_eq!(
+                (offer.provider.as_str(), offer.model.as_str()),
+                (provider, expected),
+                "{name}"
+            );
+        }
+        // A qualifier names one provider, and a filter excluding it is never
+        // widened past it.
+        assert_eq!(
+            complete(&catalog, "opencode-go/glm-5.2", Some("openrouter"), None)
+                .unwrap_err()
+                .detail
+                .as_deref(),
+            Some("'opencode-go/glm-5.2' names opencode-go/glm-5.2, outside provider openrouter, and that model has no offer within it")
+        );
+
+        // Nothing of the model within the filter: the refusal names the
+        // spelling's provider.
+        assert_eq!(
+            complete(&catalog, "glm-5.2", Some("ollama"), None)
+                .unwrap_err()
+                .detail
+                .as_deref(),
+            Some("'glm-5.2' names opencode-go/glm-5.2, outside provider ollama, and that model has no offer within it")
+        );
+        // An offer within it that cannot serve the verb is named with the
+        // spelling its provider uses.
+        let mut incapable = glm_catalog();
+        incapable.providers[0].serves.clear();
+        assert_eq!(
+            complete(&incapable, "glm-5.2", Some("openrouter"), None)
+                .unwrap_err()
+                .detail
+                .as_deref(),
+            Some("'glm-5.2' is offered only by openrouter (as 'z-ai/glm-5.2'), which cannot serve completions")
+        );
+
+        // Several providers within the filter: refused naming each, as any
+        // name reaching two providers is.
+        let mut catalog = glm_catalog();
+        catalog.providers[1].models.as_mut().unwrap().models[0].serving_account_ids =
+            vec!["go".into()];
+        catalog.providers.push(conversing(provider(
+            "ollama",
+            Some(vec![model("z-ai/glm-5.2", None)]),
+        )));
+        assert_eq!(catalog.models().len(), 1);
+        assert_eq!(
+            complete(&catalog, "glm-5.2", None, Some("go"))
+                .unwrap()
+                .provider,
+            "opencode-go"
+        );
+        let refusal = complete(&catalog, "glm-5.2", None, Some("elsewhere")).unwrap_err();
+        assert!(refusal.ambiguous);
+        assert_eq!(
+            refusal.to_string(),
+            "'glm-5.2' is offered by ollama (ollama/z-ai/glm-5.2) and openrouter (openrouter/z-ai/glm-5.2): name one."
+        );
     }
 
     #[test]

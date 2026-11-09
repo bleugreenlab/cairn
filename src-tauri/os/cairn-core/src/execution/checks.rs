@@ -12399,6 +12399,9 @@ fn append_tracked_modification_evidence(
         evidence.lines_added,
         evidence.lines_deleted,
     ));
+    if let Some(failure) = &evidence.index_restore_failure {
+        output.push_str(&format!("\nnote: {failure}"));
+    }
 }
 
 /// What a check the executor stopped is recorded as: never a red and never a
@@ -18911,6 +18914,7 @@ cairn-common = { path = "../cairn-common" }
                     files_changed: 2,
                     lines_added: 4,
                     lines_deleted: 1,
+                    index_restore_failure: None,
                 },
             ),
         );
@@ -18919,6 +18923,29 @@ cairn-common = { path = "../cairn-common" }
         assert!(output.contains("check modified tracked paths: Cargo.lock, src/generated.rs"));
         assert!(output.contains("2 files, +4 -1"));
         assert!(output.ends_with("changes were discarded"));
+    }
+
+    #[test]
+    fn an_index_restore_failure_is_named_beside_the_discard() {
+        let mut output = String::new();
+        append_tracked_modification_evidence(
+            &mut output,
+            Some(
+                &cairn_common::executor_protocol::TrackedModificationEvidence {
+                    paths: vec!["src/lib.rs".into()],
+                    files_changed: 1,
+                    lines_added: 1,
+                    lines_deleted: 0,
+                    index_restore_failure: Some(
+                        "index restore failed: index.lock exists; 1 path(s) may still be staged"
+                            .into(),
+                    ),
+                },
+            ),
+        );
+
+        assert!(output.contains("changes were discarded\nnote: index restore failed"));
+        assert!(output.ends_with("1 path(s) may still be staged"));
     }
 
     #[test]

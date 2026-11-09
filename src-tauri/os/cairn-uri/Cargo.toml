@@ -15,7 +15,12 @@ homepage = "https://cairn.computer"
 regex = "1"
 # The JSON form `cairn-uri-wasm` hands across the WebAssembly boundary.
 serde = { version = "1.0", features = ["derive"], optional = true }
+# The JSON Schema of that form, which `cairn-uri-wasm`'s `emit_types` turns
+# into the frontend's TypeScript types. Never built for wasm32.
+schemars = { version = "1.2", optional = true }
 
 [features]
 # `CairnResource` as `{"kind": <ResourceKind slug>, ...fields}`.
 serde = ["dep:serde"]
+# `schemars::JsonSchema` for every type that crosses the WebAssembly boundary.
+schema = ["serde", "dep:schemars"]

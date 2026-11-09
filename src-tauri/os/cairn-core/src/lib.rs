@@ -10,6 +10,7 @@
 // ── Domain operations ──────────────────────────────────
 pub mod action_configs;
 pub mod action_runs;
+pub mod address_read;
 pub mod archival;
 pub mod artifacts;
 pub mod attachments;

@@ -84,6 +84,7 @@ pub fn is_reserved_node_segment(segment: &str) -> bool {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "lowercase")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum AttachmentRef {
     /// `cairn://p/{PROJECT}/‹scope›/{images|attachments}/{ordinal}` — the
     /// friendly form, an ordinal inside the scope the object entered through.
@@ -109,6 +110,7 @@ pub enum AttachmentRef {
     derive(serde::Serialize, serde::Deserialize),
     serde(rename_all = "lowercase")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum AttachmentScopeRef {
     Issue(i32),
     /// The thread's stable name, which is what its URI carries; the record
@@ -126,6 +128,7 @@ pub enum AttachmentScopeRef {
     derive(serde::Serialize, serde::Deserialize),
     serde(tag = "kind", rename_all = "kebab-case")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum CairnResource {
     Project {
         project: String,

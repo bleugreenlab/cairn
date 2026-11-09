@@ -9,10 +9,14 @@
 //! - [`label`]: its condensed label, `CairnResource::label`.
 //! - [`surface`]: the view it opens, as JSON `{"surface": <name>, ...fields}`,
 //!   the `serde` form of `cairn_uri::Surface`.
+//! - [`canonical`]: the one spelling of what it addresses, `to_uri()` of the
+//!   resolved resource, so two spellings of one address compare equal.
 //!
 //! Each returns `undefined` for an address that names nothing. The frontend
 //! builds URIs from typed fields itself, so there is no JSON-to-URI export:
-//! deserializing a resource was most of the module's size.
+//! deserializing a resource was most of the module's size. `canonical` takes
+//! a URI string, not a resource, and `to_uri` is already linked for
+//! `Surface::Read`, so it costs the module almost nothing.
 
 use cairn_uri::{delegate_thread_descendant, parse_uri, CairnResource, LabelContext};
 use wasm_bindgen::prelude::*;
@@ -57,6 +61,13 @@ pub fn surface(uri: &str) -> Option<String> {
     })
 }
 
+/// The canonical URI of what `uri` addresses, or `undefined` when it names
+/// nothing. Lowercases the project and drops any query.
+#[wasm_bindgen]
+pub fn canonical(uri: &str) -> Option<String> {
+    resolve(uri).map(|resource| resource.to_uri())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +109,18 @@ mod tests {
     }
 
     #[test]
+    fn two_spellings_of_one_address_have_one_canonical_form() {
+        assert_eq!(
+            canonical("cairn://p/CAIRN/42/1/builder/chat?limit=5").as_deref(),
+            Some("cairn://p/cairn/42/1/builder/chat")
+        );
+        for sample in every_resource_variant() {
+            let uri = sample.resource.to_uri();
+            assert_eq!(canonical(&uri).as_deref(), Some(uri.as_str()));
+        }
+    }
+
+    #[test]
     fn a_label_context_takes_the_frontend_option_names() {
         let uri = "cairn://p/CAIRN/42/1/builder/task/review/chat";
         assert_eq!(
@@ -122,6 +145,7 @@ mod tests {
             assert_eq!(parse(uri), None);
             assert_eq!(label_with(uri, None), Ok(None));
             assert_eq!(surface(uri), None);
+            assert_eq!(canonical(uri), None);
         }
     }
 }

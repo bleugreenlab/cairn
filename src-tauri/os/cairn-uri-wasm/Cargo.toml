@@ -20,3 +20,9 @@ serde_json = "1.0"
 # Must equal the `wasm-bindgen` CLI pin in scripts/lib/wasm-tools.ts: the CLI
 # refuses a module built against any other version.
 wasm-bindgen = "=0.2.114"
+
+# The `emit_types` example only. A dev-dependency's features never reach the
+# wasm32 build of the library, so the module carries no schema code.
+[dev-dependencies]
+cairn-uri = { path = "../cairn-uri", features = ["schema"] }
+schemars = "1.2"

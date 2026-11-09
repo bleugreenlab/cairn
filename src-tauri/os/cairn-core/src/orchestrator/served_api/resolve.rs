@@ -16,7 +16,7 @@
 
 use cairn_inference::served::ServedModel;
 use cairn_models::interface::relay::RelayDoor;
-use cairn_models::interface::{Catalog, CatalogOffer, SelectedOffer};
+use cairn_models::interface::{ambiguous, Catalog, CatalogOffer, SelectedOffer};
 
 use super::{relays_to, LOCAL_PROVIDER};
 
@@ -54,8 +54,9 @@ pub enum ServedRefusal {
     /// Only a remote provider serves it, and the client holds no grant for
     /// that provider.
     RemoteNotGranted { model: String, provider: String },
-    /// More than one granted remote provider serves the name.
-    Ambiguous { model: String, offers: Vec<String> },
+    /// More than one granted remote provider serves the name. `message` is
+    /// the catalog's refusal, naming each provider's qualified offers.
+    Ambiguous { message: String },
 }
 
 /// `asked` without an `inference/` qualifier, which names Cairn's own
@@ -201,13 +202,9 @@ fn resolve_relaying(
             provider: first_provider,
         });
     };
-    if granted.iter().any(|offer| offer.provider != first.provider) {
+    if let Some(refusal) = ambiguous(verb, &asked, &granted) {
         return Err(ServedRefusal::Ambiguous {
-            model: asked,
-            offers: granted
-                .iter()
-                .map(|offer| format!("{}/{}", offer.provider, offer.model))
-                .collect(),
+            message: refusal.to_string(),
         });
     }
     Ok(resolved(first.clone()))
@@ -433,11 +430,7 @@ mod tests {
         assert_eq!(
             resolve_remote(|_| true),
             Err(ServedRefusal::Ambiguous {
-                model: "claude-opus-4.6".into(),
-                offers: vec![
-                    "openrouter/anthropic/claude-opus-4.6".into(),
-                    "opencode-go/claude-opus-4-6".into(),
-                ],
+                message: "'claude-opus-4.6' is offered by opencode-go (opencode-go/claude-opus-4-6) and openrouter (openrouter/anthropic/claude-opus-4.6): name one.".into(),
             })
         );
         for allowed in ["openrouter", "opencode-go"] {

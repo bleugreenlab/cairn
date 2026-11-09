@@ -1455,6 +1455,7 @@ name = "cairn-uri"
 version = "0.13.7"
 dependencies = [
  "regex",
+ "schemars 1.2.0",
  "serde",
 ]
 
@@ -1463,6 +1464,7 @@ name = "cairn-uri-wasm"
 version = "0.13.7"
 dependencies = [
  "cairn-uri",
+ "schemars 1.2.0",
  "serde_json",
  "wasm-bindgen",
 ]

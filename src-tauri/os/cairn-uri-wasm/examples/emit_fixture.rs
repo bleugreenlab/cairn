@@ -13,7 +13,7 @@
 //! `parity.test.ts` against the module built from the same commit.
 
 use cairn_uri::samples::every_resource_variant;
-use cairn_uri_wasm::{label_with, parse, resolve, surface};
+use cairn_uri_wasm::{canonical, label_with, parse, resolve, surface};
 use serde_json::json;
 
 /// Parseable shapes the resolver refuses, and strings that are not addresses.
@@ -47,6 +47,7 @@ fn main() {
                 "label": label_with(&uri, None).unwrap().expect("resolved above"),
                 "namedLabel": label_with(&uri, Some(NAMED)).unwrap().expect("resolved above"),
                 "surface": surface(&uri).expect("resolved above"),
+                "canonical": canonical(&uri).expect("resolved above"),
             })
         })
         .collect();

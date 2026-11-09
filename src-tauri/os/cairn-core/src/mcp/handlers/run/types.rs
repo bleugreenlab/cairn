@@ -455,6 +455,7 @@ mod tests {
                 files_changed: 1,
                 lines_added: 2,
                 lines_deleted: 1,
+                index_restore_failure: None,
             }),
             environment_fingerprint: String::new(),
             verdict_platform: None,
