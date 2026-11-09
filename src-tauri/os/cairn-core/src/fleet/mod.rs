@@ -28073,15 +28073,19 @@ mod tests {
     /// census (one millisecond, two pids), the command exited, and the terminal
     /// was released, so the machine posts no occupancy for it, only the kills,
     /// each carrying the project and command class the terminal started with.
-    /// Starting another terminal of that class there, through the real
-    /// `StartProcess` dispatch, is refused with both kills counted; a second
-    /// start, as a further restarted runner would make, counts neither again;
-    /// and an interactive shell is not judged.
+    /// Starting another terminal of that class through `StartProcess` learns
+    /// both kills once, even when replayed after another restart. Their load
+    /// is unknown, so the kills alone never refuse the next terminal. A later
+    /// oversized victim does refuse by size; an interactive shell is not judged.
     #[tokio::test]
     async fn a_terminal_running_across_a_runner_restart_teaches_its_kills_and_refuses_the_next() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let temp = tempfile::tempdir().unwrap();
         let orch = test_orchestrator(temp.path()).await;
+        orch.db.local.execute(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p', 'default', 'Project', 'p', ?1, 1, 1)",
+            [temp.path().to_string_lossy().into_owned()],
+        ).await.unwrap();
         let command = "bun run test:rust -p cairn-core";
         let spec = |launch: Option<&str>| -> cairn_common::executor_protocol::ResidentProcessSpec {
             serde_json::from_value(serde_json::json!({
@@ -28124,8 +28128,14 @@ mod tests {
                 })
                 .collect();
         }
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        entry.sender = sender;
+        let generation = entry.generation;
+        let selected = selected_executor(&entry);
+        let context = ReservationPlan::profile_context(&selected);
         // A fresh environment: nothing of the killed terminal is posted.
-        let cell = materialization_read_cell("ub-home", "builder");
+        let mut cell = materialization_read_cell("ub-home", "builder");
+        cell.executor_id = "bgsrv-ub".into();
         let residency = cell.residency.clone().unwrap();
         Arc::make_mut(&mut entry.snapshot).cells = vec![cell.clone()];
         orch.fleet.lock_connections().insert(id, entry);
@@ -28151,34 +28161,76 @@ mod tests {
             reservation: None,
             process: spec(launch),
         };
-        let refused = format!(
-            "{:?}",
-            orch.fleet
-                .operate_residency(&orch, start("terminal:again", Some(command)))
-                .await
-        );
-        assert!(
-            refused.contains("cannot run this terminal's command"),
-            "{refused}"
-        );
-        assert!(
-            refused.contains("killed it here for memory 2 times"),
-            "{refused}"
-        );
-        let again = format!(
-            "{:?}",
-            orch.fleet
-                .operate_residency(&orch, start("terminal:third", Some(command)))
-                .await
-        );
-        assert!(again.contains("2 times"), "each kill counted once: {again}");
+        let fleet = orch.fleet.clone();
+        let answered = cell.clone();
+        let machine = tokio::spawn(async move {
+            for expected in ["terminal:again", "terminal:third", "terminal:shell"] {
+                let Some(ExecutorMessage::ResidencyRequest {
+                    correlation_id,
+                    operation: ResidencyOperation::StartProcess { process_key, .. },
+                    ..
+                }) = next_work_frame(&mut executor).await
+                else {
+                    panic!("a fitting terminal reaches the executor");
+                };
+                assert_eq!(process_key, expected);
+                fleet.handle_executor_message(
+                    "bgsrv-ub",
+                    generation,
+                    ExecutorMessage::ResidencyResponse {
+                        correlation_id,
+                        result: ResidencyResult::State {
+                            cell: answered.clone(),
+                        },
+                    },
+                );
+            }
+        });
+        for key in ["terminal:again", "terminal:third"] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                orch.fleet
+                    .operate_residency(&orch, start(key, Some(command))),
+            )
+            .await
+            .expect("the start settles");
+            assert!(
+                matches!(result, ResidencyResult::State { .. }),
+                "{result:?}"
+            );
+        }
+        let suite = resource_profiles::suite_key(
+            "p",
+            None,
+            cairn_common::executor_protocol::CellCommandClass::classify(command),
+        )
+        .unwrap();
+        let evidence = resource_profiles::resolve_process_demand(
+            orch.db.local.clone(),
+            None,
+            Some(&suite),
+            cairn_common::executor_protocol::CellCommandClass::classify(command),
+            &context,
+        )
+        .await;
+        let demand = evidence.demand.expect("the killed rustc is learned");
+        assert_eq!(demand.peak_bytes, 3 * GIB);
+        assert_eq!(demand.name.as_deref(), Some("rustc"));
+        let kills = demand.kills_here.unwrap();
+        assert_eq!(kills.alone, 0);
+        let crowded = kills.crowded.unwrap();
+        assert_eq!(crowded.count, 2);
+        assert_eq!(crowded.most_co_resident, None);
         let counted = orch
             .db
             .local
             .read(|conn| {
                 Box::pin(async move {
                     let mut rows = conn
-                        .query("SELECT SUM(oom_kill_count) FROM suite_memory_evidence", ())
+                        .query(
+                            "SELECT SUM(oom_crowded_kill_count) FROM suite_memory_evidence",
+                            (),
+                        )
                         .await?;
                     Ok(rows
                         .next()
@@ -28194,16 +28246,40 @@ mod tests {
             Some(2),
             "two kills in one millisecond are two kills, once"
         );
-        let shell = format!(
+        {
+            let mut connections = orch.fleet.lock_connections();
+            let health = Arc::make_mut(&mut connections.get_mut("bgsrv-ub").unwrap().health);
+            let mut oversized = health.memory_record.oom_kills[0].clone();
+            oversized.pid = 13;
+            oversized.footprint_bytes = Some(12 * GIB);
+            health.memory_record.oom_kills.push(oversized);
+        }
+        let refused = format!(
             "{:?}",
             orch.fleet
-                .operate_residency(&orch, start("terminal:shell", None))
+                .operate_residency(&orch, start("terminal:oversized", Some(command)))
                 .await
         );
         assert!(
-            !shell.contains("cannot run this terminal's command"),
-            "an interactive shell is not judged: {shell}"
+            refused.contains("cannot run this terminal's command"),
+            "{refused}"
         );
+        assert!(
+            !refused.contains("while it ran alone"),
+            "size, not unknown load, refuses: {refused}"
+        );
+        let shell = tokio::time::timeout(
+            Duration::from_secs(10),
+            orch.fleet
+                .operate_residency(&orch, start("terminal:shell", None)),
+        )
+        .await
+        .expect("the shell start settles");
+        assert!(
+            matches!(shell, ResidencyResult::State { .. }),
+            "an interactive shell is not judged: {shell:?}"
+        );
+        machine.await.unwrap();
     }
 
     /// The executor keeps its last kills by count, so a kill learned days ago
@@ -42453,8 +42529,9 @@ mod tests {
     /// An agent's batch carries no command identities, and its items' kills
     /// live only in their own outcomes. Through the real completion path each
     /// item teaches its own command class: the two cargo items killed below
-    /// the fit line count two kills at the machine's total, and the vitest
-    /// item's process is learned under vitest, not cargo.
+    /// the fit line count two crowded kills because their starting load is
+    /// unknown, and the vitest item's process is learned under vitest, not
+    /// cargo. Those kills teach the victim's size without ending the fit.
     #[tokio::test]
     async fn an_identity_free_batch_teaches_each_items_suite_and_counts_its_kills() {
         use cairn_common::executor_protocol::ProcessBatchItemOutcome;
@@ -42591,7 +42668,7 @@ mod tests {
                 Box::pin(async move {
                     let mut rows = conn
                         .query(
-                            "SELECT suite_key, upper_process_peak_bytes, oom_kill_count FROM suite_memory_evidence ORDER BY suite_key",
+                            "SELECT suite_key, upper_process_peak_bytes, oom_kill_count, oom_crowded_kill_count FROM suite_memory_evidence ORDER BY suite_key",
                             (),
                         )
                         .await?;
@@ -42601,6 +42678,7 @@ mod tests {
                             row.get::<String>(0)?,
                             row.get::<i64>(1)? as u64,
                             row.get::<i64>(2)?,
+                            row.get::<i64>(3)?,
                         ));
                     }
                     Ok(found)
@@ -42611,12 +42689,44 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].0.ends_with("/class:cargoTest"), "{rows:?}");
         assert_eq!(
-            (rows[0].1, rows[0].2),
-            (3 * GIB, 2),
-            "two kills at one total"
+            (rows[0].1, rows[0].2, rows[0].3),
+            (3 * GIB, 0, 2),
+            "two unknown-load kills teach the victim peak, never solo kills"
         );
         assert!(rows[1].0.ends_with("/class:vitest"), "{rows:?}");
-        assert_eq!((rows[1].1, rows[1].2), (GIB, 0));
+        assert_eq!((rows[1].1, rows[1].2, rows[1].3), (GIB, 0, 0));
+        let context = {
+            let connections = orch.fleet.lock_connections();
+            ReservationPlan::profile_context(&selected_executor(
+                connections.get(COLOCATED_EXECUTOR_ID).unwrap(),
+            ))
+        };
+        let evidence = resource_profiles::resolve_process_demand(
+            db,
+            None,
+            Some(&rows[0].0),
+            cairn_common::executor_protocol::CellCommandClass::CargoTest,
+            &context,
+        )
+        .await;
+        assert_eq!(
+            judge_process_evidence(
+                &evidence,
+                13_000_000_000,
+                Some(GIB),
+                Some(11_042_782_208),
+                &context.executor_class,
+                true,
+            ),
+            None,
+            "unknown-load kills below capacity never refuse a Linux machine"
+        );
+        let demand = evidence.demand.expect("the killed rustc is learned");
+        assert_eq!(demand.peak_bytes, 3 * GIB);
+        assert_eq!(demand.name.as_deref(), Some("rustc"));
+        let kills = demand.kills_here.expect("the machine's kills are retained");
+        assert_eq!(kills.alone, 0);
+        assert_eq!(kills.crowded.unwrap().count, 2);
     }
 
     /// A machine that provisions one cell at a time: it claims the first offer
