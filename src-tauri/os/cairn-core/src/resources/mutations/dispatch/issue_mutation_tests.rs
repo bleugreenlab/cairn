@@ -1812,7 +1812,7 @@ async fn an_adopted_child_wakes_the_thread_without_minting_a_subscription() {
 /// An issue an agent files while holding a thread belongs to that thread. The
 /// payload names no parent; the edge lands anyway, and it lands as a thread
 /// edge — routing attention back to the session that decided on the work,
-/// carrying neither an issue parent nor a spawning job.
+/// carrying no issue parent while retaining the authenticated filing job.
 #[tokio::test]
 async fn an_issue_filed_from_a_thread_defaults_to_that_thread() {
     let orch = seeded_orch().await;
@@ -1831,9 +1831,8 @@ async fn an_issue_filed_from_a_thread_defaults_to_that_thread() {
     assert_eq!(parent_issue_id_of(&orch, &child_id).await, None);
     assert_eq!(
         parent_job_id_of(&orch, &child_id).await,
-        None,
-        "a thread edge routes attention and confers no branch ancestry, so nothing\
-         records a spawning node"
+        Some(session.clone()),
+        "a thread edge retains the authenticated filing job as creator provenance"
     );
 
     let overview = crate::resources::read::produce_cairn_resource(

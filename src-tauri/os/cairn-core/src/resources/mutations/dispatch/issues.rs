@@ -870,8 +870,8 @@ mod tests {
         assert_eq!(
             edges,
             vec![
-                (None, Some("thread".into()), None),
-                (None, Some("thread".into()), None)
+                (None, Some("thread".into()), Some("thread-session".into())),
+                (None, Some("thread".into()), Some("thread-session".into()))
             ]
         );
     }
